@@ -3,7 +3,7 @@ package main
 import (
 	"C"
 
-	"github.com/baahl-nyu/lattigo/v6/schemes/ckks"
+	"github.com/realqhc/lattigo/v6/schemes/ckks"
 )
 
 //export NewEncryptor

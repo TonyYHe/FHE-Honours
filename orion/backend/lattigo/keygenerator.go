@@ -3,7 +3,7 @@ package main
 import (
 	"C"
 
-	"github.com/baahl-nyu/lattigo/v6/core/rlwe"
+	"github.com/realqhc/lattigo/v6/core/rlwe"
 )
 import (
 	"unsafe"

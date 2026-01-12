@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/bootstrapping"
-	"github.com/baahl-nyu/lattigo/v6/utils"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/bootstrapping"
+	"github.com/realqhc/lattigo/v6/utils"
 )
 
 // Map to store bootstrapping.Evaluators by their slot count

@@ -7,11 +7,11 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/minimax"
-	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/polynomial"
-	"github.com/baahl-nyu/lattigo/v6/core/rlwe"
-	"github.com/baahl-nyu/lattigo/v6/schemes/ckks"
-	"github.com/baahl-nyu/lattigo/v6/utils/bignum"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/minimax"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/polynomial"
+	"github.com/realqhc/lattigo/v6/core/rlwe"
+	"github.com/realqhc/lattigo/v6/schemes/ckks"
+	"github.com/realqhc/lattigo/v6/utils/bignum"
 )
 
 var polyHeap = NewHeapAllocator()

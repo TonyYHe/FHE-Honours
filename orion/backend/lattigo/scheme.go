@@ -3,14 +3,14 @@ package main
 import (
 	"C"
 
-	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/bootstrapping"
-	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/polynomial"
-	"github.com/baahl-nyu/lattigo/v6/core/rlwe"
-	"github.com/baahl-nyu/lattigo/v6/ring"
-	"github.com/baahl-nyu/lattigo/v6/schemes/ckks"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/bootstrapping"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/polynomial"
+	"github.com/realqhc/lattigo/v6/core/rlwe"
+	"github.com/realqhc/lattigo/v6/ring"
+	"github.com/realqhc/lattigo/v6/schemes/ckks"
 )
 import (
-	"github.com/baahl-nyu/lattigo/v6/circuits/ckks/lintrans"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
 )
 
 type Scheme struct {

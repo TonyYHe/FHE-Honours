@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/baahl-nyu/lattigo/v6/core/rlwe"
+	"github.com/realqhc/lattigo/v6/core/rlwe"
 )
 
 func convertCIntToInt(v C.int) int {
