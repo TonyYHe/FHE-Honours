@@ -599,6 +599,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         write_big_graph_lattigo_microbench,
     )
     from orion.experimental.cir.report import build_region_first_pipeline_report
+    from orion.experimental.cir.stage_matrix import build_stage_materialization_lattigo_matrix
 
     artifacts = {
         "region_search_candidates": Path(output_dir) / "orion_region_search_candidates.json",
@@ -609,6 +610,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         "big_graph_convolution_microbench": Path(output_dir) / "orion_big_graph_convolution_microbench.json",
         "big_graph_lattigo_microbench": Path(output_dir) / "orion_big_graph_lattigo_microbench.json",
         "region_first_pipeline_report": Path(output_dir) / "orion_region_first_pipeline_report.json",
+        "stage_materialization_lattigo_matrix": Path(output_dir) / "orion_stage_materialization_lattigo_matrix.json",
     }
     payloads = {
         "region_search_candidates": build_region_search_candidates(),
@@ -624,6 +626,9 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
     payloads["region_first_pipeline_report"] = build_region_first_pipeline_report(
         attach_lattigo=False,
         lattigo_evidence=payloads["big_graph_lattigo_microbench"],
+    )
+    payloads["stage_materialization_lattigo_matrix"] = build_stage_materialization_lattigo_matrix(
+        lattigo_payload=payloads["big_graph_lattigo_microbench"]
     )
     for key, path in artifacts.items():
         if key == "big_graph_lattigo_microbench":

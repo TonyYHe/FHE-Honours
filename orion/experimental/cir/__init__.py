@@ -19,6 +19,7 @@ from .ir import (
 from .lattigo_block import build_r18_stage1_shared_block_plan
 from .report import build_region_first_pipeline_report, write_region_first_pipeline_report
 from .selector import build_region_first_full_selector, build_region_first_full_selector_summary
+from .stage_matrix import build_stage_materialization_lattigo_matrix, write_stage_materialization_lattigo_matrix
 
 __all__ = [
     "CanonicalTemplateEntry",
@@ -34,5 +35,7 @@ __all__ = [
     "build_region_first_full_selector",
     "build_region_first_full_selector_summary",
     "build_region_first_pipeline_report",
+    "build_stage_materialization_lattigo_matrix",
     "write_region_first_pipeline_report",
+    "write_stage_materialization_lattigo_matrix",
 ]

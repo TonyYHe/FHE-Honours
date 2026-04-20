@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 STATS_KEYS = ("rotations", "conjugations", "ct_pt_mults", "adds")
@@ -21,6 +22,18 @@ class RegionFirstFixture:
     selected_stats: dict[str, int]
     parity: dict[str, float | bool]
     source_families: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StageMaterializerReference:
+    network: str
+    stage: str
+    family: str
+    materializer: str
+    expected_stats: dict[str, int]
+    source: str
+    status: Literal["ported", "missing_materializer"] = "missing_materializer"
+    note: str = ""
 
 
 R18_STAGE1_STAGE2 = RegionFirstFixture(
@@ -55,6 +68,77 @@ R34_STAGE1_STAGE2 = RegionFirstFixture(
 
 R18_R34_FIXTURES = (R18_STAGE1_STAGE2, R34_STAGE1_STAGE2)
 EXCLUDED_SYNTHETIC_ROWS = ("R20:stage1_two_output_region",)
+
+
+STAGE_MATERIALIZER_REFERENCES: tuple[StageMaterializerReference, ...] = (
+    StageMaterializerReference(
+        network="R18",
+        stage="stage1",
+        family="stage1_same",
+        materializer="generalized_inter_hsplit_full_native_shared_output_collapse",
+        expected_stats={"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089},
+        source="vendored R18 stage1 first input surface-pair full output-bank block",
+        status="ported",
+        note="original-size Lattigo proof covers all 8 output banks for block0",
+    ),
+    StageMaterializerReference(
+        network="R18",
+        stage="stage2",
+        family="stage2_same",
+        materializer="generalized_inter_hsplit_full_native_shared_output_collapse",
+        expected_stats={"rotations": 84, "conjugations": 8, "ct_pt_mults": 5880, "adds": 5890},
+        source="/tmp/region_first_end_to_end_orion_comparison.json per-instance stage2_same",
+    ),
+    StageMaterializerReference(
+        network="R18",
+        stage="stage3",
+        family="stage3_same",
+        materializer="inter_group_shared_lt",
+        expected_stats={"rotations": 90, "conjugations": 2, "ct_pt_mults": 6750, "adds": 6753},
+        source="/tmp/r18_shared_lt_selector.json stage3_same",
+    ),
+    StageMaterializerReference(
+        network="R18",
+        stage="stage4",
+        family="stage4_same",
+        materializer="compact_intra_group_phase",
+        expected_stats={"rotations": 158, "conjugations": 1, "ct_pt_mults": 9767, "adds": 9768},
+        source="/tmp/r18_shared_lt_selector.json stage4_same",
+    ),
+    StageMaterializerReference(
+        network="R34",
+        stage="stage1",
+        family="stage1_same_3x3_s1_gap4_to4",
+        materializer="generalized_inter_hsplit_full_native_shared_output_collapse",
+        expected_stats={"rotations": 144, "conjugations": 16, "ct_pt_mults": 3600, "adds": 3620},
+        source="/tmp/region_first_end_to_end_orion_comparison.json per-instance stage1_same_3x3_s1_gap4_to4",
+    ),
+    StageMaterializerReference(
+        network="R34",
+        stage="stage2",
+        family="stage2_same_3x3_s1_gap8_to8",
+        materializer="generalized_inter_hsplit_full_native_shared_output_collapse",
+        expected_stats={"rotations": 152, "conjugations": 4, "ct_pt_mults": 3844, "adds": 3850},
+        source="/tmp/region_first_end_to_end_orion_comparison.json per-instance stage2_same_3x3_s1_gap8_to8",
+    ),
+    StageMaterializerReference(
+        network="R34",
+        stage="stage3",
+        family="stage3_same_3x3_s1_gap16_to16",
+        materializer="inter_hsplit_native_shared_multi_output",
+        expected_stats={"rotations": 204, "conjugations": 2, "ct_pt_mults": 7938, "adds": 7941},
+        source="/tmp/r34_shared_lt_selected_families.json layer3_0_conv2_torch",
+    ),
+    StageMaterializerReference(
+        network="R34",
+        stage="stage4",
+        family="stage4_same_3x3_s1_gap32_to32",
+        materializer="missing_stage4_reference",
+        expected_stats={"rotations": 0, "conjugations": 0, "ct_pt_mults": 0, "adds": 0},
+        source="not locked in current vendored Orion reference table",
+        note="requires reading/porting scripts/cir stage4 selected fixture",
+    ),
+)
 
 
 def stats_sum(rows: list[dict[str, int]] | tuple[dict[str, int], ...]) -> dict[str, int]:
@@ -92,4 +176,3 @@ def summary(selected: dict[str, int], orion: dict[str, int]) -> dict[str, object
             "delta": float(delta["score"]),
         },
     }
-
