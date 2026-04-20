@@ -20,6 +20,14 @@ from typing import Literal, Sequence
 BankKind = Literal["regular", "real_imag_pair"]
 SourcePackingKind = Literal["none", "input_replication"]
 BoundaryAction = Literal["keep_layout", "insert_extract", "validate_relu_safe"]
+RegionStrategy = Literal[
+    "baseline",
+    "input_mult_output_fold",
+    "real_imag_hybrid",
+    "real_imag_hybrid_output_fold",
+    "input_mult_real_imag_hybrid_output_fold",
+    "real_imag_hybrid_transition_branch",
+]
 
 
 def _ceil_div(left: int, right: int) -> int:
@@ -50,6 +58,8 @@ class RegionCandidate:
     output_node_ids: tuple[str, ...]
     useful_output_banks: int
     reason: str = ""
+    boundary_constraints: tuple[str, ...] = ()
+    region_kind: str = ""
 
 
 class RegionPlanner:
@@ -152,6 +162,13 @@ class LoweredRegionPlan:
     source_packing: SourcePacking
     boundary_actions: tuple[BoundaryAction, ...]
     relu_safe_boundary: bool
+    strategy: RegionStrategy = "baseline"
+    legal: bool = True
+    reject_reason: str = ""
+
+    @property
+    def relu_safe(self) -> bool:
+        return bool(self.relu_safe_boundary)
 
 
 class PackingPlanner:
@@ -250,22 +267,24 @@ class PackingPlanner:
         max_slots: int,
         use_real_imag_hybrid: bool = False,
         input_replication: int = 1,
+        strategy: RegionStrategy = "baseline",
     ) -> LoweredRegionPlan:
-        source_tiles = PackingPlanner.build_ch_halo_source_tiles(
-            c=int(c_in),
-            h=int(h_in),
-            w=int(w_in),
-            gap=int(input_gap),
-            kernel=int(kernel),
-            stride=int(stride),
-            pad=int(pad),
-            max_slots=int(max_slots),
-        )
         target_tiles = PackingPlanner.build_target_tiles(
             c=int(c_out),
             h=int(h_out),
             w=int(w_out),
             gap=int(output_gap),
+            max_slots=int(max_slots),
+        )
+        source_tiles = PackingPlanner.build_source_tiles_for_targets(
+            target_tiles=target_tiles,
+            c_in=int(c_in),
+            h_in=int(h_in),
+            w_in=int(w_in),
+            input_gap=int(input_gap),
+            kernel=int(kernel),
+            stride=int(stride),
+            pad=int(pad),
             max_slots=int(max_slots),
         )
         banks: list[OutputBank] = []
@@ -304,7 +323,73 @@ class PackingPlanner:
             source_packing=packing,
             boundary_actions=("insert_extract", "validate_relu_safe") if bool(use_real_imag_hybrid) else ("keep_layout", "validate_relu_safe"),
             relu_safe_boundary=True,
+            strategy=strategy,
         )
+
+    @staticmethod
+    def source_h_range_for_target(
+        *,
+        target_h_start: int,
+        target_h_end: int,
+        input_h: int,
+        kernel: int,
+        stride: int,
+        pad: int,
+    ) -> tuple[int, int]:
+        if int(target_h_end) <= int(target_h_start):
+            raise ValueError("target H range must be non-empty")
+        source_start = int(target_h_start) * int(stride) - int(pad)
+        source_end = (int(target_h_end) - 1) * int(stride) - int(pad) + int(kernel) - 1
+        return max(0, int(source_start)), min(int(input_h), int(source_end) + 1)
+
+    @staticmethod
+    def build_source_tiles_for_targets(
+        *,
+        target_tiles: Sequence[TargetTile],
+        c_in: int,
+        h_in: int,
+        w_in: int,
+        input_gap: int,
+        kernel: int,
+        stride: int,
+        pad: int,
+        max_slots: int,
+    ) -> tuple[SourceTile, ...]:
+        tiles: list[SourceTile] = []
+        for target_tile in target_tiles:
+            h0, h1 = PackingPlanner.source_h_range_for_target(
+                target_h_start=int(target_tile.h_start),
+                target_h_end=int(target_tile.h_end),
+                input_h=int(h_in),
+                kernel=int(kernel),
+                stride=int(stride),
+                pad=int(pad),
+            )
+            h_src = int(h1 - h0)
+            c_tile = 1
+            for candidate_c in range(1, int(c_in) + 1):
+                if packed_active_slots(candidate_c, int(h_src), int(w_in), int(input_gap)) > int(max_slots):
+                    break
+                c_tile = int(candidate_c)
+            if int(c_tile) <= 0:
+                raise ValueError("source tile exceeds max_slots")
+            for c0 in range(0, int(c_in), int(c_tile)):
+                c1 = min(int(c_in), int(c0 + c_tile))
+                source = SourceTile(
+                    tile_id=f"source_for_{target_tile.tile_id}_c{int(c0)}_{int(c1)}_h{int(h0)}_{int(h1)}",
+                    c_start=int(c0),
+                    c_end=int(c1),
+                    h_start=int(h0),
+                    h_end=int(h1),
+                    w=int(w_in),
+                    gap=int(input_gap),
+                    halo_top=max(0, int(target_tile.h_start) - int(h0)),
+                    halo_bottom=max(0, int(h1) - int(target_tile.h_end)),
+                )
+                if int(source.active_slots) > int(max_slots):
+                    raise ValueError("source tile exceeds max_slots")
+                tiles.append(source)
+        return tuple(tiles)
 
 
 @dataclass(frozen=True)

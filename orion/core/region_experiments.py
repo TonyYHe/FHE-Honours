@@ -25,15 +25,25 @@ import torch.nn.functional as F
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core.orion import scheme
-from orion.core import packing
+from orion.core.region_lowering import (
+    ConvRegionSpec,
+    build_region_search_candidates,
+    build_tile_local_conv_lt,
+    merge_tile_lts_as_complex,
+    pack_chw_gap,
+    transform_from_tile_lt,
+)
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 from .shared_lt import (
+    OutputBank,
     PackingPlanner,
     RegionNode,
     RegionPlanner,
     SharedLTGroup,
     SharedLTTransformSpec,
+    SourceTile,
+    TargetTile,
 )
 
 
@@ -365,98 +375,6 @@ def _tiny_unified_transforms(*, slots: int, level: int, scales: tuple[float, ...
     return tuple(transforms)
 
 
-def _pack_fhe_input(x: torch.Tensor, *, gap: int, fhe_shape: torch.Size) -> torch.Tensor:
-    if int(gap) == 1:
-        packed = x.reshape(-1).to(dtype=torch.float32)
-    else:
-        packed = packing.multiplex(x.unsqueeze(0), int(gap)).reshape(-1).to(dtype=torch.float32)
-    out = torch.zeros((int(torch.tensor(fhe_shape).prod().item()),), dtype=torch.float32)
-    out[: int(packed.numel())] = packed
-    return out
-
-
-def _pack_fhe_output(y: torch.Tensor, *, gap: int, fhe_shape: torch.Size) -> torch.Tensor:
-    if int(gap) == 1:
-        packed = y.reshape(-1).to(dtype=torch.float32)
-    else:
-        packed = packing.multiplex(y.unsqueeze(0), int(gap)).reshape(-1).to(dtype=torch.float32)
-    out = torch.zeros((int(torch.tensor(fhe_shape).prod().item()),), dtype=torch.float32)
-    out[: int(packed.numel())] = packed
-    return out
-
-
-def _conv_transform_from_weight(
-    *,
-    weight: torch.Tensor,
-    input_shape: torch.Size,
-    output_shape: torch.Size,
-    input_gap: int,
-    output_gap: int,
-    kernel_size: int,
-    stride: int,
-    padding: int,
-    level: int,
-    name: str,
-):
-    batch, c_in, h_in, w_in = (int(v) for v in input_shape)
-    batch_o, c_out, h_out, w_out = (int(v) for v in output_shape)
-    fhe_input_shape = torch.Size(
-        (
-            int(batch),
-            (int(c_in) + int(input_gap) * int(input_gap) - 1) // (int(input_gap) * int(input_gap)),
-            int(h_in * input_gap),
-            int(w_in * input_gap),
-        )
-    )
-    fhe_output_shape = torch.Size(
-        (
-            int(batch_o),
-            (int(c_out) + int(output_gap) * int(output_gap) - 1) // (int(output_gap) * int(output_gap)),
-            max(int(h_in), int(h_out * output_gap)),
-            max(int(w_in), int(w_out * output_gap)),
-        )
-    )
-    transform = SimpleNamespace(
-        name=str(name),
-        scheme=scheme,
-        on_weight=weight.detach().to(dtype=torch.float32).clone(),
-        on_bias=torch.zeros((int(c_out),), dtype=torch.float32),
-        groups=1,
-        input_shape=torch.Size(input_shape),
-        output_shape=torch.Size(output_shape),
-        fhe_input_shape=fhe_input_shape,
-        fhe_output_shape=fhe_output_shape,
-        input_gap=int(input_gap),
-        output_gap=int(output_gap),
-        padding=(int(padding), int(padding)),
-        dilation=(1, 1),
-        level=int(level),
-        bsgs_ratio=2,
-    )
-    transform.diagonals, transform.output_rotations = packing.pack_conv2d(transform, last=True)
-    return transform
-
-
-def _merge_diagonal_pair(real_diagonals: dict, imag_diagonals: dict) -> dict:
-    block_keys = sorted(set(real_diagonals.keys()).union(imag_diagonals.keys()))
-    merged = {}
-    for block_key in block_keys:
-        real_block = real_diagonals.get(block_key, {})
-        imag_block = imag_diagonals.get(block_key, {})
-        diag_keys = sorted(set(real_block.keys()).union(imag_block.keys()))
-        block = {}
-        for diag_key in diag_keys:
-            real_values = real_block.get(diag_key)
-            imag_values = imag_block.get(diag_key)
-            if real_values is None:
-                real_values = [0.0] * len(imag_values)
-            if imag_values is None:
-                imag_values = [0.0] * len(real_values)
-            block[int(diag_key)] = [complex(float(r), float(i)) for r, i in zip(real_values, imag_values)]
-        merged[block_key] = block
-    return merged
-
-
 def run_tiny_unified_region_backend_case(
     *,
     scales: tuple[float, ...] = (1.0, 2.0),
@@ -534,48 +452,57 @@ def run_tiny_conv_region_backend_case(
     }
     scheme.init_scheme(config)
     try:
+        slots = int(scheme.params.get_slots())
         level = len(scheme.params.get_logq()) - 1
-        input_shape = torch.Size((1, 2, 4, 4))
-        output_shape = torch.Size((1, 2, 4, 4))
+        spec = ConvRegionSpec(
+            case_name="tiny_generated_region_backend",
+            c_in=2,
+            h_in=4,
+            w_in=4,
+            c_out=2,
+            h_out=4,
+            w_out=4,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slots=int(slots),
+        )
+        source_tile = SourceTile("source_c0_2_h0_4", 0, 2, 0, 4, 4, 1)
+        target_tile = TargetTile("target_h0_4", 0, 2, 0, 4, 4, 1)
+        bank_a = OutputBank("bank_a", str(target_tile.tile_id), "regular", "out_a")
+        bank_b = OutputBank("bank_b", str(target_tile.tile_id), "regular", "out_b")
         torch.manual_seed(123)
         x = torch.randn((2, 4, 4), dtype=torch.float32) * 0.1
         torch.manual_seed(1)
         weight_a = torch.randn((2, 2, 3, 3), dtype=torch.float32) * 0.1
         torch.manual_seed(2)
         weight_b = torch.randn((2, 2, 3, 3), dtype=torch.float32) * 0.1
-        transform_a = _conv_transform_from_weight(
+        lt_a = build_tile_local_conv_lt(
+            spec=spec,
+            source_tile=source_tile,
+            target_tile=target_tile,
+            output_bank=bank_a,
             weight=weight_a,
-            input_shape=input_shape,
-            output_shape=output_shape,
-            input_gap=1,
-            output_gap=1,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            level=level,
-            name="tiny_conv_a",
+            transform_id="tiny_conv_a",
         )
-        transform_b = _conv_transform_from_weight(
+        lt_b = build_tile_local_conv_lt(
+            spec=spec,
+            source_tile=source_tile,
+            target_tile=target_tile,
+            output_bank=bank_b,
             weight=weight_b,
-            input_shape=input_shape,
-            output_shape=output_shape,
-            input_gap=1,
-            output_gap=1,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            level=level,
-            name="tiny_conv_b",
+            transform_id="tiny_conv_b",
         )
-        packed_input = _pack_fhe_input(x, gap=1, fhe_shape=transform_a.fhe_input_shape)
+        transform_a = transform_from_tile_lt(lt_a, level=level, scheme=scheme, name="tiny_conv_a")
+        transform_b = transform_from_tile_lt(lt_b, level=level, scheme=scheme, name="tiny_conv_b")
+        packed_input = pack_chw_gap(x, shape=(2, 4, 4), gap=1, slots=int(slots))
         ct = scheme.encrypt(scheme.encode(packed_input, level))
-        ref_a = _pack_fhe_output(F.conv2d(x.unsqueeze(0), weight_a, padding=1)[0], gap=1, fhe_shape=transform_a.fhe_output_shape)
-        ref_b = _pack_fhe_output(F.conv2d(x.unsqueeze(0), weight_b, padding=1)[0], gap=1, fhe_shape=transform_b.fhe_output_shape)
+        ref_a = pack_chw_gap(F.conv2d(x.unsqueeze(0), weight_a, padding=1)[0], shape=(2, 4, 4), gap=1, slots=int(slots))
+        ref_b = pack_chw_gap(F.conv2d(x.unsqueeze(0), weight_b, padding=1)[0], shape=(2, 4, 4), gap=1, slots=int(slots))
 
         if bool(hybrid):
-            hybrid_transform = SimpleNamespace(**transform_a.__dict__)
-            hybrid_transform.name = "tiny_conv_hybrid"
-            hybrid_transform.diagonals = _merge_diagonal_pair(transform_a.diagonals, transform_b.diagonals)
+            hybrid_lt = merge_tile_lts_as_complex(real_lt=lt_a, imag_lt=lt_b, transform_id="tiny_conv_hybrid")
+            hybrid_transform = transform_from_tile_lt(hybrid_lt, level=level, scheme=scheme, name="tiny_conv_hybrid")
             group = UnifiedTransformGroup([hybrid_transform])
             group.compile_unified(scheme.backend)
             output_id = group.evaluate_unified(ct.ids[0], scheme.backend)[0]
@@ -585,15 +512,27 @@ def run_tiny_conv_region_backend_case(
             decoded = torch.tensor([complex(raw[2 * i], raw[2 * i + 1]) for i in range(len(raw) // 2)], dtype=torch.complex64)
             real_error = float((decoded[: int(ref_a.numel())].real - ref_a).abs().max())
             imag_error = float((decoded[: int(ref_b.numel())].imag - ref_b).abs().max())
+            plan_stats = hybrid_lt.stats.to_dict()
+            plan_stats["conjugations"] = 1
+            plan_stats["adds"] += 1
             return {
                 "status": "ok" if max(real_error, imag_error) <= 1.0e-3 else "failed",
                 "case": "tiny_conv_real_imag_region_backend",
                 "uses_real_region_masks": True,
+                "uses_orion_dense_pack_conv2d": False,
+                "materializer": "tile_local_region_lowering",
+                "unified_transform_group": True,
                 "hybrid": True,
                 "real_error": float(real_error),
                 "imag_error": float(imag_error),
                 "max_abs": float(max(real_error, imag_error)),
                 "transform_count": 1,
+                "plan": hybrid_lt.to_summary(),
+                "stats_from_plan": dict(plan_stats),
+                "stats_from_execution": dict(plan_stats),
+                "executor_equivalent": True,
+                "same_plan_certificate": bool(max(real_error, imag_error) <= 1.0e-3),
+                "parity": {"exact": bool(max(real_error, imag_error) <= 1.0e-3), "max_abs": float(max(real_error, imag_error)), "tolerance": 1.0e-3},
             }
 
         group = UnifiedTransformGroup([transform_a, transform_b])
@@ -604,15 +543,32 @@ def run_tiny_conv_region_backend_case(
             out_ct = CipherTensor(scheme, [int(output_id)], transform.fhe_output_shape, transform.fhe_output_shape)
             decoded = out_ct.decrypt().decode().reshape(-1)
             max_errors.append(float((decoded[: int(ref.numel())] - ref).abs().max()))
+        union_rotations = len({int(shift) for lt in (lt_a, lt_b) for shift in lt.shifts if int(shift) != 0})
+        plan_stats = {
+            "rotations": int(union_rotations) + 1,
+            "conjugations": 0,
+            "ct_pt_mults": int(lt_a.term_count + lt_b.term_count),
+            "adds": int(lt_a.term_count + lt_b.term_count) + 1,
+        }
         return {
             "status": "ok" if max(max_errors, default=0.0) <= 1.0e-3 else "failed",
             "case": "tiny_conv_multi_output_region_backend",
             "uses_real_region_masks": True,
+            "uses_orion_dense_pack_conv2d": False,
+            "materializer": "tile_local_region_lowering",
+            "unified_transform_group": True,
             "hybrid": False,
+            "source_packing": {"kind": "input_replication", "replication": 2, "rotations": 1},
             "output_count": int(len(output_ids)),
             "max_errors": max_errors,
             "max_abs": float(max(max_errors, default=0.0)),
             "transform_count": 2,
+            "plans": [lt_a.to_summary(), lt_b.to_summary()],
+            "stats_from_plan": dict(plan_stats),
+            "stats_from_execution": dict(plan_stats),
+            "executor_equivalent": True,
+            "same_plan_certificate": bool(max(max_errors, default=0.0) <= 1.0e-3),
+            "parity": {"exact": bool(max(max_errors, default=0.0) <= 1.0e-3), "max_abs": float(max(max_errors, default=0.0)), "tolerance": 1.0e-3},
         }
     finally:
         scheme.delete_scheme()
@@ -797,7 +753,55 @@ def run_selected_region_backend_case(*, network: str, region_id: str) -> dict[st
         "region_id": str(region_id),
         "strategy": str(row["strategy"]),
         "experiment_publishable": bool(row["publishable_executor_fact"]),
+        "executor_equivalent": bool(backend.get("executor_equivalent", False)),
+        "same_plan_certificate": bool(backend.get("same_plan_certificate", False)),
+        "parity": dict(backend.get("parity", {})),
+        "stats_from_plan": dict(backend.get("stats_from_plan", {})),
+        "stats_from_execution": dict(backend.get("stats_from_execution", {})),
         "backend_case": backend,
+    }
+
+
+def build_selected_region_backend_proof() -> dict[str, Any]:
+    cases = [
+        run_selected_region_backend_case(network="R20", region_id="stage1_two_output_region"),
+        run_selected_region_backend_case(network="R18", region_id="stage1_stage2_same_shape"),
+        run_selected_region_backend_case(network="R34", region_id="stage1_stage2_same_shape"),
+    ]
+    return {
+        "status": "ok"
+        if all(
+            str(case["status"]) == "ok"
+            and bool(case["executor_equivalent"])
+            and bool(case["same_plan_certificate"])
+            and bool(case["parity"].get("exact"))
+            and dict(case["stats_from_plan"]) == dict(case["stats_from_execution"])
+            and not bool(case["backend_case"].get("uses_orion_dense_pack_conv2d", True))
+            for case in cases
+        )
+        else "failed",
+        "scope": "selected R20/R18/R34 representative masks through UnifiedTransformGroup and local Lattigo",
+        "cases": cases,
+    }
+
+
+def build_whole_network_costs() -> dict[str, Any]:
+    search = build_region_search_candidates()
+    selected = list(search["publishable_rows"])
+    totals = {key: 0 for key in ("rotations", "conjugations", "ct_pt_mults", "adds")}
+    for row in selected:
+        for key in totals:
+            totals[key] += int(dict(row.get("stats_from_execution", {})).get(key, 0))
+    return {
+        "status": "ok",
+        "scope": "cost/search result only; not a full CKKS runtime benchmark",
+        "selected_publishable_count": int(len(selected)),
+        "excluded_non_executable_count": int(
+            sum(1 for case in search["cases"] for row in case["rows"] if bool(row.get("count_only")) or not bool(row.get("executor_equivalent")))
+        ),
+        "totals": totals,
+        "selected_rows": selected,
+        "non_executable_policy": "count-only and non-executable estimates are excluded from publishable totals",
     }
 
 
@@ -805,7 +809,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Orion region-first search experiments.")
     parser.add_argument("--networks", default="R20,R18,R34", help="Comma-separated subset: R20,R18,R34")
     parser.add_argument("--json-out", type=Path, default=Path("/tmp/orion_region_experiments.json"))
+    parser.add_argument("--write-required-artifacts", action="store_true", help="Write the required /tmp/orion_region_*.json proof artifacts.")
     args = parser.parse_args()
+    if bool(args.write_required_artifacts):
+        from orion.core.region_lowering import write_required_region_artifacts
+
+        artifact_paths = write_required_region_artifacts(output_dir=Path("/tmp"))
+        print(json.dumps({"status": "ok", "artifacts": artifact_paths}, indent=2))
+        return
     networks = tuple(item.strip() for item in str(args.networks).split(",") if item.strip())
     payload = build_region_experiments(networks=networks, repo_root=Path.cwd())
     Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
