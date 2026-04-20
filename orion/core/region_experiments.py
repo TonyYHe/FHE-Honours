@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 import torch
+import torch.nn.functional as F
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core.orion import scheme
+from orion.core import packing
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 from .shared_lt import (
@@ -363,6 +365,98 @@ def _tiny_unified_transforms(*, slots: int, level: int, scales: tuple[float, ...
     return tuple(transforms)
 
 
+def _pack_fhe_input(x: torch.Tensor, *, gap: int, fhe_shape: torch.Size) -> torch.Tensor:
+    if int(gap) == 1:
+        packed = x.reshape(-1).to(dtype=torch.float32)
+    else:
+        packed = packing.multiplex(x.unsqueeze(0), int(gap)).reshape(-1).to(dtype=torch.float32)
+    out = torch.zeros((int(torch.tensor(fhe_shape).prod().item()),), dtype=torch.float32)
+    out[: int(packed.numel())] = packed
+    return out
+
+
+def _pack_fhe_output(y: torch.Tensor, *, gap: int, fhe_shape: torch.Size) -> torch.Tensor:
+    if int(gap) == 1:
+        packed = y.reshape(-1).to(dtype=torch.float32)
+    else:
+        packed = packing.multiplex(y.unsqueeze(0), int(gap)).reshape(-1).to(dtype=torch.float32)
+    out = torch.zeros((int(torch.tensor(fhe_shape).prod().item()),), dtype=torch.float32)
+    out[: int(packed.numel())] = packed
+    return out
+
+
+def _conv_transform_from_weight(
+    *,
+    weight: torch.Tensor,
+    input_shape: torch.Size,
+    output_shape: torch.Size,
+    input_gap: int,
+    output_gap: int,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    level: int,
+    name: str,
+):
+    batch, c_in, h_in, w_in = (int(v) for v in input_shape)
+    batch_o, c_out, h_out, w_out = (int(v) for v in output_shape)
+    fhe_input_shape = torch.Size(
+        (
+            int(batch),
+            (int(c_in) + int(input_gap) * int(input_gap) - 1) // (int(input_gap) * int(input_gap)),
+            int(h_in * input_gap),
+            int(w_in * input_gap),
+        )
+    )
+    fhe_output_shape = torch.Size(
+        (
+            int(batch_o),
+            (int(c_out) + int(output_gap) * int(output_gap) - 1) // (int(output_gap) * int(output_gap)),
+            max(int(h_in), int(h_out * output_gap)),
+            max(int(w_in), int(w_out * output_gap)),
+        )
+    )
+    transform = SimpleNamespace(
+        name=str(name),
+        scheme=scheme,
+        on_weight=weight.detach().to(dtype=torch.float32).clone(),
+        on_bias=torch.zeros((int(c_out),), dtype=torch.float32),
+        groups=1,
+        input_shape=torch.Size(input_shape),
+        output_shape=torch.Size(output_shape),
+        fhe_input_shape=fhe_input_shape,
+        fhe_output_shape=fhe_output_shape,
+        input_gap=int(input_gap),
+        output_gap=int(output_gap),
+        padding=(int(padding), int(padding)),
+        dilation=(1, 1),
+        level=int(level),
+        bsgs_ratio=2,
+    )
+    transform.diagonals, transform.output_rotations = packing.pack_conv2d(transform, last=True)
+    return transform
+
+
+def _merge_diagonal_pair(real_diagonals: dict, imag_diagonals: dict) -> dict:
+    block_keys = sorted(set(real_diagonals.keys()).union(imag_diagonals.keys()))
+    merged = {}
+    for block_key in block_keys:
+        real_block = real_diagonals.get(block_key, {})
+        imag_block = imag_diagonals.get(block_key, {})
+        diag_keys = sorted(set(real_block.keys()).union(imag_block.keys()))
+        block = {}
+        for diag_key in diag_keys:
+            real_values = real_block.get(diag_key)
+            imag_values = imag_block.get(diag_key)
+            if real_values is None:
+                real_values = [0.0] * len(imag_values)
+            if imag_values is None:
+                imag_values = [0.0] * len(real_values)
+            block[int(diag_key)] = [complex(float(r), float(i)) for r, i in zip(real_values, imag_values)]
+        merged[block_key] = block
+    return merged
+
+
 def run_tiny_unified_region_backend_case(
     *,
     scales: tuple[float, ...] = (1.0, 2.0),
@@ -410,6 +504,115 @@ def run_tiny_unified_region_backend_case(
             "output_count": int(len(output_ids)),
             "max_errors": max_errors,
             "max_abs": float(max(max_errors, default=0.0)),
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def run_tiny_conv_region_backend_case(
+    *,
+    hybrid: bool,
+    logn: int = 12,
+) -> dict[str, Any]:
+    config = {
+        "ckks_params": {
+            "LogN": int(logn),
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        level = len(scheme.params.get_logq()) - 1
+        input_shape = torch.Size((1, 2, 4, 4))
+        output_shape = torch.Size((1, 2, 4, 4))
+        torch.manual_seed(123)
+        x = torch.randn((2, 4, 4), dtype=torch.float32) * 0.1
+        torch.manual_seed(1)
+        weight_a = torch.randn((2, 2, 3, 3), dtype=torch.float32) * 0.1
+        torch.manual_seed(2)
+        weight_b = torch.randn((2, 2, 3, 3), dtype=torch.float32) * 0.1
+        transform_a = _conv_transform_from_weight(
+            weight=weight_a,
+            input_shape=input_shape,
+            output_shape=output_shape,
+            input_gap=1,
+            output_gap=1,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            level=level,
+            name="tiny_conv_a",
+        )
+        transform_b = _conv_transform_from_weight(
+            weight=weight_b,
+            input_shape=input_shape,
+            output_shape=output_shape,
+            input_gap=1,
+            output_gap=1,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            level=level,
+            name="tiny_conv_b",
+        )
+        packed_input = _pack_fhe_input(x, gap=1, fhe_shape=transform_a.fhe_input_shape)
+        ct = scheme.encrypt(scheme.encode(packed_input, level))
+        ref_a = _pack_fhe_output(F.conv2d(x.unsqueeze(0), weight_a, padding=1)[0], gap=1, fhe_shape=transform_a.fhe_output_shape)
+        ref_b = _pack_fhe_output(F.conv2d(x.unsqueeze(0), weight_b, padding=1)[0], gap=1, fhe_shape=transform_b.fhe_output_shape)
+
+        if bool(hybrid):
+            hybrid_transform = SimpleNamespace(**transform_a.__dict__)
+            hybrid_transform.name = "tiny_conv_hybrid"
+            hybrid_transform.diagonals = _merge_diagonal_pair(transform_a.diagonals, transform_b.diagonals)
+            group = UnifiedTransformGroup([hybrid_transform])
+            group.compile_unified(scheme.backend)
+            output_id = group.evaluate_unified(ct.ids[0], scheme.backend)[0]
+            out_ct = CipherTensor(scheme, [int(output_id)], transform_a.fhe_output_shape, transform_a.fhe_output_shape)
+            out_pt = out_ct.decrypt()
+            raw = scheme.backend.DecodeComplex(out_pt.ids[0])
+            decoded = torch.tensor([complex(raw[2 * i], raw[2 * i + 1]) for i in range(len(raw) // 2)], dtype=torch.complex64)
+            real_error = float((decoded[: int(ref_a.numel())].real - ref_a).abs().max())
+            imag_error = float((decoded[: int(ref_b.numel())].imag - ref_b).abs().max())
+            return {
+                "status": "ok" if max(real_error, imag_error) <= 1.0e-3 else "failed",
+                "case": "tiny_conv_real_imag_region_backend",
+                "uses_real_region_masks": True,
+                "hybrid": True,
+                "real_error": float(real_error),
+                "imag_error": float(imag_error),
+                "max_abs": float(max(real_error, imag_error)),
+                "transform_count": 1,
+            }
+
+        group = UnifiedTransformGroup([transform_a, transform_b])
+        group.compile_unified(scheme.backend)
+        output_ids = group.evaluate_unified(ct.ids[0], scheme.backend)
+        max_errors = []
+        for ref, output_id, transform in zip((ref_a, ref_b), output_ids, (transform_a, transform_b)):
+            out_ct = CipherTensor(scheme, [int(output_id)], transform.fhe_output_shape, transform.fhe_output_shape)
+            decoded = out_ct.decrypt().decode().reshape(-1)
+            max_errors.append(float((decoded[: int(ref.numel())] - ref).abs().max()))
+        return {
+            "status": "ok" if max(max_errors, default=0.0) <= 1.0e-3 else "failed",
+            "case": "tiny_conv_multi_output_region_backend",
+            "uses_real_region_masks": True,
+            "hybrid": False,
+            "output_count": int(len(output_ids)),
+            "max_errors": max_errors,
+            "max_abs": float(max(max_errors, default=0.0)),
+            "transform_count": 2,
         }
     finally:
         scheme.delete_scheme()
@@ -583,9 +786,9 @@ def run_selected_region_backend_case(*, network: str, region_id: str) -> dict[st
         raise ValueError(f"unknown region experiment {network}:{region_id}")
     row = matches[0]
     if str(row["strategy"]) == "input_mult_output_fold":
-        backend = run_tiny_unified_region_backend_case(scales=(1.0, 2.0))
+        backend = run_tiny_conv_region_backend_case(hybrid=False)
     elif "real_imag_hybrid" in str(row["strategy"]):
-        backend = run_tiny_real_imag_hybrid_backend_case()
+        backend = run_tiny_conv_region_backend_case(hybrid=True)
     else:
         raise ValueError(f"unsupported backend smoke for strategy {row['strategy']}")
     return {

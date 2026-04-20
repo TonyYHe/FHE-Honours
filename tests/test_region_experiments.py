@@ -93,8 +93,14 @@ def test_tiny_real_imag_hybrid_backend_case_runs_with_conjugate_binding() -> Non
 def test_selected_region_backend_cases_use_unified_transform_group() -> None:
     r20 = run_selected_region_backend_case(network="R20", region_id="stage1_two_output_region")
     r18 = run_selected_region_backend_case(network="R18", region_id="stage1_stage2_same_shape")
+    r34 = run_selected_region_backend_case(network="R34", region_id="stage1_stage2_same_shape")
 
     assert r20["status"] == "ok"
     assert r20["backend_case"]["output_count"] == 2
+    assert r20["backend_case"]["uses_real_region_masks"] is True
     assert r18["status"] == "ok"
-    assert r18["backend_case"]["conjugate_available"] is True
+    assert r18["backend_case"]["uses_real_region_masks"] is True
+    assert r18["backend_case"]["hybrid"] is True
+    assert r34["status"] == "ok"
+    assert r34["backend_case"]["uses_real_region_masks"] is True
+    assert r34["backend_case"]["hybrid"] is True
