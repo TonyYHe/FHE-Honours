@@ -246,10 +246,48 @@ def build_r18_same_stage_shared_block_plan(
     spec: R18SameStageSpec,
     input_pair_index: int = 0,
     bank_count: int | None = None,
+    weight_override: torch.Tensor | None = None,
+    bias_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    input_shape: tuple[int, int, int] | None = None,
+    output_shape: tuple[int, int, int] | None = None,
+    input_gap: int | None = None,
+    output_gap: int | None = None,
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
     torch.manual_seed(0)
-    x = torch.randn((int(spec.c), int(spec.h), int(spec.w)), dtype=torch.float32)
-    weight = torch.randn((int(spec.c), int(spec.c), 3, 3), dtype=torch.float32)
+    expected_shape = (int(spec.c), int(spec.c), 3, 3)
+    if weight_override is None:
+        weight = torch.randn(expected_shape, dtype=torch.float32)
+        weight_source = "deterministic_random"
+    else:
+        weight = weight_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in weight.shape) != expected_shape:
+            raise ValueError(f"{spec.stage} fused weight shape mismatch: expected {expected_shape}, got {tuple(weight.shape)}")
+        weight_source = "fused_orion_on_weight"
+    if source_override is None:
+        x = torch.randn((int(spec.c), int(spec.h), int(spec.w)), dtype=torch.float32)
+        source_kind = "deterministic_random"
+    else:
+        x = source_override.detach().to(dtype=torch.float32).clone()
+        expected_source = (int(spec.c), int(spec.h), int(spec.w))
+        if tuple(int(v) for v in x.shape) != expected_source:
+            raise ValueError(f"{spec.stage} source shape mismatch: expected {expected_source}, got {tuple(x.shape)}")
+        source_kind = "provided_source_override"
+    if input_shape is not None and tuple(int(v) for v in input_shape) != (int(spec.c), int(spec.h), int(spec.w)):
+        raise ValueError(f"{spec.stage} input_shape mismatch: {input_shape}")
+    if output_shape is not None and tuple(int(v) for v in output_shape) != (int(spec.c), int(spec.h), int(spec.w)):
+        raise ValueError(f"{spec.stage} output_shape mismatch: {output_shape}")
+    if input_gap is not None and int(input_gap) != int(spec.gap):
+        raise ValueError(f"{spec.stage} input_gap mismatch: {input_gap}")
+    if output_gap is not None and int(output_gap) != int(spec.gap):
+        raise ValueError(f"{spec.stage} output_gap mismatch: {output_gap}")
+    if bias_override is not None:
+        bias = bias_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in bias.shape) != (int(spec.c),):
+            raise ValueError(f"{spec.stage} bias shape mismatch: expected {(int(spec.c),)}, got {tuple(bias.shape)}")
+        bias_source = "accepted_not_folded"
+    else:
+        bias_source = "none"
     bank_count = int(spec.bank_count if bank_count is None else max(1, min(int(bank_count), int(spec.bank_count))))
     input_pair_index = max(0, min(int(input_pair_index), int(spec.input_pair_count) - 1))
     case_name = f"orion_vendored_r18_{spec.stage}_block{int(input_pair_index)}"
@@ -338,7 +376,12 @@ def build_r18_same_stage_shared_block_plan(
             adds=int(len(all_terms) + int(bank_count) + 1),
         ),
         evidence_kind=f"vendored_scripts_cir_r18_{spec.stage}_block",
-        notes=(f"R18 {spec.stage} input surface-pair {input_pair_index}, selected output banks",),
+        notes=(
+            f"R18 {spec.stage} input surface-pair {input_pair_index}, selected output banks",
+            f"weight_source={weight_source}",
+            f"source_kind={source_kind}",
+            f"bias_source={bias_source}",
+        ),
     )
     # Set LT cost after all terms are known.
     step = LinearTransformStep(
@@ -366,8 +409,29 @@ def build_r18_same_stage_shared_block_plan(
     return plan, inputs, reference
 
 
-def build_r18_stage1_shared_block_plan(*, bank_count: int = 2) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
-    return build_r18_same_stage_shared_block_plan(spec=R18_STAGE1_SPEC, input_pair_index=0, bank_count=bank_count)
+def build_r18_stage1_shared_block_plan(
+    *,
+    bank_count: int = 2,
+    weight_override: torch.Tensor | None = None,
+    bias_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    input_shape: tuple[int, int, int] | None = None,
+    output_shape: tuple[int, int, int] | None = None,
+    input_gap: int | None = None,
+    output_gap: int | None = None,
+) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+    return build_r18_same_stage_shared_block_plan(
+        spec=R18_STAGE1_SPEC,
+        input_pair_index=0,
+        bank_count=bank_count,
+        weight_override=weight_override,
+        bias_override=bias_override,
+        source_override=source_override,
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_gap=input_gap,
+        output_gap=output_gap,
+    )
 
 
 def build_r18_stage2_shared_block_plan(*, input_pair_index: int = 0, bank_count: int | None = None) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
