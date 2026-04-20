@@ -388,6 +388,7 @@ class FullConvRegionRuntimeExecutor:
                 raise RuntimeError(f"missing region-first output bank {bank_index}")
             real = (ct + ct.conjugate(in_place=False)) * 0.5
             real = self._add_bias(real, bank_index=int(bank_index))
+            real.set_scale(int(scheme.params.get_default_scale()))
             real_ids.append(int(real.ids[0]))
             # Transfer ownership of the produced ciphertext id to the assembled
             # multi-bank CipherTensor returned below.

@@ -242,6 +242,7 @@ def test_full_conv_region_executor_pairs_sources_and_assembles_output(monkeypatc
         assert len(out.ids) == 2
         assert out.shape == torch.Size([1, 256, 16, 16])
         assert out.on_shape == torch.Size([1, 16, 64, 64])
+        assert out.scale() == scheme.params.get_default_scale()
         assert tuple(out.decrypt().decode().shape) == (1, 16, 64, 64)
         assert executor.compile_count == 1
         assert executor.block_evaluate_count == 1
