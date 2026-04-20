@@ -274,6 +274,8 @@ class FullConvRegionRuntimeExecutor:
         self.transforms_by_block: list[list[Any]] = []
         self.compile_count = 0
         self.block_evaluate_count = 0
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
 
     @property
     def bank_count(self) -> int:
@@ -295,7 +297,7 @@ class FullConvRegionRuntimeExecutor:
         self._ensure_plans()
         from orion.nn.unified_transform import UnifiedTransformGroup
 
-        level = len(scheme.params.get_logq()) - 1
+        level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
         for plan in self.plans:
             transforms, _bank_ids = transforms_from_conv_scheme_plan(
                 plan,
@@ -471,6 +473,10 @@ class RegionFirstRuntimeGroup:
     def compile(self, scheme: Any | None = None) -> None:
         if self.executable and self.executor is None:
             raise RuntimeError(f"region {self.region_id} is executable but has no executor")
+        if self.executor is not None and hasattr(self.executor, "assigned_level") and hasattr(self, "assigned_level"):
+            self.executor.assigned_level = getattr(self, "assigned_level")
+        if self.executor is not None and hasattr(self.executor, "assigned_depth") and hasattr(self, "assigned_depth"):
+            self.executor.assigned_depth = getattr(self, "assigned_depth")
         if self.executor is not None and scheme is not None and hasattr(self.executor, "compile"):
             self.executor.compile(scheme)
         self.compiled = True
@@ -486,6 +492,10 @@ class RegionFirstRuntimeGroup:
             raise RuntimeError(f"region {self.region_id} is not executable: {self.fallback_reason}")
         self.execute_count += 1
         if self.executor is not None:
+            if hasattr(self.executor, "assigned_level") and hasattr(self, "assigned_level"):
+                self.executor.assigned_level = getattr(self, "assigned_level")
+            if hasattr(self.executor, "assigned_depth") and hasattr(self, "assigned_depth"):
+                self.executor.assigned_depth = getattr(self, "assigned_depth")
             outputs = self.executor(source_ct)
         else:
             raise RuntimeError(f"region {self.region_id} is executable but has no executor")

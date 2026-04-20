@@ -246,6 +246,12 @@ class Conv2d(LinearTransform):
             return
         runtime = getattr(self, "region_runtime", None)
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
+            runtime.assigned_level = int(self.level)
+            runtime.assigned_depth = int(self.depth or 0)
+            if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_level"):
+                runtime.executor.assigned_level = int(self.level)
+            if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_depth"):
+                runtime.executor.assigned_depth = int(self.depth or 0)
             if not bool(getattr(self, "region_first_probe_lazy_region_compile", False)):
                 runtime.compile(self.scheme)
             self.transform_ids = {}

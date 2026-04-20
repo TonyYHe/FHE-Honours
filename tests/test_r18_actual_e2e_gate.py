@@ -184,6 +184,23 @@ def test_r18_e2e_probe_bypasses_only_stem_relu_in_he_mode() -> None:
     assert net.act(sentinel) is sentinel
 
 
+def test_r18_e2e_compile_records_assigned_region_level() -> None:
+    conv = on.Conv2d(1, 1, 3, padding=1, bias=False)
+    group = RegionFirstCompileRegistry.for_r18_tiny_e2e(_prepared_r18_tiny_dag()[1]).groups[0]
+    conv.region_runtime = group
+    conv.region_first_skip_dense_pack = True
+    conv.region_first_probe_lazy_region_compile = True
+    conv.level = 6
+    conv.depth = 2
+    conv.scheme = SimpleNamespace()
+
+    conv.compile()
+
+    assert getattr(group, "assigned_level") == 6
+    assert getattr(group, "assigned_depth") == 2
+    assert getattr(group.executor, "assigned_level") == 6
+
+
 def test_full_conv_region_executor_pairs_sources_and_assembles_output(monkeypatch) -> None:
     _require_lattigo()
 
