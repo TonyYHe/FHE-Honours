@@ -282,6 +282,8 @@ class ReLU(Module):
     
     @timer
     def forward(self, x):
+        if self.he_mode and bool(getattr(self, "region_first_probe_activation_bypass", False)):
+            return x
         x = self.mult1(x, self.prescale)
         x = self.mult2(x, self.sign(x))
         x *= self.postscale # integer mult, no level consumed

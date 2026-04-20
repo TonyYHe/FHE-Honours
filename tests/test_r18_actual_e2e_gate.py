@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -163,6 +164,24 @@ def test_r18_e2e_probe_marks_dense_fallback_bypass_nodes() -> None:
     for group in registry.groups:
         module = dag.nodes[group.conv_nodes[0]]["module"]
         assert getattr(module, "region_first_probe_lazy_region_compile") is True
+
+
+def test_r18_e2e_probe_bypasses_only_stem_relu_in_he_mode() -> None:
+    net = ResNet18(dataset="tiny", activation="silu", silu_degree=7, stem_relu=True)
+    traced = OrionTracer().trace_model(net)
+    StatsTracker(traced).propagate(torch.randn((1, 3, 64, 64), dtype=torch.float32))
+    dag = NetworkDAG(traced)
+    dag.build_dag()
+    registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(dag)
+
+    bypassed = registry.attach_probe_stem_activation_bypass(net)
+
+    assert bypassed == [{"node": "act", "module": "ReLU", "reason": "probe_only_skip_stem_relu"}]
+    assert getattr(net.act, "region_first_probe_activation_bypass") is True
+    sentinel = object()
+    net.act.he_mode = True
+    net.act.scheme = SimpleNamespace(params=SimpleNamespace(get_debug_status=lambda: False))
+    assert net.act(sentinel) is sentinel
 
 
 def test_full_conv_region_executor_pairs_sources_and_assembles_output(monkeypatch) -> None:

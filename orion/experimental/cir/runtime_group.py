@@ -964,6 +964,22 @@ class RegionFirstCompileRegistry:
             )
         return bypassed
 
+    def attach_probe_stem_activation_bypass(self, net: Any) -> list[dict[str, str]]:
+        from orion.nn.activation import ReLU
+
+        stem_act = getattr(net, "act", None)
+        if not isinstance(stem_act, ReLU):
+            return []
+        stem_act.region_first_probe_activation_bypass = True
+        stem_act.region_first_probe_reason = "probe_only_skip_stem_relu"
+        return [
+            {
+                "node": "act",
+                "module": type(stem_act).__name__,
+                "reason": "probe_only_skip_stem_relu",
+            }
+        ]
+
 
 def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
     started = time.time()

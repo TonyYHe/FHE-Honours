@@ -246,6 +246,7 @@ class Scheme:
             self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
             if self.params.get_experimental_region_first() == "r18_tiny_e2e_probe":
                 self.region_first_attach_audit["probe_dense_bypass"] = self.region_first_registry.attach_probe_dense_bypass_to_dag(network_dag)
+                self.region_first_attach_audit["probe_stem_activation_bypass"] = self.region_first_registry.attach_probe_stem_activation_bypass(net)
                 self.region_first_attach_audit["probe_publishable"] = False
 
         #---------------------------------------------#
