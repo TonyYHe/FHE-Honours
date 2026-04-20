@@ -58,3 +58,4 @@ def test_r18_tiny_region_first_e2e_report_has_claim_hygiene_and_depth_audit() ->
     assert payload["bootstrap_audit"]["region_depths"]["stage4"]["depth"] == 3
     for group in payload["region_first"]["groups"]:
         assert "insert_extract_before_relu_or_add" in group["boundary_actions"]
+    assert payload["region_first"]["groups"][0]["executor_attached"] is True

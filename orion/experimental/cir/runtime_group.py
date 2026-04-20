@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 import json
 import time
@@ -23,6 +24,87 @@ from .lattigo_block import build_r18_stage1_shared_block_plan
 
 
 DEFAULT_R18_TINY_E2E_OUT = Path("/tmp/orion_r18_tiny_region_first_e2e.json")
+
+
+def transforms_from_conv_scheme_plan(plan: Any, *, level: int, scheme: Any, bank_count: int | None = None) -> tuple[list[Any], list[str]]:
+    if len(plan.linear_transform_steps) != 1:
+        raise ValueError("RegionFirstRuntimeGroup expects one collapsed SharedMultiOutput LT step")
+    step = plan.linear_transform_steps[0]
+    prepared = {str(plain.plaintext_id): plain for plain in plan.prepared_plaintexts}
+    templates = {str(entry.template_id): entry for family in plan.family_templates for entry in family.template_entries}
+    slots = int(plan.ring_slot_count)
+    selected_banks = tuple(step.shared_output_banks[: int(bank_count or len(step.shared_output_banks))])
+    transforms: list[Any] = []
+    bank_ids: list[str] = []
+    for bank in selected_banks:
+        bank_id = str(bank.bank_id)
+        diag_tensors: dict[int, torch.Tensor] = {}
+        terms = [term for term in step.terms if str(getattr(term, "bank_id", "")) == bank_id]
+        if len(terms) != int(bank.term_count):
+            raise ValueError(f"bank {bank_id} expected {bank.term_count} terms, got {len(terms)}")
+        for term in terms:
+            template = templates[str(term.template_id)]
+            plaintext = prepared[str(term.plaintext_id)]
+            mapped_source_indices = template.indices.to(dtype=torch.int64).index_select(0, term.lookup_indices.to(dtype=torch.int64))
+            output_indices = term.output_slot_indices.to(dtype=torch.int64)
+            if not bool(torch.equal(mapped_source_indices, output_indices)):
+                raise ValueError(f"term {term.term_id} cannot be encoded as one dense Orion diagonal")
+            values = plaintext.values.to(dtype=torch.complex64)
+            diag_index = (-int(term.shift)) % int(slots)
+            diag = diag_tensors.setdefault(int(diag_index), torch.zeros((int(slots),), dtype=torch.complex64))
+            diag.index_add_(0, output_indices, values)
+        transforms.append(
+            SimpleNamespace(
+                name=f"{plan.case_name}_{bank_id}",
+                diagonals={(0, 0): {int(index): diag.tolist() for index, diag in sorted(diag_tensors.items())}},
+                level=int(level),
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, int(slots)]),
+                output_shape=torch.Size([1, int(slots)]),
+                bank_id=bank_id,
+            )
+        )
+        bank_ids.append(bank_id)
+    return transforms, bank_ids
+
+
+class Stage1RuntimeExecutor:
+    def __init__(self, *, plan: Any, output_node_ids: tuple[str, ...]) -> None:
+        self.plan = plan
+        self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.group = None
+        self.transforms: list[Any] = []
+        self.bank_ids: list[str] = []
+        self.compile_count = 0
+
+    def compile(self, scheme: Any) -> None:
+        if self.group is not None:
+            return
+        from orion.nn.unified_transform import UnifiedTransformGroup
+
+        level = len(scheme.params.get_logq()) - 1
+        self.transforms, self.bank_ids = transforms_from_conv_scheme_plan(
+            self.plan,
+            level=int(level),
+            scheme=scheme,
+            bank_count=len(self.output_node_ids),
+        )
+        self.group = UnifiedTransformGroup(self.transforms)
+        self.group.compile_unified(scheme.backend)
+        self.compile_count += 1
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        from orion.backend.python.tensors import CipherTensor
+
+        scheme = source_ct.scheme
+        self.compile(scheme)
+        assert self.group is not None
+        output_ids = self.group.evaluate_unified(int(source_ct.ids[0]), scheme.backend)
+        outputs: dict[str, Any] = {}
+        for node_id, output_id in zip(self.output_node_ids, output_ids):
+            ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(self.plan.ring_slot_count)]), torch.Size([1, int(self.plan.ring_slot_count)]))
+            outputs[str(node_id)] = (ct + ct.conjugate(in_place=False)) * 0.5
+        return outputs
 
 
 def _replace_group(group: "RegionFirstRuntimeGroup", **updates: Any) -> "RegionFirstRuntimeGroup":
@@ -82,7 +164,8 @@ class RegionFirstRuntimeGroup:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload.pop("executor", None)
+        executor = payload.pop("executor", None)
+        payload["executor_attached"] = bool(executor is not None)
         payload.pop("plan", None)
         payload.pop("_cache_key", None)
         payload.pop("_cache_outputs", None)
@@ -93,6 +176,10 @@ class RegionFirstRuntimeGroup:
             self.output_node_ids = tuple(self.conv_nodes)
 
     def compile(self, scheme: Any | None = None) -> None:
+        if self.executable and self.executor is None:
+            raise RuntimeError(f"region {self.region_id} is executable but has no executor")
+        if self.executor is not None and scheme is not None and hasattr(self.executor, "compile"):
+            self.executor.compile(scheme)
         self.compiled = True
 
     def _source_key(self, source_ct: Any) -> tuple[int, ...]:
@@ -108,7 +195,7 @@ class RegionFirstRuntimeGroup:
         if self.executor is not None:
             outputs = self.executor(source_ct)
         else:
-            outputs = {node_id: source_ct for node_id in self.output_node_ids}
+            raise RuntimeError(f"region {self.region_id} is executable but has no executor")
         return dict(outputs)
 
     def output(self, output_node_id: str, source_ct: Any) -> Any:
@@ -161,6 +248,7 @@ def _stage1_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[
         fallback_reason="",
         plan=plan,
         fused_weight_count=len(modules),
+        executor=Stage1RuntimeExecutor(plan=plan, output_node_ids=group.conv_nodes),
     )
 
 
@@ -265,6 +353,7 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
             executable=bool(group.stage == "stage1"),
             fallback_reason="" if group.stage == "stage1" else group.fallback_reason,
             fused_weight_count=4 if group.stage == "stage1" else 0,
+            executor="stage1_runtime_executor_attached" if group.stage == "stage1" else None,
         )
         for group in groups
     )

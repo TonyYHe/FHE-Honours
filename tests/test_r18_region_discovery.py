@@ -50,6 +50,7 @@ def test_r18_compile_registry_marks_stage1_executable_with_fused_weights() -> No
         module = dag.nodes[item["node"]]["module"]
         assert getattr(module, "region_first_skip_dense_pack") is True
         assert getattr(module, "region_runtime").executable is True
+        assert getattr(module, "region_runtime").executor is not None
 
 
 def test_r18_region_discovery_depths_are_bootstrap_visible() -> None:

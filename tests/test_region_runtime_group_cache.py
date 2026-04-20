@@ -62,3 +62,27 @@ def test_region_runtime_group_rejects_non_executable_group() -> None:
         assert "missing_fused_weight_materializer" in str(exc)
     else:
         raise AssertionError("expected non-executable runtime group to raise")
+
+
+def test_executable_region_runtime_group_requires_executor() -> None:
+    group = RegionFirstRuntimeGroup(
+        region_id="r",
+        network="R18",
+        stage="stage1",
+        module_prefix="layers.0",
+        conv_nodes=("a",),
+        strategy="test",
+        materializer="test",
+        depth=2,
+        boundary_actions=(),
+        expected_stats={},
+        executable=True,
+        fallback_reason="",
+    )
+
+    try:
+        group.output("a", SimpleNamespace(ids=[1]))
+    except RuntimeError as exc:
+        assert "has no executor" in str(exc)
+    else:
+        raise AssertionError("expected executable group without executor to raise")
