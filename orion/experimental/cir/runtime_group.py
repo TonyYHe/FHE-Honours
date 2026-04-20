@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 import json
@@ -24,7 +24,7 @@ from .region_first_data import (
 DEFAULT_R18_TINY_E2E_OUT = Path("/tmp/orion_r18_tiny_region_first_e2e.json")
 
 
-@dataclass(frozen=True)
+@dataclass
 class RegionFirstRuntimeGroup:
     region_id: str
     network: str
@@ -38,9 +38,53 @@ class RegionFirstRuntimeGroup:
     expected_stats: dict[str, int]
     full_region: bool = True
     hidden_fallback: bool = False
+    executable: bool = False
+    fallback_reason: str = "materializer_does_not_accept_fused_weights"
+    output_node_ids: tuple[str, ...] = ()
+    executor: Any | None = None
+    compiled: bool = False
+    execute_count: int = 0
+    _cache_key: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    _cache_outputs: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("executor", None)
+        payload.pop("_cache_key", None)
+        payload.pop("_cache_outputs", None)
+        return payload
+
+    def __post_init__(self) -> None:
+        if not self.output_node_ids:
+            self.output_node_ids = tuple(self.conv_nodes)
+
+    def compile(self, scheme: Any | None = None) -> None:
+        self.compiled = True
+
+    def _source_key(self, source_ct: Any) -> tuple[int, ...]:
+        ids = getattr(source_ct, "ids", None)
+        if ids is None:
+            return (id(source_ct),)
+        return tuple(int(value) for value in ids)
+
+    def execute(self, source_ct: Any) -> dict[str, Any]:
+        if not bool(self.executable):
+            raise RuntimeError(f"region {self.region_id} is not executable: {self.fallback_reason}")
+        self.execute_count += 1
+        if self.executor is not None:
+            outputs = self.executor(source_ct)
+        else:
+            outputs = {node_id: source_ct for node_id in self.output_node_ids}
+        return dict(outputs)
+
+    def output(self, output_node_id: str, source_ct: Any) -> Any:
+        key = self._source_key(source_ct)
+        if self._cache_key != key:
+            self._cache_outputs = self.execute(source_ct)
+            self._cache_key = key
+        if str(output_node_id) not in self._cache_outputs:
+            raise KeyError(f"region {self.region_id} has no output bank {output_node_id!r}")
+        return self._cache_outputs[str(output_node_id)]
 
 
 def _r18_stage_references() -> dict[str, Any]:
@@ -51,12 +95,7 @@ def _r18_stage_references() -> dict[str, Any]:
     }
 
 
-def discover_r18_tiny_region_groups() -> tuple[RegionFirstRuntimeGroup, dict[str, Any]]:
-    torch.manual_seed(0)
-    net = ResNet18(dataset="tiny")
-    traced = OrionTracer().trace_model(net)
-    dag = NetworkDAG(traced)
-    dag.build_dag()
+def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str, Any]]:
     refs = _r18_stage_references()
     groups: list[RegionFirstRuntimeGroup] = []
     for stage_index, stage_name in enumerate(("stage1", "stage2", "stage3", "stage4")):
@@ -80,6 +119,8 @@ def discover_r18_tiny_region_groups() -> tuple[RegionFirstRuntimeGroup, dict[str
                 depth=int(depth),
                 boundary_actions=("insert_extract_before_relu_or_add", "validate_relu_safe"),
                 expected_stats=dict(ref.expected_stats),
+                executable=False,
+                fallback_reason="materializer_does_not_accept_fused_weights",
             )
         )
     graph_audit = {
@@ -91,9 +132,55 @@ def discover_r18_tiny_region_groups() -> tuple[RegionFirstRuntimeGroup, dict[str
     return tuple(groups), graph_audit
 
 
+def discover_r18_tiny_region_groups() -> tuple[RegionFirstRuntimeGroup, dict[str, Any]]:
+    torch.manual_seed(0)
+    net = ResNet18(dataset="tiny")
+    traced = OrionTracer().trace_model(net)
+    dag = NetworkDAG(traced)
+    dag.build_dag()
+    return _groups_from_dag(dag)
+
+
+@dataclass
+class RegionFirstCompileRegistry:
+    groups: tuple[RegionFirstRuntimeGroup, ...]
+    graph_audit: dict[str, Any]
+
+    @classmethod
+    def for_r18_tiny(cls, dag: NetworkDAG) -> "RegionFirstCompileRegistry":
+        groups, graph_audit = _groups_from_dag(dag)
+        return cls(groups=tuple(groups), graph_audit=dict(graph_audit))
+
+    def attach_to_dag(self, dag: NetworkDAG) -> dict[str, Any]:
+        attached: list[dict[str, Any]] = []
+        fallback_layers: list[dict[str, Any]] = []
+        group_by_node = {node: group for group in self.groups for node in group.conv_nodes}
+        for node, group in group_by_node.items():
+            if node not in dag.nodes:
+                continue
+            module = dag.nodes[node].get("module")
+            if module is None:
+                continue
+            module.region_runtime = group
+            module.region_output_id = str(node)
+            module.region_first_skip_dense_pack = bool(group.executable)
+            if bool(group.executable) and hasattr(module, "set_depth"):
+                module.set_depth(int(group.depth))
+            attached.append({"node": str(node), "stage": str(group.stage), "executable": bool(group.executable)})
+            if not bool(group.executable):
+                fallback_layers.append({"node": str(node), "stage": str(group.stage), "reason": str(group.fallback_reason)})
+        return {
+            "attached_count": int(len(attached)),
+            "attached": attached,
+            "fallback_layers": fallback_layers,
+            "executable_region_count": int(sum(1 for group in self.groups if bool(group.executable))),
+        }
+
+
 def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
     started = time.time()
     groups, graph_audit = discover_r18_tiny_region_groups()
+    registry = RegionFirstCompileRegistry(groups=groups, graph_audit=graph_audit)
     dense_stats = dict(R18_TINY_DENSE_FULL_STATS)
     region_stats = dict(R18_TINY_REGION_FIRST_FULL_STATS)
     dense_score = score(dense_stats)
@@ -109,8 +196,14 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
         }
         for group in groups
     }
+    fallback_layers = [
+        {"stage": group.stage, "node": node, "reason": group.fallback_reason}
+        for group in groups
+        for node in group.conv_nodes
+        if not bool(group.executable)
+    ]
     return {
-        "status": "ok",
+        "status": "partial",
         "scope": "R18 TinyImageNet experimental region-first full-network comparison; cost/proxy path, not full CKKS runtime",
         "network": "R18",
         "dataset": "tiny",
@@ -144,13 +237,15 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
         "fallback_audit": {
             "unselected_layers_dense": True,
             "selected_region_hidden_fallback_count": int(sum(1 for group in groups if group.hidden_fallback)),
-            "selected_regions_no_dense_pack_conv2d": True,
+            "selected_executable_regions_no_dense_pack_conv2d": True,
+            "fallback_layers": fallback_layers,
+            "fallback_count": int(len(fallback_layers)),
         },
         "claim": {
             "selected_regions_use_region_first_runtime_group": True,
             "full_network_ckks": False,
             "full_runtime_publishable": False,
-            "reason": "NetworkDAG replacement is represented as an experimental proxy/audit; full encrypted forward replacement is next stage.",
+            "reason": "RegionFirstRuntimeGroups are attached as compile-time proxies; fused-weight runtime materializers are still dense fallback.",
         },
         "timing_s": {"report_build_s": float(time.time() - started)},
     }
@@ -164,4 +259,3 @@ def write_r18_tiny_region_first_e2e_report(
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
-

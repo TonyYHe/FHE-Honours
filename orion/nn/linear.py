@@ -225,6 +225,11 @@ class Conv2d(LinearTransform):
         return torch.Size((N, on_Co, on_Ho, on_Wo))
     
     def generate_diagonals(self, last):
+        runtime = getattr(self, "region_runtime", None)
+        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
+            self.diagonals = {}
+            self.output_rotations = 0
+            return
         # Generate Toeplitz diagonals and determine the number of output
         # rotations if the `hybrid` packing method is used.
         self.diagonals, self.output_rotations = packing.pack_conv2d(self, last)
@@ -232,6 +237,11 @@ class Conv2d(LinearTransform):
             self.save_transforms()
 
     def compile(self):
+        runtime = getattr(self, "region_runtime", None)
+        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
+            runtime.compile(self.scheme)
+            self.transform_ids = {}
+            return
         # If the user specifies an io mode = "save" or "load", then diagonals will
         # be temporarily stored to disk to save memory. Load right before they're 
         # needed to generate the backend transforms themselves. 
@@ -246,6 +256,11 @@ class Conv2d(LinearTransform):
 
     def forward(self, x):
         # Forward pass that handles both cleartext and FHE inference.
+        runtime = getattr(self, "region_runtime", None)
+        if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)):
+            output_id = getattr(self, "region_output_id", None) or getattr(self, "name", self.__class__.__name__)
+            return runtime.output(str(output_id), x)
+
         if not self.he_mode: # cleartext mode
             if x.dim() != 4:
                 raise ValueError(

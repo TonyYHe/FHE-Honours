@@ -23,7 +23,7 @@ def test_r18_tiny_region_discovery_finds_four_runtime_groups() -> None:
 def test_r18_tiny_region_first_e2e_report_records_dense_vs_region_first_costs() -> None:
     payload = build_r18_tiny_region_first_e2e_report()
 
-    assert payload["status"] == "ok"
+    assert payload["status"] == "partial"
     assert payload["network"] == "R18"
     assert payload["dataset"] == "tiny"
     assert payload["region_first"]["runtime_group_count"] == 4
@@ -50,7 +50,8 @@ def test_r18_tiny_region_first_e2e_report_has_claim_hygiene_and_depth_audit() ->
     assert payload["claim"]["full_network_ckks"] is False
     assert payload["claim"]["full_runtime_publishable"] is False
     assert payload["fallback_audit"]["selected_region_hidden_fallback_count"] == 0
-    assert payload["fallback_audit"]["selected_regions_no_dense_pack_conv2d"] is True
+    assert payload["fallback_audit"]["selected_executable_regions_no_dense_pack_conv2d"] is True
+    assert payload["fallback_audit"]["fallback_count"] > 0
     assert payload["bootstrap_audit"]["status"] == "depths_declared_for_solver"
     assert payload["bootstrap_audit"]["region_depths"]["stage1"]["depth"] == 2
     assert payload["bootstrap_audit"]["region_depths"]["stage4"]["depth"] == 3

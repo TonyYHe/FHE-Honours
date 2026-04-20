@@ -77,6 +77,7 @@ class OrionParameters:
     io_mode: Literal["none", "save", "load"] = "none"
     diags_path: str = ""
     keys_path: str = ""
+    experimental_region_first: str = ""
 
     def __str__(self) -> str:
         output = [
@@ -182,6 +183,9 @@ class NewParameters:
 
     def get_io_mode(self):
         return self.orion_params.io_mode.lower()
+
+    def get_experimental_region_first(self):
+        return str(self.orion_params.experimental_region_first).lower()
 
     def get_boot_logp(self):
         return self.ckks_params.boot_logp
