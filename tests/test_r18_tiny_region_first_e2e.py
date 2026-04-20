@@ -51,8 +51,8 @@ def test_r18_tiny_region_first_e2e_report_has_claim_hygiene_and_depth_audit() ->
     assert payload["claim"]["full_runtime_publishable"] is False
     assert payload["fallback_audit"]["selected_region_hidden_fallback_count"] == 0
     assert payload["fallback_audit"]["selected_executable_regions_no_dense_pack_conv2d"] is True
-    assert payload["fallback_audit"]["executable_region_count"] == 2
-    assert payload["fallback_audit"]["fallback_count"] == 8
+    assert payload["fallback_audit"]["executable_region_count"] == 4
+    assert payload["fallback_audit"]["fallback_count"] == 0
     assert payload["bootstrap_audit"]["status"] == "depths_declared_for_solver"
     assert payload["bootstrap_audit"]["region_depths"]["stage1"]["depth"] == 2
     assert payload["bootstrap_audit"]["region_depths"]["stage4"]["depth"] == 3
@@ -61,5 +61,6 @@ def test_r18_tiny_region_first_e2e_report_has_claim_hygiene_and_depth_audit() ->
     groups = {group["stage"]: group for group in payload["region_first"]["groups"]}
     assert groups["stage1"]["executor_attached"] is True
     assert groups["stage2"]["executor_attached"] is True
-    assert groups["stage3"]["executor_attached"] is False
-    assert groups["stage4"]["executor_attached"] is False
+    assert groups["stage3"]["executor_attached"] is True
+    assert groups["stage4"]["executor_attached"] is True
+    assert payload["graph_audit"]["excluded_nodes"]

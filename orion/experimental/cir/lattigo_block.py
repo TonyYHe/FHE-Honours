@@ -460,8 +460,29 @@ def build_r18_stage2_shared_block_plan(
     )
 
 
-def build_r18_stage3_shared_block_plan(*, bank_count: int | None = None) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
-    return build_r18_same_stage_shared_block_plan(spec=R18_STAGE3_SPEC, input_pair_index=0, bank_count=bank_count)
+def build_r18_stage3_shared_block_plan(
+    *,
+    bank_count: int | None = None,
+    weight_override: torch.Tensor | None = None,
+    bias_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    input_shape: tuple[int, int, int] | None = None,
+    output_shape: tuple[int, int, int] | None = None,
+    input_gap: int | None = None,
+    output_gap: int | None = None,
+) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+    return build_r18_same_stage_shared_block_plan(
+        spec=R18_STAGE3_SPEC,
+        input_pair_index=0,
+        bank_count=bank_count,
+        weight_override=weight_override,
+        bias_override=bias_override,
+        source_override=source_override,
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_gap=input_gap,
+        output_gap=output_gap,
+    )
 
 
 @dataclass(frozen=True)
@@ -749,11 +770,51 @@ def _build_compact_intra_rows(
     return shifts, output_slots, all_values.to(dtype=torch.complex64)
 
 
-def build_r18_stage4_compact_intra_plan() -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+def build_r18_stage4_compact_intra_plan(
+    *,
+    weight_override: torch.Tensor | None = None,
+    bias_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    input_shape: tuple[int, int, int] | None = None,
+    output_shape: tuple[int, int, int] | None = None,
+    input_gap: int | None = None,
+    output_gap: int | None = None,
+) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
     spec = R18_STAGE4_SPEC
     torch.manual_seed(0)
-    x = torch.randn((int(spec.c), int(spec.h), int(spec.w)), dtype=torch.float32)
-    weight = torch.randn((int(spec.c), int(spec.c), 3, 3), dtype=torch.float32)
+    expected_shape = (int(spec.c), int(spec.c), 3, 3)
+    if weight_override is None:
+        weight = torch.randn(expected_shape, dtype=torch.float32)
+        weight_source = "deterministic_random"
+    else:
+        weight = weight_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in weight.shape) != expected_shape:
+            raise ValueError(f"{spec.stage} fused weight shape mismatch: expected {expected_shape}, got {tuple(weight.shape)}")
+        weight_source = "fused_orion_on_weight"
+    expected_source = (int(spec.c), int(spec.h), int(spec.w))
+    if source_override is None:
+        x = torch.randn(expected_source, dtype=torch.float32)
+        source_kind = "deterministic_random"
+    else:
+        x = source_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in x.shape) != expected_source:
+            raise ValueError(f"{spec.stage} source shape mismatch: expected {expected_source}, got {tuple(x.shape)}")
+        source_kind = "provided_source_override"
+    if input_shape is not None and tuple(int(v) for v in input_shape) != expected_source:
+        raise ValueError(f"{spec.stage} input_shape mismatch: {input_shape}")
+    if output_shape is not None and tuple(int(v) for v in output_shape) != expected_source:
+        raise ValueError(f"{spec.stage} output_shape mismatch: {output_shape}")
+    if input_gap is not None and int(input_gap) != int(spec.gap):
+        raise ValueError(f"{spec.stage} input_gap mismatch: {input_gap}")
+    if output_gap is not None and int(output_gap) != int(spec.gap):
+        raise ValueError(f"{spec.stage} output_gap mismatch: {output_gap}")
+    if bias_override is not None:
+        bias = bias_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in bias.shape) != (int(spec.c),):
+            raise ValueError(f"{spec.stage} bias shape mismatch: expected {(int(spec.c),)}, got {tuple(bias.shape)}")
+        bias_source = "accepted_not_folded"
+    else:
+        bias_source = "none"
     shifts, output_slots, values = _build_compact_intra_rows(spec=spec, weight=weight)
     case_name = "orion_vendored_r18_stage4_same_compact_intra"
     family_id = f"{case_name}_family"
@@ -849,7 +910,12 @@ def build_r18_stage4_compact_intra_plan() -> tuple[ConvSchemePlan, dict[str, Pla
         linear_transform_steps=(step,),
         expected_cost=ExecutionStats(rotations=158, conjugations=1, ct_pt_mults=9767, adds=9768),
         evidence_kind="vendored_scripts_cir_r18_stage4_compact_intra",
-        notes=("R18 stage4 compact-intra full materializer",),
+        notes=(
+            "R18 stage4 compact-intra full materializer",
+            f"weight_source={weight_source}",
+            f"source_kind={source_kind}",
+            f"bias_source={bias_source}",
+        ),
     )
     packed = _pack_chw(x, channels=int(spec.c), h=int(spec.h), w=int(spec.w), gap=int(spec.gap))
     inputs = {"source_0_lane_0": PlainCipherTensor(packed, label="source_0_lane_0")}

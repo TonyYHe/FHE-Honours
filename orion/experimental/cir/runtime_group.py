@@ -20,7 +20,12 @@ from .region_first_data import (
     score,
     stats_delta,
 )
-from .lattigo_block import build_r18_stage1_shared_block_plan, build_r18_stage2_shared_block_plan
+from .lattigo_block import (
+    build_r18_stage1_shared_block_plan,
+    build_r18_stage2_shared_block_plan,
+    build_r18_stage3_shared_block_plan,
+    build_r18_stage4_compact_intra_plan,
+)
 
 
 DEFAULT_R18_TINY_E2E_OUT = Path("/tmp/orion_r18_tiny_region_first_e2e.json")
@@ -185,6 +190,60 @@ class Stage2RuntimeExecutor:
         return outputs
 
 
+class LazySingleBlockRuntimeExecutor(Stage1RuntimeExecutor):
+    def __init__(
+        self,
+        *,
+        plan: Any | None = None,
+        output_node_ids: tuple[str, ...],
+        plan_builder: Any | None = None,
+        builder_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        self.plan = plan
+        self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.group = None
+        self.transforms: list[Any] = []
+        self.bank_ids: list[str] = []
+        self.compile_count = 0
+        self._plan_builder = plan_builder
+        self._builder_kwargs = dict(builder_kwargs or {})
+
+    def _ensure_plan(self) -> None:
+        if self.plan is not None:
+            return
+        if self._plan_builder is None:
+            raise RuntimeError("lazy region-first executor has no materializer")
+        self.plan, _inputs, _reference = self._plan_builder(**self._builder_kwargs)
+
+    def compile(self, scheme: Any) -> None:
+        self._ensure_plan()
+        super().compile(scheme)
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        self._ensure_plan()
+        return super().__call__(source_ct)
+
+
+class Stage3RuntimeExecutor(LazySingleBlockRuntimeExecutor):
+    pass
+
+
+class Stage4RuntimeExecutor(LazySingleBlockRuntimeExecutor):
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        compact_source = getattr(source_ct, "region_first_compact_source", None)
+        if compact_source is not None and compact_source is not True:
+            source_ct = compact_source
+        elif not bool(
+            getattr(source_ct, "region_first_compact_source", False)
+            or getattr(source_ct, "stage4_compact_source", False)
+            or getattr(source_ct, "is_region_first_compact_source", False)
+        ):
+            raise RuntimeError(
+                "stage4 region-first executor requires a ciphertext already in the compact-intra source layout"
+            )
+        return super().__call__(source_ct)
+
+
 def _replace_group(group: "RegionFirstRuntimeGroup", **updates: Any) -> "RegionFirstRuntimeGroup":
     payload = {
         key: getattr(group, key)
@@ -314,6 +373,17 @@ def _stage2_modules_compatible(modules: tuple[Any, ...]) -> bool:
     return True
 
 
+def _stage_modules_compatible(modules: tuple[Any, ...], *, expected_weight_shape: tuple[int, int, int, int]) -> bool:
+    if len(modules) < 1:
+        return False
+    expected = tuple(int(value) for value in expected_weight_shape)
+    for module in modules:
+        weight = getattr(module, "on_weight", None)
+        if weight is None or tuple(int(v) for v in weight.shape) != expected:
+            return False
+    return True
+
+
 def _stage1_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...]) -> RegionFirstRuntimeGroup:
     if not _stage1_modules_compatible(modules):
         return group
@@ -370,10 +440,66 @@ def _stage2_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[
     )
 
 
+def _stage3_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...]) -> RegionFirstRuntimeGroup:
+    if not _stage_modules_compatible(modules, expected_weight_shape=(256, 256, 3, 3)):
+        return group
+    first = modules[0]
+    return _replace_group(
+        group,
+        executable=True,
+        fallback_reason="",
+        plan=None,
+        fused_weight_count=len(modules),
+        executor=Stage3RuntimeExecutor(
+            output_node_ids=group.conv_nodes,
+            plan_builder=build_r18_stage3_shared_block_plan,
+            builder_kwargs={
+                "bank_count": len(group.conv_nodes),
+                "weight_override": getattr(first, "on_weight"),
+                "bias_override": getattr(first, "on_bias", None),
+                "input_shape": (256, 16, 16),
+                "output_shape": (256, 16, 16),
+                "input_gap": 4,
+                "output_gap": 4,
+            },
+        ),
+    )
+
+
+def _stage4_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...]) -> RegionFirstRuntimeGroup:
+    if not _stage_modules_compatible(modules, expected_weight_shape=(512, 512, 3, 3)):
+        return group
+    first = modules[0]
+    return _replace_group(
+        group,
+        executable=True,
+        fallback_reason="",
+        plan=None,
+        fused_weight_count=len(modules),
+        executor=Stage4RuntimeExecutor(
+            output_node_ids=group.conv_nodes,
+            plan_builder=build_r18_stage4_compact_intra_plan,
+            builder_kwargs={
+                "weight_override": getattr(first, "on_weight"),
+                "bias_override": getattr(first, "on_bias", None),
+                "input_shape": (512, 8, 8),
+                "output_shape": (512, 8, 8),
+                "input_gap": 8,
+                "output_gap": 8,
+            },
+        ),
+    )
+
+
 def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str, Any]]:
     refs = _r18_stage_references()
     groups: list[RegionFirstRuntimeGroup] = []
     excluded_nodes: list[dict[str, str]] = []
+    same_shape_constraints = {
+        "stage2": {"in_channels": 128, "out_channels": 128, "stride": (1, 1), "max_nodes": 4},
+        "stage3": {"in_channels": 256, "out_channels": 256, "stride": (1, 1), "max_nodes": 2},
+        "stage4": {"in_channels": 512, "out_channels": 512, "stride": (1, 1), "max_nodes": 1},
+    }
     for stage_index, stage_name in enumerate(("stage1", "stage2", "stage3", "stage4")):
         prefix = f"layers_{stage_index}"
         conv_nodes_list: list[str] = []
@@ -381,22 +507,28 @@ def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str
             if not (str(node).startswith(prefix) and "conv" in str(node)):
                 continue
             module = dag.nodes[node].get("module")
-            if str(stage_name) == "stage2":
-                # The vendored stage2 materializer is the same-shape
-                # 128->128 region. The first block conv is a stride-2
-                # transition and must stay dense until a transition
-                # materializer exists.
+            if str(stage_name) in same_shape_constraints:
+                constraints = same_shape_constraints[str(stage_name)]
                 if (
-                    getattr(module, "in_channels", None) != 128
-                    or getattr(module, "out_channels", None) != 128
+                    getattr(module, "in_channels", None) != int(constraints["in_channels"])
+                    or getattr(module, "out_channels", None) != int(constraints["out_channels"])
                     or tuple(getattr(module, "kernel_size", ())) != (3, 3)
-                    or tuple(getattr(module, "stride", ())) != (1, 1)
+                    or tuple(getattr(module, "stride", ())) != tuple(constraints["stride"])
                 ):
                     excluded_nodes.append(
                         {
                             "node": str(node),
                             "stage": str(stage_name),
-                            "reason": "transition_conv_not_supported_by_same_shape_stage2_materializer",
+                            "reason": f"transition_conv_not_supported_by_{stage_name}_same_shape_materializer",
+                        }
+                    )
+                    continue
+                if len(conv_nodes_list) >= int(constraints["max_nodes"]):
+                    excluded_nodes.append(
+                        {
+                            "node": str(node),
+                            "stage": str(stage_name),
+                            "reason": f"{stage_name}_materializer_output_bank_limit",
                         }
                     )
                     continue
@@ -459,6 +591,10 @@ class RegionFirstCompileRegistry:
                 group = _stage1_runtime_from_modules(group, modules)
             elif group.stage == "stage2":
                 group = _stage2_runtime_from_modules(group, modules)
+            elif group.stage == "stage3":
+                group = _stage3_runtime_from_modules(group, modules)
+            elif group.stage == "stage4":
+                group = _stage4_runtime_from_modules(group, modules)
             resolved_groups.append(group)
         object.__setattr__(self, "groups", tuple(resolved_groups))
         group_by_node = {node: group for group in self.groups for node in group.conv_nodes}
@@ -488,15 +624,16 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
     started = time.time()
     groups, graph_audit = discover_r18_tiny_region_groups()
     # Report mode does not have fused Orion modules available, so simulate the
-    # post-compile state: stage1/stage2 are fused-weight capable, stages3-4
-    # remain explicit fallbacks until their runtime handoff is implemented.
+    # post-compile state: the selected stage1-4 proxy groups are fused-weight
+    # capable. Transition and output-bank-limit exclusions remain auditable in
+    # graph_audit.excluded_nodes and are not counted as executable region facts.
     groups = tuple(
         _replace_group(
             group,
-            executable=bool(group.stage in {"stage1", "stage2"}),
-            fallback_reason="" if group.stage in {"stage1", "stage2"} else group.fallback_reason,
-            fused_weight_count=len(group.conv_nodes) if group.stage in {"stage1", "stage2"} else 0,
-            executor=f"{group.stage}_runtime_executor_attached" if group.stage in {"stage1", "stage2"} else None,
+            executable=True,
+            fallback_reason="",
+            fused_weight_count=len(group.conv_nodes),
+            executor=f"{group.stage}_runtime_executor_attached",
         )
         for group in groups
     )
@@ -565,7 +702,7 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
             "selected_regions_use_region_first_runtime_group": True,
             "full_network_ckks": False,
             "full_runtime_publishable": False,
-            "reason": "Stage1 and same-shape stage2 proxies are executable; stage3/stage4 and transition coverage remain non-publishable fallback work.",
+            "reason": "Selected stage1-4 proxy groups are executable, but excluded transition/output-bank-limit nodes and full source-layout handoff keep full CKKS runtime non-publishable.",
         },
         "timing_s": {"report_build_s": float(time.time() - started)},
     }
