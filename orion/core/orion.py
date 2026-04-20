@@ -236,10 +236,13 @@ class Scheme:
 
         self.region_first_registry = None
         self.region_first_attach_audit = {}
-        if self.params.get_experimental_region_first() == "r18_tiny":
+        if self.params.get_experimental_region_first() in {"r18_tiny", "r18_tiny_e2e"}:
             from orion.experimental.cir.runtime_group import RegionFirstCompileRegistry
 
-            self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny(network_dag)
+            if self.params.get_experimental_region_first() == "r18_tiny_e2e":
+                self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(network_dag)
+            else:
+                self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny(network_dag)
             self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
 
         #---------------------------------------------#

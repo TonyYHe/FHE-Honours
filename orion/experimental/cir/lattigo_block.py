@@ -412,6 +412,7 @@ def build_r18_same_stage_shared_block_plan(
 def build_r18_stage1_shared_block_plan(
     *,
     bank_count: int = 2,
+    input_pair_index: int = 0,
     weight_override: torch.Tensor | None = None,
     bias_override: torch.Tensor | None = None,
     source_override: torch.Tensor | None = None,
@@ -422,7 +423,7 @@ def build_r18_stage1_shared_block_plan(
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
     return build_r18_same_stage_shared_block_plan(
         spec=R18_STAGE1_SPEC,
-        input_pair_index=0,
+        input_pair_index=int(input_pair_index),
         bank_count=bank_count,
         weight_override=weight_override,
         bias_override=bias_override,

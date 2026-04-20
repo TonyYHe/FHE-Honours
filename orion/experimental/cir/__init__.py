@@ -25,8 +25,10 @@ from .lattigo_block import (
 from .report import build_region_first_pipeline_report, write_region_first_pipeline_report
 from .runtime_group import (
     RegionFirstRuntimeGroup,
+    build_r18_actual_region_first_e2e_report,
     build_r18_tiny_region_first_e2e_report,
     discover_r18_tiny_region_groups,
+    write_r18_actual_region_first_e2e_report,
     write_r18_tiny_region_first_e2e_report,
 )
 from .selector import build_region_first_full_selector, build_region_first_full_selector_summary
@@ -51,8 +53,10 @@ __all__ = [
     "build_region_first_pipeline_report",
     "build_stage_materialization_lattigo_matrix",
     "RegionFirstRuntimeGroup",
+    "build_r18_actual_region_first_e2e_report",
     "build_r18_tiny_region_first_e2e_report",
     "discover_r18_tiny_region_groups",
+    "write_r18_actual_region_first_e2e_report",
     "write_r18_tiny_region_first_e2e_report",
     "write_region_first_pipeline_report",
     "write_stage_materialization_lattigo_matrix",

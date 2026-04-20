@@ -602,7 +602,10 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         write_big_graph_lattigo_microbench,
     )
     from orion.experimental.cir.report import build_region_first_pipeline_report
-    from orion.experimental.cir.runtime_group import build_r18_tiny_region_first_e2e_report
+    from orion.experimental.cir.runtime_group import (
+        build_r18_actual_region_first_e2e_report,
+        build_r18_tiny_region_first_e2e_report,
+    )
     from orion.experimental.cir.stage_matrix import build_stage_materialization_lattigo_matrix
 
     artifacts = {
@@ -619,6 +622,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         "region_first_pipeline_report": Path(output_dir) / "orion_region_first_pipeline_report.json",
         "stage_materialization_lattigo_matrix": Path(output_dir) / "orion_stage_materialization_lattigo_matrix.json",
         "r18_tiny_region_first_e2e": Path(output_dir) / "orion_r18_tiny_region_first_e2e.json",
+        "r18_actual_region_first_e2e": Path(output_dir) / "orion_r18_actual_region_first_e2e.json",
     }
     payloads = {
         "region_search_candidates": build_region_search_candidates(),
@@ -647,6 +651,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         ),
     )
     payloads["r18_tiny_region_first_e2e"] = build_r18_tiny_region_first_e2e_report()
+    payloads["r18_actual_region_first_e2e"] = build_r18_actual_region_first_e2e_report()
     for key, path in artifacts.items():
         if key == "big_graph_lattigo_microbench":
             continue
