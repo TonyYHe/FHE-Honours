@@ -75,6 +75,26 @@ def test_r18_actual_e2e_report_builds_gate_without_dense_pack(monkeypatch) -> No
     assert payload["claim"]["runtime_speedup_publishable"] is False
 
 
+def test_r18_e2e_probe_marks_dense_fallback_bypass_nodes() -> None:
+    _net, dag = _prepared_r18_tiny_dag()
+    registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(dag)
+    audit = registry.attach_to_dag(dag)
+
+    bypassed = registry.attach_probe_dense_bypass_to_dag(dag)
+
+    assert audit["executable_region_count"] == len(registry.groups)
+    assert bypassed
+    assert any(item["node"] == "conv1" for item in bypassed)
+    assert any(item["node"] == "layers_1_0_conv1" for item in bypassed)
+    for item in bypassed:
+        module = dag.nodes[item["node"]]["module"]
+        assert getattr(module, "region_first_probe_dense_bypass") is True
+        assert getattr(module, "region_first_skip_dense_pack", False) is not True
+    for group in registry.groups:
+        module = dag.nodes[group.conv_nodes[0]]["module"]
+        assert getattr(module, "region_first_probe_lazy_region_compile") is True
+
+
 def test_full_conv_region_executor_pairs_sources_and_assembles_output(monkeypatch) -> None:
     _require_lattigo()
 

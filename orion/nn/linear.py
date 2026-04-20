@@ -225,6 +225,10 @@ class Conv2d(LinearTransform):
         return torch.Size((N, on_Co, on_Ho, on_Wo))
     
     def generate_diagonals(self, last):
+        if bool(getattr(self, "region_first_probe_dense_bypass", False)):
+            self.diagonals = {}
+            self.output_rotations = 0
+            return
         runtime = getattr(self, "region_runtime", None)
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
             self.diagonals = {}
@@ -237,9 +241,13 @@ class Conv2d(LinearTransform):
             self.save_transforms()
 
     def compile(self):
+        if bool(getattr(self, "region_first_probe_dense_bypass", False)):
+            self.transform_ids = {}
+            return
         runtime = getattr(self, "region_runtime", None)
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
-            runtime.compile(self.scheme)
+            if not bool(getattr(self, "region_first_probe_lazy_region_compile", False)):
+                runtime.compile(self.scheme)
             self.transform_ids = {}
             return
         # If the user specifies an io mode = "save" or "load", then diagonals will
@@ -260,6 +268,17 @@ class Conv2d(LinearTransform):
         if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)):
             output_id = getattr(self, "region_output_id", None) or getattr(self, "name", self.__class__.__name__)
             return runtime.output(str(output_id), x)
+        if self.he_mode and bool(getattr(self, "region_first_probe_dense_bypass", False)):
+            from orion.backend.python.tensors import CipherTensor
+
+            zeros = torch.zeros(self.fhe_output_shape, dtype=torch.float32)
+            input_level = x.level() if hasattr(x, "level") else len(self.scheme.params.get_logq()) - 1
+            output_level = max(0, int(input_level) - int(self.depth or 0))
+            ptxt = self.scheme.encode(zeros, output_level)
+            ctxt = self.scheme.encrypt(ptxt)
+            ids = [int(value) for value in ctxt.ids]
+            ctxt.ids = []
+            return CipherTensor(self.scheme, ids, self.output_shape, self.fhe_output_shape)
 
         if not self.he_mode: # cleartext mode
             if x.dim() != 4:

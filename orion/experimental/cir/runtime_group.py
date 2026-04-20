@@ -936,6 +936,34 @@ class RegionFirstCompileRegistry:
             "graph_audit": dict(self.graph_audit),
         }
 
+    def attach_probe_dense_bypass_to_dag(self, dag: NetworkDAG) -> list[dict[str, str]]:
+        from orion.nn.linear import Conv2d
+
+        bypassed: list[dict[str, str]] = []
+        selected_nodes = {node for group in self.groups for node in group.conv_nodes}
+        for node in selected_nodes:
+            if node not in dag.nodes:
+                continue
+            module = dag.nodes[node].get("module")
+            if module is not None:
+                module.region_first_probe_lazy_region_compile = True
+        for node in dag.topological_sort():
+            if node in selected_nodes:
+                continue
+            module = dag.nodes[node].get("module")
+            if not isinstance(module, Conv2d):
+                continue
+            module.region_first_probe_dense_bypass = True
+            module.region_first_probe_reason = "probe_only_skip_orion_dense_pack_conv2d"
+            bypassed.append(
+                {
+                    "node": str(node),
+                    "module": type(module).__name__,
+                    "reason": "probe_only_skip_orion_dense_pack_conv2d",
+                }
+            )
+        return bypassed
+
 
 def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
     started = time.time()
