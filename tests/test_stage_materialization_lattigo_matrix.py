@@ -13,6 +13,16 @@ def _fake_r18_stage1_evidence() -> dict:
     }
 
 
+def _fake_r18_stage2_evidence() -> dict:
+    return {
+        "status": "ok",
+        "network": "R18",
+        "family": "stage2_same",
+        "stats_from_execution": {"rotations": 84, "conjugations": 8, "ct_pt_mults": 5880, "adds": 5890},
+        "parity": {"exact": True, "max_abs": 0.00025, "tolerance": 0.001},
+    }
+
+
 def _row(payload: dict, network: str, stage: str) -> dict:
     for row in payload["rows"]:
         if row["network"] == network and row["stage"] == stage:
@@ -75,3 +85,16 @@ def test_stage_matrix_locks_reference_stats_for_next_ports() -> None:
         "ct_pt_mults": 7938,
         "adds": 7941,
     }
+
+
+def test_stage_matrix_flips_r18_stage2_when_lattigo_evidence_is_available() -> None:
+    payload = build_stage_materialization_lattigo_matrix(
+        lattigo_payload=_fake_r18_stage1_evidence(),
+        extra_lattigo_payloads=(_fake_r18_stage2_evidence(),),
+    )
+
+    assert _row(payload, "R18", "stage2")["status"] == "ok"
+    assert _row(payload, "R18", "stage2")["stats_match_scripts_cir"] is True
+    assert _row(payload, "R18", "stage2")["publishable_lattigo_fact"] is True
+    assert payload["summary"]["ok_count"] == 2
+    assert payload["summary"]["missing_materializer_count"] == 6

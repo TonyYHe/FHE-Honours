@@ -503,6 +503,12 @@ def _scripts_cir_r18_stage1_block() -> tuple[Any, dict[str, Any], torch.Tensor]:
     return build_r18_stage1_shared_block_plan(bank_count=8)
 
 
+def _scripts_cir_r18_stage2_block(input_pair_index: int) -> tuple[Any, dict[str, Any], torch.Tensor]:
+    from orion.experimental.cir import build_r18_stage2_shared_block_plan
+
+    return build_r18_stage2_shared_block_plan(input_pair_index=int(input_pair_index), bank_count=None)
+
+
 def _bank_transforms_from_scripts_cir_plan(
     plan: Any,
     inputs: dict[str, Any],
@@ -668,6 +674,122 @@ def build_big_graph_lattigo_microbench(*, bank_count: int = 8, logn: int = 16) -
                 "note": "single original-size R18 stage1 full output-bank block, not aggregate full-network execution",
             },
             "timing_s": timings,
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def _run_lattigo_plan_once(plan: Any, inputs: dict[str, Any], *, bank_count: int, level: int) -> tuple[dict[str, int], dict[str, Any], dict[str, float]]:
+    from orion.backend.python.tensors import CipherTensor
+    from orion.core.orion import scheme
+    from orion.nn.unified_transform import UnifiedTransformGroup
+
+    timings: dict[str, float] = {}
+    slots = int(scheme.params.get_slots())
+    transforms, expected_outputs, detail = _bank_transforms_from_scripts_cir_plan(
+        plan,
+        inputs,
+        bank_count=int(bank_count),
+        level=int(level),
+        scheme=scheme,
+    )
+    start = time.time()
+    group = UnifiedTransformGroup(transforms)
+    group.compile_unified(scheme.backend)
+    timings["compile_unified_s"] = float(time.time() - start)
+    left = inputs["source_0_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
+    right = inputs["source_1_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
+    ct_left = scheme.encrypt(scheme.encode(left, level))
+    ct_right = scheme.encrypt(scheme.encode(right, level))
+    ct_complex = ct_left + ct_right.mul_imaginary_unit(+1, in_place=False)
+    start = time.time()
+    output_ids = group.evaluate_unified(int(ct_complex.ids[0]), scheme.backend)
+    timings["evaluate_unified_s"] = float(time.time() - start)
+    max_errors: list[float] = []
+    for output_id, expected in zip(output_ids, expected_outputs):
+        out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(slots)]), torch.Size([1, int(slots)]))
+        out_pt = out_ct.decrypt()
+        raw = scheme.backend.DecodeComplex(out_pt.ids[0])
+        decoded = torch.tensor([complex(raw[2 * i], raw[2 * i + 1]) for i in range(int(slots))], dtype=torch.complex64)
+        max_errors.append(float((decoded - expected).abs().max()))
+    parity = {"exact": bool(max(max_errors, default=0.0) <= 1.0e-3), "max_abs": float(max(max_errors, default=0.0)), "max_errors": max_errors, "tolerance": 1.0e-3}
+    return dict(detail["scripts_cir_subset_stats"]), parity, timings
+
+
+def build_r18_stage2_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
+    from orion.core.orion import scheme
+
+    config = {
+        "ckks_params": {
+            "LogN": int(logn),
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    timings = {"scheme_init_s": 0.0, "compile_unified_s": 0.0, "evaluate_unified_s": 0.0}
+    started = time.time()
+    scheme.init_scheme(config)
+    timings["scheme_init_s"] = float(time.time() - started)
+    try:
+        level = len(scheme.params.get_logq()) - 1
+        total = {key: 0 for key in ("rotations", "conjugations", "ct_pt_mults", "adds")}
+        block_rows: list[dict[str, Any]] = []
+        all_exact = True
+        max_abs = 0.0
+        for input_pair_index in (0, 1):
+            plan, inputs, _reference = _scripts_cir_r18_stage2_block(int(input_pair_index))
+            stats, parity, block_timing = _run_lattigo_plan_once(
+                plan,
+                inputs,
+                bank_count=len(plan.linear_transform_steps[0].shared_output_banks),
+                level=int(level),
+            )
+            for key in total:
+                total[key] += int(stats.get(key, 0))
+            timings["compile_unified_s"] += float(block_timing["compile_unified_s"])
+            timings["evaluate_unified_s"] += float(block_timing["evaluate_unified_s"])
+            all_exact = bool(all_exact and parity.get("exact", False))
+            max_abs = max(float(max_abs), float(parity.get("max_abs", 0.0)))
+            block_rows.append(
+                {
+                    "input_pair_index": int(input_pair_index),
+                    "stats_from_execution": stats,
+                    "parity": parity,
+                    "timing_s": block_timing,
+                }
+            )
+        expected = {"rotations": 84, "conjugations": 8, "ct_pt_mults": 5880, "adds": 5890}
+        stats_match = dict(total) == dict(expected)
+        return {
+            "status": "ok" if bool(all_exact and stats_match) else "failed",
+            "scope": "original-size R18 stage2 same-shape full input-pair Lattigo materialization",
+            "network": "R18",
+            "family": "stage2_same",
+            "stage": "stage2",
+            "full_region": True,
+            "original_size_slot_domain": True,
+            "local_lattigo": True,
+            "unified_transform_group": True,
+            "uses_orion_dense_pack_conv2d": False,
+            "stats_from_execution": dict(total),
+            "expected_stats": dict(expected),
+            "stats_match_scripts_cir": bool(stats_match),
+            "same_plan_certificate": bool(all_exact and stats_match),
+            "parity": {"exact": bool(all_exact), "max_abs": float(max_abs), "tolerance": 1.0e-3},
+            "block_rows": block_rows,
+            "timing_s": timings,
+            "publishable_lattigo_microbenchmark": bool(all_exact and stats_match),
         }
     finally:
         scheme.delete_scheme()

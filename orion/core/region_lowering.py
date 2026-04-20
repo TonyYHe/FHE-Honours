@@ -595,6 +595,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
     from orion.core.region_experiments import build_selected_region_backend_proof, build_whole_network_costs
     from orion.core.region_cir_replay import (
         build_big_graph_convolution_microbench,
+        build_r18_stage2_lattigo_microbench,
         build_original_size_cir_replay,
         write_big_graph_lattigo_microbench,
     )
@@ -609,6 +610,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         "original_size_cir_replay": Path(output_dir) / "orion_original_size_cir_replay.json",
         "big_graph_convolution_microbench": Path(output_dir) / "orion_big_graph_convolution_microbench.json",
         "big_graph_lattigo_microbench": Path(output_dir) / "orion_big_graph_lattigo_microbench.json",
+        "r18_stage2_lattigo_microbench": Path(output_dir) / "orion_r18_stage2_lattigo_microbench.json",
         "region_first_pipeline_report": Path(output_dir) / "orion_region_first_pipeline_report.json",
         "stage_materialization_lattigo_matrix": Path(output_dir) / "orion_stage_materialization_lattigo_matrix.json",
     }
@@ -620,6 +622,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         "original_size_cir_replay": build_original_size_cir_replay(),
     }
     payloads["big_graph_lattigo_microbench"] = write_big_graph_lattigo_microbench(out_path=artifacts["big_graph_lattigo_microbench"])
+    payloads["r18_stage2_lattigo_microbench"] = build_r18_stage2_lattigo_microbench()
     payloads["big_graph_convolution_microbench"] = build_big_graph_convolution_microbench(
         lattigo_microbench_artifact=artifacts["big_graph_lattigo_microbench"]
     )
@@ -628,10 +631,14 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         lattigo_evidence=payloads["big_graph_lattigo_microbench"],
     )
     payloads["stage_materialization_lattigo_matrix"] = build_stage_materialization_lattigo_matrix(
-        lattigo_payload=payloads["big_graph_lattigo_microbench"]
+        lattigo_payload=payloads["big_graph_lattigo_microbench"],
+        extra_lattigo_payloads=(payloads["r18_stage2_lattigo_microbench"],),
     )
     for key, path in artifacts.items():
         if key == "big_graph_lattigo_microbench":
+            continue
+        if key == "r18_stage2_lattigo_microbench":
+            Path(path).write_text(json.dumps(payloads[key], indent=2) + "\n", encoding="utf-8")
             continue
         Path(path).write_text(json.dumps(payloads[key], indent=2) + "\n", encoding="utf-8")
     return {key: str(path) for key, path in artifacts.items()}
