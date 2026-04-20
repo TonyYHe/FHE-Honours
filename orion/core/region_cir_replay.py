@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
 import json
-import sys
 import time
 
 import torch
@@ -27,7 +26,6 @@ DEFAULT_SELECTED_BACKEND_ARTIFACT = Path("/tmp/orion_selected_region_backend_pro
 DEFAULT_REPLAY_OUT = Path("/tmp/orion_original_size_cir_replay.json")
 DEFAULT_BIG_GRAPH_MICROBENCH_OUT = Path("/tmp/orion_big_graph_convolution_microbench.json")
 DEFAULT_BIG_GRAPH_LATTIGO_MICROBENCH_OUT = Path("/tmp/orion_big_graph_lattigo_microbench.json")
-DEFAULT_HALOED_ROOT = Path("/home/anakano/CLionProjects/HaloED")
 
 
 @dataclass(frozen=True)
@@ -499,36 +497,10 @@ def write_big_graph_convolution_microbench(
     return payload
 
 
-def _ensure_haloed_imports(haloed_root: Path) -> None:
-    root = Path(haloed_root)
-    for path in (root / "src", root):
-        value = str(path)
-        if value not in sys.path:
-            sys.path.insert(0, value)
-
-
 def _scripts_cir_r18_stage1_block() -> tuple[Any, dict[str, Any], torch.Tensor]:
-    _ensure_haloed_imports(DEFAULT_HALOED_ROOT)
-    from scripts.cir.model_axis_vs_orion_counts import _resnet18_tiny_families
-    from scripts.cir.region_first_search import _bounded_inter_group_surface_pair_spec, _build_shared_output_inter_hsplit_block_plan
+    from orion.experimental.cir import build_r18_stage1_shared_block_plan
 
-    family = {str(family.family): family for family in _resnet18_tiny_families()}["stage1_same"]
-    bounded = _bounded_inter_group_surface_pair_spec(family)
-    if bounded is None:
-        raise RuntimeError("scripts/cir did not provide a bounded R18 stage1 same-shape spec")
-    torch.manual_seed(0)
-    x = torch.randn((int(family.c_in), int(family.h_in), int(family.w_in)), dtype=torch.float32)
-    weight = torch.randn((int(family.c_out), int(family.c_in), int(family.kernel), int(family.kernel)), dtype=torch.float32)
-    return _build_shared_output_inter_hsplit_block_plan(
-        family=family,
-        x=x,
-        weight=weight,
-        c_pair=int(bounded.c),
-        in_start=0,
-        in_end=int(bounded.c),
-        target_h_range=(0, int(family.h_out)),
-        source_h_range=(0, int(family.h_in)),
-    )
+    return build_r18_stage1_shared_block_plan(bank_count=8)
 
 
 def _bank_transforms_from_scripts_cir_plan(
