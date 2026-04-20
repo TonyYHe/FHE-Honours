@@ -5,15 +5,15 @@ import orion.nn as on
 class BasicBlock(on.Module):
     expansion = 1
 
-    def __init__(self, Ci, Co, stride=1):
+    def __init__(self, Ci, Co, stride=1, activation="relu", silu_degree=127):
         super().__init__()
         self.conv1 = on.Conv2d(Ci, Co, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1   = on.BatchNorm2d(Co)
-        self.act1  = on.ReLU()
+        self.act1  = _make_activation(activation, silu_degree)
 
         self.conv2 = on.Conv2d(Co, Co, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2   = on.BatchNorm2d(Co)
-        self.act2  = on.ReLU()
+        self.act2  = _make_activation(activation, silu_degree)
        
         self.add = on.Add()
         self.shortcut = nn.Sequential()
@@ -61,15 +61,35 @@ class Bottleneck(on.Module):
         return self.act3(out)
     
 
+def _make_activation(activation="relu", silu_degree=127):
+    activation = str(activation).lower()
+    if activation == "relu":
+        return on.ReLU()
+    if activation == "silu":
+        return on.SiLU(degree=int(silu_degree))
+    raise ValueError(f"Unsupported ResNet activation {activation!r}")
+
+
 class ResNet(on.Module):
-    def __init__(self, dataset, block, num_blocks, num_chans, conv1_params, num_classes):
+    def __init__(
+            self,
+            dataset,
+            block,
+            num_blocks,
+            num_chans,
+            conv1_params,
+            num_classes,
+            activation="relu",
+            silu_degree=127,
+            stem_relu=True,
+    ):
         super().__init__()
         self.in_chans = num_chans[0]
         self.last_chans = num_chans[-1]
 
         self.conv1 = on.Conv2d(3, self.in_chans, **conv1_params, bias=False)
         self.bn1 = on.BatchNorm2d(self.in_chans)
-        self.act = on.ReLU()
+        self.act = on.ReLU() if bool(stem_relu) else _make_activation(activation, silu_degree)
 
         self.pool = nn.Identity()
         if dataset == 'imagenet': # for imagenet we must also downsample
@@ -78,17 +98,20 @@ class ResNet(on.Module):
         self.layers = nn.ModuleList()
         for i in range(len(num_blocks)):
             stride = 1 if i == 0 else 2
-            self.layers.append(self.layer(block, num_chans[i], num_blocks[i], stride))
+            self.layers.append(self.layer(block, num_chans[i], num_blocks[i], stride, activation, silu_degree))
 
         self.avgpool = on.AdaptiveAvgPool2d(output_size=(1,1)) 
         self.flatten = on.Flatten()
         self.linear  = on.Linear(self.last_chans * block.expansion, num_classes)
 
-    def layer(self, block, chans, num_blocks, stride):
+    def layer(self, block, chans, num_blocks, stride, activation="relu", silu_degree=127):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_chans, chans, stride))
+            if block is BasicBlock:
+                layers.append(block(self.in_chans, chans, stride, activation=activation, silu_degree=silu_degree))
+            else:
+                layers.append(block(self.in_chans, chans, stride))
             self.in_chans = chans * block.expansion
         return nn.Sequential(*layers)
     
@@ -135,9 +158,19 @@ def ResNet1202(dataset='cifar10'):
 # Tiny ImageNet / ImageNet ResNets #
 ####################################
 
-def ResNet18(dataset='imagenet'):
+def ResNet18(dataset='imagenet', activation="relu", silu_degree=127, stem_relu=True):
     conv1_params, num_classes = get_resnet_config(dataset)
-    return ResNet(dataset, BasicBlock, [2,2,2,2], [64,128,256,512], conv1_params, num_classes)
+    return ResNet(
+        dataset,
+        BasicBlock,
+        [2,2,2,2],
+        [64,128,256,512],
+        conv1_params,
+        num_classes,
+        activation=activation,
+        silu_degree=silu_degree,
+        stem_relu=stem_relu,
+    )
 
 def ResNet34(dataset='imagenet'):
     conv1_params, num_classes = get_resnet_config(dataset)

@@ -1057,10 +1057,18 @@ def build_r18_actual_region_first_e2e_report(
     *,
     seed: int = 0,
     attempt_ckks_forward: bool = False,
+    activation: str = "relu",
+    silu_degree: int = 127,
+    stem_relu: bool = True,
 ) -> dict[str, Any]:
     started = time.time()
     torch.manual_seed(int(seed))
-    net = ResNet18(dataset="tiny")
+    net = ResNet18(
+        dataset="tiny",
+        activation=str(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=bool(stem_relu),
+    )
     net.eval()
     sample = torch.randn((1, 3, 64, 64), dtype=torch.float32)
     dense_started = time.time()
@@ -1111,6 +1119,12 @@ def build_r18_actual_region_first_e2e_report(
         "scope": "R18 TinyImageNet actual graph-replacement E2E gate",
         "network": "R18",
         "dataset": "tiny",
+        "activation": {
+            "kind": str(activation),
+            "silu_degree": int(silu_degree) if str(activation).lower() == "silu" else None,
+            "stem_relu": bool(stem_relu),
+            "expected_bootstraps_reference": 61 if str(activation).lower() == "silu" and int(silu_degree) == 7 and bool(stem_relu) else None,
+        },
         "input": {"seed": int(seed), "shape": list(sample.shape)},
         "dense_cleartext": {
             "ran": True,
@@ -1148,8 +1162,16 @@ def write_r18_actual_region_first_e2e_report(
     *,
     out_path: Path = DEFAULT_R18_ACTUAL_E2E_OUT,
     attempt_ckks_forward: bool = False,
+    activation: str = "relu",
+    silu_degree: int = 127,
+    stem_relu: bool = True,
 ) -> dict[str, Any]:
-    payload = build_r18_actual_region_first_e2e_report(attempt_ckks_forward=bool(attempt_ckks_forward))
+    payload = build_r18_actual_region_first_e2e_report(
+        attempt_ckks_forward=bool(attempt_ckks_forward),
+        activation=str(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=bool(stem_relu),
+    )
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload

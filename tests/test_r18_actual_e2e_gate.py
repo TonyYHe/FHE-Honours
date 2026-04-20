@@ -4,9 +4,12 @@ from pathlib import Path
 
 import pytest
 import torch
+import orion.nn as on
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core import packing
+from orion.core.auto_bootstrap import BootstrapSolver
+from orion.core.fuser import Fuser
 from orion.core.orion import scheme
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
@@ -35,6 +38,58 @@ def _prepared_r18_tiny_dag() -> tuple[ResNet18, NetworkDAG]:
         if hasattr(module, "init_orion_params") and callable(module.init_orion_params):
             module.init_orion_params()
     return net, dag
+
+
+def _bootstrap_count_for_net(net: ResNet18) -> int:
+    config = {
+        "ckks_params": {"LogN": 16, "LogQ": [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40], "LogP": [61, 61, 61], "LogScale": 40, "H": 192, "RingType": "Standard"},
+        "boot_params": {"LogP": [61, 61, 61, 61, 61, 61, 61, 61]},
+        "orion": {"margin": 2, "embedding_method": "hybrid", "backend": "lattigo", "fuse_modules": True, "debug": False, "io_mode": "none", "experimental_region_first": "r18_tiny_e2e_probe"},
+    }
+    torch.manual_seed(0)
+    x = torch.randn((1, 3, 64, 64), dtype=torch.float32)
+    scheme.init_scheme(config)
+    try:
+        net.set_scheme(scheme)
+        net.set_margin(scheme.params.get_margin())
+        traced = OrionTracer().trace_model(net)
+        StatsTracker(traced).propagate(x)
+        for module in net.modules():
+            if hasattr(module, "fit") and callable(module.fit):
+                module.fit()
+        dag = NetworkDAG(traced)
+        dag.build_dag()
+        for module in net.modules():
+            if hasattr(module, "init_orion_params") and callable(module.init_orion_params):
+                module.init_orion_params()
+        for module in net.modules():
+            if hasattr(module, "update_params") and callable(module.update_params):
+                module.update_params()
+        fuser = Fuser(dag)
+        fuser.fuse_modules()
+        dag.remove_fused_batchnorms()
+        registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(dag)
+        registry.attach_to_dag(dag)
+        registry.attach_probe_dense_bypass_to_dag(dag)
+        dag.find_residuals()
+        solver = BootstrapSolver(net, dag, l_eff=len(scheme.params.get_logq()) - 1)
+        _input_level, bootstraps, _slots = solver.solve()
+        return int(bootstraps)
+    finally:
+        scheme.delete_scheme()
+
+
+def test_r18_silu_variant_preserves_default_and_hits_bootstrap_target() -> None:
+    default = ResNet18(dataset="tiny")
+    assert isinstance(default.act, on.ReLU)
+    assert sum(1 for _name, module in default.named_modules() if isinstance(module, on.SiLU)) == 0
+
+    silu = ResNet18(dataset="tiny", activation="silu", silu_degree=7, stem_relu=True)
+    assert isinstance(silu.act, on.ReLU)
+    assert sum(1 for _name, module in silu.named_modules() if isinstance(module, on.SiLU)) == 16
+    assert sum(1 for _name, module in silu.named_modules() if isinstance(module, on.ReLU)) == 1
+
+    assert _bootstrap_count_for_net(silu) == 60
 
 
 def test_r18_e2e_compile_registry_attaches_full_conv_region_nodes() -> None:
@@ -73,6 +128,21 @@ def test_r18_actual_e2e_report_builds_gate_without_dense_pack(monkeypatch) -> No
     assert payload["e2e_gate"]["output_assembly_runtime_ready"] is True
     assert payload["claim"]["full_network_ckks"] is False
     assert payload["claim"]["runtime_speedup_publishable"] is False
+
+
+def test_r18_actual_e2e_report_records_silu_bootstrap_reference() -> None:
+    payload = build_r18_actual_region_first_e2e_report(
+        activation="silu",
+        silu_degree=7,
+        stem_relu=True,
+    )
+
+    assert payload["activation"] == {
+        "kind": "silu",
+        "silu_degree": 7,
+        "stem_relu": True,
+        "expected_bootstraps_reference": 61,
+    }
 
 
 def test_r18_e2e_probe_marks_dense_fallback_bypass_nodes() -> None:
