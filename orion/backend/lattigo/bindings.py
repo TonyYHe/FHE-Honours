@@ -688,6 +688,29 @@ class LattigoLibrary:
             restype=None
         )
 
+        self.GenerateLinearTransformsUnified = LattigoFunction(
+            self.lib.GenerateLinearTransformsUnified,
+            argtypes=[
+                ctypes.c_int,  # numTransforms
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
+                ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),  # diagDataArray
+                ctypes.POINTER(ctypes.c_int),  # diagDataLens
+                ctypes.POINTER(ctypes.c_int),  # levels
+            ],
+            restype=ArrayResultInt
+        )
+
+        self.EvaluateLinearTransformsWithSharedCache = LattigoFunction(
+            self.lib.EvaluateLinearTransformsWithSharedCache,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_int),  # transformIDs
+                ctypes.c_int,  # numTransforms
+                ctypes.c_int,  # ctxtID
+            ],
+            restype=ArrayResultInt
+        )
+
         self.GenerateAndSerializeRotationKey = LattigoFunction(
             self.lib.GenerateAndSerializeRotationKey,
             argtypes=[ctypes.c_int],

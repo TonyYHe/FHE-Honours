@@ -209,3 +209,90 @@ func RemoveRotationKeys() {
 		scheme.EvalKeys,
 	))
 }
+
+//export GenerateLinearTransformsUnified
+func GenerateLinearTransformsUnified(
+	numTransforms C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	diagDataArray **C.float, diagDataLens *C.int,
+	levels *C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	slots := scheme.Params.MaxSlots()
+
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	diagDataArraySlice := unsafe.Slice(diagDataArray, n)
+	diagDataLensSlice := unsafe.Slice(diagDataLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	params := make([]lintrans.Parameters, n)
+	diagonalsList := make([]lintrans.Diagonals[float64], n)
+
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		diagDataFlat := CArrayToSlice(diagDataArraySlice[i], diagDataLensSlice[i], convertCFloatToFloat)
+
+		diagonals := make(lintrans.Diagonals[float64])
+		for j, key := range diagIdxs {
+			diagonals[key] = diagDataFlat[j*slots : (j+1)*slots]
+		}
+		diagonalsList[i] = diagonals
+
+		params[i] = lintrans.Parameters{
+			DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: 1,
+		}
+	}
+
+	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+	for i := range transforms {
+		if err := lintrans.Encode(scheme.Encoder, diagonalsList[i], transforms[i]); err != nil {
+			panic(err)
+		}
+	}
+
+	ids := make([]int, n)
+	for i, lt := range transforms {
+		ids[i] = AddLinearTransform(lt)
+	}
+	return SliceToCArray(ids, convertIntToCInt)
+}
+
+//export EvaluateLinearTransformsWithSharedCache
+func EvaluateLinearTransformsWithSharedCache(
+	transformIDs *C.int, numTransforms C.int,
+	ctxtID C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	transformIDsSlice := CArrayToSlice(transformIDs, numTransforms, convertCIntToInt)
+
+	transforms := make([]lintrans.LinearTransformation, n)
+	for i, id := range transformIDsSlice {
+		transforms[i] = RetrieveLinearTransform(id)
+	}
+
+	ctIn := RetrieveCiphertext(int(ctxtID))
+	scheme.LinEvaluator = lintrans.NewEvaluator(
+		scheme.Evaluator.WithKey(scheme.EvalKeys),
+	)
+
+	outputs := make([]*rlwe.Ciphertext, n)
+	for i := range outputs {
+		outputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transforms[i].LevelQ)
+	}
+
+	if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, transforms, outputs); err != nil {
+		panic(err)
+	}
+
+	outIDs := make([]int, n)
+	for i, ct := range outputs {
+		outIDs[i] = PushCiphertext(ct)
+	}
+	return SliceToCArray(outIDs, convertIntToCInt)
+}
