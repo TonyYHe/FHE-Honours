@@ -598,6 +598,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         build_original_size_cir_replay,
         write_big_graph_lattigo_microbench,
     )
+    from orion.experimental.cir.report import build_region_first_pipeline_report
 
     artifacts = {
         "region_search_candidates": Path(output_dir) / "orion_region_search_candidates.json",
@@ -607,6 +608,7 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
         "original_size_cir_replay": Path(output_dir) / "orion_original_size_cir_replay.json",
         "big_graph_convolution_microbench": Path(output_dir) / "orion_big_graph_convolution_microbench.json",
         "big_graph_lattigo_microbench": Path(output_dir) / "orion_big_graph_lattigo_microbench.json",
+        "region_first_pipeline_report": Path(output_dir) / "orion_region_first_pipeline_report.json",
     }
     payloads = {
         "region_search_candidates": build_region_search_candidates(),
@@ -618,6 +620,10 @@ def write_required_region_artifacts(*, output_dir: Path = Path("/tmp")) -> dict[
     payloads["big_graph_lattigo_microbench"] = write_big_graph_lattigo_microbench(out_path=artifacts["big_graph_lattigo_microbench"])
     payloads["big_graph_convolution_microbench"] = build_big_graph_convolution_microbench(
         lattigo_microbench_artifact=artifacts["big_graph_lattigo_microbench"]
+    )
+    payloads["region_first_pipeline_report"] = build_region_first_pipeline_report(
+        attach_lattigo=False,
+        lattigo_evidence=payloads["big_graph_lattigo_microbench"],
     )
     for key, path in artifacts.items():
         if key == "big_graph_lattigo_microbench":
