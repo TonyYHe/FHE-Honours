@@ -28,7 +28,7 @@ def test_r18_compile_registry_attaches_region_metadata_to_stage_convs() -> None:
         assert getattr(module, "region_first_skip_dense_pack") is False
 
 
-def test_r18_compile_registry_marks_stage1_executable_with_fused_weights() -> None:
+def test_r18_compile_registry_marks_stage1_and_stage2_executable_with_fused_weights() -> None:
     torch.manual_seed(0)
     traced = OrionTracer().trace_model(ResNet18(dataset="tiny"))
     dag = NetworkDAG(traced)
@@ -41,12 +41,15 @@ def test_r18_compile_registry_marks_stage1_executable_with_fused_weights() -> No
 
     audit = registry.attach_to_dag(dag)
 
-    assert audit["executable_region_count"] == 1
-    assert len(audit["fallback_layers"]) == 12
+    assert audit["executable_region_count"] == 2
+    assert len(audit["fallback_layers"]) == 8
     stage1 = [item for item in audit["attached"] if item["stage"] == "stage1"]
+    stage2 = [item for item in audit["attached"] if item["stage"] == "stage2"]
     assert stage1
+    assert stage2
     assert all(item["executable"] is True for item in stage1)
-    for item in stage1:
+    assert all(item["executable"] is True for item in stage2)
+    for item in stage1 + stage2:
         module = dag.nodes[item["node"]]["module"]
         assert getattr(module, "region_first_skip_dense_pack") is True
         assert getattr(module, "region_runtime").executable is True

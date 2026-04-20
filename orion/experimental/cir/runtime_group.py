@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,7 +20,7 @@ from .region_first_data import (
     score,
     stats_delta,
 )
-from .lattigo_block import build_r18_stage1_shared_block_plan
+from .lattigo_block import build_r18_stage1_shared_block_plan, build_r18_stage2_shared_block_plan
 
 
 DEFAULT_R18_TINY_E2E_OUT = Path("/tmp/orion_r18_tiny_region_first_e2e.json")
@@ -107,6 +107,84 @@ class Stage1RuntimeExecutor:
         return outputs
 
 
+class Stage2RuntimeExecutor:
+    def __init__(self, *, plans: tuple[Any, Any], output_node_ids: tuple[str, ...]) -> None:
+        if len(plans) != 2:
+            raise ValueError("Stage2RuntimeExecutor expects exactly two input surface-pair block plans")
+        self.plans = tuple(plans)
+        self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.groups: list[Any] = []
+        self.transforms_by_block: list[list[Any]] = []
+        self.bank_ids_by_block: list[list[str]] = []
+        self.compile_count = 0
+        self.block_evaluate_count = 0
+
+    def compile(self, scheme: Any) -> None:
+        if self.groups:
+            return
+        from orion.nn.unified_transform import UnifiedTransformGroup
+
+        level = len(scheme.params.get_logq()) - 1
+        for plan in self.plans:
+            transforms, bank_ids = transforms_from_conv_scheme_plan(
+                plan,
+                level=int(level),
+                scheme=scheme,
+                bank_count=len(self.output_node_ids),
+            )
+            group = UnifiedTransformGroup(transforms)
+            group.compile_unified(scheme.backend)
+            self.transforms_by_block.append(transforms)
+            self.bank_ids_by_block.append(bank_ids)
+            self.groups.append(group)
+        self.compile_count += 1
+
+    def _source_ids_for_blocks(self, source_ct: Any) -> tuple[int, int]:
+        explicit_sources = getattr(source_ct, "region_first_block_sources", None)
+        if explicit_sources is None:
+            explicit_sources = getattr(source_ct, "stage2_input_pair_ciphertexts", None)
+        if explicit_sources is not None:
+            if len(explicit_sources) != 2:
+                raise RuntimeError("stage2 region-first executor requires exactly two input surface-pair ciphertexts")
+            ids: list[int] = []
+            for source in explicit_sources:
+                if hasattr(source, "ids"):
+                    ids.append(int(source.ids[0]))
+                else:
+                    ids.append(int(source))
+            return int(ids[0]), int(ids[1])
+
+        ids = getattr(source_ct, "ids", None)
+        if ids is not None and len(ids) >= 2:
+            return int(ids[0]), int(ids[1])
+        raise RuntimeError(
+            "stage2 region-first executor requires a compatible source layout: "
+            "provide two ciphertext ids or source_ct.region_first_block_sources for the two input surface-pair blocks"
+        )
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        from orion.backend.python.tensors import CipherTensor
+
+        scheme = source_ct.scheme
+        self.compile(scheme)
+        source_ids = self._source_ids_for_blocks(source_ct)
+        complex_outputs: dict[str, Any] = {}
+        slots = int(self.plans[0].ring_slot_count)
+        for group, source_id in zip(self.groups, source_ids):
+            output_ids = group.evaluate_unified(int(source_id), scheme.backend)
+            self.block_evaluate_count += 1
+            for node_id, output_id in zip(self.output_node_ids, output_ids):
+                block_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(slots)]), torch.Size([1, int(slots)]))
+                if str(node_id) in complex_outputs:
+                    complex_outputs[str(node_id)] = complex_outputs[str(node_id)] + block_ct
+                else:
+                    complex_outputs[str(node_id)] = block_ct
+        outputs: dict[str, Any] = {}
+        for node_id, ct in complex_outputs.items():
+            outputs[str(node_id)] = (ct + ct.conjugate(in_place=False)) * 0.5
+        return outputs
+
+
 def _replace_group(group: "RegionFirstRuntimeGroup", **updates: Any) -> "RegionFirstRuntimeGroup":
     payload = {
         key: getattr(group, key)
@@ -163,12 +241,12 @@ class RegionFirstRuntimeGroup:
     _cache_outputs: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        executor = payload.pop("executor", None)
-        payload["executor_attached"] = bool(executor is not None)
-        payload.pop("plan", None)
-        payload.pop("_cache_key", None)
-        payload.pop("_cache_outputs", None)
+        payload = {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name not in {"executor", "plan", "_cache_key", "_cache_outputs"}
+        }
+        payload["executor_attached"] = bool(self.executor is not None)
         return payload
 
     def __post_init__(self) -> None:
@@ -226,6 +304,16 @@ def _stage1_modules_compatible(modules: tuple[Any, ...]) -> bool:
     return True
 
 
+def _stage2_modules_compatible(modules: tuple[Any, ...]) -> bool:
+    if len(modules) < 1:
+        return False
+    for module in modules:
+        weight = getattr(module, "on_weight", None)
+        if weight is None or tuple(int(v) for v in weight.shape) != (128, 128, 3, 3):
+            return False
+    return True
+
+
 def _stage1_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...]) -> RegionFirstRuntimeGroup:
     if not _stage1_modules_compatible(modules):
         return group
@@ -252,16 +340,68 @@ def _stage1_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[
     )
 
 
+def _stage2_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...]) -> RegionFirstRuntimeGroup:
+    if not _stage2_modules_compatible(modules):
+        return group
+    # As with stage1, the first fused conv proves the fused-weight handoff.
+    # Stage2 needs two input surface-pair block plans, both using that same
+    # fused weight tensor but consuming different source surface pairs.
+    first = modules[0]
+    plans: list[Any] = []
+    for input_pair_index in (0, 1):
+        plan, _inputs, _reference = build_r18_stage2_shared_block_plan(
+            input_pair_index=int(input_pair_index),
+            bank_count=len(group.conv_nodes),
+            weight_override=getattr(first, "on_weight"),
+            bias_override=getattr(first, "on_bias", None),
+            input_shape=(128, 32, 32),
+            output_shape=(128, 32, 32),
+            input_gap=2,
+            output_gap=2,
+        )
+        plans.append(plan)
+    return _replace_group(
+        group,
+        executable=True,
+        fallback_reason="",
+        plan=tuple(plans),
+        fused_weight_count=len(modules),
+        executor=Stage2RuntimeExecutor(plans=(plans[0], plans[1]), output_node_ids=group.conv_nodes),
+    )
+
+
 def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str, Any]]:
     refs = _r18_stage_references()
     groups: list[RegionFirstRuntimeGroup] = []
+    excluded_nodes: list[dict[str, str]] = []
     for stage_index, stage_name in enumerate(("stage1", "stage2", "stage3", "stage4")):
         prefix = f"layers_{stage_index}"
-        conv_nodes = tuple(
-            str(node)
-            for node in dag.topological_sort()
-            if str(node).startswith(prefix) and "conv" in str(node)
-        )
+        conv_nodes_list: list[str] = []
+        for node in dag.topological_sort():
+            if not (str(node).startswith(prefix) and "conv" in str(node)):
+                continue
+            module = dag.nodes[node].get("module")
+            if str(stage_name) == "stage2":
+                # The vendored stage2 materializer is the same-shape
+                # 128->128 region. The first block conv is a stride-2
+                # transition and must stay dense until a transition
+                # materializer exists.
+                if (
+                    getattr(module, "in_channels", None) != 128
+                    or getattr(module, "out_channels", None) != 128
+                    or tuple(getattr(module, "kernel_size", ())) != (3, 3)
+                    or tuple(getattr(module, "stride", ())) != (1, 1)
+                ):
+                    excluded_nodes.append(
+                        {
+                            "node": str(node),
+                            "stage": str(stage_name),
+                            "reason": "transition_conv_not_supported_by_same_shape_stage2_materializer",
+                        }
+                    )
+                    continue
+            conv_nodes_list.append(str(node))
+        conv_nodes = tuple(conv_nodes_list)
         ref = refs[str(stage_name)]
         depth = 3 if str(stage_name) == "stage4" else 2
         groups.append(
@@ -285,6 +425,7 @@ def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str
         "edge_count": int(len(dag.edges)),
         "selected_region_count": int(len(groups)),
         "stage_node_counts": {group.stage: int(len(group.conv_nodes)) for group in groups},
+        "excluded_nodes": excluded_nodes,
     }
     return tuple(groups), graph_audit
 
@@ -316,6 +457,8 @@ class RegionFirstCompileRegistry:
             modules = tuple(dag.nodes[node].get("module") for node in group.conv_nodes if node in dag.nodes)
             if group.stage == "stage1":
                 group = _stage1_runtime_from_modules(group, modules)
+            elif group.stage == "stage2":
+                group = _stage2_runtime_from_modules(group, modules)
             resolved_groups.append(group)
         object.__setattr__(self, "groups", tuple(resolved_groups))
         group_by_node = {node: group for group in self.groups for node in group.conv_nodes}
@@ -345,15 +488,15 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
     started = time.time()
     groups, graph_audit = discover_r18_tiny_region_groups()
     # Report mode does not have fused Orion modules available, so simulate the
-    # post-compile state: stage1 is now fused-weight capable, stages2-4 remain
-    # explicit fallbacks until their runtime handoff is implemented.
+    # post-compile state: stage1/stage2 are fused-weight capable, stages3-4
+    # remain explicit fallbacks until their runtime handoff is implemented.
     groups = tuple(
         _replace_group(
             group,
-            executable=bool(group.stage == "stage1"),
-            fallback_reason="" if group.stage == "stage1" else group.fallback_reason,
-            fused_weight_count=4 if group.stage == "stage1" else 0,
-            executor="stage1_runtime_executor_attached" if group.stage == "stage1" else None,
+            executable=bool(group.stage in {"stage1", "stage2"}),
+            fallback_reason="" if group.stage in {"stage1", "stage2"} else group.fallback_reason,
+            fused_weight_count=len(group.conv_nodes) if group.stage in {"stage1", "stage2"} else 0,
+            executor=f"{group.stage}_runtime_executor_attached" if group.stage in {"stage1", "stage2"} else None,
         )
         for group in groups
     )
@@ -422,7 +565,7 @@ def build_r18_tiny_region_first_e2e_report() -> dict[str, Any]:
             "selected_regions_use_region_first_runtime_group": True,
             "full_network_ckks": False,
             "full_runtime_publishable": False,
-            "reason": "RegionFirstRuntimeGroups are attached as compile-time proxies; fused-weight runtime materializers are still dense fallback.",
+            "reason": "Stage1 and same-shape stage2 proxies are executable; stage3/stage4 and transition coverage remain non-publishable fallback work.",
         },
         "timing_s": {"report_build_s": float(time.time() - started)},
     }

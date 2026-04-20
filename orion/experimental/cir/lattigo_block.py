@@ -434,8 +434,30 @@ def build_r18_stage1_shared_block_plan(
     )
 
 
-def build_r18_stage2_shared_block_plan(*, input_pair_index: int = 0, bank_count: int | None = None) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
-    return build_r18_same_stage_shared_block_plan(spec=R18_STAGE2_SPEC, input_pair_index=int(input_pair_index), bank_count=bank_count)
+def build_r18_stage2_shared_block_plan(
+    *,
+    input_pair_index: int = 0,
+    bank_count: int | None = None,
+    weight_override: torch.Tensor | None = None,
+    bias_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    input_shape: tuple[int, int, int] | None = None,
+    output_shape: tuple[int, int, int] | None = None,
+    input_gap: int | None = None,
+    output_gap: int | None = None,
+) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+    return build_r18_same_stage_shared_block_plan(
+        spec=R18_STAGE2_SPEC,
+        input_pair_index=int(input_pair_index),
+        bank_count=bank_count,
+        weight_override=weight_override,
+        bias_override=bias_override,
+        source_override=source_override,
+        input_shape=input_shape,
+        output_shape=output_shape,
+        input_gap=input_gap,
+        output_gap=output_gap,
+    )
 
 
 def build_r18_stage3_shared_block_plan(*, bank_count: int | None = None) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
