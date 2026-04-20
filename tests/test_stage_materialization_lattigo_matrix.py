@@ -23,6 +23,26 @@ def _fake_r18_stage2_evidence() -> dict:
     }
 
 
+def _fake_r18_stage3_evidence() -> dict:
+    return {
+        "status": "ok",
+        "network": "R18",
+        "family": "stage3_same",
+        "stats_from_execution": {"rotations": 90, "conjugations": 2, "ct_pt_mults": 6750, "adds": 6753},
+        "parity": {"exact": True, "max_abs": 0.00045, "tolerance": 0.001},
+    }
+
+
+def _fake_r18_stage4_evidence() -> dict:
+    return {
+        "status": "ok",
+        "network": "R18",
+        "family": "stage4_same",
+        "stats_from_execution": {"rotations": 158, "conjugations": 1, "ct_pt_mults": 9767, "adds": 9768},
+        "parity": {"exact": True, "max_abs": 0.00082, "tolerance": 0.001},
+    }
+
+
 def _row(payload: dict, network: str, stage: str) -> dict:
     for row in payload["rows"]:
         if row["network"] == network and row["stage"] == stage:
@@ -98,3 +118,22 @@ def test_stage_matrix_flips_r18_stage2_when_lattigo_evidence_is_available() -> N
     assert _row(payload, "R18", "stage2")["publishable_lattigo_fact"] is True
     assert payload["summary"]["ok_count"] == 2
     assert payload["summary"]["missing_materializer_count"] == 6
+
+
+def test_stage_matrix_flips_all_r18_stages_when_lattigo_evidence_is_available() -> None:
+    payload = build_stage_materialization_lattigo_matrix(
+        lattigo_payload=_fake_r18_stage1_evidence(),
+        extra_lattigo_payloads=(
+            _fake_r18_stage2_evidence(),
+            _fake_r18_stage3_evidence(),
+            _fake_r18_stage4_evidence(),
+        ),
+    )
+
+    for stage in ("stage1", "stage2", "stage3", "stage4"):
+        row = _row(payload, "R18", stage)
+        assert row["status"] == "ok"
+        assert row["stats_match_scripts_cir"] is True
+        assert row["publishable_lattigo_fact"] is True
+    assert payload["summary"]["ok_count"] == 4
+    assert payload["summary"]["missing_materializer_count"] == 4

@@ -24,6 +24,10 @@ def _lattigo_evidence_by_stage(*payloads: dict[str, Any] | None) -> dict[tuple[s
             out[("R18", "stage1")] = dict(lattigo_payload)
         elif family == "stage2_same":
             out[("R18", "stage2")] = dict(lattigo_payload)
+        elif family == "stage3_same":
+            out[("R18", "stage3")] = dict(lattigo_payload)
+        elif family == "stage4_same":
+            out[("R18", "stage4")] = dict(lattigo_payload)
     return out
 
 

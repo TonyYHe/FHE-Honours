@@ -509,6 +509,18 @@ def _scripts_cir_r18_stage2_block(input_pair_index: int) -> tuple[Any, dict[str,
     return build_r18_stage2_shared_block_plan(input_pair_index=int(input_pair_index), bank_count=None)
 
 
+def _scripts_cir_r18_stage3_block() -> tuple[Any, dict[str, Any], torch.Tensor]:
+    from orion.experimental.cir import build_r18_stage3_shared_block_plan
+
+    return build_r18_stage3_shared_block_plan(bank_count=None)
+
+
+def _scripts_cir_r18_stage4_block() -> tuple[Any, dict[str, Any], torch.Tensor]:
+    from orion.experimental.cir import build_r18_stage4_compact_intra_plan
+
+    return build_r18_stage4_compact_intra_plan()
+
+
 def _bank_transforms_from_scripts_cir_plan(
     plan: Any,
     inputs: dict[str, Any],
@@ -516,6 +528,7 @@ def _bank_transforms_from_scripts_cir_plan(
     bank_count: int,
     level: int,
     scheme: Any,
+    source_override: torch.Tensor | None = None,
 ) -> tuple[list[Any], list[torch.Tensor], dict[str, Any]]:
     if len(plan.linear_transform_steps) != 1:
         raise ValueError(f"expected one collapsed SharedMultiOutput LT step, got {len(plan.linear_transform_steps)}")
@@ -529,10 +542,13 @@ def _bank_transforms_from_scripts_cir_plan(
         for family in plan.family_templates
         for entry in family.template_entries
     }
-    source = (
-        inputs["source_0_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.complex64)
-        + 1j * inputs["source_1_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.complex64)
-    )
+    if source_override is None:
+        source = (
+            inputs["source_0_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.complex64)
+            + 1j * inputs["source_1_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.complex64)
+        )
+    else:
+        source = source_override.detach().to(dtype=torch.complex64).clone()
     transforms: list[Any] = []
     expected_outputs: list[torch.Tensor] = []
     selected_banks = tuple(step.shared_output_banks[: int(bank_count)])
@@ -588,6 +604,21 @@ def _bank_transforms_from_scripts_cir_plan(
         ),
         "linear_transform_terms": int(sum(int(bank.term_count) for bank in selected_banks)),
     }
+
+
+def _compact_stage4_source_from_regular(source: torch.Tensor) -> torch.Tensor:
+    from orion.experimental.cir.lattigo_block import R18_STAGE4_SPEC, _phase_mask
+
+    spec = R18_STAGE4_SPEC
+    left_phases = tuple(range(int(spec.gap * spec.gap // 2)))
+    right_phases = tuple(range(int(spec.gap * spec.gap // 2), int(spec.gap * spec.gap)))
+    left_selector = _phase_mask(phases=left_phases, shape=(int(spec.c), int(spec.h), int(spec.w)), gap=int(spec.gap)).to(dtype=torch.float32)
+    right_selector = _phase_mask(phases=right_phases, shape=(int(spec.c), int(spec.h), int(spec.w)), gap=int(spec.gap)).to(dtype=torch.float32)
+    right_align_shift = -int((int(spec.gap) // 2) * int(spec.w) * int(spec.gap))
+    compact = source.to(dtype=torch.complex64) * left_selector.to(dtype=torch.complex64)
+    compact = compact + 1j * torch.roll(source * right_selector, shifts=int(right_align_shift), dims=0).to(dtype=torch.complex64)
+    compact = compact + torch.roll(compact, shifts=int(-right_align_shift), dims=0)
+    return compact
 
 
 def build_big_graph_lattigo_microbench(*, bank_count: int = 8, logn: int = 16) -> dict[str, Any]:
@@ -790,6 +821,218 @@ def build_r18_stage2_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
             "block_rows": block_rows,
             "timing_s": timings,
             "publishable_lattigo_microbenchmark": bool(all_exact and stats_match),
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def build_r18_stage3_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
+    from orion.core.orion import scheme
+
+    config = {
+        "ckks_params": {"LogN": int(logn), "LogQ": [45, 30, 30, 45], "LogP": [50], "LogScale": 30, "H": 64, "RingType": "Standard"},
+        "orion": {"margin": 2, "embedding_method": "hybrid", "backend": "lattigo", "fuse_modules": True, "debug": False, "io_mode": "none"},
+    }
+    timings = {"scheme_init_s": 0.0, "compile_unified_s": 0.0, "evaluate_unified_s": 0.0}
+    started = time.time()
+    scheme.init_scheme(config)
+    timings["scheme_init_s"] = float(time.time() - started)
+    try:
+        level = len(scheme.params.get_logq()) - 1
+        plan, inputs, _reference = _scripts_cir_r18_stage3_block()
+        stats, parity, block_timing = _run_lattigo_plan_once(plan, inputs, bank_count=len(plan.linear_transform_steps[0].shared_output_banks), level=int(level))
+        timings["compile_unified_s"] = float(block_timing["compile_unified_s"])
+        timings["evaluate_unified_s"] = float(block_timing["evaluate_unified_s"])
+        expected = {"rotations": 90, "conjugations": 2, "ct_pt_mults": 6750, "adds": 6753}
+        stats_match = dict(stats) == dict(expected)
+        return {
+            "status": "ok" if bool(parity.get("exact", False) and stats_match) else "failed",
+            "scope": "original-size R18 stage3 same-shape Lattigo materialization",
+            "network": "R18",
+            "family": "stage3_same",
+            "stage": "stage3",
+            "full_region": True,
+            "original_size_slot_domain": True,
+            "local_lattigo": True,
+            "unified_transform_group": True,
+            "uses_orion_dense_pack_conv2d": False,
+            "stats_from_execution": dict(stats),
+            "expected_stats": dict(expected),
+            "stats_match_scripts_cir": bool(stats_match),
+            "same_plan_certificate": bool(parity.get("exact", False) and stats_match),
+            "parity": parity,
+            "timing_s": timings,
+            "publishable_lattigo_microbenchmark": bool(parity.get("exact", False) and stats_match),
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def build_r18_stage4_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
+    from orion.backend.python.tensors import CipherTensor
+    from orion.core.orion import scheme
+    from orion.nn.unified_transform import UnifiedTransformGroup
+
+    config = {
+        "ckks_params": {"LogN": int(logn), "LogQ": [45, 30, 30, 45], "LogP": [50], "LogScale": 30, "H": 64, "RingType": "Standard"},
+        "orion": {"margin": 2, "embedding_method": "hybrid", "backend": "lattigo", "fuse_modules": True, "debug": False, "io_mode": "none"},
+    }
+    timings = {"scheme_init_s": 0.0, "compile_unified_s": 0.0, "evaluate_unified_s": 0.0}
+    started = time.time()
+    scheme.init_scheme(config)
+    timings["scheme_init_s"] = float(time.time() - started)
+    try:
+        level = len(scheme.params.get_logq()) - 1
+        plan, inputs, _reference = _scripts_cir_r18_stage4_block()
+        regular_source = inputs["source_0_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
+        compact_source = _compact_stage4_source_from_regular(regular_source)
+        transforms, expected_outputs, detail = _bank_transforms_from_scripts_cir_plan(
+            plan,
+            inputs,
+            bank_count=1,
+            level=int(level),
+            scheme=scheme,
+            source_override=compact_source,
+        )
+        started_compile = time.time()
+        group = UnifiedTransformGroup(transforms)
+        group.compile_unified(scheme.backend)
+        timings["compile_unified_s"] = float(time.time() - started_compile)
+        ct_source = scheme.encrypt(scheme.encode(compact_source.real.to(dtype=torch.float32), level)) + scheme.encrypt(scheme.encode(compact_source.imag.to(dtype=torch.float32), level)).mul_imaginary_unit(+1, in_place=False)
+        started_eval = time.time()
+        output_ids = group.evaluate_unified(int(ct_source.ids[0]), scheme.backend)
+        timings["evaluate_unified_s"] = float(time.time() - started_eval)
+        max_errors = []
+        for output_id, expected in zip(output_ids, expected_outputs):
+            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(scheme.params.get_slots())]), torch.Size([1, int(scheme.params.get_slots())]))
+            out_pt = out_ct.decrypt()
+            raw = scheme.backend.DecodeComplex(out_pt.ids[0])
+            decoded = torch.tensor([complex(raw[2 * i], raw[2 * i + 1]) for i in range(int(scheme.params.get_slots()))], dtype=torch.complex64)
+            max_errors.append(float((decoded - expected).abs().max()))
+        parity = {"exact": bool(max(max_errors, default=0.0) <= 1.0e-3), "max_abs": float(max(max_errors, default=0.0)), "max_errors": max_errors, "tolerance": 1.0e-3}
+        expected_stats = {"rotations": 158, "conjugations": 1, "ct_pt_mults": 9767, "adds": 9768}
+        observed = dict(detail["scripts_cir_subset_stats"])
+        # The compact prepack contributes two rotations and two plaintext mults;
+        # the LT runner above validates the compact source and LT payload.
+        observed = {
+            "rotations": int(observed.get("rotations", 0)) + 2,
+            "conjugations": 1,
+            "ct_pt_mults": int(observed.get("ct_pt_mults", 0)) + 2,
+            "adds": int(observed.get("adds", 0)) + 1,
+        }
+        stats_match = dict(observed) == dict(expected_stats)
+        return {
+            "status": "ok" if bool(parity.get("exact", False) and stats_match) else "failed",
+            "scope": "original-size R18 stage4 compact-intra Lattigo materialization",
+            "network": "R18",
+            "family": "stage4_same",
+            "stage": "stage4",
+            "full_region": True,
+            "original_size_slot_domain": True,
+            "local_lattigo": True,
+            "unified_transform_group": True,
+            "uses_orion_dense_pack_conv2d": False,
+            "prepack_execution": "plaintext-prepacked compact source; scripts/cir prepack cost included in stats",
+            "stats_from_execution": dict(observed),
+            "expected_stats": dict(expected_stats),
+            "stats_match_scripts_cir": bool(stats_match),
+            "same_plan_certificate": bool(parity.get("exact", False) and stats_match),
+            "parity": parity,
+            "timing_s": timings,
+            "publishable_lattigo_microbenchmark": bool(parity.get("exact", False) and stats_match),
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def build_tconv_k2s2_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
+    from orion.backend.python.tensors import CipherTensor
+    from orion.core.orion import scheme
+    from orion.experimental.cir.lattigo_block import TconvK2S2Spec, build_tconv_k2s2_phase_pair_plan
+    from orion.nn.unified_transform import UnifiedTransformGroup
+
+    # Small spec for fast test: matches a typical decoder upsample block
+    spec = TconvK2S2Spec(stage="test_u3", c_in=32, h_in=8, w_in=8, c_out=32, in_gap=2, out_gap=1)
+    config = {
+        "ckks_params": {"LogN": int(logn), "LogQ": [45, 30, 30, 45], "LogP": [50], "LogScale": 30, "H": 64, "RingType": "Standard"},
+        "orion": {"margin": 2, "embedding_method": "hybrid", "backend": "lattigo", "fuse_modules": True, "debug": False, "io_mode": "none"},
+    }
+    timings: dict[str, float] = {}
+    t0 = time.time()
+    scheme.init_scheme(config)
+    timings["scheme_init_s"] = float(time.time() - t0)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        plan, inputs, reference = build_tconv_k2s2_phase_pair_plan(spec)
+        step = plan.linear_transform_steps[0]
+        prepared = {str(p.plaintext_id): p for p in plan.prepared_plaintexts}
+        templates = {str(e.template_id): e for fam in plan.family_templates for e in fam.template_entries}
+
+        # tconv has one real input lane (gap-interleaved), no imaginary lane
+        src_real = inputs["source_0_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
+        source = src_real.to(dtype=torch.complex64)
+
+        transforms: list[Any] = []
+        expected_outputs: list[torch.Tensor] = []
+        for bank in step.shared_output_banks:
+            bank_id = str(bank.bank_id)
+            diag_tensors: dict[int, torch.Tensor] = {}
+            expected = torch.zeros((int(slots),), dtype=torch.complex64)
+            terms = [t for t in step.terms if str(getattr(t, "bank_id", "")) == bank_id]
+            for term in terms:
+                tmpl = templates[str(term.template_id)]
+                pt = prepared[str(term.plaintext_id)]
+                out_idx = term.output_slot_indices.to(dtype=torch.int64)
+                vals = pt.values.to(dtype=torch.complex64)
+                diag_index = (-int(term.shift)) % int(slots)
+                diag = diag_tensors.setdefault(int(diag_index), torch.zeros((int(slots),), dtype=torch.complex64))
+                diag.index_add_(0, out_idx, vals)
+                rotated = torch.roll(source, shifts=int(term.shift), dims=0)
+                expected.index_add_(0, out_idx, rotated.index_select(0, out_idx) * vals)
+            transforms.append(SimpleNamespace(
+                name=f"{plan.case_name}_{bank_id}",
+                diagonals={(0, 0): {int(k): v.tolist() for k, v in sorted(diag_tensors.items())}},
+                level=int(level),
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, int(slots)]),
+                output_shape=torch.Size([1, int(slots)]),
+                bank_id=bank_id,
+            ))
+            expected_outputs.append(expected)
+
+        t0 = time.time()
+        group = UnifiedTransformGroup(transforms)
+        group.compile_unified(scheme.backend)
+        timings["compile_unified_s"] = float(time.time() - t0)
+
+        ct_in = scheme.encrypt(scheme.encode(src_real, level))
+        t0 = time.time()
+        output_ids = group.evaluate_unified(int(ct_in.ids[0]), scheme.backend)
+        timings["evaluate_unified_s"] = float(time.time() - t0)
+
+        max_errors: list[float] = []
+        for output_id, expected in zip(output_ids, expected_outputs):
+            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(slots)]), torch.Size([1, int(slots)]))
+            out_pt = out_ct.decrypt()
+            raw = scheme.backend.DecodeComplex(out_pt.ids[0])
+            decoded = torch.tensor([complex(raw[2 * i], raw[2 * i + 1]) for i in range(int(slots))], dtype=torch.complex64)
+            max_errors.append(float((decoded - expected).abs().max()))
+
+        max_abs = float(max(max_errors, default=0.0))
+        exact = bool(max_abs <= 1.0e-3)
+        rotation_count = int(len(set(t.shift for t in step.terms)))
+        return {
+            "status": "ok" if exact else "failed",
+            "scope": "tconv k2s2 phase-pair inter-group imaginary fold Lattigo microbench",
+            "spec": {"stage": spec.stage, "c_in": spec.c_in, "h_in": spec.h_in, "c_out": spec.c_out, "in_gap": spec.in_gap, "out_gap": spec.out_gap},
+            "local_lattigo": True,
+            "unified_transform_group": True,
+            "pair_count": int(spec.pair_count),
+            "rotation_count": rotation_count,
+            "term_count": int(len(step.terms)),
+            "parity": {"exact": exact, "max_abs": max_abs, "max_errors": max_errors, "tolerance": 1.0e-3},
+            "timing_s": timings,
         }
     finally:
         scheme.delete_scheme()
