@@ -1,9 +1,8 @@
 """Vendored region-first CIR support for Orion experiments.
 
-This package contains the minimal scripts/cir-derived data model and selected
-R18/R34 selector/materializer surfaces needed by Orion's experimental
-region-first report path. It is intentionally local to Orion and does not import
-HaloED or mutate ``sys.path``.
+This package contains the minimal region-first data model and selected R18/R34
+selector/materializer surfaces needed by Orion's experimental report path. It is
+intentionally self-contained inside Orion.
 """
 
 from .ir import (
@@ -18,6 +17,7 @@ from .ir import (
     TensorRegion,
 )
 from .lattigo_block import build_r18_stage1_shared_block_plan
+from .selector import build_region_first_full_selector, build_region_first_full_selector_summary
 
 __all__ = [
     "CanonicalTemplateEntry",
@@ -30,5 +30,6 @@ __all__ = [
     "SharedOutputBank",
     "TensorRegion",
     "build_r18_stage1_shared_block_plan",
+    "build_region_first_full_selector",
+    "build_region_first_full_selector_summary",
 ]
-
