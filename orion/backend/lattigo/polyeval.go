@@ -130,7 +130,6 @@ func GenerateMinimaxSignCoeffs(
 			int(logerr),
 			degrees,
 			bignum.Sign,
-			int(debug) != 0,
 		)
 
 		// Divide last poly by 2 to scale from [-1,1] -> [-0.5, 0.5]

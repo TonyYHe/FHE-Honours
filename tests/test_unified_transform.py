@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
+import torch
 
+from orion.backend.python.tensors import CipherTensor
+from orion.core.orion import scheme
 from orion.nn.unified_transform import UnifiedTransformGroup, can_use_unified_bsgs
 
 
@@ -90,3 +94,65 @@ def test_unified_transform_group_requires_diagonals() -> None:
 
 def test_can_use_unified_bsgs_rejects_non_linear_transform_instances() -> None:
     assert can_use_unified_bsgs([_fake_transform({0: [1.0]})]) is False
+
+
+def test_unified_transform_group_runs_on_lattigo_backend() -> None:
+    shared_library = Path("orion/backend/lattigo/lattigo-linux.so")
+    if not shared_library.exists():
+        pytest.skip("local Lattigo shared library has not been built")
+
+    config = {
+        "ckks_params": {
+            "LogN": 12,
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        identity = [1.0] * slots
+        doubled = [2.0] * slots
+        transform_a = SimpleNamespace(
+            diagonals={(0, 0): {0: identity}},
+            level=level,
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, slots]),
+            output_shape=torch.Size([1, slots]),
+        )
+        transform_b = SimpleNamespace(
+            diagonals={(0, 0): {0: doubled}},
+            level=level,
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, slots]),
+            output_shape=torch.Size([1, slots]),
+        )
+        group = UnifiedTransformGroup([transform_a, transform_b])
+        group.compile_unified(scheme.backend)
+
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        ct = scheme.encrypt(scheme.encode(x, level))
+        output_ids = group.evaluate_unified(ct.ids[0], scheme.backend)
+        decoded = []
+        for output_id in output_ids:
+            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, slots]), torch.Size([1, slots]))
+            decoded.append(out_ct.decrypt().decode().reshape(-1))
+
+        assert len(decoded) == 2
+        assert float((decoded[0][:8] - x[:8]).abs().max()) <= 1.0e-4
+        assert float((decoded[1][:8] - 2.0 * x[:8]).abs().max()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()
