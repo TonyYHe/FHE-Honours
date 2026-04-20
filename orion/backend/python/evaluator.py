@@ -11,6 +11,11 @@ class NewEvaluator:
 
     def negate(self, ctxt):
         return self.backend.Negate(ctxt)
+
+    def conjugate(self, ctxt, in_place):
+        if in_place:
+            return self.backend.Conjugate(ctxt)
+        return self.backend.ConjugateNew(ctxt)
     
     def rotate(self, ctxt, amount, in_place):
         if in_place:
@@ -40,6 +45,11 @@ class NewEvaluator:
             ct_out = self.backend.Rescale(ct_out)
 
         return ct_out
+
+    def mul_imaginary_unit(self, ctxt, sign, in_place):
+        if in_place:
+            return self.backend.MulImaginaryUnit(ctxt, int(sign))
+        return self.backend.MulImaginaryUnitNew(ctxt, int(sign))
         
     def add_plaintext(self, ctxt, ptxt, in_place):
         if in_place:
@@ -87,4 +97,3 @@ class NewEvaluator:
 
     def get_live_ciphertexts(self):
         return self.backend.GetLiveCiphertexts() 
-

@@ -33,7 +33,10 @@ func AddPo2RotationKeys() {
 //export AddRotationKey
 func AddRotationKey(rotation C.int) {
 	galEl := scheme.Params.GaloisElement(int(rotation))
+	addGaloisKey(galEl)
+}
 
+func addGaloisKey(galEl uint64) {
 	// Generate the required rotation key if it doesn't exist
 	if _, exists := liveRotKeys[galEl]; !exists {
 		rotKey := scheme.KeyGen.GenGaloisKeyNew(galEl, scheme.SecretKey)
@@ -43,6 +46,32 @@ func AddRotationKey(rotation C.int) {
 		keys := rlwe.NewMemEvaluationKeySet(scheme.RelinKey, allKeysList...)
 		scheme.Evaluator = scheme.Evaluator.WithKey(keys)
 	}
+}
+
+func AddConjugationKey() {
+	addGaloisKey(scheme.Params.GaloisElementOrderTwoOrthogonalSubgroup())
+}
+
+//export Conjugate
+func Conjugate(ciphertextID C.int) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	AddConjugationKey()
+	if err := scheme.Evaluator.Conjugate(ctIn, ctIn); err != nil {
+		panic(err)
+	}
+	return ciphertextID
+}
+
+//export ConjugateNew
+func ConjugateNew(ciphertextID C.int) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	AddConjugationKey()
+	ctOut, err := scheme.Evaluator.ConjugateNew(ctIn)
+	if err != nil {
+		panic(err)
+	}
+	idx := PushCiphertext(ctOut)
+	return C.int(idx)
 }
 
 //export Negate
@@ -174,6 +203,34 @@ func MulScalarFloatNew(ciphertextID C.int, scalar C.float) C.int {
 		panic(err)
 	}
 
+	idx := PushCiphertext(ctOut)
+	return C.int(idx)
+}
+
+//export MulImaginaryUnit
+func MulImaginaryUnit(ciphertextID, sign C.int) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	imag := 1.0
+	if int(sign) < 0 {
+		imag = -1.0
+	}
+	if err := scheme.Evaluator.Mul(ctIn, complex(0, imag), ctIn); err != nil {
+		panic(err)
+	}
+	return ciphertextID
+}
+
+//export MulImaginaryUnitNew
+func MulImaginaryUnitNew(ciphertextID, sign C.int) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	imag := 1.0
+	if int(sign) < 0 {
+		imag = -1.0
+	}
+	ctOut, err := scheme.Evaluator.MulNew(ctIn, complex(0, imag))
+	if err != nil {
+		panic(err)
+	}
 	idx := PushCiphertext(ctOut)
 	return C.int(idx)
 }

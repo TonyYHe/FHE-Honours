@@ -347,6 +347,11 @@ class LattigoLibrary:
             argtypes=[ctypes.c_int],
             restype=ArrayResultFloat,
         )
+        self.DecodeComplex = LattigoFunction(
+            self.lib.DecodeComplex,
+            argtypes=[ctypes.c_int],
+            restype=ArrayResultDouble,
+        )
 
     def setup_encryptor(self):
         self.NewEncryptor = LattigoFunction(
@@ -386,13 +391,25 @@ class LattigoLibrary:
         )
 
         self.Negate = LattigoFunction(
-            self.lib.Negate,
+          self.lib.Negate,
+            argtypes=[ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.Conjugate = LattigoFunction(
+          self.lib.Conjugate,
+            argtypes=[ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.ConjugateNew = LattigoFunction(
+          self.lib.ConjugateNew,
             argtypes=[ctypes.c_int],
             restype=ctypes.c_int
         )
 
         self.Rotate = LattigoFunction(
-            self.lib.Rotate,
+          self.lib.Rotate,
             argtypes=[
                 ctypes.c_int,
                 ctypes.c_int
@@ -489,6 +506,24 @@ class LattigoLibrary:
             argtypes=[
                 ctypes.c_int,
                 ctypes.c_float
+            ],
+            restype=ctypes.c_int
+        )
+
+        self.MulImaginaryUnit = LattigoFunction(
+          self.lib.MulImaginaryUnit,
+            argtypes=[
+                ctypes.c_int,
+                ctypes.c_int
+            ],
+            restype=ctypes.c_int
+        )
+
+        self.MulImaginaryUnitNew = LattigoFunction(
+          self.lib.MulImaginaryUnitNew,
+            argtypes=[
+                ctypes.c_int,
+                ctypes.c_int
             ],
             restype=ctypes.c_int
         )
@@ -695,6 +730,19 @@ class LattigoLibrary:
                 ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
                 ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
                 ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),  # diagDataArray
+                ctypes.POINTER(ctypes.c_int),  # diagDataLens
+                ctypes.POINTER(ctypes.c_int),  # levels
+            ],
+            restype=ArrayResultInt
+        )
+
+        self.GenerateLinearTransformsUnifiedComplex = LattigoFunction(
+            self.lib.GenerateLinearTransformsUnifiedComplex,
+            argtypes=[
+                ctypes.c_int,  # numTransforms
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
+                ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_double)),  # interleaved real/imag diagDataArray
                 ctypes.POINTER(ctypes.c_int),  # diagDataLens
                 ctypes.POINTER(ctypes.c_int),  # levels
             ],

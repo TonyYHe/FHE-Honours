@@ -116,6 +116,26 @@ class CipherTensor:
             neg_ids.append(neg_id)
 
         return CipherTensor(self.scheme, neg_ids, self.shape, self.on_shape)
+
+    def conjugate(self, in_place=False):
+        conj_ids = []
+        for ctxt in self.ids:
+            conj_id = self.evaluator.conjugate(ctxt, in_place)
+            conj_ids.append(conj_id)
+
+        if in_place:
+            return self
+        return CipherTensor(self.scheme, conj_ids, self.shape, self.on_shape)
+
+    def mul_imaginary_unit(self, sign=1, in_place=False):
+        mul_ids = []
+        for ctxt in self.ids:
+            mul_id = self.evaluator.mul_imaginary_unit(ctxt, int(sign), in_place)
+            mul_ids.append(mul_id)
+
+        if in_place:
+            return self
+        return CipherTensor(self.scheme, mul_ids, self.shape, self.on_shape)
     
     def add(self, other, in_place=False):
         self._check_valid(other)

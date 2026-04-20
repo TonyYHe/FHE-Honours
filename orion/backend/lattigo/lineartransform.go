@@ -263,6 +263,63 @@ func GenerateLinearTransformsUnified(
 	return SliceToCArray(ids, convertIntToCInt)
 }
 
+//export GenerateLinearTransformsUnifiedComplex
+func GenerateLinearTransformsUnifiedComplex(
+	numTransforms C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	diagDataArray **C.double, diagDataLens *C.int,
+	levels *C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	slots := scheme.Params.MaxSlots()
+
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	diagDataArraySlice := unsafe.Slice(diagDataArray, n)
+	diagDataLensSlice := unsafe.Slice(diagDataLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	params := make([]lintrans.Parameters, n)
+	diagonalsList := make([]lintrans.Diagonals[complex128], n)
+
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		raw := unsafe.Slice(diagDataArraySlice[i], int(diagDataLensSlice[i]))
+		diagonals := make(lintrans.Diagonals[complex128])
+		for j, key := range diagIdxs {
+			start := j * slots * 2
+			values := make([]complex128, slots)
+			for k := 0; k < slots; k++ {
+				values[k] = complex(float64(raw[start+2*k]), float64(raw[start+2*k+1]))
+			}
+			diagonals[key] = values
+		}
+		diagonalsList[i] = diagonals
+
+		params[i] = lintrans.Parameters{
+			DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: 1,
+		}
+	}
+
+	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+	for i := range transforms {
+		if err := lintrans.Encode(scheme.Encoder, diagonalsList[i], transforms[i]); err != nil {
+			panic(err)
+		}
+	}
+
+	ids := make([]int, n)
+	for i, lt := range transforms {
+		ids[i] = AddLinearTransform(lt)
+	}
+	return SliceToCArray(ids, convertIntToCInt)
+}
+
 //export EvaluateLinearTransformsWithSharedCache
 func EvaluateLinearTransformsWithSharedCache(
 	transformIDs *C.int, numTransforms C.int,

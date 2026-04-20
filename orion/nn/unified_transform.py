@@ -28,19 +28,27 @@ class UnifiedTransformGroup:
         diag_idxs_list: list[list[int]] = []
         diag_data_list: list[list[float]] = []
         levels: list[int] = []
+        has_complex = False
 
         for transform in self.transforms:
             all_diagonals: dict[int, list[float]] = {}
             for _block_key, block_diags in getattr(transform, "diagonals", {}).items():
                 for diag_idx, diag_values in block_diags.items():
-                    all_diagonals.setdefault(int(diag_idx), list(diag_values))
+                    values = list(diag_values)
+                    if any(isinstance(value, complex) or getattr(value, "imag", 0) != 0 for value in values):
+                        has_complex = True
+                    all_diagonals.setdefault(int(diag_idx), values)
             if not all_diagonals:
                 raise ValueError("all transforms must have generated diagonals before unified compilation")
 
             diag_idxs = sorted(all_diagonals.keys())
             diag_data_flat: list[float] = []
             for idx in diag_idxs:
-                diag_data_flat.extend(float(value) for value in all_diagonals[int(idx)])
+                for value in all_diagonals[int(idx)]:
+                    if has_complex:
+                        diag_data_flat.extend((float(getattr(value, "real", value)), float(getattr(value, "imag", 0.0))))
+                    else:
+                        diag_data_flat.append(float(value))
 
             diag_idxs_list.append(diag_idxs)
             diag_data_list.append(diag_data_flat)
@@ -53,7 +61,7 @@ class UnifiedTransformGroup:
         num_transforms = len(self.transforms)
         diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
         diag_idxs_lens = (ctypes.c_int * num_transforms)()
-        diag_data_ptrs = (ctypes.POINTER(ctypes.c_float) * num_transforms)()
+        diag_data_ptrs = (ctypes.POINTER(ctypes.c_double if has_complex else ctypes.c_float) * num_transforms)()
         diag_data_lens = (ctypes.c_int * num_transforms)()
 
         # Keep arrays alive until backend call returns.
@@ -65,7 +73,8 @@ class UnifiedTransformGroup:
             diag_idxs_lens[idx] = len(diag_idxs)
 
         for idx, diag_data in enumerate(diag_data_list):
-            array = (ctypes.c_float * len(diag_data))(*diag_data)
+            array_type = ctypes.c_double if has_complex else ctypes.c_float
+            array = (array_type * len(diag_data))(*diag_data)
             owned_arrays.append(array)
             diag_data_ptrs[idx] = array
             diag_data_lens[idx] = len(diag_data)
@@ -73,8 +82,13 @@ class UnifiedTransformGroup:
         levels_array = (ctypes.c_int * num_transforms)(*levels)
         owned_arrays.append(levels_array)
 
+        generate = (
+            backend.GenerateLinearTransformsUnifiedComplex
+            if has_complex and hasattr(backend, "GenerateLinearTransformsUnifiedComplex")
+            else backend.GenerateLinearTransformsUnified
+        )
         self.unified_ids = list(
-            backend.GenerateLinearTransformsUnified(
+            generate(
                 num_transforms,
                 diag_idxs_ptrs,
                 diag_idxs_lens,

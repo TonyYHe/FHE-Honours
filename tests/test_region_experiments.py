@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import json
 
-from orion.core.region_experiments import build_region_experiments
+import pytest
+
+from orion.core.region_experiments import (
+    build_region_experiments,
+    run_selected_region_backend_case,
+    run_tiny_imaginary_unit_backend_case,
+    run_tiny_mul_plain_backend_case,
+    run_tiny_real_imag_hybrid_backend_case,
+    run_tiny_unified_region_backend_case,
+)
 
 
 def test_region_experiments_include_local_lattigo_metadata() -> None:
@@ -45,3 +54,47 @@ def test_region_experiment_payload_is_json_serializable() -> None:
     assert '"publishable_summary"' in dumped
     assert payload["publishable_summary"]["delta"]["rotations"] < 0
     assert payload["publishable_summary"]["delta"]["ct_pt_mults"] < 0
+
+
+def test_tiny_unified_region_backend_case_runs_on_local_lattigo() -> None:
+    result = run_tiny_unified_region_backend_case()
+
+    assert result["status"] == "ok"
+    assert result["output_count"] == 2
+    assert result["max_abs"] <= 1.0e-4
+
+
+def test_tiny_mul_plain_backend_case_runs_on_local_lattigo() -> None:
+    result = run_tiny_mul_plain_backend_case()
+
+    assert result["status"] == "ok"
+    assert result["max_abs"] <= result["tolerance"]
+
+
+def test_tiny_imaginary_unit_backend_case_runs_on_local_lattigo() -> None:
+    result = run_tiny_imaginary_unit_backend_case()
+
+    assert result["status"] == "ok"
+    assert result["max_abs"] <= 1.0e-4
+    assert result["pos_imag_error"] <= 1.0e-4
+    assert result["neg_imag_error"] <= 1.0e-4
+
+
+def test_tiny_real_imag_hybrid_backend_case_runs_with_conjugate_binding() -> None:
+    result = run_tiny_real_imag_hybrid_backend_case()
+
+    assert result["status"] == "ok"
+    assert result["max_abs"] <= 1.0e-4
+    assert result["conjugate_error"] <= 1.0e-4
+    assert result["conjugate_available"] is True
+    assert result["boundary_action"] == "insert_extract"
+
+
+def test_selected_region_backend_cases_use_unified_transform_group() -> None:
+    r20 = run_selected_region_backend_case(network="R20", region_id="stage1_two_output_region")
+    r18 = run_selected_region_backend_case(network="R18", region_id="stage1_stage2_same_shape")
+
+    assert r20["status"] == "ok"
+    assert r20["backend_case"]["output_count"] == 2
+    assert r18["status"] == "ok"
+    assert r18["backend_case"]["conjugate_available"] is True

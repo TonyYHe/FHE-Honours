@@ -15,9 +15,16 @@ from __future__ import annotations
 
 import argparse
 import json
+from types import SimpleNamespace
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
+
+import torch
+
+from orion.backend.python.tensors import CipherTensor
+from orion.core.orion import scheme
+from orion.nn.unified_transform import UnifiedTransformGroup
 
 from .shared_lt import (
     PackingPlanner,
@@ -338,6 +345,256 @@ def build_region_experiments(*, networks: Iterable[str] = ("R20", "R18", "R34"),
             "experiment_count": int(len(publishable)),
         },
         "non_publishable_count": int(sum(1 for exp in experiments if not exp.publishable_executor_fact)),
+    }
+
+
+def _tiny_unified_transforms(*, slots: int, level: int, scales: tuple[float, ...]) -> tuple[Any, ...]:
+    transforms = []
+    for scale in scales:
+        transforms.append(
+            SimpleNamespace(
+                diagonals={(0, 0): {0: [float(scale)] * int(slots)}},
+                level=int(level),
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, int(slots)]),
+                output_shape=torch.Size([1, int(slots)]),
+            )
+        )
+    return tuple(transforms)
+
+
+def run_tiny_unified_region_backend_case(
+    *,
+    scales: tuple[float, ...] = (1.0, 2.0),
+    logn: int = 12,
+) -> dict[str, Any]:
+    config = {
+        "ckks_params": {
+            "LogN": int(logn),
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        transforms = _tiny_unified_transforms(slots=int(slots), level=int(level), scales=tuple(float(v) for v in scales))
+        group = UnifiedTransformGroup(transforms)
+        group.compile_unified(scheme.backend)
+
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        ct = scheme.encrypt(scheme.encode(x, level))
+        output_ids = group.evaluate_unified(ct.ids[0], scheme.backend)
+        max_errors = []
+        for scale, output_id in zip(scales, output_ids):
+            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, slots]), torch.Size([1, slots]))
+            decoded = out_ct.decrypt().decode().reshape(-1)
+            max_errors.append(float((decoded[:8] - float(scale) * x[:8]).abs().max()))
+        return {
+            "status": "ok" if max(max_errors, default=0.0) <= 1.0e-4 else "failed",
+            "case": "tiny_unified_region_backend",
+            "scales": [float(v) for v in scales],
+            "output_count": int(len(output_ids)),
+            "max_errors": max_errors,
+            "max_abs": float(max(max_errors, default=0.0)),
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def run_tiny_real_imag_hybrid_backend_case(*, logn: int = 12) -> dict[str, Any]:
+    # This validates the backend requirement for real/imag split: conjugation
+    # is available in Lattigo, and a complex packed branch output can be split
+    # back into two ReLU-safe real outputs. The input is still encrypted; the
+    # split is checked after decrypt for this first integration smoke.
+    config = {
+        "ckks_params": {
+            "LogN": int(logn),
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        transform = _tiny_unified_transforms(slots=int(slots), level=int(level), scales=(1.0,))[0]
+        # Diagonal has complex payload: real branch = 1*x, imag branch = 2*x.
+        transform.diagonals = {(0, 0): {0: [1.0 + 2.0j] * int(slots)}}
+        group = UnifiedTransformGroup([transform])
+        group.compile_unified(scheme.backend)
+
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        ct = scheme.encrypt(scheme.encode(x, level))
+        output_id = group.evaluate_unified(ct.ids[0], scheme.backend)[0]
+        out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, slots]), torch.Size([1, slots]))
+        conj_ct = out_ct.conjugate(in_place=False)
+        out_pt = out_ct.decrypt()
+        conj_pt = conj_ct.decrypt()
+        raw_complex = scheme.backend.DecodeComplex(out_pt.ids[0])
+        raw_conj = scheme.backend.DecodeComplex(conj_pt.ids[0])
+        decoded = torch.tensor(
+            [complex(raw_complex[2 * i], raw_complex[2 * i + 1]) for i in range(slots)],
+            dtype=torch.complex64,
+        )
+        decoded_conj = torch.tensor(
+            [complex(raw_conj[2 * i], raw_conj[2 * i + 1]) for i in range(slots)],
+            dtype=torch.complex64,
+        )
+        real_error = float((decoded[:8].real - x[:8]).abs().max())
+        imag_error = float((decoded[:8].imag - 2.0 * x[:8]).abs().max())
+        conj_error = float((decoded_conj[:8] - torch.conj(decoded[:8])).abs().max())
+        return {
+            "status": "ok" if max(real_error, imag_error, conj_error) <= 1.0e-4 else "failed",
+            "case": "tiny_real_imag_hybrid_backend",
+            "real_error": float(real_error),
+            "imag_error": float(imag_error),
+            "conjugate_error": float(conj_error),
+            "max_abs": float(max(real_error, imag_error, conj_error)),
+            "conjugate_available": True,
+            "boundary_action": "insert_extract",
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def run_tiny_mul_plain_backend_case(*, logn: int = 12) -> dict[str, Any]:
+    config = {
+        "ckks_params": {
+            "LogN": int(logn),
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        mask = torch.ones(slots, dtype=torch.float32) * 3.0
+        ct = scheme.encrypt(scheme.encode(x, level))
+        pt = scheme.encode(mask, level)
+        out = ct * pt
+        decoded = out.decrypt().decode().reshape(-1)
+        max_error = float((decoded[:8] - 3.0 * x[:8]).abs().max())
+        return {
+            "status": "ok" if max_error <= 1.0e-2 else "failed",
+            "case": "tiny_mul_plain_backend",
+            "max_abs": float(max_error),
+            "tolerance": 1.0e-2,
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def run_tiny_imaginary_unit_backend_case(*, logn: int = 12) -> dict[str, Any]:
+    config = {
+        "ckks_params": {
+            "LogN": int(logn),
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        ct = scheme.encrypt(scheme.encode(x, level))
+        pos = ct.mul_imaginary_unit(+1, in_place=False)
+        neg = ct.mul_imaginary_unit(-1, in_place=False)
+        pos_pt = pos.decrypt()
+        neg_pt = neg.decrypt()
+        raw_pos = scheme.backend.DecodeComplex(pos_pt.ids[0])
+        raw_neg = scheme.backend.DecodeComplex(neg_pt.ids[0])
+        dec_pos = torch.tensor([complex(raw_pos[2 * i], raw_pos[2 * i + 1]) for i in range(slots)], dtype=torch.complex64)
+        dec_neg = torch.tensor([complex(raw_neg[2 * i], raw_neg[2 * i + 1]) for i in range(slots)], dtype=torch.complex64)
+        pos_real = float(dec_pos[:8].real.abs().max())
+        pos_imag = float((dec_pos[:8].imag - x[:8]).abs().max())
+        neg_real = float(dec_neg[:8].real.abs().max())
+        neg_imag = float((dec_neg[:8].imag + x[:8]).abs().max())
+        max_error = max(pos_real, pos_imag, neg_real, neg_imag)
+        return {
+            "status": "ok" if max_error <= 1.0e-4 else "failed",
+            "case": "tiny_imaginary_unit_backend",
+            "max_abs": float(max_error),
+            "pos_real_error": float(pos_real),
+            "pos_imag_error": float(pos_imag),
+            "neg_real_error": float(neg_real),
+            "neg_imag_error": float(neg_imag),
+        }
+    finally:
+        scheme.delete_scheme()
+
+
+def run_selected_region_backend_case(*, network: str, region_id: str) -> dict[str, Any]:
+    experiments = build_region_experiments(networks=(str(network),))["experiments"]
+    matches = [row for row in experiments if str(row["region_id"]) == str(region_id)]
+    if not matches:
+        raise ValueError(f"unknown region experiment {network}:{region_id}")
+    row = matches[0]
+    if str(row["strategy"]) == "input_mult_output_fold":
+        backend = run_tiny_unified_region_backend_case(scales=(1.0, 2.0))
+    elif "real_imag_hybrid" in str(row["strategy"]):
+        backend = run_tiny_real_imag_hybrid_backend_case()
+    else:
+        raise ValueError(f"unsupported backend smoke for strategy {row['strategy']}")
+    return {
+        "status": str(backend["status"]),
+        "network": str(network),
+        "region_id": str(region_id),
+        "strategy": str(row["strategy"]),
+        "experiment_publishable": bool(row["publishable_executor_fact"]),
+        "backend_case": backend,
     }
 
 

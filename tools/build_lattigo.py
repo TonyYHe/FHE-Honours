@@ -59,5 +59,5 @@ def build(setup_kwargs=None):
     return setup_kwargs or {}
 
 if __name__ == "__main__":
-    success = build()
-    sys.exit(0 if success else 1)
+    build()
+    sys.exit(0)

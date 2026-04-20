@@ -40,3 +40,21 @@ func Decode(
 	arrPtr, length := SliceToCArray(result, convertFloatToCFloat)
 	return arrPtr, length
 }
+
+//export DecodeComplex
+func DecodeComplex(
+	plaintextID C.int,
+) (*C.double, C.ulong) {
+	plaintext := RetrievePlaintext(int(plaintextID))
+	result := make([]complex128, scheme.Params.MaxSlots())
+	scheme.Encoder.Decode(plaintext, result)
+
+	flat := make([]float64, 2*len(result))
+	for i, value := range result {
+		flat[2*i] = real(value)
+		flat[2*i+1] = imag(value)
+	}
+
+	arrPtr, length := SliceToCArray(flat, convertFloat64ToCDouble)
+	return arrPtr, length
+}
