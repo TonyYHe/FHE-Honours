@@ -69,6 +69,9 @@ R34_STAGE1_STAGE2 = RegionFirstFixture(
 R18_R34_FIXTURES = (R18_STAGE1_STAGE2, R34_STAGE1_STAGE2)
 EXCLUDED_SYNTHETIC_ROWS = ("R20:stage1_two_output_region",)
 
+R18_TINY_DENSE_FULL_STATS = {"rotations": 11454, "conjugations": 0, "ct_pt_mults": 177121, "adds": 177121}
+R18_TINY_REGION_FIRST_FULL_STATS = {"rotations": 3996, "conjugations": 161, "ct_pt_mults": 108007, "adds": 108193}
+
 
 STAGE_MATERIALIZER_REFERENCES: tuple[StageMaterializerReference, ...] = (
     StageMaterializerReference(
