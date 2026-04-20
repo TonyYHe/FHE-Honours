@@ -112,4 +112,3 @@ def write_region_first_pipeline_report(
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
-

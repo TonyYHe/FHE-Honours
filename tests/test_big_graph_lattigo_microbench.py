@@ -34,7 +34,9 @@ def test_r18_original_size_block_runs_through_lattigo_unified_transform(monkeypa
     assert payload["local_lattigo"] is True
     assert payload["unified_transform_group"] is True
     assert payload["uses_orion_dense_pack_conv2d"] is False
-    assert payload["bank_count"] == 2
+    assert payload["bank_count"] == 8
+    assert payload["stats_from_execution"] == {"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089}
+    assert payload["scripts_cir_full_block_stats"] == payload["stats_from_execution"]
     assert payload["same_plan_certificate"] is True
     assert payload["parity"]["exact"] is True
     assert payload["parity"]["max_abs"] <= payload["parity"]["tolerance"]

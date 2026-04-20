@@ -66,8 +66,8 @@ def test_big_graph_microbench_counts_original_size_lattigo_artifact(tmp_path: Pa
   "region_id": "stage1_same_block0",
   "full_region": false,
   "original_size_slot_domain": true,
-  "bank_count": 2,
-  "stats_from_execution": {"rotations": 20, "conjugations": 2, "ct_pt_mults": 270, "adds": 273},
+  "bank_count": 8,
+  "stats_from_execution": {"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089},
   "parity": {"exact": true, "max_abs": 0.0001, "tolerance": 0.001},
   "publishable_lattigo_microbenchmark": true
 }
@@ -80,6 +80,7 @@ def test_big_graph_microbench_counts_original_size_lattigo_artifact(tmp_path: Pa
     assert payload["status"] == "partial_original_size_lattigo"
     assert payload["publishability"]["lattigo_microbenchmark_publishable_count"] == 1
     assert payload["lattigo_microbench_rows"][0]["network"] == "R18"
+    assert payload["lattigo_microbench_rows"][0]["bank_count"] == 8
 
 
 def test_big_graph_microbench_artifact_is_written(tmp_path: Path) -> None:

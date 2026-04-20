@@ -584,7 +584,7 @@ def _bank_transforms_from_scripts_cir_plan(
     }
 
 
-def build_big_graph_lattigo_microbench(*, bank_count: int = 2, logn: int = 16) -> dict[str, Any]:
+def build_big_graph_lattigo_microbench(*, bank_count: int = 8, logn: int = 16) -> dict[str, Any]:
     from orion.backend.python.tensors import CipherTensor
     from orion.core.orion import scheme
     from orion.nn.unified_transform import UnifiedTransformGroup
@@ -665,7 +665,7 @@ def build_big_graph_lattigo_microbench(*, bank_count: int = 2, logn: int = 16) -
             "publishable_lattigo_microbenchmark": bool(exact),
             "publishability": {
                 "lattigo_microbenchmark_publishable_count": 1 if exact else 0,
-                "note": "single original-size R18 stage1 scripts/cir block, not aggregate full-network execution",
+                "note": "single original-size R18 stage1 full output-bank block, not aggregate full-network execution",
             },
             "timing_s": timings,
         }
@@ -676,7 +676,7 @@ def build_big_graph_lattigo_microbench(*, bank_count: int = 2, logn: int = 16) -
 def write_big_graph_lattigo_microbench(
     *,
     out_path: Path = DEFAULT_BIG_GRAPH_LATTIGO_MICROBENCH_OUT,
-    bank_count: int = 2,
+    bank_count: int = 8,
     logn: int = 16,
 ) -> dict[str, Any]:
     payload = build_big_graph_lattigo_microbench(bank_count=int(bank_count), logn=int(logn))

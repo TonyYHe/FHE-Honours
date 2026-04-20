@@ -20,8 +20,8 @@ def _fake_lattigo_evidence() -> dict:
         "local_lattigo": True,
         "unified_transform_group": True,
         "uses_orion_dense_pack_conv2d": False,
-        "bank_count": 2,
-        "stats_from_execution": {"rotations": 20, "conjugations": 2, "ct_pt_mults": 270, "adds": 273},
+        "bank_count": 8,
+        "stats_from_execution": {"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089},
         "scripts_cir_full_block_stats": {"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089},
         "parity": {"exact": True, "max_abs": 0.0001, "tolerance": 0.001},
         "publishable_lattigo_microbenchmark": True,
@@ -79,8 +79,8 @@ def test_pipeline_report_attaches_backend_evidence_and_claim_hygiene() -> None:
     assert payload["publishable_facts"]["lattigo_backend"]["publishable"] is True
     evidence = payload["publishable_facts"]["lattigo_backend"]["evidence"]
     assert evidence["original_size_slot_domain"] is True
-    assert evidence["bank_count"] == 2
-    assert evidence["stats_from_execution"] == {"rotations": 20, "conjugations": 2, "ct_pt_mults": 270, "adds": 273}
+    assert evidence["bank_count"] == 8
+    assert evidence["stats_from_execution"] == {"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089}
     assert evidence["scripts_cir_full_block_stats"] == {"rotations": 20, "conjugations": 8, "ct_pt_mults": 1080, "adds": 1089}
     assert payload["claim_hygiene"]["excluded_synthetic_rows"] == ["R20:stage1_two_output_region"]
     assert payload["claim_hygiene"]["r20_in_main_claim"] is False
