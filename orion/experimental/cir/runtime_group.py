@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 import json
+import os
 import time
 
 import torch
@@ -277,6 +279,8 @@ class FullConvRegionRuntimeExecutor:
         self.assigned_level: int | None = None
         self.assigned_depth: int | None = None
         self.last_runtime_timing: dict[str, float] = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
             "compile_unified_s": 0.0,
             "evaluate_unified_s": 0.0,
             "postprocess_s": 0.0,
@@ -290,27 +294,63 @@ class FullConvRegionRuntimeExecutor:
     def _ensure_plans(self) -> None:
         if self.plans:
             return
-        plans: list[Any] = []
-        for builder, kwargs in zip(self._plan_builders, self._builder_kwargs):
+        tasks = list(zip(self._plan_builders, self._builder_kwargs))
+        if len(tasks) <= 1:
+            plans: list[Any] = []
+            for builder, kwargs in tasks:
+                plan, _inputs, _reference = builder(**kwargs)
+                plans.append(plan)
+            self.plans = tuple(plans)
+            return
+
+        workers = min(len(tasks), max(1, int(os.cpu_count() or 1)))
+
+        def _build_plan(task: tuple[Any, dict[str, Any]]) -> Any:
+            builder, kwargs = task
             plan, _inputs, _reference = builder(**kwargs)
-            plans.append(plan)
-        self.plans = tuple(plans)
+            return plan
+
+        with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-region-plan") as executor:
+            self.plans = tuple(executor.map(_build_plan, tasks))
 
     def compile(self, scheme: Any) -> None:
         if self.groups:
             return
+        prepare_plans_started = time.time()
         self._ensure_plans()
+        self.last_runtime_timing["prepare_plans_s"] = float(time.time() - prepare_plans_started)
         from orion.nn.unified_transform import UnifiedTransformGroup
 
-        compile_started = time.time()
         level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
-        for plan in self.plans:
-            transforms, _bank_ids = transforms_from_conv_scheme_plan(
-                plan,
-                level=int(level),
-                scheme=scheme,
-                bank_count=self.bank_count,
-            )
+        prepare_transforms_started = time.time()
+        if len(self.plans) <= 1:
+            prepared_transforms = [
+                transforms_from_conv_scheme_plan(
+                    plan,
+                    level=int(level),
+                    scheme=scheme,
+                    bank_count=self.bank_count,
+                )[0]
+                for plan in self.plans
+            ]
+        else:
+            workers = min(len(self.plans), max(1, int(os.cpu_count() or 1)))
+
+            def _build_transforms(plan: Any) -> list[Any]:
+                transforms, _bank_ids = transforms_from_conv_scheme_plan(
+                    plan,
+                    level=int(level),
+                    scheme=scheme,
+                    bank_count=self.bank_count,
+                )
+                return transforms
+
+            with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-region-transform") as executor:
+                prepared_transforms = list(executor.map(_build_transforms, self.plans))
+        self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
+
+        compile_started = time.time()
+        for transforms in prepared_transforms:
             group = UnifiedTransformGroup(transforms)
             group.compile_unified(scheme.backend)
             self.transforms_by_block.append(transforms)
@@ -377,6 +417,8 @@ class FullConvRegionRuntimeExecutor:
         scheme = source_ct.scheme
         self._ensure_plans()
         self.last_runtime_timing = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
             "compile_unified_s": 0.0,
             "evaluate_unified_s": 0.0,
             "postprocess_s": 0.0,
