@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -519,44 +520,144 @@ def _tconv_k2s2_slot_index_out(oc: int, oh: int, ow: int, spec: TconvK2S2Spec) -
     return _slot_index(oc, oh, ow, h=spec.h_out, w=spec.w_out, gap=spec.out_gap)
 
 
-def _build_tconv_bank_terms(
+def _tconv_k2s2_dense_source_group_count(spec: TconvK2S2Spec) -> int:
+    return int(math.ceil(int(spec.c_in) / int(spec.in_gap * spec.in_gap)))
+
+
+def _tconv_k2s2_local_dense_src_slot(group: int, oh: int, ow: int, spec: TconvK2S2Spec) -> int:
+    return _slot_index(group, oh, ow, h=spec.h_out, w=spec.w_out, gap=1)
+
+
+def _tconv_k2s2_local_dense_out_slot(oc_local: int, oh: int, ow: int, spec: TconvK2S2Spec) -> int:
+    return _slot_index(oc_local, oh, ow, h=spec.h_out, w=spec.w_out, gap=1)
+
+
+def _tconv_k2s2_output_phase(oh: int, ow: int) -> int:
+    return (int(oh) % 2) * 2 + (int(ow) % 2)
+
+
+def _tconv_k2s2_phase_expansion_shifts(phase: int, spec: TconvK2S2Spec) -> tuple[int, int]:
+    horizontal = 1 if int(phase) in (0, 2) else -1
+    vertical = int(spec.w_out) if int(phase) in (0, 1) else -int(spec.w_out)
+    return int(horizontal), int(vertical)
+
+
+def _tconv_k2s2_compact_source_pairs(spec: TconvK2S2Spec) -> tuple[tuple[tuple[int, int], tuple[int, int]], ...]:
+    return (
+        ((0, 0), (1, -1)),
+        ((2, -int(spec.w_out)), (3, -int(spec.w_out) - 1)),
+    )
+
+
+def _tconv_k2s2_phase_mask(phase: int, spec: TconvK2S2Spec) -> torch.Tensor:
+    return _phase_mask(
+        phases=(int(phase),),
+        shape=(int(spec.c_in), int(spec.h_in), int(spec.w_in)),
+        gap=int(spec.in_gap),
+    )
+
+
+def _tconv_k2s2_factorized_candidate_stats(spec: TconvK2S2Spec, *, bank_channels: int) -> dict[str, int | float]:
+    bank_width = max(1, int(bank_channels))
+    bank_count = int(math.ceil(int(spec.c_out) / int(bank_width)))
+    source_group_count = int(_tconv_k2s2_dense_source_group_count(spec))
+    expansion_shifts = {
+        int(shift)
+        for phase in range(int(spec.in_gap * spec.in_gap))
+        for shift in _tconv_k2s2_phase_expansion_shifts(int(phase), spec)
+    }
+    mix_shifts: set[int] = set()
+    total_terms = 0
+    transform_count = int(spec.in_gap * spec.in_gap) * int(spec.pair_count) * int(bank_count)
+
+    for bank_index in range(int(bank_count)):
+        oc_start = int(bank_index) * int(bank_width)
+        oc_end = min(int(spec.c_out), oc_start + int(bank_width))
+        local_width = max(1, oc_end - oc_start)
+        bank_shifts: set[int] = set()
+        for src_group in range(int(source_group_count)):
+            for oc_local in range(int(local_width)):
+                shift = (int(oc_local) - int(src_group)) * int(spec.h_out) * int(spec.w_out)
+                bank_shifts.add(int(shift) % int(RING_SLOT_COUNT))
+                mix_shifts.add(int(shift) % int(RING_SLOT_COUNT))
+        total_terms += int(len(bank_shifts)) * int(spec.in_gap * spec.in_gap) * int(spec.pair_count)
+
+    rotation_count = int(len(expansion_shifts.union(mix_shifts)))
+    score = float(rotation_count) * 8.0 + float(total_terms) + float(transform_count) * 8.0
+    return {
+        "bank_channels": int(bank_width),
+        "bank_count": int(bank_count),
+        "rotation_count": int(rotation_count),
+        "term_count": int(total_terms),
+        "transform_count": int(transform_count),
+        "score": float(score),
+    }
+
+
+def _choose_tconv_k2s2_factorized_bank_channels(spec: TconvK2S2Spec) -> dict[str, int | float]:
+    candidates = [value for value in range(1, int(spec.c_out) + 1) if int(spec.c_out) % int(value) == 0]
+    viable = [
+        _tconv_k2s2_factorized_candidate_stats(spec, bank_channels=int(value))
+        for value in candidates
+    ]
+    capped = [item for item in viable if int(item["transform_count"]) <= 32]
+    pool = capped or viable
+    best = min(
+        pool,
+        key=lambda item: (
+            int(item["rotation_count"]),
+            float(item["score"]),
+            int(item["term_count"]),
+            int(item["transform_count"]),
+        ),
+    )
+    return dict(best)
+
+
+def _build_tconv_factorized_mix_terms(
     *,
     spec: TconvK2S2Spec,
     weight: torch.Tensor,
+    input_phase: int,
     pair_index: int,
+    bank_index: int,
+    oc_start: int,
+    bank_channels: int,
     case_name: str,
     family_id: str,
 ) -> tuple[tuple[CanonicalTemplateEntry, ...], tuple[PreparedPlaintext, ...], tuple[LinearTransformTerm, ...]]:
     """
-    Build LT terms for one phase-pair of a k2s2 tconv.
+    Build the factorized mix LT terms for one expanded input phase.
 
-    k2s2 tconv: output[oc, oh, ow] += weight[ic, oc, oh%2, ow%2] * input[ic, oh//2, ow//2]
-    Phase = (oh%2)*2 + (ow%2) in {0,1,2,3}.
-    pair_index=0 handles phases {0,1}, pair_index=1 handles phases {2,3}.
-    Within each pair: phase%2==0 -> real lane, phase%2==1 -> imag lane.
+    The input to this LT is already phase-masked and spatially expanded into a
+    dense gap-1 layout with `source_group_count` channels. This stage only
+    performs channel mixing into a bank-local dense output layout, while the
+    two-step spatial expansion is tracked separately.
     """
-    # phases owned by this pair
-    phase0 = int(pair_index) * 2      # real lane
-    phase1 = int(pair_index) * 2 + 1  # imag lane
+    phase0 = int(pair_index) * 2
+    phase1 = int(pair_index) * 2 + 1
 
     buckets: dict[int, dict[int, complex]] = {}  # shift -> {out_slot -> complex weight}
+    oc_end = min(int(spec.c_out), int(oc_start) + int(bank_channels))
+    source_group_count = int(_tconv_k2s2_dense_source_group_count(spec))
 
-    for ic in range(int(spec.c_in)):
+    for src_group in range(int(source_group_count)):
+        ic = int(src_group) * int(spec.in_gap * spec.in_gap) + int(input_phase)
+        if int(ic) >= int(spec.c_in):
+            continue
         for oh in range(int(spec.h_out)):
             for ow in range(int(spec.w_out)):
-                phase = (int(oh) % 2) * 2 + (int(ow) % 2)
+                phase = _tconv_k2s2_output_phase(oh, ow)
                 if int(phase) != int(phase0) and int(phase) != int(phase1):
                     continue
                 kh = int(oh) % 2
                 kw = int(ow) % 2
-                ih = int(oh) // 2
-                iw = int(ow) // 2
-                src_slot = _tconv_k2s2_slot_index_in(ic, ih, iw, spec)
-                for oc in range(int(spec.c_out)):
+                src_slot = _tconv_k2s2_local_dense_src_slot(int(src_group), oh, ow, spec)
+                for oc in range(int(oc_start), int(oc_end)):
                     w_val = float(weight[ic, oc, kh, kw])
                     if w_val == 0.0:
                         continue
-                    out_slot = _tconv_k2s2_slot_index_out(oc, oh, ow, spec)
+                    out_slot = _tconv_k2s2_local_dense_out_slot(int(oc - oc_start), oh, ow, spec)
                     shift = (int(out_slot) - int(src_slot)) % RING_SLOT_COUNT
                     if int(shift) not in buckets:
                         buckets[int(shift)] = {}
@@ -571,16 +672,15 @@ def _build_tconv_bank_terms(
         slot_map = buckets[int(shift)]
         out_slots = torch.tensor(sorted(slot_map.keys()), dtype=torch.int64)
         values = torch.tensor([slot_map[int(s)] for s in out_slots.tolist()], dtype=torch.complex64)
-        template_id = f"{case_name}_pair{int(pair_index)}_template_{int(term_index)}"
-        plaintext_id = f"{case_name}_pair{int(pair_index)}_pt_{int(term_index)}"
-        bank_id = f"{case_name}_pair{int(pair_index)}"
+        template_id = f"{case_name}_phase{int(input_phase)}_bank{int(bank_index)}_pair{int(pair_index)}_template_{int(term_index)}"
+        plaintext_id = f"{case_name}_phase{int(input_phase)}_bank{int(bank_index)}_pair{int(pair_index)}_pt_{int(term_index)}"
         templates.append(CanonicalTemplateEntry(
             template_id=template_id,
             family_id=family_id,
-            key=(int(pair_index), int(shift)),
+            key=(int(input_phase), int(bank_index), int(pair_index), int(shift)),
             fine_shift=int(shift),
             indices=out_slots,
-            note=f"tconv k2s2 {spec.stage} pair{int(pair_index)} phase-pair inter-group",
+            note=f"tconv k2s2 {spec.stage} factorized mix phase{int(input_phase)} bank{int(bank_index)} pair{int(pair_index)}",
         ))
         plaintexts.append(PreparedPlaintext(
             plaintext_id=plaintext_id,
@@ -589,17 +689,17 @@ def _build_tconv_bank_terms(
             scale=1.0,
             slot_count=RING_SLOT_COUNT,
             values=values,
-            note=f"tconv k2s2 {spec.stage} pair{int(pair_index)} payload",
+            note=f"tconv k2s2 {spec.stage} factorized mix payload",
         ))
         terms.append(LinearTransformTerm(
-            term_id=f"{case_name}_pair{int(pair_index)}_term_{int(term_index)}",
+            term_id=f"{case_name}_phase{int(input_phase)}_bank{int(bank_index)}_pair{int(pair_index)}_term_{int(term_index)}",
             shift=int(shift),
             plaintext_id=plaintext_id,
             template_id=template_id,
             lookup_indices=torch.arange(int(out_slots.numel()), dtype=torch.int64),
             output_slot_indices=out_slots,
-            note=f"tconv k2s2 {spec.stage} pair{int(pair_index)} term",
-            bank_id=bank_id,
+            note=f"tconv k2s2 {spec.stage} factorized mix term",
+            bank_id=f"{case_name}_bank{int(bank_index)}_pair{int(pair_index)}",
         ))
     return tuple(templates), tuple(plaintexts), tuple(terms)
 
@@ -608,104 +708,139 @@ def build_tconv_k2s2_phase_pair_plan(
     spec: TconvK2S2Spec,
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
     """
-    Build a ConvSchemePlan for a k2s2 transposed convolution using inter-tile group imaginary fold.
+    Build a factorized `expand-then-mix` plan for a k=2, s=2 transposed convolution.
 
-    The input is gap-interleaved packed (gap=spec.in_gap). The 4 output phases are folded into
-    2 complex pairs: pair0=(phase0 real, phase1 imag), pair1=(phase2 real, phase3 imag).
-    Each pair is one SharedOutputBank evaluated via UnifiedTransformGroup.
+    The input starts in a gap-interleaved packed layout (`gap=spec.in_gap`). We
+    first phase-mask the 4 packed input phases and expand each masked surface to
+    a dense gap-1 layout using two rotations. We then run bank-local dense
+    mixing LT steps from each expanded input phase into output phase-pair banks.
     """
     torch.manual_seed(0)
     x = torch.randn((int(spec.c_in), int(spec.h_in), int(spec.w_in)), dtype=torch.float32)
-    # weight shape: [c_in, c_out, kH, kW] for ConvTranspose2d
     weight = torch.randn((int(spec.c_in), int(spec.c_out), 2, 2), dtype=torch.float32)
+    banking = _choose_tconv_k2s2_factorized_bank_channels(spec)
+    bank_channels = int(banking["bank_channels"])
+    bank_count = int(banking["bank_count"])
+    input_phase_count = int(spec.in_gap * spec.in_gap)
+    compact_pairs = _tconv_k2s2_compact_source_pairs(spec)
+    compact_source_rotation_shifts = {
+        int(abs(shift))
+        for pair in compact_pairs
+        for _phase, shift in pair
+        if int(shift) != 0
+    }
+    expansion_shifts = {1, int(spec.w_out)}
 
     case_name = f"tconv_k2s2_{spec.stage}"
     family_id = f"{case_name}_family"
 
     all_templates: list[CanonicalTemplateEntry] = []
     all_plaintexts: list[PreparedPlaintext] = []
-    all_terms: list[LinearTransformTerm] = []
-    banks: list[SharedOutputBank] = []
+    lt_steps: list[LinearTransformStep] = []
     regions: list[TensorRegion] = []
+    for bank_index in range(int(bank_count)):
+        oc_start = int(bank_index) * int(bank_channels)
+        oc_end = min(int(spec.c_out), oc_start + int(bank_channels))
+        local_bank_width = max(1, oc_end - oc_start)
+        for pair_index in range(int(spec.pair_count)):
+            regions.append(TensorRegion(
+                c_start=int(oc_start),
+                c_end=int(oc_end),
+                h_start=0,
+                h_end=int(spec.h_out),
+                w_start=0,
+                w_end=int(spec.w_out),
+            ))
+            target_index = int(bank_index) * int(spec.pair_count) + int(pair_index)
+            for input_phase in range(int(input_phase_count)):
+                templates, plaintexts, terms = _build_tconv_factorized_mix_terms(
+                    spec=spec,
+                    weight=weight,
+                    input_phase=int(input_phase),
+                    pair_index=int(pair_index),
+                    bank_index=int(bank_index),
+                    oc_start=int(oc_start),
+                    bank_channels=int(local_bank_width),
+                    case_name=case_name,
+                    family_id=family_id,
+                )
+                all_templates.extend(templates)
+                all_plaintexts.extend(plaintexts)
+                if not terms:
+                    continue
+                shift_set = {int(term.shift) for term in terms}
+                lt_steps.append(
+                    LinearTransformStep(
+                        step_id=f"{case_name}_phase{int(input_phase)}_bank{int(bank_index)}_pair{int(pair_index)}",
+                        input_id=f"expanded_input_phase_{int(input_phase)}",
+                        target_index=int(target_index),
+                        selected_n1=0,
+                        baby_shifts=(),
+                        giant_shifts=(),
+                        terms=tuple(terms),
+                        required_rotations=tuple(sorted(int(value) for value in shift_set)),
+                        prepared_plaintext_ids=tuple(str(plain.plaintext_id) for plain in plaintexts),
+                        expected_cost=ExecutionStats(
+                            rotations=int(len(shift_set)),
+                            ct_pt_mults=int(len(terms)),
+                            adds=int(len(terms)),
+                        ),
+                        representation="factorized_phase_mix_complex",
+                        note=f"tconv k2s2 factorized mix for input phase {int(input_phase)}",
+                        rotation_group_id=f"{case_name}:expanded_input_phase_{int(input_phase)}",
+                        rotation_cost_owner=True,
+                    )
+                )
 
-    for pair_index in range(int(spec.pair_count)):
-        templates, plaintexts, terms = _build_tconv_bank_terms(
-            spec=spec,
-            weight=weight,
-            pair_index=int(pair_index),
-            case_name=case_name,
-            family_id=family_id,
-        )
-        all_templates.extend(templates)
-        all_plaintexts.extend(plaintexts)
-        all_terms.extend(terms)
-        banks.append(SharedOutputBank(
-            bank_id=f"{case_name}_pair{int(pair_index)}",
-            target_index=int(pair_index),
-            fold_lane=int(pair_index),
-            input_lane_id=int(pair_index),
-            output_slot_offset=0,
-            active_slot_count=RING_SLOT_COUNT,
-            term_count=int(len(terms)),
-            note=f"tconv k2s2 {spec.stage} phase-pair {int(pair_index)}",
-        ))
-        regions.append(TensorRegion(
-            c_start=0,
-            c_end=int(spec.c_out),
-            h_start=int(pair_index) * int(spec.h_in),
-            h_end=int(pair_index) * int(spec.h_in) + int(spec.h_in),
-            w_start=0,
-            w_end=int(spec.w_out),
-        ))
-
-    rotation_count = int(len({t.shift for t in all_terms}))
-    step = LinearTransformStep(
-        step_id=f"{case_name}_shared_lt",
-        input_id="complex_source_pair_0",
-        target_index=0,
-        selected_n1=0,
-        baby_shifts=(),
-        giant_shifts=(),
-        terms=tuple(all_terms),
-        required_rotations=tuple(sorted({t.shift for t in all_terms})),
-        prepared_plaintext_ids=tuple(p.plaintext_id for p in all_plaintexts),
-        expected_cost=ExecutionStats(rotations=rotation_count, ct_pt_mults=int(len(all_terms)), adds=int(len(all_terms))),
-        representation="inter_group_complex",
-        note="tconv k2s2 phase-pair inter-group imaginary fold",
-        rotation_group_id=f"{case_name}:complex_source_pair_0",
-        rotation_cost_owner=True,
-        shared_multi_output=True,
-        shared_output_banks=tuple(banks),
-    )
+    mix_shift_union = {int(term.shift) for step in lt_steps for term in step.terms}
+    mix_term_count = sum(int(len(step.terms)) for step in lt_steps)
+    source_pair_count = int(len(compact_pairs))
+    source_pair_adds = int(source_pair_count)
+    expansion_adds = int(source_pair_count) * 2
+    expansion_mults = int(input_phase_count)
+    total_rotation_count = int(len(compact_source_rotation_shifts.union(expansion_shifts).union(mix_shift_union)))
     plan = ConvSchemePlan(
         case_name=case_name,
         ring_slot_count=RING_SLOT_COUNT,
         output_regions=tuple(regions),
-        output_active_slot_counts=tuple(RING_SLOT_COUNT for _ in regions),
+        output_active_slot_counts=tuple(
+            int((region.c_end - region.c_start) * int(spec.h_out) * int(spec.w_out))
+            for region in regions
+        ),
         family_templates=(FamilyTemplateBank(
             family_id=family_id,
-            family_key=("tconv_k2s2", str(spec.stage), "phase_pair_inter_group"),
+            family_key=("tconv_k2s2", str(spec.stage), "factorized_expand_then_mix"),
             source_tile_shape=(int(spec.c_in), int(spec.h_in), int(spec.w_in)),
-            target_tile_shape=(int(spec.c_out), int(spec.h_out), int(spec.w_out)),
+            target_tile_shape=(int(bank_channels), int(spec.h_out), int(spec.w_out)),
             source_h_range=(0, int(spec.h_in)),
             target_h_range=(0, int(spec.h_out)),
             template_entries=tuple(all_templates),
-            member_count=int(spec.pair_count),
-            evidence_kind="tconv_k2s2_phase_pair_materialized",
+            member_count=int(len(lt_steps)),
+            evidence_kind="tconv_k2s2_factorized_materialized",
         ),),
         prepared_plaintexts=tuple(all_plaintexts),
-        linear_transform_steps=(step,),
+        linear_transform_steps=tuple(lt_steps),
         expected_cost=ExecutionStats(
-            rotations=rotation_count,
-            conjugations=int(spec.pair_count),
-            ct_pt_mults=int(len(all_terms)),
-            adds=int(len(all_terms) + int(spec.pair_count) + 1),
+            rotations=int(total_rotation_count),
+            conjugations=int(source_pair_count),
+            ct_pt_mults=int(mix_term_count + expansion_mults),
+            adds=int(mix_term_count + source_pair_adds + expansion_adds),
         ),
-        evidence_kind="tconv_k2s2_phase_pair_inter_group",
-        notes=(f"tconv k2s2 {spec.stage} phase-pair imaginary fold, {spec.pair_count} pairs",),
+        evidence_kind="tconv_k2s2_factorized_expand_then_mix",
+        notes=(
+            f"tconv k2s2 {spec.stage} factorized expand-then-mix",
+            f"output_bank_channels={bank_channels}",
+            f"output_bank_count={bank_count}",
+            f"input_phase_count={input_phase_count}",
+            f"source_pair_count={source_pair_count}",
+            f"compact_source_rotation_shifts={','.join(str(int(v)) for v in sorted(compact_source_rotation_shifts))}",
+            f"expansion_rotation_shifts={','.join(str(int(v)) for v in sorted(expansion_shifts))}",
+            f"mix_rotation_count={len(mix_shift_union)}",
+            f"selected_rotation_count={total_rotation_count}",
+            f"banking_score={float(banking['score']):.2f}",
+        ),
     )
 
-    # Pack input: gap-interleaved layout matching spec.in_gap
     inputs = {
         "source_0_lane_0": PlainCipherTensor(
             _pack_chw(x, channels=int(spec.c_in), h=int(spec.h_in), w=int(spec.w_in), gap=int(spec.in_gap)),
@@ -713,7 +848,6 @@ def build_tconv_k2s2_phase_pair_plan(
         ),
     }
 
-    # Reference: torch ConvTranspose2d (weight layout [c_in, c_out, kH, kW])
     reference = F.conv_transpose2d(
         x.unsqueeze(0),
         weight,

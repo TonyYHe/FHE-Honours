@@ -948,7 +948,14 @@ def build_r18_stage4_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
 def build_tconv_k2s2_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
     from orion.backend.python.tensors import CipherTensor
     from orion.core.orion import scheme
-    from orion.experimental.cir.lattigo_block import TconvK2S2Spec, build_tconv_k2s2_phase_pair_plan
+    from orion.experimental.cir.lattigo_block import (
+        TconvK2S2Spec,
+        _tconv_k2s2_compact_source_pairs,
+        _tconv_k2s2_output_phase,
+        _tconv_k2s2_phase_expansion_shifts,
+        _tconv_k2s2_phase_mask,
+        build_tconv_k2s2_phase_pair_plan,
+    )
     from orion.nn.unified_transform import UnifiedTransformGroup
 
     # Small spec for fast test: matches a typical decoder upsample block
@@ -964,73 +971,165 @@ def build_tconv_k2s2_lattigo_microbench(*, logn: int = 16) -> dict[str, Any]:
     try:
         slots = int(scheme.params.get_slots())
         level = len(scheme.params.get_logq()) - 1
+        mix_level = max(0, int(level) - 1)
         plan, inputs, reference = build_tconv_k2s2_phase_pair_plan(spec)
-        step = plan.linear_transform_steps[0]
+        banking_info = {}
+        for note in plan.notes:
+            if "=" not in str(note):
+                continue
+            key, value = str(note).split("=", 1)
+            banking_info[str(key)] = str(value)
         prepared = {str(p.plaintext_id): p for p in plan.prepared_plaintexts}
         templates = {str(e.template_id): e for fam in plan.family_templates for e in fam.template_entries}
+        bank_channels = int(banking_info.get("output_bank_channels", spec.c_out))
+        bank_count = int(banking_info.get("output_bank_count", 1))
+        input_phase_count = int(banking_info.get("input_phase_count", spec.in_gap * spec.in_gap))
+        source_pair_count = int(banking_info.get("source_pair_count", 2))
+        compact_rotation_values = tuple(
+            int(value)
+            for value in str(banking_info.get("compact_source_rotation_shifts", "")).split(",")
+            if str(value)
+        )
+        expansion_shift_values = tuple(
+            int(value)
+            for value in str(banking_info.get("expansion_rotation_shifts", "")).split(",")
+            if str(value)
+        )
 
-        # tconv has one real input lane (gap-interleaved), no imaginary lane
         src_real = inputs["source_0_lane_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
-        source = src_real.to(dtype=torch.complex64)
+        def _phase_index_from_input_id(input_id: str) -> int:
+            return int(str(input_id).rsplit("_", 1)[-1])
 
-        transforms: list[Any] = []
-        expected_outputs: list[torch.Tensor] = []
-        for bank in step.shared_output_banks:
-            bank_id = str(bank.bank_id)
+        def _transform_from_step(step: Any) -> Any:
             diag_tensors: dict[int, torch.Tensor] = {}
-            expected = torch.zeros((int(slots),), dtype=torch.complex64)
-            terms = [t for t in step.terms if str(getattr(t, "bank_id", "")) == bank_id]
-            for term in terms:
-                tmpl = templates[str(term.template_id)]
-                pt = prepared[str(term.plaintext_id)]
-                out_idx = term.output_slot_indices.to(dtype=torch.int64)
-                vals = pt.values.to(dtype=torch.complex64)
+            for term in step.terms:
+                template = templates[str(term.template_id)]
+                plaintext = prepared[str(term.plaintext_id)]
+                mapped_indices = template.indices.to(dtype=torch.int64).index_select(0, term.lookup_indices.to(dtype=torch.int64))
+                output_indices = term.output_slot_indices.to(dtype=torch.int64)
+                if not bool(torch.equal(mapped_indices, output_indices)):
+                    raise ValueError(f"term {term.term_id} cannot be encoded as one dense diagonal")
+                values = plaintext.values.to(dtype=torch.complex64)
                 diag_index = (-int(term.shift)) % int(slots)
                 diag = diag_tensors.setdefault(int(diag_index), torch.zeros((int(slots),), dtype=torch.complex64))
-                diag.index_add_(0, out_idx, vals)
-                rotated = torch.roll(source, shifts=int(term.shift), dims=0)
-                expected.index_add_(0, out_idx, rotated.index_select(0, out_idx) * vals)
-            transforms.append(SimpleNamespace(
-                name=f"{plan.case_name}_{bank_id}",
-                diagonals={(0, 0): {int(k): v.tolist() for k, v in sorted(diag_tensors.items())}},
-                level=int(level),
+                diag.index_add_(0, output_indices, values)
+            return SimpleNamespace(
+                name=str(step.step_id),
+                diagonals={(0, 0): {int(index): diag.tolist() for index, diag in sorted(diag_tensors.items())}},
+                level=int(mix_level),
                 scheme=scheme,
                 fhe_output_shape=torch.Size([1, int(slots)]),
                 output_shape=torch.Size([1, int(slots)]),
-                bank_id=bank_id,
-            ))
-            expected_outputs.append(expected)
+                target_index=int(step.target_index),
+            )
 
+        transforms_by_phase: dict[int, list[tuple[int, Any]]] = {}
+        for step in plan.linear_transform_steps:
+            phase = _phase_index_from_input_id(str(step.input_id))
+            transforms_by_phase.setdefault(int(phase), []).append((int(step.target_index), _transform_from_step(step)))
+
+        groups_by_phase: dict[int, tuple[tuple[int, ...], Any]] = {}
         t0 = time.time()
-        group = UnifiedTransformGroup(transforms)
-        group.compile_unified(scheme.backend)
+        for phase, entries in sorted(transforms_by_phase.items()):
+            ordered = sorted(entries, key=lambda item: int(item[0]))
+            group = UnifiedTransformGroup([transform for _target_index, transform in ordered])
+            group.compile_unified(scheme.backend)
+            groups_by_phase[int(phase)] = (tuple(int(target_index) for target_index, _transform in ordered), group)
         timings["compile_unified_s"] = float(time.time() - t0)
 
+        expected_outputs: list[torch.Tensor] = []
+        for bank_index in range(int(bank_count)):
+            oc_start = int(bank_index) * int(bank_channels)
+            oc_end = min(int(spec.c_out), oc_start + int(bank_channels))
+            for pair_index in range(int(spec.pair_count)):
+                phase0 = int(pair_index) * 2
+                phase1 = int(pair_index) * 2 + 1
+                expected = torch.zeros((int(slots),), dtype=torch.complex64)
+                for oc in range(int(oc_start), int(oc_end)):
+                    oc_local = int(oc - oc_start)
+                    for oh in range(int(spec.h_out)):
+                        for ow in range(int(spec.w_out)):
+                            phase = _tconv_k2s2_output_phase(oh, ow)
+                            if int(phase) != int(phase0) and int(phase) != int(phase1):
+                                continue
+                            out_slot = oc_local * int(spec.h_out) * int(spec.w_out) + int(oh) * int(spec.w_out) + int(ow)
+                            value = float(reference[oc, oh, ow])
+                            if int(phase) == int(phase0):
+                                expected[int(out_slot)] = complex(value, 0.0)
+                            else:
+                                expected[int(out_slot)] = complex(0.0, value)
+                expected_outputs.append(expected)
+
         ct_in = scheme.encrypt(scheme.encode(src_real, level))
+        ql = scheme.encoder.get_moduli_chain()[int(level)]
+        phase_masks = {
+            int(phase): scheme.encoder.encode(_tconv_k2s2_phase_mask(int(phase), spec), level=int(level), scale=ql)
+            for phase in range(int(input_phase_count))
+        }
+
+        partial_outputs: list[Any | None] = [None for _ in expected_outputs]
         t0 = time.time()
-        output_ids = group.evaluate_unified(int(ct_in.ids[0]), scheme.backend)
+        compact_pairs = _tconv_k2s2_compact_source_pairs(spec)
+        for pair_index, pair in enumerate(compact_pairs):
+            compact_ct: Any | None = None
+            for lane_index, (phase, logical_shift) in enumerate(pair):
+                phase_ct = ct_in * phase_masks[int(phase)]
+                if int(logical_shift) != 0:
+                    phase_ct = phase_ct.roll(int(-logical_shift), in_place=False)
+                if int(lane_index) == 1:
+                    phase_ct = phase_ct.mul_imaginary_unit(+1, in_place=False)
+                compact_ct = phase_ct if compact_ct is None else compact_ct + phase_ct
+            if compact_ct is None:
+                raise RuntimeError("failed to build compact tconv source pair")
+            expanded_row = compact_ct + compact_ct.roll(-1, in_place=False)
+            expanded_pair = expanded_row + expanded_row.roll(-int(spec.w_out), in_place=False)
+
+            conj_pair = expanded_pair.conjugate(in_place=False)
+            expanded_real = (expanded_pair + conj_pair) * 0.5
+            expanded_imag = (expanded_pair - conj_pair).mul_imaginary_unit(-1, in_place=False) * 0.5
+            phase_sources = {
+                int(pair[0][0]): expanded_real,
+                int(pair[1][0]): expanded_imag,
+            }
+
+            for phase, expanded in phase_sources.items():
+                target_indices, group = groups_by_phase[int(phase)]
+                output_ids = group.evaluate_unified(int(expanded.ids[0]), scheme.backend)
+                for target_index, output_id in zip(target_indices, output_ids):
+                    out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(slots)]), torch.Size([1, int(slots)]))
+                    if partial_outputs[int(target_index)] is None:
+                        partial_outputs[int(target_index)] = out_ct
+                    else:
+                        partial_outputs[int(target_index)] = partial_outputs[int(target_index)] + out_ct
         timings["evaluate_unified_s"] = float(time.time() - t0)
 
         max_errors: list[float] = []
-        for output_id, expected in zip(output_ids, expected_outputs):
-            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(slots)]), torch.Size([1, int(slots)]))
-            out_pt = out_ct.decrypt()
+        for partial, expected in zip(partial_outputs, expected_outputs):
+            if partial is None:
+                raise RuntimeError("factorized tconv microbench produced a missing output block")
+            out_pt = partial.decrypt()
             raw = scheme.backend.DecodeComplex(out_pt.ids[0])
             decoded = torch.tensor([complex(raw[2 * i], raw[2 * i + 1]) for i in range(int(slots))], dtype=torch.complex64)
             max_errors.append(float((decoded - expected).abs().max()))
 
         max_abs = float(max(max_errors, default=0.0))
         exact = bool(max_abs <= 1.0e-3)
-        rotation_count = int(len(set(t.shift for t in step.terms)))
         return {
             "status": "ok" if exact else "failed",
-            "scope": "tconv k2s2 phase-pair inter-group imaginary fold Lattigo microbench",
+            "scope": "tconv k2s2 factorized expand-then-mix Lattigo microbench",
             "spec": {"stage": spec.stage, "c_in": spec.c_in, "h_in": spec.h_in, "c_out": spec.c_out, "in_gap": spec.in_gap, "out_gap": spec.out_gap},
             "local_lattigo": True,
             "unified_transform_group": True,
             "pair_count": int(spec.pair_count),
-            "rotation_count": rotation_count,
-            "term_count": int(len(step.terms)),
+            "input_phase_count": int(input_phase_count),
+            "source_pair_count": int(source_pair_count),
+            "rotation_count": int(banking_info.get("selected_rotation_count", 0)),
+            "mix_rotation_count": int(banking_info.get("mix_rotation_count", 0)),
+            "compact_source_rotation_count": int(len(compact_rotation_values)),
+            "expansion_rotation_count": int(len(expansion_shift_values)),
+            "term_count": int(sum(len(step.terms) for step in plan.linear_transform_steps)),
+            "output_bank_channels": int(bank_channels),
+            "output_bank_count": int(bank_count),
             "parity": {"exact": exact, "max_abs": max_abs, "max_errors": max_errors, "tolerance": 1.0e-3},
             "timing_s": timings,
         }
