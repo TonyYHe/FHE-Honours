@@ -74,7 +74,7 @@ def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> N
             "levels": [2, 2],
         }
     ]
-    assert sorted(backend.generated_keys) == [1, 1, 3, 5]
+    assert sorted(backend.generated_keys) == [1, 3, 5]
     assert outputs == [100, 101]
     assert backend.evaluated == [([11, 12], 7)]
     assert group.get_transform_ids(transforms[0]) == {(0, 0): 11}

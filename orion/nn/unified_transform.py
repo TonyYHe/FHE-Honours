@@ -99,9 +99,12 @@ class UnifiedTransformGroup:
         )
         self.is_compiled = True
 
+        required_keys: set[int] = set()
         for transform_id in self.unified_ids:
             for key in backend.GetLinearTransformRotationKeys(int(transform_id)):
-                backend.GenerateLinearTransformRotationKey(int(key))
+                required_keys.add(int(key))
+        for key in sorted(required_keys):
+            backend.GenerateLinearTransformRotationKey(int(key))
 
     def get_transform_ids(self, transform) -> dict[tuple[int, int], int]:
         if not self.is_compiled or self.unified_ids is None:
