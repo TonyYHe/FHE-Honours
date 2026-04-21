@@ -246,5 +246,8 @@ def test_full_conv_region_executor_pairs_sources_and_assembles_output(monkeypatc
         assert tuple(out.decrypt().decode().shape) == (1, 16, 64, 64)
         assert executor.compile_count == 1
         assert executor.block_evaluate_count == 1
+        assert executor.last_runtime_timing["compile_unified_s"] >= 0.0
+        assert executor.last_runtime_timing["evaluate_unified_s"] > 0.0
+        assert executor.last_runtime_timing["postprocess_s"] > 0.0
     finally:
         scheme.delete_scheme()

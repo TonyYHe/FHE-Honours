@@ -276,6 +276,11 @@ class FullConvRegionRuntimeExecutor:
         self.block_evaluate_count = 0
         self.assigned_level: int | None = None
         self.assigned_depth: int | None = None
+        self.last_runtime_timing: dict[str, float] = {
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
 
     @property
     def bank_count(self) -> int:
@@ -297,6 +302,7 @@ class FullConvRegionRuntimeExecutor:
         self._ensure_plans()
         from orion.nn.unified_transform import UnifiedTransformGroup
 
+        compile_started = time.time()
         level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
         for plan in self.plans:
             transforms, _bank_ids = transforms_from_conv_scheme_plan(
@@ -310,6 +316,7 @@ class FullConvRegionRuntimeExecutor:
             self.transforms_by_block.append(transforms)
             self.groups.append(group)
         self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
 
     def _complex_sources_from_ids(self, source_ct: Any) -> tuple[Any, ...]:
         from orion.backend.python.tensors import CipherTensor
@@ -369,10 +376,16 @@ class FullConvRegionRuntimeExecutor:
 
         scheme = source_ct.scheme
         self._ensure_plans()
+        self.last_runtime_timing = {
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
         self.compile(scheme)
         sources = self._source_ciphertexts(source_ct)
         complex_outputs: list[Any | None] = [None for _ in range(self.bank_count)]
         slots = int(self.plans[0].ring_slot_count)
+        evaluate_started = time.time()
         for group, block_source in zip(self.groups, sources):
             output_ids = group.evaluate_unified(int(block_source.ids[0]), scheme.backend)
             self.block_evaluate_count += 1
@@ -382,7 +395,9 @@ class FullConvRegionRuntimeExecutor:
                     complex_outputs[int(bank_index)] = block_ct
                 else:
                     complex_outputs[int(bank_index)] = complex_outputs[int(bank_index)] + block_ct
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
         real_ids: list[int] = []
+        postprocess_started = time.time()
         for bank_index, ct in enumerate(complex_outputs):
             if ct is None:
                 raise RuntimeError(f"missing region-first output bank {bank_index}")
@@ -393,6 +408,7 @@ class FullConvRegionRuntimeExecutor:
             # Transfer ownership of the produced ciphertext id to the assembled
             # multi-bank CipherTensor returned below.
             real.ids = []
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
         return {
             self.output_node_id: CipherTensor(
                 scheme,
