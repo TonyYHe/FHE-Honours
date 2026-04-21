@@ -3,6 +3,8 @@ package main
 import (
 	"C"
 	"math"
+	"runtime"
+	"sync"
 	"unsafe"
 
 	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
@@ -13,6 +15,90 @@ import (
 )
 
 var ltHeap = NewHeapAllocator()
+
+func encodeUnifiedFloatTransformsParallel(
+	diagonalsList []lintrans.Diagonals[float64],
+	transforms []lintrans.LinearTransformation,
+) error {
+	n := len(transforms)
+	if n == 0 {
+		return nil
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	jobs := make(chan int, n)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			encoder := ckks.NewEncoder(*scheme.Params)
+			for idx := range jobs {
+				if err := lintrans.Encode(encoder, diagonalsList[idx], transforms[idx]); err != nil {
+					once.Do(func() {
+						firstErr = err
+					})
+				}
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return firstErr
+}
+
+func encodeUnifiedComplexTransformsParallel(
+	diagonalsList []lintrans.Diagonals[complex128],
+	transforms []lintrans.LinearTransformation,
+) error {
+	n := len(transforms)
+	if n == 0 {
+		return nil
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	jobs := make(chan int, n)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			encoder := ckks.NewEncoder(*scheme.Params)
+			for idx := range jobs {
+				if err := lintrans.Encode(encoder, diagonalsList[idx], transforms[idx]); err != nil {
+					once.Do(func() {
+						firstErr = err
+					})
+				}
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return firstErr
+}
 
 func AddLinearTransform(lt lintrans.LinearTransformation) int {
 	return ltHeap.Add(lt)
@@ -250,10 +336,8 @@ func GenerateLinearTransformsUnified(
 	}
 
 	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
-	for i := range transforms {
-		if err := lintrans.Encode(scheme.Encoder, diagonalsList[i], transforms[i]); err != nil {
-			panic(err)
-		}
+	if err := encodeUnifiedFloatTransformsParallel(diagonalsList, transforms); err != nil {
+		panic(err)
 	}
 
 	ids := make([]int, n)
@@ -307,10 +391,8 @@ func GenerateLinearTransformsUnifiedComplex(
 	}
 
 	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
-	for i := range transforms {
-		if err := lintrans.Encode(scheme.Encoder, diagonalsList[i], transforms[i]); err != nil {
-			panic(err)
-		}
+	if err := encodeUnifiedComplexTransformsParallel(diagonalsList, transforms); err != nil {
+		panic(err)
 	}
 
 	ids := make([]int, n)
