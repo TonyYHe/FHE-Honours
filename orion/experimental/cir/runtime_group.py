@@ -963,7 +963,7 @@ class RegionFirstCompileRegistry:
             "graph_audit": dict(self.graph_audit),
         }
 
-    def attach_probe_dense_bypass_to_dag(self, dag: NetworkDAG) -> list[dict[str, str]]:
+    def attach_probe_dense_bypass_to_dag(self, dag: NetworkDAG, *, lazy_region_compile: bool = True) -> list[dict[str, str]]:
         from orion.nn.linear import Conv2d
 
         bypassed: list[dict[str, str]] = []
@@ -973,7 +973,7 @@ class RegionFirstCompileRegistry:
                 continue
             module = dag.nodes[node].get("module")
             if module is not None:
-                module.region_first_probe_lazy_region_compile = True
+                module.region_first_probe_lazy_region_compile = bool(lazy_region_compile)
         for node in dag.topological_sort():
             if node in selected_nodes:
                 continue

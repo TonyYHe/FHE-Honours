@@ -166,6 +166,18 @@ def test_r18_e2e_probe_marks_dense_fallback_bypass_nodes() -> None:
         assert getattr(module, "region_first_probe_lazy_region_compile") is True
 
 
+def test_r18_e2e_probe_can_disable_lazy_region_compile() -> None:
+    _net, dag = _prepared_r18_tiny_dag()
+    registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(dag)
+    registry.attach_to_dag(dag)
+
+    registry.attach_probe_dense_bypass_to_dag(dag, lazy_region_compile=False)
+
+    for group in registry.groups:
+        module = dag.nodes[group.conv_nodes[0]]["module"]
+        assert getattr(module, "region_first_probe_lazy_region_compile") is False
+
+
 def test_r18_e2e_probe_bypasses_only_stem_relu_in_he_mode() -> None:
     net = ResNet18(dataset="tiny", activation="silu", silu_degree=7, stem_relu=True)
     traced = OrionTracer().trace_model(net)
