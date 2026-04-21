@@ -19,11 +19,14 @@ class LinearTransform(Module):
         self.diagonals = {} # diags[(row, col)] = {0: [...], 1: [...], ...}
         self.transform_ids = {} # ids[(row, col)] = int
         self.output_rotations = 0
+        self._transform_backend = None
 
     def __del__(self):
-        if 'sys' in globals() and sys.modules and self.scheme:
+        backend = getattr(self, "_transform_backend", None)
+        if 'sys' in globals() and sys.modules and backend is not None:
             try:
-                self.scheme.lt_evaluator.delete_transforms(self.transform_ids)
+                for tid in self.transform_ids.values():
+                    backend.DeleteLinearTransform(tid)
             except Exception:
                 pass # avoids errors for GC at program termination
 
@@ -133,6 +136,7 @@ class Linear(LinearTransform):
         bias = packing.construct_linear_bias(self)
         self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
+        self._transform_backend = self.scheme.backend
     
     def forward(self, x):
         if not self.he_mode:
@@ -267,6 +271,7 @@ class Conv2d(LinearTransform):
         bias = packing.construct_conv2d_bias(self)
         self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
+        self._transform_backend = self.scheme.backend
 
     def forward(self, x):
         # Forward pass that handles both cleartext and FHE inference.
@@ -299,3 +304,116 @@ class Conv2d(LinearTransform):
             )
         
         return self.evaluate_transforms(x) # FHE mode
+
+
+class ConvTranspose2d(LinearTransform):
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int,
+            stride: int = 1,
+            padding: int = 0,
+            output_padding: int = 0,
+            dilation: int = 1,
+            groups: int = 1,
+            bias: bool = True,
+            bsgs_ratio: int = 2,
+            level: int = None,
+    ) -> None:
+        super().__init__(bsgs_ratio, level)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.kernel_size = self._make_tuple(kernel_size)
+        self.stride = self._make_tuple(stride)
+        self.padding = self._make_tuple(padding)
+        self.output_padding = self._make_tuple(output_padding)
+        self.dilation = self._make_tuple(dilation)
+        self.groups = groups
+
+        self.weight = nn.Parameter(
+            torch.empty(in_channels, out_channels // groups, *self.kernel_size)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+        self.reset_parameters()
+
+    def _make_tuple(self, value):
+        return (value, value) if isinstance(value, int) else value
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def extra_repr(self):
+        return (
+            f"in_channels={self.in_channels}, out_channels={self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}, "
+            f"padding={self.padding}, output_padding={self.output_padding}, "
+            f"dilation={self.dilation}, groups={self.groups}, "
+            + super().extra_repr()
+        )
+
+    def init_orion_params(self):
+        self.on_weight = self.weight.data.clone()
+        self.on_bias = (
+            self.bias.data.clone()
+            if hasattr(self, "bias") and self.bias is not None
+            else torch.zeros(self.out_channels)
+        )
+
+    def compute_fhe_output_gap(self, **kwargs):
+        input_gap = kwargs["input_gap"]
+        return max(1, input_gap // self.stride[0])
+
+    def compute_fhe_output_shape(self, **kwargs) -> tuple:
+        clear_output_shape = kwargs["clear_output_shape"]
+        output_gap = self.compute_fhe_output_gap(input_gap=kwargs["input_gap"])
+
+        N, Co, Ho, Wo = clear_output_shape
+        on_Co = math.ceil(Co / (output_gap ** 2))
+        on_Ho = Ho * output_gap
+        on_Wo = Wo * output_gap
+
+        return torch.Size((N, on_Co, on_Ho, on_Wo))
+
+    def generate_diagonals(self, last):
+        self.diagonals, self.output_rotations = packing.pack_conv_transpose2d(self, last)
+        if self.get_io_mode() == "save":
+            self.save_transforms()
+
+    def compile(self):
+        if self.get_io_mode() != "none":
+            self.diagonals, self.on_bias, self.output_rotations = self.load_transforms()
+
+        bias = packing.construct_conv_transpose2d_bias(self)
+        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level - self.depth)
+        self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
+        self._transform_backend = self.scheme.backend
+
+    def forward(self, x):
+        if not self.he_mode:
+            if x.dim() != 4:
+                raise ValueError(
+                    f"Expected input to {self.__class__.__name__} to have "
+                    f"4 dimensions (N, C, H, W), but got {x.dim()} "
+                    f"dimension(s): {x.shape}."
+                )
+
+            return torch.nn.functional.conv_transpose2d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                self.padding,
+                self.output_padding,
+                self.groups,
+                self.dilation,
+            )
+
+        return self.evaluate_transforms(x)

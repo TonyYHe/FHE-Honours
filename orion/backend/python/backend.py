@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from itertools import count
+
+import numpy as np
+import torch
+
+
+@dataclass
+class _TensorState:
+    values: torch.Tensor
+    level: int
+    scale: float
+    slots: int
+    degree: int = 0
+
+
+@dataclass
+class _LinearTransformState:
+    diag_indices: list[int]
+    diagonals: list[torch.Tensor]
+    level: int
+    slots: int
+
+
+@dataclass
+class _PolynomialState:
+    kind: str
+    coeffs: list[float]
+
+
+class PythonBackend:
+    """
+    Lightweight in-memory backend used for Orion development and unit tests.
+
+    It mirrors the small subset of the Lattigo bindings that Orion's Python
+    wrapper expects, but all values stay as plain tensors in memory. This lets
+    us compile and exercise packing/runtime paths without the shared library.
+    """
+
+    def __init__(self, params) -> None:
+        self.params = params
+        self._ids = count(1)
+        self._plaintexts: dict[int, _TensorState] = {}
+        self._ciphertexts: dict[int, _TensorState] = {}
+        self._linear_transforms: dict[int, _LinearTransformState] = {}
+        self._polynomials: dict[int, _PolynomialState] = {}
+        self._rotation_keys: set[int] = set()
+        self._num_slots = int(params.get_slots())
+        self._moduli_chain = [float(2 ** int(q)) for q in params.get_logq()]
+        self._aux_moduli_chain = [float(2 ** int(q)) for q in params.get_boot_logp()]
+
+    # ---------------- #
+    # Lifecycle / keys #
+    # ---------------- #
+
+    def DeleteScheme(self) -> None:
+        self._plaintexts.clear()
+        self._ciphertexts.clear()
+        self._linear_transforms.clear()
+        self._polynomials.clear()
+        self._rotation_keys.clear()
+
+    def NewKeyGenerator(self) -> None:
+        return
+
+    def GenerateSecretKey(self) -> None:
+        return
+
+    def SerializeSecretKey(self):
+        return np.array([], dtype=np.uint8), None
+
+    def LoadSecretKey(self, _serialized) -> None:
+        return
+
+    def GeneratePublicKey(self) -> None:
+        return
+
+    def GenerateRelinearizationKey(self) -> None:
+        return
+
+    def GenerateEvaluationKeys(self) -> None:
+        return
+
+    def NewEncoder(self) -> None:
+        return
+
+    def NewEncryptor(self) -> None:
+        return
+
+    def NewDecryptor(self) -> None:
+        return
+
+    def NewEvaluator(self) -> None:
+        return
+
+    def NewLinearTransformEvaluator(self) -> None:
+        return
+
+    def NewPolynomialEvaluator(self) -> None:
+        return
+
+    def NewBootstrapper(self, _logp, _slots) -> None:
+        return
+
+    def DeleteBootstrappers(self) -> None:
+        return
+
+    # ------------------- #
+    # Plain / cipher data #
+    # ------------------- #
+
+    def _next_id(self) -> int:
+        return int(next(self._ids))
+
+    def _clone_values(self, values) -> torch.Tensor:
+        if isinstance(values, torch.Tensor):
+            return values.detach().clone().to(dtype=torch.float32)
+        return torch.tensor(values, dtype=torch.float32)
+
+    def _store_plaintext(self, values, level: int, scale: float) -> int:
+        plaintext_id = self._next_id()
+        tensor = self._clone_values(values).reshape(-1)
+        self._plaintexts[plaintext_id] = _TensorState(
+            values=tensor,
+            level=int(level),
+            scale=float(scale),
+            slots=int(tensor.numel()),
+            degree=0,
+        )
+        return plaintext_id
+
+    def _store_ciphertext(self, values, level: int, scale: float, degree: int = 1) -> int:
+        ciphertext_id = self._next_id()
+        tensor = self._clone_values(values).reshape(-1)
+        self._ciphertexts[ciphertext_id] = _TensorState(
+            values=tensor,
+            level=int(level),
+            scale=float(scale),
+            slots=int(tensor.numel()),
+            degree=int(degree),
+        )
+        return ciphertext_id
+
+    def _clone_plaintext(self, plaintext_id: int) -> _TensorState:
+        state = self._plaintexts[int(plaintext_id)]
+        return _TensorState(
+            values=state.values.clone(),
+            level=state.level,
+            scale=state.scale,
+            slots=state.slots,
+            degree=state.degree,
+        )
+
+    def _clone_ciphertext(self, ciphertext_id: int) -> _TensorState:
+        state = self._ciphertexts[int(ciphertext_id)]
+        return _TensorState(
+            values=state.values.clone(),
+            level=state.level,
+            scale=state.scale,
+            slots=state.slots,
+            degree=state.degree,
+        )
+
+    def Encode(self, values, level, scale) -> int:
+        return self._store_plaintext(values, level, scale)
+
+    def Decode(self, plaintext_id):
+        return self._plaintexts[int(plaintext_id)].values.tolist()
+
+    def Encrypt(self, plaintext_id) -> int:
+        state = self._clone_plaintext(int(plaintext_id))
+        return self._store_ciphertext(state.values, state.level, state.scale, degree=1)
+
+    def Decrypt(self, ciphertext_id) -> int:
+        state = self._clone_ciphertext(int(ciphertext_id))
+        return self._store_plaintext(state.values, state.level, state.scale)
+
+    def DeletePlaintext(self, plaintext_id) -> None:
+        self._plaintexts.pop(int(plaintext_id), None)
+
+    def DeleteCiphertext(self, ciphertext_id) -> None:
+        self._ciphertexts.pop(int(ciphertext_id), None)
+
+    # -------- #
+    # Metadata #
+    # -------- #
+
+    def GetModuliChain(self):
+        return list(self._moduli_chain)
+
+    def GetAuxModuliChain(self):
+        return list(self._aux_moduli_chain)
+
+    def GetPlaintextScale(self, plaintext_id):
+        return float(self._plaintexts[int(plaintext_id)].scale)
+
+    def GetPlaintextScaleLog2(self, plaintext_id):
+        scale = float(self._plaintexts[int(plaintext_id)].scale)
+        if scale <= 0:
+            return float("-inf")
+        return math.log2(scale)
+
+    def SetPlaintextScale(self, plaintext_id, scale) -> None:
+        self._plaintexts[int(plaintext_id)].scale = float(scale)
+
+    def GetPlaintextLevel(self, plaintext_id):
+        return int(self._plaintexts[int(plaintext_id)].level)
+
+    def GetPlaintextSlots(self, plaintext_id):
+        return int(self._plaintexts[int(plaintext_id)].slots)
+
+    def GetCiphertextScale(self, ciphertext_id):
+        return float(self._ciphertexts[int(ciphertext_id)].scale)
+
+    def GetCiphertextScaleLog2(self, ciphertext_id):
+        scale = float(self._ciphertexts[int(ciphertext_id)].scale)
+        if scale <= 0:
+            return float("-inf")
+        return math.log2(scale)
+
+    def SetCiphertextScale(self, ciphertext_id, scale) -> None:
+        self._ciphertexts[int(ciphertext_id)].scale = float(scale)
+
+    def GetCiphertextLevel(self, ciphertext_id):
+        return int(self._ciphertexts[int(ciphertext_id)].level)
+
+    def GetCiphertextSlots(self, ciphertext_id):
+        return int(self._ciphertexts[int(ciphertext_id)].slots)
+
+    def GetCiphertextDegree(self, ciphertext_id):
+        return int(self._ciphertexts[int(ciphertext_id)].degree)
+
+    def GetLivePlaintexts(self):
+        return len(self._plaintexts)
+
+    def GetLiveCiphertexts(self):
+        return len(self._ciphertexts)
+
+    # ---------- #
+    # Arithmetic #
+    # ---------- #
+
+    def _binary_ct_op(self, lhs_id, rhs_id, op, *, in_place: bool):
+        lhs = self._ciphertexts[int(lhs_id)]
+        rhs = self._ciphertexts[int(rhs_id)]
+        values = op(lhs.values, rhs.values)
+        level = min(lhs.level, rhs.level)
+        scale = max(lhs.scale, rhs.scale)
+        degree = max(lhs.degree, rhs.degree)
+        if in_place:
+            lhs.values = values
+            lhs.level = level
+            lhs.scale = scale
+            lhs.degree = degree
+            return int(lhs_id)
+        return self._store_ciphertext(values, level, scale, degree)
+
+    def _binary_pt_op(self, lhs_id, rhs_id, op, *, in_place: bool):
+        lhs = self._ciphertexts[int(lhs_id)]
+        rhs = self._plaintexts[int(rhs_id)]
+        values = op(lhs.values, rhs.values)
+        level = min(lhs.level, rhs.level)
+        scale = max(lhs.scale, rhs.scale)
+        if in_place:
+            lhs.values = values
+            lhs.level = level
+            lhs.scale = scale
+            return int(lhs_id)
+        return self._store_ciphertext(values, level, scale, lhs.degree)
+
+    def _scalar_ct_op(self, lhs_id, scalar, op, *, in_place: bool):
+        lhs = self._ciphertexts[int(lhs_id)]
+        values = op(lhs.values, float(scalar))
+        if in_place:
+            lhs.values = values
+            return int(lhs_id)
+        return self._store_ciphertext(values, lhs.level, lhs.scale, lhs.degree)
+
+    def Negate(self, ciphertext_id):
+        state = self._ciphertexts[int(ciphertext_id)]
+        return self._store_ciphertext(-state.values, state.level, state.scale, state.degree)
+
+    def Conjugate(self, ciphertext_id):
+        return int(ciphertext_id)
+
+    def ConjugateNew(self, ciphertext_id):
+        state = self._clone_ciphertext(int(ciphertext_id))
+        return self._store_ciphertext(state.values, state.level, state.scale, state.degree)
+
+    def Rotate(self, ciphertext_id, amount):
+        state = self._ciphertexts[int(ciphertext_id)]
+        state.values = torch.roll(state.values, shifts=int(amount))
+        return int(ciphertext_id)
+
+    def RotateNew(self, ciphertext_id, amount):
+        state = self._ciphertexts[int(ciphertext_id)]
+        values = torch.roll(state.values, shifts=int(amount))
+        return self._store_ciphertext(values, state.level, state.scale, state.degree)
+
+    def AddRotationKey(self, amount: int) -> None:
+        self._rotation_keys.add(int(amount))
+
+    def AddScalar(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x + s, in_place=True)
+
+    def AddScalarNew(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x + s, in_place=False)
+
+    def SubScalar(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x - s, in_place=True)
+
+    def SubScalarNew(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x - s, in_place=False)
+
+    def MulScalarInt(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x * s, in_place=True)
+
+    def MulScalarIntNew(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x * s, in_place=False)
+
+    def MulScalarFloat(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x * s, in_place=True)
+
+    def MulScalarFloatNew(self, ciphertext_id, scalar):
+        return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x * s, in_place=False)
+
+    def MulImaginaryUnit(self, ciphertext_id, sign):
+        return self.MulScalarInt(ciphertext_id, int(sign))
+
+    def MulImaginaryUnitNew(self, ciphertext_id, sign):
+        return self.MulScalarIntNew(ciphertext_id, int(sign))
+
+    def AddPlaintext(self, ciphertext_id, plaintext_id):
+        return self._binary_pt_op(ciphertext_id, plaintext_id, torch.add, in_place=True)
+
+    def AddPlaintextNew(self, ciphertext_id, plaintext_id):
+        return self._binary_pt_op(ciphertext_id, plaintext_id, torch.add, in_place=False)
+
+    def SubPlaintext(self, ciphertext_id, plaintext_id):
+        return self._binary_pt_op(ciphertext_id, plaintext_id, torch.sub, in_place=True)
+
+    def SubPlaintextNew(self, ciphertext_id, plaintext_id):
+        return self._binary_pt_op(ciphertext_id, plaintext_id, torch.sub, in_place=False)
+
+    def MulPlaintext(self, ciphertext_id, plaintext_id):
+        return self._binary_pt_op(ciphertext_id, plaintext_id, torch.mul, in_place=True)
+
+    def MulPlaintextNew(self, ciphertext_id, plaintext_id):
+        return self._binary_pt_op(ciphertext_id, plaintext_id, torch.mul, in_place=False)
+
+    def AddCiphertext(self, lhs_id, rhs_id):
+        return self._binary_ct_op(lhs_id, rhs_id, torch.add, in_place=True)
+
+    def AddCiphertextNew(self, lhs_id, rhs_id):
+        return self._binary_ct_op(lhs_id, rhs_id, torch.add, in_place=False)
+
+    def SubCiphertext(self, lhs_id, rhs_id):
+        return self._binary_ct_op(lhs_id, rhs_id, torch.sub, in_place=True)
+
+    def SubCiphertextNew(self, lhs_id, rhs_id):
+        return self._binary_ct_op(lhs_id, rhs_id, torch.sub, in_place=False)
+
+    def MulRelinCiphertext(self, lhs_id, rhs_id):
+        result_id = self._binary_ct_op(lhs_id, rhs_id, torch.mul, in_place=True)
+        self._ciphertexts[int(result_id)].degree = 1
+        return result_id
+
+    def MulRelinCiphertextNew(self, lhs_id, rhs_id):
+        result_id = self._binary_ct_op(lhs_id, rhs_id, torch.mul, in_place=False)
+        self._ciphertexts[int(result_id)].degree = 1
+        return result_id
+
+    def Rescale(self, ciphertext_id):
+        state = self._ciphertexts[int(ciphertext_id)]
+        state.level = max(0, int(state.level) - 1)
+        return int(ciphertext_id)
+
+    def RescaleNew(self, ciphertext_id):
+        state = self._clone_ciphertext(int(ciphertext_id))
+        state.level = max(0, int(state.level) - 1)
+        return self._store_ciphertext(state.values, state.level, state.scale, state.degree)
+
+    # ----------------- #
+    # Linear transforms #
+    # ----------------- #
+
+    def GenerateLinearTransform(self, diags_idxs, diags_data, level, _bsgs_ratio, _io_mode):
+        slots = int(len(diags_data) // max(1, len(diags_idxs))) if diags_idxs else self._num_slots
+        diagonals = []
+        cursor = 0
+        for _ in diags_idxs:
+            diagonals.append(torch.tensor(diags_data[cursor:cursor + slots], dtype=torch.float32))
+            cursor += slots
+
+        transform_id = self._next_id()
+        self._linear_transforms[transform_id] = _LinearTransformState(
+            diag_indices=[int(idx) for idx in diags_idxs],
+            diagonals=diagonals,
+            level=int(level),
+            slots=slots,
+        )
+        return transform_id
+
+    def GetLinearTransformRotationKeys(self, transform_id):
+        transform = self._linear_transforms[int(transform_id)]
+        return [int(idx) for idx in transform.diag_indices]
+
+    def GenerateLinearTransformRotationKey(self, key):
+        self._rotation_keys.add(int(key))
+
+    def GenerateAndSerializeRotationKey(self, key):
+        self._rotation_keys.add(int(key))
+        return np.array([int(key)], dtype=np.int32), None
+
+    def FreeCArray(self, _ptr) -> None:
+        return
+
+    def SerializeDiagonal(self, diagonal):
+        return np.array(diagonal, dtype=np.float32), None
+
+    def LoadRotationKey(self, _serialized_key) -> None:
+        return
+
+    def RemoveRotationKeys(self) -> None:
+        return
+
+    def LoadPlaintextDiagonal(self, _transform_id, _diag_idx, _serialized_diag) -> None:
+        return
+
+    def RemovePlaintextDiagonals(self, _transform_id) -> None:
+        return
+
+    def EvaluateLinearTransform(self, transform_id, ciphertext_id):
+        transform = self._linear_transforms[int(transform_id)]
+        state = self._ciphertexts[int(ciphertext_id)]
+
+        output = torch.zeros(transform.slots, dtype=torch.float32)
+        for diag_idx, diag in zip(transform.diag_indices, transform.diagonals):
+            output += diag * torch.roll(state.values, shifts=-int(diag_idx))
+
+        return self._store_ciphertext(
+            output,
+            min(state.level, transform.level),
+            state.scale,
+            state.degree,
+        )
+
+    def DeleteLinearTransform(self, transform_id) -> None:
+        self._linear_transforms.pop(int(transform_id), None)
+
+    # ---------- #
+    # Polynomial #
+    # ---------- #
+
+    def GenerateMonomial(self, coeffs):
+        poly_id = self._next_id()
+        self._polynomials[poly_id] = _PolynomialState("monomial", [float(v) for v in coeffs])
+        return poly_id
+
+    def GenerateChebyshev(self, coeffs):
+        poly_id = self._next_id()
+        self._polynomials[poly_id] = _PolynomialState("chebyshev", [float(v) for v in coeffs])
+        return poly_id
+
+    def EvaluatePolynomial(self, ciphertext_id, poly_id, out_scale):
+        state = self._ciphertexts[int(ciphertext_id)]
+        poly = self._polynomials[int(poly_id)]
+
+        if poly.kind == "monomial":
+            values = torch.zeros_like(state.values)
+            for coeff in poly.coeffs:
+                values = values * state.values + float(coeff)
+        else:
+            coeffs = np.array(poly.coeffs, dtype=np.float32)
+            values = torch.tensor(
+                np.polynomial.chebyshev.chebval(state.values.numpy(), coeffs),
+                dtype=torch.float32,
+            )
+
+        return self._store_ciphertext(values, state.level, float(out_scale), state.degree)
+
+    def GenerateMinimaxSignCoeffs(self, _degrees, _prec, _logalpha, _logerr, _debug):
+        raise NotImplementedError("Minimax sign coefficients are not implemented in the Python backend.")
+
+    def GetPolyDepth(self, poly_id):
+        coeff_count = max(1, len(self._polynomials[int(poly_id)].coeffs))
+        return int(math.ceil(math.log2(coeff_count)))
+
+    # ------------ #
+    # Bootstrapping #
+    # ------------ #
+
+    def Bootstrap(self, ciphertext_id, _slots):
+        state = self._clone_ciphertext(int(ciphertext_id))
+        return self._store_ciphertext(
+            state.values,
+            self.params.get_max_level(),
+            state.scale,
+            state.degree,
+        )

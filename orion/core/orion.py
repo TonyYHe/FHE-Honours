@@ -11,6 +11,7 @@ from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
 from orion.backend.lattigo import bindings as lgo
 from orion.backend.python import (
+    PythonBackend,
     parameters, 
     key_generator,
     encoder, 
@@ -25,6 +26,48 @@ from .tracer import StatsTracker, OrionTracer
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
+
+
+def _region_first_mode_options(mode: str) -> dict[str, Any]:
+    normalized = str(mode or "").lower()
+    r18_modes = {
+        "r18_tiny",
+        "r18_tiny_e2e",
+        "r18_tiny_e2e_probe",
+        "r18_tiny_e2e_probe_precompile",
+        "r18_tiny_e2e_probe_precompile_no_stem_bypass",
+        "r18_tiny_e2e_probe_precompile_stage0",
+    }
+    is_enabled = normalized in r18_modes or normalized == "r34_imgnet_phase1"
+    is_r18 = normalized in r18_modes
+    is_probe_dense_bypass = normalized in {
+        "r18_tiny_e2e_probe",
+        "r18_tiny_e2e_probe_precompile",
+        "r18_tiny_e2e_probe_precompile_no_stem_bypass",
+        "r18_tiny_e2e_probe_precompile_stage0",
+    }
+    is_probe_stem_bypass = normalized in {
+        "r18_tiny_e2e_probe",
+        "r18_tiny_e2e_probe_precompile",
+        "r18_tiny_e2e_probe_precompile_stage0",
+    }
+    is_precompiled_probe = normalized in {
+        "r18_tiny_e2e_probe_precompile",
+        "r18_tiny_e2e_probe_precompile_no_stem_bypass",
+        "r18_tiny_e2e_probe_precompile_stage0",
+    }
+    return {
+        "mode": normalized,
+        "enabled": bool(is_enabled),
+        "is_r18": bool(is_r18),
+        "is_r34_phase1": bool(normalized == "r34_imgnet_phase1"),
+        "allowed_stages": ("stage1",) if normalized == "r18_tiny_e2e_probe_precompile_stage0" else None,
+        "attach_probe_dense_bypass": bool(is_probe_dense_bypass),
+        "attach_probe_stem_activation_bypass": bool(is_probe_stem_bypass),
+        "lazy_region_compile": bool(normalized == "r18_tiny_e2e_probe"),
+        "probe_region_precompiled": bool(is_precompiled_probe),
+        "probe_publishable": False,
+    }
 
 
 class Scheme:
@@ -92,12 +135,13 @@ class Scheme:
             py_lattigo = lgo.LattigoLibrary()
             py_lattigo.setup_bindings(params)
             return py_lattigo
+        elif backend == "python":
+            return PythonBackend(params)
         elif backend in ("heaan", "openfhe"):
             raise ValueError(f"Backend {backend} not yet supported.")
         else:
             raise ValueError(
-                f"Invalid {backend}. Set the backend to Lattigo until "
-                f"further notice."
+                f"Invalid {backend}. Supported backends are: lattigo, python."
             )
 
     def encode(self, tensor, level=None, scale=None):
@@ -236,24 +280,42 @@ class Scheme:
 
         self.region_first_registry = None
         self.region_first_attach_audit = {}
-        if self.params.get_experimental_region_first() in {"r18_tiny", "r18_tiny_e2e", "r18_tiny_e2e_probe", "r18_tiny_e2e_probe_precompile"}:
-            from orion.experimental.cir.runtime_group import RegionFirstCompileRegistry
+        experimental_region_first = self.params.get_experimental_region_first()
+        region_first_options = _region_first_mode_options(experimental_region_first)
+        if bool(region_first_options["enabled"]):
+            if bool(region_first_options["is_r34_phase1"]):
+                from orion.experimental.r34_phase1 import R34CompileRegistry
 
-            if self.params.get_experimental_region_first() in {"r18_tiny_e2e", "r18_tiny_e2e_probe", "r18_tiny_e2e_probe_precompile"}:
-                self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(network_dag)
+                self.region_first_registry = R34CompileRegistry.for_r34_imgnet_phase1(network_dag)
+                self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
             else:
-                self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny(network_dag)
-            self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
-            if self.params.get_experimental_region_first() in {"r18_tiny_e2e_probe", "r18_tiny_e2e_probe_precompile"}:
-                self.region_first_attach_audit["probe_dense_bypass"] = self.region_first_registry.attach_probe_dense_bypass_to_dag(
-                    network_dag,
-                    lazy_region_compile=bool(self.params.get_experimental_region_first() == "r18_tiny_e2e_probe"),
-                )
-                self.region_first_attach_audit["probe_stem_activation_bypass"] = self.region_first_registry.attach_probe_stem_activation_bypass(net)
-                self.region_first_attach_audit["probe_publishable"] = False
-                self.region_first_attach_audit["probe_region_precompiled"] = bool(
-                    self.params.get_experimental_region_first() == "r18_tiny_e2e_probe_precompile"
-                )
+                from orion.experimental.cir.runtime_group import RegionFirstCompileRegistry
+
+                allowed_stages = region_first_options["allowed_stages"]
+                if experimental_region_first in {
+                    "r18_tiny_e2e",
+                    "r18_tiny_e2e_probe",
+                    "r18_tiny_e2e_probe_precompile",
+                    "r18_tiny_e2e_probe_precompile_no_stem_bypass",
+                    "r18_tiny_e2e_probe_precompile_stage0",
+                }:
+                    self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(
+                        network_dag,
+                        allowed_stages=allowed_stages,
+                    )
+                else:
+                    self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny(network_dag)
+                self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
+                if bool(region_first_options["attach_probe_dense_bypass"]):
+                    self.region_first_attach_audit["probe_dense_bypass"] = self.region_first_registry.attach_probe_dense_bypass_to_dag(
+                        network_dag,
+                        lazy_region_compile=bool(region_first_options["lazy_region_compile"]),
+                    )
+                if bool(region_first_options["attach_probe_stem_activation_bypass"]):
+                    self.region_first_attach_audit["probe_stem_activation_bypass"] = self.region_first_registry.attach_probe_stem_activation_bypass(net)
+                if bool(region_first_options["attach_probe_dense_bypass"] or region_first_options["attach_probe_stem_activation_bypass"]):
+                    self.region_first_attach_audit["probe_publishable"] = bool(region_first_options["probe_publishable"])
+                    self.region_first_attach_audit["probe_region_precompiled"] = bool(region_first_options["probe_region_precompiled"])
 
         #---------------------------------------------#
         #   Pack diagonals of all linear transforms   #

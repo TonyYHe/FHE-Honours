@@ -89,14 +89,14 @@ def construct_conv2d_toeplitz(conv_layer, weight):
     # Iterate over all positions that the top-left kernel element can touch 
     # populating the correct (permuted) rows of our Toeplitz matrix.
     for i, start_idx in enumerate(corner_indices):
-        rows = (row_map[i] + out_channels).reshape(-1, 1)
-        cols = initial_kernel_position + start_idx
-        toeplitz[rows, cols] = kernel_flat
+        rows = (row_map[i] + out_channels).reshape(-1, 1).cpu().numpy()
+        cols = (initial_kernel_position + start_idx).cpu().numpy()
+        toeplitz[rows, cols] = kernel_flat.cpu().numpy()
 
     # Keep only the columns corresponding to the non-padded input image.
     row_idxs = torch.arange(P*iG, P*iG + on_Hi).reshape(-1, 1)
     col_idxs = torch.arange(P*iG, P*iG + on_Wi)
-    image_indices = valid_image_indices[:, row_idxs, col_idxs].flatten()
+    image_indices = valid_image_indices[:, row_idxs, col_idxs].flatten().cpu().numpy()
     toeplitz = toeplitz.tocsc()[:, image_indices]
     
     # Support batching
@@ -112,6 +112,119 @@ def construct_conv2d_bias(conv_layer):
     bias = bias.reshape(1, Co, Ho, Wo)
     bias_multiplexed = multiplex(bias, conv_layer.output_gap).squeeze(0)
     
+    mC, mH, mW = bias_multiplexed.shape
+    bias_vector = torch.zeros(on_Co, on_Ho, on_Wo)
+    bias_vector[:mC, :mH, :mW] = bias_multiplexed
+    bias_vector = bias_vector.flatten().repeat(N)
+
+    return bias_vector
+
+
+def pack_conv_transpose2d(conv_layer: nn.Module, last: bool):
+    slots = conv_layer.scheme.params.get_slots()
+    embed_method = conv_layer.scheme.params.get_embedding_method()
+
+    toeplitz = construct_conv_transpose2d_toeplitz(conv_layer)
+    diagonals, output_rotations = diagonalize(toeplitz, slots, embed_method, last)
+
+    return diagonals, output_rotations
+
+
+def _pad_fhe_tensor(matrix: torch.Tensor, fhe_shape: torch.Size) -> torch.Tensor:
+    padded = torch.zeros(fhe_shape, dtype=matrix.dtype)
+    padded[
+        : matrix.shape[0],
+        : matrix.shape[1],
+        : matrix.shape[2],
+        : matrix.shape[3],
+    ] = matrix
+    return padded
+
+
+def _demultiplex(matrix: torch.Tensor, gap: int, channels: int, height: int, width: int) -> torch.Tensor:
+    if gap == 1:
+        return matrix[:, :channels, :height, :width]
+
+    demux = F.pixel_unshuffle(matrix, gap)
+    return demux[:, :channels, :height, :width]
+
+
+def construct_conv_transpose2d_toeplitz(conv_layer):
+    """
+    Build the transposed-convolution Toeplitz matrix in the multiplexed space.
+
+    Rather than manually reasoning about gap-aligned subpixels, we probe the
+    operator with basis vectors in the FHE layout, demultiplex them back to the
+    clear layout, run PyTorch's reference `conv_transpose2d`, then remultiplex
+    the result. This keeps the packing logic aligned with Orion's actual tensor
+    layout and naturally handles stride, padding, dilation, output_padding, and
+    grouped convolutions.
+    """
+    N, on_Ci, on_Hi, on_Wi = conv_layer.fhe_input_shape
+    on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
+    Hi, Wi = conv_layer.input_shape[2:]
+
+    n_rows = on_Co * on_Ho * on_Wo
+    n_cols = on_Ci * on_Hi * on_Wi
+
+    row_coords = []
+    col_coords = []
+    data_values = []
+
+    for input_col in range(n_cols):
+        basis_fhe = torch.zeros((1, on_Ci, on_Hi, on_Wi), dtype=conv_layer.on_weight.dtype)
+        basis_fhe.view(-1)[input_col] = 1.0
+
+        clear_input = _demultiplex(
+            basis_fhe,
+            conv_layer.input_gap,
+            conv_layer.in_channels,
+            Hi,
+            Wi,
+        )
+        clear_output = F.conv_transpose2d(
+            clear_input,
+            conv_layer.on_weight,
+            None,
+            conv_layer.stride,
+            conv_layer.padding,
+            conv_layer.output_padding,
+            conv_layer.groups,
+            conv_layer.dilation,
+        )
+        output_fhe = _pad_fhe_tensor(
+            multiplex(clear_output, conv_layer.output_gap),
+            torch.Size((1, on_Co, on_Ho, on_Wo)),
+        )
+
+        flat_output = output_fhe.view(-1)
+        nonzero_idx = flat_output.nonzero(as_tuple=False).flatten()
+        row_coords.extend(nonzero_idx.tolist())
+        col_coords.extend([input_col] * int(nonzero_idx.numel()))
+        data_values.extend(flat_output[nonzero_idx].tolist())
+
+    if row_coords:
+        toeplitz = sp.coo_matrix(
+            (data_values, (row_coords, col_coords)),
+            shape=(n_rows, n_cols),
+            dtype="f",
+        ).tocsr()
+    else:
+        toeplitz = sp.csr_matrix((n_rows, n_cols), dtype="f")
+
+    toeplitz = sp.kron(sp.eye(N, dtype="f"), toeplitz, format="csr")
+    return toeplitz
+
+
+def construct_conv_transpose2d_bias(conv_layer):
+    N, Co, Ho, Wo = conv_layer.output_shape
+    on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
+
+    bias = conv_layer.on_bias
+    bias = bias.repeat_interleave(Ho * Wo)
+    bias = bias.reshape(1, Co, Ho, Wo)
+    bias_multiplexed = multiplex(bias, conv_layer.output_gap).squeeze(0)
+
     mC, mH, mW = bias_multiplexed.shape
     bias_vector = torch.zeros(on_Co, on_Ho, on_Wo)
     bias_vector[:mC, :mH, :mW] = bias_multiplexed
