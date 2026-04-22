@@ -79,21 +79,22 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     audit = registry.attach_to_dag(dag)
 
     assert audit["attached_count"] == 31
-    assert audit["executable_region_count"] == 30
-    assert len(audit["fallback_layers"]) == 0
+    assert audit["executable_region_count"] == 17
+    assert len(audit["fallback_layers"]) == 13
 
     stage2_module = dag.nodes["layers_1_1_conv1"]["module"]
     assert getattr(stage2_module, "region_runtime") is not None
     assert getattr(stage2_module, "region_output_id") == "layers_1_1_conv1"
-    assert getattr(stage2_module, "region_first_skip_dense_pack") is True
+    assert getattr(stage2_module, "region_first_skip_dense_pack") is False
     assert getattr(stage2_module, "region_layout_contract_imported") is True
     assert getattr(stage2_module, "region_input_layout")["stride"] == 8
     assert getattr(stage2_module, "region_output_layout")["stride"] == 8
     assert getattr(stage2_module, "region_family_label") == "stage2_same"
     assert getattr(stage2_module, "region_source_group_count") == 2
     assert getattr(stage2_module, "region_kernel_policy") == "inter_group_hybrid"
-    assert stage2_module.region_runtime.executable is True
-    assert stage2_module.region_runtime.executor is not None
+    assert stage2_module.region_runtime.executable is False
+    assert stage2_module.region_runtime.executor is None
+    assert stage2_module.region_runtime.fallback_reason == "inter_group_hybrid_materializer_not_parity_safe_yet"
 
     stage4_module = dag.nodes["layers_3_2_conv2"]["module"]
     assert getattr(stage4_module, "region_runtime") is not None
@@ -210,10 +211,10 @@ def test_r34_same_shape_group_compiles_and_executes_runtime(monkeypatch) -> None
 
     registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
     registry.attach_to_dag(dag)
-    module = dag.nodes["layers_1_1_conv1"]["module"]
+    module = dag.nodes["layers_2_1_conv1"]["module"]
     group = module.region_runtime
     executor = group.executor
-    assert isinstance(executor, r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor)
+    assert isinstance(executor, r34_same_shape.R34IntraGroupPack2SameShapeRuntimeExecutor)
 
     def fail_pack_conv2d(*_args, **_kwargs):
         raise AssertionError("same-shape runtime should not call pack_conv2d")
@@ -349,7 +350,7 @@ def test_r34_same_shape_group_compiles_and_executes_runtime(monkeypatch) -> None
             module.fhe_input_shape,
         )
 
-        out = group.output("layers_1_1_conv1", source)
+        out = group.output("layers_2_1_conv1", source)
 
         assert isinstance(out, CipherTensor)
         assert len(out.ids) == executor.rows
@@ -363,3 +364,17 @@ def test_r34_policy_matches_simple_source_group_rule() -> None:
     assert r34_same_shape.r34_same_shape_policy(c=128, gap=8) == "inter_group_hybrid"
     assert r34_same_shape.r34_same_shape_policy(c=256, gap=16) == "intra_group_pack2"
     assert r34_same_shape.r34_same_shape_policy(c=512, gap=32) == "intra_group_pack2"
+
+
+def test_r34_inter_group_policy_is_gated_until_parity_is_restored() -> None:
+    dag = _prepared_r34_imagenet_dag()
+    registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
+    registry.attach_to_dag(dag)
+
+    stage1_module = dag.nodes["layers_0_0_conv1"]["module"]
+    stage2_module = dag.nodes["layers_1_1_conv1"]["module"]
+
+    assert getattr(stage1_module, "region_kernel_policy") == "inter_group_hybrid"
+    assert getattr(stage2_module, "region_kernel_policy") == "inter_group_hybrid"
+    assert stage1_module.region_runtime.executable is False
+    assert stage2_module.region_runtime.executable is False

@@ -364,16 +364,16 @@ _PHASE1_KERNEL_BINDINGS: tuple[KernelBinding, ...] = (
         provider_key="r34_stage1_same_inter_group_hybrid_policy",
         provider_kind="scripts_cir_same_shape",
         materializer="policy_inter_group_hybrid",
-        phase1_status="implemented",
-        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid.",
+        phase1_status="bound",
+        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid, but the executable Orion-side materializer is currently gated off until parity is restored.",
     ),
     KernelBinding(
         family_label="stage2_same",
         provider_key="r34_stage2_same_inter_group_hybrid_policy",
         provider_kind="scripts_cir_same_shape",
         materializer="policy_inter_group_hybrid",
-        phase1_status="implemented",
-        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid.",
+        phase1_status="bound",
+        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid, but the executable Orion-side materializer is currently gated off until parity is restored.",
     ),
     KernelBinding(
         family_label="stage3_same",
@@ -1006,6 +1006,13 @@ def _r34_same_shape_runtime_from_modules(
     policy = str(_r34_kernel_policy_from_module(module) or spec.policy)
     if policy != str(spec.policy):
         return group
+    if str(policy) == "inter_group_hybrid":
+        return _replace_r34_group(
+            group,
+            executable=False,
+            fallback_reason="inter_group_hybrid_materializer_not_parity_safe_yet",
+            executor=None,
+        )
     executor_cls = (
         R34InterGroupHybridSameShapeRuntimeExecutor
         if str(policy) == "inter_group_hybrid"
