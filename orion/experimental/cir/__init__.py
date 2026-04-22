@@ -21,6 +21,7 @@ from .lattigo_block import (
     build_r18_stage2_shared_block_plan,
     build_r18_stage3_shared_block_plan,
     build_r18_stage4_compact_intra_plan,
+    build_r18_stage4_compact_intra_gs256_prototype_plan,
 )
 from .report import build_region_first_pipeline_report, write_region_first_pipeline_report
 from .runtime_group import (
@@ -48,6 +49,7 @@ __all__ = [
     "build_r18_stage2_shared_block_plan",
     "build_r18_stage3_shared_block_plan",
     "build_r18_stage4_compact_intra_plan",
+    "build_r18_stage4_compact_intra_gs256_prototype_plan",
     "build_region_first_full_selector",
     "build_region_first_full_selector_summary",
     "build_region_first_pipeline_report",

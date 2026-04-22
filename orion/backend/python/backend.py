@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import ctypes
 from dataclasses import dataclass
 from itertools import count
 
@@ -117,8 +118,33 @@ class PythonBackend:
 
     def _clone_values(self, values) -> torch.Tensor:
         if isinstance(values, torch.Tensor):
-            return values.detach().clone().to(dtype=torch.float32)
-        return torch.tensor(values, dtype=torch.float32)
+            tensor = values.detach().clone()
+        else:
+            tensor = torch.tensor(values)
+        if bool(torch.is_complex(tensor)):
+            return tensor.to(dtype=torch.complex64)
+        return tensor.to(dtype=torch.float32)
+
+    def _decode_complex_list(self, values: torch.Tensor) -> list[float]:
+        tensor = self._clone_values(values).reshape(-1)
+        out: list[float] = []
+        if bool(torch.is_complex(tensor)):
+            for value in tensor.tolist():
+                out.extend((float(np.real(value)), float(np.imag(value))))
+            return out
+        for value in tensor.tolist():
+            out.extend((float(value), 0.0))
+        return out
+
+    def _store_linear_transform(self, diag_indices: list[int], diagonals: list[torch.Tensor], level: int, slots: int) -> int:
+        transform_id = self._next_id()
+        self._linear_transforms[transform_id] = _LinearTransformState(
+            diag_indices=[int(idx) for idx in diag_indices],
+            diagonals=[self._clone_values(diag).reshape(-1) for diag in diagonals],
+            level=int(level),
+            slots=int(slots),
+        )
+        return int(transform_id)
 
     def _store_plaintext(self, values, level: int, scale: float) -> int:
         plaintext_id = self._next_id()
@@ -169,6 +195,9 @@ class PythonBackend:
 
     def Decode(self, plaintext_id):
         return self._plaintexts[int(plaintext_id)].values.tolist()
+
+    def DecodeComplex(self, plaintext_id):
+        return self._decode_complex_list(self._plaintexts[int(plaintext_id)].values)
 
     def Encrypt(self, plaintext_id) -> int:
         state = self._clone_plaintext(int(plaintext_id))
@@ -284,11 +313,13 @@ class PythonBackend:
         return self._store_ciphertext(-state.values, state.level, state.scale, state.degree)
 
     def Conjugate(self, ciphertext_id):
+        state = self._ciphertexts[int(ciphertext_id)]
+        state.values = torch.conj(state.values)
         return int(ciphertext_id)
 
     def ConjugateNew(self, ciphertext_id):
         state = self._clone_ciphertext(int(ciphertext_id))
-        return self._store_ciphertext(state.values, state.level, state.scale, state.degree)
+        return self._store_ciphertext(torch.conj(state.values), state.level, state.scale, state.degree)
 
     def Rotate(self, ciphertext_id, amount):
         state = self._ciphertexts[int(ciphertext_id)]
@@ -328,10 +359,13 @@ class PythonBackend:
         return self._scalar_ct_op(ciphertext_id, scalar, lambda x, s: x * s, in_place=False)
 
     def MulImaginaryUnit(self, ciphertext_id, sign):
-        return self.MulScalarInt(ciphertext_id, int(sign))
+        state = self._ciphertexts[int(ciphertext_id)]
+        state.values = state.values * complex(0.0, int(sign))
+        return int(ciphertext_id)
 
     def MulImaginaryUnitNew(self, ciphertext_id, sign):
-        return self.MulScalarIntNew(ciphertext_id, int(sign))
+        state = self._ciphertexts[int(ciphertext_id)]
+        return self._store_ciphertext(state.values * complex(0.0, int(sign)), state.level, state.scale, state.degree)
 
     def AddPlaintext(self, ciphertext_id, plaintext_id):
         return self._binary_pt_op(ciphertext_id, plaintext_id, torch.add, in_place=True)
@@ -392,17 +426,47 @@ class PythonBackend:
         diagonals = []
         cursor = 0
         for _ in diags_idxs:
-            diagonals.append(torch.tensor(diags_data[cursor:cursor + slots], dtype=torch.float32))
+            diagonals.append(self._clone_values(diags_data[cursor:cursor + slots]))
             cursor += slots
+        return self._store_linear_transform([int(idx) for idx in diags_idxs], diagonals, int(level), int(slots))
 
-        transform_id = self._next_id()
-        self._linear_transforms[transform_id] = _LinearTransformState(
-            diag_indices=[int(idx) for idx in diags_idxs],
-            diagonals=diagonals,
-            level=int(level),
-            slots=slots,
-        )
-        return transform_id
+    def GenerateLinearTransformsUnified(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, diag_data_ptrs, diag_data_lens, levels_array):
+        out: list[int] = []
+        count = int(num_transforms)
+        for transform_index in range(int(count)):
+            diag_len = int(diag_idxs_lens[transform_index])
+            data_len = int(diag_data_lens[transform_index])
+            diag_indices = [int(diag_idxs_ptrs[transform_index][diag_index]) for diag_index in range(int(diag_len))]
+            slots = int(data_len // max(1, diag_len)) if diag_len else int(self._num_slots)
+            diagonals: list[torch.Tensor] = []
+            cursor = 0
+            for _ in range(int(diag_len)):
+                values = [float(diag_data_ptrs[transform_index][cursor + offset]) for offset in range(int(slots))]
+                diagonals.append(torch.tensor(values, dtype=torch.float32))
+                cursor += int(slots)
+            out.append(self._store_linear_transform(diag_indices, diagonals, int(levels_array[transform_index]), int(slots)))
+        return out
+
+    def GenerateLinearTransformsUnifiedComplex(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, diag_data_ptrs, diag_data_lens, levels_array):
+        out: list[int] = []
+        count = int(num_transforms)
+        for transform_index in range(int(count)):
+            diag_len = int(diag_idxs_lens[transform_index])
+            data_len = int(diag_data_lens[transform_index])
+            diag_indices = [int(diag_idxs_ptrs[transform_index][diag_index]) for diag_index in range(int(diag_len))]
+            slots = int(data_len // max(1, 2 * diag_len)) if diag_len else int(self._num_slots)
+            diagonals: list[torch.Tensor] = []
+            cursor = 0
+            for _ in range(int(diag_len)):
+                values: list[complex] = []
+                for offset in range(int(slots)):
+                    real = float(diag_data_ptrs[transform_index][cursor + 2 * offset])
+                    imag = float(diag_data_ptrs[transform_index][cursor + 2 * offset + 1])
+                    values.append(complex(real, imag))
+                diagonals.append(torch.tensor(values, dtype=torch.complex64))
+                cursor += int(2 * slots)
+            out.append(self._store_linear_transform(diag_indices, diagonals, int(levels_array[transform_index]), int(slots)))
+        return out
 
     def GetLinearTransformRotationKeys(self, transform_id):
         transform = self._linear_transforms[int(transform_id)]
@@ -437,7 +501,10 @@ class PythonBackend:
         transform = self._linear_transforms[int(transform_id)]
         state = self._ciphertexts[int(ciphertext_id)]
 
-        output = torch.zeros(transform.slots, dtype=torch.float32)
+        output_dtype = state.values.dtype
+        for diag in transform.diagonals:
+            output_dtype = torch.promote_types(output_dtype, diag.dtype)
+        output = torch.zeros(transform.slots, dtype=output_dtype)
         for diag_idx, diag in zip(transform.diag_indices, transform.diagonals):
             output += diag * torch.roll(state.values, shifts=-int(diag_idx))
 
@@ -447,6 +514,12 @@ class PythonBackend:
             state.scale,
             state.degree,
         )
+
+    def EvaluateLinearTransformsWithSharedCache(self, transform_ids_array, num_transforms, ct_input_id):
+        return [
+            int(self.EvaluateLinearTransform(int(transform_ids_array[index]), int(ct_input_id)))
+            for index in range(int(num_transforms))
+        ]
 
     def DeleteLinearTransform(self, transform_id) -> None:
         self._linear_transforms.pop(int(transform_id), None)

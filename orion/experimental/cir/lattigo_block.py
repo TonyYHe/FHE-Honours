@@ -905,6 +905,66 @@ def _build_compact_intra_rows(
     return shifts, output_slots, all_values.to(dtype=torch.complex64)
 
 
+def _stage4_replica_shift(spec: R18CompactStageSpec) -> int:
+    return int((int(spec.gap) // 2) * int(spec.w) * int(spec.gap))
+
+
+def _alternate_replica_shift_assignment(shifts: torch.Tensor, *, replica_shift: int) -> dict[int, int]:
+    """Choose between direct and replica-backed routing for each shift family.
+
+    The current stage4 compact source already stores a duplicate source family
+    at a fixed offset (`replica_shift`) in the lower half of each phase tile.
+    For a term with shift `s`, reading from that duplicate is equivalent to
+    re-encoding the same contribution with shift `s - replica_shift`.
+
+    We alternate along each `mod replica_shift` chain so consecutive shift
+    families can collapse onto one canonical residual shift.
+    """
+
+    unique_shifts = sorted({int(value) for value in shifts.tolist()})
+    classes: dict[int, list[int]] = {}
+    for shift in unique_shifts:
+        classes.setdefault(int(shift) % int(replica_shift), []).append(int(shift))
+
+    out: dict[int, int] = {}
+    for chain in classes.values():
+        chain.sort()
+        for index, shift in enumerate(chain):
+            out[int(shift)] = int(shift) if int(index % 2) == 0 else int(shift - int(replica_shift))
+    return out
+
+
+def _reassign_compact_rows_with_replica(
+    shifts: torch.Tensor,
+    output_slots: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    replica_shift: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mapping = _alternate_replica_shift_assignment(shifts, replica_shift=int(replica_shift))
+    reassigned = torch.tensor([int(mapping[int(value)]) for value in shifts.tolist()], dtype=torch.int64)
+    keys = reassigned * int(RING_SLOT_COUNT) + output_slots.to(dtype=torch.int64)
+    coalesced_keys, coalesced_vals = _coalesce_complex_rows(keys, values.to(dtype=torch.complex64))
+    out_shifts = torch.div(coalesced_keys, int(RING_SLOT_COUNT), rounding_mode="floor").to(dtype=torch.int64)
+    out_slots = torch.remainder(coalesced_keys, int(RING_SLOT_COUNT)).to(dtype=torch.int64)
+    return out_shifts, out_slots, coalesced_vals.to(dtype=torch.complex64)
+
+
+def _build_compact_intra_rows_with_replica_routing(
+    *,
+    spec: R18CompactStageSpec,
+    weight: torch.Tensor,
+    replica_shift: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    shifts, output_slots, values = _build_compact_intra_rows(spec=spec, weight=weight)
+    return _reassign_compact_rows_with_replica(
+        shifts,
+        output_slots,
+        values,
+        replica_shift=int(replica_shift if replica_shift is not None else _stage4_replica_shift(spec)),
+    )
+
+
 def build_r18_stage4_compact_intra_plan(
     *,
     weight_override: torch.Tensor | None = None,
@@ -1050,6 +1110,168 @@ def build_r18_stage4_compact_intra_plan(
             f"weight_source={weight_source}",
             f"source_kind={source_kind}",
             f"bias_source={bias_source}",
+        ),
+    )
+    packed = _pack_chw(x, channels=int(spec.c), h=int(spec.h), w=int(spec.w), gap=int(spec.gap))
+    inputs = {"source_0_lane_0": PlainCipherTensor(packed, label="source_0_lane_0")}
+    reference = F.conv2d(x.unsqueeze(0), weight, bias=None, stride=1, padding=1)[0]
+    return plan, inputs, reference
+
+
+def build_r18_stage4_compact_intra_gs256_prototype_plan(
+    *,
+    weight_override: torch.Tensor | None = None,
+    bias_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    input_shape: tuple[int, int, int] | None = None,
+    output_shape: tuple[int, int, int] | None = None,
+    input_gap: int | None = None,
+    output_gap: int | None = None,
+) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+    spec = R18_STAGE4_SPEC
+    torch.manual_seed(0)
+    expected_shape = (int(spec.c), int(spec.c), 3, 3)
+    if weight_override is None:
+        weight = torch.randn(expected_shape, dtype=torch.float32)
+        weight_source = "deterministic_random"
+    else:
+        weight = weight_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in weight.shape) != expected_shape:
+            raise ValueError(f"{spec.stage} fused weight shape mismatch: expected {expected_shape}, got {tuple(weight.shape)}")
+        weight_source = "fused_orion_on_weight"
+    expected_source = (int(spec.c), int(spec.h), int(spec.w))
+    if source_override is None:
+        x = torch.randn(expected_source, dtype=torch.float32)
+        source_kind = "deterministic_random"
+    else:
+        x = source_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in x.shape) != expected_source:
+            raise ValueError(f"{spec.stage} source shape mismatch: expected {expected_source}, got {tuple(x.shape)}")
+        source_kind = "provided_source_override"
+    if input_shape is not None and tuple(int(v) for v in input_shape) != expected_source:
+        raise ValueError(f"{spec.stage} input_shape mismatch: {input_shape}")
+    if output_shape is not None and tuple(int(v) for v in output_shape) != expected_source:
+        raise ValueError(f"{spec.stage} output_shape mismatch: {output_shape}")
+    if input_gap is not None and int(input_gap) != int(spec.gap):
+        raise ValueError(f"{spec.stage} input_gap mismatch: {input_gap}")
+    if output_gap is not None and int(output_gap) != int(spec.gap):
+        raise ValueError(f"{spec.stage} output_gap mismatch: {output_gap}")
+    if bias_override is not None:
+        bias = bias_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in bias.shape) != (int(spec.c),):
+            raise ValueError(f"{spec.stage} bias shape mismatch: expected {(int(spec.c),)}, got {tuple(bias.shape)}")
+        bias_source = "accepted_not_folded"
+    else:
+        bias_source = "none"
+
+    replica_shift = _stage4_replica_shift(spec)
+    shifts, output_slots, values = _build_compact_intra_rows_with_replica_routing(
+        spec=spec,
+        weight=weight,
+        replica_shift=int(replica_shift),
+    )
+    case_name = "orion_vendored_r18_stage4_same_compact_intra_gs256_proto"
+    family_id = f"{case_name}_family"
+    templates: list[CanonicalTemplateEntry] = []
+    plaintexts: list[PreparedPlaintext] = []
+    terms: list[LinearTransformTerm] = []
+    for index, shift in enumerate(torch.unique_consecutive(shifts).tolist()):
+        mask = shifts == int(shift)
+        term_outputs = output_slots[mask].to(dtype=torch.int64)
+        term_values = values[mask].to(dtype=torch.complex64)
+        template_id = f"{case_name}_template_{int(index)}"
+        plaintext_id = f"{case_name}_pt_{int(index)}"
+        templates.append(
+            CanonicalTemplateEntry(
+                template_id=template_id,
+                family_id=family_id,
+                key=(int(shift),),
+                fine_shift=int(shift),
+                indices=term_outputs,
+                note="vendored compact-intra gs256 prototype template",
+            )
+        )
+        plaintexts.append(
+            PreparedPlaintext(
+                plaintext_id=plaintext_id,
+                template_id=template_id,
+                level=0,
+                scale=1.0,
+                slot_count=RING_SLOT_COUNT,
+                values=term_values,
+                note="vendored compact-intra gs256 prototype payload",
+            )
+        )
+        terms.append(
+            LinearTransformTerm(
+                term_id=f"{case_name}_term_{int(index)}",
+                shift=int(shift),
+                plaintext_id=plaintext_id,
+                template_id=template_id,
+                lookup_indices=torch.arange(int(term_outputs.numel()), dtype=torch.int64),
+                output_slot_indices=term_outputs,
+                note="vendored compact-intra gs256 prototype term",
+                bank_id="r18_stage4_compact_bank_0",
+            )
+        )
+    bank = SharedOutputBank(
+        bank_id="r18_stage4_compact_bank_0",
+        target_index=0,
+        fold_lane=0,
+        input_lane_id=0,
+        output_slot_offset=0,
+        active_slot_count=RING_SLOT_COUNT,
+        term_count=int(len(terms)),
+        note="vendored R18 stage4 compact output bank",
+    )
+    unique_shift_count = int(len({int(term.shift) for term in terms}))
+    step = LinearTransformStep(
+        step_id=f"{case_name}_lt_0",
+        input_id="compact_source_0_lane_0",
+        target_index=0,
+        selected_n1=0,
+        baby_shifts=(),
+        giant_shifts=(),
+        terms=tuple(terms),
+        required_rotations=tuple(sorted({int(term.shift) for term in terms})),
+        prepared_plaintext_ids=tuple(plain.plaintext_id for plain in plaintexts),
+        expected_cost=ExecutionStats(rotations=int(unique_shift_count), ct_pt_mults=int(len(terms)), adds=int(len(terms))),
+        representation="intra_group_phase_complex_gs256_proto",
+        note="vendored compact-intra gs256 prototype LT",
+        rotation_group_id=f"{case_name}:compact_source_0_lane_0",
+        rotation_cost_owner=True,
+        shared_multi_output=True,
+        shared_output_banks=(bank,),
+    )
+    plan = ConvSchemePlan(
+        case_name=case_name,
+        ring_slot_count=RING_SLOT_COUNT,
+        output_regions=(TensorRegion(c_start=0, c_end=int(spec.c), h_start=0, h_end=int(spec.h), w_start=0, w_end=int(spec.w)),),
+        output_active_slot_counts=(RING_SLOT_COUNT,),
+        family_templates=(
+            FamilyTemplateBank(
+                family_id=family_id,
+                family_key=("resnet18_tiny_imagenet", "stage4_same", "vendored_compact_intra_gs256_proto"),
+                source_tile_shape=(int(spec.c), int(spec.h), int(spec.w)),
+                target_tile_shape=(int(spec.c), int(spec.h), int(spec.w)),
+                source_h_range=(0, int(spec.h)),
+                target_h_range=(0, int(spec.h)),
+                template_entries=tuple(templates),
+                member_count=1,
+                evidence_kind="vendored_compact_intra_gs256_proto",
+            ),
+        ),
+        prepared_plaintexts=tuple(plaintexts),
+        linear_transform_steps=(step,),
+        expected_cost=ExecutionStats(rotations=int(unique_shift_count + 2), conjugations=1, ct_pt_mults=int(len(terms) + 2), adds=int(len(terms) + 3)),
+        evidence_kind="vendored_scripts_cir_r18_stage4_compact_intra_gs256_proto",
+        notes=(
+            "R18 stage4 compact-intra gs256 prototype materializer",
+            f"replica_shift={int(replica_shift)}",
+            f"weight_source={weight_source}",
+            f"source_kind={source_kind}",
+            f"bias_source={bias_source}",
+            "actual BSGS/shared rotation count should be measured after compile_unified",
         ),
     )
     packed = _pack_chw(x, channels=int(spec.c), h=int(spec.h), w=int(spec.w), gap=int(spec.gap))
