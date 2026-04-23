@@ -175,10 +175,14 @@ class NewParameters:
 
     def get_diags_path(self):
         path = self.orion_params.diags_path
+        if not path:
+            return ""
         return os.path.abspath(os.path.join(os.getcwd(), path))
 
     def get_keys_path(self):
         path = self.orion_params.keys_path
+        if not path:
+            return ""
         return os.path.abspath(os.path.join(os.getcwd(), path))
 
     def get_io_mode(self):

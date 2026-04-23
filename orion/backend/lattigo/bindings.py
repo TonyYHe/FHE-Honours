@@ -205,10 +205,22 @@ class LattigoLibrary:
             restype=ctypes.c_ulong
         )
 
+        self.GetPlaintextScaleLog2 = LattigoFunction(
+            self.lib.GetPlaintextScaleLog2,
+            argtypes=[ctypes.c_int],
+            restype=ctypes.c_double
+        )
+
         self.GetCiphertextScale = LattigoFunction(
             self.lib.GetCiphertextScale,
             argtypes=[ctypes.c_int],
             restype=ctypes.c_ulong
+        )
+
+        self.GetCiphertextScaleLog2 = LattigoFunction(
+            self.lib.GetCiphertextScaleLog2,
+            argtypes=[ctypes.c_int],
+            restype=ctypes.c_double
         )
 
         self.SetPlaintextScale = LattigoFunction(
@@ -789,6 +801,18 @@ class LattigoLibrary:
                 ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong,
                 ctypes.c_int,
                 ctypes.c_ulong,
+            ],
+            restype=None
+        )
+
+        self.LoadPlaintextDiagonalsBatch = LattigoFunction(
+            self.lib.LoadPlaintextDiagonalsBatch,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.c_int,
             ],
             restype=None
         )

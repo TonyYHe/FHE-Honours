@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import math
 import ctypes
 from dataclasses import dataclass
@@ -122,7 +123,11 @@ class PythonBackend:
         else:
             tensor = torch.tensor(values)
         if bool(torch.is_complex(tensor)):
+            if tensor.dtype in (torch.complex64, torch.complex128):
+                return tensor
             return tensor.to(dtype=torch.complex64)
+        if tensor.dtype == torch.float64:
+            return tensor
         return tensor.to(dtype=torch.float32)
 
     def _decode_complex_list(self, values: torch.Tensor) -> list[float]:
@@ -482,8 +487,23 @@ class PythonBackend:
     def FreeCArray(self, _ptr) -> None:
         return
 
-    def SerializeDiagonal(self, diagonal):
-        return np.array(diagonal, dtype=np.float32), None
+    def SerializeDiagonal(self, transform_id, diag_idx):
+        transform = self._linear_transforms[int(transform_id)]
+        try:
+            diag_pos = transform.diag_indices.index(int(diag_idx))
+        except ValueError as exc:
+            raise KeyError(
+                f"Linear transform {transform_id} has no diagonal {diag_idx}"
+            ) from exc
+
+        buffer = io.BytesIO()
+        np.save(
+            buffer,
+            transform.diagonals[int(diag_pos)].detach().cpu().numpy(),
+            allow_pickle=False,
+        )
+        payload = np.frombuffer(buffer.getvalue(), dtype=np.uint8).copy()
+        return payload, None
 
     def LoadRotationKey(self, _serialized_key) -> None:
         return
@@ -491,11 +511,35 @@ class PythonBackend:
     def RemoveRotationKeys(self) -> None:
         return
 
-    def LoadPlaintextDiagonal(self, _transform_id, _diag_idx, _serialized_diag) -> None:
-        return
+    def LoadPlaintextDiagonal(self, serialized_diag, transform_id, diag_idx) -> None:
+        transform = self._linear_transforms[int(transform_id)]
+        buffer = io.BytesIO(np.asarray(serialized_diag, dtype=np.uint8).tobytes())
+        diag = torch.from_numpy(np.load(buffer, allow_pickle=False)).reshape(-1).clone()
+        try:
+            diag_pos = transform.diag_indices.index(int(diag_idx))
+        except ValueError:
+            transform.diag_indices.append(int(diag_idx))
+            transform.diagonals.append(diag)
+        else:
+            transform.diagonals[int(diag_pos)] = diag
 
-    def RemovePlaintextDiagonals(self, _transform_id) -> None:
-        return
+    def LoadPlaintextDiagonalsBatch(self, payload, offsets, lengths, diag_indices, transform_id) -> None:
+        payload_arr = np.asarray(payload, dtype=np.uint8).reshape(-1)
+        for offset, length, diag_idx in zip(offsets, lengths, diag_indices):
+            start = int(offset)
+            end = int(start + length)
+            self.LoadPlaintextDiagonal(
+                payload_arr[start:end].copy(),
+                int(transform_id),
+                int(diag_idx),
+            )
+
+    def RemovePlaintextDiagonals(self, transform_id) -> None:
+        transform = self._linear_transforms[int(transform_id)]
+        transform.diagonals = [
+            torch.zeros((0,), dtype=diag.dtype)
+            for diag in transform.diagonals
+        ]
 
     def EvaluateLinearTransform(self, transform_id, ciphertext_id):
         transform = self._linear_transforms[int(transform_id)]
@@ -504,9 +548,19 @@ class PythonBackend:
         output_dtype = state.values.dtype
         for diag in transform.diagonals:
             output_dtype = torch.promote_types(output_dtype, diag.dtype)
+        if output_dtype in (torch.complex64, torch.complex128):
+            output_dtype = torch.complex128
+        elif output_dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            output_dtype = torch.float64
         output = torch.zeros(transform.slots, dtype=output_dtype)
         for diag_idx, diag in zip(transform.diag_indices, transform.diagonals):
-            output += diag * torch.roll(state.values, shifts=-int(diag_idx))
+            rotated = torch.roll(state.values, shifts=-int(diag_idx))
+            if output_dtype == torch.complex128:
+                output += diag.to(dtype=torch.complex128) * rotated.to(dtype=torch.complex128)
+            elif output_dtype == torch.float64:
+                output += diag.to(dtype=torch.float64) * rotated.to(dtype=torch.float64)
+            else:
+                output += diag * rotated
 
         return self._store_ciphertext(
             output,

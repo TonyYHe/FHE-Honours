@@ -281,6 +281,39 @@ func LoadPlaintextDiagonal(
 	transform.Vec[int(diagIdx)] = poly
 }
 
+//export LoadPlaintextDiagonalsBatch
+func LoadPlaintextDiagonalsBatch(
+	dataPtr *C.uchar, lenData C.ulong,
+	offsetsPtr *C.ulonglong, offsetsLen C.int,
+	lengthsPtr *C.ulonglong, lengthsLen C.int,
+	diagIdxsPtr *C.int, diagIdxsLen C.int,
+	transformID C.int,
+) {
+	if int(offsetsLen) != int(lengthsLen) || int(offsetsLen) != int(diagIdxsLen) {
+		panic("LoadPlaintextDiagonalsBatch received mismatched batch array lengths")
+	}
+
+	transform := RetrieveLinearTransform(int(transformID))
+	payload := CArrayToByteSlice(unsafe.Pointer(dataPtr), uint64(lenData))
+	offsets := unsafe.Slice(offsetsPtr, int(offsetsLen))
+	lengths := unsafe.Slice(lengthsPtr, int(lengthsLen))
+	diagIdxs := unsafe.Slice(diagIdxsPtr, int(diagIdxsLen))
+
+	for i := range diagIdxs {
+		start := uint64(offsets[i])
+		end := start + uint64(lengths[i])
+		if end > uint64(len(payload)) {
+			panic("LoadPlaintextDiagonalsBatch slice exceeds payload bounds")
+		}
+
+		var poly ringqp.Poly
+		if err := poly.UnmarshalBinary(payload[start:end]); err != nil {
+			panic(err)
+		}
+		transform.Vec[int(diagIdxs[i])] = poly
+	}
+}
+
 //export RemovePlaintextDiagonals
 func RemovePlaintextDiagonals(transformID C.int) {
 	linTransf := RetrieveLinearTransform(int(transformID))
