@@ -44,6 +44,8 @@ class PythonBackend:
 
     def __init__(self, params) -> None:
         self.params = params
+        self.load_plaintext_diagonals_requires_payload = True
+        self.saved_io_prefetch_requires_device_memory = False
         self._ids = count(1)
         self._plaintexts: dict[int, _TensorState] = {}
         self._ciphertexts: dict[int, _TensorState] = {}
@@ -434,6 +436,45 @@ class PythonBackend:
             diagonals.append(self._clone_values(diags_data[cursor:cursor + slots]))
             cursor += slots
         return self._store_linear_transform([int(idx) for idx in diags_idxs], diagonals, int(level), int(slots))
+
+    def GenerateLinearTransformsBatch(
+        self,
+        num_transforms,
+        diag_idxs_ptrs,
+        diag_idxs_lens,
+        diag_data_ptrs,
+        diag_data_lens,
+        levels_array,
+        _bsgs_ratio,
+        _io_mode,
+    ):
+        out: list[int] = []
+        for transform_index in range(int(num_transforms)):
+            diag_len = int(diag_idxs_lens[transform_index])
+            data_len = int(diag_data_lens[transform_index])
+            diag_indices = [
+                int(diag_idxs_ptrs[transform_index][diag_index])
+                for diag_index in range(int(diag_len))
+            ]
+            slots = int(data_len // max(1, diag_len)) if diag_len else int(self._num_slots)
+            diagonals: list[torch.Tensor] = []
+            cursor = 0
+            for _ in range(int(diag_len)):
+                values = [
+                    float(diag_data_ptrs[transform_index][cursor + offset])
+                    for offset in range(int(slots))
+                ]
+                diagonals.append(torch.tensor(values, dtype=torch.float32))
+                cursor += int(slots)
+            out.append(
+                self._store_linear_transform(
+                    diag_indices,
+                    diagonals,
+                    int(levels_array[transform_index]),
+                    int(slots),
+                )
+            )
+        return out
 
     def GenerateLinearTransformsUnified(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, diag_data_ptrs, diag_data_lens, levels_array):
         out: list[int] = []

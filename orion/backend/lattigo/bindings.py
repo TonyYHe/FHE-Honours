@@ -100,6 +100,8 @@ class LattigoLibrary:
     """A class to manage loading and interfacing with Lattigo."""
     def __init__(self):
         self.lib = self._load_library()
+        self.load_plaintext_diagonals_requires_payload = True
+        self.saved_io_prefetch_requires_device_memory = False
 
     def _load_library(self):
         try:
@@ -707,6 +709,23 @@ class LattigoLibrary:
             ],
             restype=ctypes.c_int
         )
+
+        generate_batch = getattr(self.lib, "GenerateLinearTransformsBatch", None)
+        if generate_batch is not None:
+            self.GenerateLinearTransformsBatch = LattigoFunction(
+                generate_batch,
+                argtypes=[
+                    ctypes.c_int,  # numTransforms
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
+                    ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),  # diagDataArray
+                    ctypes.POINTER(ctypes.c_int),  # diagDataLens
+                    ctypes.POINTER(ctypes.c_int),  # levels
+                    ctypes.c_float,  # bsgsRatio
+                    ctypes.c_char_p,  # ioMode
+                ],
+                restype=ArrayResultInt
+            )
 
         self.EvaluateLinearTransform = LattigoFunction(
             self.lib.EvaluateLinearTransform,

@@ -70,6 +70,7 @@ int GetCiphertextSlots(int ciphertextID);
 int GetCiphertextDegree(int ciphertextID);
 ArrayResultUInt64 GetModuliChain();
 ArrayResultUInt64 GetAuxModuliChain();
+ArrayResultUInt64 GetDeviceMemoryInfo();
 ArrayResultInt GetLivePlaintexts();
 ArrayResultInt GetLiveCiphertexts();
 
@@ -121,7 +122,10 @@ int GenerateLinearTransform(const int *diagIdxs, int diagIdxsLen,
 int EvaluateLinearTransform(int transformID, int ciphertextID);
 void DeleteLinearTransform(int transformID);
 ArrayResultInt GetLinearTransformRotationKeys(int transformID);
+ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID);
+ArrayResultUInt64 EstimateLinearTransformDeviceBytes(int transformID);
 void GenerateLinearTransformRotationKey(int key);
+void GenerateLinearTransformRotationKeyAtLevel(int key, int level);
 ArrayResultInt GenerateLinearTransformsUnified(
     int numTransforms, const int *const *diagIdxsArray, const int *diagIdxsLens,
     const float *const *diagDataArray, const int *diagDataLens,
@@ -134,6 +138,7 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
                                                        int numTransforms,
                                                        int ciphertextID);
 ArrayResultByte GenerateAndSerializeRotationKey(int key);
+ArrayResultByte GenerateAndSerializeRotationKeyAtLevel(int key, int level);
 void LoadRotationKey(const unsigned char *data, unsigned long lenData,
                      unsigned long key);
 ArrayResultByte SerializeDiagonal(int transformID, int diagIdx);

@@ -8,11 +8,14 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#include <cuda_runtime_api.h>
 
 #include "UserInterface.h"
 #include "common/Assert.h"
@@ -164,7 +167,7 @@ void RequireScheme() {
   }
 }
 
-void EnsureRotationKeyPrepared(int key);
+void EnsureRotationKeyPrepared(int key, int level);
 
 template <typename T>
 T *AllocArray(std::size_t count) {
@@ -320,6 +323,59 @@ LinearTransform &EnsureTransformLoaded(LinearTransformState &state) {
         g_scheme->param->GetScale(state.level), state.bs, state.gs);
   }
   return *state.transform;
+}
+
+int EstimateLinearTransformStride(const LinearTransformState &state) {
+  const int width = state.matrix.GetWidth();
+  int gcd_rot = 0;
+  int max_rot = 0;
+  int num_pt = 0;
+  for (const auto &[diag_idx, _] : state.matrix) {
+    ++num_pt;
+    int rot = diag_idx % width;
+    if (rot < 0) {
+      rot += width;
+    }
+    if (gcd_rot == 0 && rot == 0) {
+      gcd_rot = rot;
+    } else {
+      gcd_rot = std::gcd(gcd_rot, rot);
+    }
+    max_rot = std::max(max_rot, rot);
+  }
+  if (num_pt <= 1 || gcd_rot <= 0) {
+    return 1;
+  }
+  const int max_pt_dist = (state.bs * state.gs - 1) * gcd_rot;
+  if (max_rot > max_pt_dist) {
+    return 1;
+  }
+  return gcd_rot;
+}
+
+unsigned long long EstimateLinearTransformStateDeviceBytes(
+    const LinearTransformState &state) {
+  const int stride = EstimateLinearTransformStride(state);
+  const int gs_stride = std::max(1, stride * state.bs);
+  const int width = state.matrix.GetWidth();
+  std::set<std::pair<int, int>> plaintext_slots;
+  for (const auto &[diag_idx, _] : state.matrix) {
+    int rot = diag_idx % width;
+    if (rot < 0) {
+      rot += width;
+    }
+    const int bs_rot = rot % gs_stride;
+    const int gs_rot = rot - bs_rot;
+    plaintext_slots.emplace(gs_rot, bs_rot);
+  }
+
+  const auto np = g_scheme->param->LevelToNP(state.level, g_scheme->param->alpha_);
+  const unsigned long long bytes_per_plaintext =
+      static_cast<unsigned long long>(np.GetNumTotal()) *
+      static_cast<unsigned long long>(g_scheme->param->degree_) *
+      static_cast<unsigned long long>(sizeof(word));
+  return static_cast<unsigned long long>(plaintext_slots.size()) *
+         bytes_per_plaintext;
 }
 
 int CiphertextDegree(const Ct &ciphertext) { return ciphertext.HasRx() ? 2 : 1; }
@@ -623,16 +679,56 @@ cheddar::StripedMatrix BuildComplexStripedMatrix(const int *diag_idxs,
   return matrix;
 }
 
+int NormalizeRotationIndex(int index, int width) {
+  int rot = index % width;
+  if (rot < 0) {
+    rot += width;
+  }
+  return rot;
+}
+
+std::pair<int, int> ChooseLinearTransformSplit(
+    const cheddar::StripedMatrix &matrix, float bsgs_ratio) {
+  const int width = matrix.GetWidth();
+  int stride = 0;
+  int max_rot = 0;
+  for (const auto &[diag_idx, _] : matrix) {
+    const int rot = NormalizeRotationIndex(diag_idx, width);
+    if (rot != 0) {
+      stride = stride == 0 ? rot : std::gcd(stride, rot);
+    }
+    max_rot = std::max(max_rot, rot);
+  }
+  if (stride == 0) {
+    stride = 1;
+  }
+
+  const int coverage = std::max(2, max_rot / stride + 1);
+  const double ratio =
+      std::isfinite(static_cast<double>(bsgs_ratio)) && bsgs_ratio > 0.0f
+          ? static_cast<double>(bsgs_ratio)
+          : 1.0;
+  constexpr int kMaxBabyStepsForFusedPath = 128;
+  int bs = static_cast<int>(std::ceil(std::sqrt(coverage * ratio)));
+  bs = std::max(2, std::min(kMaxBabyStepsForFusedPath, bs));
+  int gs = (coverage + bs - 1) / bs;
+  gs = std::max(1, gs);
+  while (bs * gs < coverage) {
+    ++gs;
+  }
+  return {bs, gs};
+}
+
 int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
-                                 int level) {
+                                 int level, float bsgs_ratio) {
   if (level < 0 || level > g_scheme->param->default_encryption_level_) {
     throw std::runtime_error(
         "linear transform level is outside supported preset range");
   }
-  const int bs = std::max(2, matrix.GetNumDiag());
+  const auto [bs, gs] = ChooseLinearTransformSplit(matrix, bsgs_ratio);
   auto transform = std::make_unique<LinearTransform>(
       g_scheme->context, matrix, level, g_scheme->param->GetScale(level), bs,
-      1);
+      gs);
   std::vector<int> diag_indices;
   diag_indices.reserve(matrix.size());
   for (const auto &[diag_idx, _] : matrix) {
@@ -640,7 +736,7 @@ int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
   }
   return g_scheme->transforms.Add(
       LinearTransformState(std::move(transform), matrix,
-                           std::move(diag_indices), level, bs, 1));
+                           std::move(diag_indices), level, bs, gs));
 }
 
 std::unique_ptr<HoistHandler> BuildSharedCacheHoist(
@@ -682,7 +778,7 @@ SharedCachePlan BuildSharedCachePlan(const std::vector<int> &ordered_ids) {
     transform.AddRequiredRotations(req);
     for (const auto &[rot_idx, _] : req) {
       if (rot_idx != 0) {
-        EnsureRotationKeyPrepared(rot_idx);
+        EnsureRotationKeyPrepared(rot_idx, state.level);
       }
     }
   }
@@ -703,11 +799,14 @@ SharedCachePlan &GetOrBuildSharedCachePlan(const std::vector<int> &ordered_ids) 
   return inserted_it->second;
 }
 
-void EnsureRotationKeyPrepared(int key) {
+void EnsureRotationKeyPrepared(int key, int level) {
   if (key <= 0) {
     return;
   }
-  g_scheme->interface->PrepareRotationKey(key, g_scheme->param->max_level_);
+  if (level < 0 || level > g_scheme->param->max_level_) {
+    AbortWithMessage("rotation key level is outside supported preset range");
+  }
+  g_scheme->interface->PrepareRotationKey(key, level);
 }
 
 void EnsureBootstrapPrepared(int num_slots) {
@@ -909,6 +1008,19 @@ ArrayResultUInt64 GetAuxModuliChain() {
   return MakeUInt64ArrayResult(aux);
 }
 
+ArrayResultUInt64 GetDeviceMemoryInfo() {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (status != cudaSuccess) {
+    return MakeUInt64ArrayResult({0, 0});
+  }
+  return MakeUInt64ArrayResult({
+      static_cast<unsigned long long>(free_bytes),
+      static_cast<unsigned long long>(total_bytes),
+  });
+}
+
 ArrayResultInt GetLivePlaintexts() {
   RequireScheme();
   return MakeIntArrayResult(g_scheme->plaintexts.LiveKeys());
@@ -927,7 +1039,7 @@ void AddRotationKey(int rotation) {
     AbortWithMessage(
         "negative rotation keys are not supported in the first C++ adapter pass");
   }
-  EnsureRotationKeyPrepared(rotation);
+  EnsureRotationKeyPrepared(rotation, g_scheme->param->default_encryption_level_);
 }
 
 int Negate(int ciphertextID) {
@@ -959,7 +1071,7 @@ int Rotate(int ciphertextID, int amount) {
     AbortWithMessage(
         "negative rotations are not supported in the first C++ adapter pass");
   }
-  EnsureRotationKeyPrepared(amount);
+  EnsureRotationKeyPrepared(amount, CiphertextLevel(RetrieveCiphertext(ciphertextID)));
   return ApplyCiphertextUnaryInPlace(ciphertextID, [&](Ct &out, const Ct &in) {
     g_scheme->context->HRot(out, in,
                             g_scheme->interface->GetRotationKey(amount),
@@ -973,7 +1085,7 @@ int RotateNew(int ciphertextID, int amount) {
     AbortWithMessage(
         "negative rotations are not supported in the first C++ adapter pass");
   }
-  EnsureRotationKeyPrepared(amount);
+  EnsureRotationKeyPrepared(amount, CiphertextLevel(RetrieveCiphertext(ciphertextID)));
   return ApplyCiphertextUnaryNew(ciphertextID, [&](Ct &out, const Ct &in) {
     g_scheme->context->HRot(out, in,
                             g_scheme->interface->GetRotationKey(amount),
@@ -997,8 +1109,9 @@ int RescaleNew(int ciphertextID) {
 
 int AddScalar(int ciphertextID, float scalar) {
   RequireScheme();
+  const double scale = RetrieveCiphertext(ciphertextID).GetScale();
   return ApplyCiphertextConstInPlace(
-      ciphertextID, static_cast<double>(scalar), 1.0,
+      ciphertextID, static_cast<double>(scalar), scale,
       [&](Ct &out, const Ct &in, const Const &constant) {
         g_scheme->context->Add(out, in, constant);
       });
@@ -1006,8 +1119,9 @@ int AddScalar(int ciphertextID, float scalar) {
 
 int AddScalarNew(int ciphertextID, float scalar) {
   RequireScheme();
+  const double scale = RetrieveCiphertext(ciphertextID).GetScale();
   return ApplyCiphertextConstNew(
-      ciphertextID, static_cast<double>(scalar), 1.0,
+      ciphertextID, static_cast<double>(scalar), scale,
       [&](Ct &out, const Ct &in, const Const &constant) {
         g_scheme->context->Add(out, in, constant);
       });
@@ -1015,8 +1129,9 @@ int AddScalarNew(int ciphertextID, float scalar) {
 
 int SubScalar(int ciphertextID, float scalar) {
   RequireScheme();
+  const double scale = RetrieveCiphertext(ciphertextID).GetScale();
   return ApplyCiphertextConstInPlace(
-      ciphertextID, static_cast<double>(scalar), 1.0,
+      ciphertextID, static_cast<double>(scalar), scale,
       [&](Ct &out, const Ct &in, const Const &constant) {
         g_scheme->context->Sub(out, in, constant);
       });
@@ -1024,8 +1139,9 @@ int SubScalar(int ciphertextID, float scalar) {
 
 int SubScalarNew(int ciphertextID, float scalar) {
   RequireScheme();
+  const double scale = RetrieveCiphertext(ciphertextID).GetScale();
   return ApplyCiphertextConstNew(
-      ciphertextID, static_cast<double>(scalar), 1.0,
+      ciphertextID, static_cast<double>(scalar), scale,
       [&](Ct &out, const Ct &in, const Const &constant) {
         g_scheme->context->Sub(out, in, constant);
       });
@@ -1256,11 +1372,11 @@ void NewLinearTransformEvaluator() { RequireScheme(); }
 
 int GenerateLinearTransform(const int *diagIdxs, int diagIdxsLen,
                             const float *diagData, int diagDataLen, int level,
-                            float /*bsgsRatio*/, const char * /*ioMode*/) {
+                            float bsgsRatio, const char * /*ioMode*/) {
   RequireScheme();
   return AddLinearTransformFromMatrix(
       BuildRealStripedMatrix(diagIdxs, diagIdxsLen, diagData, diagDataLen),
-      level);
+      level, bsgsRatio);
 }
 
 int EvaluateLinearTransform(int transformID, int ciphertextID) {
@@ -1295,9 +1411,36 @@ ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
   return MakeIntArrayResult(keys);
 }
 
+ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID) {
+  RequireScheme();
+  cheddar::EvkRequest req;
+  LinearTransform &transform = EnsureTransformLoaded(RetrieveTransform(transformID));
+  transform.AddRequiredRotations(req);
+  std::vector<int> flat;
+  flat.reserve(req.size() * 2);
+  for (const auto &[key, level] : req) {
+    if (key != 0) {
+      flat.push_back(key);
+      flat.push_back(level);
+    }
+  }
+  return MakeIntArrayResult(flat);
+}
+
+ArrayResultUInt64 EstimateLinearTransformDeviceBytes(int transformID) {
+  RequireScheme();
+  const LinearTransformState &state = RetrieveTransform(transformID);
+  return MakeUInt64ArrayResult({EstimateLinearTransformStateDeviceBytes(state)});
+}
+
 void GenerateLinearTransformRotationKey(int key) {
   RequireScheme();
-  EnsureRotationKeyPrepared(key);
+  EnsureRotationKeyPrepared(key, g_scheme->param->default_encryption_level_);
+}
+
+void GenerateLinearTransformRotationKeyAtLevel(int key, int level) {
+  RequireScheme();
+  EnsureRotationKeyPrepared(key, level);
 }
 
 ArrayResultInt GenerateLinearTransformsUnified(
@@ -1311,7 +1454,7 @@ ArrayResultInt GenerateLinearTransformsUnified(
     ids.push_back(AddLinearTransformFromMatrix(
         BuildRealStripedMatrix(diagIdxsArray[i], diagIdxsLens[i],
                                diagDataArray[i], diagDataLens[i]),
-        levels[i]));
+        levels[i], 2.0f));
   }
   return MakeIntArrayResult(ids);
 }
@@ -1327,7 +1470,7 @@ ArrayResultInt GenerateLinearTransformsUnifiedComplex(
     ids.push_back(AddLinearTransformFromMatrix(
         BuildComplexStripedMatrix(diagIdxsArray[i], diagIdxsLens[i],
                                   diagDataArray[i], diagDataLens[i]),
-        levels[i]));
+        levels[i], 2.0f));
   }
   return MakeIntArrayResult(ids);
 }
@@ -1380,7 +1523,16 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
 
 ArrayResultByte GenerateAndSerializeRotationKey(int key) {
   RequireScheme();
-  EnsureRotationKeyPrepared(key);
+  EnsureRotationKeyPrepared(key, g_scheme->param->default_encryption_level_);
+  const auto bytes =
+      SerializeEvaluationKeyBytes(g_scheme->interface->GetRotationKey(key));
+  g_scheme->interface->RemoveRotationKeys();
+  return MakeByteArrayResult(bytes);
+}
+
+ArrayResultByte GenerateAndSerializeRotationKeyAtLevel(int key, int level) {
+  RequireScheme();
+  EnsureRotationKeyPrepared(key, level);
   const auto bytes =
       SerializeEvaluationKeyBytes(g_scheme->interface->GetRotationKey(key));
   g_scheme->interface->RemoveRotationKeys();

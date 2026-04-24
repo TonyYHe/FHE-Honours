@@ -170,6 +170,41 @@ def test_unified_transform_group_offloads_plaintext_diagonals_when_saving(tmp_pa
         assert len(handle["__unified_transform_groups__"].keys()) == 0
 
 
+def test_unified_transform_group_skips_payloads_when_backend_does_not_need_them(tmp_path) -> None:
+    diags_path = tmp_path / "unified_diagonals.h5"
+    transforms = (
+        _fake_transform({0: [1.0, 0.0, 0.0, 0.0], 1: [0.0, 2.0, 0.0, 0.0]}, io_mode="save", diags_path=str(diags_path)),
+        _fake_transform({0: [3.0, 0.0, 0.0, 0.0], 2: [0.0, 4.0, 0.0, 0.0]}, io_mode="save", diags_path=str(diags_path)),
+    )
+    backend = _FakeBackend()
+    backend.load_plaintext_diagonals_requires_payload = False
+    group = UnifiedTransformGroup(transforms)
+
+    group.compile_unified(backend)
+
+    assert backend.serialized == []
+    with h5py.File(diags_path, "r") as handle:
+        storage = handle["__unified_transform_groups__"][group._storage_key]
+        assert storage["11"]["diag_payload"].shape == (0,)
+        assert storage["12"]["diag_payload"].shape == (0,)
+
+    outputs = group.evaluate_unified(7, backend)
+
+    assert outputs == [100, 101]
+    assert backend.loaded_batches == [
+        {
+            "transform_id": 11,
+            "diag_indices": [0, 1],
+            "segments": [],
+        },
+        {
+            "transform_id": 12,
+            "diag_indices": [0, 2],
+            "segments": [],
+        },
+    ]
+
+
 def test_can_use_unified_bsgs_rejects_non_linear_transform_instances() -> None:
     assert can_use_unified_bsgs([_fake_transform({0: [1.0]})]) is False
 

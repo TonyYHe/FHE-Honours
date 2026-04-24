@@ -14,6 +14,12 @@ import h5py
 import numpy as np
 import torch
 
+from orion.backend.python.io_prefetch import (
+    AsyncIOPrefetcher,
+    estimate_linear_transform_device_bytes,
+    should_prefetch_saved_io,
+)
+
 
 _UNIFIED_GROUP_COUNTER = count(1)
 
@@ -31,7 +37,10 @@ class UnifiedTransformGroup:
         self._storage_key = f"group_{next(_UNIFIED_GROUP_COUNTER)}"
         self._offloaded_plaintext_diagonals = False
         self._diag_indices_by_transform: dict[int, tuple[int, ...]] = {}
-        self._required_keys: tuple[int, ...] = ()
+        self._required_keys: tuple[tuple[int, int | None], ...] = ()
+        self._io_prefetcher = AsyncIOPrefetcher()
+        self._prefetch_host_bytes: int | None = None
+        self._prefetch_device_bytes: int | None = None
 
     def _scheme_params(self):
         if not self.transforms:
@@ -74,12 +83,155 @@ class UnifiedTransformGroup:
     def _storage_root_name(self) -> str:
         return "__unified_transform_groups__"
 
-    def _load_rotation_keys(self, backend) -> None:
+    def _rotation_key_storage_name(self, key: int, level: int | None) -> str:
+        return str(int(key)) if level is None else f"{int(key)}@{int(level)}"
+
+    def _rotation_key_requests(self, backend, transform_id: int) -> tuple[tuple[int, int | None], ...]:
+        get_requests = getattr(backend, "GetLinearTransformRotationKeyRequests", None)
+        if callable(get_requests):
+            flat = list(get_requests(int(transform_id)))
+            if len(flat) % 2 != 0:
+                raise RuntimeError("backend returned malformed rotation key requests")
+            requests: dict[int, int] = {}
+            for index in range(0, len(flat), 2):
+                key = int(flat[index])
+                level = int(flat[index + 1])
+                requests[key] = max(level, requests.get(key, level))
+            return tuple(sorted(requests.items()))
+        return tuple((int(key), None) for key in backend.GetLinearTransformRotationKeys(int(transform_id)))
+
+    def _generate_rotation_key(self, backend, key: int, level: int | None) -> None:
+        if level is not None and hasattr(backend, "GenerateLinearTransformRotationKeyAtLevel"):
+            backend.GenerateLinearTransformRotationKeyAtLevel(int(key), int(level))
+        else:
+            backend.GenerateLinearTransformRotationKey(int(key))
+
+    def _generate_and_serialize_rotation_key(self, backend, key: int, level: int | None):
+        if level is not None and hasattr(backend, "GenerateAndSerializeRotationKeyAtLevel"):
+            return backend.GenerateAndSerializeRotationKeyAtLevel(int(key), int(level))
+        return backend.GenerateAndSerializeRotationKey(int(key))
+
+    def _plaintext_payload_required(self, backend) -> bool:
+        return bool(getattr(backend, "load_plaintext_diagonals_requires_payload", True))
+
+    def _estimate_prefetch_host_bytes(self, backend) -> int:
+        if self._prefetch_host_bytes is not None:
+            return int(self._prefetch_host_bytes)
+
+        total_bytes = 0
+        if self._should_offload_rotation_keys():
+            with h5py.File(self._keys_path, "r") as handle:
+                for key, level in self._required_keys:
+                    key_name = self._rotation_key_storage_name(int(key), level)
+                    if key_name not in handle and str(int(key)) in handle:
+                        key_name = str(int(key))
+                    dataset = handle[key_name]
+                    total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
+
+        if self._offloaded_plaintext_diagonals and self._plaintext_payload_required(backend):
+            handle, root = self._storage_group("r")
+            try:
+                storage = root[self._storage_key]
+                for transform_id in self._diag_indices_by_transform:
+                    transform_group = storage[str(transform_id)]
+                    for name in ("diag_payload", "diag_offsets", "diag_lengths", "diag_indices"):
+                        dataset = transform_group[name]
+                        total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
+            finally:
+                handle.close()
+
+        self._prefetch_host_bytes = int(total_bytes)
+        return int(total_bytes)
+
+    def _estimate_prefetch_device_bytes(self, backend) -> int:
+        if self._prefetch_device_bytes is not None:
+            return int(self._prefetch_device_bytes)
+
+        total_bytes = 0
+        if self._should_offload_rotation_keys():
+            total_bytes += self._estimate_prefetch_host_bytes(backend)
+        if self._offloaded_plaintext_diagonals:
+            for transform_id in self._diag_indices_by_transform:
+                total_bytes += estimate_linear_transform_device_bytes(backend, int(transform_id))
+        self._prefetch_device_bytes = int(total_bytes)
+        return int(total_bytes)
+
+    def _read_saved_io_bundle(self, backend, *, prefetch: bool) -> dict[str, object] | None:
+        if prefetch:
+            if not should_prefetch_saved_io(
+                self._estimate_prefetch_host_bytes(backend),
+                backend=backend,
+                device_bytes=self._estimate_prefetch_device_bytes(backend),
+            ):
+                return None
+
+        bundle: dict[str, object] = {
+            "rotation_keys": (),
+            "plaintexts": {},
+        }
+
+        if self._should_offload_rotation_keys():
+            rotation_keys = []
+            with h5py.File(self._keys_path, "r") as handle:
+                for key, level in self._required_keys:
+                    key_name = self._rotation_key_storage_name(int(key), level)
+                    if key_name not in handle and str(int(key)) in handle:
+                        key_name = str(int(key))
+                    rotation_keys.append((int(key), np.asarray(handle[key_name][()], dtype=np.uint8).copy()))
+            bundle["rotation_keys"] = tuple(rotation_keys)
+
+        if self._offloaded_plaintext_diagonals:
+            if not self._plaintext_payload_required(backend):
+                bundle["plaintexts"] = {
+                    int(transform_id): {
+                        "payload": np.zeros((0,), dtype=np.uint8),
+                        "offsets": (),
+                        "lengths": (),
+                        "diag_indices": tuple(int(idx) for idx in diag_indices),
+                    }
+                    for transform_id, diag_indices in self._diag_indices_by_transform.items()
+                }
+                return bundle
+
+            handle, root = self._storage_group("r")
+            try:
+                storage = root[self._storage_key]
+                plaintexts: dict[int, dict[str, object]] = {}
+                for transform_id, diag_indices in self._diag_indices_by_transform.items():
+                    transform_group = storage[str(transform_id)]
+                    plaintexts[int(transform_id)] = {
+                        "payload": np.asarray(transform_group["diag_payload"][:], dtype=np.uint8).copy(),
+                        "offsets": tuple(int(v) for v in transform_group["diag_offsets"][:].tolist()),
+                        "lengths": tuple(int(v) for v in transform_group["diag_lengths"][:].tolist()),
+                        "diag_indices": tuple(int(v) for v in diag_indices),
+                    }
+                bundle["plaintexts"] = plaintexts
+            finally:
+                handle.close()
+
+        return bundle
+
+    def _schedule_next_saved_io_prefetch(self, backend) -> None:
+        if not self._should_offload_rotation_keys() and not self._offloaded_plaintext_diagonals:
+            return
+        self._io_prefetcher.submit(
+            self._storage_key,
+            lambda: self._read_saved_io_bundle(backend, prefetch=True),
+        )
+
+    def _load_rotation_keys(self, backend, bundle: dict[str, object] | None = None) -> None:
         if not self._should_offload_rotation_keys():
             return
+        if bundle is not None:
+            for key, serial_key in bundle.get("rotation_keys", ()):
+                backend.LoadRotationKey(serial_key, int(key))
+            return
         with h5py.File(self._keys_path, "r") as handle:
-            for key in self._required_keys:
-                backend.LoadRotationKey(handle[str(int(key))][()], int(key))
+            for key, level in self._required_keys:
+                key_name = self._rotation_key_storage_name(int(key), level)
+                if key_name not in handle and str(int(key)) in handle:
+                    key_name = str(int(key))
+                backend.LoadRotationKey(handle[key_name][()], int(key))
 
     def _unload_rotation_keys(self, backend) -> None:
         if self._should_offload_rotation_keys():
@@ -104,25 +256,27 @@ class UnifiedTransformGroup:
             if self._storage_key in root:
                 del root[self._storage_key]
             storage = root.create_group(self._storage_key)
+            payload_required = self._plaintext_payload_required(backend)
             for transform_id, diag_indices in self._diag_indices_by_transform.items():
                 transform_group = storage.create_group(str(transform_id))
                 payload_chunks: list[np.ndarray] = []
                 offsets: list[int] = []
                 lengths: list[int] = []
                 cursor = 0
-                for diag_idx in diag_indices:
-                    serial_diag, diag_ptr = backend.SerializeDiagonal(
-                        int(transform_id),
-                        int(diag_idx),
-                    )
-                    try:
-                        serial_arr = np.asarray(serial_diag, dtype=np.uint8).reshape(-1).copy()
-                        offsets.append(int(cursor))
-                        lengths.append(int(serial_arr.size))
-                        payload_chunks.append(serial_arr)
-                        cursor += int(serial_arr.size)
-                    finally:
-                        backend.FreeCArray(diag_ptr)
+                if payload_required:
+                    for diag_idx in diag_indices:
+                        serial_diag, diag_ptr = backend.SerializeDiagonal(
+                            int(transform_id),
+                            int(diag_idx),
+                        )
+                        try:
+                            serial_arr = np.asarray(serial_diag, dtype=np.uint8).reshape(-1).copy()
+                            offsets.append(int(cursor))
+                            lengths.append(int(serial_arr.size))
+                            payload_chunks.append(serial_arr)
+                            cursor += int(serial_arr.size)
+                        finally:
+                            backend.FreeCArray(diag_ptr)
                 payload = (
                     np.concatenate(payload_chunks)
                     if payload_chunks
@@ -145,9 +299,21 @@ class UnifiedTransformGroup:
         finally:
             handle.close()
         self._offloaded_plaintext_diagonals = True
+        self._prefetch_host_bytes = None
+        self._prefetch_device_bytes = None
 
-    def _load_plaintext_diagonals(self, backend) -> None:
+    def _load_plaintext_diagonals(self, backend, bundle: dict[str, object] | None = None) -> None:
         if not self._offloaded_plaintext_diagonals:
+            return
+        if bundle is not None:
+            for transform_id, payload in bundle.get("plaintexts", {}).items():
+                backend.LoadPlaintextDiagonalsBatch(
+                    payload["payload"],
+                    list(payload["offsets"]),
+                    list(payload["lengths"]),
+                    list(payload["diag_indices"]),
+                    int(transform_id),
+                )
             return
         handle, root = self._storage_group("r")
         try:
@@ -193,6 +359,8 @@ class UnifiedTransformGroup:
             raise ValueError("UnifiedTransformGroup requires at least one transform")
 
         self._configure_io()
+        self._prefetch_host_bytes = None
+        self._prefetch_device_bytes = None
         diag_idxs_list: list[list[int]] = []
         diag_data_list: list[list[float]] = []
         levels: list[int] = []
@@ -279,25 +447,29 @@ class UnifiedTransformGroup:
             for transform_id, diag_idxs in zip(self.unified_ids, diag_idxs_list)
         }
 
-        required_keys: set[int] = set()
+        required_keys: dict[int, int | None] = {}
         for transform_id in self.unified_ids:
-            for key in backend.GetLinearTransformRotationKeys(int(transform_id)):
-                required_keys.add(int(key))
-        self._required_keys = tuple(sorted(int(key) for key in required_keys))
+            for key, level in self._rotation_key_requests(backend, int(transform_id)):
+                if level is None:
+                    required_keys[int(key)] = None
+                else:
+                    current = required_keys.get(int(key))
+                    required_keys[int(key)] = int(level) if current is None else max(int(level), int(current))
+        self._required_keys = tuple(sorted((int(key), level) for key, level in required_keys.items()))
         if self._should_offload_rotation_keys():
             with h5py.File(self._keys_path, "a") as handle:
-                for key in self._required_keys:
-                    key_name = str(int(key))
+                for key, level in self._required_keys:
+                    key_name = self._rotation_key_storage_name(int(key), level)
                     if key_name in handle:
                         continue
-                    serial_key, key_ptr = backend.GenerateAndSerializeRotationKey(int(key))
+                    serial_key, key_ptr = self._generate_and_serialize_rotation_key(backend, int(key), level)
                     try:
                         handle.create_dataset(key_name, data=serial_key)
                     finally:
                         backend.FreeCArray(key_ptr)
         else:
-            for key in self._required_keys:
-                backend.GenerateLinearTransformRotationKey(int(key))
+            for key, level in self._required_keys:
+                self._generate_rotation_key(backend, int(key), level)
 
         if self._should_offload_plaintext_diagonals():
             self._save_and_unload_plaintext_diagonals(backend)
@@ -314,8 +486,12 @@ class UnifiedTransformGroup:
     def evaluate_unified(self, ct_input_id: int, backend) -> list[int]:
         if not self.is_compiled or self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
-        self._load_rotation_keys(backend)
-        self._load_plaintext_diagonals(backend)
+        bundle = self._io_prefetcher.consume(self._storage_key)
+        if bundle is None and (self._should_offload_rotation_keys() or self._offloaded_plaintext_diagonals):
+            bundle = self._read_saved_io_bundle(backend, prefetch=False)
+        self._load_rotation_keys(backend, bundle)
+        self._load_plaintext_diagonals(backend, bundle)
+        self._schedule_next_saved_io_prefetch(backend)
         transform_ids_array = (ctypes.c_int * len(self.unified_ids))(*[int(v) for v in self.unified_ids])
         try:
             return list(
@@ -346,6 +522,7 @@ class UnifiedTransformGroup:
         return self._result_cache[calling_transform]
 
     def cleanup(self, backend) -> None:
+        self._io_prefetcher.clear(wait=True)
         if self.unified_ids is not None:
             for transform_id in self.unified_ids:
                 backend.DeleteLinearTransform(int(transform_id))
@@ -355,6 +532,8 @@ class UnifiedTransformGroup:
         self._diag_indices_by_transform = {}
         self._offloaded_plaintext_diagonals = False
         self._required_keys = ()
+        self._prefetch_host_bytes = None
+        self._prefetch_device_bytes = None
 
 
 def can_use_unified_bsgs(layers: List) -> bool:
