@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
+import numpy as np
 
 from tqdm import tqdm
 
@@ -21,8 +22,13 @@ def pack_conv2d(conv_layer: nn.Module, last: bool):
     if conv_layer.groups > 1:
         weight = resolve_grouped_conv(conv_layer)
 
-    toeplitz = construct_conv2d_toeplitz(conv_layer, weight)
-    diagonals, output_rotations = diagonalize(toeplitz, slots, embed_method, last)
+    diagonals, output_rotations = direct_diagonalize_conv2d(
+        conv_layer,
+        weight,
+        slots,
+        embed_method,
+        last,
+    )
     
     return diagonals, output_rotations
 
@@ -124,8 +130,12 @@ def pack_conv_transpose2d(conv_layer: nn.Module, last: bool):
     slots = conv_layer.scheme.params.get_slots()
     embed_method = conv_layer.scheme.params.get_embedding_method()
 
-    toeplitz = construct_conv_transpose2d_toeplitz(conv_layer)
-    diagonals, output_rotations = diagonalize(toeplitz, slots, embed_method, last)
+    diagonals, output_rotations = direct_diagonalize_conv_transpose2d(
+        conv_layer,
+        slots,
+        embed_method,
+        last,
+    )
 
     return diagonals, output_rotations
 
@@ -232,6 +242,359 @@ def construct_conv_transpose2d_bias(conv_layer):
 
     return bias_vector
 
+
+class _DirectDiagonalAccumulator:
+    def __init__(
+        self,
+        matrix_shape: tuple[int, int],
+        num_slots: int,
+        embed_method: str,
+        is_last_layer: bool,
+        *,
+        allow_hybrid: bool = True,
+    ) -> None:
+        self.matrix_height = int(matrix_shape[0])
+        self.matrix_width = int(matrix_shape[1])
+        self.num_slots = int(num_slots)
+        self.num_block_rows = math.ceil(self.matrix_height / self.num_slots)
+        self.num_block_cols = math.ceil(self.matrix_width / self.num_slots)
+        print(f"├── embed method: {embed_method}")
+        print(f"├── original matrix shape: {matrix_shape}")
+        print(f"├── # blocks (rows, cols) = {(self.num_block_rows, self.num_block_cols)}")
+
+        if (
+            allow_hybrid
+            and self.num_block_rows == 1
+            and embed_method == "hybrid"
+            and not is_last_layer
+        ):
+            self.block_height = 2 ** math.ceil(math.log2(self.matrix_height))
+            self.output_rotations = int(math.log2(self.num_slots // self.block_height))
+        else:
+            self.block_height = self.num_slots
+            self.output_rotations = 0
+
+        self.resized_shape = (
+            self.num_block_rows * self.block_height,
+            self.num_block_cols * self.num_slots,
+        )
+        print(f"├── resized matrix shape: {self.resized_shape}")
+        print(f"├── # output rotations: {self.output_rotations}")
+        self.diagonals_by_block: dict[tuple[int, int], dict[int, np.ndarray]] = {}
+
+    def add_entries(self, rows, cols, values) -> None:
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        cols = np.asarray(cols, dtype=np.int64).reshape(-1)
+        values = np.asarray(values, dtype=np.float32).reshape(-1)
+        if rows.size == 0:
+            return
+
+        valid = (
+            (rows >= 0)
+            & (rows < self.matrix_height)
+            & (cols >= 0)
+            & (cols < self.matrix_width)
+            & (values != 0.0)
+        )
+        if not bool(np.any(valid)):
+            return
+        rows = rows[valid]
+        cols = cols[valid]
+        values = values[valid]
+
+        if self.block_height == self.num_slots:
+            block_rows = rows // self.num_slots
+            local_rows = rows - block_rows * self.num_slots
+            block_cols = cols // self.num_slots
+            local_cols = cols - block_cols * self.num_slots
+            diag_idxs = (local_cols - local_rows) % self.num_slots
+            positions = local_rows
+        else:
+            block_rows = np.zeros_like(rows)
+            local_rows = rows
+            block_cols = cols // self.num_slots
+            local_cols = cols - block_cols * self.num_slots
+            diag_idxs = (local_cols - local_rows) % self.block_height
+            positions = (local_cols - diag_idxs) % self.num_slots
+
+        order = np.lexsort((diag_idxs, block_cols, block_rows))
+        block_rows = block_rows[order]
+        block_cols = block_cols[order]
+        diag_idxs = diag_idxs[order]
+        positions = positions[order]
+        values = values[order]
+
+        start = 0
+        while start < int(values.size):
+            end = start + 1
+            while (
+                end < int(values.size)
+                and int(block_rows[end]) == int(block_rows[start])
+                and int(block_cols[end]) == int(block_cols[start])
+                and int(diag_idxs[end]) == int(diag_idxs[start])
+            ):
+                end += 1
+
+            block_key = (int(block_rows[start]), int(block_cols[start]))
+            diag_idx = int(diag_idxs[start])
+            block = self.diagonals_by_block.setdefault(block_key, {})
+            diagonal = block.get(diag_idx)
+            if diagonal is None:
+                diagonal = np.zeros((self.num_slots,), dtype=np.float32)
+                block[diag_idx] = diagonal
+            np.add.at(diagonal, positions[start:end].astype(np.int64), values[start:end])
+            start = end
+
+    def finish(self, start_time: float) -> tuple[dict[tuple[int, int], dict[int, list[float]]], int]:
+        out: dict[tuple[int, int], dict[int, list[float]]] = {}
+        total_diagonals = 0
+        for block_row in range(self.num_block_rows):
+            for block_col in range(self.num_block_cols):
+                block = self.diagonals_by_block.get((int(block_row), int(block_col)), {})
+                if not block:
+                    out[(int(block_row), int(block_col))] = {0: [0.0] * self.num_slots}
+                    continue
+                total_diagonals += len(block)
+                out[(int(block_row), int(block_col))] = {
+                    int(diag_idx): block[int(diag_idx)].tolist()
+                    for diag_idx in sorted(int(value) for value in block.keys())
+                }
+        elapsed_time = time.time() - start_time
+        print(f"├── time to pack (s): {elapsed_time:.2f}")
+        print(f"├── # diagonals = {total_diagonals}")
+        return out, int(self.output_rotations)
+
+
+def _packed_flat_indices(
+    channel: int,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    *,
+    gap: int,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    gap = int(gap)
+    phase = int(channel) % int(gap * gap)
+    packed_channel = int(channel) // int(gap * gap)
+    packed_rows = rows.astype(np.int64) * int(gap) + int(phase // gap)
+    packed_cols = cols.astype(np.int64) * int(gap) + int(phase % gap)
+    return (
+        (int(packed_channel) * int(height) + packed_rows) * int(width)
+        + packed_cols
+    ).astype(np.int64)
+
+
+def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    _, _, hi, wi = [int(value) for value in conv_layer.input_shape]
+    _, _, ho, wo = [int(value) for value in conv_layer.output_shape]
+    stride_h, stride_w = [int(value) for value in conv_layer.stride]
+    pad_h, pad_w = [int(value) for value in conv_layer.padding]
+    dil_h, dil_w = [int(value) for value in conv_layer.dilation]
+    k_h, k_w = [int(value) for value in conv_layer.kernel_size]
+
+    oh_grid, ow_grid = np.meshgrid(
+        np.arange(ho, dtype=np.int64),
+        np.arange(wo, dtype=np.int64),
+        indexing="ij",
+    )
+    cache = {}
+    for kh in range(k_h):
+        for kw in range(k_w):
+            ih_grid = oh_grid * int(stride_h) - int(pad_h) + int(kh) * int(dil_h)
+            iw_grid = ow_grid * int(stride_w) - int(pad_w) + int(kw) * int(dil_w)
+            valid = (
+                (ih_grid >= 0)
+                & (ih_grid < int(hi))
+                & (iw_grid >= 0)
+                & (iw_grid < int(wi))
+            )
+            cache[(int(kh), int(kw))] = (
+                oh_grid[valid].reshape(-1),
+                ow_grid[valid].reshape(-1),
+                ih_grid[valid].reshape(-1),
+                iw_grid[valid].reshape(-1),
+            )
+    return cache
+
+
+def direct_diagonalize_conv2d(
+    conv_layer,
+    weight,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+):
+    start_time = time.time()
+    matrix_shape = (
+        int(torch.Size(conv_layer.fhe_output_shape).numel()),
+        int(torch.Size(conv_layer.fhe_input_shape).numel()),
+    )
+    accumulator = _DirectDiagonalAccumulator(
+        matrix_shape,
+        int(num_slots),
+        str(embed_method),
+        bool(is_last_layer),
+    )
+
+    n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
+    _, co, _, _ = [int(value) for value in conv_layer.output_shape]
+    _, on_ci, on_hi, on_wi = [int(value) for value in conv_layer.fhe_input_shape]
+    _, on_co, on_ho, on_wo = [int(value) for value in conv_layer.fhe_output_shape]
+    input_gap = int(conv_layer.input_gap)
+    output_gap = int(conv_layer.output_gap)
+    input_block_size = int(on_ci * on_hi * on_wi)
+    output_block_size = int(on_co * on_ho * on_wo)
+
+    weight = weight.detach().cpu().to(dtype=torch.float32)
+    spatial_cache = _conv2d_spatial_cache(conv_layer)
+    for oc in range(int(co)):
+        for ic in range(int(ci)):
+            for kh in range(int(weight.shape[2])):
+                for kw in range(int(weight.shape[3])):
+                    coeff = float(weight[int(oc), int(ic), int(kh), int(kw)])
+                    if coeff == 0.0:
+                        continue
+                    oh, ow, ih, iw = spatial_cache[(int(kh), int(kw))]
+                    if oh.size == 0:
+                        continue
+                    local_rows = _packed_flat_indices(
+                        int(oc),
+                        oh,
+                        ow,
+                        gap=int(output_gap),
+                        height=int(on_ho),
+                        width=int(on_wo),
+                    )
+                    local_cols = _packed_flat_indices(
+                        int(ic),
+                        ih,
+                        iw,
+                        gap=int(input_gap),
+                        height=int(on_hi),
+                        width=int(on_wi),
+                    )
+                    values = np.full((int(local_rows.size),), float(coeff), dtype=np.float32)
+                    for batch in range(int(n_batch)):
+                        accumulator.add_entries(
+                            local_rows + int(batch) * int(output_block_size),
+                            local_cols + int(batch) * int(input_block_size),
+                            values,
+                        )
+
+    return accumulator.finish(start_time)
+
+
+def _tconv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    _, _, hi, wi = [int(value) for value in conv_layer.input_shape]
+    _, _, ho, wo = [int(value) for value in conv_layer.output_shape]
+    stride_h, stride_w = [int(value) for value in conv_layer.stride]
+    pad_h, pad_w = [int(value) for value in conv_layer.padding]
+    dil_h, dil_w = [int(value) for value in conv_layer.dilation]
+    k_h, k_w = [int(value) for value in conv_layer.kernel_size]
+
+    ih_grid, iw_grid = np.meshgrid(
+        np.arange(hi, dtype=np.int64),
+        np.arange(wi, dtype=np.int64),
+        indexing="ij",
+    )
+    cache = {}
+    for kh in range(k_h):
+        for kw in range(k_w):
+            oh_grid = ih_grid * int(stride_h) - int(pad_h) + int(kh) * int(dil_h)
+            ow_grid = iw_grid * int(stride_w) - int(pad_w) + int(kw) * int(dil_w)
+            valid = (
+                (oh_grid >= 0)
+                & (oh_grid < int(ho))
+                & (ow_grid >= 0)
+                & (ow_grid < int(wo))
+            )
+            cache[(int(kh), int(kw))] = (
+                ih_grid[valid].reshape(-1),
+                iw_grid[valid].reshape(-1),
+                oh_grid[valid].reshape(-1),
+                ow_grid[valid].reshape(-1),
+            )
+    return cache
+
+
+def direct_diagonalize_conv_transpose2d(
+    conv_layer,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    *,
+    allow_hybrid: bool = True,
+):
+    start_time = time.time()
+    matrix_shape = (
+        int(torch.Size(conv_layer.fhe_output_shape).numel()),
+        int(torch.Size(conv_layer.fhe_input_shape).numel()),
+    )
+    accumulator = _DirectDiagonalAccumulator(
+        matrix_shape,
+        int(num_slots),
+        str(embed_method),
+        bool(is_last_layer),
+        allow_hybrid=bool(allow_hybrid),
+    )
+
+    n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
+    _, co, _, _ = [int(value) for value in conv_layer.output_shape]
+    _, on_ci, on_hi, on_wi = [int(value) for value in conv_layer.fhe_input_shape]
+    _, on_co, on_ho, on_wo = [int(value) for value in conv_layer.fhe_output_shape]
+    input_gap = int(conv_layer.input_gap)
+    output_gap = int(conv_layer.output_gap)
+    input_block_size = int(on_ci * on_hi * on_wi)
+    output_block_size = int(on_co * on_ho * on_wo)
+
+    weight = conv_layer.on_weight.detach().cpu().to(dtype=torch.float32)
+    groups = int(conv_layer.groups)
+    in_channels_per_group = int(conv_layer.in_channels // groups)
+    out_channels_per_group = int(conv_layer.out_channels // groups)
+    spatial_cache = _tconv2d_spatial_cache(conv_layer)
+
+    for ic in range(int(ci)):
+        group = int(ic) // int(in_channels_per_group)
+        oc_offset = int(group) * int(out_channels_per_group)
+        for oc_rel in range(int(out_channels_per_group)):
+            oc = int(oc_offset + oc_rel)
+            if int(oc) >= int(co):
+                continue
+            for kh in range(int(weight.shape[2])):
+                for kw in range(int(weight.shape[3])):
+                    coeff = float(weight[int(ic), int(oc_rel), int(kh), int(kw)])
+                    if coeff == 0.0:
+                        continue
+                    ih, iw, oh, ow = spatial_cache[(int(kh), int(kw))]
+                    if ih.size == 0:
+                        continue
+                    local_rows = _packed_flat_indices(
+                        int(oc),
+                        oh,
+                        ow,
+                        gap=int(output_gap),
+                        height=int(on_ho),
+                        width=int(on_wo),
+                    )
+                    local_cols = _packed_flat_indices(
+                        int(ic),
+                        ih,
+                        iw,
+                        gap=int(input_gap),
+                        height=int(on_hi),
+                        width=int(on_wi),
+                    )
+                    values = np.full((int(local_rows.size),), float(coeff), dtype=np.float32)
+                    for batch in range(int(n_batch)):
+                        accumulator.add_entries(
+                            local_rows + int(batch) * int(output_block_size),
+                            local_cols + int(batch) * int(input_block_size),
+                            values,
+                        )
+
+    return accumulator.finish(start_time)
+
 def pack_linear(linear_layer: nn.Module, last: bool):
     slots = linear_layer.scheme.params.get_slots()
     embed_method = linear_layer.scheme.params.get_embedding_method()
@@ -297,6 +660,8 @@ def diagonalize(
     num_slots: int,
     embed_method: str,
     is_last_layer: bool,
+    *,
+    allow_hybrid: bool = True,
 ):
     """
     For each (slots, slots) block of the input matrix, this function 
@@ -349,7 +714,7 @@ def diagonalize(
     print(f"├── original matrix shape: {matrix.shape}")
     print(f"├── # blocks (rows, cols) = {(num_block_rows, num_block_cols)}")
 
-    if num_block_rows == 1 and embed_method == "hybrid" and not is_last_layer:
+    if allow_hybrid and num_block_rows == 1 and embed_method == "hybrid" and not is_last_layer:
         block_height = 2 ** math.ceil(math.log2(matrix_height))
         output_rotations = int(math.log2(num_slots // block_height))
     else:
@@ -385,14 +750,17 @@ def diagonalize(
                 row_start: row_start + block_height,
                 col_start: col_start + num_slots,
             ]
-            block_dense = torch.tensor(block_sparse.todense(), dtype=torch.float32)
-            block_diagonals = block_dense[row_idx, col_idx]
+            if block_height == num_slots:
+                nonzero_diagonals = _extract_square_block_diagonals(block_sparse, num_slots)
+            else:
+                block_dense = torch.tensor(block_sparse.todense(), dtype=torch.float32)
+                block_diagonals = block_dense[row_idx, col_idx]
 
-            # Collect non-zero diagonals
-            nonzero_diagonals = {}
-            for i in range(block_height):
-                if torch.any(block_diagonals[i]):
-                    nonzero_diagonals[i] = block_diagonals[i].tolist()
+                # Collect non-zero diagonals
+                nonzero_diagonals = {}
+                for i in range(block_height):
+                    if torch.any(block_diagonals[i]):
+                        nonzero_diagonals[i] = block_diagonals[i].tolist()
 
             total_diagonals += len(nonzero_diagonals)
             diagonals_by_block[(block_row, block_col)] = (
@@ -411,6 +779,24 @@ def diagonalize(
     print(f"├── # diagonals = {total_diagonals}")
 
     return diagonals_by_block, output_rotations
+
+
+def _extract_square_block_diagonals(block_sparse: sp.spmatrix, num_slots: int) -> dict[int, list[float]]:
+    coo = block_sparse.tocoo()
+    diagonals: dict[int, torch.Tensor] = {}
+
+    for row_idx, col_idx, value in zip(coo.row, coo.col, coo.data):
+        diag_idx = int((int(col_idx) - int(row_idx)) % int(num_slots))
+        diagonal = diagonals.get(int(diag_idx))
+        if diagonal is None:
+            diagonal = torch.zeros((int(num_slots),), dtype=torch.float32)
+            diagonals[int(diag_idx)] = diagonal
+        diagonal[int(row_idx)] = float(value)
+
+    return {
+        int(diag_idx): diagonals[int(diag_idx)].tolist()
+        for diag_idx in sorted(int(value) for value in diagonals.keys())
+    }
 
 def plot_toeplitz(matrix, save_path=""):
     if isinstance(matrix, sp.csr_matrix):

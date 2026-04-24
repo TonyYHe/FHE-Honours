@@ -16,7 +16,7 @@ import (
 
 var ltHeap = NewHeapAllocator()
 
-func encodeUnifiedFloatTransformsParallel(
+func encodeFloatTransformsParallel(
 	diagonalsList []lintrans.Diagonals[float64],
 	transforms []lintrans.LinearTransformation,
 ) error {
@@ -56,6 +56,13 @@ func encodeUnifiedFloatTransformsParallel(
 	close(jobs)
 	wg.Wait()
 	return firstErr
+}
+
+func encodeUnifiedFloatTransformsParallel(
+	diagonalsList []lintrans.Diagonals[float64],
+	transforms []lintrans.LinearTransformation,
+) error {
+	return encodeFloatTransformsParallel(diagonalsList, transforms)
 }
 
 func encodeUnifiedComplexTransformsParallel(
@@ -176,6 +183,68 @@ func GenerateLinearTransform(
 	// Return reference to linear transform object we just created
 	ltID := ltHeap.Add(lt)
 	return C.int(ltID)
+}
+
+//export GenerateLinearTransformsBatch
+func GenerateLinearTransformsBatch(
+	numTransforms C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	diagDataArray **C.float, diagDataLens *C.int,
+	levels *C.int,
+	bsgsRatio C.float,
+	ioModeC *C.char,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	slots := scheme.Params.MaxSlots()
+	ioMode := C.GoString(ioModeC)
+
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	diagDataArraySlice := unsafe.Slice(diagDataArray, n)
+	diagDataLensSlice := unsafe.Slice(diagDataLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	transforms := make([]lintrans.LinearTransformation, n)
+	diagonalsList := make([]lintrans.Diagonals[float64], n)
+
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		diagDataFlat := CArrayToSlice(diagDataArraySlice[i], diagDataLensSlice[i], convertCFloatToFloat)
+
+		diagonals := make(lintrans.Diagonals[float64])
+		for j, key := range diagIdxs {
+			diagonals[key] = diagDataFlat[j*slots : (j+1)*slots]
+		}
+		diagonalsList[i] = diagonals
+
+		ltparams := lintrans.Parameters{
+			DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: int(math.Log(float64(bsgsRatio))),
+		}
+		transforms[i] = lintrans.NewTransformation(scheme.Params, ltparams)
+		if ioMode == "load" {
+			transforms[i].Vec = make(map[int]ringqp.Poly)
+			for _, diag := range diagIdxs {
+				transforms[i].Vec[diag] = ringqp.Poly{}
+			}
+		}
+	}
+
+	if ioMode != "load" {
+		if err := encodeFloatTransformsParallel(diagonalsList, transforms); err != nil {
+			panic(err)
+		}
+	}
+
+	ids := make([]int, n)
+	for i, lt := range transforms {
+		ids[i] = AddLinearTransform(lt)
+	}
+	return SliceToCArray(ids, convertIntToCInt)
 }
 
 //export EvaluateLinearTransform

@@ -62,6 +62,13 @@ class LinearTransform(Module):
     def load_transforms(self):
         return self.scheme.lt_evaluator.load_transforms(self) 
 
+    def load_cached_transform_metadata(self) -> bool:
+        if self.get_io_mode() != "load":
+            return False
+        self.output_rotations = self.scheme.lt_evaluator.load_transform_metadata(self)
+        self.diagonals = {}
+        return True
+
     def compile(self):
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
@@ -117,6 +124,8 @@ class Linear(LinearTransform):
         return kwargs["clear_output_shape"]
         
     def generate_diagonals(self, last):
+        if self.load_cached_transform_metadata():
+            return
         # Here, we'll apply our packing strategies to return the diagonals
         # of our linear layer. When using the "hybrid" method of packing, this
         # may also require several output rotations and summations.
@@ -237,6 +246,8 @@ class Conv2d(LinearTransform):
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
             self.diagonals = {}
             self.output_rotations = 0
+            return
+        if self.load_cached_transform_metadata():
             return
         # Generate Toeplitz diagonals and determine the number of output
         # rotations if the `hybrid` packing method is used.
@@ -383,6 +394,8 @@ class ConvTranspose2d(LinearTransform):
         return torch.Size((N, on_Co, on_Ho, on_Wo))
 
     def generate_diagonals(self, last):
+        if self.load_cached_transform_metadata():
+            return
         self.diagonals, self.output_rotations = packing.pack_conv_transpose2d(self, last)
         if self.get_io_mode() == "save":
             self.save_transforms()
