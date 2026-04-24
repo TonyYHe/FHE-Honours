@@ -3,6 +3,7 @@ include LICENSE
 include README.md
 
 recursive-include orion/backend/lattigo *.so *.dylib *.dll
+recursive-include orion/backend/cheddar *.so *.dylib *.dll
 
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]

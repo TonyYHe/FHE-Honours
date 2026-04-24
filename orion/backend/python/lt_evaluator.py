@@ -108,10 +108,10 @@ class NewEvaluator:
             layer.create_dataset("output_min", data=output_min.item())
             layer.create_dataset("output_max", data=output_max.item())
 
-            diags_group = layer.require_group("diagonals", track_order=True)
+            diags_group = layer.require_group("diagonals")
             for (row, col), diags in diagonals.items():
                 block_idx = f"{row}_{col}"
-                block_diags_group = diags_group.create_group(block_idx, track_order=True)
+                block_diags_group = diags_group.create_group(block_idx)
                 
                 # Iterate over all diagonals in the block and save
                 for diag_idx, diag_data in diags.items():
@@ -148,6 +148,7 @@ class NewEvaluator:
         layer_name = linear_layer.name
         out_shape = linear_layer.output_shape
         fhe_out_shape = linear_layer.fhe_output_shape 
+        skip_post_rescale = bool(getattr(self.backend, "lt_outputs_are_rescaled", False))
 
         # Order-preserving flatten that can be mapped back to 
         # (row, col) format in backend via len(in_ctensor.ids)
@@ -178,8 +179,12 @@ class NewEvaluator:
                     self.remove_plaintext_diagonals(t_id)
             
             # We know the output of this accumulation will just be one ciphertext
-            ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
-            cts_out.append(ct_out_rescaled)
+            if skip_post_rescale:
+                cts_out.append(int(ct_out.ids[0]))
+                ct_out.ids = []
+            else:
+                ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
+                cts_out.append(ct_out_rescaled)
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
             

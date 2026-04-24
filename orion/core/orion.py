@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, RandomSampler
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
 from orion.backend.lattigo import bindings as lgo
+from orion.backend.cheddar import bindings as cgo
 from orion.backend.python import (
     PythonBackend,
     parameters, 
@@ -135,13 +136,17 @@ class Scheme:
             py_lattigo = lgo.LattigoLibrary()
             py_lattigo.setup_bindings(params)
             return py_lattigo
+        elif backend == "cheddar":
+            py_cheddar = cgo.CheddarLibrary()
+            py_cheddar.setup_bindings(params)
+            return py_cheddar
         elif backend == "python":
             return PythonBackend(params)
         elif backend in ("heaan", "openfhe"):
             raise ValueError(f"Backend {backend} not yet supported.")
         else:
             raise ValueError(
-                f"Invalid {backend}. Supported backends are: lattigo, python."
+                f"Invalid {backend}. Supported backends are: lattigo, cheddar, python."
             )
 
     def encode(self, tensor, level=None, scale=None):

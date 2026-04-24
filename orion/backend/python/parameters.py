@@ -73,7 +73,7 @@ class OrionParameters:
     fuse_modules: bool = True
     debug: bool = True
     embedding_method: Literal["hybrid", "square"] = "hybrid"
-    backend: Literal["lattigo", "openfhe", "heaan", "python"] = "lattigo"
+    backend: Literal["lattigo", "cheddar", "openfhe", "heaan", "python"] = "lattigo"
     io_mode: Literal["none", "save", "load"] = "none"
     diags_path: str = ""
     keys_path: str = ""

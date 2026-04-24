@@ -27,9 +27,11 @@ class UnifiedTransformGroup:
         self.is_compiled = False
         self._io_mode = "none"
         self._diags_path = ""
+        self._keys_path = ""
         self._storage_key = f"group_{next(_UNIFIED_GROUP_COUNTER)}"
         self._offloaded_plaintext_diagonals = False
         self._diag_indices_by_transform: dict[int, tuple[int, ...]] = {}
+        self._required_keys: tuple[int, ...] = ()
 
     def _scheme_params(self):
         if not self.transforms:
@@ -46,6 +48,7 @@ class UnifiedTransformGroup:
 
         get_io_mode = getattr(params, "get_io_mode", None)
         get_diags_path = getattr(params, "get_diags_path", None)
+        get_keys_path = getattr(params, "get_keys_path", None)
         self._io_mode = (
             str(get_io_mode()).lower()
             if callable(get_io_mode)
@@ -56,12 +59,31 @@ class UnifiedTransformGroup:
             if callable(get_diags_path)
             else ""
         )
+        self._keys_path = (
+            str(get_keys_path() or "")
+            if callable(get_keys_path)
+            else ""
+        )
 
     def _should_offload_plaintext_diagonals(self) -> bool:
-        return self._io_mode == "save"
+        return self._io_mode == "save" and bool(self._diags_path)
+
+    def _should_offload_rotation_keys(self) -> bool:
+        return self._io_mode == "save" and bool(self._keys_path)
 
     def _storage_root_name(self) -> str:
         return "__unified_transform_groups__"
+
+    def _load_rotation_keys(self, backend) -> None:
+        if not self._should_offload_rotation_keys():
+            return
+        with h5py.File(self._keys_path, "r") as handle:
+            for key in self._required_keys:
+                backend.LoadRotationKey(handle[str(int(key))][()], int(key))
+
+    def _unload_rotation_keys(self, backend) -> None:
+        if self._should_offload_rotation_keys():
+            backend.RemoveRotationKeys()
 
     def _storage_group(self, mode: str):
         if not self._diags_path:
@@ -261,8 +283,21 @@ class UnifiedTransformGroup:
         for transform_id in self.unified_ids:
             for key in backend.GetLinearTransformRotationKeys(int(transform_id)):
                 required_keys.add(int(key))
-        for key in sorted(required_keys):
-            backend.GenerateLinearTransformRotationKey(int(key))
+        self._required_keys = tuple(sorted(int(key) for key in required_keys))
+        if self._should_offload_rotation_keys():
+            with h5py.File(self._keys_path, "a") as handle:
+                for key in self._required_keys:
+                    key_name = str(int(key))
+                    if key_name in handle:
+                        continue
+                    serial_key, key_ptr = backend.GenerateAndSerializeRotationKey(int(key))
+                    try:
+                        handle.create_dataset(key_name, data=serial_key)
+                    finally:
+                        backend.FreeCArray(key_ptr)
+        else:
+            for key in self._required_keys:
+                backend.GenerateLinearTransformRotationKey(int(key))
 
         if self._should_offload_plaintext_diagonals():
             self._save_and_unload_plaintext_diagonals(backend)
@@ -279,6 +314,7 @@ class UnifiedTransformGroup:
     def evaluate_unified(self, ct_input_id: int, backend) -> list[int]:
         if not self.is_compiled or self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
+        self._load_rotation_keys(backend)
         self._load_plaintext_diagonals(backend)
         transform_ids_array = (ctypes.c_int * len(self.unified_ids))(*[int(v) for v in self.unified_ids])
         try:
@@ -291,6 +327,7 @@ class UnifiedTransformGroup:
             )
         finally:
             self._unload_plaintext_diagonals(backend)
+            self._unload_rotation_keys(backend)
 
     def execute(self, calling_transform, ct_input):
         from orion.backend.python.tensors import CipherTensor
@@ -317,6 +354,7 @@ class UnifiedTransformGroup:
         self.is_compiled = False
         self._diag_indices_by_transform = {}
         self._offloaded_plaintext_diagonals = False
+        self._required_keys = ()
 
 
 def can_use_unified_bsgs(layers: List) -> bool:
