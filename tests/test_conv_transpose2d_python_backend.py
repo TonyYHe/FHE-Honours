@@ -3,10 +3,14 @@ from __future__ import annotations
 import copy
 import pytest
 import torch
+import torch.nn.functional as F
 import orion
 from orion.core import packing
+from orion.core.orion import scheme
+from orion.backend.python.tensors import CipherTensor
 from orion.models.unet import MiniUNet
 from orion.nn.linear import ConvTranspose2d
+from orion.nn.module import Module
 
 
 PYTHON_BACKEND_CONFIG = {
@@ -39,6 +43,38 @@ def _pad_to_fhe(matrix: torch.Tensor, fhe_shape: torch.Size) -> torch.Tensor:
     out = torch.zeros(fhe_shape, dtype=matrix.dtype)
     out[:, : matrix.shape[1], : matrix.shape[2], : matrix.shape[3]] = matrix
     return out
+
+
+def _encode_layer_input(layer: ConvTranspose2d, x: torch.Tensor) -> CipherTensor:
+    level = len(scheme.params.get_logq()) - 1
+    packed = packing.multiplex(x, int(layer.input_gap))
+    target = torch.zeros(tuple(int(v) for v in layer.fhe_input_shape), dtype=torch.float32)
+    target[:, : packed.shape[1], : packed.shape[2], : packed.shape[3]] = packed
+    flat = target.flatten()
+    ids: list[int] = []
+    slots = int(scheme.params.get_slots())
+    for start in range(0, int(flat.numel()), int(slots)):
+        block = flat[int(start) : int(min(int(flat.numel()), int(start + int(slots))))]
+        padded = torch.zeros((int(slots),), dtype=torch.float32)
+        padded[: int(block.numel())] = block
+        ct = scheme.encrypt(scheme.encode(padded, level))
+        ids.append(int(ct.ids[0]))
+        ct.ids = []
+    return CipherTensor(scheme, ids, layer.input_shape, layer.fhe_input_shape)
+
+
+def _decode_layer_output(layer: ConvTranspose2d, out: CipherTensor) -> torch.Tensor:
+    decoded = out.decrypt().decode().detach().cpu()
+    if torch.is_complex(decoded):
+        decoded = decoded.real
+    packed = decoded.to(dtype=torch.float32).reshape(tuple(int(v) for v in layer.fhe_output_shape))
+    return packing._demultiplex(
+        packed,
+        int(layer.output_gap),
+        int(layer.output_shape[1]),
+        int(layer.output_shape[2]),
+        int(layer.output_shape[3]),
+    )
 
 
 @pytest.mark.parametrize(
@@ -161,3 +197,68 @@ def test_python_encoder_preserves_explicit_level_zero() -> None:
         assert encoded.level() == 0
     finally:
         scheme.delete_scheme()
+
+
+def test_conv_transpose2d_dense_path_supports_multi_block_compile_and_eval() -> None:
+    config = _python_backend_config(embedding_method="hybrid")
+    config["ckks_params"]["LogN"] = 10
+
+    active_scheme = orion.init_scheme(config)
+    Module.set_scheme(active_scheme)
+    Module.set_margin(active_scheme.params.get_margin())
+    try:
+        torch.manual_seed(7)
+        layer = ConvTranspose2d(
+            in_channels=16,
+            out_channels=12,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            output_padding=0,
+            groups=1,
+            bias=True,
+        )
+        layer.eval()
+        layer.init_orion_params()
+        layer.name = "dense_tconv_multi_block"
+
+        x = torch.randn(1, 16, 6, 6, dtype=torch.float32)
+        y = layer(x)
+
+        layer.input_shape = x.shape
+        layer.output_shape = y.shape
+        layer.input_gap = 2
+        layer.output_gap = max(1, int(layer.input_gap) // int(layer.stride[0]))
+        layer.fhe_input_shape = torch.Size((1, 4, 12, 12))
+        layer.fhe_output_shape = torch.Size((1, 12, 12, 12))
+        layer.set_level(len(active_scheme.params.get_logq()) - 1)
+
+        layer.generate_diagonals(last=False)
+        layer.compile()
+        layer.he_mode = True
+
+        assert len(layer.transform_ids) == 8
+        assert {int(row) for row, _col in layer.transform_ids.keys()} == {0, 1, 2, 3}
+        assert {int(col) for _row, col in layer.transform_ids.keys()} == {0, 1}
+
+        source = _encode_layer_input(layer, x)
+        assert len(source.ids) == 2
+
+        out = layer(source)
+        assert len(out.ids) == 4
+        decoded = _decode_layer_output(layer, out)
+        reference = F.conv_transpose2d(
+            x,
+            layer.on_weight.detach().to(dtype=torch.float32),
+            layer.on_bias.detach().to(dtype=torch.float32),
+            stride=tuple(int(v) for v in layer.stride),
+            padding=tuple(int(v) for v in layer.padding),
+            output_padding=tuple(int(v) for v in layer.output_padding),
+            groups=int(layer.groups),
+            dilation=tuple(int(v) for v in layer.dilation),
+        )
+
+        assert decoded.shape == reference.shape
+        assert torch.allclose(decoded, reference, atol=1.0e-5, rtol=1.0e-5)
+    finally:
+        active_scheme.delete_scheme()

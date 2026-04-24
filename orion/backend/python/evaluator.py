@@ -50,13 +50,37 @@ class NewEvaluator:
         if in_place:
             return self.backend.MulImaginaryUnit(ctxt, int(sign))
         return self.backend.MulImaginaryUnitNew(ctxt, int(sign))
+
+    def _align_addend_scale(self, ctxt, other, *, plaintext: bool):
+        if not bool(getattr(self.backend, "align_addition_scales", False)):
+            return
+        lhs_log = float(self.backend.GetCiphertextScaleLog2(ctxt))
+        if plaintext:
+            rhs_log = float(self.backend.GetPlaintextScaleLog2(other))
+            set_scale = self.backend.SetPlaintextScale
+        else:
+            rhs_log = float(self.backend.GetCiphertextScaleLog2(other))
+            set_scale = self.backend.SetCiphertextScale
+
+        # Cheddar tracks the exact post-rescale scale. Orion/Lattigo code often
+        # treats tiny prime-induced scale drift as the default CKKS scale, so
+        # align metadata only when the two operands are already effectively
+        # equivalent.
+        if abs(lhs_log - rhs_log) > 1e-2:
+            raise RuntimeError(
+                f"Refusing to align addition scales with log2 gap "
+                f"{abs(lhs_log - rhs_log):.6g}"
+            )
+        set_scale(other, self.backend.GetCiphertextScale(ctxt))
         
     def add_plaintext(self, ctxt, ptxt, in_place):
+        self._align_addend_scale(ctxt, ptxt, plaintext=True)
         if in_place:
             return self.backend.AddPlaintext(ctxt, ptxt) 
         return self.backend.AddPlaintextNew(ctxt, ptxt) 
 
     def sub_plaintext(self, ctxt, ptxt, in_place):
+        self._align_addend_scale(ctxt, ptxt, plaintext=True)
         if in_place:
             return self.backend.SubPlaintext(ctxt, ptxt) 
         return self.backend.SubPlaintextNew(ctxt, ptxt) 
@@ -70,11 +94,13 @@ class NewEvaluator:
         return self.backend.Rescale(ct_out)
 
     def add_ciphertext(self, ctxt0, ctxt1, in_place):
+        self._align_addend_scale(ctxt0, ctxt1, plaintext=False)
         if in_place:
             return self.backend.AddCiphertext(ctxt0, ctxt1)
         return self.backend.AddCiphertextNew(ctxt0, ctxt1)
 
     def sub_ciphertext(self, ctxt0, ctxt1, in_place):
+        self._align_addend_scale(ctxt0, ctxt1, plaintext=False)
         if in_place:
             return self.backend.SubCiphertext(ctxt0, ctxt1)
         return self.backend.SubCiphertextNew(ctxt0, ctxt1)

@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 import json
+import time
 
 import torch
 
@@ -32,18 +33,21 @@ from orion.core.shared_lt import PackingPlanner, RegionNode, RegionPlanner
 from orion.experimental.cir.r34_orion_same_shape import (
     R34InterGroupHybridSameShapeRuntimeExecutor,
     R34IntraGroupPack2SameShapeRuntimeExecutor,
+    R34Pack2SameShapeRuntimeExecutor,
     R34SameShapeStageSpec,
+    _maybe_set_default_scale,
     r34_same_shape_policy,
     r34_same_shape_policy_from_source_group_count,
     r34_source_group_count,
     r34_same_shape_spec_for_family_label,
 )
+from orion.experimental.cir.r34_inter_group_python import R34PythonTransitionFlowRuntimeExecutor
 from orion.experimental.cir.region_first_data import STAGE_MATERIALIZER_REFERENCES
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 
-ProviderKind = Literal["scripts_cir_same_shape", "tile_local_transition_bridge"]
+ProviderKind = Literal["scripts_cir_same_shape", "tile_local_transition_bridge", "python_single_flow"]
 Phase1Status = Literal["bound", "implemented"]
 
 
@@ -126,6 +130,123 @@ class KernelBinding:
 
 
 _R34_IMPORTED_LAYOUT_CONTRACTS: tuple[ImportedLayoutContract, ...] = (
+    ImportedLayoutContract(
+        haloed_node="stem_conv1_torch",
+        orion_node="conv1",
+        family_id="stem_conv7x7_s2_gap1_to2",
+        family_kind="stem_conv_family",
+        family_label="stem_conv",
+        input_shape=(3, 224, 224),
+        output_shape=(64, 112, 112),
+        weight_shape=(64, 3, 7, 7),
+        stride=(2, 2),
+        padding=(3, 3),
+        dilation=(1, 1),
+        groups=1,
+        input_layout={"alpha": 224, "beta": 0, "c": 3, "h": 224, "stride": 1, "w": 224},
+        output_layout={"alpha": 112, "beta": 0, "c": 64, "h": 112, "stride": 2, "w": 112},
+        num_tiles=16,
+        exec_mode="halo",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "halo",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 224, "beta": 0, "stride": 1},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "halo",
+            "chosen_output_layout": {"alpha": 112, "beta": 0, "stride": 2},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 1,
+            "planned_output_stride": 2,
+            "planner_cost_model": "phase1_stem_fixture",
+            "planner_selected_backend": "phase1_stem_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 1,
+            "runtime_output_stride": 2,
+            "structural_oracle_used": False,
+        },
+        planner_source="orion.experimental.r34_stem_pool_phase1",
+    ),
+    ImportedLayoutContract(
+        haloed_node="stem_pool_torch",
+        orion_node="pool",
+        family_id="stem_pool3x3_s2_gap2_to4",
+        family_kind="stem_pool_family",
+        family_label="stem_pool",
+        input_shape=(64, 112, 112),
+        output_shape=(64, 56, 56),
+        weight_shape=(64, 1, 3, 3),
+        stride=(2, 2),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=64,
+        input_layout={"alpha": 112, "beta": 0, "c": 64, "h": 112, "stride": 2, "w": 112},
+        output_layout={"alpha": 56, "beta": 0, "c": 64, "h": 56, "stride": 4, "w": 56},
+        num_tiles=8,
+        exec_mode="halo",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "halo",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 112, "beta": 0, "stride": 2},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "halo",
+            "chosen_output_layout": {"alpha": 56, "beta": 0, "stride": 4},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 2,
+            "planned_output_stride": 4,
+            "planner_cost_model": "phase1_stem_fixture",
+            "planner_selected_backend": "phase1_stem_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 2,
+            "runtime_output_stride": 4,
+            "structural_oracle_used": False,
+        },
+        planner_source="orion.experimental.r34_stem_pool_phase1",
+    ),
+    ImportedLayoutContract(
+        haloed_node="global_avgpool_exit_torch",
+        orion_node="avgpool",
+        family_id="global_avgpool_exit_gap32_to_dense",
+        family_kind="global_pool_exit_family",
+        family_label="global_avgpool_exit",
+        input_shape=(512, 7, 7),
+        output_shape=(512, 1, 1),
+        weight_shape=(512, 1, 7, 7),
+        stride=(7, 7),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=512,
+        input_layout={"alpha": 2, "beta": 1, "c": 512, "h": 7, "stride": 32, "w": 7},
+        output_layout={"alpha": 1, "beta": 0, "c": 512, "h": 1, "stride": 224, "w": 1},
+        num_tiles=1,
+        exec_mode="layout_exit",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "layout_exit",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 2, "beta": 1, "stride": 32},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "layout_exit",
+            "chosen_output_layout": {"alpha": 1, "beta": 0, "stride": 224},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 32,
+            "planned_output_stride": 224,
+            "planner_cost_model": "phase1_stem_fixture",
+            "planner_selected_backend": "phase1_stem_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 32,
+            "runtime_output_stride": 224,
+            "structural_oracle_used": False,
+        },
+        planner_source="orion.experimental.r34_stem_pool_phase1",
+    ),
     ImportedLayoutContract(
         haloed_node="layer1_0_conv1_torch",
         orion_node="layers_0_0_conv1",
@@ -280,6 +401,82 @@ _R34_IMPORTED_LAYOUT_CONTRACTS: tuple[ImportedLayoutContract, ...] = (
         planner_source="haloed.scripts.cir.source_pack2_pairing_search",
     ),
     ImportedLayoutContract(
+        haloed_node="layer2_0_conv1_torch",
+        orion_node="layers_1_0_conv1",
+        family_id="resnet34_layer2_0_conv1_torch",
+        family_kind="transition_family_baseline",
+        family_label="stage2_transition",
+        input_shape=(64, 56, 56),
+        output_shape=(128, 28, 28),
+        weight_shape=(128, 64, 3, 3),
+        stride=(2, 2),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_layout={"alpha": 36, "beta": 0, "c": 64, "h": 56, "stride": 4, "w": 56},
+        output_layout={"alpha": 15, "beta": 0, "c": 128, "h": 28, "stride": 8, "w": 28},
+        num_tiles=4,
+        exec_mode="halo",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "halo",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 36, "beta": 0, "stride": 4},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "halo",
+            "chosen_output_layout": {"alpha": 15, "beta": 0, "stride": 8},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 4,
+            "planned_output_stride": 8,
+            "planner_cost_model": "phase1_transition_fixture",
+            "planner_selected_backend": "phase1_transition_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 4,
+            "runtime_output_stride": 8,
+            "structural_oracle_used": False,
+        },
+    ),
+    ImportedLayoutContract(
+        haloed_node="layer2_0_downsample_conv_torch",
+        orion_node="layers_1_0_shortcut_0",
+        family_id="resnet34_layer2_0_downsample_conv_torch",
+        family_kind="transition_family_baseline",
+        family_label="stage2_transition",
+        input_shape=(64, 56, 56),
+        output_shape=(128, 28, 28),
+        weight_shape=(128, 64, 1, 1),
+        stride=(2, 2),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        input_layout={"alpha": 36, "beta": 0, "c": 64, "h": 56, "stride": 4, "w": 56},
+        output_layout={"alpha": 15, "beta": 0, "c": 128, "h": 28, "stride": 8, "w": 28},
+        num_tiles=4,
+        exec_mode="halo",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "halo",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 36, "beta": 0, "stride": 4},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "halo",
+            "chosen_output_layout": {"alpha": 15, "beta": 0, "stride": 8},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 4,
+            "planned_output_stride": 8,
+            "planner_cost_model": "phase1_transition_fixture",
+            "planner_selected_backend": "phase1_transition_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 4,
+            "runtime_output_stride": 8,
+            "structural_oracle_used": False,
+        },
+    ),
+    ImportedLayoutContract(
         haloed_node="layer3_0_conv1_torch",
         orion_node="layers_2_0_conv1",
         family_id="resnet34_layer3_0_conv1_torch",
@@ -314,6 +511,82 @@ _R34_IMPORTED_LAYOUT_CONTRACTS: tuple[ImportedLayoutContract, ...] = (
             "regret_ratio": 1.129626620332754,
             "runtime_input_stride": 8,
             "runtime_output_stride": 16,
+            "structural_oracle_used": False,
+        },
+    ),
+    ImportedLayoutContract(
+        haloed_node="layer4_0_conv1_torch",
+        orion_node="layers_3_0_conv1",
+        family_id="resnet34_layer4_0_conv1_torch",
+        family_kind="transition_family_baseline",
+        family_label="stage4_transition",
+        input_shape=(256, 14, 14),
+        output_shape=(512, 7, 7),
+        weight_shape=(512, 256, 3, 3),
+        stride=(2, 2),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_layout={"alpha": 7, "beta": 0, "c": 256, "h": 14, "stride": 16, "w": 14},
+        output_layout={"alpha": 2, "beta": 1, "c": 512, "h": 7, "stride": 32, "w": 7},
+        num_tiles=2,
+        exec_mode="halo",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "halo",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 7, "beta": 0, "stride": 16},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "halo",
+            "chosen_output_layout": {"alpha": 2, "beta": 1, "stride": 32},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 16,
+            "planned_output_stride": 32,
+            "planner_cost_model": "phase1_transition_fixture",
+            "planner_selected_backend": "phase1_transition_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 16,
+            "runtime_output_stride": 32,
+            "structural_oracle_used": False,
+        },
+    ),
+    ImportedLayoutContract(
+        haloed_node="layer4_0_downsample_conv_torch",
+        orion_node="layers_3_0_shortcut_0",
+        family_id="resnet34_layer4_0_downsample_conv_torch",
+        family_kind="transition_family_baseline",
+        family_label="stage4_transition",
+        input_shape=(256, 14, 14),
+        output_shape=(512, 7, 7),
+        weight_shape=(512, 256, 1, 1),
+        stride=(2, 2),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        input_layout={"alpha": 7, "beta": 0, "c": 256, "h": 14, "stride": 16, "w": 14},
+        output_layout={"alpha": 2, "beta": 1, "c": 512, "h": 7, "stride": 32, "w": 7},
+        num_tiles=2,
+        exec_mode="halo",
+        planner_diagnostics={
+            "best_explored_layout_cost": 0.0,
+            "best_explored_mode": "halo",
+            "candidate_count": 1,
+            "chosen_input_layout": {"alpha": 7, "beta": 0, "stride": 16},
+            "chosen_layout_cost": 0.0,
+            "chosen_mode": "halo",
+            "chosen_output_layout": {"alpha": 2, "beta": 1, "stride": 32},
+            "conv_rotation_cost": 0,
+            "exact_oracle_used": False,
+            "manual_exchange_rotations": 0,
+            "planned_input_stride": 16,
+            "planned_output_stride": 32,
+            "planner_cost_model": "phase1_transition_fixture",
+            "planner_selected_backend": "phase1_transition_fixture",
+            "regret_ratio": 1.0,
+            "runtime_input_stride": 16,
+            "runtime_output_stride": 32,
             "structural_oracle_used": False,
         },
     ),
@@ -360,20 +633,44 @@ _R34_IMPORTED_LAYOUT_CONTRACTS: tuple[ImportedLayoutContract, ...] = (
 
 _PHASE1_KERNEL_BINDINGS: tuple[KernelBinding, ...] = (
     KernelBinding(
+        family_label="stem_conv",
+        provider_key="r34_stem_conv_inter_group_hybrid_policy",
+        provider_kind="python_single_flow",
+        materializer="policy_inter_group_hybrid",
+        phase1_status="implemented",
+        note="Stem conv7x7 currently uses the Python single-flow runtime under the same source-group policy; non-Python backends still fall back.",
+    ),
+    KernelBinding(
+        family_label="stem_pool",
+        provider_key="r34_stem_pool_inter_group_hybrid_policy",
+        provider_kind="python_single_flow",
+        materializer="policy_inter_group_hybrid_pool",
+        phase1_status="implemented",
+        note="Stem pool3x3 currently uses the Python single-flow runtime under the same source-group policy; non-Python backends still fall back.",
+    ),
+    KernelBinding(
+        family_label="global_avgpool_exit",
+        provider_key="r34_global_avgpool_exit_policy",
+        provider_kind="python_single_flow",
+        materializer="policy_global_avgpool_exit",
+        phase1_status="implemented",
+        note="Global avgpool exit currently uses a Python single-flow runtime that returns to Orion's existing avgpool output layout; non-Python backends still fall back.",
+    ),
+    KernelBinding(
         family_label="stage1_same",
         provider_key="r34_stage1_same_inter_group_hybrid_policy",
         provider_kind="scripts_cir_same_shape",
         materializer="policy_inter_group_hybrid",
-        phase1_status="bound",
-        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid, but the executable Orion-side materializer is currently gated off until parity is restored.",
+        phase1_status="implemented",
+        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid. Current Orion runtime implementation is enabled on the Python backend and still falls back on non-Python backends.",
     ),
     KernelBinding(
         family_label="stage2_same",
         provider_key="r34_stage2_same_inter_group_hybrid_policy",
         provider_kind="scripts_cir_same_shape",
         materializer="policy_inter_group_hybrid",
-        phase1_status="bound",
-        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid, but the executable Orion-side materializer is currently gated off until parity is restored.",
+        phase1_status="implemented",
+        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid. Current Orion runtime implementation is enabled on the Python backend and still falls back on non-Python backends.",
     ),
     KernelBinding(
         family_label="stage3_same",
@@ -392,12 +689,28 @@ _PHASE1_KERNEL_BINDINGS: tuple[KernelBinding, ...] = (
         note="Selected by policy: source_group_count == 1 uses intra_group_pack2.",
     ),
     KernelBinding(
+        family_label="stage2_transition",
+        provider_key="r34_stage2_transition_inter_group_hybrid_policy",
+        provider_kind="tile_local_transition_bridge",
+        materializer="policy_inter_group_hybrid_transition",
+        phase1_status="implemented",
+        note="Selected by policy: source_group_count > 1 uses inter_group_hybrid on transition branches. Current Orion runtime implementation is enabled on the Python backend and still falls back on non-Python backends.",
+    ),
+    KernelBinding(
         family_label="stage3_transition",
         provider_key="r34_stage3_transition_inter_group_hybrid_policy",
         provider_kind="tile_local_transition_bridge",
         materializer="policy_inter_group_hybrid_transition",
         phase1_status="implemented",
         note="Selected by policy: source_group_count > 1 uses inter_group_hybrid on transition branches.",
+    ),
+    KernelBinding(
+        family_label="stage4_transition",
+        provider_key="r34_stage4_transition_intra_group_pack2_policy",
+        provider_kind="tile_local_transition_bridge",
+        materializer="policy_intra_group_pack2_transition",
+        phase1_status="implemented",
+        note="Selected by policy: source_group_count == 1 uses intra_group_pack2 on transition branches. Current Orion runtime implementation is enabled on the Python backend and still falls back on non-Python backends.",
     ),
 )
 
@@ -429,7 +742,7 @@ def imported_layout_contract_by_orion_node(node_name: str) -> ImportedLayoutCont
 
 def imported_layout_contract_by_family_label(family_label: str) -> ImportedLayoutContract:
     for contract in _R34_IMPORTED_LAYOUT_CONTRACTS:
-        if str(contract.family_label) == str(family_label) and str(contract.family_label).endswith("_same"):
+        if str(contract.family_label) == str(family_label):
             return contract
     raise KeyError(f"unknown R34 phase1 family label {family_label!r}")
 
@@ -674,6 +987,9 @@ def _common_module_prefix(*node_names: str) -> str:
 
 def _r34_expected_stats_by_family_label() -> dict[str, dict[str, int]]:
     refs = {
+        "stem_conv": {},
+        "stem_pool": {},
+        "global_avgpool_exit": {},
         "stage1_same": next(
             dict(ref.expected_stats)
             for ref in STAGE_MATERIALIZER_REFERENCES
@@ -696,9 +1012,12 @@ def _r34_expected_stats_by_family_label() -> dict[str, dict[str, int]]:
         ),
     }
     transition_stats = dict(_selected_r34_results()["transition_region"]["candidate"])
-    refs["stage3_transition"] = {
+    shared_transition = {
         key: int(transition_stats[key]) for key in ("rotations", "conjugations", "ct_pt_mults", "adds")
     }
+    refs["stage2_transition"] = dict(shared_transition)
+    refs["stage3_transition"] = dict(shared_transition)
+    refs["stage4_transition"] = dict(shared_transition)
     return refs
 
 
@@ -719,6 +1038,25 @@ def _r34_group_for_same_shape_node(*, node_name: str, family_label: str) -> Regi
         expected_stats=dict(expected_stats),
         executable=False,
         fallback_reason="phase1_same_shape_provider_not_implemented",
+    )
+
+
+def _r34_group_for_direct_node(*, node_name: str, family_label: str) -> RegionFirstRuntimeGroup:
+    binding = kernel_binding_for_family(str(family_label))
+    expected_stats = _r34_expected_stats_by_family_label().get(str(family_label), {})
+    return RegionFirstRuntimeGroup(
+        region_id=f"r34_imgnet_{str(family_label)}_{str(node_name)}",
+        network="R34",
+        stage=str(family_label),
+        module_prefix=str(node_name).replace("_", "."),
+        conv_nodes=(str(node_name),),
+        strategy=str(binding.provider_key),
+        materializer=str(binding.materializer),
+        depth=1,
+        boundary_actions=(),
+        expected_stats=dict(expected_stats),
+        executable=False,
+        fallback_reason="phase1_direct_executor_not_implemented",
     )
 
 
@@ -773,6 +1111,14 @@ def _r34_same_shape_family_label_for_module(node_name: str, module: Any) -> str 
     if tuple(int(v) for v in tuple(weight.shape)) == (512, 512, 3, 3) and input_shape == (512, 7, 7) and int(gap) == 32:
         return "stage4_same"
     return None
+
+
+def _r34_direct_family_label_for_node(node_name: str) -> str | None:
+    return {
+        "conv1": "stem_conv",
+        "pool": "stem_pool",
+        "avgpool": "global_avgpool_exit",
+    }.get(str(node_name))
 
 
 def _r34_source_group_count_from_module(module: Any) -> int | None:
@@ -952,8 +1298,8 @@ class R34TransitionHybridRuntimeExecutor:
             shortcut_imag = (row_ct - conj).mul_imaginary_unit(-1, in_place=False) * 0.5
             conv_real = self._add_bias(conv_real, bias_vector=self.conv_bias_vector, row_index=int(row_index))
             shortcut_imag = self._add_bias(shortcut_imag, bias_vector=self.shortcut_bias_vector, row_index=int(row_index))
-            conv_real.set_scale(int(scheme.params.get_default_scale()))
-            shortcut_imag.set_scale(int(scheme.params.get_default_scale()))
+            _maybe_set_default_scale(conv_real)
+            _maybe_set_default_scale(shortcut_imag)
             conv_ids.append(int(conv_real.ids[0]))
             shortcut_ids.append(int(shortcut_imag.ids[0]))
             conv_real.ids = []
@@ -974,6 +1320,115 @@ class R34TransitionHybridRuntimeExecutor:
                 self.fhe_output_shape,
             ),
         }
+
+
+class _DenseTransformProxy:
+    def __init__(
+        self,
+        *,
+        name: str,
+        diagonals: dict[tuple[int, int], dict[int, Any]],
+        level: int,
+        bsgs_ratio: float,
+        output_shape: Any,
+        fhe_output_shape: Any,
+    ) -> None:
+        self.name = str(name)
+        self.diagonals = dict(diagonals)
+        self.level = int(level)
+        self.bsgs_ratio = float(bsgs_ratio)
+        self.output_shape = output_shape
+        self.fhe_output_shape = fhe_output_shape
+        self.transform_ids: dict[tuple[int, int], int] = {}
+
+
+class R34DenseSingleFlowRuntimeExecutor:
+    def __init__(self, *, module: Any, family_label: str, output_node_id: str) -> None:
+        self.module = module
+        self.family_label = str(family_label)
+        self.output_node_id = str(output_node_id)
+        self.output_shape = getattr(module, "output_shape", None)
+        self.fhe_output_shape = getattr(module, "fhe_output_shape", None)
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
+        self.transform_ids: dict[tuple[int, int], int] = {}
+        self.output_rotations = 0
+        self.on_bias_ptxt: Any | None = None
+        self.cols = 0
+        self.rows = 0
+        self.compile_count = 0
+        self.last_runtime_timing: dict[str, float] = {
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self._proxy: _DenseTransformProxy | None = None
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        return scheme is not None
+
+    def _level(self, scheme: Any) -> int:
+        return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+
+    def _bias_level(self, scheme: Any) -> int:
+        depth = 0 if self.assigned_depth is None else int(self.assigned_depth)
+        return max(0, int(self._level(scheme)) - int(depth))
+
+    def compile(self, scheme: Any) -> None:
+        if self._proxy is not None:
+            return
+        prepare_started = time.time()
+        diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
+        level = self._level(scheme)
+        self.output_rotations = int(output_rotations)
+        self._proxy = _DenseTransformProxy(
+            name=f"{self.output_node_id}_dense_runtime",
+            diagonals=diagonals,
+            level=int(level),
+            bsgs_ratio=float(getattr(self.module, "bsgs_ratio", 2.0)),
+            output_shape=self.output_shape,
+            fhe_output_shape=self.fhe_output_shape,
+        )
+        bias = packing.construct_conv2d_bias(self.module)
+        self.on_bias_ptxt = scheme.encoder.encode(bias, self._bias_level(scheme))
+        self.last_runtime_timing = {
+            "prepare_transforms_s": float(time.time() - prepare_started),
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        compile_started = time.time()
+        self.transform_ids = scheme.lt_evaluator.generate_transforms(self._proxy)
+        self._proxy.transform_ids = dict(self.transform_ids)
+        keys = list(self.transform_ids.keys())
+        self.cols = 0 if not keys else max(int(col) for _row, col in keys) + 1
+        self.rows = 0 if not keys else max(int(row) for row, _col in keys) + 1
+        self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        scheme = source_ct.scheme
+        self.last_runtime_timing = {
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.compile(scheme)
+        if self._proxy is None or self.on_bias_ptxt is None:
+            raise RuntimeError(f"{self.output_node_id} dense single-flow runtime failed to compile")
+        evaluate_started = time.time()
+        out = scheme.lt_evaluator.evaluate_transforms(self._proxy, source_ct)
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+
+        postprocess_started = time.time()
+        slots = int(scheme.params.get_slots())
+        for rotation_index in range(1, int(self.output_rotations) + 1):
+            out += out.roll(int(slots // (2**int(rotation_index))))
+        out += self.on_bias_ptxt
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        return {self.output_node_id: out}
 
 
 def _r34_same_shape_module_compatible(module: Any, spec: R34SameShapeStageSpec) -> bool:
@@ -1007,18 +1462,9 @@ def _r34_same_shape_runtime_from_modules(
     if policy != str(spec.policy):
         return group
     if str(policy) == "inter_group_hybrid":
-        return _replace_r34_group(
-            group,
-            executable=False,
-            fallback_reason="inter_group_hybrid_materializer_not_parity_safe_yet",
-            executor=None,
-        )
-    executor_cls = (
-        R34InterGroupHybridSameShapeRuntimeExecutor
-        if str(policy) == "inter_group_hybrid"
-        else R34IntraGroupPack2SameShapeRuntimeExecutor
-    )
-    executor = executor_cls(module=module, spec=spec, output_node_id=str(group.conv_nodes[0]))
+        executor = R34InterGroupHybridSameShapeRuntimeExecutor(module=module, spec=spec, output_node_id=str(group.conv_nodes[0]))
+    else:
+        executor = R34Pack2SameShapeRuntimeExecutor(module=module, spec=spec, output_node_id=str(group.conv_nodes[0]))
     return _replace_r34_group(
         group,
         executable=True,
@@ -1028,31 +1474,47 @@ def _r34_same_shape_runtime_from_modules(
     )
 
 
-def _r34_transition_modules_compatible(modules: tuple[Any, ...]) -> bool:
+def _r34_transition_modules_compatible(modules: tuple[Any, ...], *, contracts: tuple[ImportedLayoutContract, ImportedLayoutContract]) -> bool:
     if len(modules) != 2:
         return False
     conv, shortcut = modules
+    conv_contract, shortcut_contract = contracts
     conv_weight = getattr(conv, "on_weight", None)
     shortcut_weight = getattr(shortcut, "on_weight", None)
     return (
         conv_weight is not None
         and shortcut_weight is not None
-        and tuple(int(v) for v in conv_weight.shape) == (256, 128, 3, 3)
-        and tuple(int(v) for v in shortcut_weight.shape) == (256, 128, 1, 1)
-        and tuple(getattr(conv, "stride", ())) == (2, 2)
-        and tuple(getattr(shortcut, "stride", ())) == (2, 2)
+        and tuple(int(v) for v in conv_weight.shape) == tuple(int(v) for v in conv_contract.weight_shape)
+        and tuple(int(v) for v in shortcut_weight.shape) == tuple(int(v) for v in shortcut_contract.weight_shape)
+        and tuple(int(v) for v in getattr(conv, "stride", ())) == tuple(int(v) for v in conv_contract.stride)
+        and tuple(int(v) for v in getattr(shortcut, "stride", ())) == tuple(int(v) for v in shortcut_contract.stride)
     )
 
 
-def _r34_transition_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...]) -> RegionFirstRuntimeGroup:
-    if not _r34_transition_modules_compatible(modules):
+def _r34_transition_runtime_from_modules(
+    group: RegionFirstRuntimeGroup,
+    modules: tuple[Any, ...],
+    *,
+    contracts: tuple[ImportedLayoutContract, ImportedLayoutContract],
+) -> RegionFirstRuntimeGroup:
+    if not _r34_transition_modules_compatible(modules, contracts=contracts):
         return group
     conv, shortcut = modules
-    executor = R34TransitionHybridRuntimeExecutor(
-        conv_module=conv,
-        shortcut_module=shortcut,
-        output_node_ids=group.conv_nodes,
-    )
+    policy = str(_r34_kernel_policy_from_module(conv) or "")
+    if str(group.stage) in {"stage2_transition", "stage3_transition", "stage4_transition"}:
+        executor = R34TransitionHybridRuntimeExecutor(
+            conv_module=conv,
+            shortcut_module=shortcut,
+            output_node_ids=group.conv_nodes,
+        )
+    else:
+        executor = R34PythonTransitionFlowRuntimeExecutor(
+            conv_module=conv,
+            shortcut_module=shortcut,
+            family_label=str(group.stage),
+            kernel_policy=str(policy),
+            output_node_ids=group.conv_nodes,
+        )
     return _replace_r34_group(
         group,
         executable=True,
@@ -1062,16 +1524,57 @@ def _r34_transition_runtime_from_modules(group: RegionFirstRuntimeGroup, modules
     )
 
 
-def _r34_transition_group() -> RegionFirstRuntimeGroup:
-    conv = imported_layout_contract_by_haloed_node("layer3_0_conv1_torch")
-    downsample = imported_layout_contract_by_haloed_node("layer3_0_downsample_conv_torch")
-    binding = kernel_binding_for_family("stage3_transition")
-    expected_stats = _r34_expected_stats_by_family_label()["stage3_transition"]
+def _r34_direct_module_compatible(module: Any, contract: ImportedLayoutContract) -> bool:
+    weight = getattr(module, "on_weight", None)
+    return (
+        weight is not None
+        and tuple(int(v) for v in weight.shape) == tuple(int(v) for v in contract.weight_shape)
+        and tuple(int(v) for v in getattr(module, "stride", ())) == tuple(int(v) for v in contract.stride)
+        and tuple(int(v) for v in getattr(module, "padding", ())) == tuple(int(v) for v in contract.padding)
+        and tuple(int(v) for v in getattr(module, "dilation", ())) == tuple(int(v) for v in contract.dilation)
+        and int(getattr(module, "groups", -1)) == int(contract.groups)
+        and tuple(int(v) for v in getattr(module, "input_shape", torch.Size())[1:]) == tuple(int(v) for v in contract.input_shape)
+        and tuple(int(v) for v in getattr(module, "output_shape", torch.Size())[1:]) == tuple(int(v) for v in contract.output_shape)
+        and int(getattr(module, "input_gap", -1)) == int(contract.input_gap)
+        and int(getattr(module, "output_gap", -1)) == int(contract.output_gap)
+    )
+
+
+def _r34_direct_runtime_from_modules(
+    group: RegionFirstRuntimeGroup,
+    modules: tuple[Any, ...],
+    *,
+    contract: ImportedLayoutContract,
+) -> RegionFirstRuntimeGroup:
+    if len(modules) != 1:
+        return group
+    module = modules[0]
+    if not _r34_direct_module_compatible(module, contract):
+        return group
+    executor = R34DenseSingleFlowRuntimeExecutor(
+        module=module,
+        family_label=str(group.stage),
+        output_node_id=str(group.conv_nodes[0]),
+    )
+    return _replace_r34_group(
+        group,
+        executable=True,
+        fallback_reason="",
+        fused_weight_count=1,
+        executor=executor,
+    )
+
+
+def _r34_transition_group(*, family_label: str, conv_haloed_node: str, shortcut_haloed_node: str) -> RegionFirstRuntimeGroup:
+    conv = imported_layout_contract_by_haloed_node(str(conv_haloed_node))
+    downsample = imported_layout_contract_by_haloed_node(str(shortcut_haloed_node))
+    binding = kernel_binding_for_family(str(family_label))
+    expected_stats = _r34_expected_stats_by_family_label()[str(family_label)]
     conv_nodes = (str(conv.orion_node), str(downsample.orion_node))
     return RegionFirstRuntimeGroup(
-        region_id="r34_imgnet_stage3_transition_pair",
+        region_id=f"r34_imgnet_{str(family_label)}_pair",
         network="R34",
-        stage="stage3_transition",
+        stage=str(family_label),
         module_prefix=_common_module_prefix(*conv_nodes),
         conv_nodes=conv_nodes,
         strategy=str(binding.provider_key),
@@ -1100,17 +1603,32 @@ class R34CompileRegistry:
             module = dag.nodes[str(node)].get("module")
             if module is None:
                 continue
+            direct_family = _r34_direct_family_label_for_node(str(node))
+            if direct_family is not None:
+                groups.append(_r34_group_for_direct_node(node_name=str(node), family_label=str(direct_family)))
+                continue
             family_label = _r34_same_shape_family_label_for_module(str(node), module)
             if family_label is None:
                 continue
             groups.append(_r34_group_for_same_shape_node(node_name=str(node), family_label=str(family_label)))
 
-        transition_nodes = {
-            "layers_2_0_conv1",
-            "layers_2_0_shortcut_0",
-        }
-        if transition_nodes.issubset(existing_nodes):
-            groups.append(_r34_transition_group())
+        transition_specs = (
+            ("stage2_transition", "layer2_0_conv1_torch", "layer2_0_downsample_conv_torch"),
+            ("stage3_transition", "layer3_0_conv1_torch", "layer3_0_downsample_conv_torch"),
+            ("stage4_transition", "layer4_0_conv1_torch", "layer4_0_downsample_conv_torch"),
+        )
+        for family_label, conv_node, shortcut_node in transition_specs:
+            conv_contract = imported_layout_contract_by_haloed_node(str(conv_node))
+            shortcut_contract = imported_layout_contract_by_haloed_node(str(shortcut_node))
+            transition_nodes = {str(conv_contract.orion_node), str(shortcut_contract.orion_node)}
+            if transition_nodes.issubset(existing_nodes):
+                groups.append(
+                    _r34_transition_group(
+                        family_label=str(family_label),
+                        conv_haloed_node=str(conv_node),
+                        shortcut_haloed_node=str(shortcut_node),
+                    )
+                )
 
         graph_audit = {
             "node_count": int(len(dag.nodes)),
@@ -1130,8 +1648,12 @@ class R34CompileRegistry:
         resolved_groups: list[RegionFirstRuntimeGroup] = []
         for group in self.groups:
             modules = tuple(dag.nodes[node].get("module") for node in group.conv_nodes if node in dag.nodes)
-            if str(group.stage) == "stage3_transition":
-                group = _r34_transition_runtime_from_modules(group, modules)
+            if str(group.stage).endswith("_transition"):
+                contracts = tuple(imported_layout_contract_by_orion_node(str(node)) for node in group.conv_nodes)
+                group = _r34_transition_runtime_from_modules(group, modules, contracts=contracts)
+            elif str(group.stage) in {"stem_conv", "stem_pool", "global_avgpool_exit"}:
+                contract = imported_layout_contract_by_orion_node(str(group.conv_nodes[0]))
+                group = _r34_direct_runtime_from_modules(group, modules, contract=contract)
             elif str(group.stage).endswith("_same") and len(group.conv_nodes) == 1:
                 group = _r34_same_shape_runtime_from_modules(group, modules, family_label=str(group.stage))
             resolved_groups.append(group)

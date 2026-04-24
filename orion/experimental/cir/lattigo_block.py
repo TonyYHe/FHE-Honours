@@ -109,8 +109,16 @@ def _coalesce_complex_rows(keys: torch.Tensor, values: torch.Tensor) -> tuple[to
     return unique.to(dtype=torch.int64), out_values
 
 
-def _pack_chw(tensor: torch.Tensor, *, channels: int = 8, h: int = 64, w: int = 64, gap: int = 1) -> torch.Tensor:
-    out = torch.zeros((RING_SLOT_COUNT,), dtype=torch.float32)
+def _pack_chw(
+    tensor: torch.Tensor,
+    *,
+    channels: int = 8,
+    h: int = 64,
+    w: int = 64,
+    gap: int = 1,
+    slots: int = RING_SLOT_COUNT,
+) -> torch.Tensor:
+    out = torch.zeros((int(slots),), dtype=torch.float32)
     for c in range(int(channels)):
         for ih in range(int(h)):
             for iw in range(int(w)):
@@ -118,10 +126,10 @@ def _pack_chw(tensor: torch.Tensor, *, channels: int = 8, h: int = 64, w: int = 
     return out
 
 
-def _phase_mask(*, phases: tuple[int, ...], shape: tuple[int, int, int], gap: int) -> torch.Tensor:
+def _phase_mask(*, phases: tuple[int, ...], shape: tuple[int, int, int], gap: int, slots: int = RING_SLOT_COUNT) -> torch.Tensor:
     c, h, w = (int(v) for v in shape)
     wanted = {int(phase) for phase in phases}
-    out = torch.zeros((RING_SLOT_COUNT,), dtype=torch.float32)
+    out = torch.zeros((int(slots),), dtype=torch.float32)
     for channel in range(int(c)):
         if int(channel) % int(gap * gap) not in wanted:
             continue
@@ -497,6 +505,7 @@ class TconvK2S2Spec:
     c_out: int
     in_gap: int   # input packing gap (e.g. 4 for stage3 output feeding tconv)
     out_gap: int  # output packing gap = in_gap // 2
+    ring_slot_count: int = RING_SLOT_COUNT
 
     @property
     def h_out(self) -> int:
@@ -554,12 +563,23 @@ def _tconv_k2s2_phase_mask(phase: int, spec: TconvK2S2Spec) -> torch.Tensor:
         phases=(int(phase),),
         shape=(int(spec.c_in), int(spec.h_in), int(spec.w_in)),
         gap=int(spec.in_gap),
+        slots=int(spec.ring_slot_count),
     )
 
 
 def _tconv_k2s2_factorized_candidate_stats(spec: TconvK2S2Spec, *, bank_channels: int) -> dict[str, int | float]:
     bank_width = max(1, int(bank_channels))
     bank_count = int(math.ceil(int(spec.c_out) / int(bank_width)))
+    active_slots = int(bank_width * int(spec.h_out) * int(spec.w_out))
+    if int(active_slots) > int(spec.ring_slot_count):
+        return {
+            "bank_channels": int(bank_width),
+            "bank_count": int(bank_count),
+            "rotation_count": int(10**9),
+            "term_count": int(10**9),
+            "transform_count": int(10**9),
+            "score": float("inf"),
+        }
     source_group_count = int(_tconv_k2s2_dense_source_group_count(spec))
     expansion_shifts = {
         int(shift)
@@ -578,8 +598,8 @@ def _tconv_k2s2_factorized_candidate_stats(spec: TconvK2S2Spec, *, bank_channels
         for src_group in range(int(source_group_count)):
             for oc_local in range(int(local_width)):
                 shift = (int(oc_local) - int(src_group)) * int(spec.h_out) * int(spec.w_out)
-                bank_shifts.add(int(shift) % int(RING_SLOT_COUNT))
-                mix_shifts.add(int(shift) % int(RING_SLOT_COUNT))
+                bank_shifts.add(int(shift) % int(spec.ring_slot_count))
+                mix_shifts.add(int(shift) % int(spec.ring_slot_count))
         total_terms += int(len(bank_shifts)) * int(spec.in_gap * spec.in_gap) * int(spec.pair_count)
 
     rotation_count = int(len(expansion_shifts.union(mix_shifts)))
@@ -594,12 +614,28 @@ def _tconv_k2s2_factorized_candidate_stats(spec: TconvK2S2Spec, *, bank_channels
     }
 
 
-def _choose_tconv_k2s2_factorized_bank_channels(spec: TconvK2S2Spec) -> dict[str, int | float]:
+def _choose_tconv_k2s2_factorized_bank_channels(
+    spec: TconvK2S2Spec,
+    *,
+    bank_channels_override: int | None = None,
+) -> dict[str, int | float]:
+    if bank_channels_override is not None:
+        candidate = int(bank_channels_override)
+        if candidate <= 0 or int(spec.c_out) % int(candidate) != 0:
+            raise ValueError("bank_channels_override must be a positive divisor of spec.c_out")
+        stats = _tconv_k2s2_factorized_candidate_stats(spec, bank_channels=int(candidate))
+        if not math.isfinite(float(stats["score"])):
+            raise ValueError("bank_channels_override exceeds the available ring slots")
+        return dict(stats)
+
     candidates = [value for value in range(1, int(spec.c_out) + 1) if int(spec.c_out) % int(value) == 0]
-    viable = [
-        _tconv_k2s2_factorized_candidate_stats(spec, bank_channels=int(value))
-        for value in candidates
-    ]
+    viable = []
+    for value in candidates:
+        stats = _tconv_k2s2_factorized_candidate_stats(spec, bank_channels=int(value))
+        if math.isfinite(float(stats["score"])):
+            viable.append(stats)
+    if not viable:
+        raise ValueError("no viable tconv k2s2 bank width fits the available ring slots")
     capped = [item for item in viable if int(item["transform_count"]) <= 32]
     pool = capped or viable
     best = min(
@@ -658,7 +694,7 @@ def _build_tconv_factorized_mix_terms(
                     if w_val == 0.0:
                         continue
                     out_slot = _tconv_k2s2_local_dense_out_slot(int(oc - oc_start), oh, ow, spec)
-                    shift = (int(out_slot) - int(src_slot)) % RING_SLOT_COUNT
+                    shift = (int(out_slot) - int(src_slot)) % int(spec.ring_slot_count)
                     if int(shift) not in buckets:
                         buckets[int(shift)] = {}
                     cval = complex(w_val) if int(phase) == int(phase0) else complex(0, w_val)
@@ -687,7 +723,7 @@ def _build_tconv_factorized_mix_terms(
             template_id=template_id,
             level=0,
             scale=1.0,
-            slot_count=RING_SLOT_COUNT,
+            slot_count=int(spec.ring_slot_count),
             values=values,
             note=f"tconv k2s2 {spec.stage} factorized mix payload",
         ))
@@ -706,6 +742,10 @@ def _build_tconv_factorized_mix_terms(
 
 def build_tconv_k2s2_phase_pair_plan(
     spec: TconvK2S2Spec,
+    *,
+    weight_override: torch.Tensor | None = None,
+    source_override: torch.Tensor | None = None,
+    bank_channels_override: int | None = None,
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
     """
     Build a factorized `expand-then-mix` plan for a k=2, s=2 transposed convolution.
@@ -716,9 +756,17 @@ def build_tconv_k2s2_phase_pair_plan(
     mixing LT steps from each expanded input phase into output phase-pair banks.
     """
     torch.manual_seed(0)
-    x = torch.randn((int(spec.c_in), int(spec.h_in), int(spec.w_in)), dtype=torch.float32)
-    weight = torch.randn((int(spec.c_in), int(spec.c_out), 2, 2), dtype=torch.float32)
-    banking = _choose_tconv_k2s2_factorized_bank_channels(spec)
+    x = (
+        source_override.detach().clone().to(dtype=torch.float32)
+        if source_override is not None
+        else torch.randn((int(spec.c_in), int(spec.h_in), int(spec.w_in)), dtype=torch.float32)
+    )
+    weight = (
+        weight_override.detach().clone().to(dtype=torch.float32)
+        if weight_override is not None
+        else torch.randn((int(spec.c_in), int(spec.c_out), 2, 2), dtype=torch.float32)
+    )
+    banking = _choose_tconv_k2s2_factorized_bank_channels(spec, bank_channels_override=bank_channels_override)
     bank_channels = int(banking["bank_channels"])
     bank_count = int(banking["bank_count"])
     input_phase_count = int(spec.in_gap * spec.in_gap)
@@ -801,7 +849,7 @@ def build_tconv_k2s2_phase_pair_plan(
     total_rotation_count = int(len(compact_source_rotation_shifts.union(expansion_shifts).union(mix_shift_union)))
     plan = ConvSchemePlan(
         case_name=case_name,
-        ring_slot_count=RING_SLOT_COUNT,
+        ring_slot_count=int(spec.ring_slot_count),
         output_regions=tuple(regions),
         output_active_slot_counts=tuple(
             int((region.c_end - region.c_start) * int(spec.h_out) * int(spec.w_out))
@@ -843,7 +891,14 @@ def build_tconv_k2s2_phase_pair_plan(
 
     inputs = {
         "source_0_lane_0": PlainCipherTensor(
-            _pack_chw(x, channels=int(spec.c_in), h=int(spec.h_in), w=int(spec.w_in), gap=int(spec.in_gap)),
+            _pack_chw(
+                x,
+                channels=int(spec.c_in),
+                h=int(spec.h_in),
+                w=int(spec.w_in),
+                gap=int(spec.in_gap),
+                slots=int(spec.ring_slot_count),
+            ),
             label="source_0_lane_0",
         ),
     }

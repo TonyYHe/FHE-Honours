@@ -49,12 +49,24 @@ func GetPlaintextScale(plaintextID C.int) C.ulong {
 	return C.ulong(scale)
 }
 
+//export GetPlaintextScaleLog2
+func GetPlaintextScaleLog2(plaintextID C.int) C.double {
+	plaintext := RetrievePlaintext(int(plaintextID))
+	return C.double(plaintext.Scale.Log2())
+}
+
 //export GetCiphertextScale
 func GetCiphertextScale(ciphertextID C.int) C.ulong {
 	ciphertext := RetrieveCiphertext(int(ciphertextID))
 	scaleBig := &ciphertext.Scale.Value
 	scale, _ := scaleBig.Uint64()
 	return C.ulong(scale)
+}
+
+//export GetCiphertextScaleLog2
+func GetCiphertextScaleLog2(ciphertextID C.int) C.double {
+	ciphertext := RetrieveCiphertext(int(ciphertextID))
+	return C.double(ciphertext.Scale.Log2())
 }
 
 //export SetPlaintextScale

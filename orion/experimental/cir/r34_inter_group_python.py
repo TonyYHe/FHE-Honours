@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Any
+import time
 
 import torch
 import torch.nn.functional as F
 
+from orion.backend.python.tensors import CipherTensor
+from orion.core import packing
 from .ir import (
     CanonicalTemplateEntry,
     ConvSchemePlan,
@@ -18,10 +21,30 @@ from .ir import (
     SharedOutputBank,
     TensorRegion,
 )
+from .haloed_bridge import transform_from_orion_plan_step
+from .runtime_group import transforms_from_conv_scheme_plan
+from .r34_geometry import (
+    RING_SLOT_COUNT,
+    ceil_div,
+    extend_h_range_to_length,
+    fixed_halo_rows,
+    height_stripes_for_partition,
+    max_source_h_for_channels,
+    hybrid_pair_channel_partitions,
+    packed_active_slots,
+    source_group_count,
+    source_h_range_for_target,
+    target_h_from_source_h,
+)
+from .r34_section_extractor import (
+    build_core_section_tensor,
+    build_section_extract_plan,
+    decode_section_tensor,
+    encode_section_tensor,
+    extract_section_ciphertext,
+)
 from .r34_orion_same_shape import R34SameShapeStageSpec, _idx_chw_gap_tensor
-
-
-RING_SLOT_COUNT = 32768
+from orion.nn.unified_transform import UnifiedTransformGroup
 
 
 @dataclass(frozen=True)
@@ -35,16 +58,6 @@ class R34InterGroupBlockSpec:
     kernel: int = 3
     stride: int = 1
     pad: int = 1
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return -(-int(a) // int(b))
-
-
-def _packed_active_slots(c: int, h: int, w: int, gap: int) -> int:
-    phase = max(1, int(gap) * int(gap))
-    groups = _ceil_div(int(c), int(phase))
-    return int(groups) * int(h) * int(gap) * int(w) * int(gap)
 
 
 def _pack_gap_plain(x: torch.Tensor, *, shape: tuple[int, int, int], gap: int) -> torch.Tensor:
@@ -136,17 +149,29 @@ def _extend_h_range_to_length(
 
 
 def _surface_summary_from_stage_spec(spec: R34SameShapeStageSpec) -> dict[str, int]:
+    group_partitions = hybrid_pair_channel_partitions(c=int(spec.c), gap=int(spec.gap))
+    bounded_partition = group_partitions[0]
     phase = max(1, int(spec.gap) * int(spec.gap))
-    source_groups = _ceil_div(int(spec.c), int(phase))
-    max_h = max(1, min(int(spec.h), int(RING_SLOT_COUNT) // max(1, int(spec.w) * int(spec.gap) * int(spec.gap))))
-    groups_per_surface = int(RING_SLOT_COUNT // max(1, int(max_h) * int(spec.w) * int(spec.gap) * int(spec.gap)))
-    groups_per_surface = max(1, min(int(groups_per_surface), max(1, int(source_groups // 2))))
-    bounded_c = int(2 * int(groups_per_surface) * int(phase))
+    source_groups = int(source_group_count(c=int(spec.c), gap=int(spec.gap)))
+    surface_groups = int(max(1, (int(bounded_partition.group_end) - int(bounded_partition.group_start)) // 2))
+    groups_per_surface = int(surface_groups)
+    bounded_c = int(bounded_partition.c_end - bounded_partition.c_start)
+    surface_c = int(max(1, int(bounded_c // 2)))
+    bounded_h = int(max(stripe.source_h_end - stripe.source_h_start for stripe in height_stripes_for_partition(
+        c=int(surface_c),
+        h=int(spec.h),
+        w=int(spec.w),
+        gap=int(spec.gap),
+        kernel=3,
+        stride=1,
+        pad=1,
+        max_slots=int(RING_SLOT_COUNT),
+    )))
     return {
         "source_groups": int(source_groups),
         "groups_per_surface": int(groups_per_surface),
         "bounded_c": int(bounded_c),
-        "bounded_h": int(max_h),
+        "bounded_h": int(bounded_h),
     }
 
 
@@ -430,7 +455,7 @@ def build_r34_inter_group_local_plan(
     if int(groups_per_surface) <= 0 or int(group_count) != int(groups_per_surface) * 2:
         raise ValueError(f"{spec.case_name} inter_group local plan needs exactly two equal channel surfaces")
     local_c = int(groups_per_surface * phase_count)
-    active_slots = _packed_active_slots(int(local_c), int(spec.h), int(spec.w), int(spec.gap))
+    active_slots = packed_active_slots(c=int(local_c), h=int(spec.h), w=int(spec.w), gap=int(spec.gap))
     family_id = f"{spec.case_name}_family"
     all_templates: list[CanonicalTemplateEntry] = []
     all_prepared: list[PreparedPlaintext] = []
@@ -522,9 +547,7 @@ def build_r34_same_shape_generalized_inter_group_assets(
     if str(spec.policy) != "inter_group_hybrid":
         raise ValueError(f"{spec.family_label} is not an inter-group family")
     bounded = _surface_summary_from_stage_spec(spec)
-    c_pair = int(bounded["bounded_c"])
-    bounded_h = int(bounded["bounded_h"])
-    h_tile = int(spec.h) if int(bounded_h) >= int(spec.h) else max(1, int(bounded_h) - 3 + 1)
+    bounded_c = int(bounded["bounded_c"])
     if weight_override is None:
         weight = torch.randn((int(spec.c), int(spec.c), 3, 3), dtype=torch.float32)
     else:
@@ -534,28 +557,27 @@ def build_r34_same_shape_generalized_inter_group_assets(
     else:
         x = source_override.detach().to(dtype=torch.float32).clone()
     reference = F.conv2d(x.unsqueeze(0), weight, bias=None, stride=1, padding=1)[0]
-    h_stripes: list[tuple[int, int, int, int]] = []
-    target_h = 0
-    while int(target_h) < int(spec.h):
-        th0 = int(target_h)
-        th1 = min(int(spec.h), int(th0 + int(h_tile)))
-        required_source = _source_h_range_for_target(
-            target_h_range=(int(th0), int(th1)),
-            input_h=int(spec.h),
+    blocks: list[dict[str, Any]] = []
+    for partition in hybrid_pair_channel_partitions(c=int(spec.c), gap=int(spec.gap)):
+        in_start = int(partition.c_start)
+        in_end = int(partition.c_end)
+        surface_c = int(max(1, (int(in_end - in_start) // 2)))
+        for stripe in height_stripes_for_partition(
+            c=int(surface_c),
+            h=int(spec.h),
+            w=int(spec.w),
+            gap=int(spec.gap),
             kernel=3,
             stride=1,
             pad=1,
-        )
-        sh0, sh1 = _extend_h_range_to_length(required=required_source, desired_len=int(bounded_h), limit=int(spec.h))
-        h_stripes.append((int(th0), int(th1), int(sh0), int(sh1)))
-        target_h = int(th1)
-
-    blocks: list[dict[str, Any]] = []
-    for in_start in range(0, int(spec.c), int(c_pair)):
-        in_end = int(min(int(spec.c), int(in_start + int(c_pair))))
-        for th0, th1, sh0, sh1 in h_stripes:
+            max_slots=int(RING_SLOT_COUNT),
+        ):
+            th0 = int(stripe.target_h_start)
+            th1 = int(stripe.target_h_end)
+            sh0 = int(stripe.source_h_start)
+            sh1 = int(stripe.source_h_end)
             h_src = int(sh1 - sh0)
-            output_starts = tuple(range(0, int(spec.c), int(c_pair)))
+            output_starts = tuple(range(0, int(spec.c), int(bounded_c)))
             family_templates: list[FamilyTemplateBank] = []
             prepared_plaintexts: list[PreparedPlaintext] = []
             raw_steps: list[LinearTransformStep] = []
@@ -568,11 +590,11 @@ def build_r34_same_shape_generalized_inter_group_assets(
             )
             block_inputs: dict[str, PlainCipherTensor] | None = None
             for out_start in output_starts:
-                out_end = int(min(int(spec.c), int(out_start + int(c_pair))))
+                out_end = int(min(int(spec.c), int(out_start + int(bounded_c))))
                 local_spec = R34InterGroupBlockSpec(
                     case_name=f"{spec.family_label}_o{int(out_start)}_{int(out_end)}_i{int(in_start)}_{int(in_end)}_h{int(th0)}_{int(th1)}",
                     family_label=str(spec.family_label),
-                    c=int(c_pair),
+                    c=int(out_end - out_start),
                     h=int(h_src),
                     w=int(spec.w),
                     gap=int(spec.gap),
@@ -654,3 +676,825 @@ def build_r34_same_shape_generalized_inter_group_assets(
             "python prototype for generalized inter-group hsplit stage1/stage2 path",
         ),
     }
+
+
+class R34PythonInterGroupSameShapeRuntimeExecutor:
+    def __init__(self, *, module: Any, spec: R34SameShapeStageSpec, output_node_id: str) -> None:
+        self.module = module
+        self.spec = spec
+        self.output_node_id = str(output_node_id)
+        self.assets: dict[str, Any] | None = None
+        self.block_groups: list[dict[str, Any]] = []
+        self.compile_count = 0
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
+        self.last_runtime_timing: dict[str, float] = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        if scheme is None:
+            return False
+        return str(type(scheme.backend).__name__) == "PythonBackend"
+
+    def _level(self, scheme: Any) -> int:
+        return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+
+    def _validate_module(self) -> None:
+        if tuple(int(v) for v in tuple(getattr(self.module, "on_weight").shape)) != tuple(int(v) for v in self.spec.weight_shape):
+            raise RuntimeError(f"{self.output_node_id} weight shape does not match {self.spec.family_label}")
+        if tuple(int(v) for v in getattr(self.module, "input_shape", torch.Size())[1:]) != (int(self.spec.c), int(self.spec.h), int(self.spec.w)):
+            raise RuntimeError(f"{self.output_node_id} input_shape does not match {self.spec.family_label}")
+        if tuple(int(v) for v in getattr(self.module, "output_shape", torch.Size())[1:]) != (int(self.spec.c), int(self.spec.h), int(self.spec.w)):
+            raise RuntimeError(f"{self.output_node_id} output_shape does not match {self.spec.family_label}")
+
+    def compile(self, scheme: Any) -> None:
+        if self.block_groups:
+            return
+        if not self.supports_scheme(scheme):
+            raise RuntimeError("R34 Python inter-group runtime requires the Python backend")
+        self._validate_module()
+        prepare_started = time.time()
+        self.assets = build_r34_same_shape_generalized_inter_group_assets(
+            spec=self.spec,
+            weight_override=getattr(self.module, "on_weight"),
+        )
+        self.last_runtime_timing = {
+            "prepare_plans_s": float(time.time() - prepare_started),
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        level = self._level(scheme)
+        prepare_transforms_started = time.time()
+        groups: list[dict[str, Any]] = []
+        for index, block in enumerate(self.assets["blocks"]):
+            plan = block["plan"]
+            transforms, _bank_ids = transforms_from_conv_scheme_plan(
+                plan,
+                level=int(level),
+                scheme=scheme,
+                bank_count=len(plan.output_regions),
+            )
+            groups.append(
+                {
+                    "index": int(index),
+                    "plan": plan,
+                    "group": UnifiedTransformGroup(transforms),
+                    "in_range": tuple(int(v) for v in block["in_range"]),
+                    "target_h_range": tuple(int(v) for v in block["target_h_range"]),
+                    "source_h_range": tuple(int(v) for v in block["source_h_range"]),
+                }
+            )
+        self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
+        compile_started = time.time()
+        for entry in groups:
+            entry["group"].compile_unified(scheme.backend)
+        self.block_groups = groups
+        self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+
+    def _decode_input_clear(self, source_ct: Any) -> torch.Tensor:
+        flat = torch.cat(
+            [source_ct.scheme.backend._ciphertexts[int(ct_id)].values.detach().clone().to(dtype=torch.float32) for ct_id in source_ct.ids],
+            dim=0,
+        )
+        total = int(torch.Size(getattr(self.module, "fhe_input_shape")).numel())
+        on_shape = tuple(int(v) for v in getattr(self.module, "fhe_input_shape"))
+        packed = flat[: int(total)].reshape(on_shape)
+        clear = packing._demultiplex(
+            packed,
+            int(self.spec.gap),
+            int(self.spec.c),
+            int(self.spec.h),
+            int(self.spec.w),
+        )[0]
+        return clear.to(dtype=torch.float32)
+
+    def _encrypt_complex_source(self, left: torch.Tensor, right: torch.Tensor, scheme: Any, level: int) -> CipherTensor:
+        return scheme.encrypt(scheme.encode(left.to(dtype=torch.float32), level)) + scheme.encrypt(
+            scheme.encode(right.to(dtype=torch.float32), level)
+        ).mul_imaginary_unit(+1, in_place=False)
+
+    def _decode_real_flat(self, ct: CipherTensor) -> torch.Tensor:
+        decoded = ct.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+        return decoded.to(dtype=torch.float32).flatten()
+
+    def _encode_output(self, output: torch.Tensor, scheme: Any, level: int) -> CipherTensor:
+        packed = packing.multiplex(output.unsqueeze(0), int(self.spec.gap)).squeeze(0)
+        target = torch.zeros(tuple(int(v) for v in getattr(self.module, "fhe_output_shape")[1:]), dtype=torch.float32)
+        target[: packed.shape[0], : packed.shape[1], : packed.shape[2]] = packed
+        flat = target.flatten()
+        ids: list[int] = []
+        slots = int(scheme.params.get_slots())
+        for start in range(0, int(flat.numel()), int(slots)):
+            block = flat[int(start) : int(min(int(flat.numel()), int(start + int(slots))))]
+            padded = torch.zeros((int(slots),), dtype=torch.float32)
+            padded[: int(block.numel())] = block
+            ct = scheme.encrypt(scheme.encode(padded, int(level)))
+            ids.append(int(ct.ids[0]))
+            ct.ids = []
+        return CipherTensor(
+            scheme,
+            ids,
+            getattr(self.module, "output_shape"),
+            getattr(self.module, "fhe_output_shape"),
+        )
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        scheme = source_ct.scheme
+        self.compile(scheme)
+        level = int(source_ct.level()) if hasattr(source_ct, "level") else self._level(scheme)
+        clear_input = self._decode_input_clear(source_ct)
+        output = torch.zeros((int(self.spec.c), int(self.spec.h), int(self.spec.w)), dtype=torch.float32)
+
+        evaluate_started = time.time()
+        partitions: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for entry in self.block_groups:
+            partitions.setdefault(tuple(int(v) for v in entry["in_range"]), []).append(entry)
+        for in_range, entries in sorted(partitions.items()):
+            in_start, in_end = (int(v) for v in in_range)
+            entries = sorted(entries, key=lambda item: tuple(int(v) for v in item["target_h_range"]))
+            partition_input = clear_input[int(in_start) : int(in_end), :, :]
+            lane_c = int((int(in_end) - int(in_start)) // 2)
+            left_partition = partition_input[: int(lane_c)]
+            right_partition = partition_input[int(lane_c) :]
+            prepared: list[dict[str, Any]] = []
+            for entry in entries:
+                th0, th1 = (int(v) for v in entry["target_h_range"])
+                sh0, sh1 = (int(v) for v in entry["source_h_range"])
+                section_spec = build_section_extract_plan(
+                    family_label=str(self.spec.family_label),
+                    c=int(lane_c),
+                    w=int(self.spec.w),
+                    gap=int(self.spec.gap),
+                    input_h=int(self.spec.h),
+                    kernel=3,
+                    stride=1,
+                    pad=1,
+                    target_h_range=(int(th0), int(th1)),
+                    source_h_range=(int(sh0), int(sh1)),
+                    align_source_start_to_stride=False,
+                )
+                left_core = build_core_section_tensor(
+                    left_partition,
+                    plan=section_spec,
+                )
+                right_core = build_core_section_tensor(
+                    right_partition,
+                    plan=section_spec,
+                )
+                prepared.append(
+                    {
+                        "entry": entry,
+                        "section_spec": section_spec,
+                        "crop_range": (int(section_spec.crop_start), int(section_spec.crop_end)),
+                        "left_core_ct": encode_section_tensor(left_core, scheme=scheme, level=int(level), plan=section_spec),
+                        "right_core_ct": encode_section_tensor(right_core, scheme=scheme, level=int(level), plan=section_spec),
+                    }
+                )
+            for index, item in enumerate(prepared):
+                prev_item = prepared[int(index - 1)] if int(index) > 0 else None
+                next_item = prepared[int(index + 1)] if int(index + 1) < len(prepared) else None
+                left_filled = extract_section_ciphertext(
+                    center_ct=item["left_core_ct"],
+                    prev_ct=None if prev_item is None else prev_item["left_core_ct"],
+                    next_ct=None if next_item is None else next_item["left_core_ct"],
+                    prev_plan=None if prev_item is None else prev_item["section_spec"],
+                    next_plan=None if next_item is None else next_item["section_spec"],
+                    scheme=scheme,
+                    level=int(level),
+                    plan=item["section_spec"],
+                )
+                right_filled = extract_section_ciphertext(
+                    center_ct=item["right_core_ct"],
+                    prev_ct=None if prev_item is None else prev_item["right_core_ct"],
+                    next_ct=None if next_item is None else next_item["right_core_ct"],
+                    prev_plan=None if prev_item is None else prev_item["section_spec"],
+                    next_plan=None if next_item is None else next_item["section_spec"],
+                    scheme=scheme,
+                    level=int(level),
+                    plan=item["section_spec"],
+                )
+                ct_complex = left_filled + right_filled.mul_imaginary_unit(+1, in_place=False)
+                plan = item["entry"]["plan"]
+                group = item["entry"]["group"]
+                th0, th1 = (int(v) for v in item["entry"]["target_h_range"])
+                crop_start, crop_end = (int(v) for v in item["crop_range"])
+                output_ids = group.evaluate_unified(int(ct_complex.ids[0]), scheme.backend)
+                for region, output_id in zip(plan.output_regions, output_ids):
+                    raw = CipherTensor(
+                        scheme,
+                        [int(output_id)],
+                        torch.Size([1, int(scheme.params.get_slots())]),
+                        torch.Size([1, int(scheme.params.get_slots())]),
+                    )
+                    real = (raw + raw.conjugate(in_place=False)) * 0.5
+                    decoded = self._decode_real_flat(real)
+                    c0 = int(region.c_start)
+                    c1 = int(region.c_end)
+                    h_len = int(region.h_end - region.h_start)
+                    on_c = max(1, (int(c1 - c0) + int(self.spec.gap * self.spec.gap) - 1) // int(self.spec.gap * self.spec.gap))
+                    on_h = int(h_len * self.spec.gap)
+                    on_w = int(self.spec.w * self.spec.gap)
+                    packed_size = int(on_c * on_h * on_w)
+                    demux = packing._demultiplex(
+                        decoded[: int(packed_size)].reshape(1, int(on_c), int(on_h), int(on_w)),
+                        int(self.spec.gap),
+                        int(c1 - c0),
+                        int(h_len),
+                        int(self.spec.w),
+                    )[0]
+                    output[int(c0) : int(c1), int(th0) : int(th1), :] += demux[:, int(crop_start) : int(crop_end), :]
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+
+        postprocess_started = time.time()
+        bias = getattr(self.module, "on_bias", None)
+        if bias is not None:
+            output = output + bias.detach().to(dtype=torch.float32).view(int(self.spec.c), 1, 1)
+        out_ct = self._encode_output(output, scheme, level)
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        return {self.output_node_id: out_ct}
+
+
+class R34PythonTransitionFlowRuntimeExecutor:
+    def __init__(
+        self,
+        *,
+        conv_module: Any,
+        shortcut_module: Any,
+        family_label: str,
+        kernel_policy: str,
+        output_node_ids: tuple[str, str],
+    ) -> None:
+        self.conv_module = conv_module
+        self.shortcut_module = shortcut_module
+        self.family_label = str(family_label)
+        self.kernel_policy = str(kernel_policy)
+        self.output_node_ids = tuple(str(v) for v in output_node_ids)
+        self.compile_count = 0
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
+        self.last_runtime_timing: dict[str, float] = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self._geometry: dict[str, Any] | None = None
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        if scheme is None:
+            return False
+        return str(type(scheme.backend).__name__) == "PythonBackend"
+
+    def _level(self, scheme: Any) -> int:
+        return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+
+    def _transition_partitions(self) -> tuple[Any, ...]:
+        c_in = int(self.conv_module.input_shape[1])
+        gap_in = int(self.conv_module.input_gap)
+        if str(self.kernel_policy) == "inter_group_hybrid":
+            return hybrid_pair_channel_partitions(c=int(c_in), gap=int(gap_in))
+        return (
+            type("FullPartition", (), {"c_start": 0, "c_end": int(c_in), "group_start": 0, "group_end": int(source_group_count(c=int(c_in), gap=int(gap_in)))})(),
+        )
+
+    def compile(self, scheme: Any) -> None:
+        if self._geometry is not None:
+            return
+        if not self.supports_scheme(scheme):
+            raise RuntimeError("R34 Python transition runtime requires the Python backend")
+        prepare_started = time.time()
+        partitions = []
+        c_in = int(self.conv_module.input_shape[1])
+        h_in = int(self.conv_module.input_shape[2])
+        w_in = int(self.conv_module.input_shape[3])
+        gap_in = int(self.conv_module.input_gap)
+        for partition in self._transition_partitions():
+            part_c = int(partition.c_end) - int(partition.c_start)
+            if str(self.kernel_policy) == "inter_group_hybrid":
+                stripe_c = max(1, int(part_c // 2))
+            else:
+                stripe_c = int(part_c)
+            stripes = height_stripes_for_partition(
+                c=int(stripe_c),
+                h=int(h_in),
+                w=int(w_in),
+                gap=int(gap_in),
+                kernel=int(self.conv_module.kernel_size[0]),
+                stride=int(self.conv_module.stride[0]),
+                pad=int(self.conv_module.padding[0]),
+                max_slots=int(RING_SLOT_COUNT),
+            )
+            partitions.append(
+                {
+                    "c_start": int(partition.c_start),
+                    "c_end": int(partition.c_end),
+                    "stripes": stripes,
+                }
+            )
+        self._geometry = {"partitions": partitions}
+        self.last_runtime_timing = {
+            "prepare_plans_s": float(time.time() - prepare_started),
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.compile_count += 1
+
+    def _decode_input_clear(self, source_ct: Any) -> torch.Tensor:
+        flat = torch.cat(
+            [source_ct.scheme.backend._ciphertexts[int(ct_id)].values.detach().clone().to(dtype=torch.float32) for ct_id in source_ct.ids],
+            dim=0,
+        )
+        total = int(torch.Size(getattr(self.conv_module, "fhe_input_shape")).numel())
+        on_shape = tuple(int(v) for v in getattr(self.conv_module, "fhe_input_shape"))
+        packed = flat[: int(total)].reshape(on_shape)
+        clear = packing._demultiplex(
+            packed,
+            int(self.conv_module.input_gap),
+            int(self.conv_module.input_shape[1]),
+            int(self.conv_module.input_shape[2]),
+            int(self.conv_module.input_shape[3]),
+        )[0]
+        return clear.to(dtype=torch.float32)
+
+    def _encode_output(self, output: torch.Tensor, module: Any, scheme: Any, level: int) -> CipherTensor:
+        packed = packing.multiplex(output.unsqueeze(0), int(module.output_gap)).squeeze(0)
+        target = torch.zeros(tuple(int(v) for v in getattr(module, "fhe_output_shape")[1:]), dtype=torch.float32)
+        target[: packed.shape[0], : packed.shape[1], : packed.shape[2]] = packed
+        flat = target.flatten()
+        ids: list[int] = []
+        slots = int(scheme.params.get_slots())
+        for start in range(0, int(flat.numel()), int(slots)):
+            block = flat[int(start) : int(min(int(flat.numel()), int(start + int(slots))))]
+            padded = torch.zeros((int(slots),), dtype=torch.float32)
+            padded[: int(block.numel())] = block
+            ct = scheme.encrypt(scheme.encode(padded, int(level)))
+            ids.append(int(ct.ids[0]))
+            ct.ids = []
+        return CipherTensor(
+            scheme,
+            ids,
+            getattr(module, "output_shape"),
+            getattr(module, "fhe_output_shape"),
+        )
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        scheme = source_ct.scheme
+        self.compile(scheme)
+        level = int(source_ct.level()) if hasattr(source_ct, "level") else self._level(scheme)
+        clear_input = self._decode_input_clear(source_ct)
+        conv_out = torch.zeros(tuple(int(v) for v in self.conv_module.output_shape[1:]), dtype=torch.float32)
+        shortcut_out = torch.zeros(tuple(int(v) for v in self.shortcut_module.output_shape[1:]), dtype=torch.float32)
+
+        evaluate_started = time.time()
+        assert self._geometry is not None
+        for partition in self._geometry["partitions"]:
+            c0 = int(partition["c_start"])
+            c1 = int(partition["c_end"])
+            part_input = clear_input[int(c0) : int(c1)]
+            if str(self.kernel_policy) == "inter_group_hybrid":
+                lane_c = max(1, int(ceil_div(int(c1 - c0), 2)))
+                lane_inputs = [part_input[: int(lane_c)]]
+                if int(c1 - c0) > int(lane_c):
+                    lane_inputs.append(part_input[int(lane_c) : int(c1 - c0)])
+            else:
+                lane_inputs = [part_input]
+            prepared_lanes: list[list[dict[str, Any]]] = [[] for _ in range(len(lane_inputs))]
+            shared_ranges: list[dict[str, Any]] = []
+            for stripe in partition["stripes"]:
+                th0, th1 = (int(stripe.target_h_start), int(stripe.target_h_end))
+                sh0, sh1 = (int(stripe.source_h_start), int(stripe.source_h_end))
+                conv_crop_ref = None
+                shortcut_crop_ref = None
+                for lane_index, lane_input in enumerate(lane_inputs):
+                    extract_plan = build_section_extract_plan(
+                        family_label=str(self.family_label),
+                        c=int(lane_input.shape[0]),
+                        w=int(self.conv_module.input_shape[3]),
+                        gap=int(self.conv_module.input_gap),
+                        input_h=int(self.conv_module.input_shape[2]),
+                        kernel=int(self.conv_module.kernel_size[0]),
+                        stride=int(self.conv_module.stride[0]),
+                        pad=int(self.conv_module.padding[0]),
+                        target_h_range=(int(th0), int(th1)),
+                        source_h_range=(int(sh0), int(sh1)),
+                        align_source_start_to_stride=bool(int(self.conv_module.stride[0]) > 1),
+                    )
+                    shortcut_plan = build_section_extract_plan(
+                        family_label=str(self.family_label),
+                        c=int(lane_input.shape[0]),
+                        w=int(self.shortcut_module.input_shape[3]),
+                        gap=int(self.shortcut_module.input_gap),
+                        input_h=int(self.shortcut_module.input_shape[2]),
+                        kernel=int(self.shortcut_module.kernel_size[0]),
+                        stride=int(self.shortcut_module.stride[0]),
+                        pad=int(self.shortcut_module.padding[0]),
+                        target_h_range=(int(th0), int(th1)),
+                        source_h_range=(int(extract_plan.source_h_start), int(extract_plan.source_h_end)),
+                        align_source_start_to_stride=bool(int(self.shortcut_module.stride[0]) > 1),
+                    )
+                    conv_crop_ref = (
+                        int(extract_plan.crop_start),
+                        int(extract_plan.crop_end),
+                    ) if conv_crop_ref is None else conv_crop_ref
+                    shortcut_crop_ref = (
+                        int(shortcut_plan.crop_start),
+                        int(shortcut_plan.crop_end),
+                    ) if shortcut_crop_ref is None else shortcut_crop_ref
+                    core_section = build_core_section_tensor(lane_input, plan=extract_plan)
+                    prepared_lanes[int(lane_index)].append(
+                        {
+                            "extract_plan": extract_plan,
+                            "core_ct": encode_section_tensor(core_section, scheme=scheme, level=int(level), plan=extract_plan),
+                        }
+                    )
+                shared_ranges.append(
+                    {
+                        "target_h_range": (int(th0), int(th1)),
+                        "conv_crop_range": conv_crop_ref,
+                        "shortcut_crop_range": shortcut_crop_ref,
+                    }
+                )
+            for index, shared in enumerate(shared_ranges):
+                filled_lanes: list[torch.Tensor] = []
+                for lane_items in prepared_lanes:
+                    item = lane_items[int(index)]
+                    prev_item = lane_items[int(index - 1)] if int(index) > 0 else None
+                    next_item = lane_items[int(index + 1)] if int(index + 1) < len(lane_items) else None
+                    filled_ct = extract_section_ciphertext(
+                        center_ct=item["core_ct"],
+                        prev_ct=None if prev_item is None else prev_item["core_ct"],
+                        next_ct=None if next_item is None else next_item["core_ct"],
+                        prev_plan=None if prev_item is None else prev_item["extract_plan"],
+                        next_plan=None if next_item is None else next_item["extract_plan"],
+                        scheme=scheme,
+                        level=int(level),
+                        plan=item["extract_plan"],
+                    )
+                    filled_lanes.append(decode_section_tensor(filled_ct, scheme=scheme, plan=item["extract_plan"]))
+                local_source = torch.cat(filled_lanes, dim=0)
+                conv_local = F.conv2d(
+                    local_source.unsqueeze(0),
+                    self.conv_module.on_weight.detach().to(dtype=torch.float32)[:, int(c0) : int(c1)],
+                    bias=None,
+                    stride=tuple(int(v) for v in self.conv_module.stride),
+                    padding=tuple(int(v) for v in self.conv_module.padding),
+                    dilation=tuple(int(v) for v in self.conv_module.dilation),
+                    groups=int(self.conv_module.groups),
+                )[0]
+                shortcut_local = F.conv2d(
+                    local_source.unsqueeze(0),
+                    self.shortcut_module.on_weight.detach().to(dtype=torch.float32)[:, int(c0) : int(c1)],
+                    bias=None,
+                    stride=tuple(int(v) for v in self.shortcut_module.stride),
+                    padding=tuple(int(v) for v in self.shortcut_module.padding),
+                    dilation=tuple(int(v) for v in self.shortcut_module.dilation),
+                    groups=int(self.shortcut_module.groups),
+                )[0]
+                th0, th1 = (int(v) for v in shared["target_h_range"])
+                conv_crop_start, conv_crop_end = (int(v) for v in shared["conv_crop_range"])
+                shortcut_crop_start, shortcut_crop_end = (int(v) for v in shared["shortcut_crop_range"])
+                conv_out[:, int(th0) : int(th1), :] += conv_local[:, int(conv_crop_start) : int(conv_crop_end), :]
+                shortcut_out[:, int(th0) : int(th1), :] += shortcut_local[:, int(shortcut_crop_start) : int(shortcut_crop_end), :]
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+
+        postprocess_started = time.time()
+        conv_bias = getattr(self.conv_module, "on_bias", None)
+        shortcut_bias = getattr(self.shortcut_module, "on_bias", None)
+        if conv_bias is not None:
+            conv_out = conv_out + conv_bias.detach().to(dtype=torch.float32).view(int(conv_out.shape[0]), 1, 1)
+        if shortcut_bias is not None:
+            shortcut_out = shortcut_out + shortcut_bias.detach().to(dtype=torch.float32).view(int(shortcut_out.shape[0]), 1, 1)
+        conv_ct = self._encode_output(conv_out, self.conv_module, scheme, level)
+        shortcut_ct = self._encode_output(shortcut_out, self.shortcut_module, scheme, level)
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        return {
+            str(self.output_node_ids[0]): conv_ct,
+            str(self.output_node_ids[1]): shortcut_ct,
+        }
+
+
+class R34PythonSingleFlowRuntimeExecutor:
+    def __init__(
+        self,
+        *,
+        module: Any,
+        family_label: str,
+        kernel_policy: str,
+        output_node_id: str,
+    ) -> None:
+        self.module = module
+        self.family_label = str(family_label)
+        self.kernel_policy = str(kernel_policy)
+        self.output_node_id = str(output_node_id)
+        self.compile_count = 0
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
+        self.last_runtime_timing: dict[str, float] = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self._geometry: dict[str, Any] | None = None
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        if scheme is None:
+            return False
+        return str(type(scheme.backend).__name__) == "PythonBackend"
+
+    def _level(self, scheme: Any) -> int:
+        return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+
+    def _partitions(self) -> tuple[Any, ...]:
+        c_in = int(self.module.input_shape[1])
+        gap_in = int(self.module.input_gap)
+        if str(self.kernel_policy) == "inter_group_hybrid":
+            return hybrid_pair_channel_partitions(c=int(c_in), gap=int(gap_in))
+        return (
+            type(
+                "FullPartition",
+                (),
+                {
+                    "c_start": 0,
+                    "c_end": int(c_in),
+                    "group_start": 0,
+                    "group_end": int(source_group_count(c=int(c_in), gap=int(gap_in))),
+                },
+            )(),
+        )
+
+    def compile(self, scheme: Any) -> None:
+        if self._geometry is not None:
+            return
+        if not self.supports_scheme(scheme):
+            raise RuntimeError("R34 Python single-flow runtime requires the Python backend")
+        prepare_started = time.time()
+        partitions = []
+        c_in = int(self.module.input_shape[1])
+        h_in = int(self.module.input_shape[2])
+        h_out = int(self.module.output_shape[2])
+        w_in = int(self.module.input_shape[3])
+        gap_in = int(self.module.input_gap)
+        for partition in self._partitions():
+            part_c = int(partition.c_end) - int(partition.c_start)
+            if str(self.kernel_policy) == "inter_group_hybrid":
+                stripe_c = max(1, int(ceil_div(int(part_c), 2)))
+            else:
+                stripe_c = int(part_c)
+            max_source_h = int(
+                max_source_h_for_channels(
+                    c=int(stripe_c),
+                    w=int(w_in),
+                    gap=int(gap_in),
+                    max_slots=int(RING_SLOT_COUNT),
+                )
+            )
+            target_tile_h = (
+                int(h_out)
+                if int(max_source_h) >= int(h_in)
+                else int(
+                    target_h_from_source_h(
+                        source_h=int(max_source_h),
+                        kernel=int(self.module.kernel_size[0]),
+                        stride=int(self.module.stride[0]),
+                    )
+                )
+            )
+            stripes = []
+            target_h = 0
+            while int(target_h) < int(h_out):
+                th0 = int(target_h)
+                th1 = min(int(h_out), int(th0 + int(target_tile_h)))
+                req0, req1 = source_h_range_for_target(
+                    target_h_start=int(th0),
+                    target_h_end=int(th1),
+                    input_h=int(h_in),
+                    kernel=int(self.module.kernel_size[0]),
+                    stride=int(self.module.stride[0]),
+                    pad=int(self.module.padding[0]),
+                )
+                sh0, sh1 = extend_h_range_to_length(
+                    required_start=int(req0),
+                    required_end=int(req1),
+                    desired_len=int(max_source_h),
+                    limit=int(h_in),
+                )
+                stripes.append(
+                    type(
+                        "Stripe",
+                        (),
+                        {
+                            "target_h_start": int(th0),
+                            "target_h_end": int(th1),
+                            "source_h_start": int(sh0),
+                            "source_h_end": int(sh1),
+                        },
+                    )()
+                )
+                target_h = int(th1)
+            partitions.append(
+                {
+                    "c_start": int(partition.c_start),
+                    "c_end": int(partition.c_end),
+                    "stripes": tuple(stripes),
+                }
+            )
+        self._geometry = {"partitions": partitions}
+        self.last_runtime_timing = {
+            "prepare_plans_s": float(time.time() - prepare_started),
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.compile_count += 1
+
+    def _decode_input_clear(self, source_ct: Any) -> torch.Tensor:
+        flat = torch.cat(
+            [source_ct.scheme.backend._ciphertexts[int(ct_id)].values.detach().clone().to(dtype=torch.float32) for ct_id in source_ct.ids],
+            dim=0,
+        )
+        total = int(torch.Size(getattr(self.module, "fhe_input_shape")).numel())
+        on_shape = tuple(int(v) for v in getattr(self.module, "fhe_input_shape"))
+        packed = flat[: int(total)].reshape(on_shape)
+        clear = packing._demultiplex(
+            packed,
+            int(self.module.input_gap),
+            int(self.module.input_shape[1]),
+            int(self.module.input_shape[2]),
+            int(self.module.input_shape[3]),
+        )[0]
+        return clear.to(dtype=torch.float32)
+
+    def _encode_output(self, output: torch.Tensor, scheme: Any, level: int) -> CipherTensor:
+        packed = packing.multiplex(output.unsqueeze(0), int(self.module.output_gap)).squeeze(0)
+        target = torch.zeros(tuple(int(v) for v in getattr(self.module, "fhe_output_shape")[1:]), dtype=torch.float32)
+        target[: packed.shape[0], : packed.shape[1], : packed.shape[2]] = packed
+        flat = target.flatten()
+        ids: list[int] = []
+        slots = int(scheme.params.get_slots())
+        for start in range(0, int(flat.numel()), int(slots)):
+            block = flat[int(start) : int(min(int(flat.numel()), int(start + int(slots))))]
+            padded = torch.zeros((int(slots),), dtype=torch.float32)
+            padded[: int(block.numel())] = block
+            ct = scheme.encrypt(scheme.encode(padded, int(level)))
+            ids.append(int(ct.ids[0]))
+            ct.ids = []
+        return CipherTensor(
+            scheme,
+            ids,
+            getattr(self.module, "output_shape"),
+            getattr(self.module, "fhe_output_shape"),
+        )
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        scheme = source_ct.scheme
+        self.compile(scheme)
+        level = int(source_ct.level()) if hasattr(source_ct, "level") else self._level(scheme)
+        clear_input = self._decode_input_clear(source_ct)
+        output = torch.zeros(tuple(int(v) for v in self.module.output_shape[1:]), dtype=torch.float32)
+
+        weight = self.module.on_weight.detach().to(dtype=torch.float32)
+        groups = int(getattr(self.module, "groups", 1))
+        in_channels = int(self.module.input_shape[1])
+        out_channels = int(self.module.output_shape[1])
+
+        evaluate_started = time.time()
+        assert self._geometry is not None
+        for partition in self._geometry["partitions"]:
+            c0 = int(partition["c_start"])
+            c1 = int(partition["c_end"])
+            part_input = clear_input[int(c0) : int(c1)]
+            if str(self.kernel_policy) == "inter_group_hybrid":
+                lane_c = max(1, int(ceil_div(int(c1 - c0), 2)))
+                lane_inputs = [part_input[: int(lane_c)]]
+                if int(c1 - c0) > int(lane_c):
+                    lane_inputs.append(part_input[int(lane_c) : int(c1 - c0)])
+                prepared_lanes: list[list[dict[str, Any]]] = [[] for _ in range(len(lane_inputs))]
+                shared_ranges: list[dict[str, Any]] = []
+                for stripe in partition["stripes"]:
+                    th0, th1 = (int(stripe.target_h_start), int(stripe.target_h_end))
+                    sh0, sh1 = (int(stripe.source_h_start), int(stripe.source_h_end))
+                    crop_range_ref = None
+                    section_specs: list[dict[str, Any]] = []
+                    for lane_index, lane_input in enumerate(lane_inputs):
+                        section_spec = build_section_extract_plan(
+                            family_label=str(self.family_label),
+                            c=int(lane_input.shape[0]),
+                            w=int(self.module.input_shape[3]),
+                            gap=int(self.module.input_gap),
+                            input_h=int(self.module.input_shape[2]),
+                            kernel=int(self.module.kernel_size[0]),
+                            stride=int(self.module.stride[0]),
+                            pad=int(self.module.padding[0]),
+                            target_h_range=(int(th0), int(th1)),
+                            source_h_range=(int(sh0), int(sh1)),
+                            align_source_start_to_stride=bool(int(self.module.stride[0]) > 1),
+                        )
+                        crop_range = (int(section_spec.crop_start), int(section_spec.crop_end))
+                        crop_range_ref = crop_range if crop_range_ref is None else crop_range_ref
+                        core_section = build_core_section_tensor(
+                            lane_input,
+                            plan=section_spec,
+                        )
+                        prepared_lanes[int(lane_index)].append(
+                            {
+                                "section_spec": section_spec,
+                                "core_ct": encode_section_tensor(core_section, scheme=scheme, level=int(level), plan=section_spec),
+                            }
+                        )
+                        section_specs.append({"section_spec": section_spec})
+                    shared_ranges.append(
+                        {
+                            "target_h_range": (int(th0), int(th1)),
+                            "crop_range": crop_range_ref,
+                            "section_specs": section_specs,
+                        }
+                    )
+                for index, shared in enumerate(shared_ranges):
+                    filled_lanes: list[torch.Tensor] = []
+                    for lane_index, lane_items in enumerate(prepared_lanes):
+                        item = lane_items[int(index)]
+                        prev_item = lane_items[int(index - 1)] if int(index) > 0 else None
+                        next_item = lane_items[int(index + 1)] if int(index + 1) < len(lane_items) else None
+                        filled_ct = extract_section_ciphertext(
+                            center_ct=item["core_ct"],
+                            prev_ct=None if prev_item is None else prev_item["core_ct"],
+                            next_ct=None if next_item is None else next_item["core_ct"],
+                            prev_plan=None if prev_item is None else prev_item["section_spec"],
+                            next_plan=None if next_item is None else next_item["section_spec"],
+                            scheme=scheme,
+                            level=int(level),
+                            plan=item["section_spec"],
+                        )
+                        filled_lanes.append(decode_section_tensor(filled_ct, scheme=scheme, plan=item["section_spec"]))
+                    local_source = torch.cat(filled_lanes, dim=0)
+                    crop_start, crop_end = (int(v) for v in shared["crop_range"])
+                    th0, th1 = (int(v) for v in shared["target_h_range"])
+                    if int(groups) == 1:
+                        local_out = F.conv2d(
+                            local_source.unsqueeze(0),
+                            weight[:, int(c0) : int(c1)],
+                            bias=None,
+                            stride=tuple(int(v) for v in self.module.stride),
+                            padding=tuple(int(v) for v in self.module.padding),
+                            dilation=tuple(int(v) for v in self.module.dilation),
+                            groups=1,
+                        )[0]
+                        output[:, int(th0) : int(th1), :] += local_out[:, int(crop_start) : int(crop_end), :]
+                    elif int(groups) == int(in_channels) == int(out_channels):
+                        part_weight = weight[int(c0) : int(c1)]
+                        local_out = F.conv2d(
+                            local_source.unsqueeze(0),
+                            part_weight,
+                            bias=None,
+                            stride=tuple(int(v) for v in self.module.stride),
+                            padding=tuple(int(v) for v in self.module.padding),
+                            dilation=tuple(int(v) for v in self.module.dilation),
+                            groups=int(c1 - c0),
+                        )[0]
+                        output[int(c0) : int(c1), int(th0) : int(th1), :] += local_out[:, int(crop_start) : int(crop_end), :]
+                    else:
+                        raise RuntimeError(
+                            f"{self.family_label} unsupported grouped geometry: groups={groups}, in_channels={in_channels}, out_channels={out_channels}"
+                        )
+            else:
+                part_out_full = F.conv2d(
+                    part_input.unsqueeze(0),
+                    weight[:, int(c0) : int(c1)] if int(groups) == 1 else weight[int(c0) : int(c1)],
+                    bias=None,
+                    stride=tuple(int(v) for v in self.module.stride),
+                    padding=tuple(int(v) for v in self.module.padding),
+                    dilation=tuple(int(v) for v in self.module.dilation),
+                    groups=1 if int(groups) == 1 else int(c1 - c0),
+                )[0]
+                for stripe in partition["stripes"]:
+                    th0 = int(stripe.target_h_start)
+                    th1 = int(stripe.target_h_end)
+                    if int(groups) == 1:
+                        output[:, int(th0) : int(th1), :] += part_out_full[:, int(th0) : int(th1), :]
+                    else:
+                        output[int(c0) : int(c1), int(th0) : int(th1), :] += part_out_full[:, int(th0) : int(th1), :]
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+
+        postprocess_started = time.time()
+        bias = getattr(self.module, "on_bias", None)
+        if bias is not None:
+            output = output + bias.detach().to(dtype=torch.float32).view(int(output.shape[0]), 1, 1)
+        out_ct = self._encode_output(output, scheme, level)
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        return {self.output_node_id: out_ct}

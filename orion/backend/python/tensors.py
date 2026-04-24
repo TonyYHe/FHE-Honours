@@ -244,6 +244,9 @@ class CipherTensor:
     
     def scale(self):
         return self.backend.GetCiphertextScale(self.ids[0])
+
+    def log_scale(self):
+        return self.backend.GetCiphertextScaleLog2(self.ids[0])
     
     def set_scale(self, scale):
         for ctxt in self.ids:
@@ -267,9 +270,10 @@ class CipherTensor:
     def moduli(self):
         return self.backend.GetModuliChain()
     
-    def bootstrap(self):
-        elements = self.on_shape.numel()
-        slots = 2 ** math.ceil(math.log2(elements))
+    def bootstrap(self, slots=None):
+        if slots is None:
+            elements = self.on_shape.numel()
+            slots = 2 ** math.ceil(math.log2(elements))
         slots = int(min(self.slots(), slots)) # sparse bootstrapping
         
         btp_ids = []

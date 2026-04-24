@@ -243,7 +243,8 @@ class Conv2d(LinearTransform):
             self.output_rotations = 0
             return
         runtime = getattr(self, "region_runtime", None)
-        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
+        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
+        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
             self.diagonals = {}
             self.output_rotations = 0
             return
@@ -260,7 +261,8 @@ class Conv2d(LinearTransform):
             self.transform_ids = {}
             return
         runtime = getattr(self, "region_runtime", None)
-        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)):
+        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
+        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
             runtime.assigned_level = int(self.level)
             runtime.assigned_depth = int(self.depth or 0)
             if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_level"):
@@ -287,7 +289,8 @@ class Conv2d(LinearTransform):
     def forward(self, x):
         # Forward pass that handles both cleartext and FHE inference.
         runtime = getattr(self, "region_runtime", None)
-        if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)):
+        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
+        if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)) and bool(runtime_supported):
             output_id = getattr(self, "region_output_id", None) or getattr(self, "name", self.__class__.__name__)
             return runtime.output(str(output_id), x)
         if self.he_mode and bool(getattr(self, "region_first_probe_dense_bypass", False)):
@@ -394,6 +397,12 @@ class ConvTranspose2d(LinearTransform):
         return torch.Size((N, on_Co, on_Ho, on_Wo))
 
     def generate_diagonals(self, last):
+        runtime = getattr(self, "region_runtime", None)
+        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
+        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
+            self.diagonals = {}
+            self.output_rotations = 0
+            return
         if self.load_cached_transform_metadata():
             return
         self.diagonals, self.output_rotations = packing.pack_conv_transpose2d(self, last)
@@ -401,6 +410,18 @@ class ConvTranspose2d(LinearTransform):
             self.save_transforms()
 
     def compile(self):
+        runtime = getattr(self, "region_runtime", None)
+        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
+        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
+            runtime.assigned_level = int(self.level)
+            runtime.assigned_depth = int(self.depth or 0)
+            if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_level"):
+                runtime.executor.assigned_level = int(self.level)
+            if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_depth"):
+                runtime.executor.assigned_depth = int(self.depth or 0)
+            runtime.compile(self.scheme)
+            self.transform_ids = {}
+            return
         if self.get_io_mode() != "none":
             self.diagonals, self.on_bias, self.output_rotations = self.load_transforms()
 
@@ -410,6 +431,11 @@ class ConvTranspose2d(LinearTransform):
         self._transform_backend = self.scheme.backend
 
     def forward(self, x):
+        runtime = getattr(self, "region_runtime", None)
+        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
+        if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)) and bool(runtime_supported):
+            output_id = getattr(self, "region_output_id", None) or getattr(self, "name", self.__class__.__name__)
+            return runtime.output(str(output_id), x)
         if not self.he_mode:
             if x.dim() != 4:
                 raise ValueError(

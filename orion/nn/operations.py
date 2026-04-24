@@ -30,6 +30,9 @@ class Bootstrap(Module):
         self.prescale = 1
         self.postscale = 1
         self.constant = 0
+        self.prescale_ptxt = None
+        self._prescale_vec = None
+        self._prescale_ptxt_cache = {}
 
     def extra_repr(self):
         l_eff = len(self.scheme.params.get_logq()) - 1
@@ -51,17 +54,30 @@ class Bootstrap(Module):
         self.constant = -(self.low + self.high) / 2 
 
     def compile(self):
-        # We'll then encode the prescale at the level of the input ciphertext
-        # to ensure its rescaling is errorless
+        # Precompute the sparse prescale vector once. We then lazily encode it
+        # at the ciphertext's actual runtime level to keep the bootstrap
+        # prescale contract aligned even if the planner's guessed input level
+        # differs from the level that reaches the hook at execution time.
         elements = self.fhe_input_shape.numel()
         curr_slots = 2 ** math.ceil(math.log2(elements))
+        self.bootstrap_slots = curr_slots
 
         prescale_vec = torch.zeros(curr_slots)
         prescale_vec[:elements] = self.prescale
+        self._prescale_vec = prescale_vec
+        self._prescale_ptxt_cache = {}
+        self.prescale_ptxt = self._get_prescale_ptxt(self.input_level)
 
-        ql = self.scheme.encoder.get_moduli_chain()[self.input_level]
-        self.prescale_ptxt = self.scheme.encoder.encode(
-            prescale_vec, level=self.input_level, scale=ql)
+    def _get_prescale_ptxt(self, level):
+        level = int(level)
+        if level not in self._prescale_ptxt_cache:
+            if self._prescale_vec is None:
+                raise RuntimeError("Bootstrap prescale vector has not been compiled")
+            ql = self.scheme.encoder.get_moduli_chain()[level]
+            self._prescale_ptxt_cache[level] = self.scheme.encoder.encode(
+                self._prescale_vec, level=level, scale=ql
+            )
+        return self._prescale_ptxt_cache[level]
 
     @timer
     def forward(self, x):
@@ -73,9 +89,10 @@ class Bootstrap(Module):
         # sparse bootstrapping (i.e., where slots < N/2).
         if self.constant != 0:
             x += self.constant
-        x *= self.prescale_ptxt
+        x *= self._get_prescale_ptxt(x.level())
  
-        x = x.bootstrap()
+        slots = int(min(x.slots(), self.bootstrap_slots))
+        x = x.bootstrap(slots=slots)
 
         # Scale and shift back to the original range
         if self.postscale != 1:
@@ -84,7 +101,5 @@ class Bootstrap(Module):
             x -= self.constant
 
         return x
-
-
 
 

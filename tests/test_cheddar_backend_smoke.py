@@ -151,6 +151,30 @@ def test_cheddar_unified_shared_cache_matches_individual_evaluation() -> None:
 
 
 @pytest.mark.skipif(not _backend_available(), reason="cheddar backend shared library is not built")
+def test_cheddar_linear_transform_uses_bsgs_and_level_specific_key_requests() -> None:
+    scheme = Scheme().init_scheme(_config())
+    try:
+        slots = scheme.params.get_slots()
+        diag_idxs = list(range(0, 17 * 64, 64))
+        transform_id = scheme.backend.GenerateLinearTransform(
+            diag_idxs,
+            [0.0] * (len(diag_idxs) * slots),
+            7,
+            2.0,
+            "none",
+        )
+
+        flat_requests = scheme.backend.GetLinearTransformRotationKeyRequests(transform_id)
+        requests = [(int(flat_requests[i]), int(flat_requests[i + 1])) for i in range(0, len(flat_requests), 2)]
+
+        assert requests
+        assert all(level == 7 for _key, level in requests)
+        assert len(requests) < len([idx for idx in diag_idxs if idx != 0])
+    finally:
+        scheme.delete_scheme()
+
+
+@pytest.mark.skipif(not _backend_available(), reason="cheddar backend shared library is not built")
 def test_cheddar_unified_transform_group_save_mode_offloads_and_recovers(tmp_path: Path) -> None:
     scheme = Scheme().init_scheme(_save_config(tmp_path))
     try:

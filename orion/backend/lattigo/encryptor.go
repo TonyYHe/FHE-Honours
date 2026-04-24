@@ -31,6 +31,7 @@ func Decrypt(ciphertextID C.int) C.int {
 	ciphertext := RetrieveCiphertext(int(ciphertextID))
 
 	plaintext := ckks.NewPlaintext(*scheme.Params, ciphertext.Level())
+	plaintext.Scale = ciphertext.Scale
 	scheme.Decryptor.Decrypt(ciphertext, plaintext)
 
 	idx := PushPlaintext(plaintext)

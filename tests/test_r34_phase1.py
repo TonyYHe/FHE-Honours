@@ -17,13 +17,26 @@ def test_r34_phase1_imported_layout_contracts_cover_selected_representatives() -
     contracts = {contract.haloed_node: contract for contract in imported_layout_contracts()}
 
     assert set(contracts) == {
+        "stem_conv1_torch",
+        "stem_pool_torch",
+        "global_avgpool_exit_torch",
         "layer1_0_conv1_torch",
         "layer2_1_conv1_torch",
+        "layer2_0_conv1_torch",
+        "layer2_0_downsample_conv_torch",
         "layer3_1_conv1_torch",
         "layer4_1_conv1_torch",
         "layer3_0_conv1_torch",
         "layer3_0_downsample_conv_torch",
+        "layer4_0_conv1_torch",
+        "layer4_0_downsample_conv_torch",
     }
+    assert contracts["stem_conv1_torch"].orion_node == "conv1"
+    assert contracts["stem_conv1_torch"].output_layout["stride"] == 2
+    assert contracts["stem_pool_torch"].orion_node == "pool"
+    assert contracts["stem_pool_torch"].groups == 64
+    assert contracts["global_avgpool_exit_torch"].orion_node == "avgpool"
+    assert contracts["global_avgpool_exit_torch"].output_layout["stride"] == 224
     assert contracts["layer1_0_conv1_torch"].orion_node == "layers_0_0_conv1"
     assert contracts["layer1_0_conv1_torch"].input_layout["stride"] == 4
     assert contracts["layer2_1_conv1_torch"].output_layout["stride"] == 8
@@ -67,14 +80,19 @@ def test_r34_phase1_report_surfaces_bindings_and_selected_results() -> None:
     payload = build_r34_phase1_report()
 
     assert payload["status"] == "ok"
-    assert payload["layout_registry"]["selected_node_count"] == 6
+    assert payload["layout_registry"]["selected_node_count"] == 13
     assert len(payload["kernel_bindings"]) == len(kernel_bindings())
     assert {binding["family_label"] for binding in payload["kernel_bindings"]} == {
+        "stem_conv",
+        "stem_pool",
+        "global_avgpool_exit",
         "stage1_same",
         "stage2_same",
+        "stage2_transition",
         "stage3_same",
         "stage4_same",
         "stage3_transition",
+        "stage4_transition",
     }
     assert len(payload["same_shape_surface"]) == 4
     assert payload["selected_results"]["same_shape_region"]["network"] == "R34"

@@ -180,11 +180,11 @@ class NewEvaluator:
             for key, level in keys_to_gen:
                 self._generate_rotation_key(key, level)
 
-        elif self.io_mode == "save":
+        elif self.io_mode in ("save", "load"):
             with h5py.File(self.keys_path, "a") as f:
                 for key, level in keys_to_gen:
                     key_str = self._rotation_key_storage_name(key, level)
-                    if key_str in f: # don't regenerate the key
+                    if key_str in f or str(int(key)) in f: # don't regenerate the key
                         continue
                     
                     # We'll generate, serialize, and then save the key

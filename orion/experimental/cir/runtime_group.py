@@ -23,10 +23,19 @@ from .region_first_data import (
     stats_delta,
 )
 from .lattigo_block import (
+    R18_STAGE4_SPEC,
+    _phase_mask,
     build_r18_stage1_shared_block_plan,
     build_r18_stage2_shared_block_plan,
     build_r18_stage3_shared_block_plan,
     build_r18_stage4_compact_intra_plan,
+)
+from .r18_e2e_bridges import (
+    R18_STAGE12_TRANSITION_SPEC,
+    R18_STAGE23_TRANSITION_SPEC,
+    R18_STAGE34_TRANSITION_SPEC,
+    R18StemBridgeRuntimeExecutor,
+    R18TransitionBridgeRuntimeExecutor,
 )
 
 
@@ -76,6 +85,13 @@ def transforms_from_conv_scheme_plan(plan: Any, *, level: int, scheme: Any, bank
     return transforms, bank_ids
 
 
+def _rescale_cipher_tensor(ct: Any) -> Any:
+    if len(getattr(ct, "ids", ())) != 1:
+        raise ValueError("region-first rescale helper expects a single-ciphertext tensor")
+    rescaled_id = ct.evaluator.rescale(int(ct.ids[0]), in_place=False)
+    return type(ct)(ct.scheme, [int(rescaled_id)], ct.shape, ct.on_shape)
+
+
 class Stage1RuntimeExecutor:
     def __init__(self, *, plan: Any, output_node_ids: tuple[str, ...]) -> None:
         self.plan = plan
@@ -111,6 +127,7 @@ class Stage1RuntimeExecutor:
         outputs: dict[str, Any] = {}
         for node_id, output_id in zip(self.output_node_ids, output_ids):
             ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(self.plan.ring_slot_count)]), torch.Size([1, int(self.plan.ring_slot_count)]))
+            ct = _rescale_cipher_tensor(ct)
             outputs[str(node_id)] = (ct + ct.conjugate(in_place=False)) * 0.5
         return outputs
 
@@ -189,6 +206,7 @@ class Stage2RuntimeExecutor:
                     complex_outputs[str(node_id)] = block_ct
         outputs: dict[str, Any] = {}
         for node_id, ct in complex_outputs.items():
+            ct = _rescale_cipher_tensor(ct)
             outputs[str(node_id)] = (ct + ct.conjugate(in_place=False)) * 0.5
         return outputs
 
@@ -285,6 +303,8 @@ class FullConvRegionRuntimeExecutor:
             "evaluate_unified_s": 0.0,
             "postprocess_s": 0.0,
         }
+        self._compact_source_mask_cache: dict[int, tuple[Any, Any]] = {}
+        self._compact_source_shift: int | None = None
 
     @property
     def bank_count(self) -> int:
@@ -378,6 +398,45 @@ class FullConvRegionRuntimeExecutor:
             sources.append(CipherTensor(scheme, [int(complex_id)], source_ct.shape, source_ct.on_shape))
         return tuple(sources)
 
+    def _stage4_compact_masks(self, source_ct: Any) -> tuple[Any, Any]:
+        scheme = source_ct.scheme
+        level = int(source_ct.level())
+        cached = self._compact_source_mask_cache.get(int(level))
+        if cached is not None:
+            return cached
+
+        spec = R18_STAGE4_SPEC
+        left_phases = tuple(range(int(spec.gap * spec.gap // 2)))
+        right_phases = tuple(range(int(spec.gap * spec.gap // 2), int(spec.gap * spec.gap)))
+        left_selector = _phase_mask(
+            phases=left_phases,
+            shape=(int(spec.c), int(spec.h), int(spec.w)),
+            gap=int(spec.gap),
+        ).to(dtype=torch.float32)
+        right_selector = _phase_mask(
+            phases=right_phases,
+            shape=(int(spec.c), int(spec.h), int(spec.w)),
+            gap=int(spec.gap),
+        ).to(dtype=torch.float32)
+        left_pt = scheme.encode(left_selector, level)
+        right_pt = scheme.encode(right_selector, level)
+        self._compact_source_mask_cache[int(level)] = (left_pt, right_pt)
+        self._compact_source_shift = -int((int(spec.gap) // 2) * int(spec.w) * int(spec.gap))
+        return left_pt, right_pt
+
+    def _compact_stage4_source_from_regular(self, source_ct: Any) -> Any:
+        left_pt, right_pt = self._stage4_compact_masks(source_ct)
+        shift = int(self._compact_source_shift or 0)
+
+        left = source_ct * left_pt
+        right = (source_ct * right_pt).roll(int(shift), in_place=False)
+        compact = left + right.mul_imaginary_unit(+1, in_place=False)
+        compact = compact + compact.roll(int(-shift), in_place=False)
+        compact.region_first_compact_source = True
+        compact.stage4_compact_source = True
+        compact.is_region_first_compact_source = True
+        return compact
+
     def _source_ciphertexts(self, source_ct: Any) -> tuple[Any, ...]:
         explicit_sources = getattr(source_ct, "region_first_block_sources", None)
         if explicit_sources is not None:
@@ -396,7 +455,7 @@ class FullConvRegionRuntimeExecutor:
                 or getattr(source_ct, "is_region_first_compact_source", False)
             ):
                 return (source_ct,)
-            raise RuntimeError("stage4 full-conv region requires compact-intra ciphertext source layout")
+            return (self._compact_stage4_source_from_regular(source_ct),)
         return self._complex_sources_from_ids(source_ct)
 
     def _add_bias(self, ct: Any, *, bank_index: int) -> Any:
@@ -443,6 +502,7 @@ class FullConvRegionRuntimeExecutor:
         for bank_index, ct in enumerate(complex_outputs):
             if ct is None:
                 raise RuntimeError(f"missing region-first output bank {bank_index}")
+            ct = _rescale_cipher_tensor(ct)
             real = (ct + ct.conjugate(in_place=False)) * 0.5
             real = self._add_bias(real, bank_index=int(bank_index))
             real.set_scale(int(scheme.params.get_default_scale()))
@@ -473,6 +533,7 @@ def _replace_group(group: "RegionFirstRuntimeGroup", **updates: Any) -> "RegionF
             "strategy",
             "materializer",
             "depth",
+            "solver_depth",
             "boundary_actions",
             "expected_stats",
             "full_region",
@@ -507,6 +568,7 @@ class RegionFirstRuntimeGroup:
     hidden_fallback: bool = False
     executable: bool = False
     fallback_reason: str = "materializer_does_not_accept_fused_weights"
+    solver_depth: int | None = None
     output_node_ids: tuple[str, ...] = ()
     executor: Any | None = None
     plan: Any | None = None
@@ -525,6 +587,11 @@ class RegionFirstRuntimeGroup:
         payload["executor_attached"] = bool(self.executor is not None)
         return payload
 
+    def effective_depth(self) -> int:
+        if self.solver_depth is not None:
+            return int(self.solver_depth)
+        return int(self.depth)
+
     def __post_init__(self) -> None:
         if not self.output_node_ids:
             self.output_node_ids = tuple(self.conv_nodes)
@@ -539,6 +606,11 @@ class RegionFirstRuntimeGroup:
         if self.executor is not None and scheme is not None and hasattr(self.executor, "compile"):
             self.executor.compile(scheme)
         self.compiled = True
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        if self.executor is not None and hasattr(self.executor, "supports_scheme"):
+            return bool(self.executor.supports_scheme(scheme))
+        return True
 
     def _source_key(self, source_ct: Any) -> tuple[int, ...]:
         ids = getattr(source_ct, "ids", None)
@@ -792,10 +864,22 @@ def _full_conv_region_from_module(
         )
         source_pair_count = 1
     elif stage == "stage4":
-        # The compact ciphertext prepack is not implemented for full-network
-        # handoff yet. Keep stage4 out of the actual E2E replacement registry
-        # until that source-layout transform exists.
-        return None
+        if tuple(int(v) for v in weight.shape) != (512, 512, 3, 3):
+            return None
+        plan_builders.append(build_r18_stage4_compact_intra_plan)
+        builder_kwargs.append(
+            {
+                "weight_override": weight,
+                "bias_override": getattr(module, "on_bias", None),
+                "input_shape": (512, 8, 8),
+                "output_shape": (512, 8, 8),
+                "input_gap": 8,
+                "output_gap": 8,
+            }
+        )
+        requires_compact = True
+        source_pair_count = 1
+        strategy = "compact_intra_group_phase"
     else:
         return None
 
@@ -817,12 +901,115 @@ def _full_conv_region_from_module(
         conv_nodes=(node,),
         strategy=strategy,
         materializer=str(ref.materializer),
-        depth=2,
+        depth=3 if stage == "stage4" else 2,
         boundary_actions=("full_conv_output_assembly", "insert_extract_before_relu_or_add"),
         expected_stats=dict(ref.expected_stats),
         executable=True,
         fallback_reason="",
         output_node_ids=(node,),
+        executor=executor,
+        fused_weight_count=1,
+    )
+
+
+def _r18_transition_modules_compatible(modules: tuple[Any, ...], *, spec: Any) -> bool:
+    if len(modules) != 2:
+        return False
+    conv, shortcut = modules
+    conv_weight = getattr(conv, "on_weight", None)
+    shortcut_weight = getattr(shortcut, "on_weight", None)
+    return (
+        conv_weight is not None
+        and shortcut_weight is not None
+        and tuple(int(v) for v in conv_weight.shape) == (int(spec.c_out), int(spec.c_in), 3, 3)
+        and tuple(int(v) for v in shortcut_weight.shape) == (int(spec.c_out), int(spec.c_in), 1, 1)
+        and tuple(getattr(conv, "stride", ())) == (2, 2)
+        and tuple(getattr(shortcut, "stride", ())) == (2, 2)
+        and tuple(int(v) for v in getattr(conv, "input_shape", torch.Size())[1:]) == (int(spec.c_in), int(spec.h_in), int(spec.w_in))
+        and tuple(int(v) for v in getattr(shortcut, "input_shape", torch.Size())[1:]) == (int(spec.c_in), int(spec.h_in), int(spec.w_in))
+        and tuple(int(v) for v in getattr(conv, "output_shape", torch.Size())[1:]) == (int(spec.c_out), int(spec.h_out), int(spec.w_out))
+        and tuple(int(v) for v in getattr(shortcut, "output_shape", torch.Size())[1:]) == (int(spec.c_out), int(spec.h_out), int(spec.w_out))
+        and int(getattr(conv, "input_gap", -1)) == int(spec.input_gap)
+        and int(getattr(shortcut, "input_gap", -1)) == int(spec.input_gap)
+        and int(getattr(conv, "output_gap", -1)) == int(spec.output_gap)
+        and int(getattr(shortcut, "output_gap", -1)) == int(spec.output_gap)
+    )
+
+
+def _r18_transition_group(*, stage: str, conv_node: str, shortcut_node: str, spec: Any) -> RegionFirstRuntimeGroup:
+    return RegionFirstRuntimeGroup(
+        region_id=f"r18_tiny_e2e_{stage}",
+        network="R18",
+        stage=str(stage),
+        module_prefix=str(conv_node).replace("_", "."),
+        conv_nodes=(str(conv_node), str(shortcut_node)),
+        strategy="strict_channel_split_hybrid_transition_bridge",
+        materializer="strict_channel_split_hybrid_transition_bridge",
+        depth=2,
+        boundary_actions=("full_conv_output_assembly", "insert_extract_before_relu_or_add"),
+        expected_stats={},
+        executable=False,
+        fallback_reason="transition_bridge_materializer_unavailable",
+        output_node_ids=(str(conv_node), str(shortcut_node)),
+    )
+
+
+def _r18_transition_runtime_from_modules(group: RegionFirstRuntimeGroup, modules: tuple[Any, ...], *, spec: Any) -> RegionFirstRuntimeGroup:
+    if not _r18_transition_modules_compatible(modules, spec=spec):
+        return group
+    conv, shortcut = modules
+    executor = R18TransitionBridgeRuntimeExecutor(
+        conv_module=conv,
+        shortcut_module=shortcut,
+        spec=spec,
+        output_node_ids=group.conv_nodes,
+    )
+    return _replace_group(
+        group,
+        executable=True,
+        fallback_reason="",
+        executor=executor,
+        fused_weight_count=2,
+    )
+
+
+def _r18_stem_module_compatible(module: Any) -> bool:
+    weight = getattr(module, "on_weight", None)
+    return bool(
+        weight is not None
+        and tuple(int(v) for v in weight.shape) == (64, 3, 7, 7)
+        and tuple(getattr(module, "stride", ())) == (1, 1)
+        and tuple(getattr(module, "padding", ())) == (3, 3)
+    )
+
+
+def _r18_stem_group(node: str) -> RegionFirstRuntimeGroup:
+    return RegionFirstRuntimeGroup(
+        region_id="r18_tiny_e2e_stem",
+        network="R18",
+        stage="stem",
+        module_prefix="conv1",
+        conv_nodes=(str(node),),
+        strategy="strict_channel_split_stem_bridge",
+        materializer="strict_channel_split_stem_bridge",
+        depth=1,
+        solver_depth=1,
+        boundary_actions=("full_conv_output_assembly",),
+        expected_stats={},
+        executable=False,
+        fallback_reason="stem_bridge_materializer_unavailable",
+        output_node_ids=(str(node),),
+    )
+
+
+def _r18_stem_runtime_from_module(group: RegionFirstRuntimeGroup, module: Any) -> RegionFirstRuntimeGroup:
+    if module is None or not _r18_stem_module_compatible(module):
+        return group
+    executor = R18StemBridgeRuntimeExecutor(module=module, output_node_id=str(group.conv_nodes[0]))
+    return _replace_group(
+        group,
+        executable=True,
+        fallback_reason="",
         executor=executor,
         fused_weight_count=1,
     )
@@ -883,6 +1070,7 @@ def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str
                 strategy="compact_intra_group_phase" if str(stage_name) == "stage4" else "inter_group_shared_lt",
                 materializer=str(ref.materializer),
                 depth=int(depth),
+                solver_depth=1,
                 boundary_actions=("insert_extract_before_relu_or_add", "validate_relu_safe"),
                 expected_stats=dict(ref.expected_stats),
                 executable=False,
@@ -919,7 +1107,12 @@ class RegionFirstCompileRegistry:
         return cls(groups=tuple(groups), graph_audit=dict(graph_audit))
 
     @classmethod
-    def for_r18_tiny_e2e(cls, dag: NetworkDAG) -> "RegionFirstCompileRegistry":
+    def for_r18_tiny_e2e(
+        cls,
+        dag: NetworkDAG,
+        *,
+        allowed_stages: tuple[str, ...] | None = None,
+    ) -> "RegionFirstCompileRegistry":
         refs = _r18_stage_references()
         groups: list[RegionFirstRuntimeGroup] = []
         excluded_nodes: list[dict[str, str]] = []
@@ -929,8 +1122,47 @@ class RegionFirstCompileRegistry:
             "layers_2": "stage3",
             "layers_3": "stage4",
         }
+        allowed = None if allowed_stages is None else {str(stage) for stage in allowed_stages}
+        existing_nodes = set(dag.nodes)
+        handled_nodes: set[str] = set()
+        special_groups: list[RegionFirstRuntimeGroup] = []
+
+        if "conv1" in existing_nodes and (allowed is None or "stem" in allowed):
+            module = dag.nodes["conv1"].get("module")
+            group = _r18_stem_runtime_from_module(_r18_stem_group("conv1"), module)
+            if bool(group.executable):
+                special_groups.append(group)
+                handled_nodes.add("conv1")
+            else:
+                excluded_nodes.append({"node": "conv1", "stage": "stem", "reason": str(group.fallback_reason)})
+
+        transition_specs = (
+            ("stage1_transition", ("layers_1_0_conv1", "layers_1_0_shortcut_0"), R18_STAGE12_TRANSITION_SPEC),
+            ("stage2_transition", ("layers_2_0_conv1", "layers_2_0_shortcut_0"), R18_STAGE23_TRANSITION_SPEC),
+            ("stage3_transition", ("layers_3_0_conv1", "layers_3_0_shortcut_0"), R18_STAGE34_TRANSITION_SPEC),
+        )
+        for stage_name, nodes, spec in transition_specs:
+            if allowed is not None and str(stage_name) not in allowed:
+                continue
+            if not set(nodes).issubset(existing_nodes):
+                excluded_nodes.append({"node": ",".join(nodes), "stage": str(stage_name), "reason": "transition_pair_missing"})
+                continue
+            modules = tuple(dag.nodes[node].get("module") for node in nodes)
+            group = _r18_transition_runtime_from_modules(
+                _r18_transition_group(stage=str(stage_name), conv_node=nodes[0], shortcut_node=nodes[1], spec=spec),
+                modules,
+                spec=spec,
+            )
+            if bool(group.executable):
+                special_groups.append(group)
+                handled_nodes.update(str(node) for node in nodes)
+            else:
+                excluded_nodes.append({"node": ",".join(nodes), "stage": str(stage_name), "reason": str(group.fallback_reason)})
+
         for node in dag.topological_sort():
             if "conv" not in str(node):
+                continue
+            if str(node) in handled_nodes:
                 continue
             stage = None
             for prefix, candidate in stage_by_prefix.items():
@@ -938,6 +1170,9 @@ class RegionFirstCompileRegistry:
                     stage = candidate
                     break
             if stage is None:
+                continue
+            if allowed is not None and str(stage) not in allowed:
+                excluded_nodes.append({"node": str(node), "stage": str(stage), "reason": "stage_filtered_out"})
                 continue
             module = dag.nodes[node].get("module")
             if module is None:
@@ -954,6 +1189,7 @@ class RegionFirstCompileRegistry:
                 excluded_nodes.append({"node": str(node), "stage": str(stage), "reason": "full_conv_region_materializer_unavailable"})
                 continue
             groups.append(group)
+        groups = list(special_groups) + groups
         graph_audit = {
             "node_count": int(len(dag.nodes)),
             "edge_count": int(len(dag.edges)),
@@ -993,7 +1229,7 @@ class RegionFirstCompileRegistry:
             module.region_output_id = str(node)
             module.region_first_skip_dense_pack = bool(group.executable)
             if bool(group.executable) and hasattr(module, "set_depth"):
-                module.set_depth(int(group.depth))
+                module.set_depth(int(group.effective_depth()))
             attached.append({"node": str(node), "stage": str(group.stage), "executable": bool(group.executable)})
             if not bool(group.executable):
                 fallback_layers.append({"node": str(node), "stage": str(group.stage), "reason": str(group.fallback_reason)})
@@ -1179,7 +1415,7 @@ def build_r18_actual_region_first_e2e_report(
             "node": group.conv_nodes[0] if group.conv_nodes else "",
             "stage": group.stage,
             "source_layout": (
-                "compact_intra_ciphertext"
+                "regular_stage4_ciphertext_prepacked_to_compact_intra_at_runtime"
                 if group.stage == "stage4"
                 else "paired_dense_orion_ciphertexts_to_complex_sources"
             ),

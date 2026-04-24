@@ -388,6 +388,7 @@ def build_r34_same_shape_orion_plan(
     output_shape: tuple[int, int, int] | None = None,
     input_gap: int | None = None,
     output_gap: int | None = None,
+    output_block_indices: tuple[int, ...] | None = None,
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
     torch.manual_seed(0)
     expected_policy = r34_same_shape_policy(c=int(spec.c), gap=int(spec.gap))
@@ -428,6 +429,13 @@ def build_r34_same_shape_orion_plan(
 
     output_length = _packed_active_slots(int(spec.c), int(spec.h), int(spec.w), int(spec.gap))
     output_block_count = _ceil_div(int(output_length), int(RING_SLOT_COUNT))
+    if output_block_indices is None:
+        selected_output_blocks = tuple(range(int(output_block_count)))
+    else:
+        selected_output_blocks = tuple(int(index) for index in output_block_indices)
+        invalid = [index for index in selected_output_blocks if index < 0 or index >= int(output_block_count)]
+        if invalid:
+            raise ValueError(f"{spec.family_label} invalid output_block_indices: {invalid}")
     block_height, output_rotations = _orion_hybrid_block_height(int(output_length))
     if int(output_block_count) > 1:
         block_height = int(RING_SLOT_COUNT)
@@ -440,7 +448,7 @@ def build_r34_same_shape_orion_plan(
     all_prepared: list[PreparedPlaintext] = []
     lt_steps: list[LinearTransformStep] = []
     expected = ExecutionStats()
-    for output_block_index in range(int(output_block_count)):
+    for output_block_index in selected_output_blocks:
         for input_block_index in range(int(output_block_count)):
             templates, prepared, step = _build_orion_same_shape_block_lt_assets(
                 spec=spec,
@@ -462,11 +470,11 @@ def build_r34_same_shape_orion_plan(
 
     output_regions = tuple(
         TensorRegion(c_start=0, c_end=int(spec.c), h_start=0, h_end=int(spec.h), w_start=0, w_end=int(spec.w))
-        for _ in range(int(output_block_count))
+        for _ in selected_output_blocks
     )
     output_active_counts = tuple(
         int(min(int(RING_SLOT_COUNT), max(0, int(output_length) - int(block_index) * int(RING_SLOT_COUNT))))
-        for block_index in range(int(output_block_count))
+        for block_index in selected_output_blocks
     )
     plan = ConvSchemePlan(
         case_name=f"orion_vendored_r34_{spec.stage}_same_orion_blocks",
@@ -760,11 +768,322 @@ class R34OrionSameShapeRuntimeExecutor:
 
 
 class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecutor):
-    pass
+    def __init__(self, *, module: Any, spec: R34SameShapeStageSpec, output_node_id: str) -> None:
+        super().__init__(module=module, spec=spec, output_node_id=output_node_id)
+        self.groups_by_input_block: list[Any] = []
+        self.target_indices_by_input_block: list[tuple[int, ...]] = []
+        self.input_block_pairs: list[tuple[int, int | None]] = []
+        self.complex_input_block_flags: list[bool] = []
+
+    def compile(self, scheme: Any) -> None:
+        if self.groups_by_input_block:
+            return
+        prepare_plans_started = time.time()
+        plan = self._ensure_plan()
+        self.last_runtime_timing = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.last_runtime_timing["prepare_plans_s"] = float(time.time() - prepare_plans_started)
+        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        self.rows = int(len(plan.output_regions))
+
+        level = self._level(scheme)
+        prepare_transforms_started = time.time()
+        transforms_by_target_and_input: dict[int, dict[int, Any]] = {}
+        max_input_index = -1
+        for step in plan.linear_transform_steps:
+            input_index = int(_parse_block_index(step.input_id))
+            max_input_index = max(int(max_input_index), int(input_index))
+            transform = _transform_from_plan_step(
+                plan=plan,
+                step=step,
+                level=int(level),
+                scheme=scheme,
+                name=f"{self.output_node_id}_{step.input_id}_t{int(step.target_index)}",
+            )
+            transforms_by_target_and_input.setdefault(int(step.target_index), {})[int(input_index)] = transform
+        self.cols = int(max_input_index + 1)
+
+        entries_by_input_block: list[tuple[tuple[int, int | None], bool, list[tuple[int, Any]]]] = []
+        for left_input_index in range(0, int(self.cols), 2):
+            right_input_index = int(left_input_index + 1)
+            has_right = int(right_input_index) < int(self.cols)
+            entries: list[tuple[int, Any]] = []
+            if has_right:
+                for target_index in range(int(self.rows)):
+                    by_input = transforms_by_target_and_input.get(int(target_index), {})
+                    left_transform = by_input.get(int(left_input_index))
+                    right_transform = by_input.get(int(right_input_index))
+                    if left_transform is None and right_transform is None:
+                        continue
+                    entries.append(
+                        (
+                            int(target_index),
+                            _merge_optional_dense_block_transforms_to_complex(
+                                left_transform,
+                                right_transform,
+                                name=(
+                                    f"{self.output_node_id}_hybrid_pair_"
+                                    f"{int(left_input_index)}_{int(right_input_index)}_t{int(target_index)}"
+                                ),
+                            ),
+                        )
+                    )
+                is_complex = True
+                pair = (int(left_input_index), int(right_input_index))
+            else:
+                for target_index in range(int(self.rows)):
+                    transform = transforms_by_target_and_input.get(int(target_index), {}).get(int(left_input_index))
+                    if transform is not None:
+                        entries.append((int(target_index), transform))
+                is_complex = False
+                pair = (int(left_input_index), None)
+            if entries:
+                entries_by_input_block.append((pair, bool(is_complex), entries))
+        self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
+
+        compile_started = time.time()
+        for pair, is_complex, entries in entries_by_input_block:
+            ordered = sorted(entries, key=lambda item: int(item[0]))
+            group = UnifiedTransformGroup([transform for _target_index, transform in ordered])
+            group.compile_unified(scheme.backend)
+            self.groups_by_input_block.append(group)
+            self.target_indices_by_input_block.append(tuple(int(target_index) for target_index, _transform in ordered))
+            self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
+            self.complex_input_block_flags.append(bool(is_complex))
+        self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        scheme = source_ct.scheme
+        self.last_runtime_timing = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.compile(scheme)
+        ids = tuple(int(value) for value in getattr(source_ct, "ids", ()))
+        if len(ids) < int(self.cols):
+            raise RuntimeError(f"{self.output_node_id} requires {self.cols} source ciphertext blocks, got {len(ids)}")
+
+        output_blocks: list[Any | None] = [None for _ in range(int(self.rows))]
+        evaluate_started = time.time()
+        for block_index, group in enumerate(self.groups_by_input_block):
+            left_input_index, right_input_index = self.input_block_pairs[int(block_index)]
+            if bool(self.complex_input_block_flags[int(block_index)]):
+                if right_input_index is None:
+                    raise RuntimeError(f"{self.output_node_id} hybrid input block pair is missing its imaginary lane")
+                imag_id = scheme.evaluator.mul_imaginary_unit(int(ids[int(right_input_index)]), +1, False)
+                input_id = scheme.evaluator.add_ciphertext(int(ids[int(left_input_index)]), int(imag_id), False)
+            else:
+                input_id = int(ids[int(left_input_index)])
+            output_ids = group.evaluate_unified(int(input_id), scheme.backend)
+            for target_index, output_id in zip(self.target_indices_by_input_block[int(block_index)], output_ids):
+                partial = CipherTensor(
+                    scheme,
+                    [int(output_id)],
+                    torch.Size([1, int(RING_SLOT_COUNT)]),
+                    torch.Size([1, int(RING_SLOT_COUNT)]),
+                )
+                if output_blocks[int(target_index)] is None:
+                    output_blocks[int(target_index)] = partial
+                else:
+                    output_blocks[int(target_index)] = output_blocks[int(target_index)] + partial
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+
+        postprocess_started = time.time()
+        output_ids: list[int] = []
+        needs_real_lane_extract = any(bool(value) for value in self.complex_input_block_flags)
+        for block_index, block_ct in enumerate(output_blocks):
+            if block_ct is None:
+                raise RuntimeError(f"missing same-shape output block {block_index} for {self.output_node_id}")
+            if bool(needs_real_lane_extract):
+                block_ct = (block_ct + block_ct.conjugate(in_place=False)) * 0.5
+            block_ct = self._add_bias(block_ct, block_index=int(block_index))
+            _maybe_set_default_scale(block_ct)
+            output_ids.append(int(block_ct.ids[0]))
+            block_ct.ids = []
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        return {
+            self.output_node_id: CipherTensor(
+                scheme,
+                output_ids,
+                self.output_shape,
+                self.fhe_output_shape,
+            )
+        }
 
 
 class R34IntraGroupPack2SameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecutor):
     pass
+
+
+class R34Pack2SameShapeRuntimeExecutor:
+    def __init__(self, *, module: Any, spec: R34SameShapeStageSpec, output_node_id: str) -> None:
+        self.module = module
+        self.spec = spec
+        self.output_node_id = str(output_node_id)
+        self.group: Any | None = None
+        self.target_indices: tuple[int, ...] = ()
+        self.bias_vector: torch.Tensor | None = None
+        self.output_shape = getattr(module, "output_shape", None)
+        self.fhe_output_shape = getattr(module, "fhe_output_shape", None)
+        self.slots = int(RING_SLOT_COUNT)
+        self.cols = 2
+        self.rows = 0
+        self.compile_count = 0
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
+        self.last_runtime_timing: dict[str, float] = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+
+    def _level(self, scheme: Any) -> int:
+        return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+
+    def _validate_module(self) -> None:
+        weight = getattr(self.module, "on_weight", None)
+        if weight is None:
+            raise RuntimeError(f"{self.output_node_id} has no fused Orion weight for R34 pack2 runtime")
+        if tuple(int(v) for v in tuple(weight.shape)) != tuple(int(v) for v in self.spec.weight_shape):
+            raise RuntimeError(f"{self.output_node_id} weight shape does not match {self.spec.family_label}")
+        if tuple(int(v) for v in getattr(self.module, "stride", ())) != (1, 1):
+            raise RuntimeError(f"{self.output_node_id} stride does not match {self.spec.family_label}")
+        if tuple(int(v) for v in getattr(self.module, "padding", ())) != (1, 1):
+            raise RuntimeError(f"{self.output_node_id} padding does not match {self.spec.family_label}")
+        if tuple(int(v) for v in getattr(self.module, "input_shape", torch.Size())[1:]) != (int(self.spec.c), int(self.spec.h), int(self.spec.w)):
+            raise RuntimeError(f"{self.output_node_id} input_shape does not match {self.spec.family_label}")
+        if tuple(int(v) for v in getattr(self.module, "output_shape", torch.Size())[1:]) != (int(self.spec.c), int(self.spec.h), int(self.spec.w)):
+            raise RuntimeError(f"{self.output_node_id} output_shape does not match {self.spec.family_label}")
+        if int(getattr(self.module, "input_gap", -1)) != int(self.spec.gap):
+            raise RuntimeError(f"{self.output_node_id} input_gap does not match {self.spec.family_label}")
+        if int(getattr(self.module, "output_gap", -1)) != int(self.spec.gap):
+            raise RuntimeError(f"{self.output_node_id} output_gap does not match {self.spec.family_label}")
+
+    def _bias_chunk(self, *, target_index: int) -> torch.Tensor | None:
+        if self.bias_vector is None:
+            return None
+        start = int(target_index) * int(self.slots)
+        end = min(int(start + self.slots), int(self.bias_vector.numel()))
+        out = torch.zeros((int(self.slots),), dtype=torch.float32)
+        if end > start:
+            out[: int(end - start)] = self.bias_vector[int(start): int(end)]
+        return out
+
+    def _add_bias(self, ct: Any, *, target_index: int) -> Any:
+        chunk = self._bias_chunk(target_index=int(target_index))
+        if chunk is None:
+            return ct
+        bias_pt = ct.scheme.encode(chunk, ct.level())
+        return ct + bias_pt
+
+    def compile(self, scheme: Any) -> None:
+        if self.group is not None:
+            return
+        self._validate_module()
+        from orion.nn.unified_transform import UnifiedTransformGroup
+
+        prepare_started = time.time()
+        assets = build_r34_same_shape_pack2_prototype_assets(
+            spec=self.spec,
+            weight_override=getattr(self.module, "on_weight"),
+            bias_override=getattr(self.module, "on_bias", None),
+            input_shape=(int(self.spec.c), int(self.spec.h), int(self.spec.w)),
+            output_shape=(int(self.spec.c), int(self.spec.h), int(self.spec.w)),
+            input_gap=int(self.spec.gap),
+            output_gap=int(self.spec.gap),
+            level=self._level(scheme),
+            scheme=scheme,
+        )
+        self.target_indices = tuple(int(v) for v in assets["prototype"]["target_indices"])
+        self.rows = int(len(self.target_indices))
+        transforms = list(assets["prototype"]["transforms"])
+        self.last_runtime_timing = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": float(time.time() - prepare_started),
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        compile_started = time.time()
+        self.group = UnifiedTransformGroup(transforms)
+        self.group.compile_unified(scheme.backend)
+        self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        scheme = source_ct.scheme
+        self.last_runtime_timing = {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+        }
+        self.compile(scheme)
+        ids = tuple(int(v) for v in getattr(source_ct, "ids", ()))
+        if len(ids) < 2:
+            raise RuntimeError(f"{self.output_node_id} pack2 runtime requires 2 source ciphertext blocks, got {len(ids)}")
+        imag_id = scheme.evaluator.mul_imaginary_unit(int(ids[1]), +1, False)
+        complex_id = scheme.evaluator.add_ciphertext(int(ids[0]), int(imag_id), False)
+        complex_source = CipherTensor(
+            scheme,
+            [int(complex_id)],
+            torch.Size([1, int(self.slots)]),
+            torch.Size([1, int(self.slots)]),
+        )
+        evaluate_started = time.time()
+        assert self.group is not None
+        output_ids = self.group.evaluate_unified(int(complex_source.ids[0]), scheme.backend)
+        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+
+        postprocess_started = time.time()
+        row_outputs: dict[int, int] = {}
+        for target_index, output_id in zip(self.target_indices, output_ids):
+            raw = CipherTensor(
+                scheme,
+                [int(output_id)],
+                torch.Size([1, int(self.slots)]),
+                torch.Size([1, int(self.slots)]),
+            )
+            real = (raw + raw.conjugate(in_place=False)) * 0.5
+            real = self._add_bias(real, target_index=int(target_index))
+            _maybe_set_default_scale(real)
+            row_outputs[int(target_index)] = int(real.ids[0])
+            real.ids = []
+        ordered_ids = [int(row_outputs[int(index)]) for index in sorted(row_outputs)]
+        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        return {
+            self.output_node_id: CipherTensor(
+                scheme,
+                ordered_ids,
+                self.output_shape,
+                self.fhe_output_shape,
+            )
+        }
+
+
+def _maybe_set_default_scale(ct: Any) -> None:
+    backend_name = str(type(ct.scheme.backend).__name__)
+    if backend_name == "LattigoLibrary":
+        try:
+            current_scale = int(ct.scale())
+        except Exception:
+            return
+        if int(current_scale) > (1 << 60):
+            return
+    ct.set_scale(int(ct.scheme.params.get_default_scale()))
 
 
 def _step_dict_by_target_and_input(plan: ConvSchemePlan) -> dict[int, dict[int, LinearTransformStep]]:
@@ -781,34 +1100,127 @@ def _merge_dense_block_transforms_to_complex(
     *,
     name: str,
 ) -> Any:
-    slots = int(left.fhe_output_shape[-1])
-    left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {}))
-    right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {}))
+    return _merge_optional_dense_block_transforms_to_complex(left, right, name=str(name))
+
+
+def _merge_optional_dense_block_transforms_to_complex(
+    left: Any | None,
+    right: Any | None,
+    *,
+    name: str,
+) -> Any:
+    if left is None and right is None:
+        raise ValueError("at least one dense block transform is required")
+    anchor = left if left is not None else right
+    slots = int(anchor.fhe_output_shape[-1])
+    left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
+    right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
     all_keys = sorted({int(key) for key in left_diags.keys()} | {int(key) for key in right_diags.keys()})
-    merged: dict[int, list[complex]] = {}
+    merged: dict[int, torch.Tensor] = {}
     for key in all_keys:
         left_diag = left_diags.get(int(key))
         right_diag = right_diags.get(int(key))
         left_tensor = (
-            torch.tensor(left_diag, dtype=torch.float32)
-            if left_diag is not None
-            else torch.zeros((int(slots),), dtype=torch.float32)
-        )
+            left_diag.detach().clone().to(dtype=torch.float32)
+            if isinstance(left_diag, torch.Tensor)
+            else torch.tensor(left_diag, dtype=torch.float32)
+        ) if left_diag is not None else torch.zeros((int(slots),), dtype=torch.float32)
         right_tensor = (
-            torch.tensor(right_diag, dtype=torch.float32)
-            if right_diag is not None
-            else torch.zeros((int(slots),), dtype=torch.float32)
-        )
-        merged[int(key)] = (left_tensor.to(dtype=torch.complex64) - 1j * right_tensor.to(dtype=torch.complex64)).tolist()
+            right_diag.detach().clone().to(dtype=torch.float32)
+            if isinstance(right_diag, torch.Tensor)
+            else torch.tensor(right_diag, dtype=torch.float32)
+        ) if right_diag is not None else torch.zeros((int(slots),), dtype=torch.float32)
+        merged[int(key)] = left_tensor.to(dtype=torch.complex64) - 1j * right_tensor.to(dtype=torch.complex64)
     return SimpleNamespace(
         name=str(name),
         diagonals={(0, 0): merged},
-        level=int(left.level),
-        scheme=left.scheme,
-        fhe_output_shape=left.fhe_output_shape,
-        output_shape=left.output_shape,
-        target_index=int(getattr(left, "target_index", 0)),
+        level=int(anchor.level),
+        scheme=anchor.scheme,
+        fhe_output_shape=anchor.fhe_output_shape,
+        output_shape=anchor.output_shape,
+        target_index=int(getattr(anchor, "target_index", 0)),
         input_id="orion_complex_source_block_0",
+    )
+
+
+def _build_orion_same_shape_direct_transform(
+    *,
+    spec: R34SameShapeStageSpec,
+    weight: torch.Tensor,
+    output_block_index: int,
+    input_block_index: int,
+    level: int,
+    scheme: Any,
+    name: str,
+) -> Any:
+    output_length = _packed_active_slots(int(spec.c), int(spec.h), int(spec.w), int(spec.gap))
+    output_start = int(output_block_index) * int(RING_SLOT_COUNT)
+    output_end = min(int(output_length), int(output_start + int(RING_SLOT_COUNT)))
+    input_start = int(input_block_index) * int(RING_SLOT_COUNT)
+    input_end = min(int(output_length), int(input_start + int(RING_SLOT_COUNT)))
+    base_indices = _channel_base_indices(channels=int(spec.c), height=int(spec.h), width=int(spec.w), gap=int(spec.gap))
+    delta_groups = _same_shape_delta_groups(spec)
+    spatial_parts: list[tuple[int, int, torch.Tensor, torch.Tensor]] = []
+    candidate_shifts: set[int] = set()
+    for kh in range(3):
+        for kw in range(3):
+            out_spatial, src_spatial, spatial_offset = _same_shape_spatial_parts(spec=spec, kh=int(kh), kw=int(kw))
+            if int(out_spatial.numel()) == 0:
+                continue
+            spatial_parts.append((int(kh), int(kw), out_spatial, src_spatial))
+            for delta in delta_groups:
+                candidate_shifts.add(int(delta) + int(spatial_offset) - int(output_start) + int(input_start))
+
+    diag_tensors: dict[int, torch.Tensor] = {}
+    for shift in sorted(candidate_shifts):
+        output_parts: list[torch.Tensor] = []
+        value_parts: list[torch.Tensor] = []
+        for kh, kw, out_spatial, src_spatial in spatial_parts:
+            spatial_offset = int((out_spatial[0] - src_spatial[0]).item())
+            needed_delta = int(shift) - int(spatial_offset) + int(output_start) - int(input_start)
+            group = delta_groups.get(int(needed_delta))
+            if group is None:
+                continue
+            oc_pairs, ic_pairs = group
+            coeff = weight[
+                oc_pairs.to(dtype=torch.int64),
+                ic_pairs.to(dtype=torch.int64),
+                int(kh),
+                int(kw),
+            ].to(dtype=torch.float32)
+            out_global = base_indices.index_select(0, oc_pairs.to(dtype=torch.int64))[:, None] + out_spatial[None, :]
+            src_global = base_indices.index_select(0, ic_pairs.to(dtype=torch.int64))[:, None] + src_spatial[None, :]
+            valid = (
+                (out_global >= int(output_start))
+                & (out_global < int(output_end))
+                & (src_global >= int(input_start))
+                & (src_global < int(input_end))
+            )
+            if not bool(torch.any(valid).item()):
+                continue
+            output_parts.append((out_global - int(output_start))[valid].to(dtype=torch.int64))
+            value_parts.append(coeff[:, None].expand_as(out_global)[valid].to(dtype=torch.float32))
+        if not output_parts:
+            continue
+        output_slots = torch.cat(output_parts).to(dtype=torch.int64)
+        values = torch.cat(value_parts).to(dtype=torch.float32)
+        diag_index = (-int(shift)) % int(RING_SLOT_COUNT)
+        diag = diag_tensors.setdefault(int(diag_index), torch.zeros((int(RING_SLOT_COUNT),), dtype=torch.float32))
+        diag.index_add_(0, output_slots, values)
+
+    if not diag_tensors:
+        raise RuntimeError(
+            f"{spec.family_label} produced no diagonals for output block {output_block_index} input block {input_block_index}"
+        )
+    return SimpleNamespace(
+        name=str(name),
+        diagonals={(0, 0): {int(index): diag for index, diag in sorted(diag_tensors.items())}},
+        level=int(level),
+        scheme=scheme,
+        fhe_output_shape=torch.Size([1, int(RING_SLOT_COUNT)]),
+        output_shape=torch.Size([1, int(RING_SLOT_COUNT)]),
+        target_index=int(output_block_index),
+        input_id=f"orion_source_block_{int(input_block_index)}",
     )
 
 
@@ -824,41 +1236,84 @@ def build_r34_same_shape_pack2_prototype_assets(
     output_gap: int | None = None,
     level: int | None = None,
     scheme: Any | None = None,
+    target_block_indices: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    plan, inputs, reference = build_r34_same_shape_orion_plan(
-        spec=spec,
-        weight_override=weight_override,
-        bias_override=bias_override,
-        source_override=source_override,
-        input_shape=input_shape,
-        output_shape=output_shape,
-        input_gap=input_gap,
-        output_gap=output_gap,
-    )
     if scheme is None:
         raise ValueError("build_r34_same_shape_pack2_prototype_assets requires a scheme")
     if level is None:
         level = len(scheme.params.get_logq()) - 1
 
-    grouped = _step_dict_by_target_and_input(plan)
+    torch.manual_seed(0)
+    expected_policy = r34_same_shape_policy(c=int(spec.c), gap=int(spec.gap))
+    if str(spec.policy) != str(expected_policy):
+        raise ValueError(
+            f"{spec.family_label} policy mismatch: spec says {spec.policy}, derived policy is {expected_policy}"
+        )
+    expected_weight_shape = tuple(int(v) for v in spec.weight_shape)
+    if weight_override is None:
+        weight = torch.randn(expected_weight_shape, dtype=torch.float32)
+    else:
+        weight = weight_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in weight.shape) != expected_weight_shape:
+            raise ValueError(
+                f"{spec.family_label} fused weight shape mismatch: expected {expected_weight_shape}, got {tuple(weight.shape)}"
+            )
+    expected_source_shape = (int(spec.c), int(spec.h), int(spec.w))
+    if source_override is None:
+        x = torch.randn(expected_source_shape, dtype=torch.float32)
+    else:
+        x = source_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in x.shape) != expected_source_shape:
+            raise ValueError(
+                f"{spec.family_label} source shape mismatch: expected {expected_source_shape}, got {tuple(x.shape)}"
+            )
+    if input_shape is not None and tuple(int(v) for v in input_shape) != expected_source_shape:
+        raise ValueError(f"{spec.family_label} input_shape mismatch: {input_shape}")
+    if output_shape is not None and tuple(int(v) for v in output_shape) != expected_source_shape:
+        raise ValueError(f"{spec.family_label} output_shape mismatch: {output_shape}")
+    if input_gap is not None and int(input_gap) != int(spec.gap):
+        raise ValueError(f"{spec.family_label} input_gap mismatch: {input_gap}")
+    if output_gap is not None and int(output_gap) != int(spec.gap):
+        raise ValueError(f"{spec.family_label} output_gap mismatch: {output_gap}")
+    if bias_override is not None:
+        bias = bias_override.detach().to(dtype=torch.float32).clone()
+        if tuple(int(v) for v in bias.shape) != (int(spec.c),):
+            raise ValueError(f"{spec.family_label} bias shape mismatch: expected {(int(spec.c),)}, got {tuple(bias.shape)}")
+
+    output_length = _packed_active_slots(int(spec.c), int(spec.h), int(spec.w), int(spec.gap))
+    output_block_count = _ceil_div(int(output_length), int(RING_SLOT_COUNT))
+    if target_block_indices is None:
+        selected_target_blocks = tuple(range(int(output_block_count)))
+    else:
+        selected_target_blocks = tuple(int(index) for index in target_block_indices)
+        invalid = [index for index in selected_target_blocks if index < 0 or index >= int(output_block_count)]
+        if invalid:
+            raise ValueError(f"{spec.family_label} invalid target_block_indices: {invalid}")
+
+    inputs = _split_flat_into_ring_blocks(
+        _pack_gap_flat(x, shape=(int(spec.c), int(spec.h), int(spec.w)), gap=int(spec.gap)),
+        prefix="orion_source_block",
+    )
+    reference = F.conv2d(x.unsqueeze(0), weight, bias=None, stride=1, padding=1)[0]
+
     baseline_groups: dict[int, Any] = {}
     prototype_transforms: list[Any] = []
     prototype_target_indices: list[int] = []
-    for target_index, by_input in sorted(grouped.items()):
-        left_step = by_input.get(0)
-        right_step = by_input.get(1)
-        if left_step is None or right_step is None:
-            raise RuntimeError(f"{spec.family_label} expected both input blocks for target {target_index}")
-        left_transform = _transform_from_plan_step(
-            plan=plan,
-            step=left_step,
+    for target_index in selected_target_blocks:
+        left_transform = _build_orion_same_shape_direct_transform(
+            spec=spec,
+            weight=weight,
+            output_block_index=int(target_index),
+            input_block_index=0,
             level=int(level),
             scheme=scheme,
             name=f"{spec.family_label}_baseline_in0_t{int(target_index)}",
         )
-        right_transform = _transform_from_plan_step(
-            plan=plan,
-            step=right_step,
+        right_transform = _build_orion_same_shape_direct_transform(
+            spec=spec,
+            weight=weight,
+            output_block_index=int(target_index),
+            input_block_index=1,
             level=int(level),
             scheme=scheme,
             name=f"{spec.family_label}_baseline_in1_t{int(target_index)}",
@@ -878,7 +1333,7 @@ def build_r34_same_shape_pack2_prototype_assets(
     block1 = inputs["orion_source_block_1"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
     complex_source = block0.to(dtype=torch.complex64) + 1j * block1.to(dtype=torch.complex64)
     return {
-        "plan": plan,
+        "plan": None,
         "inputs": inputs,
         "reference": reference,
         "baseline_groups": {

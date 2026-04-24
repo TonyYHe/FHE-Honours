@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from orion.core.network_dag import NetworkDAG
+from orion.core.orion import _region_first_mode_options
 from orion.core.tracer import OrionTracer
 from orion.backend.python.parameters import NewParameters
 from orion.experimental.cir.runtime_group import RegionFirstCompileRegistry, discover_r18_tiny_region_groups
@@ -60,6 +61,8 @@ def test_r18_compile_registry_marks_stage1_to_stage4_executable_with_fused_weigh
         assert getattr(module, "region_first_skip_dense_pack") is True
         assert getattr(module, "region_runtime").executable is True
         assert getattr(module, "region_runtime").executor is not None
+        assert int(getattr(module, "depth")) == 1
+        assert int(getattr(module, "region_runtime").effective_depth()) == 1
 
 
 def test_r18_region_discovery_depths_are_bootstrap_visible() -> None:
@@ -83,3 +86,26 @@ def test_experimental_region_first_config_flag_is_parsed() -> None:
     )
 
     assert params.get_experimental_region_first() == "r18_tiny"
+
+
+def test_region_first_mode_options_can_disable_only_stem_probe_bypass() -> None:
+    options = _region_first_mode_options("r18_tiny_e2e_probe_precompile_no_stem_bypass")
+
+    assert options["enabled"] is True
+    assert options["is_r18"] is True
+    assert options["attach_probe_dense_bypass"] is True
+    assert options["attach_probe_stem_activation_bypass"] is False
+    assert options["probe_region_precompiled"] is True
+    assert options["probe_publishable"] is False
+    assert options["lazy_region_compile"] is False
+
+
+def test_region_first_mode_options_leave_honest_r18_e2e_without_probe_bypasses() -> None:
+    options = _region_first_mode_options("r18_tiny_e2e")
+
+    assert options["enabled"] is True
+    assert options["is_r18"] is True
+    assert options["attach_probe_dense_bypass"] is False
+    assert options["attach_probe_stem_activation_bypass"] is False
+    assert options["probe_region_precompiled"] is False
+    assert options["probe_publishable"] is False
