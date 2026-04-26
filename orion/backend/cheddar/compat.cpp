@@ -35,12 +35,16 @@ using Complex = cheddar::Complex;
 using Ct = cheddar::Ciphertext<word>;
 using Pt = cheddar::Plaintext<word>;
 using Const = cheddar::Constant<word>;
+using Evk = cheddar::EvaluationKey<word>;
 using Parameter = cheddar::Parameter<word>;
 using BootContext = cheddar::BootContext<word>;
 using HoistHandler = cheddar::HoistHandler<word>;
 using LinearTransform = cheddar::LinearTransform<word>;
 using EvalPoly = cheddar::EvalPoly<word>;
 using UserInterface = cheddar::UserInterface<word>;
+using EvkMap = cheddar::EvkMap<word>;
+
+constexpr bool kUseMinKSLinearTransforms = false;
 
 template <typename T>
 class HeapAllocator {
@@ -113,8 +117,12 @@ struct PolynomialSpec {
 
 struct LinearTransformState {
   std::unique_ptr<LinearTransform> transform;
+  std::unique_ptr<EvkMap> rotation_keys;
   cheddar::StripedMatrix matrix;
   std::vector<int> diag_indices;
+  bool singleton = false;
+  int singleton_diag_idx = 0;
+  std::vector<Complex> singleton_values;
   int level = 0;
   int bs = 2;
   int gs = 1;
@@ -129,6 +137,18 @@ struct LinearTransformState {
         level(transform_level),
         bs(baby_step),
         gs(giant_step) {}
+
+  LinearTransformState(cheddar::StripedMatrix raw_matrix,
+                       std::vector<int> indices, int transform_level,
+                       int diag_idx, std::vector<Complex> diag_values)
+      : matrix(std::move(raw_matrix)),
+        diag_indices(std::move(indices)),
+        singleton(true),
+        singleton_diag_idx(diag_idx),
+        singleton_values(std::move(diag_values)),
+        level(transform_level),
+        bs(1),
+        gs(1) {}
 };
 
 struct SharedCacheBucket {
@@ -145,6 +165,7 @@ struct SchemeState {
   std::unique_ptr<Parameter> param;
   std::shared_ptr<BootContext> context;
   std::unique_ptr<UserInterface> interface;
+  std::unique_ptr<UserInterface> bootstrap_interface;
   HeapAllocator<Pt> plaintexts;
   HeapAllocator<Ct> ciphertexts;
   HeapAllocator<PolynomialSpec> polynomials;
@@ -155,6 +176,17 @@ struct SchemeState {
 };
 
 std::unique_ptr<SchemeState> g_scheme;
+
+void SyncBootstrapInterfaceSecrets(SchemeState &state) {
+  if (!state.interface) {
+    return;
+  }
+  cheddar::HostVector<word> main_secret;
+  cheddar::HostVector<word> sparse_secret;
+  state.interface->ExportSecrets(main_secret, sparse_secret);
+  state.bootstrap_interface = std::make_unique<UserInterface>(state.context);
+  state.bootstrap_interface->LoadSecrets(main_secret, sparse_secret);
+}
 
 [[noreturn]] void AbortWithMessage(const char *message) {
   std::fprintf(stderr, "Cheddar backend error: %s\n", message);
@@ -168,6 +200,8 @@ void RequireScheme() {
 }
 
 void EnsureRotationKeyPrepared(int key, int level);
+bool LinearTransformHasRotationKey(const LinearTransformState &state, int key);
+const EvkMap &LinearTransformEvkMap(const LinearTransformState &state);
 
 template <typename T>
 T *AllocArray(std::size_t count) {
@@ -285,6 +319,7 @@ std::unique_ptr<SchemeState> BuildPreset40Scheme() {
                                           preset.num_stc_levels);
   state->context = BootContext::Create(*state->param, boot_param);
   state->interface = std::make_unique<UserInterface>(state->context);
+  SyncBootstrapInterfaceSecrets(*state);
   return state;
 }
 
@@ -378,6 +413,285 @@ unsigned long long EstimateLinearTransformStateDeviceBytes(
          bytes_per_plaintext;
 }
 
+struct LinearTransformLayout {
+  int stride = 1;
+  int gs_stride = 1;
+  std::set<int> baby_steps;
+  std::vector<int> giant_steps;
+};
+
+LinearTransformLayout DescribeLinearTransformLayout(
+    const LinearTransformState &state) {
+  LinearTransformLayout layout;
+  layout.stride = EstimateLinearTransformStride(state);
+  layout.gs_stride = std::max(1, layout.stride * state.bs);
+  const int width = state.matrix.GetWidth();
+  std::set<int> giant_step_set;
+  for (const auto &[diag_idx, _] : state.matrix) {
+    int rot = diag_idx % width;
+    if (rot < 0) {
+      rot += width;
+    }
+    const int bs_rot = rot % layout.gs_stride;
+    const int gs_rot = rot - bs_rot;
+    layout.baby_steps.insert(bs_rot);
+    giant_step_set.insert(gs_rot);
+  }
+  if (layout.baby_steps.empty()) {
+    layout.baby_steps.insert(0);
+  }
+  layout.giant_steps.assign(giant_step_set.begin(), giant_step_set.end());
+  if (layout.giant_steps.empty()) {
+    layout.giant_steps.push_back(0);
+  }
+  return layout;
+}
+
+void AddLinearTransformRequiredRotations(const LinearTransformState &state,
+                                         cheddar::EvkRequest &req) {
+  const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  for (const int bs_idx : layout.baby_steps) {
+    if (bs_idx != 0) {
+      req.AddRequest(bs_idx, state.level);
+    }
+  }
+  for (const int gs_idx : layout.giant_steps) {
+    if (gs_idx != 0) {
+      req.AddRequest(gs_idx, state.level);
+    }
+  }
+}
+
+unsigned long long ReadULLFromEnv(const char *name,
+                                  unsigned long long default_value) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return default_value;
+  }
+  char *end = nullptr;
+  const unsigned long long value = std::strtoull(raw, &end, 10);
+  if (end == raw || value == 0) {
+    return default_value;
+  }
+  return value;
+}
+
+unsigned long long ReadULLFromEnvOrZero(const char *name) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || raw[0] == '\0') {
+    return 0;
+  }
+  char *end = nullptr;
+  const unsigned long long value = std::strtoull(raw, &end, 10);
+  if (end == raw) {
+    return 0;
+  }
+  return value;
+}
+
+bool EnvValueIsFalse(const char *value) {
+  return value != nullptr &&
+         (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+          std::strcmp(value, "False") == 0 ||
+          std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0);
+}
+
+bool EnvValueIsTrue(const char *value) {
+  return value != nullptr &&
+         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+          std::strcmp(value, "True") == 0 ||
+          std::strcmp(value, "on") == 0 || std::strcmp(value, "ON") == 0 ||
+          std::strcmp(value, "force") == 0);
+}
+
+bool ShouldStreamLinearTransform(const LinearTransformState &state) {
+  if (state.singleton) {
+    return false;
+  }
+  const char *mode = std::getenv("ORION_CHEDDAR_LT_STREAMING");
+  if (EnvValueIsFalse(mode)) {
+    return false;
+  }
+  if (EnvValueIsTrue(mode)) {
+    return true;
+  }
+  constexpr unsigned long long kDefaultStreamingThresholdBytes =
+      8ULL * 1024ULL * 1024ULL * 1024ULL;
+  const unsigned long long threshold = ReadULLFromEnv(
+      "ORION_CHEDDAR_LT_STREAMING_THRESHOLD_BYTES",
+      kDefaultStreamingThresholdBytes);
+  return EstimateLinearTransformStateDeviceBytes(state) >= threshold;
+}
+
+unsigned long long LinearTransformPlaintextBytesPerSlot(
+    const LinearTransformState &state) {
+  const auto np = g_scheme->param->LevelToNP(state.level, g_scheme->param->alpha_);
+  return static_cast<unsigned long long>(np.GetNumTotal()) *
+         static_cast<unsigned long long>(g_scheme->param->degree_) *
+         static_cast<unsigned long long>(sizeof(word));
+}
+
+std::map<int, unsigned long long> EstimatePlaintextBytesByGiantStep(
+    const LinearTransformState &state, const LinearTransformLayout &layout) {
+  std::map<int, std::set<int>> baby_steps_by_giant_step;
+  const int width = state.matrix.GetWidth();
+  for (const auto &[diag_idx, _] : state.matrix) {
+    int rot = diag_idx % width;
+    if (rot < 0) {
+      rot += width;
+    }
+    const int bs_rot = rot % layout.gs_stride;
+    const int gs_rot = rot - bs_rot;
+    baby_steps_by_giant_step[gs_rot].insert(bs_rot);
+  }
+  const unsigned long long bytes_per_plaintext =
+      LinearTransformPlaintextBytesPerSlot(state);
+  std::map<int, unsigned long long> result;
+  for (const auto &[gs_idx, bs_set] : baby_steps_by_giant_step) {
+    result[gs_idx] =
+        static_cast<unsigned long long>(bs_set.size()) * bytes_per_plaintext;
+  }
+  return result;
+}
+
+unsigned long long CiphertextDeviceBytesForNP(const cheddar::NPInfo &np,
+                                              bool has_rx = false) {
+  const unsigned long long polys = has_rx ? 3ULL : 2ULL;
+  return polys * static_cast<unsigned long long>(np.GetNumTotal()) *
+         static_cast<unsigned long long>(g_scheme->param->degree_) *
+         static_cast<unsigned long long>(sizeof(word));
+}
+
+unsigned long long StreamingGiantStepMemoryBudgetBytes() {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (err != cudaSuccess || free_bytes == 0) {
+    return 1ULL * 1024ULL * 1024ULL * 1024ULL;
+  }
+  const unsigned long long free_u64 =
+      static_cast<unsigned long long>(free_bytes);
+  const unsigned long long total_u64 =
+      static_cast<unsigned long long>(total_bytes);
+  const unsigned long long default_reserve =
+      std::max(8ULL * 1024ULL * 1024ULL * 1024ULL, total_u64 / 8ULL);
+  const unsigned long long reserve = ReadULLFromEnv(
+      "ORION_CHEDDAR_LT_STREAM_RESERVE_BYTES", default_reserve);
+  const unsigned long long pct =
+      std::min<unsigned long long>(
+          95ULL, ReadULLFromEnv("ORION_CHEDDAR_LT_STREAM_BUDGET_PCT", 60ULL));
+  const unsigned long long fraction_budget =
+      free_u64 * pct / 100ULL;
+  if (free_u64 > reserve) {
+    return std::min(free_u64 - reserve, fraction_budget);
+  }
+  return std::max(256ULL * 1024ULL * 1024ULL, fraction_budget / 2ULL);
+}
+
+std::vector<std::vector<int>> BuildStreamingGiantStepChunks(
+    const LinearTransformState &state, const LinearTransformLayout &layout,
+    const std::map<int, Ct> &bs_cache) {
+  const unsigned long long fixed_chunk =
+      ReadULLFromEnvOrZero("ORION_CHEDDAR_LT_STREAM_GS_CHUNK");
+  const unsigned long long configured_max_chunk =
+      ReadULLFromEnvOrZero("ORION_CHEDDAR_LT_STREAM_GS_MAX_CHUNK");
+  const std::size_t max_chunk =
+      static_cast<std::size_t>(std::max<unsigned long long>(
+          1ULL,
+          fixed_chunk > 0
+              ? fixed_chunk
+              : (configured_max_chunk > 0
+                     ? configured_max_chunk
+                     : static_cast<unsigned long long>(
+                           layout.giant_steps.size()))));
+  const auto bytes_by_gs = EstimatePlaintextBytesByGiantStep(state, layout);
+  const unsigned long long ct_bytes =
+      bs_cache.empty()
+          ? 0ULL
+          : CiphertextDeviceBytesForNP(bs_cache.begin()->second.GetNP());
+  const unsigned long long budget =
+      fixed_chunk > 0 ? ~0ULL : StreamingGiantStepMemoryBudgetBytes();
+
+  std::vector<std::vector<int>> chunks;
+  std::vector<int> current;
+  unsigned long long current_plaintext_bytes = 0;
+  for (const int gs_idx : layout.giant_steps) {
+    const auto it = bytes_by_gs.find(gs_idx);
+    const unsigned long long gs_plaintext_bytes =
+        it == bytes_by_gs.end() ? 0ULL : it->second;
+    const unsigned long long candidate_plaintext_bytes =
+        current_plaintext_bytes + gs_plaintext_bytes;
+    const std::size_t candidate_count = current.size() + 1;
+    const unsigned long long candidate_bytes =
+        candidate_plaintext_bytes +
+        (static_cast<unsigned long long>(candidate_count) + 4ULL) * ct_bytes;
+    const bool over_count = candidate_count > max_chunk;
+    const bool over_budget =
+        fixed_chunk == 0 && !current.empty() && candidate_bytes > budget;
+    if (over_count || over_budget) {
+      chunks.push_back(std::move(current));
+      current = {};
+      current_plaintext_bytes = 0;
+    }
+    current.push_back(gs_idx);
+    current_plaintext_bytes += gs_plaintext_bytes;
+  }
+  if (!current.empty()) {
+    chunks.push_back(std::move(current));
+  }
+  if (chunks.empty()) {
+    chunks.push_back(std::vector<int>{0});
+  }
+  if (EnvValueIsTrue(std::getenv("ORION_CHEDDAR_LT_STREAM_LOG"))) {
+    std::fprintf(stderr,
+                 "Cheddar streaming LT: %zu giant steps in %zu chunks "
+                 "(max_chunk=%zu, budget=%llu, ct_bytes=%llu)\n",
+                 layout.giant_steps.size(), chunks.size(), max_chunk, budget,
+                 ct_bytes);
+  }
+  return chunks;
+}
+
+cheddar::PlainHoistMap BuildPlainHoistMapForGiantSteps(
+    const LinearTransformState &state, const LinearTransformLayout &layout,
+    const std::vector<int> &selected_giant_steps) {
+  const std::set<int> selected(selected_giant_steps.begin(),
+                               selected_giant_steps.end());
+  const int height = state.matrix.GetHeight();
+  const int width = state.matrix.GetWidth();
+  cheddar::PlainHoistMap hoist_map;
+  for (const auto &[diag_idx, diag] : state.matrix) {
+    int rot = diag_idx % width;
+    if (rot < 0) {
+      rot += width;
+    }
+    const int bs_rot = rot % layout.gs_stride;
+    const int gs_rot = rot - bs_rot;
+    if (selected.find(gs_rot) == selected.end()) {
+      continue;
+    }
+    auto &message = hoist_map[gs_rot][bs_rot];
+    if (message.empty()) {
+      message.assign(height, Complex(0.0, 0.0));
+    }
+    int offset = gs_rot % height;
+    if (offset < 0) {
+      offset += height;
+    }
+    for (int j = 0; j < height; ++j) {
+      message[(j + offset) % height] = diag[j];
+    }
+  }
+  return hoist_map;
+}
+
+void SynchronizeCudaAfterStreamingChunk() {
+  const cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    AbortWithMessage("cuda synchronization failed after streaming LT chunk");
+  }
+}
+
 int CiphertextDegree(const Ct &ciphertext) { return ciphertext.HasRx() ? 2 : 1; }
 
 int CiphertextLevel(const Ct &ciphertext) {
@@ -386,6 +700,23 @@ int CiphertextLevel(const Ct &ciphertext) {
 
 int PlaintextLevel(const Pt &plaintext) {
   return g_scheme->param->NPToLevel(plaintext.GetNP());
+}
+
+const Ct &CiphertextAtLevel(Ct &scratch, const Ct &ciphertext,
+                            int target_level) {
+  const int level = CiphertextLevel(ciphertext);
+  if (level == target_level) {
+    return ciphertext;
+  }
+  if (level < target_level) {
+    AbortWithMessage("ciphertext level is below requested target level");
+  }
+  if (target_level < 0) {
+    AbortWithMessage("level-down to Cheddar short base is not supported here");
+  }
+  g_scheme->context->LevelDown(scratch, ciphertext, target_level);
+  scratch.SetScale(ciphertext.GetScale());
+  return scratch;
 }
 
 std::vector<Complex> DecodeMessage(const Pt &plaintext) {
@@ -443,6 +774,33 @@ T ReadPod(const unsigned char *&cursor, const unsigned char *end) {
   return value;
 }
 
+void CopySerializedWordsToDevice(cheddar::DeviceVector<word> &dst,
+                                 const unsigned char *&cursor,
+                                 const unsigned char *end,
+                                 std::uint64_t word_count) {
+  const std::size_t count = static_cast<std::size_t>(word_count);
+  const std::size_t byte_count = count * sizeof(word);
+  if (static_cast<std::size_t>(end - cursor) < byte_count) {
+    AbortWithMessage("serialized word payload is truncated");
+  }
+
+  dst.resize(static_cast<int>(count));
+  void *pinned = nullptr;
+  const cudaError_t alloc_status = cudaHostAlloc(&pinned, byte_count, 0);
+  if (alloc_status == cudaSuccess && pinned != nullptr) {
+    std::memcpy(pinned, cursor, byte_count);
+    cudaMemcpyAsync(dst.data(), pinned, byte_count, cudaMemcpyHostToDevice,
+                    dst.stream());
+    cudaStreamSynchronize(dst.stream());
+    cudaFreeHost(pinned);
+  } else {
+    cheddar::HostVector<word> host(count);
+    std::memcpy(host.data(), cursor, byte_count);
+    cheddar::CopyHostToDevice(dst, host);
+  }
+  cursor += byte_count;
+}
+
 std::vector<unsigned char> SerializeEvaluationKeyBytes(
     const cheddar::EvaluationKey<word> &key) {
   const cheddar::NPInfo np = key.GetNP();
@@ -488,18 +846,12 @@ cheddar::EvaluationKey<word> DeserializeEvaluationKeyBytes(
   cheddar::EvaluationKey<word> key(cheddar::NPInfo(num_main, num_ter, num_aux),
                                    beta);
   for (int index = 0; index < beta; ++index) {
-    cheddar::HostVector<word> bx_host(static_cast<std::size_t>(vec_size));
-    cheddar::HostVector<word> ax_host(static_cast<std::size_t>(vec_size));
     const std::size_t byte_count = static_cast<std::size_t>(vec_size) * sizeof(word);
     if (static_cast<std::size_t>(end - cursor) < byte_count * 2) {
       AbortWithMessage("serialized evaluation key payload is truncated");
     }
-    std::memcpy(bx_host.data(), cursor, byte_count);
-    cursor += byte_count;
-    std::memcpy(ax_host.data(), cursor, byte_count);
-    cursor += byte_count;
-    cheddar::CopyHostToDevice(key.bx_.at(index), bx_host);
-    cheddar::CopyHostToDevice(key.ax_.at(index), ax_host);
+    CopySerializedWordsToDevice(key.bx_.at(index), cursor, end, vec_size);
+    CopySerializedWordsToDevice(key.ax_.at(index), cursor, end, vec_size);
   }
   return key;
 }
@@ -544,6 +896,13 @@ void LoadSecretBytes(const unsigned char *data, std::size_t size) {
   cursor += main_bytes;
   std::memcpy(sparse_secret.data(), cursor, sparse_bytes);
   g_scheme->interface->LoadSecrets(main_secret, sparse_secret);
+  if (!g_scheme->bootstrap_interface) {
+    g_scheme->bootstrap_interface =
+        std::make_unique<UserInterface>(g_scheme->context);
+  }
+  g_scheme->bootstrap_interface->LoadSecrets(main_secret, sparse_secret);
+  g_scheme->eval_mod_prepared = false;
+  g_scheme->prepared_boot_slots.clear();
 }
 
 std::vector<unsigned char> SerializeDiagonalBytes(
@@ -560,6 +919,111 @@ std::vector<unsigned char> SerializeDiagonalBytes(
     AppendPod(payload, value.imag());
   }
   return payload;
+}
+
+constexpr std::uint32_t kLinearTransformPlaintextsMagic = 0x4f484c54U;
+constexpr std::uint32_t kLinearTransformPlaintextsVersion = 1U;
+
+void AppendPlaintextPayload(std::vector<unsigned char> &buffer,
+                            const Pt &plaintext) {
+  const cheddar::NPInfo np = plaintext.GetNP();
+  cheddar::HostVector<word> host;
+  cheddar::CopyDeviceToHost(host, plaintext.mx_);
+  AppendPod(buffer, static_cast<std::int32_t>(np.num_main_));
+  AppendPod(buffer, static_cast<std::int32_t>(np.num_ter_));
+  AppendPod(buffer, static_cast<std::int32_t>(np.num_aux_));
+  AppendPod(buffer, static_cast<std::int32_t>(plaintext.GetNumSlots()));
+  AppendPod(buffer, plaintext.GetScale());
+  AppendPod(buffer, static_cast<std::uint64_t>(host.size()));
+  const unsigned char *raw =
+      reinterpret_cast<const unsigned char *>(host.data());
+  buffer.insert(buffer.end(), raw, raw + host.size() * sizeof(word));
+}
+
+Pt ReadPlaintextPayload(const unsigned char *&cursor,
+                        const unsigned char *end) {
+  const int num_main = ReadPod<std::int32_t>(cursor, end);
+  const int num_ter = ReadPod<std::int32_t>(cursor, end);
+  const int num_aux = ReadPod<std::int32_t>(cursor, end);
+  const int num_slots = ReadPod<std::int32_t>(cursor, end);
+  const double scale = ReadPod<double>(cursor, end);
+  const std::uint64_t word_count = ReadPod<std::uint64_t>(cursor, end);
+  const cheddar::NPInfo np(num_main, num_ter, num_aux);
+  const std::uint64_t expected_word_count =
+      static_cast<std::uint64_t>(np.GetNumTotal()) *
+      static_cast<std::uint64_t>(g_scheme->param->degree_);
+  if (word_count != expected_word_count) {
+    AbortWithMessage("serialized plaintext payload has invalid size");
+  }
+  Pt plaintext(np);
+  plaintext.SetNumSlots(num_slots);
+  plaintext.SetScale(scale);
+  CopySerializedWordsToDevice(plaintext.mx_, cursor, end, word_count);
+  return plaintext;
+}
+
+std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
+    LinearTransformState &state) {
+  const LinearTransform &transform = EnsureTransformLoaded(state);
+  const auto &plaintext_map = transform.GetPlaintextMap();
+
+  std::uint64_t record_count = 0;
+  for (const auto &[_, bs_map] : plaintext_map) {
+    record_count += static_cast<std::uint64_t>(bs_map.size());
+  }
+
+  std::vector<unsigned char> payload;
+  AppendPod(payload, kLinearTransformPlaintextsMagic);
+  AppendPod(payload, kLinearTransformPlaintextsVersion);
+  AppendPod(payload, static_cast<std::int32_t>(state.level));
+  AppendPod(payload, static_cast<std::int32_t>(state.bs));
+  AppendPod(payload, static_cast<std::int32_t>(state.gs));
+  AppendPod(payload, record_count);
+  for (const auto &[gs_idx, bs_map] : plaintext_map) {
+    for (const auto &[bs_idx, plaintext] : bs_map) {
+      AppendPod(payload, static_cast<std::int32_t>(gs_idx));
+      AppendPod(payload, static_cast<std::int32_t>(bs_idx));
+      AppendPlaintextPayload(payload, plaintext);
+    }
+  }
+  return payload;
+}
+
+void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
+                                        const unsigned char *data,
+                                        std::size_t size) {
+  const unsigned char *cursor = data;
+  const unsigned char *end = data + size;
+  const std::uint32_t magic = ReadPod<std::uint32_t>(cursor, end);
+  const std::uint32_t version = ReadPod<std::uint32_t>(cursor, end);
+  if (magic != kLinearTransformPlaintextsMagic ||
+      version != kLinearTransformPlaintextsVersion) {
+    AbortWithMessage("unsupported linear transform plaintext payload");
+  }
+  const int level = ReadPod<std::int32_t>(cursor, end);
+  const int bs = ReadPod<std::int32_t>(cursor, end);
+  const int gs = ReadPod<std::int32_t>(cursor, end);
+  const std::uint64_t record_count = ReadPod<std::uint64_t>(cursor, end);
+  if (level != state.level || bs != state.bs || gs != state.gs) {
+    AbortWithMessage("linear transform plaintext payload does not match transform");
+  }
+
+  LinearTransform::PlaintextMap plaintext_map;
+  for (std::uint64_t record = 0; record < record_count; ++record) {
+    const int gs_idx = ReadPod<std::int32_t>(cursor, end);
+    const int bs_idx = ReadPod<std::int32_t>(cursor, end);
+    plaintext_map[gs_idx].emplace(bs_idx, ReadPlaintextPayload(cursor, end));
+  }
+  if (cursor != end) {
+    AbortWithMessage("linear transform plaintext payload has trailing bytes");
+  }
+
+  state.transform.reset();
+  state.transform = std::make_unique<LinearTransform>(
+      g_scheme->context, std::move(plaintext_map), state.level,
+      g_scheme->param->GetScale(state.level), state.bs, state.gs, 0, 0,
+      EstimateLinearTransformStride(state));
+  g_scheme->shared_cache_plans.clear();
 }
 
 template <typename Fn>
@@ -580,7 +1044,13 @@ int ApplyCiphertextUnaryNew(int ciphertext_id, Fn &&fn) {
 template <typename Fn>
 int ApplyCiphertextBinaryInPlace(int lhs_id, int rhs_id, Fn &&fn) {
   Ct result;
-  fn(result, RetrieveCiphertext(lhs_id), RetrieveCiphertext(rhs_id));
+  const Ct &lhs = RetrieveCiphertext(lhs_id);
+  const Ct &rhs = RetrieveCiphertext(rhs_id);
+  const int target_level = std::min(CiphertextLevel(lhs), CiphertextLevel(rhs));
+  Ct lhs_leveled;
+  Ct rhs_leveled;
+  fn(result, CiphertextAtLevel(lhs_leveled, lhs, target_level),
+     CiphertextAtLevel(rhs_leveled, rhs, target_level));
   RetrieveCiphertext(lhs_id) = std::move(result);
   return lhs_id;
 }
@@ -588,7 +1058,13 @@ int ApplyCiphertextBinaryInPlace(int lhs_id, int rhs_id, Fn &&fn) {
 template <typename Fn>
 int ApplyCiphertextBinaryNew(int lhs_id, int rhs_id, Fn &&fn) {
   Ct result;
-  fn(result, RetrieveCiphertext(lhs_id), RetrieveCiphertext(rhs_id));
+  const Ct &lhs = RetrieveCiphertext(lhs_id);
+  const Ct &rhs = RetrieveCiphertext(rhs_id);
+  const int target_level = std::min(CiphertextLevel(lhs), CiphertextLevel(rhs));
+  Ct lhs_leveled;
+  Ct rhs_leveled;
+  fn(result, CiphertextAtLevel(lhs_leveled, lhs, target_level),
+     CiphertextAtLevel(rhs_leveled, rhs, target_level));
   return PushCiphertext(std::move(result));
 }
 
@@ -596,7 +1072,15 @@ template <typename Fn>
 int ApplyCiphertextPlainBinaryInPlace(int ciphertext_id, int plaintext_id,
                                       Fn &&fn) {
   Ct result;
-  fn(result, RetrieveCiphertext(ciphertext_id), RetrievePlaintext(plaintext_id));
+  const Ct &ciphertext = RetrieveCiphertext(ciphertext_id);
+  const Pt &plaintext = RetrievePlaintext(plaintext_id);
+  const int ciphertext_level = CiphertextLevel(ciphertext);
+  const int plaintext_level = PlaintextLevel(plaintext);
+  if (ciphertext_level < plaintext_level) {
+    AbortWithMessage("plaintext level exceeds ciphertext level");
+  }
+  Ct leveled;
+  fn(result, CiphertextAtLevel(leveled, ciphertext, plaintext_level), plaintext);
   RetrieveCiphertext(ciphertext_id) = std::move(result);
   return ciphertext_id;
 }
@@ -605,7 +1089,15 @@ template <typename Fn>
 int ApplyCiphertextPlainBinaryNew(int ciphertext_id, int plaintext_id,
                                   Fn &&fn) {
   Ct result;
-  fn(result, RetrieveCiphertext(ciphertext_id), RetrievePlaintext(plaintext_id));
+  const Ct &ciphertext = RetrieveCiphertext(ciphertext_id);
+  const Pt &plaintext = RetrievePlaintext(plaintext_id);
+  const int ciphertext_level = CiphertextLevel(ciphertext);
+  const int plaintext_level = PlaintextLevel(plaintext);
+  if (ciphertext_level < plaintext_level) {
+    AbortWithMessage("plaintext level exceeds ciphertext level");
+  }
+  Ct leveled;
+  fn(result, CiphertextAtLevel(leveled, ciphertext, plaintext_level), plaintext);
   return PushCiphertext(std::move(result));
 }
 
@@ -725,18 +1217,69 @@ int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
     throw std::runtime_error(
         "linear transform level is outside supported preset range");
   }
+  if (matrix.size() == 1) {
+    const auto &entry = *matrix.begin();
+    std::vector<int> diag_indices = {entry.first};
+    return g_scheme->transforms.Add(LinearTransformState(
+        matrix, std::move(diag_indices), level, entry.first, entry.second));
+  }
   const auto [bs, gs] = ChooseLinearTransformSplit(matrix, bsgs_ratio);
-  auto transform = std::make_unique<LinearTransform>(
-      g_scheme->context, matrix, level, g_scheme->param->GetScale(level), bs,
-      gs);
   std::vector<int> diag_indices;
   diag_indices.reserve(matrix.size());
   for (const auto &[diag_idx, _] : matrix) {
     diag_indices.push_back(diag_idx);
   }
   return g_scheme->transforms.Add(
-      LinearTransformState(std::move(transform), matrix,
+      LinearTransformState(std::unique_ptr<LinearTransform>(), matrix,
                            std::move(diag_indices), level, bs, gs));
+}
+
+int SingletonLinearTransformRotationKey(const LinearTransformState &state) {
+  if (!state.singleton) {
+    return 0;
+  }
+  const int width = std::max(1, state.matrix.GetWidth());
+  return NormalizeRotationIndex(state.singleton_diag_idx, width);
+}
+
+int EvaluateSingletonLinearTransform(const LinearTransformState &state,
+                                     int ciphertext_id) {
+  const Ct &input = RetrieveCiphertext(ciphertext_id);
+  const int input_level = CiphertextLevel(input);
+  if (input_level < state.level) {
+    AbortWithMessage("input ciphertext level is below the linear transform level");
+  }
+  Ct leveled_input;
+  const Ct &eval_input = CiphertextAtLevel(leveled_input, input, state.level);
+
+  const int rotation = SingletonLinearTransformRotationKey(state);
+  Ct rotated;
+  const Ct *mul_input = &eval_input;
+  if (rotation != 0) {
+    EnsureRotationKeyPrepared(rotation, state.level);
+    g_scheme->context->HRot(rotated, eval_input,
+                            g_scheme->interface->GetRotationKey(rotation),
+                            rotation);
+    mul_input = &rotated;
+  }
+
+  Pt plaintext =
+      EncodeMessage(state.singleton_values, state.level,
+                    g_scheme->param->GetScale(state.level));
+  Ct multiplied;
+  g_scheme->context->Mult(multiplied, *mul_input, plaintext);
+  Ct output;
+  g_scheme->context->Rescale(output, multiplied);
+  return PushCiphertext(std::move(output));
+}
+
+bool HasSingletonLinearTransform(const std::vector<int> &ordered_ids) {
+  for (int transform_id : ordered_ids) {
+    if (RetrieveTransform(transform_id).singleton) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::unique_ptr<HoistHandler> BuildSharedCacheHoist(
@@ -750,6 +1293,75 @@ std::unique_ptr<HoistHandler> BuildSharedCacheHoist(
   return std::make_unique<HoistHandler>(
       g_scheme->context, hoist_map, level, g_scheme->param->GetScale(level),
       true);
+}
+
+void PrepareLinearTransformRotationKeys(const LinearTransformState &state) {
+  cheddar::EvkRequest req;
+  AddLinearTransformRequiredRotations(state, req);
+  for (const auto &[rot_idx, _] : req) {
+    if (rot_idx != 0 && !LinearTransformHasRotationKey(state, rot_idx)) {
+      EnsureRotationKeyPrepared(rot_idx, state.level);
+    }
+  }
+}
+
+void EvaluateLinearTransformGiantStepStreaming(
+    const LinearTransformState &state, Ct &output,
+    const std::map<int, Ct> &bs_cache, const EvkMap &evk_map) {
+  const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  const std::vector<std::vector<int>> chunks =
+      BuildStreamingGiantStepChunks(state, layout, bs_cache);
+  bool initialized = false;
+  Ct accumulated_output;
+  for (const std::vector<int> &chunk : chunks) {
+    cheddar::PlainHoistMap chunk_map =
+        BuildPlainHoistMapForGiantSteps(state, layout, chunk);
+    if (chunk_map.empty()) {
+      continue;
+    }
+    Ct partial_output;
+    {
+      HoistHandler chunk_hoist(g_scheme->context, chunk_map, state.level,
+                               g_scheme->param->GetScale(state.level), true);
+      chunk_hoist.EvaluateGiantStep(g_scheme->context, partial_output, bs_cache,
+                                    evk_map, kUseMinKSLinearTransforms);
+      SynchronizeCudaAfterStreamingChunk();
+    }
+    if (!initialized) {
+      accumulated_output = std::move(partial_output);
+      initialized = true;
+    } else {
+      Ct sum;
+      g_scheme->context->Add(sum, accumulated_output, partial_output);
+      accumulated_output = std::move(sum);
+    }
+  }
+  if (!initialized) {
+    AbortWithMessage("streaming linear transform produced no giant-step chunks");
+  }
+  output = std::move(accumulated_output);
+}
+
+int EvaluateLinearTransformStreaming(LinearTransformState &state,
+                                     int ciphertext_id) {
+  const Ct &input = RetrieveCiphertext(ciphertext_id);
+  const int input_level = CiphertextLevel(input);
+  if (input_level < state.level) {
+    AbortWithMessage("input ciphertext level is below the linear transform level");
+  }
+  Ct leveled_input;
+  const Ct &eval_input = CiphertextAtLevel(leveled_input, input, state.level);
+  const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  std::unique_ptr<HoistHandler> cache =
+      BuildSharedCacheHoist(state.level, layout.baby_steps);
+  std::map<int, Ct> bs_cache;
+  cache->EvaluateBabyStep(g_scheme->context, bs_cache, eval_input,
+                          LinearTransformEvkMap(state),
+                          kUseMinKSLinearTransforms);
+  Ct output;
+  EvaluateLinearTransformGiantStepStreaming(
+      state, output, bs_cache, LinearTransformEvkMap(state));
+  return PushCiphertext(std::move(output));
 }
 
 SharedCachePlan BuildSharedCachePlan(const std::vector<int> &ordered_ids) {
@@ -770,15 +1382,23 @@ SharedCachePlan BuildSharedCachePlan(const std::vector<int> &ordered_ids) {
     bucket.transform_ids.push_back(transform_id);
     std::set<int> &union_indices = bucket_bs_union[state.level];
     union_indices.insert(0);
-    LinearTransform &transform = EnsureTransformLoaded(state);
-    for (int bs_idx : transform.GetBabyStepIndices()) {
-      union_indices.insert(bs_idx);
-    }
-    cheddar::EvkRequest req;
-    transform.AddRequiredRotations(req);
-    for (const auto &[rot_idx, _] : req) {
-      if (rot_idx != 0) {
-        EnsureRotationKeyPrepared(rot_idx, state.level);
+    if (ShouldStreamLinearTransform(state)) {
+      const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+      for (int bs_idx : layout.baby_steps) {
+        union_indices.insert(bs_idx);
+      }
+      PrepareLinearTransformRotationKeys(state);
+    } else {
+      LinearTransform &transform = EnsureTransformLoaded(state);
+      for (int bs_idx : transform.GetBabyStepIndices()) {
+        union_indices.insert(bs_idx);
+      }
+      cheddar::EvkRequest req;
+      transform.AddRequiredRotations(req, kUseMinKSLinearTransforms);
+      for (const auto &[rot_idx, _] : req) {
+        if (rot_idx != 0 && !LinearTransformHasRotationKey(state, rot_idx)) {
+          EnsureRotationKeyPrepared(rot_idx, state.level);
+        }
       }
     }
   }
@@ -809,17 +1429,50 @@ void EnsureRotationKeyPrepared(int key, int level) {
   g_scheme->interface->PrepareRotationKey(key, level);
 }
 
+const EvkMap &LinearTransformEvkMap(const LinearTransformState &state) {
+  if (state.rotation_keys) {
+    return *state.rotation_keys;
+  }
+  return g_scheme->interface->GetEvkMap();
+}
+
+bool LinearTransformHasRotationKey(const LinearTransformState &state, int key) {
+  return state.rotation_keys && state.rotation_keys->find(key) != state.rotation_keys->end();
+}
+
+void SetLinearTransformRotationKey(LinearTransformState &state, int key,
+                                   Evk &&evk) {
+  if (key <= 0) {
+    return;
+  }
+  if (!state.rotation_keys) {
+    state.rotation_keys = std::make_unique<EvkMap>();
+  }
+  state.rotation_keys->erase(key);
+  state.rotation_keys->try_emplace(key, std::move(evk));
+}
+
+void RemoveLinearTransformRotationKeysState(LinearTransformState &state) {
+  state.rotation_keys.reset();
+}
+
 void EnsureBootstrapPrepared(int num_slots) {
+  if (!g_scheme->bootstrap_interface) {
+    SyncBootstrapInterfaceSecrets(*g_scheme);
+  }
   if (!g_scheme->eval_mod_prepared) {
     g_scheme->context->PrepareEvalMod();
     g_scheme->eval_mod_prepared = true;
   }
   if (g_scheme->prepared_boot_slots.insert(num_slots).second) {
     g_scheme->context->PrepareEvalSpecialFFT(num_slots);
-    cheddar::EvkRequest req;
-    g_scheme->context->AddRequiredRotations(req, num_slots);
-    g_scheme->interface->PrepareRotationKey(req);
   }
+  // LT evaluation in load mode removes transient rotation keys between
+  // transforms. Bootstrap FFT plans stay prepared, but their rotation keys may
+  // have been cleared from the interface evk map, so ensure them at use time.
+  cheddar::EvkRequest req;
+  g_scheme->context->AddRequiredRotations(req, num_slots);
+  g_scheme->bootstrap_interface->PrepareRotationKey(req);
 }
 
 ArrayResultDouble UnsupportedMinimax() {
@@ -1019,6 +1672,13 @@ ArrayResultUInt64 GetDeviceMemoryInfo() {
       static_cast<unsigned long long>(free_bytes),
       static_cast<unsigned long long>(total_bytes),
   });
+}
+
+void SynchronizeDevice() {
+  const cudaError_t status = cudaDeviceSynchronize();
+  if (status != cudaSuccess) {
+    AbortWithMessage("cudaDeviceSynchronize failed");
+  }
 }
 
 ArrayResultInt GetLivePlaintexts() {
@@ -1382,9 +2042,24 @@ int GenerateLinearTransform(const int *diagIdxs, int diagIdxsLen,
 int EvaluateLinearTransform(int transformID, int ciphertextID) {
   RequireScheme();
   Ct output;
-  LinearTransform &transform = EnsureTransformLoaded(RetrieveTransform(transformID));
-  transform.Evaluate(g_scheme->context, output, RetrieveCiphertext(ciphertextID),
-                     g_scheme->interface->GetEvkMap());
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    return EvaluateSingletonLinearTransform(state, ciphertextID);
+  }
+  if (ShouldStreamLinearTransform(state)) {
+    return EvaluateLinearTransformStreaming(state, ciphertextID);
+  }
+  LinearTransform &transform = EnsureTransformLoaded(state);
+  const Ct &input = RetrieveCiphertext(ciphertextID);
+  const int input_level = CiphertextLevel(input);
+  if (input_level < state.level) {
+    AbortWithMessage("input ciphertext level is below the linear transform level");
+  }
+  Ct leveled_input;
+  const Ct &eval_input = CiphertextAtLevel(leveled_input, input, state.level);
+  transform.Evaluate(g_scheme->context, output, eval_input,
+                     LinearTransformEvkMap(state),
+                     kUseMinKSLinearTransforms);
   return PushCiphertext(std::move(output));
 }
 
@@ -1398,9 +2073,22 @@ void DeleteLinearTransform(int transformID) {
 
 ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
   RequireScheme();
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    const int key = SingletonLinearTransformRotationKey(state);
+    std::vector<int> keys;
+    if (key != 0) {
+      keys.push_back(key);
+    }
+    return MakeIntArrayResult(keys);
+  }
   cheddar::EvkRequest req;
-  LinearTransform &transform = EnsureTransformLoaded(RetrieveTransform(transformID));
-  transform.AddRequiredRotations(req);
+  if (ShouldStreamLinearTransform(state)) {
+    AddLinearTransformRequiredRotations(state, req);
+  } else {
+    LinearTransform &transform = EnsureTransformLoaded(state);
+    transform.AddRequiredRotations(req, kUseMinKSLinearTransforms);
+  }
   std::vector<int> keys;
   keys.reserve(req.size());
   for (const auto &[key, _] : req) {
@@ -1413,9 +2101,23 @@ ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
 
 ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID) {
   RequireScheme();
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    const int key = SingletonLinearTransformRotationKey(state);
+    std::vector<int> flat;
+    if (key != 0) {
+      flat.push_back(key);
+      flat.push_back(state.level);
+    }
+    return MakeIntArrayResult(flat);
+  }
   cheddar::EvkRequest req;
-  LinearTransform &transform = EnsureTransformLoaded(RetrieveTransform(transformID));
-  transform.AddRequiredRotations(req);
+  if (ShouldStreamLinearTransform(state)) {
+    AddLinearTransformRequiredRotations(state, req);
+  } else {
+    LinearTransform &transform = EnsureTransformLoaded(state);
+    transform.AddRequiredRotations(req, kUseMinKSLinearTransforms);
+  }
   std::vector<int> flat;
   flat.reserve(req.size() * 2);
   for (const auto &[key, level] : req) {
@@ -1430,6 +2132,11 @@ ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID) {
 ArrayResultUInt64 EstimateLinearTransformDeviceBytes(int transformID) {
   RequireScheme();
   const LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    return MakeUInt64ArrayResult(
+        {static_cast<unsigned long long>(state.singleton_values.size() *
+                                         sizeof(Complex))});
+  }
   return MakeUInt64ArrayResult({EstimateLinearTransformStateDeviceBytes(state)});
 }
 
@@ -1484,6 +2191,14 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
   for (int i = 0; i < numTransforms; ++i) {
     ordered_ids.push_back(transformIDs[i]);
   }
+  if (HasSingletonLinearTransform(ordered_ids)) {
+    std::vector<int> output_ids;
+    output_ids.reserve(numTransforms);
+    for (int transform_id : ordered_ids) {
+      output_ids.push_back(EvaluateLinearTransform(transform_id, ciphertextID));
+    }
+    return MakeIntArrayResult(output_ids);
+  }
   SharedCachePlan &plan = GetOrBuildSharedCachePlan(ordered_ids);
   const Ct &input = RetrieveCiphertext(ciphertextID);
   const int input_level = CiphertextLevel(input);
@@ -1493,22 +2208,31 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
     const Ct *bucket_input = &input;
     Ct leveled_input;
     if (input_level > bucket.level) {
-      g_scheme->context->LevelDown(leveled_input, input, bucket.level);
-      bucket_input = &leveled_input;
+      bucket_input = &CiphertextAtLevel(leveled_input, input, bucket.level);
     } else if (input_level < bucket.level) {
       AbortWithMessage(
           "input ciphertext level is below the shared-cache transform level");
     }
 
+    const EvkMap &bucket_evk_map =
+        LinearTransformEvkMap(RetrieveTransform(bucket.transform_ids.front()));
     std::map<int, Ct> bs_cache;
     bucket.cache->EvaluateBabyStep(g_scheme->context, bs_cache, *bucket_input,
-                                   g_scheme->interface->GetEvkMap(), false);
+                                   bucket_evk_map, false);
 
     for (int transform_id : bucket.transform_ids) {
       Ct output;
-      LinearTransform &transform = EnsureTransformLoaded(RetrieveTransform(transform_id));
-      transform.EvaluateGiantStep(g_scheme->context, output, bs_cache,
-                                  g_scheme->interface->GetEvkMap(), false);
+      LinearTransformState &transform_state = RetrieveTransform(transform_id);
+      if (ShouldStreamLinearTransform(transform_state)) {
+        EvaluateLinearTransformGiantStepStreaming(
+            transform_state, output, bs_cache,
+            LinearTransformEvkMap(transform_state));
+      } else {
+        LinearTransform &transform = EnsureTransformLoaded(transform_state);
+        transform.EvaluateGiantStep(g_scheme->context, output, bs_cache,
+                                    LinearTransformEvkMap(transform_state),
+                                    kUseMinKSLinearTransforms);
+      }
       output_id_by_transform[transform_id] = PushCiphertext(std::move(output));
     }
   }
@@ -1546,6 +2270,22 @@ void LoadRotationKey(const unsigned char *data, unsigned long lenData,
   g_scheme->interface->SetRotationKey(static_cast<int>(key), std::move(evk));
 }
 
+void LoadLinearTransformRotationKey(const unsigned char *data,
+                                    unsigned long lenData,
+                                    unsigned long key,
+                                    int transformID) {
+  RequireScheme();
+  auto evk =
+      DeserializeEvaluationKeyBytes(data, static_cast<std::size_t>(lenData));
+  SetLinearTransformRotationKey(
+      RetrieveTransform(transformID), static_cast<int>(key), std::move(evk));
+}
+
+void RemoveLinearTransformRotationKeys(int transformID) {
+  RequireScheme();
+  RemoveLinearTransformRotationKeysState(RetrieveTransform(transformID));
+}
+
 ArrayResultByte SerializeDiagonal(int transformID, int diagIdx) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
@@ -1555,29 +2295,68 @@ ArrayResultByte SerializeDiagonal(int transformID, int diagIdx) {
   return MakeByteArrayResult(bytes);
 }
 
-void LoadPlaintextDiagonal(const unsigned char * /*data*/,
-                          unsigned long /*lenData*/, int transformID,
-                          unsigned long /*diagIdx*/) {
+ArrayResultByte SerializeLinearTransformPlaintexts(int transformID) {
   RequireScheme();
-  EnsureTransformLoaded(RetrieveTransform(transformID));
+  LinearTransformState &state = RetrieveTransform(transformID);
+  const auto bytes = SerializeLinearTransformPlaintextsBytes(state);
+  state.transform.reset();
+  g_scheme->shared_cache_plans.clear();
+  return MakeByteArrayResult(bytes);
+}
+
+void LoadPlaintextDiagonal(const unsigned char * /*data*/,
+                           unsigned long lenData, int transformID,
+                           unsigned long /*diagIdx*/) {
+  RequireScheme();
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    return;
+  }
+  if (lenData == 0) {
+    return;
+  }
+  EnsureTransformLoaded(state);
 }
 
 void LoadPlaintextDiagonalsBatch(const unsigned char * /*data*/,
-                                 unsigned long /*lenData*/,
+                                 unsigned long lenData,
                                  const unsigned long long * /*offsets*/,
                                  int /*numOffsets*/,
                                  const unsigned long long * /*lengths*/,
                                  int /*numLengths*/,
-                                  const int * /*diagIdxs*/,
-                                  int /*numDiagIdxs*/,
+                                 const int * /*diagIdxs*/,
+                                 int /*numDiagIdxs*/,
                                  int transformID) {
   RequireScheme();
-  EnsureTransformLoaded(RetrieveTransform(transformID));
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    return;
+  }
+  if (lenData == 0) {
+    return;
+  }
+  EnsureTransformLoaded(state);
+}
+
+void LoadLinearTransformPlaintexts(const unsigned char *data,
+                                   unsigned long lenData,
+                                   int transformID) {
+  RequireScheme();
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.singleton) {
+    return;
+  }
+  if (lenData == 0) {
+    return;
+  }
+  LoadLinearTransformPlaintextsBytes(
+      state, data, static_cast<std::size_t>(lenData));
 }
 
 void RemovePlaintextDiagonals(int transformID) {
   RequireScheme();
   RetrieveTransform(transformID).transform.reset();
+  g_scheme->shared_cache_plans.clear();
 }
 
 void RemoveRotationKeys() {
@@ -1593,9 +2372,29 @@ void NewBootstrapper(const int * /*logPs*/, int /*lenLogPs*/, int numSlots) {
 int Bootstrap(int ciphertextID, int numSlots) {
   RequireScheme();
   EnsureBootstrapPrepared(numSlots);
+  const Ct &input = RetrieveCiphertext(ciphertextID);
+  if (numSlots <= 0 || numSlots > input.GetNumSlots()) {
+    AbortWithMessage("bootstrap slot count is outside ciphertext slot range");
+  }
+  Ct boot_input;
+  g_scheme->context->Copy(boot_input, input);
+  // Orion chooses the sparse bootstrap width at compile time. Cheddar's
+  // BootContext derives the FFT plan from ciphertext metadata, so align this
+  // temporary copy with the requested sparse slot count before bootstrapping.
+  boot_input.SetNumSlots(numSlots);
   Ct output;
-  g_scheme->context->Boot(output, RetrieveCiphertext(ciphertextID),
-                          g_scheme->interface->GetEvkMap());
+  g_scheme->context->Boot(output, boot_input,
+                          g_scheme->bootstrap_interface->GetEvkMap());
+  const int half_degree = g_scheme->param->degree_ / 2;
+  if (numSlots < half_degree) {
+    Const sparse_compensation =
+        EncodeScalarConstant(CiphertextLevel(output), 1.0,
+                             static_cast<double>(half_degree) /
+                                 static_cast<double>(numSlots));
+    Ct compensated;
+    g_scheme->context->Mult(compensated, output, sparse_compensation);
+    output = std::move(compensated);
+  }
   return PushCiphertext(std::move(output));
 }
 
