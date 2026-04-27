@@ -1,5 +1,6 @@
 import h5py
 import ctypes
+import os
 import torch
 import numpy as np
 
@@ -9,6 +10,9 @@ from .io_prefetch import (
     should_prefetch_saved_io,
 )
 from orion.backend.python.tensors import CipherTensor
+
+
+_ENCODED_HOIST_PAYLOAD_DATASET = "__encoded_hoist_payload__"
 
 
 class NewEvaluator:
@@ -25,12 +29,130 @@ class NewEvaluator:
 
         self.saved_rotation_keys = set()
         self._transform_io_prefetcher = AsyncIOPrefetcher()
+        self._transform_io_lookahead = self._read_transform_io_lookahead()
         self._transform_io_size_cache: dict[tuple[str, int, int, int], int] = {}
         self._transform_device_size_cache: dict[int, int] = {}
+        self._saved_io_linear_work_order: tuple[tuple[str, int, int, int], ...] = ()
+        self._saved_io_external_work_order: list[object] = []
+        self._saved_io_external_loaders: dict[object, object] = {}
+        self._saved_io_external_host_bytes: dict[object, object] = {}
+        self._saved_io_external_device_bytes: dict[object, object] = {}
+        self._saved_io_work_order: tuple[object, ...] = ()
+        self._saved_io_work_index: dict[object, int] = {}
         self.new_evaluator()
 
     def new_evaluator(self):
         self.backend.NewLinearTransformEvaluator()
+
+    def _read_transform_io_lookahead(self) -> int:
+        raw_value = os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "2")
+        try:
+            return max(0, int(raw_value))
+        except (TypeError, ValueError):
+            return 2
+
+    def register_saved_io_schedule(self, linear_layers) -> None:
+        work_order: list[tuple[str, int, int, int]] = []
+        for layer in linear_layers:
+            layer_name = getattr(layer, "name", None)
+            if layer_name is None:
+                continue
+            for row, col, transform_id in self._work_items_from_transform_ids(
+                getattr(layer, "transform_ids", {}) or {}
+            ):
+                work_order.append((str(layer_name), int(row), int(col), int(transform_id)))
+
+        self._saved_io_linear_work_order = tuple(work_order)
+        self._rebuild_saved_io_work_order()
+
+    def register_saved_io_prefetch_work_unit(
+        self,
+        key,
+        *,
+        loader,
+        host_bytes,
+        device_bytes,
+    ) -> None:
+        if key not in self._saved_io_external_loaders:
+            self._saved_io_external_work_order.append(key)
+        self._saved_io_external_loaders[key] = loader
+        self._saved_io_external_host_bytes[key] = host_bytes
+        self._saved_io_external_device_bytes[key] = device_bytes
+        self._rebuild_saved_io_work_order()
+
+    def unregister_saved_io_prefetch_work_unit(self, key) -> None:
+        if key not in self._saved_io_external_loaders:
+            return
+        self._transform_io_prefetcher.discard(key, wait=True)
+        self._saved_io_external_loaders.pop(key, None)
+        self._saved_io_external_host_bytes.pop(key, None)
+        self._saved_io_external_device_bytes.pop(key, None)
+        self._saved_io_external_work_order = [
+            existing_key
+            for existing_key in self._saved_io_external_work_order
+            if existing_key != key
+        ]
+        self._rebuild_saved_io_work_order()
+
+    def consume_saved_io_prefetch(self, key):
+        return self._transform_io_prefetcher.consume(key)
+
+    def fill_saved_io_prefetch_window(
+        self,
+        key,
+        *,
+        include_current: bool = True,
+        scratch_reserve_bytes: int = 0,
+    ) -> bool:
+        if key not in self._saved_io_work_index:
+            return False
+        start_index = int(self._saved_io_work_index[key])
+        if not bool(include_current):
+            start_index += 1
+        self._fill_transform_io_prefetch_window(
+            self._saved_io_work_order,
+            start_index,
+            scratch_reserve_bytes=int(scratch_reserve_bytes or 0),
+        )
+        return True
+
+    def _rebuild_saved_io_work_order(self) -> None:
+        self._transform_io_prefetcher.clear(wait=True)
+        self._saved_io_work_order = tuple(self._saved_io_linear_work_order) + tuple(
+            self._saved_io_external_work_order
+        )
+        self._saved_io_work_index = {
+            key: index
+            for index, key in enumerate(self._saved_io_work_order)
+        }
+
+    def _work_items_from_transform_ids(self, transform_ids: dict) -> list[tuple[int, int, int]]:
+        if not transform_ids:
+            return []
+        try:
+            keys = [(int(row), int(col)) for row, col in transform_ids.keys()]
+        except (TypeError, ValueError):
+            return [
+                (0, index, int(transform_id))
+                for index, transform_id in enumerate(transform_ids.values())
+            ]
+
+        rows = max(row for row, _col in keys) + 1
+        cols = max(col for _row, col in keys) + 1
+        if rows * cols == len(transform_ids) and all(
+            (row, col) in transform_ids
+            for row in range(rows)
+            for col in range(cols)
+        ):
+            return [
+                (int(row), int(col), int(transform_ids[(row, col)]))
+                for row in range(rows)
+                for col in range(cols)
+            ]
+        return [
+            (int(row), int(col), int(transform_ids[(row, col)]))
+            for row, col in sorted(keys)
+        ]
 
     def generate_transforms(self, linear_layer):
         layer_name = linear_layer.name
@@ -250,8 +372,17 @@ class NewEvaluator:
                 diags = {}
                 block_group = diag_group[block]
                 for diag_idx in block_group:
-                    diag_data = block_group[diag_idx][:]
-                    diags[int(diag_idx)] = diag_data 
+                    if (
+                        self.io_mode == "load"
+                        and bool(getattr(self.backend, "supports_index_only_linear_transform_load", False))
+                    ):
+                        # Load mode only needs diagonal indices to rebuild the
+                        # in-process transform shell. Encoded plaintext
+                        # diagonals are loaded later from the plaintext cache.
+                        diags[int(diag_idx)] = []
+                    else:
+                        diag_data = block_group[diag_idx][:]
+                        diags[int(diag_idx)] = diag_data
                 all_diagonals[(row, col)] = diags
 
         return all_diagonals, on_bias, output_rotations
@@ -270,20 +401,31 @@ class NewEvaluator:
         fhe_out_shape = linear_layer.fhe_output_shape 
         skip_post_rescale = bool(getattr(self.backend, "lt_outputs_are_rescaled", False))
 
-        # Order-preserving flatten that can be mapped back to 
-        # (row, col) format in backend via len(in_ctensor.ids)
-        transform_ids = np.array(list(linear_layer.transform_ids.values()))
-        cols = len(in_ctensor)
-        rows = len(transform_ids) // cols
-
-        # Now we can perform a blocked linear transform
-        transform_ids = transform_ids.reshape(rows, cols)
-        self._transform_io_prefetcher.clear(wait=True)
+        rows, cols, transform_ids = self._transform_id_matrix(
+            getattr(linear_layer, "transform_ids", {}) or {},
+            input_cols=len(in_ctensor),
+        )
         work_items = [
             (int(i), int(j), int(transform_ids[i][j]))
             for i in range(rows)
             for j in range(cols)
         ]
+        prefetch_sequence, use_global_prefetch_sequence = self._transform_prefetch_sequence(
+            layer_name,
+            work_items,
+        )
+        if self.io_mode != "none" and work_items:
+            first_key = self._transform_io_key(layer_name, *work_items[0])
+            first_index = self._transform_sequence_index(
+                first_key,
+                fallback=0,
+                use_global_sequence=use_global_prefetch_sequence,
+            )
+            self._fill_transform_io_prefetch_window(
+                prefetch_sequence,
+                first_index,
+                scratch_reserve_bytes=self._estimate_transform_scratch_reserve_bytes(work_items[0][2]),
+            )
         work_index = 0
         cts_out = []
         for i in range(rows):
@@ -304,15 +446,23 @@ class NewEvaluator:
                         )
                     self.load_rotation_keys(t_id, bundle=bundle)
                     self.load_plaintext_diagonals(layer_name, i, j, t_id, bundle=bundle)
-                    next_index = int(work_index + 1)
-                    if next_index < len(work_items):
-                        next_i, next_j, next_t_id = work_items[next_index]
-                        self._submit_transform_io_prefetch(
-                            layer_name,
-                            int(next_i),
-                            int(next_j),
-                            int(next_t_id),
-                        )
+                    self.ensure_plaintext_diagonals_loaded(
+                        layer_name,
+                        i,
+                        j,
+                        t_id,
+                        expected_level=int(linear_layer.level),
+                    )
+                    current_index = self._transform_sequence_index(
+                        current_key,
+                        fallback=work_index,
+                        use_global_sequence=use_global_prefetch_sequence,
+                    )
+                    self._fill_transform_io_prefetch_window(
+                        prefetch_sequence,
+                        int(current_index + 1),
+                        scratch_reserve_bytes=self._estimate_transform_scratch_reserve_bytes(t_id),
+                    )
 
                 res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
                 ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
@@ -321,7 +471,7 @@ class NewEvaluator:
                 ct_out = ct if j == 0 else ct_out + ct
                     
                 if self.io_mode != "none":
-                    self.remove_rotation_keys()
+                    self.remove_rotation_keys(t_id)
                     self.remove_plaintext_diagonals(t_id)
                 work_index += 1
             
@@ -333,8 +483,34 @@ class NewEvaluator:
                 ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
                 cts_out.append(ct_out_rescaled)
 
-        self._transform_io_prefetcher.clear(wait=True)
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
+
+    def _transform_id_matrix(self, transform_ids: dict, *, input_cols: int):
+        work_items = self._work_items_from_transform_ids(transform_ids)
+        if not work_items:
+            return 0, 0, np.zeros((0, 0), dtype=int)
+
+        rows = max(int(row) for row, _col, _transform_id in work_items) + 1
+        cols = max(int(col) for _row, col, _transform_id in work_items) + 1
+        if int(input_cols) != int(cols):
+            raise ValueError(
+                f"Linear transform block column count {cols} does not match "
+                f"input ciphertext count {int(input_cols)}"
+            )
+
+        matrix = np.full((int(rows), int(cols)), -1, dtype=int)
+        for row, col, transform_id in work_items:
+            matrix[int(row)][int(col)] = int(transform_id)
+
+        missing = [
+            (int(row), int(col))
+            for row in range(int(rows))
+            for col in range(int(cols))
+            if int(matrix[int(row)][int(col)]) < 0
+        ]
+        if missing:
+            raise ValueError(f"Linear transform id matrix is missing blocks: {missing[:16]}")
+        return int(rows), int(cols), matrix
             
     def delete_transforms(self, transform_ids: dict):
         for tid in transform_ids.values():
@@ -422,15 +598,31 @@ class NewEvaluator:
             
     def save_plaintext_diagonals(self, layer_name, lintransf_id, row, col, diag_idxs):
         with h5py.File(self.diags_path, "a") as f:
-            layer = f[layer_name]
+            layer = f.require_group(layer_name)
             plaintext_group = layer.require_group("plaintexts")
             block_idx = f"{row}_{col}"
+            if block_idx in plaintext_group:
+                del plaintext_group[block_idx]
             block_group = plaintext_group.create_group(block_idx)
 
             if not self._plaintext_payload_required():
                 for diag_idx in diag_idxs:
                     block_group.create_dataset(str(int(diag_idx)), data=np.zeros((0,), dtype=np.uint8))
                 self.backend.RemovePlaintextDiagonals(int(lintransf_id))
+                return
+
+            if self._encoded_plaintext_payload_supported():
+                serial_payload, payload_ptr = self.backend.SerializeLinearTransformPlaintexts(
+                    int(lintransf_id)
+                )
+                try:
+                    block_group.create_dataset(
+                        _ENCODED_HOIST_PAYLOAD_DATASET,
+                        data=serial_payload,
+                    )
+                finally:
+                    self.backend.FreeCArray(payload_ptr)
+                    self.backend.RemovePlaintextDiagonals(int(lintransf_id))
                 return
 
             for diag_idx in diag_idxs:
@@ -443,8 +635,128 @@ class NewEvaluator:
     def _plaintext_payload_required(self) -> bool:
         return bool(getattr(self.backend, "load_plaintext_diagonals_requires_payload", True))
 
+    def _encoded_plaintext_payload_supported(self) -> bool:
+        return callable(getattr(self.backend, "SerializeLinearTransformPlaintexts", None)) and callable(
+            getattr(self.backend, "LoadLinearTransformPlaintexts", None)
+        )
+
+    def _device_transform_prefetch_supported(self) -> bool:
+        if not bool(getattr(self.backend, "saved_io_device_prefetch_enabled", False)):
+            return False
+        return self._encoded_plaintext_payload_supported() and callable(
+            getattr(self.backend, "LoadLinearTransformRotationKey", None)
+        )
+
     def _transform_io_key(self, layer_name, row, col, transform_id):
         return (str(layer_name), int(row), int(col), int(transform_id))
+
+    def _transform_prefetch_sequence(self, layer_name, work_items):
+        if not work_items:
+            return (), False
+        first_key = self._transform_io_key(layer_name, *work_items[0])
+        if first_key in self._saved_io_work_index:
+            return self._saved_io_work_order, True
+        return tuple(
+            (str(layer_name), int(row), int(col), int(transform_id))
+            for row, col, transform_id in work_items
+        ), False
+
+    def _transform_sequence_index(self, key, *, fallback: int, use_global_sequence: bool) -> int:
+        if use_global_sequence:
+            return int(self._saved_io_work_index.get(key, int(fallback)))
+        return int(fallback)
+
+    def _fill_transform_io_prefetch_window(
+        self,
+        sequence,
+        start_index: int,
+        *,
+        scratch_reserve_bytes: int = 0,
+    ) -> None:
+        if self.io_mode == "none" or self._transform_io_lookahead <= 0:
+            return
+        if not sequence:
+            return
+
+        index = max(0, int(start_index))
+        window_count = 0
+        while index < len(sequence) and window_count < self._transform_io_lookahead:
+            key = sequence[index]
+            if self._transform_io_prefetcher.has_pending(key):
+                window_count += 1
+                index += 1
+                continue
+            submitted = self._submit_saved_io_work_prefetch(
+                key,
+                scratch_reserve_bytes=int(scratch_reserve_bytes or 0),
+                reserved_host_bytes=self._transform_io_prefetcher.pending_host_bytes(),
+                reserved_device_bytes=self._transform_io_prefetcher.pending_device_bytes(),
+            )
+            if not submitted:
+                break
+            window_count += 1
+            index += 1
+
+    def _resolve_saved_io_size(self, source, key) -> int:
+        value = source.get(key, 0)
+        if callable(value):
+            return int(value())
+        return int(value or 0)
+
+    def _submit_saved_io_work_prefetch(
+        self,
+        key,
+        *,
+        scratch_reserve_bytes=0,
+        reserved_host_bytes=0,
+        reserved_device_bytes=0,
+    ):
+        if key in self._saved_io_external_loaders:
+            return self._submit_external_saved_io_prefetch(
+                key,
+                scratch_reserve_bytes=int(scratch_reserve_bytes or 0),
+                reserved_host_bytes=int(reserved_host_bytes or 0),
+                reserved_device_bytes=int(reserved_device_bytes or 0),
+            )
+        layer_name, row, col, transform_id = key
+        return self._submit_transform_io_prefetch(
+            layer_name,
+            int(row),
+            int(col),
+            int(transform_id),
+            scratch_reserve_bytes=int(scratch_reserve_bytes or 0),
+            reserved_host_bytes=int(reserved_host_bytes or 0),
+            reserved_device_bytes=int(reserved_device_bytes or 0),
+        )
+
+    def _submit_external_saved_io_prefetch(
+        self,
+        key,
+        *,
+        scratch_reserve_bytes=0,
+        reserved_host_bytes=0,
+        reserved_device_bytes=0,
+    ):
+        if self.io_mode == "none":
+            return False
+        host_bytes = self._resolve_saved_io_size(self._saved_io_external_host_bytes, key)
+        device_bytes = self._resolve_saved_io_size(self._saved_io_external_device_bytes, key)
+        if not should_prefetch_saved_io(
+            int(host_bytes) + int(reserved_host_bytes or 0),
+            backend=self.backend,
+            device_bytes=(
+                int(device_bytes)
+                + int(scratch_reserve_bytes or 0)
+                + int(reserved_device_bytes or 0)
+            ),
+        ):
+            return False
+        return self._transform_io_prefetcher.submit(
+            key,
+            self._saved_io_external_loaders[key],
+            host_bytes=int(host_bytes),
+            device_bytes=int(device_bytes),
+        )
 
     def _estimate_transform_io_bundle_bytes(self, layer_name, row, col, transform_id):
         cache_key = self._transform_io_key(layer_name, row, col, transform_id)
@@ -464,8 +776,18 @@ class NewEvaluator:
         if self.diags_path and self._plaintext_payload_required():
             with h5py.File(self.diags_path, "r") as f:
                 block = f[layer_name]["plaintexts"][f"{row}_{col}"]
-                for diag_idx in block:
-                    dataset = block[diag_idx]
+                if _ENCODED_HOIST_PAYLOAD_DATASET in block:
+                    dataset = block[_ENCODED_HOIST_PAYLOAD_DATASET]
+                    total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
+                else:
+                    for diag_idx in block:
+                        dataset = block[diag_idx]
+                        total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
+        elif self.diags_path and self._encoded_plaintext_payload_supported():
+            with h5py.File(self.diags_path, "r") as f:
+                block = f[layer_name]["plaintexts"][f"{row}_{col}"]
+                if _ENCODED_HOIST_PAYLOAD_DATASET in block:
+                    dataset = block[_ENCODED_HOIST_PAYLOAD_DATASET]
                     total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
 
         self._transform_io_size_cache[cache_key] = int(total_bytes)
@@ -486,6 +808,10 @@ class NewEvaluator:
         self._transform_device_size_cache[transform_key] = int(total_bytes)
         return int(total_bytes)
 
+    def _estimate_transform_scratch_reserve_bytes(self, transform_id):
+        transform_bytes = estimate_linear_transform_device_bytes(self.backend, int(transform_id))
+        return max(512 * 1024 * 1024, int(transform_bytes))
+
     def _read_transform_io_bundle(self, layer_name, row, col, transform_id, *, prefetch: bool):
         if prefetch:
             if not should_prefetch_saved_io(
@@ -501,6 +827,7 @@ class NewEvaluator:
             "offsets": (),
             "lengths": (),
             "payload": np.zeros((0,), dtype=np.uint8),
+            "encoded_plaintext_payload": None,
             "plaintexts": (),
         }
 
@@ -516,6 +843,15 @@ class NewEvaluator:
 
         if not self.diags_path:
             return bundle
+
+        with h5py.File(self.diags_path, "r") as f:
+            block = f[layer_name]["plaintexts"][f"{row}_{col}"]
+            if _ENCODED_HOIST_PAYLOAD_DATASET in block:
+                bundle["encoded_plaintext_payload"] = np.asarray(
+                    block[_ENCODED_HOIST_PAYLOAD_DATASET][()],
+                    dtype=np.uint8,
+                ).reshape(-1).copy()
+                return bundle
 
         if not self._plaintext_payload_required():
             with h5py.File(self.diags_path, "r") as f:
@@ -546,23 +882,87 @@ class NewEvaluator:
             bundle["payload"] = np.concatenate(payload_chunks)
         return bundle
 
-    def _submit_transform_io_prefetch(self, layer_name, row, col, transform_id):
+    def _submit_transform_io_prefetch(
+        self,
+        layer_name,
+        row,
+        col,
+        transform_id,
+        *,
+        scratch_reserve_bytes=0,
+        reserved_host_bytes=0,
+        reserved_device_bytes=0,
+    ):
         if self.io_mode == "none":
-            return
+            return False
+        host_bytes = self._estimate_transform_io_bundle_bytes(
+            layer_name,
+            row,
+            col,
+            transform_id,
+        )
+        device_bytes = self._estimate_transform_device_bytes(
+            layer_name,
+            row,
+            col,
+            transform_id,
+        )
+        if not should_prefetch_saved_io(
+            int(host_bytes) + int(reserved_host_bytes or 0),
+            backend=self.backend,
+            device_bytes=(
+                int(device_bytes)
+                + int(scratch_reserve_bytes or 0)
+                + int(reserved_device_bytes or 0)
+            ),
+        ):
+            return False
         key = self._transform_io_key(layer_name, row, col, transform_id)
-        self._transform_io_prefetcher.submit(
-            key,
-            lambda: self._read_transform_io_bundle(
+
+        def load_bundle():
+            bundle = self._read_transform_io_bundle(
                 layer_name,
                 row,
                 col,
                 transform_id,
-                prefetch=True,
-            ),
+                prefetch=False,
+            )
+            if bundle is None or not self._device_transform_prefetch_supported():
+                return bundle
+            load_transform_key = self.backend.LoadLinearTransformRotationKey
+            for key_value, serial_key in bundle.get("rotation_keys", ()):
+                load_transform_key(serial_key, int(key_value), int(transform_id))
+            if bundle.get("rotation_keys"):
+                bundle["rotation_keys_prefetched_to_device"] = True
+                bundle["rotation_keys"] = ()
+            encoded_payload = bundle.get("encoded_plaintext_payload")
+            if encoded_payload is not None:
+                self.backend.LoadLinearTransformPlaintexts(
+                    encoded_payload,
+                    int(transform_id),
+                )
+                bundle["encoded_plaintext_payload"] = None
+                bundle["plaintexts_prefetched_to_device"] = True
+            return bundle
+
+        return self._transform_io_prefetcher.submit(
+            key,
+            load_bundle,
+            host_bytes=int(host_bytes),
+            device_bytes=int(device_bytes),
         )
 
     def load_plaintext_diagonals(self, layer_name, row, col, transform_id, bundle=None):
         if bundle is not None:
+            if bundle.get("plaintexts_prefetched_to_device"):
+                return
+            encoded_payload = bundle.get("encoded_plaintext_payload")
+            if encoded_payload is not None:
+                self.backend.LoadLinearTransformPlaintexts(
+                    encoded_payload,
+                    int(transform_id),
+                )
+                return
             diag_indices = list(bundle.get("diag_indices", ()))
             if hasattr(self.backend, "LoadPlaintextDiagonalsBatch"):
                 self.backend.LoadPlaintextDiagonalsBatch(
@@ -584,6 +984,16 @@ class NewEvaluator:
             layer = f[layer_name]
             ptxt_group = layer["plaintexts"]
             block = ptxt_group[f"{row}_{col}"]
+            if _ENCODED_HOIST_PAYLOAD_DATASET in block:
+                payload = np.asarray(
+                    block[_ENCODED_HOIST_PAYLOAD_DATASET][()],
+                    dtype=np.uint8,
+                ).reshape(-1)
+                self.backend.LoadLinearTransformPlaintexts(
+                    payload,
+                    int(transform_id),
+                )
+                return
             if not self._plaintext_payload_required() and hasattr(self.backend, "LoadPlaintextDiagonalsBatch"):
                 diag_indices = sorted(int(diag_idx) for diag_idx in block.keys())
                 self.backend.LoadPlaintextDiagonalsBatch(
@@ -597,14 +1007,81 @@ class NewEvaluator:
 
             for diag_idx in block:
                 serial_diag = block[diag_idx][()]
-                self.backend.LoadPlaintextDiagonal(
-                    serial_diag, transform_id, int(diag_idx)
-                )
+            self.backend.LoadPlaintextDiagonal(
+                serial_diag, transform_id, int(diag_idx)
+            )
+
+    def ensure_plaintext_diagonals_loaded(self, layer_name, row, col, transform_id, expected_level=None):
+        get_empty_keys = getattr(self.backend, "GetLinearTransformEmptyPlaintextKeys", None)
+        if callable(get_empty_keys):
+            empty_keys = [int(key) for key in list(get_empty_keys(int(transform_id)))]
+            if empty_keys:
+                reloaded = self._reload_plaintext_diagonals(layer_name, row, col, transform_id, empty_keys)
+                remaining = [int(key) for key in list(get_empty_keys(int(transform_id)))]
+                if remaining:
+                    raise RuntimeError(
+                        "Linear transform plaintext diagonals are not loaded "
+                        f"for layer={layer_name!r} block=({int(row)}, {int(col)}) "
+                        f"transform_id={int(transform_id)} empty_keys={remaining[:16]} "
+                        f"reloaded_keys={reloaded[:16]}"
+                    )
+
+        self._ensure_plaintext_diagonal_levels(
+            layer_name,
+            row,
+            col,
+            transform_id,
+            expected_level=expected_level,
+        )
+
+    def _ensure_plaintext_diagonal_levels(self, layer_name, row, col, transform_id, expected_level=None):
+        if expected_level is None:
+            return
+        get_levels = getattr(self.backend, "GetLinearTransformPlaintextLevels", None)
+        if not callable(get_levels):
+            return
+        flat = [int(value) for value in list(get_levels(int(transform_id)))]
+        if len(flat) % 2 != 0:
+            raise RuntimeError("backend returned malformed linear transform plaintext level data")
+        too_low = []
+        for index in range(0, len(flat), 2):
+            diag_idx = int(flat[index])
+            actual_level = int(flat[index + 1])
+            if actual_level < int(expected_level):
+                too_low.append((diag_idx, actual_level))
+        if too_low:
+            raise RuntimeError(
+                "Linear transform plaintext levels are incompatible "
+                f"for layer={layer_name!r} block=({int(row)}, {int(col)}) "
+                f"transform_id={int(transform_id)} expected_level={int(expected_level)} "
+                f"bad_diags={too_low[:16]}"
+            )
+
+    def _reload_plaintext_diagonals(self, layer_name, row, col, transform_id, diag_indices):
+        if not self.diags_path:
+            return []
+        reloaded = []
+        with h5py.File(self.diags_path, "r") as f:
+            block = f[str(layer_name)]["plaintexts"][f"{int(row)}_{int(col)}"]
+            for diag_idx in diag_indices:
+                key = str(int(diag_idx))
+                if key not in block:
+                    continue
+                serial_diag = block[key][()]
+                self.backend.LoadPlaintextDiagonal(serial_diag, int(transform_id), int(diag_idx))
+                reloaded.append(int(diag_idx))
+        return reloaded
     
     def load_rotation_keys(self, transform_id, bundle=None):
+        load_transform_key = getattr(self.backend, "LoadLinearTransformRotationKey", None)
         if bundle is not None:
+            if bundle.get("rotation_keys_prefetched_to_device"):
+                return
             for key_value, serial_key in bundle.get("rotation_keys", ()):
-                self.backend.LoadRotationKey(serial_key, int(key_value))
+                if callable(load_transform_key):
+                    load_transform_key(serial_key, int(key_value), int(transform_id))
+                else:
+                    self.backend.LoadRotationKey(serial_key, int(key_value))
             return
         keys = self.get_required_rotation_key_requests(transform_id)
 
@@ -614,9 +1091,16 @@ class NewEvaluator:
                 if key_str not in f and str(int(key)) in f:
                     key_str = str(int(key))
                 serial_key = f[key_str][()]
-                self.backend.LoadRotationKey(serial_key, int(key))
+                if callable(load_transform_key):
+                    load_transform_key(serial_key, int(key), int(transform_id))
+                else:
+                    self.backend.LoadRotationKey(serial_key, int(key))
 
-    def remove_rotation_keys(self):
+    def remove_rotation_keys(self, transform_id=None):
+        remove_transform_keys = getattr(self.backend, "RemoveLinearTransformRotationKeys", None)
+        if transform_id is not None and callable(remove_transform_keys):
+            remove_transform_keys(int(transform_id))
+            return
         self.backend.RemoveRotationKeys() 
 
     def remove_plaintext_diagonals(self, transform_id):

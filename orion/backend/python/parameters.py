@@ -123,6 +123,7 @@ class NewParameters:
         if self.get_io_mode() == "save" and self.io_paths_exist():
             self.reset_stored_keys()
             self.reset_stored_diags()
+            self.reset_compile_manifest()
 
     def __str__(self) -> str:
         border = "=" * 50
@@ -209,3 +210,12 @@ class NewParameters:
 
     def reset_stored_keys(self):
         self.reset_stored_file(self.get_keys_path(), "keys")
+
+    def get_compile_manifest_path(self):
+        path = self.get_diags_path()
+        if not path:
+            return ""
+        return os.path.join(os.path.dirname(path), "compile_manifest.json")
+
+    def reset_compile_manifest(self):
+        self.reset_stored_file(self.get_compile_manifest_path(), "compile manifest")

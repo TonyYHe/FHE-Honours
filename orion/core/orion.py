@@ -10,9 +10,9 @@ from torch.utils.data import DataLoader, RandomSampler
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
 from orion.backend.lattigo import bindings as lgo
-from orion.backend.cheddar import bindings as cgo
 from orion.backend.python import (
     PythonBackend,
+    compile_cache,
     parameters, 
     key_generator,
     encoder, 
@@ -162,6 +162,7 @@ class Scheme:
     def delete_scheme(self):
         if self.backend:
             self.backend.DeleteScheme()
+            self.backend = None
     
     def __del__(self):
         self.delete_scheme()
@@ -176,6 +177,8 @@ class Scheme:
             py_lattigo.setup_bindings(params)
             return py_lattigo
         elif backend == "cheddar":
+            from orion.backend.cheddar import bindings as cgo
+
             py_cheddar = cgo.CheddarLibrary()
             py_cheddar.setup_bindings(params)
             return py_cheddar
@@ -382,6 +385,13 @@ class Scheme:
         # method which solves this while consuming just one level (albeit 
         # usually for more ciphertext rotations).
         topo_sort = list(network_dag.topological_sort())
+        io_mode = self.params.get_io_mode()
+        compile_manifest_path = compile_cache.manifest_path(self.params)
+        compile_manifest = None
+        if io_mode == "load":
+            compile_manifest = compile_cache.read_manifest(compile_manifest_path)
+            compile_cache.validate_manifest_identity(compile_manifest, params=self.params, net=net)
+            compile_cache.validate_topology(compile_manifest, topo_sort)
 
         last_linear = None
         for node in reversed(topo_sort):
@@ -405,14 +415,38 @@ class Scheme:
         network_dag.find_residuals()
         #(save_path="network.png", figsize=(8,30)) # optional plot
 
-        print("\n{4} Running bootstrap placement... ", end="", flush=True)
-        start = time.time()
-        l_eff = len(self.params.get_logq()) - 1
-        btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
-        input_level, num_bootstraps, bootstrapper_slots = btp_solver.solve()
-        print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
+        if io_mode == "load":
+            print("\n{4} Loading cached bootstrap placement... ", end="", flush=True)
+            start = time.time()
+            input_level, num_bootstraps, bootstrapper_slots = compile_cache.apply_bootstrap_plan(
+                network_dag,
+                compile_manifest["bootstrap_plan"],
+            )
+            print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
+        else:
+            print("\n{4} Running bootstrap placement... ", end="", flush=True)
+            start = time.time()
+            l_eff = len(self.params.get_logq()) - 1
+            btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+            input_level, num_bootstraps, bootstrapper_slots = btp_solver.solve()
+            print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
         print(f"├── Network requires {num_bootstraps} bootstrap "
             f"{'operation' if num_bootstraps == 1 else 'operations'}.")
+
+        if io_mode == "save":
+            compile_cache.write_manifest(
+                compile_manifest_path,
+                compile_cache.build_manifest(
+                    params=self.params,
+                    net=net,
+                    network_dag=network_dag,
+                    topo_sort=topo_sort,
+                    input_level=int(input_level),
+                    bootstrap_count=int(num_bootstraps),
+                    bootstrapper_slots=list(bootstrapper_slots),
+                    linear_layers=[],
+                ),
+            )
 
         #btp_solver.plot_shortest_path(
         #    save_path="network-with-levels.png", figsize=(8,30) # optional plot
@@ -437,12 +471,36 @@ class Scheme:
         #------------------------------------------#
 
         print("\n{5} Compiling network layers...", flush=True)
+        compiled_linear_layers = []
         for node in topo_sort:
             node_attrs = network_dag.nodes[node]
             module = node_attrs["module"]
             if isinstance(module, Module):
                 print(f"├── {node} @ level={module.level}", flush=True)
                 module.compile()
+                if isinstance(module, LinearTransform):
+                    compiled_linear_layers.append(module)
+
+        register_saved_io_schedule = getattr(self.lt_evaluator, "register_saved_io_schedule", None)
+        if callable(register_saved_io_schedule):
+            register_saved_io_schedule(compiled_linear_layers)
+
+        if io_mode == "load" and compile_manifest is not None:
+            compile_cache.validate_transform_metadata(compile_manifest, compiled_linear_layers)
+        elif io_mode == "save":
+            compile_cache.write_manifest(
+                compile_manifest_path,
+                compile_cache.build_manifest(
+                    params=self.params,
+                    net=net,
+                    network_dag=network_dag,
+                    topo_sort=topo_sort,
+                    input_level=int(input_level),
+                    bootstrap_count=int(num_bootstraps),
+                    bootstrapper_slots=list(bootstrapper_slots),
+                    linear_layers=compiled_linear_layers,
+                ),
+            )
                 
         return input_level # level at which to encrypt the input.
 

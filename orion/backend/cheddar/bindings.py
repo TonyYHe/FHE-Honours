@@ -76,7 +76,14 @@ class CheddarLibrary(LattigoLibrary):
         self.lt_outputs_are_rescaled = True
         self.align_addition_scales = True
         self.load_plaintext_diagonals_requires_payload = False
+        self.supports_index_only_linear_transform_load = False
         self.saved_io_prefetch_requires_device_memory = True
+        self.saved_io_device_prefetch_enabled = (
+            os.environ.get("ORION_CHEDDAR_GPU_PREFETCH", "1").lower()
+            not in ("0", "false", "no", "off")
+        )
+        self.memory_bounded_unified_transforms = True
+        self.memory_bounded_unified_evaluate = True
 
     def _load_library(self):
         try:
@@ -119,10 +126,54 @@ class CheddarLibrary(LattigoLibrary):
             argtypes=[ctypes.c_int, ctypes.c_int],
             restype=ArrayResultByte,
         )
+        self.SerializeLinearTransformPlaintexts = LattigoFunction(
+            self.lib.SerializeLinearTransformPlaintexts,
+            argtypes=[ctypes.c_int],
+            restype=ArrayResultByte,
+        )
+        self.LinearTransformUsesStreaming = LattigoFunction(
+            self.lib.LinearTransformUsesStreaming,
+            argtypes=[ctypes.c_int],
+            restype=ctypes.c_int,
+        )
+        self.LoadLinearTransformPlaintexts = LattigoFunction(
+            self.lib.LoadLinearTransformPlaintexts,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.c_ulong,
+                ctypes.c_int,
+            ],
+            restype=None,
+        )
+        self.LoadLinearTransformRotationKey = LattigoFunction(
+            self.lib.LoadLinearTransformRotationKey,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_int,
+            ],
+            restype=None,
+        )
+        self.RemoveLinearTransformRotationKeys = LattigoFunction(
+            self.lib.RemoveLinearTransformRotationKeys,
+            argtypes=[ctypes.c_int],
+            restype=None,
+        )
         self.GetDeviceMemoryInfo = LattigoFunction(
             self.lib.GetDeviceMemoryInfo,
             argtypes=[],
             restype=ArrayResultUInt64,
+        )
+        self.SynchronizeDevice = LattigoFunction(
+            self.lib.SynchronizeDevice,
+            argtypes=[],
+            restype=None,
+        )
+        self.TrimDeviceMemoryPool = LattigoFunction(
+            self.lib.TrimDeviceMemoryPool,
+            argtypes=[ctypes.c_ulonglong],
+            restype=None,
         )
         self.EstimateLinearTransformDeviceBytes = LattigoFunction(
             self.lib.EstimateLinearTransformDeviceBytes,

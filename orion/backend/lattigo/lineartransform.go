@@ -4,6 +4,7 @@ import (
 	"C"
 	"math"
 	"runtime"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -115,6 +116,60 @@ func RetrieveLinearTransform(id int) lintrans.LinearTransformation {
 	return ltHeap.Retrieve(id).(lintrans.LinearTransformation)
 }
 
+func ensureLinearTransformRotationKeys(transform lintrans.LinearTransformation) {
+	if scheme.EvalKeys == nil {
+		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
+	}
+	if scheme.EvalKeys.GaloisKeys == nil {
+		scheme.EvalKeys.GaloisKeys = make(map[uint64]*rlwe.GaloisKey)
+	}
+	for _, galEl := range transform.GaloisElements(scheme.Params) {
+		if rotKey, exists := scheme.EvalKeys.GaloisKeys[galEl]; exists && rotKey != nil {
+			continue
+		}
+		scheme.EvalKeys.GaloisKeys[galEl] = scheme.KeyGen.GenGaloisKeyNew(galEl, scheme.SecretKey)
+	}
+}
+
+func emptyLinearTransformPlaintextKeys(transform lintrans.LinearTransformation) []int {
+	keys := make([]int, 0)
+	for diagIdx, poly := range transform.Vec {
+		if len(poly.Q.Coeffs) == 0 {
+			keys = append(keys, diagIdx)
+		}
+	}
+	return keys
+}
+
+func linearTransformPlaintextLevels(transform lintrans.LinearTransformation) []int {
+	levels := make([]int, 0, 2*len(transform.Vec))
+	for diagIdx, poly := range transform.Vec {
+		level := -1
+		if len(poly.Q.Coeffs) > 0 {
+			level = len(poly.Q.Coeffs) - 1
+		}
+		levels = append(levels, diagIdx, level)
+	}
+	return levels
+}
+
+func validateLinearTransformPlaintextLevels(transformID int, transform lintrans.LinearTransformation) {
+	for diagIdx, poly := range transform.Vec {
+		actualLevel := len(poly.Q.Coeffs) - 1
+		if actualLevel < 0 {
+			panic("linear transform plaintext missing: transformID=" + strconv.Itoa(transformID) + " diag=" + strconv.Itoa(diagIdx))
+		}
+		if actualLevel < transform.LevelQ {
+			panic(
+				"linear transform plaintext level mismatch: transformID=" + strconv.Itoa(transformID) +
+					" diag=" + strconv.Itoa(diagIdx) +
+					" transformLevel=" + strconv.Itoa(transform.LevelQ) +
+					" plaintextLevel=" + strconv.Itoa(actualLevel),
+			)
+		}
+	}
+}
+
 //export DeleteLinearTransform
 func DeleteLinearTransform(id C.int) {
 	ltHeap.Delete(int(id))
@@ -138,7 +193,10 @@ func GenerateLinearTransform(
 
 	// Unload diags data
 	diagIdxs := CArrayToSlice(diagIdxsC, diagIdxsLen, convertCIntToInt)
-	diagDataFlat := CArrayToSlice(diagDataC, diagDataLen, convertCFloatToFloat)
+	diagDataFlat := []float64(nil)
+	if ioMode != "load" {
+		diagDataFlat = CArrayToSlice(diagDataC, diagDataLen, convertCFloatToFloat)
+	}
 
 	// diagDataFlat is a flattened array of length len(diagIdxs) * slots.
 	// The first element in diagIdxs corresponds to the first [0, slots]
@@ -147,8 +205,14 @@ func GenerateLinearTransform(
 	slots := scheme.Params.MaxSlots()
 	diagonals := make(lintrans.Diagonals[float64])
 
-	for i, key := range diagIdxs {
-		diagonals[key] = diagDataFlat[i*slots : (i+1)*slots]
+	if ioMode == "load" {
+		for _, key := range diagIdxs {
+			diagonals[key] = nil
+		}
+	} else {
+		for i, key := range diagIdxs {
+			diagonals[key] = diagDataFlat[i*slots : (i+1)*slots]
+		}
 	}
 
 	ltparams := lintrans.Parameters{
@@ -209,11 +273,20 @@ func GenerateLinearTransformsBatch(
 
 	for i := 0; i < n; i++ {
 		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
-		diagDataFlat := CArrayToSlice(diagDataArraySlice[i], diagDataLensSlice[i], convertCFloatToFloat)
+		diagDataFlat := []float64(nil)
+		if ioMode != "load" {
+			diagDataFlat = CArrayToSlice(diagDataArraySlice[i], diagDataLensSlice[i], convertCFloatToFloat)
+		}
 
 		diagonals := make(lintrans.Diagonals[float64])
-		for j, key := range diagIdxs {
-			diagonals[key] = diagDataFlat[j*slots : (j+1)*slots]
+		if ioMode == "load" {
+			for _, key := range diagIdxs {
+				diagonals[key] = nil
+			}
+		} else {
+			for j, key := range diagIdxs {
+				diagonals[key] = diagDataFlat[j*slots : (j+1)*slots]
+			}
 		}
 		diagonalsList[i] = diagonals
 
@@ -251,6 +324,8 @@ func GenerateLinearTransformsBatch(
 func EvaluateLinearTransform(transformID, ctxtID C.int) C.int {
 	transform := RetrieveLinearTransform(int(transformID))
 	ctIn := RetrieveCiphertext(int(ctxtID))
+	ensureLinearTransformRotationKeys(transform)
+	validateLinearTransformPlaintextLevels(int(transformID), transform)
 
 	// Update the linear transform evaluator to have the most
 	// recent set of rotation keys.
@@ -273,6 +348,22 @@ func GetLinearTransformRotationKeys(transformID C.int) (*C.int, C.ulong) {
 	galEls := transform.GaloisElements(scheme.Params)
 
 	arrPtr, length := SliceToCArray(galEls, convertULongtoInt)
+	return arrPtr, length
+}
+
+//export GetLinearTransformEmptyPlaintextKeys
+func GetLinearTransformEmptyPlaintextKeys(transformID C.int) (*C.int, C.ulong) {
+	transform := RetrieveLinearTransform(int(transformID))
+	keys := emptyLinearTransformPlaintextKeys(transform)
+	arrPtr, length := SliceToCArray(keys, convertIntToCInt)
+	return arrPtr, length
+}
+
+//export GetLinearTransformPlaintextLevels
+func GetLinearTransformPlaintextLevels(transformID C.int) (*C.int, C.ulong) {
+	transform := RetrieveLinearTransform(int(transformID))
+	levels := linearTransformPlaintextLevels(transform)
+	arrPtr, length := SliceToCArray(levels, convertIntToCInt)
 	return arrPtr, length
 }
 
@@ -518,6 +609,8 @@ func EvaluateLinearTransformsWithSharedCache(
 	transforms := make([]lintrans.LinearTransformation, n)
 	for i, id := range transformIDsSlice {
 		transforms[i] = RetrieveLinearTransform(id)
+		ensureLinearTransformRotationKeys(transforms[i])
+		validateLinearTransformPlaintextLevels(id, transforms[i])
 	}
 
 	ctIn := RetrieveCiphertext(int(ctxtID))

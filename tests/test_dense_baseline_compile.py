@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import h5py
@@ -9,6 +10,7 @@ import torch
 import orion
 from orion.backend.python.lt_evaluator import NewEvaluator
 from orion.core import packing
+from orion.core import orion as orion_core
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
 
@@ -320,5 +322,100 @@ def test_load_mode_reuses_cached_diagonals_without_repacking(tmp_path, monkeypat
         assert layer.output_rotations == 0
         layer.compile()
         assert layer.transform_ids
+    finally:
+        load_scheme.delete_scheme()
+
+
+def test_load_mode_uses_cached_compile_plan(tmp_path, monkeypatch) -> None:
+    torch.manual_seed(11)
+    weight = torch.randn(1, 1, 1, 1)
+    x = torch.randn(1, 1, 2, 2)
+
+    save_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="save"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        save_input_level = orion.compile(layer)
+    finally:
+        save_scheme.delete_scheme()
+
+    manifest_path = tmp_path / "compile_manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["bootstrap_plan"]["input_level"] == save_input_level
+    assert manifest["transform_metadata"]["layers"]
+
+    def fail_solve(*_args, **_kwargs):
+        raise AssertionError("load mode should reuse the cached bootstrap plan")
+
+    monkeypatch.setattr(orion_core.BootstrapSolver, "solve", fail_solve)
+
+    load_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="load"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        assert orion.compile(layer) == save_input_level
+    finally:
+        load_scheme.delete_scheme()
+
+
+def test_load_mode_rejects_compile_manifest_fingerprint_mismatch(tmp_path) -> None:
+    torch.manual_seed(12)
+    weight = torch.randn(1, 1, 1, 1)
+    x = torch.randn(1, 1, 2, 2)
+
+    save_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="save"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        orion.compile(layer)
+    finally:
+        save_scheme.delete_scheme()
+
+    manifest_path = tmp_path / "compile_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["fingerprint"]["sha256"] = "not-current"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    load_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="load"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        with pytest.raises(RuntimeError, match="fingerprint mismatch"):
+            orion.compile(layer)
+    finally:
+        load_scheme.delete_scheme()
+
+
+def test_load_mode_rejects_transform_metadata_mismatch(tmp_path) -> None:
+    torch.manual_seed(13)
+    weight = torch.randn(1, 1, 1, 1)
+    x = torch.randn(1, 1, 2, 2)
+
+    save_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="save"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        orion.compile(layer)
+    finally:
+        save_scheme.delete_scheme()
+
+    manifest_path = tmp_path / "compile_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["transform_metadata"]["layers"][0]["level"] = 0
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    load_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="load"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        with pytest.raises(RuntimeError, match="transform metadata mismatch"):
+            orion.compile(layer)
     finally:
         load_scheme.delete_scheme()

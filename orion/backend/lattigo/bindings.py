@@ -102,6 +102,7 @@ class LattigoLibrary:
         self.lib = self._load_library()
         self.load_plaintext_diagonals_requires_payload = True
         self.saved_io_prefetch_requires_device_memory = False
+        self.supports_index_only_linear_transform_load = True
 
     def _load_library(self):
         try:
@@ -748,6 +749,14 @@ class LattigoLibrary:
             restype=ArrayResultInt
         )
 
+        get_empty_plaintext_keys = getattr(self.lib, "GetLinearTransformEmptyPlaintextKeys", None)
+        if get_empty_plaintext_keys is not None:
+            self.GetLinearTransformEmptyPlaintextKeys = LattigoFunction(
+                get_empty_plaintext_keys,
+                argtypes=[ctypes.c_int],
+                restype=ArrayResultInt
+            )
+
         self.GenerateLinearTransformRotationKey = LattigoFunction(
             self.lib.GenerateLinearTransformRotationKey,
             argtypes=[ctypes.c_int],
@@ -842,6 +851,14 @@ class LattigoLibrary:
             restype=None
         )
 
+        get_plaintext_levels = getattr(self.lib, "GetLinearTransformPlaintextLevels", None)
+        if get_plaintext_levels is not None:
+            self.GetLinearTransformPlaintextLevels = LattigoFunction(
+                get_plaintext_levels,
+                argtypes=[ctypes.c_int],
+                restype=ArrayResultInt,
+            )
+
         self.RemoveRotationKeys = LattigoFunction(
             self.lib.RemoveRotationKeys,
             argtypes=[],
@@ -866,6 +883,17 @@ class LattigoLibrary:
             ],
             restype=ctypes.c_int
         )
+
+        bootstrap_many = getattr(self.lib, "BootstrapMany", None)
+        if bootstrap_many is not None:
+            self.BootstrapMany = LattigoFunction(
+                bootstrap_many,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                    ctypes.c_int,
+                ],
+                restype=ArrayResultInt
+            )
 
         self.DeleteBootstrappers = LattigoFunction(
             self.lib.DeleteBootstrappers,
