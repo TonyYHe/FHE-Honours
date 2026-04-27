@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from orion.backend.python.tensors import CipherTensor
 from orion.core import packing
 from orion.core.network_dag import NetworkDAG
-from orion.core.orion import scheme
+from orion.core.orion import _region_first_mode_options, scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import U22CompileRegistry
 from orion.experimental.u22_phase1 import TconvK2S2PythonRuntimeExecutor
@@ -130,6 +130,88 @@ def test_u22_registry_attaches_all_decoder_tconvs_with_experimental_kernel(datas
             assert runtime.materializer == "tconv_k2s2_gap_halving_experimental"
             assert runtime.executable is True
             assert getattr(runtime.executor, "kernel_kind", "") == "tconv_k2s2_gap_halving_experimental"
+            assert getattr(runtime.executor, "use_ct_pt_hybrid_packing", False) is True
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_registry_can_attach_decoder_tconv_subset() -> None:
+    _init_python_scheme(logn=int(DATASET_SPECS["tiny"]["logn"]))
+    try:
+        dag = _prepared_dag(dataset="tiny")
+        registry = U22CompileRegistry.for_dag(dag, allowed_nodes=("up2", "up1"))
+        audit = registry.attach_to_dag(dag)
+
+        assert audit["attached_count"] == 2
+        assert {row["node"] for row in audit["attached"]} == {"up2", "up1"}
+        assert audit["graph_audit"]["allowed_nodes"] == ["up2", "up1"]
+        filtered = {
+            row["node"]
+            for row in audit["graph_audit"]["excluded_nodes"]
+            if row["reason"] == "u22_ablation_filtered_out"
+        }
+        assert filtered == {"up4", "up3"}
+        for node_name in ("up2", "up1"):
+            assert getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None) is not None
+        for node_name in ("up4", "up3"):
+            assert getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None) is None
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_64_default_provider_mode_selects_all_decoder_tconvs_and_conv_kernels() -> None:
+    opts = _region_first_mode_options("u22_64_base32")
+    assert opts["enabled"] is True
+    assert opts["is_u22_phase1"] is True
+    assert opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
+    assert opts["u22_conv_kernels"] is True
+
+    imagenet_opts = _region_first_mode_options("u22_256_base32")
+    assert imagenet_opts["enabled"] is True
+    assert imagenet_opts["is_u22_phase1"] is True
+    assert imagenet_opts["u22_allowed_nodes"] == ("up4", "up3")
+    assert imagenet_opts["u22_conv_kernels"] is True
+
+    ablation_opts = _region_first_mode_options("u22_64_base32_up1234_noconv")
+    assert ablation_opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
+    assert ablation_opts["u22_conv_kernels"] is False
+
+    up34_opts = _region_first_mode_options("u22_64_base32_up34_conv")
+    assert up34_opts["u22_allowed_nodes"] == ("up3", "up4")
+    assert up34_opts["u22_conv_kernels"] is True
+
+
+def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
+    _init_python_scheme(logn=int(DATASET_SPECS["tiny"]["logn"]))
+    try:
+        dag = _prepared_dag(dataset="tiny", base_channels=32)
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=("up4", "up3"),
+            enable_conv_kernels=True,
+        )
+        audit = registry.attach_to_dag(dag)
+        attached = {row["node"] for row in audit["attached"]}
+
+        assert {"up4", "up3", "enc1b", "dec1a", "dec2b"}.issubset(attached)
+        assert "up2" not in attached
+        assert "up1" not in attached
+        assert "bottleneckb" not in attached
+        assert audit["graph_audit"]["allowed_nodes"] == ["up4", "up3"]
+        assert audit["graph_audit"]["enable_conv_kernels"] is True
+        assert audit["graph_audit"]["selected_tconv_count"] == 2
+        assert audit["graph_audit"]["selected_conv_count"] >= 8
+        excluded = {
+            row["node"]: row["reason"]
+            for row in audit["graph_audit"]["excluded_nodes"]
+        }
+        assert excluded["bottleneckb"] == "u22_conv_single_block_fold_unsupported"
+
+        for node_name in ("enc1b", "dec1a", "dec2b"):
+            runtime = getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None)
+            assert runtime is not None
+            assert runtime.strategy.startswith("u22_conv_same_shape_")
+            assert runtime.supports_scheme(scheme) is True
     finally:
         scheme.delete_scheme()
 
@@ -218,11 +300,20 @@ def test_u22_tconv_provider_runtime_handles_multi_input_and_output_blocks_on_pyt
 
         runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="synthetic_u22_tconv")
         assert runtime.supports_scheme(scheme) is True
+        no_hybrid_runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="synthetic_u22_tconv_no_hybrid",
+            use_ct_pt_hybrid_packing=False,
+        )
+        assert no_hybrid_runtime.supports_scheme(scheme) is True
 
         torch.manual_seed(19)
         x = torch.randn(tuple(int(v) for v in module.input_shape), dtype=torch.float32)
-        out = runtime(_encode_input(module, x[0]))
+        source = _encode_input(module, x[0])
+        out = runtime(source)
+        no_hybrid_out = no_hybrid_runtime(source)
         result = _decode_output(module, out["synthetic_u22_tconv"])
+        no_hybrid_result = _decode_output(module, no_hybrid_out["synthetic_u22_tconv_no_hybrid"])
         reference = F.conv_transpose2d(
             x,
             module.on_weight.detach().to(dtype=torch.float32),
@@ -236,6 +327,15 @@ def test_u22_tconv_provider_runtime_handles_multi_input_and_output_blocks_on_pyt
 
         assert runtime.input_block_count == 2
         assert runtime.output_block_count == 3
+        assert runtime.use_ct_pt_hybrid_packing is True
+        assert runtime.input_block_pairs == [(0, 1)]
+        assert len(runtime.groups) == 1
+        assert runtime.block_evaluate_count == 1
+        assert no_hybrid_runtime.input_block_pairs == [(0, None), (1, None)]
+        assert len(no_hybrid_runtime.groups) == 2
+        assert no_hybrid_runtime.block_evaluate_count == 2
         assert float((result - reference).abs().max().item()) <= 1.0e-5
+        assert float((no_hybrid_result - reference).abs().max().item()) <= 1.0e-5
+        assert float((result - no_hybrid_result).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()

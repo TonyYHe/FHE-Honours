@@ -39,7 +39,43 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         "r18_tiny_e2e_probe_precompile_no_stem_bypass",
         "r18_tiny_e2e_probe_precompile_stage0",
     }
-    is_enabled = normalized in r18_modes or normalized == "r34_imgnet_phase1"
+    u22_base_modes = {
+        "u22_phase1",
+        "u22_64_base32",
+        "u22_256_base32",
+    }
+    u22_mode_base = next(
+        (
+            str(base)
+            for base in sorted(u22_base_modes, key=len, reverse=True)
+            if normalized == str(base) or normalized.startswith(f"{base}_")
+        ),
+        None,
+    )
+    u22_allowed_nodes = None
+    u22_conv_kernels = bool(u22_mode_base is not None)
+    if u22_mode_base is not None and normalized != str(u22_mode_base):
+        suffix = normalized[len(str(u22_mode_base)) + 1 :]
+        allowed: list[str] = []
+        for token in suffix.split("_"):
+            if token == "conv":
+                u22_conv_kernels = True
+                continue
+            if token == "noconv":
+                u22_conv_kernels = False
+                continue
+            if not token.startswith("up"):
+                continue
+            digits = token[2:]
+            if digits and all(ch in "1234" for ch in digits):
+                allowed.extend(f"up{ch}" for ch in digits)
+        if allowed:
+            u22_allowed_nodes = tuple(dict.fromkeys(allowed))
+    if u22_mode_base == "u22_64_base32" and u22_allowed_nodes is None:
+        u22_allowed_nodes = ("up1", "up2", "up3", "up4")
+    elif u22_mode_base is not None and u22_allowed_nodes is None:
+        u22_allowed_nodes = ("up4", "up3")
+    is_enabled = normalized in r18_modes or normalized == "r34_imgnet_phase1" or u22_mode_base is not None
     is_r18 = normalized in r18_modes
     is_probe_dense_bypass = normalized in {
         "r18_tiny_e2e_probe",
@@ -62,6 +98,9 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         "enabled": bool(is_enabled),
         "is_r18": bool(is_r18),
         "is_r34_phase1": bool(normalized == "r34_imgnet_phase1"),
+        "is_u22_phase1": bool(u22_mode_base is not None),
+        "u22_allowed_nodes": u22_allowed_nodes,
+        "u22_conv_kernels": bool(u22_conv_kernels),
         "allowed_stages": ("stage1",) if normalized == "r18_tiny_e2e_probe_precompile_stage0" else None,
         "attach_probe_dense_bypass": bool(is_probe_dense_bypass),
         "attach_probe_stem_activation_bypass": bool(is_probe_stem_bypass),
@@ -292,6 +331,15 @@ class Scheme:
                 from orion.experimental.r34_phase1 import R34CompileRegistry
 
                 self.region_first_registry = R34CompileRegistry.for_r34_imgnet_phase1(network_dag)
+                self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
+            elif bool(region_first_options["is_u22_phase1"]):
+                from orion.experimental.u22_phase1 import U22CompileRegistry
+
+                self.region_first_registry = U22CompileRegistry.for_dag(
+                    network_dag,
+                    allowed_nodes=region_first_options.get("u22_allowed_nodes"),
+                    enable_conv_kernels=bool(region_first_options.get("u22_conv_kernels", False)),
+                )
                 self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
             else:
                 from orion.experimental.cir.runtime_group import RegionFirstCompileRegistry
