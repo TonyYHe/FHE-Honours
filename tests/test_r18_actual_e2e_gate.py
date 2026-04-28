@@ -23,6 +23,7 @@ from orion.experimental.cir.lattigo_block import (
 from orion.experimental.cir.runtime_group import (
     FullConvRegionRuntimeExecutor,
     RegionFirstCompileRegistry,
+    RegionFirstRuntimeGroup,
     _rescale_cipher_tensor as _runtime_rescale_cipher_tensor,
     build_r18_actual_region_first_e2e_report,
 )
@@ -373,6 +374,54 @@ def test_r18_e2e_compile_records_assigned_region_level() -> None:
     assert getattr(group, "assigned_level") == 6
     assert getattr(group, "assigned_depth") == 2
     assert getattr(group.executor, "assigned_level") == 6
+
+
+def test_region_runtime_keeps_compiled_executor_for_repeat_schedule_debug(monkeypatch) -> None:
+    class CountingExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.cleanup_count = 0
+
+        def __call__(self, source_ct):
+            self.calls += 1
+            return {
+                "left": f"left-{self.calls}",
+                "right": f"right-{self.calls}",
+            }
+
+        def cleanup(self, _backend) -> None:
+            self.cleanup_count += 1
+
+    executor = CountingExecutor()
+    group = RegionFirstRuntimeGroup(
+        region_id="repeat_schedule",
+        network="R18",
+        stage="stage",
+        module_prefix="repeat",
+        conv_nodes=("left", "right"),
+        strategy="test",
+        materializer="test",
+        depth=1,
+        boundary_actions=(),
+        expected_stats={},
+        executable=True,
+        fallback_reason="",
+        output_node_ids=("left", "right"),
+        executor=executor,
+    )
+    source = SimpleNamespace(ids=[1], scheme=SimpleNamespace(backend=object()))
+
+    assert group.output("left", source) == "left-1"
+    assert group.output("right", source) == "right-1"
+    assert executor.cleanup_count == 0
+
+    source2 = SimpleNamespace(ids=[2], scheme=SimpleNamespace(backend=object()))
+    assert group.output("left", source2) == "left-2"
+    assert executor.calls == 2
+
+    monkeypatch.setenv("ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS", "1")
+    assert group.output("right", source2) == "right-2"
+    assert executor.cleanup_count == 1
 
 
 def test_stage4_dense_transition_runtime_matches_solver_levels_after_cir_depth_fix() -> None:

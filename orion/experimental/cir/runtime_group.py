@@ -760,6 +760,9 @@ class RegionFirstRuntimeGroup:
         return dict(outputs)
 
     def _cleanup_executor_after_outputs_consumed(self, source_ct: Any) -> None:
+        cleanup_enabled = str(os.environ.get("ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS", "0")).strip().lower()
+        if cleanup_enabled in {"", "0", "false", "no", "off"}:
+            return
         cleanup = getattr(self.executor, "cleanup", None)
         if not callable(cleanup):
             return
