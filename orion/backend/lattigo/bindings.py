@@ -6,6 +6,28 @@ import torch
 import numpy as np
 
 
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+
+
+def _read_env_bool(names, default: bool) -> bool:
+    for name in names:
+        raw_value = os.environ.get(str(name))
+        if raw_value is None:
+            continue
+        return raw_value.strip().lower() not in _FALSE_ENV_VALUES
+    return bool(default)
+
+
+def _read_env_int(name: str) -> int | None:
+    raw_value = os.environ.get(str(name))
+    if raw_value is None:
+        return None
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
 class LattigoFunction:
     """Helper to wrap ctypes functions with argument and return types."""
     def __init__(self, func, argtypes, restype):
@@ -103,6 +125,23 @@ class LattigoLibrary:
         self.load_plaintext_diagonals_requires_payload = True
         self.saved_io_prefetch_requires_device_memory = False
         self.supports_index_only_linear_transform_load = True
+        self.memory_bounded_unified_transforms = _read_env_bool(
+            (
+                "ORION_LATTIGO_MEMORY_BOUNDED_UNIFIED_TRANSFORMS",
+                "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE",
+            ),
+            True,
+        )
+        self.memory_bounded_unified_evaluate = _read_env_bool(
+            (
+                "ORION_LATTIGO_MEMORY_BOUNDED_UNIFIED_EVALUATE",
+                "ORION_LATTIGO_MEMORY_BOUNDED_EVAL",
+            ),
+            True,
+        )
+        eval_budget = _read_env_int("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES")
+        if eval_budget is not None:
+            self.unified_transform_eval_budget_bytes = max(1, int(eval_budget))
 
     def _load_library(self):
         try:
