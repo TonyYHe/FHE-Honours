@@ -1586,7 +1586,7 @@ def _r34_transition_group(*, family_label: str, conv_haloed_node: str, shortcut_
         conv_nodes=conv_nodes,
         strategy=str(binding.provider_key),
         materializer=str(binding.materializer),
-        depth=2,
+        depth=1,
         boundary_actions=("insert_extract_before_relu_or_add", "validate_relu_safe"),
         expected_stats=dict(expected_stats),
         executable=False,

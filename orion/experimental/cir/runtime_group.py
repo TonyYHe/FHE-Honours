@@ -43,7 +43,14 @@ DEFAULT_R18_TINY_E2E_OUT = Path("/tmp/orion_r18_tiny_region_first_e2e.json")
 DEFAULT_R18_ACTUAL_E2E_OUT = Path("/tmp/orion_r18_actual_region_first_e2e.json")
 
 
-def transforms_from_conv_scheme_plan(plan: Any, *, level: int, scheme: Any, bank_count: int | None = None) -> tuple[list[Any], list[str]]:
+def transforms_from_conv_scheme_plan(
+    plan: Any,
+    *,
+    level: int,
+    scheme: Any,
+    bank_count: int | None = None,
+    output_scale: float = 1.0,
+) -> tuple[list[Any], list[str]]:
     if len(plan.linear_transform_steps) != 1:
         raise ValueError("RegionFirstRuntimeGroup expects one collapsed SharedMultiOutput LT step")
     step = plan.linear_transform_steps[0]
@@ -67,6 +74,8 @@ def transforms_from_conv_scheme_plan(plan: Any, *, level: int, scheme: Any, bank
             if not bool(torch.equal(mapped_source_indices, output_indices)):
                 raise ValueError(f"term {term.term_id} cannot be encoded as one dense Orion diagonal")
             values = plaintext.values.to(dtype=torch.complex64)
+            if float(output_scale) != 1.0:
+                values = values * float(output_scale)
             diag_index = (-int(term.shift)) % int(slots)
             diag = diag_tensors.setdefault(int(diag_index), torch.zeros((int(slots),), dtype=torch.complex64))
             diag.index_add_(0, output_indices, values)
@@ -129,9 +138,10 @@ def _delete_ciphertext_id(scheme: Any, ciphertext_id: int) -> None:
 
 
 class Stage1RuntimeExecutor:
-    def __init__(self, *, plan: Any, output_node_ids: tuple[str, ...]) -> None:
+    def __init__(self, *, plan: Any, output_node_ids: tuple[str, ...], real_output_scale: float = 0.5) -> None:
         self.plan = plan
         self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.real_output_scale = float(real_output_scale)
         self.group = None
         self.transforms: list[Any] = []
         self.bank_ids: list[str] = []
@@ -148,6 +158,7 @@ class Stage1RuntimeExecutor:
             level=int(level),
             scheme=scheme,
             bank_count=len(self.output_node_ids),
+            output_scale=float(self.real_output_scale),
         )
         self.group = UnifiedTransformGroup(self.transforms)
         self.group.compile_unified(scheme.backend)
@@ -166,16 +177,22 @@ class Stage1RuntimeExecutor:
             ct = _rescale_cipher_tensor(ct)
             conj = ct.conjugate(in_place=False)
             ct, conj = _align_ciphertexts_for_add(ct, conj)
-            outputs[str(node_id)] = (ct + conj) * 0.5
+            outputs[str(node_id)] = ct + conj
         return outputs
+
+    def cleanup(self, backend: Any) -> None:
+        if self.group is not None and hasattr(self.group, "cleanup"):
+            self.group.cleanup(backend)
+        self.group = None
 
 
 class Stage2RuntimeExecutor:
-    def __init__(self, *, plans: tuple[Any, Any], output_node_ids: tuple[str, ...]) -> None:
+    def __init__(self, *, plans: tuple[Any, Any], output_node_ids: tuple[str, ...], real_output_scale: float = 0.5) -> None:
         if len(plans) != 2:
             raise ValueError("Stage2RuntimeExecutor expects exactly two input surface-pair block plans")
         self.plans = tuple(plans)
         self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.real_output_scale = float(real_output_scale)
         self.groups: list[Any] = []
         self.transforms_by_block: list[list[Any]] = []
         self.bank_ids_by_block: list[list[str]] = []
@@ -194,6 +211,7 @@ class Stage2RuntimeExecutor:
                 level=int(level),
                 scheme=scheme,
                 bank_count=len(self.output_node_ids),
+                output_scale=float(self.real_output_scale),
             )
             group = UnifiedTransformGroup(transforms)
             group.compile_unified(scheme.backend)
@@ -249,8 +267,16 @@ class Stage2RuntimeExecutor:
             ct = _rescale_cipher_tensor(ct)
             conj = ct.conjugate(in_place=False)
             ct, conj = _align_ciphertexts_for_add(ct, conj)
-            outputs[str(node_id)] = (ct + conj) * 0.5
+            outputs[str(node_id)] = ct + conj
         return outputs
+
+    def cleanup(self, backend: Any) -> None:
+        for group in self.groups:
+            if hasattr(group, "cleanup"):
+                group.cleanup(backend)
+        self.groups = []
+        self.transforms_by_block = []
+        self.bank_ids_by_block = []
 
 
 class LazySingleBlockRuntimeExecutor(Stage1RuntimeExecutor):
@@ -261,9 +287,11 @@ class LazySingleBlockRuntimeExecutor(Stage1RuntimeExecutor):
         output_node_ids: tuple[str, ...],
         plan_builder: Any | None = None,
         builder_kwargs: dict[str, Any] | None = None,
+        real_output_scale: float = 0.5,
     ) -> None:
         self.plan = plan
         self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.real_output_scale = float(real_output_scale)
         self.group = None
         self.transforms: list[Any] = []
         self.bank_ids: list[str] = []
@@ -320,6 +348,7 @@ class FullConvRegionRuntimeExecutor:
         bias_vector: torch.Tensor | None = None,
         source_pair_count: int | None = None,
         requires_compact_source: bool = False,
+        real_output_scale: float = 0.5,
     ) -> None:
         self.plans = tuple(plans)
         self._plan_builders = tuple(plan_builders)
@@ -332,6 +361,7 @@ class FullConvRegionRuntimeExecutor:
         self.bias_vector = None if bias_vector is None else bias_vector.detach().to(dtype=torch.float32).clone()
         self.source_pair_count = int(source_pair_count or len(plans))
         self.requires_compact_source = bool(requires_compact_source)
+        self.real_output_scale = float(real_output_scale)
         self.groups: list[Any] = []
         self.transforms_by_block: list[list[Any]] = []
         self.bias_plaintexts: tuple[Any | None, ...] = ()
@@ -394,6 +424,7 @@ class FullConvRegionRuntimeExecutor:
                     level=int(level),
                     scheme=scheme,
                     bank_count=self.bank_count,
+                    output_scale=float(self.real_output_scale),
                 )[0]
                 for plan in self.plans
             ]
@@ -406,6 +437,7 @@ class FullConvRegionRuntimeExecutor:
                     level=int(level),
                     scheme=scheme,
                     bank_count=self.bank_count,
+                    output_scale=float(self.real_output_scale),
                 )
                 return transforms
 
@@ -587,7 +619,7 @@ class FullConvRegionRuntimeExecutor:
             ct = _rescale_cipher_tensor(ct)
             conj = ct.conjugate(in_place=False)
             ct, conj = _align_ciphertexts_for_add(ct, conj)
-            real = (ct + conj) * 0.5
+            real = ct + conj
             real = self._add_bias(real, bank_index=int(bank_index))
             real.set_scale(int(scheme.params.get_default_scale()))
             real_ids.append(int(real.ids[0]))
@@ -603,6 +635,17 @@ class FullConvRegionRuntimeExecutor:
                 self.fhe_output_shape,
             )
         }
+
+    def cleanup(self, backend: Any) -> None:
+        for group in self.groups:
+            if hasattr(group, "cleanup"):
+                group.cleanup(backend)
+        self.groups = []
+        self.transforms_by_block = []
+        self.bias_plaintexts = ()
+        self._bias_plaintext_cache = {}
+        self._compact_source_mask_cache = {}
+        self._compact_source_shift = None
 
 
 def _replace_group(group: "RegionFirstRuntimeGroup", **updates: Any) -> "RegionFirstRuntimeGroup":
@@ -716,6 +759,16 @@ class RegionFirstRuntimeGroup:
             raise RuntimeError(f"region {self.region_id} is executable but has no executor")
         return dict(outputs)
 
+    def _cleanup_executor_after_outputs_consumed(self, source_ct: Any) -> None:
+        cleanup = getattr(self.executor, "cleanup", None)
+        if not callable(cleanup):
+            return
+        backend = getattr(getattr(source_ct, "scheme", None), "backend", None)
+        if backend is None:
+            return
+        cleanup(backend)
+        self.compiled = False
+
     def output(self, output_node_id: str, source_ct: Any) -> Any:
         key = self._source_key(source_ct)
         if self._cache_key != key:
@@ -726,6 +779,7 @@ class RegionFirstRuntimeGroup:
         output = self._cache_outputs.pop(str(output_node_id))
         if not self._cache_outputs:
             self._cache_key = None
+            self._cleanup_executor_after_outputs_consumed(source_ct)
         return output
 
 
@@ -988,7 +1042,7 @@ def _full_conv_region_from_module(
         conv_nodes=(node,),
         strategy=strategy,
         materializer=str(ref.materializer),
-        depth=3 if stage == "stage4" else 2,
+        depth=2 if stage == "stage4" else 1,
         boundary_actions=("full_conv_output_assembly", "insert_extract_before_relu_or_add"),
         expected_stats=dict(ref.expected_stats),
         executable=True,
@@ -1032,7 +1086,7 @@ def _r18_transition_group(*, stage: str, conv_node: str, shortcut_node: str, spe
         conv_nodes=(str(conv_node), str(shortcut_node)),
         strategy="strict_channel_split_hybrid_transition_bridge",
         materializer="strict_channel_split_hybrid_transition_bridge",
-        depth=2,
+        depth=1,
         boundary_actions=("full_conv_output_assembly", "insert_extract_before_relu_or_add"),
         expected_stats={},
         executable=False,

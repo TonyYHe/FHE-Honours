@@ -23,6 +23,7 @@ from orion.experimental.cir.lattigo_block import (
 from orion.experimental.cir.runtime_group import (
     FullConvRegionRuntimeExecutor,
     RegionFirstCompileRegistry,
+    _rescale_cipher_tensor as _runtime_rescale_cipher_tensor,
     build_r18_actual_region_first_e2e_report,
 )
 from orion.experimental.cir.r18_e2e_bridges import (
@@ -31,6 +32,7 @@ from orion.experimental.cir.r18_e2e_bridges import (
     R18_STAGE34_TRANSITION_SPEC,
     R18StemBridgeRuntimeExecutor,
     R18TransitionBridgeRuntimeExecutor,
+    _rescale_cipher_tensor as _r18_bridge_rescale_cipher_tensor,
 )
 from orion.models.resnet import ResNet18
 
@@ -59,6 +61,44 @@ def _set_scheme_levels(dag: NetworkDAG) -> None:
         module = dag.nodes[node]["module"]
         if module is not None and hasattr(module, "set_level"):
             module.set_level(level)
+
+
+class _RescaleProbeEvaluator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bool]] = []
+
+    def rescale(self, ctxt: int, in_place: bool) -> int:
+        self.calls.append((int(ctxt), bool(in_place)))
+        return int(ctxt) + 1000
+
+
+class _RescaleProbeCipher:
+    def __init__(self, scheme: SimpleNamespace, ids: list[int], shape: torch.Size, on_shape: torch.Size) -> None:
+        self.scheme = scheme
+        self.evaluator = scheme.evaluator
+        self.ids = ids
+        self.shape = shape
+        self.on_shape = on_shape
+
+
+@pytest.mark.parametrize("helper", [_runtime_rescale_cipher_tensor, _r18_bridge_rescale_cipher_tensor])
+def test_provider_rescale_helper_honors_rescaled_backend_outputs(helper) -> None:
+    evaluator = _RescaleProbeEvaluator()
+    scheme_stub = SimpleNamespace(
+        backend=SimpleNamespace(lt_outputs_are_rescaled=True),
+        evaluator=evaluator,
+    )
+    ct = _RescaleProbeCipher(scheme_stub, [7], torch.Size([1, 4]), torch.Size([1, 4]))
+
+    assert helper(ct) is ct
+    assert evaluator.calls == []
+
+    scheme_stub.backend.lt_outputs_are_rescaled = False
+    out = helper(ct)
+
+    assert out is not ct
+    assert out.ids == [1007]
+    assert evaluator.calls == [(7, False)]
 
 
 def _chunk_stage_source(x: torch.Tensor, *, channels_per_ct: int, gap: int) -> list[torch.Tensor]:
@@ -229,11 +269,11 @@ def test_r18_e2e_solver_depth_matches_provider_runtime_level_cost() -> None:
     }
 
     assert depth_by_node["conv1"] == 1
-    assert depth_by_node["layers_1_0_conv1"] == 2
-    assert depth_by_node["layers_1_0_shortcut_0"] == 2
-    assert depth_by_node["layers_0_0_conv1"] == 2
-    assert depth_by_node["layers_2_1_conv2"] == 2
-    assert depth_by_node["layers_3_1_conv2"] == 3
+    assert depth_by_node["layers_1_0_conv1"] == 1
+    assert depth_by_node["layers_1_0_shortcut_0"] == 1
+    assert depth_by_node["layers_0_0_conv1"] == 1
+    assert depth_by_node["layers_2_1_conv2"] == 1
+    assert depth_by_node["layers_3_1_conv2"] == 2
 
 
 def test_r18_actual_e2e_report_builds_gate_without_dense_pack(monkeypatch) -> None:

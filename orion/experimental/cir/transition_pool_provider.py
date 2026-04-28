@@ -98,7 +98,7 @@ def _merge_branch_pair_to_complex(real_transform: Any | None, imag_transform: An
     for key in keys:
         real_tensor = _diag_tensor(real_diags.get(int(key)), slots=int(slots))
         imag_tensor = _diag_tensor(imag_diags.get(int(key)), slots=int(slots))
-        merged[int(key)] = real_tensor.to(dtype=torch.complex64) + 1j * imag_tensor.to(dtype=torch.complex64)
+        merged[int(key)] = (real_tensor.to(dtype=torch.complex64) + 1j * imag_tensor.to(dtype=torch.complex64)) * 0.5
     return SimpleNamespace(
         name=str(name),
         diagonals={(0, 0): merged},
@@ -327,6 +327,16 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.last_runtime_timing["postprocess_s"] = float(time.perf_counter() - postprocess_started)
         return {self.output_node_id: CipherTensor(scheme, output_ids, self.output_shape, self.fhe_output_shape)}
 
+    def cleanup(self, backend: Any) -> None:
+        for group in self.groups_by_pair:
+            if hasattr(group, "cleanup"):
+                group.cleanup(backend)
+        self.groups_by_pair = []
+        self.row_indices_by_pair = []
+        self.input_block_pairs = []
+        self.pair_is_complex = []
+        self._bias_plaintext_cache = {}
+
 
 class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
     """Transition provider packing the main and shortcut branches as real/imag."""
@@ -478,8 +488,8 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             ct = _apply_output_rotations(ct, int(self.output_rotations))
             conj = ct.conjugate(in_place=False)
             ct, conj = _align_ciphertexts_for_add(ct, conj)
-            conv = (ct + conj) * 0.5
-            shortcut = (ct - conj).mul_imaginary_unit(-1, in_place=False) * 0.5
+            conv = ct + conj
+            shortcut = (ct - conj).mul_imaginary_unit(-1, in_place=False)
             conv = self._add_bias(
                 conv,
                 bias_vector=self.conv_bias_vector,
@@ -503,3 +513,12 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             self.output_node_ids[0]: CipherTensor(scheme, conv_ids, self.output_shape, self.fhe_output_shape),
             self.output_node_ids[1]: CipherTensor(scheme, shortcut_ids, self.output_shape, self.fhe_output_shape),
         }
+
+    def cleanup(self, backend: Any) -> None:
+        for group in self.groups_by_input:
+            if hasattr(group, "cleanup"):
+                group.cleanup(backend)
+        self.groups_by_input = []
+        self.row_indices_by_input = []
+        self._conv_bias_plaintext_cache = {}
+        self._shortcut_bias_plaintext_cache = {}

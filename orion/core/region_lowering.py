@@ -282,10 +282,22 @@ def apply_tile_local_lt(packed_source: torch.Tensor, lt: TileLocalLT) -> torch.T
     return out
 
 
-def transform_from_tile_lt(lt: TileLocalLT, *, level: int, scheme: Any, name: str = "") -> Any:
+def transform_from_tile_lt(lt: TileLocalLT, *, level: int, scheme: Any, name: str = "", scale: float = 1.0) -> Any:
+    factor = float(scale)
+
+    def _scaled_values(values: Sequence[float | complex]) -> list[float | complex]:
+        if factor == 1.0:
+            return list(values)
+        return [complex(value) * factor if isinstance(value, complex) else float(value) * factor for value in values]
+
     return SimpleNamespace(
         name=str(name or lt.transform_id),
-        diagonals={(0, 0): {(-int(shift)) % int(lt.slots): list(values) for shift, values in lt.plaintext_diagonals.items()}},
+        diagonals={
+            (0, 0): {
+                (-int(shift)) % int(lt.slots): _scaled_values(values)
+                for shift, values in lt.plaintext_diagonals.items()
+            }
+        },
         level=int(level),
         scheme=scheme,
         fhe_output_shape=torch.Size([1, int(lt.slots)]),

@@ -286,7 +286,13 @@ def build_r18_transition_bridge_assets(
             prototype_groups.setdefault(int(source_index), []).append(
                 (
                     int(target_index),
-                    transform_from_tile_lt(hybrid_lt, level=int(level), scheme=scheme, name=hybrid_lt.transform_id),
+                    transform_from_tile_lt(
+                        hybrid_lt,
+                        level=int(level),
+                        scheme=scheme,
+                        name=hybrid_lt.transform_id,
+                        scale=0.5,
+                    ),
                 )
             )
 
@@ -469,8 +475,8 @@ class R18TransitionBridgeRuntimeExecutor:
             row_ct = _rescale_cipher_tensor(row_ct)
             conj = row_ct.conjugate(in_place=False)
             row_ct, conj = _align_ciphertexts_for_add(row_ct, conj)
-            conv_real = (row_ct + conj) * 0.5
-            shortcut_imag = (row_ct - conj).mul_imaginary_unit(-1, in_place=False) * 0.5
+            conv_real = row_ct + conj
+            shortcut_imag = (row_ct - conj).mul_imaginary_unit(-1, in_place=False)
             conv_real = self._add_cached_bias(
                 conv_real,
                 row_index=int(row_index),
@@ -496,6 +502,17 @@ class R18TransitionBridgeRuntimeExecutor:
             str(self.output_node_ids[0]): CipherTensor(scheme, conv_ids, self.output_shape, self.fhe_output_shape),
             str(self.output_node_ids[1]): CipherTensor(scheme, shortcut_ids, self.output_shape, self.fhe_output_shape),
         }
+
+    def cleanup(self, backend: Any) -> None:
+        for group in self.groups_by_input_block:
+            if hasattr(group, "cleanup"):
+                group.cleanup(backend)
+        self.groups_by_input_block = []
+        self.conv_bias_plaintexts = ()
+        self.shortcut_bias_plaintexts = ()
+        self._conv_bias_plaintext_cache = {}
+        self._shortcut_bias_plaintext_cache = {}
+        self._target_indices_by_input = {}
 
 
 def build_r18_stem_bridge_assets(*, module: Any, level: int, scheme: Any) -> dict[str, Any]:
@@ -648,3 +665,9 @@ class R18StemBridgeRuntimeExecutor:
         return {
             self.output_node_id: CipherTensor(scheme, conv_ids, self.output_shape, self.fhe_output_shape)
         }
+
+    def cleanup(self, backend: Any) -> None:
+        if self.group is not None and hasattr(self.group, "cleanup"):
+            self.group.cleanup(backend)
+        self.group = None
+        self.bias_plaintexts = ()
