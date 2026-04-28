@@ -44,6 +44,10 @@ from orion.experimental.cir.r34_orion_same_shape import (
 from orion.experimental.cir.r34_inter_group_python import R34PythonTransitionFlowRuntimeExecutor
 from orion.experimental.cir.region_first_data import STAGE_MATERIALIZER_REFERENCES
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
+from orion.experimental.cir.transition_pool_provider import (
+    BranchPairConvRuntimeExecutor,
+    InputPairConvRuntimeExecutor,
+)
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 
@@ -1502,7 +1506,7 @@ def _r34_transition_runtime_from_modules(
     conv, shortcut = modules
     policy = str(_r34_kernel_policy_from_module(conv) or "")
     if str(group.stage) in {"stage2_transition", "stage3_transition", "stage4_transition"}:
-        executor = R34TransitionHybridRuntimeExecutor(
+        executor = BranchPairConvRuntimeExecutor(
             conv_module=conv,
             shortcut_module=shortcut,
             output_node_ids=group.conv_nodes,
@@ -1551,11 +1555,14 @@ def _r34_direct_runtime_from_modules(
     module = modules[0]
     if not _r34_direct_module_compatible(module, contract):
         return group
-    executor = R34DenseSingleFlowRuntimeExecutor(
-        module=module,
-        family_label=str(group.stage),
-        output_node_id=str(group.conv_nodes[0]),
-    )
+    if str(group.stage) in {"stem_pool", "global_avgpool_exit"}:
+        executor = InputPairConvRuntimeExecutor(module=module, output_node_id=str(group.conv_nodes[0]))
+    else:
+        executor = R34DenseSingleFlowRuntimeExecutor(
+            module=module,
+            family_label=str(group.stage),
+            output_node_id=str(group.conv_nodes[0]),
+        )
     return _replace_r34_group(
         group,
         executable=True,

@@ -11,7 +11,9 @@ import torch
 from orion.core import packing
 from orion.experimental.cir.lattigo_block import _slot_index
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
+from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.nn.linear import Conv2d, ConvTranspose2d
+from orion.nn.pooling import AvgPool2d
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 try:
@@ -71,6 +73,39 @@ def _u22_same_shape_conv_module_supported(module: Any) -> bool:
         and tuple(int(v) for v in getattr(module, "input_shape", torch.Size())[2:])
         == tuple(int(v) for v in getattr(module, "output_shape", torch.Size())[2:])
     )
+
+
+def _u22_pool_module_supported(module: Any) -> bool:
+    return bool(
+        isinstance(module, AvgPool2d)
+        and tuple(getattr(module, "kernel_size", ())) in {(2, 2), (3, 3)}
+        and tuple(getattr(module, "stride", ())) == (2, 2)
+        and tuple(getattr(module, "dilation", ())) == (1, 1)
+        and int(getattr(module, "groups", 1)) == int(getattr(module, "input_shape", torch.Size([0, 0]))[1])
+    )
+
+
+def _u22_input_pair_conv_module_supported(module: Any) -> bool:
+    return bool(
+        isinstance(module, Conv2d)
+        and not isinstance(module, ConvTranspose2d)
+        and tuple(getattr(module, "kernel_size", ())) == (3, 3)
+        and tuple(getattr(module, "stride", ())) == (1, 1)
+        and tuple(getattr(module, "padding", ())) == (1, 1)
+        and tuple(getattr(module, "dilation", ())) == (1, 1)
+        and int(getattr(module, "groups", 1)) == 1
+        and tuple(int(v) for v in getattr(module, "input_shape", torch.Size())[2:])
+        == tuple(int(v) for v in getattr(module, "output_shape", torch.Size())[2:])
+        and int(getattr(module, "input_gap", -1)) == int(getattr(module, "output_gap", -2))
+    )
+
+
+def _u22_input_pair_conv_stage(*, node: str, module: Any) -> str:
+    in_channels = int(getattr(module, "input_shape")[1])
+    out_channels = int(getattr(module, "output_shape")[1])
+    if int(in_channels) != int(out_channels):
+        return "channel_transition"
+    return "conv_single_block_fallback"
 
 
 def _ceil_pow2(value: int) -> int:
@@ -166,6 +201,48 @@ def _u22_same_shape_conv_group(*, node: str, module: Any) -> RegionFirstRuntimeG
         fallback_reason="",
         output_node_ids=(str(node),),
         executor=executor,
+        fused_weight_count=1,
+    )
+
+
+def _u22_input_pair_conv_group(*, node: str, module: Any, stage: str) -> RegionFirstRuntimeGroup:
+    return RegionFirstRuntimeGroup(
+        region_id=f"u22_{str(stage)}_{str(node)}",
+        network="U22",
+        stage=str(stage),
+        module_prefix=str(node),
+        conv_nodes=(str(node),),
+        strategy="u22_input_pair_conv_shared_rotations",
+        materializer="u22_input_pair_conv_shared_rotations",
+        depth=1,
+        solver_depth=1,
+        boundary_actions=("input_pair_ctpt_hybrid", "shared_block_rotation_cache"),
+        expected_stats={},
+        executable=True,
+        fallback_reason="",
+        output_node_ids=(str(node),),
+        executor=InputPairConvRuntimeExecutor(module=module, output_node_id=str(node)),
+        fused_weight_count=1,
+    )
+
+
+def _u22_pool_group(*, node: str, module: Any) -> RegionFirstRuntimeGroup:
+    return RegionFirstRuntimeGroup(
+        region_id=f"u22_pool_downsample_{str(node)}",
+        network="U22",
+        stage="pool_downsample",
+        module_prefix=str(node),
+        conv_nodes=(str(node),),
+        strategy="u22_pool_input_pair_shared_rotations",
+        materializer="u22_pool_input_pair_shared_rotations",
+        depth=1,
+        solver_depth=1,
+        boundary_actions=("input_pair_ctpt_hybrid", "shared_block_rotation_cache", "downsample_pool"),
+        expected_stats={},
+        executable=True,
+        fallback_reason="",
+        output_node_ids=(str(node),),
+        executor=InputPairConvRuntimeExecutor(module=module, output_node_id=str(node)),
         fused_weight_count=1,
     )
 
@@ -693,6 +770,8 @@ class U22CompileRegistry:
         allowed = None if allowed_nodes is None else {str(value) for value in allowed_nodes}
         selected_tconv_count = 0
         selected_conv_count = 0
+        selected_pool_count = 0
+        selected_generic_conv_count = 0
         for node in dag.topological_sort():
             module = dag.nodes[node].get("module")
             if isinstance(module, ConvTranspose2d):
@@ -733,16 +812,44 @@ class U22CompileRegistry:
                     )
                 )
                 selected_tconv_count += 1
-            elif bool(enable_conv_kernels) and isinstance(module, Conv2d):
-                if not _u22_same_shape_conv_module_supported(module):
+            elif bool(enable_conv_kernels) and isinstance(module, AvgPool2d):
+                if not _u22_pool_module_supported(module):
                     excluded_nodes.append(
                         {
                             "node": str(node),
-                            "reason": "u22_conv_requires_same_shape_3x3_stride1",
+                            "reason": "u22_pool_requires_stride2_avgpool",
                         }
                     )
                     continue
+                groups.append(_u22_pool_group(node=str(node), module=module))
+                selected_pool_count += 1
+            elif bool(enable_conv_kernels) and isinstance(module, Conv2d):
+                if not _u22_same_shape_conv_module_supported(module):
+                    if _u22_input_pair_conv_module_supported(module):
+                        stage = _u22_input_pair_conv_stage(node=str(node), module=module)
+                        groups.append(_u22_input_pair_conv_group(node=str(node), module=module, stage=str(stage)))
+                        selected_generic_conv_count += 1
+                        selected_conv_count += 1
+                    else:
+                        excluded_nodes.append(
+                            {
+                                "node": str(node),
+                                "reason": "u22_conv_requires_3x3_stride1_same_spatial_layout",
+                            }
+                        )
+                    continue
                 if not _u22_same_shape_conv_runtime_supported(module):
+                    if _u22_input_pair_conv_module_supported(module):
+                        groups.append(
+                            _u22_input_pair_conv_group(
+                                node=str(node),
+                                module=module,
+                                stage=_u22_input_pair_conv_stage(node=str(node), module=module),
+                            )
+                        )
+                        selected_generic_conv_count += 1
+                        selected_conv_count += 1
+                        continue
                     excluded_nodes.append(
                         {
                             "node": str(node),
@@ -760,6 +867,8 @@ class U22CompileRegistry:
                 "selected_region_count": int(len(groups)),
                 "selected_tconv_count": int(selected_tconv_count),
                 "selected_conv_count": int(selected_conv_count),
+                "selected_pool_count": int(selected_pool_count),
+                "selected_generic_conv_count": int(selected_generic_conv_count),
                 "allowed_nodes": None if allowed_nodes is None else [str(value) for value in allowed_nodes],
                 "enable_conv_kernels": bool(enable_conv_kernels),
                 "excluded_nodes": excluded_nodes,

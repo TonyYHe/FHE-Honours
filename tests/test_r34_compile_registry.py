@@ -11,6 +11,10 @@ from orion.core.orion import scheme
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental.cir import r34_orion_same_shape as r34_same_shape
+from orion.experimental.cir.transition_pool_provider import (
+    BranchPairConvRuntimeExecutor,
+    InputPairConvRuntimeExecutor,
+)
 from orion.experimental.cir.ir import (
     CanonicalTemplateEntry,
     ConvSchemePlan,
@@ -22,7 +26,7 @@ from orion.experimental.cir.ir import (
     TensorRegion,
 )
 from orion.experimental import R34CompileRegistry
-from orion.experimental.r34_phase1 import R34DenseSingleFlowRuntimeExecutor, R34TransitionHybridRuntimeExecutor
+from orion.experimental.r34_phase1 import R34DenseSingleFlowRuntimeExecutor
 from orion.nn.module import Module
 from orion.models.resnet import ResNet34
 
@@ -102,13 +106,13 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     assert getattr(stem_pool, "region_family_label") == "stem_pool"
     assert getattr(stem_pool, "region_source_group_count") == 16
     assert getattr(stem_pool, "region_kernel_policy") == "inter_group_hybrid"
-    assert isinstance(stem_pool.region_runtime.executor, R34DenseSingleFlowRuntimeExecutor)
+    assert isinstance(stem_pool.region_runtime.executor, InputPairConvRuntimeExecutor)
     assert stem_pool.region_runtime.executable is True
 
     assert getattr(exit_pool, "region_family_label") == "global_avgpool_exit"
     assert getattr(exit_pool, "region_source_group_count") == 1
     assert getattr(exit_pool, "region_kernel_policy") == "intra_group_pack2"
-    assert isinstance(exit_pool.region_runtime.executor, R34DenseSingleFlowRuntimeExecutor)
+    assert isinstance(exit_pool.region_runtime.executor, InputPairConvRuntimeExecutor)
     assert exit_pool.region_runtime.executable is True
 
     stage2_module = dag.nodes["layers_1_1_conv1"]["module"]
@@ -155,12 +159,12 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     assert getattr(stage2_transition_conv, "region_source_group_count") == 4
     assert getattr(stage2_transition_conv, "region_kernel_policy") == "inter_group_hybrid"
     assert stage2_transition_conv.region_runtime.executable is True
-    assert isinstance(stage2_transition_conv.region_runtime.executor, R34TransitionHybridRuntimeExecutor)
+    assert isinstance(stage2_transition_conv.region_runtime.executor, BranchPairConvRuntimeExecutor)
 
     stage4_transition_conv = dag.nodes["layers_3_0_conv1"]["module"]
     stage4_transition_shortcut = dag.nodes["layers_3_0_shortcut_0"]["module"]
     assert stage4_transition_conv.region_runtime is stage4_transition_shortcut.region_runtime
-    assert isinstance(stage4_transition_conv.region_runtime.executor, R34TransitionHybridRuntimeExecutor)
+    assert isinstance(stage4_transition_conv.region_runtime.executor, BranchPairConvRuntimeExecutor)
     assert getattr(stage4_transition_conv, "region_source_group_count") == 1
     assert getattr(stage4_transition_conv, "region_kernel_policy") == "intra_group_pack2"
     assert stage4_transition_conv.region_runtime.executable is True
@@ -190,7 +194,7 @@ def test_r34_transition_group_compiles_and_executes_one_hybrid_runtime(monkeypat
     transition_shortcut = dag.nodes[str(shortcut_node)]["module"]
     group = transition_conv.region_runtime
     executor = group.executor
-    assert isinstance(executor, R34TransitionHybridRuntimeExecutor)
+    assert isinstance(executor, BranchPairConvRuntimeExecutor)
 
     def fake_pack_conv2d(module, last):
         assert last is False
@@ -462,7 +466,7 @@ def test_r34_single_flow_group_compiles_and_executes_runtime(monkeypatch) -> Non
     module = dag.nodes["avgpool"]["module"]
     group = module.region_runtime
     executor = group.executor
-    assert isinstance(executor, R34DenseSingleFlowRuntimeExecutor)
+    assert isinstance(executor, InputPairConvRuntimeExecutor)
 
     def fake_pack_conv2d(conv_layer, last):
         assert last is False

@@ -193,25 +193,24 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
         audit = registry.attach_to_dag(dag)
         attached = {row["node"] for row in audit["attached"]}
 
-        assert {"up4", "up3", "enc1b", "dec1a", "dec2b"}.issubset(attached)
+        assert {"up4", "up3", "enc1b", "dec1a", "dec2b", "pool1", "pool2", "pool3", "pool4"}.issubset(attached)
         assert "up2" not in attached
         assert "up1" not in attached
-        assert "bottleneckb" not in attached
+        assert "bottleneckb" in attached
         assert audit["graph_audit"]["allowed_nodes"] == ["up4", "up3"]
         assert audit["graph_audit"]["enable_conv_kernels"] is True
         assert audit["graph_audit"]["selected_tconv_count"] == 2
-        assert audit["graph_audit"]["selected_conv_count"] >= 8
-        excluded = {
-            row["node"]: row["reason"]
-            for row in audit["graph_audit"]["excluded_nodes"]
-        }
-        assert excluded["bottleneckb"] == "u22_conv_single_block_fold_unsupported"
+        assert audit["graph_audit"]["selected_conv_count"] >= 15
+        assert audit["graph_audit"]["selected_pool_count"] == 4
+        assert audit["graph_audit"]["selected_generic_conv_count"] >= 7
 
         for node_name in ("enc1b", "dec1a", "dec2b"):
             runtime = getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None)
             assert runtime is not None
             assert runtime.strategy.startswith("u22_conv_same_shape_")
             assert runtime.supports_scheme(scheme) is True
+        assert dag.nodes["pool1"]["module"].region_runtime.stage == "pool_downsample"
+        assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "conv_single_block_fallback"
     finally:
         scheme.delete_scheme()
 

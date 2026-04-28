@@ -12,8 +12,12 @@ from orion.core.network_dag import NetworkDAG
 from orion.core.orion import scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import R34CompileRegistry
-from orion.experimental.r34_phase1 import R34DenseSingleFlowRuntimeExecutor, R34TransitionHybridRuntimeExecutor
 from orion.experimental.cir import r34_orion_same_shape as r34_same_shape
+from orion.experimental.cir.transition_pool_provider import (
+    BranchPairConvRuntimeExecutor,
+    InputPairConvRuntimeExecutor,
+)
+from orion.experimental.r34_phase1 import R34DenseSingleFlowRuntimeExecutor
 from orion.models.resnet import ResNet34
 from orion.nn.module import Module
 
@@ -172,7 +176,7 @@ def test_r34_transition_lattigo_runtime_matches_reference(conv_name: str, shortc
         conv.he_mode = True
         shortcut.he_mode = True
 
-        assert isinstance(conv.region_runtime.executor, R34TransitionHybridRuntimeExecutor)
+        assert isinstance(conv.region_runtime.executor, BranchPairConvRuntimeExecutor)
         assert conv.region_runtime.supports_scheme(scheme) is True
 
         torch.manual_seed(23)
@@ -227,7 +231,8 @@ def test_r34_single_flow_lattigo_runtime_matches_reference(node_name: str) -> No
     _init_lattigo_scheme()
     try:
         _dag, module = _compile_module(str(node_name))
-        assert isinstance(module.region_runtime.executor, R34DenseSingleFlowRuntimeExecutor)
+        expected_executor = R34DenseSingleFlowRuntimeExecutor if str(node_name) == "conv1" else InputPairConvRuntimeExecutor
+        assert isinstance(module.region_runtime.executor, expected_executor)
 
         torch.manual_seed(abs(hash(str(node_name))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)

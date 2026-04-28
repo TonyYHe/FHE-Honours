@@ -88,8 +88,44 @@ def transforms_from_conv_scheme_plan(plan: Any, *, level: int, scheme: Any, bank
 def _rescale_cipher_tensor(ct: Any) -> Any:
     if len(getattr(ct, "ids", ())) != 1:
         raise ValueError("region-first rescale helper expects a single-ciphertext tensor")
+    if bool(getattr(ct.scheme.backend, "lt_outputs_are_rescaled", False)):
+        return ct
     rescaled_id = ct.evaluator.rescale(int(ct.ids[0]), in_place=False)
     return type(ct)(ct.scheme, [int(rescaled_id)], ct.shape, ct.on_shape)
+
+
+def _encode_plaintext_for_add(ct: Any, values: torch.Tensor) -> Any:
+    scale = int(ct.scheme.params.get_default_scale())
+    if bool(getattr(ct.scheme.backend, "align_addition_scales", False)):
+        scale = max(1, int(ct.scale()))
+        ct.set_scale(int(scale))
+    return ct.scheme.encode(values, ct.level(), scale=scale)
+
+
+def _add_plaintext_for_add(ct: Any, ptxt: Any) -> Any:
+    if bool(getattr(ct.scheme.backend, "align_addition_scales", False)):
+        scale = max(1, int(ct.scale()))
+        ct.set_scale(int(scale))
+        ptxt.set_scale(int(scale))
+    return ct + ptxt
+
+
+def _align_ciphertexts_for_add(left: Any, right: Any) -> tuple[Any, Any]:
+    if bool(getattr(left.scheme.backend, "align_addition_scales", False)):
+        scale = max(1, int(left.scale()))
+        left.set_scale(int(scale))
+        right.set_scale(int(scale))
+    return left, right
+
+
+def _delete_ciphertext_id(scheme: Any, ciphertext_id: int) -> None:
+    delete = getattr(getattr(scheme, "backend", None), "DeleteCiphertext", None)
+    if not callable(delete):
+        return
+    try:
+        delete(int(ciphertext_id))
+    except Exception:
+        pass
 
 
 class Stage1RuntimeExecutor:
@@ -128,7 +164,9 @@ class Stage1RuntimeExecutor:
         for node_id, output_id in zip(self.output_node_ids, output_ids):
             ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(self.plan.ring_slot_count)]), torch.Size([1, int(self.plan.ring_slot_count)]))
             ct = _rescale_cipher_tensor(ct)
-            outputs[str(node_id)] = (ct + ct.conjugate(in_place=False)) * 0.5
+            conj = ct.conjugate(in_place=False)
+            ct, conj = _align_ciphertexts_for_add(ct, conj)
+            outputs[str(node_id)] = (ct + conj) * 0.5
         return outputs
 
 
@@ -201,13 +239,17 @@ class Stage2RuntimeExecutor:
             for node_id, output_id in zip(self.output_node_ids, output_ids):
                 block_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, int(slots)]), torch.Size([1, int(slots)]))
                 if str(node_id) in complex_outputs:
-                    complex_outputs[str(node_id)] = complex_outputs[str(node_id)] + block_ct
+                    lhs, rhs = _align_ciphertexts_for_add(complex_outputs[str(node_id)], block_ct)
+                    complex_outputs[str(node_id)] = lhs + rhs
                 else:
                     complex_outputs[str(node_id)] = block_ct
         outputs: dict[str, Any] = {}
-        for node_id, ct in complex_outputs.items():
+        for node_id in list(complex_outputs):
+            ct = complex_outputs.pop(str(node_id))
             ct = _rescale_cipher_tensor(ct)
-            outputs[str(node_id)] = (ct + ct.conjugate(in_place=False)) * 0.5
+            conj = ct.conjugate(in_place=False)
+            ct, conj = _align_ciphertexts_for_add(ct, conj)
+            outputs[str(node_id)] = (ct + conj) * 0.5
         return outputs
 
 
@@ -292,6 +334,8 @@ class FullConvRegionRuntimeExecutor:
         self.requires_compact_source = bool(requires_compact_source)
         self.groups: list[Any] = []
         self.transforms_by_block: list[list[Any]] = []
+        self.bias_plaintexts: tuple[Any | None, ...] = ()
+        self._bias_plaintext_cache: dict[tuple[int, int], Any] = {}
         self.compile_count = 0
         self.block_evaluate_count = 0
         self.assigned_level: int | None = None
@@ -375,6 +419,7 @@ class FullConvRegionRuntimeExecutor:
             group.compile_unified(scheme.backend)
             self.transforms_by_block.append(transforms)
             self.groups.append(group)
+        self.bias_plaintexts = self._compile_bias_plaintexts(scheme)
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
 
@@ -394,7 +439,10 @@ class FullConvRegionRuntimeExecutor:
             left_id = int(ids[2 * pair_index])
             right_id = int(ids[2 * pair_index + 1])
             imag_id = scheme.evaluator.mul_imaginary_unit(right_id, +1, False)
-            complex_id = scheme.evaluator.add_ciphertext(left_id, imag_id, False)
+            try:
+                complex_id = scheme.evaluator.add_ciphertext(left_id, imag_id, False)
+            finally:
+                _delete_ciphertext_id(scheme, int(imag_id))
             sources.append(CipherTensor(scheme, [int(complex_id)], source_ct.shape, source_ct.on_shape))
         return tuple(sources)
 
@@ -458,17 +506,49 @@ class FullConvRegionRuntimeExecutor:
             return (self._compact_stage4_source_from_regular(source_ct),)
         return self._complex_sources_from_ids(source_ct)
 
-    def _add_bias(self, ct: Any, *, bank_index: int) -> Any:
+    def _output_level(self, scheme: Any, *, extra_depth: int = 0) -> int:
+        level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+        depth = int(self.assigned_depth) if self.assigned_depth is not None else 1
+        return max(0, int(level) - max(0, int(depth)) - max(0, int(extra_depth)))
+
+    def _bias_chunk(self, *, bank_index: int, slots: int) -> torch.Tensor | None:
         if self.bias_vector is None:
-            return ct
-        slots = int(ct.slots())
+            return None
         start = int(bank_index * slots)
         chunk = torch.zeros((slots,), dtype=torch.float32)
         end = min(int(start + slots), int(self.bias_vector.numel()))
         if end > start:
             chunk[: int(end - start)] = self.bias_vector[start:end]
-        bias_pt = ct.scheme.encode(chunk, ct.level())
-        return ct + bias_pt
+        return chunk
+
+    def _compile_bias_plaintexts(self, scheme: Any) -> tuple[Any | None, ...]:
+        if self.bias_vector is None:
+            return ()
+        level = self._output_level(scheme)
+        scale = int(scheme.params.get_default_scale())
+        slots = int(scheme.params.get_slots())
+        plaintexts: list[Any | None] = []
+        for bank_index in range(int(self.bank_count)):
+            chunk = self._bias_chunk(bank_index=int(bank_index), slots=int(slots))
+            ptxt = None if chunk is None else scheme.encode(chunk, level=int(level), scale=int(scale))
+            if ptxt is not None:
+                self._bias_plaintext_cache[(int(bank_index), int(level))] = ptxt
+            plaintexts.append(ptxt)
+        return tuple(plaintexts)
+
+    def _add_bias(self, ct: Any, *, bank_index: int) -> Any:
+        if self.bias_vector is None:
+            return ct
+        bias_pt = self.bias_plaintexts[int(bank_index)] if int(bank_index) < len(self.bias_plaintexts) else None
+        if bias_pt is None or int(bias_pt.level()) != int(ct.level()):
+            bias_pt = self._bias_plaintext_cache.get((int(bank_index), int(ct.level())))
+        if bias_pt is None or int(bias_pt.level()) != int(ct.level()):
+            chunk = self._bias_chunk(bank_index=int(bank_index), slots=int(ct.slots()))
+            if chunk is None:
+                return ct
+            bias_pt = _encode_plaintext_for_add(ct, chunk)
+            self._bias_plaintext_cache[(int(bank_index), int(ct.level()))] = bias_pt
+        return _add_plaintext_for_add(ct, bias_pt)
 
     def __call__(self, source_ct: Any) -> dict[str, Any]:
         from orion.backend.python.tensors import CipherTensor
@@ -495,15 +575,19 @@ class FullConvRegionRuntimeExecutor:
                 if complex_outputs[int(bank_index)] is None:
                     complex_outputs[int(bank_index)] = block_ct
                 else:
-                    complex_outputs[int(bank_index)] = complex_outputs[int(bank_index)] + block_ct
+                    lhs, rhs = _align_ciphertexts_for_add(complex_outputs[int(bank_index)], block_ct)
+                    complex_outputs[int(bank_index)] = lhs + rhs
         self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
         real_ids: list[int] = []
         postprocess_started = time.time()
         for bank_index, ct in enumerate(complex_outputs):
             if ct is None:
                 raise RuntimeError(f"missing region-first output bank {bank_index}")
+            complex_outputs[int(bank_index)] = None
             ct = _rescale_cipher_tensor(ct)
-            real = (ct + ct.conjugate(in_place=False)) * 0.5
+            conj = ct.conjugate(in_place=False)
+            ct, conj = _align_ciphertexts_for_add(ct, conj)
+            real = (ct + conj) * 0.5
             real = self._add_bias(real, bank_index=int(bank_index))
             real.set_scale(int(scheme.params.get_default_scale()))
             real_ids.append(int(real.ids[0]))
@@ -639,7 +723,10 @@ class RegionFirstRuntimeGroup:
             self._cache_key = key
         if str(output_node_id) not in self._cache_outputs:
             raise KeyError(f"region {self.region_id} has no output bank {output_node_id!r}")
-        return self._cache_outputs[str(output_node_id)]
+        output = self._cache_outputs.pop(str(output_node_id))
+        if not self._cache_outputs:
+            self._cache_key = None
+        return output
 
 
 def _r18_stage_references() -> dict[str, Any]:
@@ -1015,6 +1102,52 @@ def _r18_stem_runtime_from_module(group: RegionFirstRuntimeGroup, module: Any) -
     )
 
 
+def _r18_pool_module_compatible(module: Any) -> bool:
+    from orion.nn.pooling import AdaptiveAvgPool2d, AvgPool2d
+
+    weight = getattr(module, "on_weight", None)
+    return bool(
+        isinstance(module, (AvgPool2d, AdaptiveAvgPool2d))
+        and weight is not None
+        and tuple(int(v) for v in getattr(module, "input_shape", torch.Size()))[0:1] == (1,)
+        and tuple(int(v) for v in getattr(module, "output_shape", torch.Size()))[0:1] == (1,)
+    )
+
+
+def _r18_pool_group(node: str) -> RegionFirstRuntimeGroup:
+    return RegionFirstRuntimeGroup(
+        region_id=f"r18_tiny_e2e_{str(node)}",
+        network="R18",
+        stage="pool",
+        module_prefix=str(node),
+        conv_nodes=(str(node),),
+        strategy="input_pair_pool_shared_rotations",
+        materializer="input_pair_pool_shared_rotations",
+        depth=1,
+        solver_depth=1,
+        boundary_actions=("input_pair_ctpt_hybrid", "shared_block_rotation_cache"),
+        expected_stats={},
+        executable=False,
+        fallback_reason="pool_provider_materializer_unavailable",
+        output_node_ids=(str(node),),
+    )
+
+
+def _r18_pool_runtime_from_module(group: RegionFirstRuntimeGroup, module: Any) -> RegionFirstRuntimeGroup:
+    if module is None or not _r18_pool_module_compatible(module):
+        return group
+    from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
+
+    executor = InputPairConvRuntimeExecutor(module=module, output_node_id=str(group.conv_nodes[0]))
+    return _replace_group(
+        group,
+        executable=True,
+        fallback_reason="",
+        executor=executor,
+        fused_weight_count=1,
+    )
+
+
 def _groups_from_dag(dag: NetworkDAG) -> tuple[RegionFirstRuntimeGroup, dict[str, Any]]:
     refs = _r18_stage_references()
     groups: list[RegionFirstRuntimeGroup] = []
@@ -1158,6 +1291,15 @@ class RegionFirstCompileRegistry:
                 handled_nodes.update(str(node) for node in nodes)
             else:
                 excluded_nodes.append({"node": ",".join(nodes), "stage": str(stage_name), "reason": str(group.fallback_reason)})
+
+        if "avgpool" in existing_nodes and (allowed is None or "pool" in allowed or "avgpool" in allowed):
+            module = dag.nodes["avgpool"].get("module")
+            group = _r18_pool_runtime_from_module(_r18_pool_group("avgpool"), module)
+            if bool(group.executable):
+                special_groups.append(group)
+                handled_nodes.add("avgpool")
+            else:
+                excluded_nodes.append({"node": "avgpool", "stage": "pool", "reason": str(group.fallback_reason)})
 
         for node in dag.topological_sort():
             if "conv" not in str(node):

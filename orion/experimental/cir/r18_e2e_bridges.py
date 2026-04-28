@@ -22,6 +22,30 @@ from orion.nn.unified_transform import UnifiedTransformGroup
 RING_SLOT_COUNT = 32768
 
 
+def _encode_plaintext_for_add(ct: Any, values: torch.Tensor) -> Any:
+    scale = int(ct.scheme.params.get_default_scale())
+    if bool(getattr(ct.scheme.backend, "align_addition_scales", False)):
+        scale = max(1, int(ct.scale()))
+        ct.set_scale(int(scale))
+    return ct.scheme.encode(values, ct.level(), scale=scale)
+
+
+def _add_plaintext_for_add(ct: Any, ptxt: Any) -> Any:
+    if bool(getattr(ct.scheme.backend, "align_addition_scales", False)):
+        scale = max(1, int(ct.scale()))
+        ct.set_scale(int(scale))
+        ptxt.set_scale(int(scale))
+    return ct + ptxt
+
+
+def _align_ciphertexts_for_add(left: Any, right: Any) -> tuple[Any, Any]:
+    if bool(getattr(left.scheme.backend, "align_addition_scales", False)):
+        scale = max(1, int(left.scale()))
+        left.set_scale(int(scale))
+        right.set_scale(int(scale))
+    return left, right
+
+
 @dataclass(frozen=True)
 class R18TransitionBridgeSpec:
     stage: str
@@ -115,6 +139,8 @@ R18_STEM_BRIDGE_SPEC = R18StemBridgeSpec()
 def _rescale_cipher_tensor(ct: Any) -> Any:
     if len(getattr(ct, "ids", ())) != 1:
         raise ValueError("bridge rescale helper expects a single-ciphertext tensor")
+    if bool(getattr(ct.scheme.backend, "lt_outputs_are_rescaled", False)):
+        return ct
     rescaled_id = ct.evaluator.rescale(int(ct.ids[0]), in_place=False)
     return type(ct)(ct.scheme, [int(rescaled_id)], ct.shape, ct.on_shape)
 
@@ -308,6 +334,10 @@ class R18TransitionBridgeRuntimeExecutor:
         self.cols = int(spec.input_ct_count)
         self.conv_bias_vector: torch.Tensor | None = None
         self.shortcut_bias_vector: torch.Tensor | None = None
+        self.conv_bias_plaintexts: tuple[Any | None, ...] = ()
+        self.shortcut_bias_plaintexts: tuple[Any | None, ...] = ()
+        self._conv_bias_plaintext_cache: dict[tuple[int, int], Any] = {}
+        self._shortcut_bias_plaintext_cache: dict[tuple[int, int], Any] = {}
         self.compile_count = 0
         self.block_evaluate_count = 0
         self.output_shape = getattr(conv_module, "output_shape", None)
@@ -325,6 +355,43 @@ class R18TransitionBridgeRuntimeExecutor:
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
 
+    def _output_level(self, scheme: Any, *, extra_depth: int = 0) -> int:
+        depth = int(self.assigned_depth) if self.assigned_depth is not None else 1
+        return max(0, int(self._level(scheme)) - max(0, int(depth)) - max(0, int(extra_depth)))
+
+    def _compile_bias_plaintexts(self, scheme: Any, bias_vector: torch.Tensor | None) -> tuple[Any | None, ...]:
+        if bias_vector is None:
+            return ()
+        level = self._output_level(scheme)
+        scale = int(scheme.params.get_default_scale())
+        plaintexts: list[Any | None] = []
+        for row_index in range(int(self.rows)):
+            chunk = _bias_chunk(bias_vector, row_index=int(row_index), slots=int(RING_SLOT_COUNT))
+            plaintexts.append(None if chunk is None else scheme.encode(chunk, level=int(level), scale=int(scale)))
+        return tuple(plaintexts)
+
+    def _add_cached_bias(
+        self,
+        ct: Any,
+        *,
+        row_index: int,
+        bias_vector: torch.Tensor | None,
+        plaintexts: tuple[Any | None, ...],
+        cache: dict[tuple[int, int], Any],
+    ) -> Any:
+        if bias_vector is None:
+            return ct
+        bias_ptxt = plaintexts[int(row_index)] if int(row_index) < len(plaintexts) else None
+        if bias_ptxt is None or int(bias_ptxt.level()) != int(ct.level()):
+            bias_ptxt = cache.get((int(row_index), int(ct.level())))
+        if bias_ptxt is None or int(bias_ptxt.level()) != int(ct.level()):
+            chunk = _bias_chunk(bias_vector, row_index=int(row_index), slots=int(RING_SLOT_COUNT))
+            if chunk is None:
+                return ct
+            bias_ptxt = _encode_plaintext_for_add(ct, chunk)
+            cache[(int(row_index), int(ct.level()))] = bias_ptxt
+        return _add_plaintext_for_add(ct, bias_ptxt)
+
     def compile(self, scheme: Any) -> None:
         if self.groups_by_input_block:
             return
@@ -338,6 +405,14 @@ class R18TransitionBridgeRuntimeExecutor:
         )
         self.conv_bias_vector = assets["conv_bias_vector"]
         self.shortcut_bias_vector = assets["shortcut_bias_vector"]
+        self.conv_bias_plaintexts = self._compile_bias_plaintexts(scheme, self.conv_bias_vector)
+        self.shortcut_bias_plaintexts = self._compile_bias_plaintexts(scheme, self.shortcut_bias_vector)
+        for row_index, bias_ptxt in enumerate(self.conv_bias_plaintexts):
+            if bias_ptxt is not None:
+                self._conv_bias_plaintext_cache[(int(row_index), int(bias_ptxt.level()))] = bias_ptxt
+        for row_index, bias_ptxt in enumerate(self.shortcut_bias_plaintexts):
+            if bias_ptxt is not None:
+                self._shortcut_bias_plaintext_cache[(int(row_index), int(bias_ptxt.level()))] = bias_ptxt
         self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepared_started)
 
         compile_started = time.time()
@@ -380,7 +455,8 @@ class R18TransitionBridgeRuntimeExecutor:
                 if complex_outputs[int(target_index)] is None:
                     complex_outputs[int(target_index)] = partial
                 else:
-                    complex_outputs[int(target_index)] = complex_outputs[int(target_index)] + partial
+                    lhs, rhs = _align_ciphertexts_for_add(complex_outputs[int(target_index)], partial)
+                    complex_outputs[int(target_index)] = lhs + rhs
         self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
 
         postprocess_started = time.time()
@@ -389,16 +465,26 @@ class R18TransitionBridgeRuntimeExecutor:
         for row_index, row_ct in enumerate(complex_outputs):
             if row_ct is None:
                 raise RuntimeError(f"missing transition output row {row_index} for {self.spec.stage}")
+            complex_outputs[int(row_index)] = None
             row_ct = _rescale_cipher_tensor(row_ct)
             conj = row_ct.conjugate(in_place=False)
+            row_ct, conj = _align_ciphertexts_for_add(row_ct, conj)
             conv_real = (row_ct + conj) * 0.5
             shortcut_imag = (row_ct - conj).mul_imaginary_unit(-1, in_place=False) * 0.5
-            conv_chunk = _bias_chunk(self.conv_bias_vector, row_index=int(row_index), slots=int(RING_SLOT_COUNT))
-            shortcut_chunk = _bias_chunk(self.shortcut_bias_vector, row_index=int(row_index), slots=int(RING_SLOT_COUNT))
-            if conv_chunk is not None:
-                conv_real = conv_real + conv_real.scheme.encode(conv_chunk, conv_real.level())
-            if shortcut_chunk is not None:
-                shortcut_imag = shortcut_imag + shortcut_imag.scheme.encode(shortcut_chunk, shortcut_imag.level())
+            conv_real = self._add_cached_bias(
+                conv_real,
+                row_index=int(row_index),
+                bias_vector=self.conv_bias_vector,
+                plaintexts=self.conv_bias_plaintexts,
+                cache=self._conv_bias_plaintext_cache,
+            )
+            shortcut_imag = self._add_cached_bias(
+                shortcut_imag,
+                row_index=int(row_index),
+                bias_vector=self.shortcut_bias_vector,
+                plaintexts=self.shortcut_bias_plaintexts,
+                cache=self._shortcut_bias_plaintext_cache,
+            )
             conv_real.set_scale(int(scheme.params.get_default_scale()))
             shortcut_imag.set_scale(int(scheme.params.get_default_scale()))
             conv_ids.append(int(conv_real.ids[0]))
@@ -479,6 +565,7 @@ class R18StemBridgeRuntimeExecutor:
         self.group: Any | None = None
         self.target_indices: tuple[int, ...] = ()
         self.bias_vector: torch.Tensor | None = None
+        self.bias_plaintexts: tuple[Any | None, ...] = ()
         self.compile_count = 0
         self.output_shape = getattr(module, "output_shape", None)
         self.fhe_output_shape = getattr(module, "fhe_output_shape", None)
@@ -494,6 +581,21 @@ class R18StemBridgeRuntimeExecutor:
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
 
+    def _output_level(self, scheme: Any) -> int:
+        depth = int(self.assigned_depth) if self.assigned_depth is not None else 1
+        return max(0, int(self._level(scheme)) - max(0, int(depth)))
+
+    def _compile_bias_plaintexts(self, scheme: Any) -> tuple[Any | None, ...]:
+        if self.bias_vector is None:
+            return ()
+        level = self._output_level(scheme)
+        scale = int(scheme.params.get_default_scale())
+        plaintexts: list[Any | None] = []
+        for row_index in range(len(self.target_indices)):
+            chunk = _bias_chunk(self.bias_vector, row_index=int(row_index), slots=int(RING_SLOT_COUNT))
+            plaintexts.append(None if chunk is None else scheme.encode(chunk, level, scale=scale))
+        return tuple(plaintexts)
+
     def compile(self, scheme: Any) -> None:
         if self.group is not None:
             return
@@ -501,6 +603,7 @@ class R18StemBridgeRuntimeExecutor:
         assets = build_r18_stem_bridge_assets(module=self.module, level=self._level(scheme), scheme=scheme)
         self.bias_vector = assets["bias_vector"]
         self.target_indices = tuple(assets["target_indices"])
+        self.bias_plaintexts = self._compile_bias_plaintexts(scheme)
         self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepared_started)
 
         compile_started = time.time()
@@ -535,9 +638,9 @@ class R18StemBridgeRuntimeExecutor:
                 torch.Size([1, int(RING_SLOT_COUNT)]),
             )
             out_ct = _rescale_cipher_tensor(out_ct)
-            chunk = _bias_chunk(self.bias_vector, row_index=int(row_index), slots=int(RING_SLOT_COUNT))
-            if chunk is not None:
-                out_ct = out_ct + out_ct.scheme.encode(chunk, out_ct.level())
+            bias_ptxt = self.bias_plaintexts[int(row_index)] if int(row_index) < len(self.bias_plaintexts) else None
+            if bias_ptxt is not None:
+                out_ct = _add_plaintext_for_add(out_ct, bias_ptxt)
             out_ct.set_scale(int(scheme.params.get_default_scale()))
             conv_ids.append(int(out_ct.ids[0]))
             out_ct.ids = []
