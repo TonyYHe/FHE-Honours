@@ -17,8 +17,9 @@ from orion.nn.module import Module
 
 
 DATASET_SPECS = {
-    "tiny": {"image_size": 64, "logn": 15},
-    "imagenet": {"image_size": 256, "logn": 17},
+    "tiny": {"image_size": 64, "logn": 15, "input_channels": 3},
+    "imagenet": {"image_size": 256, "logn": 17, "input_channels": 3},
+    "montgomery_lung_64": {"image_size": 64, "logn": 15, "input_channels": 1},
 }
 
 DECODER_TCONV_NODES = ("up4", "up3", "up2", "up1")
@@ -49,10 +50,14 @@ def _init_python_scheme(*, logn: int) -> None:
 
 
 def _prepared_dag(*, dataset: str, base_channels: int | None = None) -> NetworkDAG:
-    image_size = int(DATASET_SPECS[str(dataset)]["image_size"])
+    spec = DATASET_SPECS[str(dataset)]
+    image_size = int(spec["image_size"])
+    input_channels = int(spec["input_channels"])
     torch.manual_seed(0)
     traced = OrionTracer().trace_model(UNet22(dataset=dataset, base_channels=base_channels))
-    StatsTracker(traced).propagate(torch.randn((1, 3, int(image_size), int(image_size)), dtype=torch.float32))
+    StatsTracker(traced).propagate(
+        torch.randn((1, int(input_channels), int(image_size), int(image_size)), dtype=torch.float32)
+    )
     dag = NetworkDAG(traced)
     dag.build_dag()
     for node in dag.nodes:
@@ -210,7 +215,61 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
             assert runtime.strategy.startswith("u22_conv_same_shape_")
             assert runtime.supports_scheme(scheme) is True
         assert dag.nodes["pool1"]["module"].region_runtime.stage == "pool_downsample"
-        assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "conv_single_block_fallback"
+        assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_64_base32_provider_mode_attaches_all_linear_and_pool_nodes() -> None:
+    _init_python_scheme(logn=int(DATASET_SPECS["montgomery_lung_64"]["logn"]))
+    try:
+        dag = _prepared_dag(dataset="montgomery_lung_64", base_channels=32)
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=("up1", "up2", "up3", "up4"),
+            enable_conv_kernels=True,
+        )
+        audit = registry.attach_to_dag(dag)
+        attached = {row["node"] for row in audit["attached"]}
+        expected = {
+            "enc1a",
+            "enc1b",
+            "pool1",
+            "enc2a",
+            "enc2b",
+            "pool2",
+            "enc3a",
+            "enc3b",
+            "pool3",
+            "enc4a",
+            "enc4b",
+            "pool4",
+            "bottlenecka",
+            "bottleneckb",
+            "up4",
+            "dec4a",
+            "dec4b",
+            "up3",
+            "dec3a",
+            "dec3b",
+            "up2",
+            "dec2a",
+            "dec2b",
+            "up1",
+            "dec1a",
+            "dec1b",
+        }
+
+        assert attached == expected
+        assert audit["attached_count"] == 26
+        assert audit["executable_region_count"] == 26
+        assert audit["graph_audit"]["excluded_nodes"] == []
+        assert audit["graph_audit"]["selected_tconv_count"] == 4
+        assert audit["graph_audit"]["selected_conv_count"] == 18
+        assert audit["graph_audit"]["selected_pool_count"] == 4
+        assert audit["graph_audit"]["selected_generic_conv_count"] == 7
+        assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
+        assert dag.nodes["dec1b"]["module"].region_runtime.stage == "channel_transition"
     finally:
         scheme.delete_scheme()
 

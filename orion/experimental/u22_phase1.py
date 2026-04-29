@@ -105,7 +105,7 @@ def _u22_input_pair_conv_stage(*, node: str, module: Any) -> str:
     out_channels = int(getattr(module, "output_shape")[1])
     if int(in_channels) != int(out_channels):
         return "channel_transition"
-    return "conv_single_block_fallback"
+    return "single_block_conv"
 
 
 def _ceil_pow2(value: int) -> int:

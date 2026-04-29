@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import orion.nn as on
 
 
@@ -31,13 +33,118 @@ class MiniUNet(on.Module):
         return self.out(x)
 
 
-def _u22_default_base_channels(dataset: str) -> int:
+@dataclass(frozen=True)
+class UNet22MedicalSpec:
+    name: str
+    dataset_name: str
+    task: str
+    image_size: int
+    in_channels: int
+    out_channels: int
+    base_dim: int
+    source_url: str
+
+
+_U22_DATASET_ALIASES = {
+    "medical64": "montgomery_lung_64",
+    "lung64": "montgomery_lung_64",
+    "montgomery": "montgomery_lung_64",
+    "montgomery_lung": "montgomery_lung_64",
+    "medical256": "kvasir_polyp_256",
+    "polyp256": "kvasir_polyp_256",
+    "kvasir": "kvasir_polyp_256",
+    "kvasir_polyp": "kvasir_polyp_256",
+}
+
+
+_U22_BASE_CHANNEL_DEFAULTS = {
+    "tiny": 4,
+    "imagenet": 1,
+    "montgomery_lung_64": 32,
+    "kvasir_polyp_256": 32,
+}
+
+
+_U22_CHANNEL_DEFAULTS = {
+    "tiny": (3, 3),
+    "imagenet": (3, 3),
+    "montgomery_lung_64": (1, 1),
+    "kvasir_polyp_256": (3, 1),
+}
+
+
+_U22_MEDICAL_SPECS = {
+    "montgomery_lung_64": UNet22MedicalSpec(
+        name="montgomery_lung_64",
+        dataset_name="Montgomery County Chest X-ray Set",
+        task="binary lung field segmentation",
+        image_size=64,
+        in_channels=1,
+        out_channels=1,
+        base_dim=32,
+        source_url="https://openi.nlm.nih.gov/imgs/collections/NLM-MontgomeryCXRSet.zip",
+    ),
+    "kvasir_polyp_256": UNet22MedicalSpec(
+        name="kvasir_polyp_256",
+        dataset_name="Kvasir-SEG",
+        task="binary gastrointestinal polyp segmentation",
+        image_size=256,
+        in_channels=3,
+        out_channels=1,
+        base_dim=32,
+        source_url="https://datasets.simula.no/downloads/kvasir-seg.zip",
+    ),
+}
+
+
+def _normalize_u22_dataset(dataset: str) -> str:
     dataset = str(dataset).lower()
-    if dataset == "tiny":
-        return 4
-    if dataset == "imagenet":
-        return 1
+    return _U22_DATASET_ALIASES.get(dataset, dataset)
+
+
+def _u22_default_base_channels(dataset: str) -> int:
+    dataset = _normalize_u22_dataset(dataset)
+    if dataset in _U22_BASE_CHANNEL_DEFAULTS:
+        return int(_U22_BASE_CHANNEL_DEFAULTS[dataset])
     raise ValueError(f"UNet22 with dataset {dataset!r} is not supported.")
+
+
+def _u22_default_channels(dataset: str) -> tuple[int, int]:
+    dataset = str(dataset).lower()
+    dataset = _normalize_u22_dataset(dataset)
+    if dataset in _U22_CHANNEL_DEFAULTS:
+        return _U22_CHANNEL_DEFAULTS[dataset]
+    raise ValueError(f"UNet22 with dataset {dataset!r} is not supported.")
+
+
+def get_unet22_medical_spec(name: str) -> UNet22MedicalSpec:
+    name = _normalize_u22_dataset(name)
+    if name not in _U22_MEDICAL_SPECS:
+        supported = ", ".join(sorted(_U22_MEDICAL_SPECS))
+        raise ValueError(f"Unknown UNet22 medical model {name!r}. Supported: {supported}.")
+    return _U22_MEDICAL_SPECS[name]
+
+
+def list_unet22_medical_specs() -> tuple[UNet22MedicalSpec, ...]:
+    return tuple(_U22_MEDICAL_SPECS[name] for name in sorted(_U22_MEDICAL_SPECS))
+
+
+def get_unet22_medical_model(
+    name: str,
+    *,
+    base_channels: int | None = None,
+    base_dim: int | None = None,
+) -> "UNet22":
+    spec = get_unet22_medical_spec(name)
+    requested_base = base_channels if base_channels is not None else base_dim
+    if requested_base is None:
+        requested_base = spec.base_dim
+    return UNet22(
+        dataset=spec.name,
+        in_channels=spec.in_channels,
+        out_channels=spec.out_channels,
+        base_channels=requested_base,
+    )
 
 
 class UNet22(on.Module):
@@ -52,13 +159,27 @@ class UNet22(on.Module):
     def __init__(
         self,
         dataset: str = "tiny",
-        in_channels: int = 3,
-        out_channels: int = 3,
+        in_channels: int | None = None,
+        out_channels: int | None = None,
         base_channels: int | None = None,
+        base_dim: int | None = None,
     ):
         super().__init__()
-        dataset = str(dataset).lower()
-        base = int(base_channels if base_channels is not None else _u22_default_base_channels(dataset))
+        dataset = _normalize_u22_dataset(dataset)
+        if base_channels is not None and base_dim is not None and int(base_channels) != int(base_dim):
+            raise ValueError(
+                f"Received conflicting UNet22 base sizes: "
+                f"base_channels={base_channels} and base_dim={base_dim}."
+            )
+        requested_base = base_channels if base_channels is not None else base_dim
+        base = int(requested_base if requested_base is not None else _u22_default_base_channels(dataset))
+        default_in_channels, default_out_channels = _u22_default_channels(dataset)
+        in_channels = int(default_in_channels if in_channels is None else in_channels)
+        out_channels = int(default_out_channels if out_channels is None else out_channels)
+        self.dataset = dataset
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.base_channels = base
 
         c1 = int(base)
         c2 = int(base * 2)
@@ -118,3 +239,29 @@ class UNet22(on.Module):
         x = self.dec2b(self.dec2a(self.add2(self.up2(x), skip2)))
         x = self.dec1b(self.dec1a(self.add1(self.up1(x), skip1)))
         return x
+
+
+class UNet22MontgomeryLung64(UNet22):
+    """UNet22(base_dim=32) for 64x64 Montgomery CXR lung segmentation."""
+
+    def __init__(self, base_channels: int | None = None, base_dim: int | None = 32):
+        super().__init__(
+            dataset="montgomery_lung_64",
+            in_channels=1,
+            out_channels=1,
+            base_channels=base_channels,
+            base_dim=base_dim,
+        )
+
+
+class UNet22KvasirPolyp256(UNet22):
+    """UNet22(base_dim=32) for 256x256 Kvasir-SEG polyp segmentation."""
+
+    def __init__(self, base_channels: int | None = None, base_dim: int | None = 32):
+        super().__init__(
+            dataset="kvasir_polyp_256",
+            in_channels=3,
+            out_channels=1,
+            base_channels=base_channels,
+            base_dim=base_dim,
+        )

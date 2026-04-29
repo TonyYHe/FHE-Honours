@@ -260,11 +260,12 @@ def build_manifest(
     bootstrap_count: int,
     bootstrapper_slots: list[int],
     linear_layers: list[LinearTransform] | None = None,
+    fingerprint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "cache_format_version": CACHE_FORMAT_VERSION,
-        "fingerprint": cache_fingerprint(params, net),
+        "fingerprint": dict(fingerprint) if fingerprint is not None else cache_fingerprint(params, net),
         "bootstrap_plan": collect_bootstrap_plan(
             network_dag,
             topo_sort,
@@ -360,4 +361,3 @@ def validate_transform_metadata(manifest: dict[str, Any], linear_layers: list[Li
                 f"Compile cache transform metadata mismatch for layer {name!r}: "
                 f"cached={cached_comparable} current={comparable}"
             )
-

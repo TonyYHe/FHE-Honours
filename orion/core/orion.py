@@ -1,5 +1,6 @@
 import time
 import math
+import os
 from typing import Union, Dict, Any
 
 import yaml
@@ -388,10 +389,10 @@ class Scheme:
         io_mode = self.params.get_io_mode()
         compile_manifest_path = compile_cache.manifest_path(self.params)
         compile_manifest = None
+        compile_identity_fingerprint = compile_cache.cache_fingerprint(self.params, net)
         if io_mode == "load":
             compile_manifest = compile_cache.read_manifest(compile_manifest_path)
             compile_cache.validate_manifest_identity(compile_manifest, params=self.params, net=net)
-            compile_cache.validate_topology(compile_manifest, topo_sort)
 
         last_linear = None
         for node in reversed(topo_sort):
@@ -413,9 +414,11 @@ class Scheme:
         #------------------------------#
 
         network_dag.find_residuals()
+        plan_topo_sort = list(network_dag.topological_sort())
         #(save_path="network.png", figsize=(8,30)) # optional plot
 
         if io_mode == "load":
+            compile_cache.validate_topology(compile_manifest, plan_topo_sort)
             print("\n{4} Loading cached bootstrap placement... ", end="", flush=True)
             start = time.time()
             input_level, num_bootstraps, bootstrapper_slots = compile_cache.apply_bootstrap_plan(
@@ -440,11 +443,12 @@ class Scheme:
                     params=self.params,
                     net=net,
                     network_dag=network_dag,
-                    topo_sort=topo_sort,
+                    topo_sort=plan_topo_sort,
                     input_level=int(input_level),
                     bootstrap_count=int(num_bootstraps),
                     bootstrapper_slots=list(bootstrapper_slots),
                     linear_layers=[],
+                    fingerprint=compile_identity_fingerprint,
                 ),
             )
 
@@ -452,7 +456,11 @@ class Scheme:
         #    save_path="network-with-levels.png", figsize=(8,30) # optional plot
         #)
 
-        if bootstrapper_slots:
+        skip_bootstrapper_generation = os.environ.get(
+            "ORION_COMPILE_SKIP_BOOTSTRAPPER_GENERATION",
+            "0",
+        ).lower() not in ("0", "false", "no", "off")
+        if bootstrapper_slots and not skip_bootstrapper_generation:
             start = time.time()
             slots_str = ", ".join([str(int(math.log2(slot))) for slot in bootstrapper_slots])
             print(f"├── Generating bootstrappers for logslots = {slots_str} ... ", 
@@ -462,6 +470,13 @@ class Scheme:
             for slot_count in bootstrapper_slots:
                 self.bootstrapper.generate_bootstrapper(slot_count)
             print(f"done! [{time.time()-start:.3f} secs.]")
+        elif bootstrapper_slots:
+            slots_str = ", ".join([str(int(math.log2(slot))) for slot in bootstrapper_slots])
+            print(
+                f"├── Skipping bootstrapper generation for logslots = {slots_str} "
+                "(ORION_COMPILE_SKIP_BOOTSTRAPPER_GENERATION=1).",
+                flush=True,
+            )
 
         btp_placer = BootstrapPlacer(net, network_dag)
         btp_placer.place_bootstraps()
@@ -494,11 +509,12 @@ class Scheme:
                     params=self.params,
                     net=net,
                     network_dag=network_dag,
-                    topo_sort=topo_sort,
+                    topo_sort=plan_topo_sort,
                     input_level=int(input_level),
                     bootstrap_count=int(num_bootstraps),
                     bootstrapper_slots=list(bootstrapper_slots),
                     linear_layers=compiled_linear_layers,
+                    fingerprint=compile_identity_fingerprint,
                 ),
             )
                 
