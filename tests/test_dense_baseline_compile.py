@@ -9,6 +9,7 @@ import torch
 
 import orion
 from orion.backend.python.lt_evaluator import NewEvaluator
+from orion.backend.python import compile_cache
 from orion.core import packing
 from orion.core import orion as orion_core
 from orion.nn.linear import Conv2d, ConvTranspose2d
@@ -359,6 +360,66 @@ def test_load_mode_uses_cached_compile_plan(tmp_path, monkeypatch) -> None:
         assert orion.compile(layer) == save_input_level
     finally:
         load_scheme.delete_scheme()
+
+
+def test_compile_manifest_keeps_entry_fingerprint_after_compile_mutates_model(tmp_path, monkeypatch) -> None:
+    torch.manual_seed(111)
+    weight = torch.randn(1, 1, 1, 1)
+    x = torch.randn(1, 1, 2, 2)
+    original_pack_conv2d = packing.pack_conv2d
+    mutated = False
+
+    save_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="save"))
+    try:
+        layer = Conv2d(1, 1, kernel_size=1, bias=False)
+        layer.weight.data.copy_(weight)
+        orion.fit(layer, x)
+        entry_fingerprint = compile_cache.cache_fingerprint(save_scheme.params, layer)
+
+        def mutating_pack_conv2d(*args, **kwargs):
+            nonlocal mutated
+            if not mutated:
+                layer.add_module("_compile_time_probe", torch.nn.Identity())
+                mutated = True
+            return original_pack_conv2d(*args, **kwargs)
+
+        monkeypatch.setattr(packing, "pack_conv2d", mutating_pack_conv2d)
+        orion.compile(layer)
+        mutated_fingerprint = compile_cache.cache_fingerprint(save_scheme.params, layer)
+    finally:
+        save_scheme.delete_scheme()
+
+    manifest_path = tmp_path / "compile_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert mutated is True
+    assert mutated_fingerprint != entry_fingerprint
+    assert manifest["fingerprint"] == entry_fingerprint
+
+
+def test_compile_plan_can_round_trip_residual_helper_nodes() -> None:
+    class FakeDag:
+        def __init__(self):
+            self.nodes = {
+                "conv": {
+                    "module": SimpleNamespace(level=3, depth=1, scheme=SimpleNamespace(params=SimpleNamespace(get_slots=lambda: 16))),
+                    "bootstrap": False,
+                },
+                "conv_fork": {"module": None, "bootstrap": False},
+                "conv_join": {"module": None, "bootstrap": False},
+            }
+
+    dag = FakeDag()
+    topo_sort = ["conv", "conv_fork", "conv_join"]
+    plan = compile_cache.collect_bootstrap_plan(
+        dag,
+        topo_sort,
+        input_level=4,
+        bootstrap_count=0,
+        bootstrapper_slots=[],
+    )
+
+    assert plan["topological_order"] == topo_sort
+    assert compile_cache.apply_bootstrap_plan(dag, plan) == (4, 0, [])
 
 
 def test_load_mode_rejects_compile_manifest_fingerprint_mismatch(tmp_path) -> None:

@@ -1201,6 +1201,11 @@ def _run_one(
     env_defaults = _configure_cheddar_runtime_defaults() if str(backend) == "cheddar" else {}
     if str(backend) != "cheddar":
         os.environ.setdefault("ORION_LATTIGO_BOOTSTRAP_MANY", "0")
+    if str(backend) == "cheddar" and str(io_mode).lower() in {"save", "load"}:
+        os.environ.setdefault("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE", "1")
+        env_defaults["ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE"] = str(
+            os.environ.get("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE", "")
+        )
     spec = NETWORKS[str(network)]
     provider_mode = str(provider_mode_override or spec["provider_mode"]) if str(mode) == "provider" else ""
     config = _apply_io_config(
@@ -1241,7 +1246,6 @@ def _run_one(
     _write(payload, out_path)
     try:
         if bool(compile_only) and str(io_mode) == "save" and str(backend) == "cheddar":
-            os.environ.setdefault("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE", "1")
             os.environ.setdefault("ORION_UNIFIED_LT_RELEASE_INDEX_ONLY_RAW_MATRICES_AFTER_SAVE", "1")
             os.environ.setdefault("ORION_COMPILE_SKIP_BOOTSTRAPPER_GENERATION", "1")
             os.environ.setdefault("ORION_UNIFIED_LT_PREPARE_SHARED_CACHE_PLAN", "0")

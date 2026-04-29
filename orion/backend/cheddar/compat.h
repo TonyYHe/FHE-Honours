@@ -71,6 +71,10 @@ int GetCiphertextDegree(int ciphertextID);
 ArrayResultUInt64 GetModuliChain();
 ArrayResultUInt64 GetAuxModuliChain();
 ArrayResultUInt64 GetDeviceMemoryInfo();
+void SynchronizeDevice();
+void TrimDeviceMemoryPool(unsigned long long targetBytes);
+double ConsumeDeviceMemoryTrimSeconds();
+ArrayResultDouble ConsumeSharedCacheEvalProfileSeconds();
 ArrayResultInt GetLivePlaintexts();
 ArrayResultInt GetLiveCiphertexts();
 
@@ -124,6 +128,7 @@ void DeleteLinearTransform(int transformID);
 ArrayResultInt GetLinearTransformRotationKeys(int transformID);
 ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID);
 ArrayResultUInt64 EstimateLinearTransformDeviceBytes(int transformID);
+int LinearTransformUsesStreaming(int transformID);
 void GenerateLinearTransformRotationKey(int key);
 void GenerateLinearTransformRotationKeyAtLevel(int key, int level);
 ArrayResultInt GenerateLinearTransformsUnified(
@@ -137,11 +142,19 @@ ArrayResultInt GenerateLinearTransformsUnifiedComplex(
 ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
                                                        int numTransforms,
                                                        int ciphertextID);
+void PrepareLinearTransformsSharedCachePlan(const int *transformIDs,
+                                            int numTransforms);
 ArrayResultByte GenerateAndSerializeRotationKey(int key);
 ArrayResultByte GenerateAndSerializeRotationKeyAtLevel(int key, int level);
 void LoadRotationKey(const unsigned char *data, unsigned long lenData,
                      unsigned long key);
+void LoadLinearTransformRotationKey(const unsigned char *data,
+                                    unsigned long lenData,
+                                    unsigned long key,
+                                    int transformID);
+void RemoveLinearTransformRotationKeys(int transformID);
 ArrayResultByte SerializeDiagonal(int transformID, int diagIdx);
+ArrayResultByte SerializeLinearTransformPlaintexts(int transformID);
 void LoadPlaintextDiagonal(const unsigned char *data, unsigned long lenData,
                           int transformID, unsigned long diagIdx);
 void LoadPlaintextDiagonalsBatch(const unsigned char *data,
@@ -151,7 +164,11 @@ void LoadPlaintextDiagonalsBatch(const unsigned char *data,
                                  const unsigned long long *lengths,
                                  int numLengths, const int *diagIdxs,
                                  int numDiagIdxs, int transformID);
+void LoadLinearTransformPlaintexts(const unsigned char *data,
+                                   unsigned long lenData,
+                                   int transformID);
 void RemovePlaintextDiagonals(int transformID);
+void ReleaseLinearTransformMatrix(int transformID);
 void RemoveRotationKeys();
 
 void NewBootstrapper(const int *logPs, int lenLogPs, int numSlots);

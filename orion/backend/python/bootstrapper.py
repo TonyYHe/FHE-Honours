@@ -14,3 +14,9 @@ class NewEvaluator:
     
     def bootstrap(self, ctxt, slots):
         return self.backend.Bootstrap(ctxt, slots)
+
+    def bootstrap_many(self, ctxts, slots):
+        bootstrap_many = getattr(self.backend, "BootstrapMany", None)
+        if bootstrap_many is None:
+            return [self.bootstrap(ctxt, slots) for ctxt in ctxts]
+        return bootstrap_many(list(ctxts), slots)

@@ -1,13 +1,26 @@
 class NewEvaluator:
     def __init__(self, scheme):
+        self.scheme = scheme
         self.backend = scheme.backend
+        self._requested_rotation_keys = set()
+        self._cache_rotation_key_requests = (
+            scheme.params.get_io_mode() == "none"
+            or callable(getattr(self.backend, "RemoveLinearTransformRotationKeys", None))
+        )
         self.new_evaluator()
 
     def new_evaluator(self):
         self.backend.NewEvaluator()
 
     def add_rotation_key(self, amount: int):
+        amount = int(amount)
+        if amount == 0:
+            return
+        if self._cache_rotation_key_requests and amount in self._requested_rotation_keys:
+            return
         self.backend.AddRotationKey(amount)
+        if self._cache_rotation_key_requests:
+            self._requested_rotation_keys.add(amount)
 
     def negate(self, ctxt):
         return self.backend.Negate(ctxt)

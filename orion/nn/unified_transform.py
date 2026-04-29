@@ -293,7 +293,14 @@ class UnifiedTransformGroup:
             return
         resident = self._resident_rotation_key_set(backend)
         for key, level in key_requests:
-            resident.add((int(key), None if level is None else int(level)))
+            key = int(key)
+            # Cheddar's shared rotation-key map stores one EVK per rotation
+            # index. A different level for the same rotation overwrites the
+            # previous EVK, so the residency model must be exact by level.
+            for existing in tuple(resident):
+                if int(existing[0]) == key:
+                    resident.discard(existing)
+            resident.add((key, None if level is None else int(level)))
 
     def _consume_trim_seconds(self, backend) -> float:
         consume = getattr(backend, "ConsumeDeviceMemoryTrimSeconds", None)
@@ -544,7 +551,14 @@ class UnifiedTransformGroup:
         self.memory_trace.append(payload)
 
     def _memory_bounded_compile_enabled(self, backend) -> bool:
-        return bool(getattr(backend, "memory_bounded_unified_transforms", False)) and self._should_save_plaintext_diagonals()
+        if not bool(getattr(backend, "memory_bounded_unified_transforms", False)):
+            return False
+        if self._should_save_plaintext_diagonals():
+            return True
+        # Saved plaintext payloads are tied to how the backend constructs the
+        # unified transform. If save mode compiled one transform at a time,
+        # load mode must do the same before reloading those payloads.
+        return self._io_mode == "load" and bool(self._diags_path)
 
     def _memory_bounded_eval_enabled(self, backend) -> bool:
         return (
@@ -1353,11 +1367,16 @@ class UnifiedTransformGroup:
         self._diag_indices_by_transform = {}
         self._required_keys = ()
         self._required_keys_by_transform = {}
-        handle, root = self._storage_group("a")
-        try:
+        save_plaintexts = bool(self._should_save_plaintext_diagonals())
+        load_plaintexts = bool(self._io_mode == "load" and self._diags_path)
+        handle = None
+        storage = None
+        if save_plaintexts:
+            handle, root = self._storage_group("a")
             if self._storage_key in root:
                 del root[self._storage_key]
             storage = root.create_group(self._storage_key)
+        try:
             for transform_index, transform in enumerate(self.transforms):
                 payload = self._flatten_transform_diagonals(transform, has_complex=has_complex)
                 self._record_memory_event(
@@ -1380,12 +1399,19 @@ class UnifiedTransformGroup:
                     transform_index=int(transform_index),
                     transform_id=transform_id,
                 )
-                self._save_and_unload_plaintext_diagonals_for_transform(
-                    backend,
-                    storage,
-                    transform_id,
-                    payload[0],
-                )
+                if save_plaintexts:
+                    if storage is None:
+                        raise RuntimeError("missing unified transform plaintext storage")
+                    self._save_and_unload_plaintext_diagonals_for_transform(
+                        backend,
+                        storage,
+                        transform_id,
+                        payload[0],
+                    )
+                elif load_plaintexts:
+                    remove_plaintexts = getattr(backend, "RemovePlaintextDiagonals", None)
+                    if callable(remove_plaintexts):
+                        remove_plaintexts(int(transform_id))
                 self._clear_source_diagonals_after_compile(transform)
                 self._record_memory_event(
                     "after_offload_transform",
@@ -1395,8 +1421,9 @@ class UnifiedTransformGroup:
                     transform_id=transform_id,
                 )
         finally:
-            handle.close()
-        self._offloaded_plaintext_diagonals = True
+            if handle is not None:
+                handle.close()
+        self._offloaded_plaintext_diagonals = bool(save_plaintexts or load_plaintexts)
         self._prefetch_host_bytes = None
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None

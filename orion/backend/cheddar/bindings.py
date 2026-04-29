@@ -84,6 +84,23 @@ class CheddarLibrary(LattigoLibrary):
         )
         self.memory_bounded_unified_transforms = True
         self.memory_bounded_unified_evaluate = True
+        self.retain_unified_rotation_keys = True
+        self.retain_unified_plaintexts = (
+            os.environ.get("ORION_UNIFIED_LT_PLAINTEXT_RESIDENCY", "1").lower()
+            not in ("0", "false", "no", "off")
+        )
+        self.prefer_encoded_plaintext_payload_cache = (
+            os.environ.get("ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOADS", "1").lower()
+            not in ("0", "false", "no", "off")
+        )
+        encoded_payload_max = os.environ.get(
+            "ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOAD_MAX_DEVICE_BYTES",
+            str(4 * 1024**3),
+        )
+        try:
+            self.encoded_plaintext_payload_max_device_bytes = int(encoded_payload_max)
+        except ValueError:
+            self.encoded_plaintext_payload_max_device_bytes = 4 * 1024**3
 
     def _load_library(self):
         try:
@@ -145,6 +162,11 @@ class CheddarLibrary(LattigoLibrary):
             ],
             restype=None,
         )
+        self.ReleaseLinearTransformMatrix = LattigoFunction(
+            self.lib.ReleaseLinearTransformMatrix,
+            argtypes=[ctypes.c_int],
+            restype=None,
+        )
         self.LoadLinearTransformRotationKey = LattigoFunction(
             self.lib.LoadLinearTransformRotationKey,
             argtypes=[
@@ -173,6 +195,21 @@ class CheddarLibrary(LattigoLibrary):
         self.TrimDeviceMemoryPool = LattigoFunction(
             self.lib.TrimDeviceMemoryPool,
             argtypes=[ctypes.c_ulonglong],
+            restype=None,
+        )
+        self.ConsumeDeviceMemoryTrimSeconds = LattigoFunction(
+            self.lib.ConsumeDeviceMemoryTrimSeconds,
+            argtypes=[],
+            restype=ctypes.c_double,
+        )
+        self.ConsumeSharedCacheEvalProfileSeconds = LattigoFunction(
+            self.lib.ConsumeSharedCacheEvalProfileSeconds,
+            argtypes=[],
+            restype=ArrayResultDouble,
+        )
+        self.PrepareLinearTransformsSharedCachePlan = LattigoFunction(
+            self.lib.PrepareLinearTransformsSharedCachePlan,
+            argtypes=[ctypes.POINTER(ctypes.c_int), ctypes.c_int],
             restype=None,
         )
         self.EstimateLinearTransformDeviceBytes = LattigoFunction(

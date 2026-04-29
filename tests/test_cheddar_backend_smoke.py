@@ -83,6 +83,11 @@ def test_cheddar_roundtrip_rotate_poly_and_linear_transform() -> None:
         rotated = torch.tensor(scheme.backend.Decode(rot_pt)[:4])
         assert torch.allclose(rotated, torch.tensor([2.0, 3.0, 4.0, 0.0]), atol=1e-3, rtol=1e-3)
 
+        neg_rot_id = scheme.evaluator.rotate(ct.ids[0], -1, False)
+        neg_rot_pt = scheme.backend.Decrypt(neg_rot_id)
+        neg_rotated = torch.tensor(scheme.backend.Decode(neg_rot_pt)[:4])
+        assert torch.allclose(neg_rotated, torch.tensor([0.0, 1.0, 2.0, 3.0]), atol=1e-3, rtol=1e-3)
+
         poly = scheme.poly_evaluator.generate_monomial(torch.tensor([0.0, 0.0, 1.0]))
         poly_out = scheme.poly_evaluator.evaluate_polynomial(ct, poly)
         squared = scheme.decrypt(poly_out).decode()
@@ -102,6 +107,20 @@ def test_cheddar_roundtrip_rotate_poly_and_linear_transform() -> None:
         lt_pt = scheme.backend.Decrypt(lt_ct)
         lt_values = torch.tensor(scheme.backend.Decode(lt_pt)[:4])
         assert torch.allclose(lt_values, torch.tensor([1.0, 2.0, 3.0, 4.0]), atol=1e-3, rtol=1e-3)
+
+        neg_transform_id = scheme.backend.GenerateLinearTransform(
+            [-1],
+            [1.0] * slots,
+            13,
+            2.0,
+            "none",
+        )
+        for key in scheme.backend.GetLinearTransformRotationKeys(neg_transform_id):
+            scheme.backend.GenerateLinearTransformRotationKey(int(key))
+        neg_lt_ct = scheme.backend.EvaluateLinearTransform(neg_transform_id, ct.ids[0])
+        neg_lt_pt = scheme.backend.Decrypt(neg_lt_ct)
+        neg_lt_values = torch.tensor(scheme.backend.Decode(neg_lt_pt)[:4])
+        assert torch.allclose(neg_lt_values, torch.tensor([0.0, 1.0, 2.0, 3.0]), atol=1e-3, rtol=1e-3)
     finally:
         scheme.delete_scheme()
 
@@ -151,6 +170,49 @@ def test_cheddar_unified_shared_cache_matches_individual_evaluation() -> None:
 
 
 @pytest.mark.skipif(not _backend_available(), reason="cheddar backend shared library is not built")
+def test_cheddar_shared_cache_lowers_to_input_level() -> None:
+    scheme = Scheme().init_scheme(_config())
+    try:
+        slots = int(scheme.params.get_slots())
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.arange(1, 9, dtype=torch.float32)
+        ct = scheme.encrypt(scheme.encode(x, level=1))
+
+        diag0 = torch.ones(slots, dtype=torch.float32)
+        diag1 = torch.zeros(slots, dtype=torch.float32)
+        diag1[:16] = 0.25
+        transform_ids = []
+        for scale in (1.0, 2.0):
+            transform_ids.append(
+                int(
+                    scheme.backend.GenerateLinearTransform(
+                        [0, 1],
+                        (diag0 * scale).tolist() + (diag1 * scale).tolist(),
+                        2,
+                        2.0,
+                        "none",
+                    )
+                )
+            )
+
+        transform_ids_array = (ctypes.c_int * len(transform_ids))(*transform_ids)
+        shared_ids = scheme.backend.EvaluateLinearTransformsWithSharedCache(
+            transform_ids_array, len(transform_ids), int(ct.ids[0])
+        )
+
+        expected = x + torch.roll(x, -1) * 0.25
+        values_a = torch.tensor(scheme.backend.Decode(scheme.backend.Decrypt(int(shared_ids[0])))[:8])
+        values_b = torch.tensor(scheme.backend.Decode(scheme.backend.Decrypt(int(shared_ids[1])))[:8])
+
+        assert int(scheme.backend.GetCiphertextLevel(int(shared_ids[0]))) == 0
+        assert int(scheme.backend.GetCiphertextLevel(int(shared_ids[1]))) == 0
+        assert torch.allclose(values_a, expected[:8], atol=1e-3, rtol=1e-3)
+        assert torch.allclose(values_b, (2.0 * expected)[:8], atol=2e-3, rtol=1e-3)
+    finally:
+        scheme.delete_scheme()
+
+
+@pytest.mark.skipif(not _backend_available(), reason="cheddar backend shared library is not built")
 def test_cheddar_linear_transform_uses_bsgs_and_level_specific_key_requests() -> None:
     scheme = Scheme().init_scheme(_config())
     try:
@@ -170,6 +232,46 @@ def test_cheddar_linear_transform_uses_bsgs_and_level_specific_key_requests() ->
         assert requests
         assert all(level == 7 for _key, level in requests)
         assert len(requests) < len([idx for idx in diag_idxs if idx != 0])
+    finally:
+        scheme.delete_scheme()
+
+
+@pytest.mark.skipif(not _backend_available(), reason="cheddar backend shared library is not built")
+def test_cheddar_bsgs_multi_diagonal_linear_transform_matches_expected() -> None:
+    scheme = Scheme().init_scheme(_config())
+    try:
+        slots = int(scheme.params.get_slots())
+        level = 4
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:32] = torch.arange(1, 33, dtype=torch.float32)
+        ct = scheme.encrypt(scheme.encode(x, level))
+
+        diag_idxs = list(range(10))
+        diag_data = []
+        expected = torch.zeros(slots, dtype=torch.float32)
+        for offset in diag_idxs:
+            diag = torch.zeros(slots, dtype=torch.float32)
+            diag[:64] = 1.0 / float(offset + 1)
+            diag_data.extend(diag.tolist())
+            expected += torch.roll(x, -offset) * diag
+
+        transform_id = scheme.backend.GenerateLinearTransform(
+            diag_idxs,
+            diag_data,
+            level,
+            2.0,
+            "none",
+        )
+        flat_requests = list(scheme.backend.GetLinearTransformRotationKeyRequests(transform_id))
+        for index in range(0, len(flat_requests), 2):
+            scheme.backend.GenerateLinearTransformRotationKeyAtLevel(
+                int(flat_requests[index]),
+                int(flat_requests[index + 1]),
+            )
+
+        out_id = scheme.backend.EvaluateLinearTransform(transform_id, int(ct.ids[0]))
+        values = torch.tensor(scheme.backend.Decode(scheme.backend.Decrypt(int(out_id)))[:32])
+        assert torch.allclose(values, expected[:32], atol=1e-3, rtol=1e-3)
     finally:
         scheme.delete_scheme()
 
@@ -200,6 +302,14 @@ def test_cheddar_unified_transform_group_save_mode_offloads_and_recovers(tmp_pat
 
         assert Path(scheme.params.get_diags_path()).exists()
         assert Path(scheme.params.get_keys_path()).exists()
+        with h5py.File(scheme.params.get_diags_path(), "r") as handle:
+            storage = handle[group._storage_root_name()][group._storage_key]
+            for transform_id in group.unified_ids:
+                transform_storage = storage[str(int(transform_id))]
+                assert (
+                    "__encoded_hoist_payload__" in transform_storage
+                    or "diag_payload" in transform_storage
+                )
 
         x = torch.zeros(slots, dtype=torch.float32)
         x[:4] = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -242,6 +352,8 @@ def test_cheddar_regular_linear_transform_save_and_load_end_to_end(tmp_path: Pat
         with h5py.File(diags_path, "r") as handle:
             assert "plaintexts" in handle["fake_lt"]
             assert "0_0" in handle["fake_lt"]["plaintexts"]
+            block = handle["fake_lt"]["plaintexts"]["0_0"]
+            assert "__encoded_hoist_payload__" in block or len(block.keys()) > 0
 
         with h5py.File(keys_path, "r") as handle:
             assert len(handle.keys()) >= 2

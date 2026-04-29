@@ -1,6 +1,7 @@
 #include "compat.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -45,6 +46,7 @@ using UserInterface = cheddar::UserInterface<word>;
 using EvkMap = cheddar::EvkMap<word>;
 
 constexpr bool kUseMinKSLinearTransforms = false;
+double g_device_memory_trim_seconds = 0.0;
 
 template <typename T>
 class HeapAllocator {
@@ -120,6 +122,10 @@ struct LinearTransformState {
   std::unique_ptr<EvkMap> rotation_keys;
   cheddar::StripedMatrix matrix;
   std::vector<int> diag_indices;
+  bool metadata_cached = false;
+  unsigned long long cached_device_bytes = 0;
+  int cached_uses_streaming = 0;
+  std::vector<std::pair<int, int>> cached_rotation_key_requests;
   bool singleton = false;
   int singleton_diag_idx = 0;
   std::vector<Complex> singleton_values;
@@ -161,6 +167,15 @@ struct SharedCachePlan {
   std::vector<SharedCacheBucket> buckets;
 };
 
+struct SharedCacheEvalProfile {
+  double plan_s = 0.0;
+  double level_adjust_s = 0.0;
+  double baby_step_s = 0.0;
+  double giant_step_s = 0.0;
+  double push_s = 0.0;
+  double trim_s = 0.0;
+};
+
 struct SchemeState {
   std::unique_ptr<Parameter> param;
   std::shared_ptr<BootContext> context;
@@ -171,11 +186,29 @@ struct SchemeState {
   HeapAllocator<PolynomialSpec> polynomials;
   HeapAllocator<LinearTransformState> transforms;
   std::map<std::vector<int>, SharedCachePlan> shared_cache_plans;
+  std::map<int, int> prepared_rotation_key_levels;
   bool eval_mod_prepared = false;
   std::set<int> prepared_boot_slots;
 };
 
 std::unique_ptr<SchemeState> g_scheme;
+SharedCacheEvalProfile g_shared_cache_eval_profile;
+
+void AddDuration(double &target,
+                 const std::chrono::steady_clock::time_point &started) {
+  target +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+          .count();
+}
+
+void AccumulateSharedCacheEvalProfile(const SharedCacheEvalProfile &profile) {
+  g_shared_cache_eval_profile.plan_s += profile.plan_s;
+  g_shared_cache_eval_profile.level_adjust_s += profile.level_adjust_s;
+  g_shared_cache_eval_profile.baby_step_s += profile.baby_step_s;
+  g_shared_cache_eval_profile.giant_step_s += profile.giant_step_s;
+  g_shared_cache_eval_profile.push_s += profile.push_s;
+  g_shared_cache_eval_profile.trim_s += profile.trim_s;
+}
 
 void SyncBootstrapInterfaceSecrets(SchemeState &state) {
   if (!state.interface) {
@@ -202,6 +235,12 @@ void RequireScheme() {
 void EnsureRotationKeyPrepared(int key, int level);
 bool LinearTransformHasRotationKey(const LinearTransformState &state, int key);
 const EvkMap &LinearTransformEvkMap(const LinearTransformState &state);
+int SingletonLinearTransformRotationKey(const LinearTransformState &state);
+bool PersistSharedCachePlans();
+LinearTransformState MakeLinearTransformLevelView(
+    const LinearTransformState &state, int eval_level);
+void PrepareLinearTransformRotationKeysAtLevel(
+    const LinearTransformState &state, int eval_level);
 
 template <typename T>
 T *AllocArray(std::size_t count) {
@@ -353,6 +392,10 @@ LinearTransformState &RetrieveTransform(int id) {
 
 LinearTransform &EnsureTransformLoaded(LinearTransformState &state) {
   if (!state.transform) {
+    if (state.matrix.empty()) {
+      AbortWithMessage(
+          "linear transform matrix was released before plaintexts were loaded");
+    }
     state.transform = std::make_unique<LinearTransform>(
         g_scheme->context, state.matrix, state.level,
         g_scheme->param->GetScale(state.level), state.bs, state.gs);
@@ -504,7 +547,35 @@ bool EnvValueIsTrue(const char *value) {
           std::strcmp(value, "force") == 0);
 }
 
+unsigned long long LinearTransformFullLoadBudgetBytes() {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (err != cudaSuccess || free_bytes == 0 || total_bytes == 0) {
+    return 0;
+  }
+  const unsigned long long free_u64 =
+      static_cast<unsigned long long>(free_bytes);
+  const unsigned long long total_u64 =
+      static_cast<unsigned long long>(total_bytes);
+  const unsigned long long default_reserve =
+      std::max(16ULL * 1024ULL * 1024ULL * 1024ULL, total_u64 / 5ULL);
+  const unsigned long long reserve = ReadULLFromEnv(
+      "ORION_CHEDDAR_LT_FULL_LOAD_RESERVE_BYTES", default_reserve);
+  const unsigned long long pct =
+      std::min<unsigned long long>(
+          95ULL, ReadULLFromEnv("ORION_CHEDDAR_LT_FULL_LOAD_BUDGET_PCT", 85ULL));
+  const unsigned long long fraction_budget = free_u64 * pct / 100ULL;
+  if (free_u64 <= reserve) {
+    return std::max(256ULL * 1024ULL * 1024ULL, fraction_budget / 2ULL);
+  }
+  return std::min(free_u64 - reserve, fraction_budget);
+}
+
 bool ShouldStreamLinearTransform(const LinearTransformState &state) {
+  if (state.metadata_cached && state.matrix.empty()) {
+    return state.cached_uses_streaming != 0;
+  }
   if (state.singleton) {
     return false;
   }
@@ -520,7 +591,54 @@ bool ShouldStreamLinearTransform(const LinearTransformState &state) {
   const unsigned long long threshold = ReadULLFromEnv(
       "ORION_CHEDDAR_LT_STREAMING_THRESHOLD_BYTES",
       kDefaultStreamingThresholdBytes);
-  return EstimateLinearTransformStateDeviceBytes(state) >= threshold;
+  const unsigned long long estimate = EstimateLinearTransformStateDeviceBytes(state);
+  const unsigned long long budget = LinearTransformFullLoadBudgetBytes();
+  if (budget > 0) {
+    return estimate > budget;
+  }
+  return estimate >= threshold;
+}
+
+void CacheLinearTransformMetadata(LinearTransformState &state) {
+  if (state.metadata_cached) {
+    return;
+  }
+  state.cached_rotation_key_requests.clear();
+  if (state.singleton) {
+    const int key = SingletonLinearTransformRotationKey(state);
+    if (key != 0) {
+      state.cached_rotation_key_requests.emplace_back(key, state.level);
+    }
+    state.cached_device_bytes =
+        static_cast<unsigned long long>(state.singleton_values.size() *
+                                        sizeof(Complex));
+    state.cached_uses_streaming = 0;
+    state.metadata_cached = true;
+    return;
+  }
+
+  state.cached_device_bytes = EstimateLinearTransformStateDeviceBytes(state);
+  state.cached_uses_streaming = ShouldStreamLinearTransform(state) ? 1 : 0;
+
+  cheddar::EvkRequest req;
+  AddLinearTransformRequiredRotations(state, req);
+  state.cached_rotation_key_requests.reserve(req.size());
+  for (const auto &[key, level] : req) {
+    if (key != 0) {
+      state.cached_rotation_key_requests.emplace_back(key, level);
+    }
+  }
+  state.metadata_cached = true;
+}
+
+void ReleaseLinearTransformMatrixState(LinearTransformState &state) {
+  if (state.singleton || state.matrix.empty()) {
+    return;
+  }
+  CacheLinearTransformMetadata(state);
+  state.transform.reset();
+  state.matrix = cheddar::StripedMatrix();
+  state.diag_indices.clear();
 }
 
 unsigned long long LinearTransformPlaintextBytesPerSlot(
@@ -574,12 +692,12 @@ unsigned long long StreamingGiantStepMemoryBudgetBytes() {
   const unsigned long long total_u64 =
       static_cast<unsigned long long>(total_bytes);
   const unsigned long long default_reserve =
-      std::max(8ULL * 1024ULL * 1024ULL * 1024ULL, total_u64 / 8ULL);
+      std::max(16ULL * 1024ULL * 1024ULL * 1024ULL, total_u64 / 4ULL);
   const unsigned long long reserve = ReadULLFromEnv(
       "ORION_CHEDDAR_LT_STREAM_RESERVE_BYTES", default_reserve);
   const unsigned long long pct =
       std::min<unsigned long long>(
-          95ULL, ReadULLFromEnv("ORION_CHEDDAR_LT_STREAM_BUDGET_PCT", 60ULL));
+          95ULL, ReadULLFromEnv("ORION_CHEDDAR_LT_STREAM_BUDGET_PCT", 45ULL));
   const unsigned long long fraction_budget =
       free_u64 * pct / 100ULL;
   if (free_u64 > reserve) {
@@ -737,6 +855,25 @@ Const EncodeScalarConstant(int level, double scale, double value) {
   return constant;
 }
 
+int NormalizeRotationIndex(int index, int width) {
+  const int modulus = std::max(1, width);
+  int rot = index % modulus;
+  if (rot < 0) {
+    rot += modulus;
+  }
+  return rot;
+}
+
+int DefaultRotationWidth() {
+  RequireScheme();
+  return std::max(1, g_scheme->param->degree_ / 2);
+}
+
+int NormalizeCiphertextRotation(int ciphertext_id, int amount) {
+  const Ct &ciphertext = RetrieveCiphertext(ciphertext_id);
+  return NormalizeRotationIndex(amount, ciphertext.GetNumSlots());
+}
+
 std::vector<float> ExtractRealComponents(const std::vector<Complex> &values) {
   std::vector<float> out(values.size(), 0.0f);
   for (std::size_t i = 0; i < values.size(); ++i) {
@@ -758,9 +895,19 @@ std::vector<double> FlattenComplexInterleaved(
 
 template <typename T>
 void AppendPod(std::vector<unsigned char> &buffer, const T &value) {
-  const unsigned char *raw =
-      reinterpret_cast<const unsigned char *>(&value);
-  buffer.insert(buffer.end(), raw, raw + sizeof(T));
+  const std::size_t offset = buffer.size();
+  buffer.resize(offset + sizeof(T));
+  std::memcpy(buffer.data() + offset, &value, sizeof(T));
+}
+
+void AppendRawBytes(std::vector<unsigned char> &buffer,
+                    const unsigned char *data, std::size_t size) {
+  if (size == 0) {
+    return;
+  }
+  const std::size_t offset = buffer.size();
+  buffer.resize(offset + size);
+  std::memcpy(buffer.data() + offset, data, size);
 }
 
 template <typename T>
@@ -856,6 +1003,16 @@ cheddar::EvaluationKey<word> DeserializeEvaluationKeyBytes(
   return key;
 }
 
+int SerializedEvaluationKeyLevel(const unsigned char *data, std::size_t size) {
+  const unsigned char *cursor = data;
+  const unsigned char *end = data + size;
+  const int num_main = ReadPod<std::int32_t>(cursor, end);
+  const int num_ter = ReadPod<std::int32_t>(cursor, end);
+  const int num_aux = ReadPod<std::int32_t>(cursor, end);
+  return g_scheme->param->NPToLevel(
+      cheddar::NPInfo(num_main, num_ter, num_aux));
+}
+
 std::vector<unsigned char> SerializeSecretBytes() {
   cheddar::HostVector<word> main_secret;
   cheddar::HostVector<word> sparse_secret;
@@ -924,6 +1081,15 @@ std::vector<unsigned char> SerializeDiagonalBytes(
 constexpr std::uint32_t kLinearTransformPlaintextsMagic = 0x4f484c54U;
 constexpr std::uint32_t kLinearTransformPlaintextsVersion = 1U;
 
+std::size_t SerializedPlaintextPayloadByteCount(const Pt &plaintext) {
+  const cheddar::NPInfo np = plaintext.GetNP();
+  const std::size_t word_count =
+      static_cast<std::size_t>(np.GetNumTotal()) *
+      static_cast<std::size_t>(g_scheme->param->degree_);
+  return 4 * sizeof(std::int32_t) + sizeof(double) + sizeof(std::uint64_t) +
+         word_count * sizeof(word);
+}
+
 void AppendPlaintextPayload(std::vector<unsigned char> &buffer,
                             const Pt &plaintext) {
   const cheddar::NPInfo np = plaintext.GetNP();
@@ -937,7 +1103,7 @@ void AppendPlaintextPayload(std::vector<unsigned char> &buffer,
   AppendPod(buffer, static_cast<std::uint64_t>(host.size()));
   const unsigned char *raw =
       reinterpret_cast<const unsigned char *>(host.data());
-  buffer.insert(buffer.end(), raw, raw + host.size() * sizeof(word));
+  AppendRawBytes(buffer, raw, host.size() * sizeof(word));
 }
 
 Pt ReadPlaintextPayload(const unsigned char *&cursor,
@@ -968,11 +1134,19 @@ std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
   const auto &plaintext_map = transform.GetPlaintextMap();
 
   std::uint64_t record_count = 0;
+  std::size_t payload_bytes = 2 * sizeof(std::uint32_t) +
+                              3 * sizeof(std::int32_t) +
+                              sizeof(std::uint64_t);
   for (const auto &[_, bs_map] : plaintext_map) {
     record_count += static_cast<std::uint64_t>(bs_map.size());
+    for (const auto &[_, plaintext] : bs_map) {
+      payload_bytes += 2 * sizeof(std::int32_t);
+      payload_bytes += SerializedPlaintextPayloadByteCount(plaintext);
+    }
   }
 
   std::vector<unsigned char> payload;
+  payload.reserve(payload_bytes);
   AppendPod(payload, kLinearTransformPlaintextsMagic);
   AppendPod(payload, kLinearTransformPlaintextsVersion);
   AppendPod(payload, static_cast<std::int32_t>(state.level));
@@ -1023,7 +1197,9 @@ void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
       g_scheme->context, std::move(plaintext_map), state.level,
       g_scheme->param->GetScale(state.level), state.bs, state.gs, 0, 0,
       EstimateLinearTransformStride(state));
-  g_scheme->shared_cache_plans.clear();
+  if (!PersistSharedCachePlans()) {
+    g_scheme->shared_cache_plans.clear();
+  }
 }
 
 template <typename Fn>
@@ -1142,7 +1318,8 @@ cheddar::StripedMatrix BuildRealStripedMatrix(const int *diag_idxs,
       values[slot] =
           Complex(static_cast<double>(diag_data[diag_index * slots + slot]), 0.0);
     }
-    matrix[diag_idxs[diag_index]] = std::move(values);
+    matrix[NormalizeRotationIndex(diag_idxs[diag_index], slots)] =
+        std::move(values);
   }
   return matrix;
 }
@@ -1166,17 +1343,10 @@ cheddar::StripedMatrix BuildComplexStripedMatrix(const int *diag_idxs,
       const int offset = diag_index * slots * 2 + slot * 2;
       values[slot] = Complex(diag_data[offset], diag_data[offset + 1]);
     }
-    matrix[diag_idxs[diag_index]] = std::move(values);
+    matrix[NormalizeRotationIndex(diag_idxs[diag_index], slots)] =
+        std::move(values);
   }
   return matrix;
-}
-
-int NormalizeRotationIndex(int index, int width) {
-  int rot = index % width;
-  if (rot < 0) {
-    rot += width;
-  }
-  return rot;
 }
 
 std::pair<int, int> ChooseLinearTransformSplit(
@@ -1305,6 +1475,21 @@ void PrepareLinearTransformRotationKeys(const LinearTransformState &state) {
   }
 }
 
+void PrepareLinearTransformRotationKeysAtLevel(
+    const LinearTransformState &state, int eval_level) {
+  const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  for (const int bs_idx : layout.baby_steps) {
+    if (bs_idx != 0 && !LinearTransformHasRotationKey(state, bs_idx)) {
+      EnsureRotationKeyPrepared(bs_idx, eval_level);
+    }
+  }
+  for (const int gs_idx : layout.giant_steps) {
+    if (gs_idx != 0 && !LinearTransformHasRotationKey(state, gs_idx)) {
+      EnsureRotationKeyPrepared(gs_idx, eval_level);
+    }
+  }
+}
+
 void EvaluateLinearTransformGiantStepStreaming(
     const LinearTransformState &state, Ct &output,
     const std::map<int, Ct> &bs_cache, const EvkMap &evk_map) {
@@ -1364,40 +1549,51 @@ int EvaluateLinearTransformStreaming(LinearTransformState &state,
   return PushCiphertext(std::move(output));
 }
 
-SharedCachePlan BuildSharedCachePlan(const std::vector<int> &ordered_ids) {
+SharedCachePlan BuildSharedCachePlan(const std::vector<int> &ordered_ids,
+                                     int max_eval_level = -1) {
   SharedCachePlan plan;
   std::map<int, std::size_t> bucket_index_by_level;
   std::map<int, std::set<int>> bucket_bs_union;
 
   for (int transform_id : ordered_ids) {
     LinearTransformState &state = RetrieveTransform(transform_id);
+    const int bucket_level =
+        max_eval_level >= 0 ? std::min(state.level, max_eval_level) : state.level;
+    std::unique_ptr<LinearTransformState> lowered_state;
+    LinearTransformState *eval_state = &state;
+    if (bucket_level != state.level) {
+      lowered_state =
+          std::make_unique<LinearTransformState>(
+              MakeLinearTransformLevelView(state, bucket_level));
+      eval_state = lowered_state.get();
+    }
     auto [it, inserted] =
-        bucket_index_by_level.emplace(state.level, plan.buckets.size());
+        bucket_index_by_level.emplace(bucket_level, plan.buckets.size());
     if (inserted) {
       SharedCacheBucket bucket;
-      bucket.level = state.level;
+      bucket.level = bucket_level;
       plan.buckets.push_back(std::move(bucket));
     }
     SharedCacheBucket &bucket = plan.buckets[it->second];
     bucket.transform_ids.push_back(transform_id);
-    std::set<int> &union_indices = bucket_bs_union[state.level];
+    std::set<int> &union_indices = bucket_bs_union[bucket_level];
     union_indices.insert(0);
-    if (ShouldStreamLinearTransform(state)) {
-      const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+    if (ShouldStreamLinearTransform(*eval_state)) {
+      const LinearTransformLayout layout = DescribeLinearTransformLayout(*eval_state);
       for (int bs_idx : layout.baby_steps) {
         union_indices.insert(bs_idx);
       }
-      PrepareLinearTransformRotationKeys(state);
+      PrepareLinearTransformRotationKeysAtLevel(*eval_state, bucket_level);
     } else {
-      LinearTransform &transform = EnsureTransformLoaded(state);
+      LinearTransform &transform = EnsureTransformLoaded(*eval_state);
       for (int bs_idx : transform.GetBabyStepIndices()) {
         union_indices.insert(bs_idx);
       }
       cheddar::EvkRequest req;
       transform.AddRequiredRotations(req, kUseMinKSLinearTransforms);
       for (const auto &[rot_idx, _] : req) {
-        if (rot_idx != 0 && !LinearTransformHasRotationKey(state, rot_idx)) {
-          EnsureRotationKeyPrepared(rot_idx, state.level);
+        if (rot_idx != 0 && !LinearTransformHasRotationKey(*eval_state, rot_idx)) {
+          EnsureRotationKeyPrepared(rot_idx, bucket_level);
         }
       }
     }
@@ -1419,6 +1615,106 @@ SharedCachePlan &GetOrBuildSharedCachePlan(const std::vector<int> &ordered_ids) 
   return inserted_it->second;
 }
 
+bool PersistSharedCachePlans() {
+  return EnvValueIsTrue(std::getenv("ORION_CHEDDAR_SHARED_CACHE_PLAN_PERSIST"));
+}
+
+LinearTransformState MakeLinearTransformLevelView(
+    const LinearTransformState &state, int eval_level) {
+  if (state.matrix.empty()) {
+    AbortWithMessage(
+        "cannot lower shared-cache transform level after matrix release");
+  }
+  if (state.singleton) {
+    return LinearTransformState(state.matrix, state.diag_indices, eval_level,
+                                state.singleton_diag_idx,
+                                state.singleton_values);
+  }
+  return LinearTransformState(std::unique_ptr<LinearTransform>(), state.matrix,
+                              state.diag_indices, eval_level, state.bs,
+                              state.gs);
+}
+
+std::set<int> SharedCacheBabyStepsForLevel(
+    const SharedCacheBucket &bucket, int eval_level) {
+  std::set<int> baby_steps;
+  baby_steps.insert(0);
+  for (int transform_id : bucket.transform_ids) {
+    LinearTransformState &state = RetrieveTransform(transform_id);
+    std::unique_ptr<LinearTransformState> lowered_state;
+    LinearTransformState *eval_state = &state;
+    if (state.level != eval_level) {
+      lowered_state =
+          std::make_unique<LinearTransformState>(
+              MakeLinearTransformLevelView(state, eval_level));
+      eval_state = lowered_state.get();
+    }
+    const LinearTransformLayout layout =
+        DescribeLinearTransformLayout(*eval_state);
+    baby_steps.insert(layout.baby_steps.begin(), layout.baby_steps.end());
+  }
+  return baby_steps;
+}
+
+bool TrimDeviceMemoryAfterEval() {
+  return EnvValueIsTrue(std::getenv("ORION_CHEDDAR_TRIM_AFTER_EVAL"));
+}
+
+unsigned long long DeviceMemoryTrimTargetBytes() {
+  return ReadULLFromEnvOrZero("ORION_CHEDDAR_TRIM_TARGET_BYTES");
+}
+
+unsigned long long DeviceMemoryTrimMinFreeBytes(
+    unsigned long long total_bytes) {
+  const unsigned long long explicit_min =
+      ReadULLFromEnvOrZero("ORION_CHEDDAR_TRIM_MIN_FREE_BYTES");
+  if (explicit_min > 0) {
+    return explicit_min;
+  }
+  const unsigned long long pct = std::min<unsigned long long>(
+      95ULL, ReadULLFromEnv("ORION_CHEDDAR_TRIM_MIN_FREE_PCT", 20ULL));
+  const unsigned long long pct_bytes = total_bytes * pct / 100ULL;
+  return std::max(16ULL * 1024ULL * 1024ULL * 1024ULL, pct_bytes);
+}
+
+unsigned long long DeviceMemoryTrimDefaultTargetBytes(
+    unsigned long long total_bytes) {
+  const unsigned long long explicit_target = DeviceMemoryTrimTargetBytes();
+  if (explicit_target > 0) {
+    return explicit_target;
+  }
+  const unsigned long long pct = std::min<unsigned long long>(
+      95ULL, ReadULLFromEnv("ORION_CHEDDAR_TRIM_TARGET_PCT", 12ULL));
+  const unsigned long long pct_bytes = total_bytes * pct / 100ULL;
+  return std::max(8ULL * 1024ULL * 1024ULL * 1024ULL, pct_bytes);
+}
+
+void TrimDeviceMemoryPoolIfRequested() {
+  if (!TrimDeviceMemoryAfterEval() || !g_scheme || !g_scheme->context) {
+    return;
+  }
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+  if (status == cudaSuccess && total_bytes > 0) {
+    const unsigned long long free_u64 =
+        static_cast<unsigned long long>(free_bytes);
+    const unsigned long long total_u64 =
+        static_cast<unsigned long long>(total_bytes);
+    if (free_u64 >= DeviceMemoryTrimMinFreeBytes(total_u64)) {
+      return;
+    }
+  }
+  const auto started = std::chrono::steady_clock::now();
+  g_scheme->context->memory_pool_.TrimTo(
+      static_cast<std::size_t>(
+          DeviceMemoryTrimDefaultTargetBytes(
+              static_cast<unsigned long long>(total_bytes))));
+  const auto finished = std::chrono::steady_clock::now();
+  g_device_memory_trim_seconds +=
+      std::chrono::duration<double>(finished - started).count();
+}
+
 void EnsureRotationKeyPrepared(int key, int level) {
   if (key <= 0) {
     return;
@@ -1426,7 +1722,17 @@ void EnsureRotationKeyPrepared(int key, int level) {
   if (level < 0 || level > g_scheme->param->max_level_) {
     AbortWithMessage("rotation key level is outside supported preset range");
   }
+  auto prepared_it = g_scheme->prepared_rotation_key_levels.find(key);
+  if (prepared_it != g_scheme->prepared_rotation_key_levels.end() &&
+      prepared_it->second == level) {
+    return;
+  }
+  if (prepared_it != g_scheme->prepared_rotation_key_levels.end()) {
+    g_scheme->interface->RemoveRotationKeys();
+    g_scheme->prepared_rotation_key_levels.clear();
+  }
   g_scheme->interface->PrepareRotationKey(key, level);
+  g_scheme->prepared_rotation_key_levels[key] = level;
 }
 
 const EvkMap &LinearTransformEvkMap(const LinearTransformState &state) {
@@ -1464,15 +1770,13 @@ void EnsureBootstrapPrepared(int num_slots) {
     g_scheme->context->PrepareEvalMod();
     g_scheme->eval_mod_prepared = true;
   }
-  if (g_scheme->prepared_boot_slots.insert(num_slots).second) {
+  const bool prepare_slot = g_scheme->prepared_boot_slots.insert(num_slots).second;
+  if (prepare_slot) {
     g_scheme->context->PrepareEvalSpecialFFT(num_slots);
+    cheddar::EvkRequest req;
+    g_scheme->context->AddRequiredRotations(req, num_slots);
+    g_scheme->bootstrap_interface->PrepareRotationKey(req);
   }
-  // LT evaluation in load mode removes transient rotation keys between
-  // transforms. Bootstrap FFT plans stay prepared, but their rotation keys may
-  // have been cleared from the interface evk map, so ensure them at use time.
-  cheddar::EvkRequest req;
-  g_scheme->context->AddRequiredRotations(req, num_slots);
-  g_scheme->bootstrap_interface->PrepareRotationKey(req);
 }
 
 ArrayResultDouble UnsupportedMinimax() {
@@ -1681,6 +1985,34 @@ void SynchronizeDevice() {
   }
 }
 
+void TrimDeviceMemoryPool(unsigned long long targetBytes) {
+  RequireScheme();
+  const auto started = std::chrono::steady_clock::now();
+  g_scheme->context->memory_pool_.TrimTo(static_cast<std::size_t>(targetBytes));
+  const auto finished = std::chrono::steady_clock::now();
+  g_device_memory_trim_seconds +=
+      std::chrono::duration<double>(finished - started).count();
+}
+
+double ConsumeDeviceMemoryTrimSeconds() {
+  const double value = g_device_memory_trim_seconds;
+  g_device_memory_trim_seconds = 0.0;
+  return value;
+}
+
+ArrayResultDouble ConsumeSharedCacheEvalProfileSeconds() {
+  std::vector<double> values = {
+      g_shared_cache_eval_profile.plan_s,
+      g_shared_cache_eval_profile.level_adjust_s,
+      g_shared_cache_eval_profile.baby_step_s,
+      g_shared_cache_eval_profile.giant_step_s,
+      g_shared_cache_eval_profile.push_s,
+      g_shared_cache_eval_profile.trim_s,
+  };
+  g_shared_cache_eval_profile = SharedCacheEvalProfile();
+  return MakeDoubleArrayResult(values);
+}
+
 ArrayResultInt GetLivePlaintexts() {
   RequireScheme();
   return MakeIntArrayResult(g_scheme->plaintexts.LiveKeys());
@@ -1695,11 +2027,8 @@ void NewEvaluator() { RequireScheme(); }
 
 void AddRotationKey(int rotation) {
   RequireScheme();
-  if (rotation < 0) {
-    AbortWithMessage(
-        "negative rotation keys are not supported in the first C++ adapter pass");
-  }
-  EnsureRotationKeyPrepared(rotation, g_scheme->param->default_encryption_level_);
+  const int normalized = NormalizeRotationIndex(rotation, DefaultRotationWidth());
+  EnsureRotationKeyPrepared(normalized, g_scheme->param->default_encryption_level_);
 }
 
 int Negate(int ciphertextID) {
@@ -1727,29 +2056,25 @@ int ConjugateNew(int ciphertextID) {
 
 int Rotate(int ciphertextID, int amount) {
   RequireScheme();
-  if (amount < 0) {
-    AbortWithMessage(
-        "negative rotations are not supported in the first C++ adapter pass");
-  }
-  EnsureRotationKeyPrepared(amount, CiphertextLevel(RetrieveCiphertext(ciphertextID)));
+  const int normalized = NormalizeCiphertextRotation(ciphertextID, amount);
+  EnsureRotationKeyPrepared(normalized,
+                            CiphertextLevel(RetrieveCiphertext(ciphertextID)));
   return ApplyCiphertextUnaryInPlace(ciphertextID, [&](Ct &out, const Ct &in) {
     g_scheme->context->HRot(out, in,
-                            g_scheme->interface->GetRotationKey(amount),
-                            amount);
+                            g_scheme->interface->GetRotationKey(normalized),
+                            normalized);
   });
 }
 
 int RotateNew(int ciphertextID, int amount) {
   RequireScheme();
-  if (amount < 0) {
-    AbortWithMessage(
-        "negative rotations are not supported in the first C++ adapter pass");
-  }
-  EnsureRotationKeyPrepared(amount, CiphertextLevel(RetrieveCiphertext(ciphertextID)));
+  const int normalized = NormalizeCiphertextRotation(ciphertextID, amount);
+  EnsureRotationKeyPrepared(normalized,
+                            CiphertextLevel(RetrieveCiphertext(ciphertextID)));
   return ApplyCiphertextUnaryNew(ciphertextID, [&](Ct &out, const Ct &in) {
     g_scheme->context->HRot(out, in,
-                            g_scheme->interface->GetRotationKey(amount),
-                            amount);
+                            g_scheme->interface->GetRotationKey(normalized),
+                            normalized);
   });
 }
 
@@ -2044,10 +2369,14 @@ int EvaluateLinearTransform(int transformID, int ciphertextID) {
   Ct output;
   LinearTransformState &state = RetrieveTransform(transformID);
   if (state.singleton) {
-    return EvaluateSingletonLinearTransform(state, ciphertextID);
+    const int output_id = EvaluateSingletonLinearTransform(state, ciphertextID);
+    TrimDeviceMemoryPoolIfRequested();
+    return output_id;
   }
   if (ShouldStreamLinearTransform(state)) {
-    return EvaluateLinearTransformStreaming(state, ciphertextID);
+    const int output_id = EvaluateLinearTransformStreaming(state, ciphertextID);
+    TrimDeviceMemoryPoolIfRequested();
+    return output_id;
   }
   LinearTransform &transform = EnsureTransformLoaded(state);
   const Ct &input = RetrieveCiphertext(ciphertextID);
@@ -2060,7 +2389,9 @@ int EvaluateLinearTransform(int transformID, int ciphertextID) {
   transform.Evaluate(g_scheme->context, output, eval_input,
                      LinearTransformEvkMap(state),
                      kUseMinKSLinearTransforms);
-  return PushCiphertext(std::move(output));
+  const int output_id = PushCiphertext(std::move(output));
+  TrimDeviceMemoryPoolIfRequested();
+  return output_id;
 }
 
 void DeleteLinearTransform(int transformID) {
@@ -2074,6 +2405,16 @@ void DeleteLinearTransform(int transformID) {
 ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.metadata_cached && state.matrix.empty()) {
+    std::vector<int> keys;
+    keys.reserve(state.cached_rotation_key_requests.size());
+    for (const auto &[key, _level] : state.cached_rotation_key_requests) {
+      if (key != 0) {
+        keys.push_back(key);
+      }
+    }
+    return MakeIntArrayResult(keys);
+  }
   if (state.singleton) {
     const int key = SingletonLinearTransformRotationKey(state);
     std::vector<int> keys;
@@ -2083,12 +2424,7 @@ ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
     return MakeIntArrayResult(keys);
   }
   cheddar::EvkRequest req;
-  if (ShouldStreamLinearTransform(state)) {
-    AddLinearTransformRequiredRotations(state, req);
-  } else {
-    LinearTransform &transform = EnsureTransformLoaded(state);
-    transform.AddRequiredRotations(req, kUseMinKSLinearTransforms);
-  }
+  AddLinearTransformRequiredRotations(state, req);
   std::vector<int> keys;
   keys.reserve(req.size());
   for (const auto &[key, _] : req) {
@@ -2102,6 +2438,17 @@ ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
 ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.metadata_cached && state.matrix.empty()) {
+    std::vector<int> flat;
+    flat.reserve(state.cached_rotation_key_requests.size() * 2);
+    for (const auto &[key, level] : state.cached_rotation_key_requests) {
+      if (key != 0) {
+        flat.push_back(key);
+        flat.push_back(level);
+      }
+    }
+    return MakeIntArrayResult(flat);
+  }
   if (state.singleton) {
     const int key = SingletonLinearTransformRotationKey(state);
     std::vector<int> flat;
@@ -2112,12 +2459,7 @@ ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID) {
     return MakeIntArrayResult(flat);
   }
   cheddar::EvkRequest req;
-  if (ShouldStreamLinearTransform(state)) {
-    AddLinearTransformRequiredRotations(state, req);
-  } else {
-    LinearTransform &transform = EnsureTransformLoaded(state);
-    transform.AddRequiredRotations(req, kUseMinKSLinearTransforms);
-  }
+  AddLinearTransformRequiredRotations(state, req);
   std::vector<int> flat;
   flat.reserve(req.size() * 2);
   for (const auto &[key, level] : req) {
@@ -2132,12 +2474,24 @@ ArrayResultInt GetLinearTransformRotationKeyRequests(int transformID) {
 ArrayResultUInt64 EstimateLinearTransformDeviceBytes(int transformID) {
   RequireScheme();
   const LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.metadata_cached && state.matrix.empty()) {
+    return MakeUInt64ArrayResult({state.cached_device_bytes});
+  }
   if (state.singleton) {
     return MakeUInt64ArrayResult(
         {static_cast<unsigned long long>(state.singleton_values.size() *
                                          sizeof(Complex))});
   }
   return MakeUInt64ArrayResult({EstimateLinearTransformStateDeviceBytes(state)});
+}
+
+int LinearTransformUsesStreaming(int transformID) {
+  RequireScheme();
+  LinearTransformState &state = RetrieveTransform(transformID);
+  if (state.metadata_cached && state.matrix.empty()) {
+    return state.cached_uses_streaming;
+  }
+  return ShouldStreamLinearTransform(state) ? 1 : 0;
 }
 
 void GenerateLinearTransformRotationKey(int key) {
@@ -2186,6 +2540,7 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
                                                        int numTransforms,
                                                        int ciphertextID) {
   RequireScheme();
+  SharedCacheEvalProfile profile;
   std::vector<int> ordered_ids;
   ordered_ids.reserve(numTransforms);
   for (int i = 0; i < numTransforms; ++i) {
@@ -2194,46 +2549,92 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
   if (HasSingletonLinearTransform(ordered_ids)) {
     std::vector<int> output_ids;
     output_ids.reserve(numTransforms);
+    const auto eval_started = std::chrono::steady_clock::now();
     for (int transform_id : ordered_ids) {
       output_ids.push_back(EvaluateLinearTransform(transform_id, ciphertextID));
     }
+    AddDuration(profile.giant_step_s, eval_started);
+    AccumulateSharedCacheEvalProfile(profile);
     return MakeIntArrayResult(output_ids);
   }
-  SharedCachePlan &plan = GetOrBuildSharedCachePlan(ordered_ids);
+  SharedCachePlan local_plan;
+  SharedCachePlan *plan_ptr = nullptr;
+  const auto plan_started = std::chrono::steady_clock::now();
   const Ct &input = RetrieveCiphertext(ciphertextID);
   const int input_level = CiphertextLevel(input);
+  bool needs_level_limited_plan = false;
+  for (int transform_id : ordered_ids) {
+    if (RetrieveTransform(transform_id).level > input_level) {
+      needs_level_limited_plan = true;
+      break;
+    }
+  }
+  if (PersistSharedCachePlans() && !needs_level_limited_plan) {
+    plan_ptr = &GetOrBuildSharedCachePlan(ordered_ids);
+  } else {
+    local_plan = BuildSharedCachePlan(
+        ordered_ids, needs_level_limited_plan ? input_level : -1);
+    plan_ptr = &local_plan;
+  }
+  AddDuration(profile.plan_s, plan_started);
+  SharedCachePlan &plan = *plan_ptr;
   std::map<int, int> output_id_by_transform;
 
   for (const SharedCacheBucket &bucket : plan.buckets) {
     const Ct *bucket_input = &input;
     Ct leveled_input;
-    if (input_level > bucket.level) {
-      bucket_input = &CiphertextAtLevel(leveled_input, input, bucket.level);
-    } else if (input_level < bucket.level) {
-      AbortWithMessage(
-          "input ciphertext level is below the shared-cache transform level");
+    std::unique_ptr<HoistHandler> lowered_cache;
+    HoistHandler *bucket_cache = bucket.cache.get();
+    const auto level_started = std::chrono::steady_clock::now();
+    const int eval_level = std::min(input_level, bucket.level);
+    if (input_level > eval_level) {
+      bucket_input = &CiphertextAtLevel(leveled_input, input, eval_level);
     }
+    if (eval_level != bucket.level) {
+      for (int transform_id : bucket.transform_ids) {
+        PrepareLinearTransformRotationKeysAtLevel(
+            RetrieveTransform(transform_id), eval_level);
+      }
+      lowered_cache = BuildSharedCacheHoist(
+          eval_level, SharedCacheBabyStepsForLevel(bucket, eval_level));
+      bucket_cache = lowered_cache.get();
+    }
+    AddDuration(profile.level_adjust_s, level_started);
 
     const EvkMap &bucket_evk_map =
         LinearTransformEvkMap(RetrieveTransform(bucket.transform_ids.front()));
     std::map<int, Ct> bs_cache;
-    bucket.cache->EvaluateBabyStep(g_scheme->context, bs_cache, *bucket_input,
+    const auto baby_started = std::chrono::steady_clock::now();
+    bucket_cache->EvaluateBabyStep(g_scheme->context, bs_cache, *bucket_input,
                                    bucket_evk_map, false);
+    AddDuration(profile.baby_step_s, baby_started);
 
     for (int transform_id : bucket.transform_ids) {
       Ct output;
       LinearTransformState &transform_state = RetrieveTransform(transform_id);
-      if (ShouldStreamLinearTransform(transform_state)) {
+      std::unique_ptr<LinearTransformState> lowered_transform_state;
+      LinearTransformState *eval_transform_state = &transform_state;
+      if (eval_level != transform_state.level) {
+        lowered_transform_state =
+            std::make_unique<LinearTransformState>(
+                MakeLinearTransformLevelView(transform_state, eval_level));
+        eval_transform_state = lowered_transform_state.get();
+      }
+      const auto giant_started = std::chrono::steady_clock::now();
+      if (ShouldStreamLinearTransform(*eval_transform_state)) {
         EvaluateLinearTransformGiantStepStreaming(
-            transform_state, output, bs_cache,
+            *eval_transform_state, output, bs_cache,
             LinearTransformEvkMap(transform_state));
       } else {
-        LinearTransform &transform = EnsureTransformLoaded(transform_state);
+        LinearTransform &transform = EnsureTransformLoaded(*eval_transform_state);
         transform.EvaluateGiantStep(g_scheme->context, output, bs_cache,
                                     LinearTransformEvkMap(transform_state),
                                     kUseMinKSLinearTransforms);
       }
+      AddDuration(profile.giant_step_s, giant_started);
+      const auto push_started = std::chrono::steady_clock::now();
       output_id_by_transform[transform_id] = PushCiphertext(std::move(output));
+      AddDuration(profile.push_s, push_started);
     }
   }
 
@@ -2242,7 +2643,25 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
   for (int i = 0; i < numTransforms; ++i) {
     output_ids.push_back(output_id_by_transform.at(transformIDs[i]));
   }
+  const double trim_before = g_device_memory_trim_seconds;
+  TrimDeviceMemoryPoolIfRequested();
+  profile.trim_s += g_device_memory_trim_seconds - trim_before;
+  AccumulateSharedCacheEvalProfile(profile);
   return MakeIntArrayResult(output_ids);
+}
+
+void PrepareLinearTransformsSharedCachePlan(const int *transformIDs,
+                                            int numTransforms) {
+  RequireScheme();
+  if (numTransforms <= 1) {
+    return;
+  }
+  std::vector<int> ordered_ids;
+  ordered_ids.reserve(numTransforms);
+  for (int i = 0; i < numTransforms; ++i) {
+    ordered_ids.push_back(transformIDs[i]);
+  }
+  (void)GetOrBuildSharedCachePlan(ordered_ids);
 }
 
 ArrayResultByte GenerateAndSerializeRotationKey(int key) {
@@ -2251,6 +2670,7 @@ ArrayResultByte GenerateAndSerializeRotationKey(int key) {
   const auto bytes =
       SerializeEvaluationKeyBytes(g_scheme->interface->GetRotationKey(key));
   g_scheme->interface->RemoveRotationKeys();
+  g_scheme->prepared_rotation_key_levels.clear();
   return MakeByteArrayResult(bytes);
 }
 
@@ -2260,14 +2680,29 @@ ArrayResultByte GenerateAndSerializeRotationKeyAtLevel(int key, int level) {
   const auto bytes =
       SerializeEvaluationKeyBytes(g_scheme->interface->GetRotationKey(key));
   g_scheme->interface->RemoveRotationKeys();
+  g_scheme->prepared_rotation_key_levels.clear();
   return MakeByteArrayResult(bytes);
 }
 
 void LoadRotationKey(const unsigned char *data, unsigned long lenData,
                      unsigned long key) {
   RequireScheme();
-  auto evk = DeserializeEvaluationKeyBytes(data, static_cast<std::size_t>(lenData));
-  g_scheme->interface->SetRotationKey(static_cast<int>(key), std::move(evk));
+  const int key_int = static_cast<int>(key);
+  const int level =
+      SerializedEvaluationKeyLevel(data, static_cast<std::size_t>(lenData));
+  const auto prepared_it = g_scheme->prepared_rotation_key_levels.find(key_int);
+  if (prepared_it != g_scheme->prepared_rotation_key_levels.end() &&
+      prepared_it->second == level) {
+    return;
+  }
+  if (prepared_it != g_scheme->prepared_rotation_key_levels.end()) {
+    g_scheme->interface->RemoveRotationKeys();
+    g_scheme->prepared_rotation_key_levels.clear();
+  }
+  auto evk =
+      DeserializeEvaluationKeyBytes(data, static_cast<std::size_t>(lenData));
+  g_scheme->interface->SetRotationKey(key_int, std::move(evk));
+  g_scheme->prepared_rotation_key_levels[key_int] = level;
 }
 
 void LoadLinearTransformRotationKey(const unsigned char *data,
@@ -2291,7 +2726,9 @@ ArrayResultByte SerializeDiagonal(int transformID, int diagIdx) {
   LinearTransformState &state = RetrieveTransform(transformID);
   const auto bytes = SerializeDiagonalBytes(state, diagIdx);
   state.transform.reset();
-  g_scheme->shared_cache_plans.clear();
+  if (!PersistSharedCachePlans()) {
+    g_scheme->shared_cache_plans.clear();
+  }
   return MakeByteArrayResult(bytes);
 }
 
@@ -2300,7 +2737,9 @@ ArrayResultByte SerializeLinearTransformPlaintexts(int transformID) {
   LinearTransformState &state = RetrieveTransform(transformID);
   const auto bytes = SerializeLinearTransformPlaintextsBytes(state);
   state.transform.reset();
-  g_scheme->shared_cache_plans.clear();
+  if (!PersistSharedCachePlans()) {
+    g_scheme->shared_cache_plans.clear();
+  }
   return MakeByteArrayResult(bytes);
 }
 
@@ -2313,6 +2752,9 @@ void LoadPlaintextDiagonal(const unsigned char * /*data*/,
     return;
   }
   if (lenData == 0) {
+    if (!ShouldStreamLinearTransform(state)) {
+      EnsureTransformLoaded(state);
+    }
     return;
   }
   EnsureTransformLoaded(state);
@@ -2333,6 +2775,9 @@ void LoadPlaintextDiagonalsBatch(const unsigned char * /*data*/,
     return;
   }
   if (lenData == 0) {
+    if (!ShouldStreamLinearTransform(state)) {
+      EnsureTransformLoaded(state);
+    }
     return;
   }
   EnsureTransformLoaded(state);
@@ -2356,12 +2801,23 @@ void LoadLinearTransformPlaintexts(const unsigned char *data,
 void RemovePlaintextDiagonals(int transformID) {
   RequireScheme();
   RetrieveTransform(transformID).transform.reset();
-  g_scheme->shared_cache_plans.clear();
+  if (!PersistSharedCachePlans()) {
+    g_scheme->shared_cache_plans.clear();
+  }
+}
+
+void ReleaseLinearTransformMatrix(int transformID) {
+  RequireScheme();
+  ReleaseLinearTransformMatrixState(RetrieveTransform(transformID));
+  if (!PersistSharedCachePlans()) {
+    g_scheme->shared_cache_plans.clear();
+  }
 }
 
 void RemoveRotationKeys() {
   RequireScheme();
   g_scheme->interface->RemoveRotationKeys();
+  g_scheme->prepared_rotation_key_levels.clear();
 }
 
 void NewBootstrapper(const int * /*logPs*/, int /*lenLogPs*/, int numSlots) {
@@ -2395,7 +2851,9 @@ int Bootstrap(int ciphertextID, int numSlots) {
     g_scheme->context->Mult(compensated, output, sparse_compensation);
     output = std::move(compensated);
   }
-  return PushCiphertext(std::move(output));
+  const int output_id = PushCiphertext(std::move(output));
+  TrimDeviceMemoryPoolIfRequested();
+  return output_id;
 }
 
 void DeleteBootstrappers() {

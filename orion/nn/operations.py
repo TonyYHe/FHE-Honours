@@ -1,4 +1,7 @@
 import math
+import json
+import os
+import time
 import torch
 
 from .module import Module, timer
@@ -79,6 +82,36 @@ class Bootstrap(Module):
             )
         return self._prescale_ptxt_cache[level]
 
+    def _debug_cipher_stats(self, x):
+        ids = [int(value) for value in getattr(x, "ids", [])]
+        return {
+            "id_count": int(len(ids)),
+            "ids": ids[:8],
+            "level": int(x.level()) if hasattr(x, "level") else None,
+            "scale": int(x.scale()) if hasattr(x, "scale") else None,
+            "scale_log2": float(x.scale_log2()) if hasattr(x, "scale_log2") else None,
+            "slots": int(x.slots()) if hasattr(x, "slots") else None,
+        }
+
+    def _write_bootstrap_debug(self, *, phase: str, x, slots: int | None = None) -> None:
+        path = os.environ.get("ORION_BOOTSTRAP_DEBUG_PATH", "")
+        if not path:
+            return
+        row = {
+            "time": float(time.time()),
+            "phase": str(phase),
+            "name": str(getattr(self, "bootstrap_debug_name", "")),
+            "input_level": int(self.input_level),
+            "bootstrap_slots": int(self.bootstrap_slots),
+            "runtime_slots": None if slots is None else int(slots),
+            "prescale": float(self.prescale),
+            "postscale": float(self.postscale),
+            "constant": float(self.constant),
+            "cipher": self._debug_cipher_stats(x),
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
     @timer
     def forward(self, x):
         if not self.he_mode:
@@ -92,7 +125,14 @@ class Bootstrap(Module):
         x *= self._get_prescale_ptxt(x.level())
  
         slots = int(min(x.slots(), self.bootstrap_slots))
+        self._write_bootstrap_debug(phase="before_bootstrap", x=x, slots=slots)
+        if os.environ.get("ORION_ABORT_BEFORE_BOOTSTRAP", "0") != "0":
+            raise RuntimeError(
+                f"aborting before bootstrap for debug: "
+                f"{getattr(self, 'bootstrap_debug_name', '')}"
+            )
         x = x.bootstrap(slots=slots)
+        self._write_bootstrap_debug(phase="after_bootstrap", x=x, slots=slots)
 
         # Scale and shift back to the original range
         if self.postscale != 1:
@@ -101,5 +141,4 @@ class Bootstrap(Module):
             x -= self.constant
 
         return x
-
 

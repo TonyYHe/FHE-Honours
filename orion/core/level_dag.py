@@ -236,7 +236,10 @@ class LevelDAG(nx.DiGraph):
         
         # Case 3: Bootstrap required
         if curr_level > prev_level - prev_module.depth:
-            if prev_level - prev_module.depth <= 0:
+            # Bootstrap.forward first applies its sparse prescale plaintext and
+            # rescale before calling the backend bootstrap. Reserve one level
+            # for that prescale so Lattigo does not receive a level-0 input.
+            if prev_level - prev_module.depth <= 1:
                 return (float("inf"), 0)
             
             # Analytical fit based on experiments. Once again could benefit

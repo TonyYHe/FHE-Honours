@@ -1,5 +1,6 @@
 import sys
 import math
+import os
 
 class PlainTensor:
     def __init__(self, scheme, ptxt_ids, shape, on_shape=None):
@@ -275,11 +276,15 @@ class CipherTensor:
             elements = self.on_shape.numel()
             slots = 2 ** math.ceil(math.log2(elements))
         slots = int(min(self.slots(), slots)) # sparse bootstrapping
-        
-        btp_ids = []
-        for ctxt in self.ids:
-            btp_id = self.bootstrapper.bootstrap(ctxt, slots)
-            btp_ids.append(btp_id)
+
+        use_many = os.environ.get("ORION_LATTIGO_BOOTSTRAP_MANY", "0") != "0"
+        if use_many and len(self.ids) > 1 and hasattr(self.bootstrapper, "bootstrap_many"):
+            btp_ids = self.bootstrapper.bootstrap_many(self.ids, slots)
+        else:
+            btp_ids = []
+            for ctxt in self.ids:
+                btp_id = self.bootstrapper.bootstrap(ctxt, slots)
+                btp_ids.append(btp_id)
 
         return CipherTensor(self.scheme, btp_ids, self.shape, self.on_shape)
         

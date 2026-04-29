@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from concurrent.futures import Future, ThreadPoolExecutor
 import os
 from typing import Any, Callable
@@ -97,34 +98,78 @@ def estimate_linear_transform_device_bytes(backend: Any, transform_id: int) -> i
     return int(values[0])
 
 
+@dataclass
+class _PrefetchEntry:
+    future: Future
+    host_bytes: int = 0
+    device_bytes: int = 0
+
+
 class AsyncIOPrefetcher:
     def __init__(self) -> None:
-        self._key: Any = None
-        self._future: Future | None = None
+        self._entries: dict[Any, _PrefetchEntry] = {}
 
-    def submit(self, key: Any, loader: Callable[[], Any]) -> None:
-        self.clear()
-        self._key = key
-        self._future = _PREFETCH_EXECUTOR.submit(loader)
+    def submit(
+        self,
+        key: Any,
+        loader: Callable[[], Any],
+        *,
+        host_bytes: int = 0,
+        device_bytes: int = 0,
+        replace: bool = False,
+    ) -> bool:
+        if key in self._entries:
+            if not replace:
+                return False
+            self.discard(key)
+        self._entries[key] = _PrefetchEntry(
+            future=_PREFETCH_EXECUTOR.submit(loader),
+            host_bytes=int(host_bytes or 0),
+            device_bytes=int(device_bytes or 0),
+        )
+        return True
 
     def consume(self, key: Any) -> Any | None:
-        if self._future is None or self._key != key:
+        entry = self._entries.get(key)
+        if entry is None:
             return None
         try:
-            return self._future.result()
+            return entry.future.result()
         except Exception:
             return None
         finally:
-            self._future = None
-            self._key = None
+            self._entries.pop(key, None)
+
+    def discard(self, key: Any, *, wait: bool = False) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is None:
+            return
+        cancelled = entry.future.cancel()
+        if wait and not cancelled:
+            try:
+                entry.future.result()
+            except Exception:
+                pass
+
+    def pending_host_bytes(self) -> int:
+        return sum(int(entry.host_bytes) for entry in self._entries.values())
+
+    def pending_device_bytes(self) -> int:
+        return sum(int(entry.device_bytes) for entry in self._entries.values())
+
+    def pending_count(self) -> int:
+        return len(self._entries)
+
+    def has_pending(self, key: Any) -> bool:
+        return key in self._entries
 
     def clear(self, *, wait: bool = False) -> None:
-        if self._future is not None:
-            cancelled = self._future.cancel()
+        entries = list(self._entries.values())
+        self._entries.clear()
+        for entry in entries:
+            cancelled = entry.future.cancel()
             if wait and not cancelled:
                 try:
-                    self._future.result()
+                    entry.future.result()
                 except Exception:
                     pass
-        self._future = None
-        self._key = None
