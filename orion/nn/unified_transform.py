@@ -126,6 +126,26 @@ class UnifiedTransformGroup:
             return backend.GenerateAndSerializeRotationKeyAtLevel(int(key), int(level))
         return backend.GenerateAndSerializeRotationKey(int(key))
 
+    def _rotation_key_cached(self, handle, key: int, level: int | None) -> bool:
+        key_name = self._rotation_key_storage_name(int(key), level)
+        if key_name in handle:
+            return True
+        return str(int(key)) in handle
+
+    def _ensure_serialized_rotation_keys_available(self, backend) -> None:
+        if not self._keys_path:
+            return
+        with h5py.File(self._keys_path, "a") as handle:
+            for key, level in self._required_keys:
+                if self._rotation_key_cached(handle, int(key), level):
+                    continue
+                key_name = self._rotation_key_storage_name(int(key), level)
+                serial_key, key_ptr = self._generate_and_serialize_rotation_key(backend, int(key), level)
+                try:
+                    handle.create_dataset(key_name, data=serial_key)
+                finally:
+                    backend.FreeCArray(key_ptr)
+
     def _plaintext_payload_required(self, backend) -> bool:
         return bool(getattr(backend, "load_plaintext_diagonals_requires_payload", True))
 
@@ -1320,17 +1340,9 @@ class UnifiedTransformGroup:
 
     def _compile_rotation_keys(self, backend) -> None:
         if self._should_save_rotation_keys():
-            with h5py.File(self._keys_path, "a") as handle:
-                for key, level in self._required_keys:
-                    key_name = self._rotation_key_storage_name(int(key), level)
-                    if key_name in handle:
-                        continue
-                    serial_key, key_ptr = self._generate_and_serialize_rotation_key(backend, int(key), level)
-                    try:
-                        handle.create_dataset(key_name, data=serial_key)
-                    finally:
-                        backend.FreeCArray(key_ptr)
+            self._ensure_serialized_rotation_keys_available(backend)
         elif self._should_offload_rotation_keys():
+            self._ensure_serialized_rotation_keys_available(backend)
             return
         else:
             for key, level in self._required_keys:
