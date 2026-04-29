@@ -613,6 +613,86 @@ class UnifiedTransformGroup:
             device_bytes=lambda: self._estimate_prefetch_device_bytes(backend),
         )
 
+    def _prepare_shared_cache_plans(self, backend) -> None:
+        if os.environ.get("ORION_UNIFIED_LT_PREPARE_SHARED_CACHE_PLAN", "1").lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
+        prepare_plan = getattr(backend, "PrepareLinearTransformsSharedCachePlan", None)
+        if not callable(prepare_plan) or not self.unified_ids:
+            return
+        if os.environ.get("ORION_CHEDDAR_SHARED_CACHE_PLAN_PERSIST", "").lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return
+        chunks = (
+            self._memory_bounded_chunks(backend)
+            if self._memory_bounded_eval_enabled(backend)
+            else [[int(value) for value in self.unified_ids]]
+        )
+        for chunk_index, chunk_ids in enumerate(chunks):
+            chunk_ids = [int(value) for value in chunk_ids]
+            if len(chunk_ids) <= 1:
+                continue
+            load_started = time.perf_counter()
+            required_keys = self._rotation_key_requests_to_load(
+                backend,
+                chunk_ids,
+                self._required_keys_for_transform_ids(chunk_ids),
+            )
+            self._load_rotation_keys(
+                backend,
+                None,
+                transform_ids=chunk_ids,
+                required_keys=required_keys,
+            )
+            self._load_plaintext_diagonals(backend, None, transform_ids=chunk_ids)
+            plaintexts_stable = True
+            for transform_id in self._plaintext_load_transform_ids(backend, chunk_ids):
+                if int(transform_id) in self._resident_plaintext_transform_ids:
+                    continue
+                if self._can_keep_plaintexts_resident(
+                    backend,
+                    int(transform_id),
+                    already_loaded=True,
+                ):
+                    self._mark_plaintexts_resident(int(transform_id))
+                else:
+                    plaintexts_stable = False
+            load_s = float(time.perf_counter() - load_started)
+            if not plaintexts_stable:
+                self._record_memory_event(
+                    "skip_prepare_shared_cache_plan",
+                    backend,
+                    chunk_ids,
+                    chunk_index=int(chunk_index),
+                    chunk_transform_count=int(len(chunk_ids)),
+                    timing={"prepare_load_s": load_s},
+                    reason="plaintexts_not_resident_after_prepare_load",
+                )
+                continue
+            transform_ids_array = (ctypes.c_int * len(chunk_ids))(*chunk_ids)
+            prepare_started = time.perf_counter()
+            prepare_plan(transform_ids_array, len(chunk_ids))
+            prepare_s = float(time.perf_counter() - prepare_started)
+            self._record_memory_event(
+                "after_prepare_shared_cache_plan",
+                backend,
+                chunk_ids,
+                chunk_index=int(chunk_index),
+                chunk_transform_count=int(len(chunk_ids)),
+                timing={
+                    "prepare_load_s": load_s,
+                    "prepare_shared_cache_plan_s": prepare_s,
+                },
+            )
+
     def _read_and_prefetch_saved_io_bundle(self, backend) -> dict[str, object] | None:
         bundle = self._read_saved_io_bundle(backend, prefetch=False)
         if bundle is not None and self._device_transform_prefetch_supported(backend):
@@ -1350,6 +1430,7 @@ class UnifiedTransformGroup:
             self._offloaded_plaintext_diagonals = True
         if self._should_save_plaintext_diagonals() and not self._offloaded_plaintext_diagonals:
             self._save_and_unload_plaintext_diagonals(backend)
+        self._prepare_shared_cache_plans(backend)
         self._record_memory_event("after_compile_group", backend)
         self._register_shared_saved_io_work_unit(backend)
 
