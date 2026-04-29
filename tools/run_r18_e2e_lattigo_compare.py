@@ -341,6 +341,74 @@ def _parse_eval_budget_bytes_list(raw: str | None) -> tuple[int | None, ...] | N
     return tuple(values) if values else None
 
 
+def _executor_unified_groups(executor: Any) -> list[Any]:
+    groups: list[Any] = []
+    seen: set[int] = set()
+
+    def add_group(value: Any) -> None:
+        if value is None or id(value) in seen:
+            return
+        if not hasattr(value, "memory_trace"):
+            return
+        seen.add(id(value))
+        groups.append(value)
+
+    add_group(getattr(executor, "group", None))
+    for value in list(getattr(executor, "groups", []) or []):
+        add_group(value)
+    for value in list(getattr(executor, "groups_by_input_block", []) or []):
+        add_group(value)
+    groups_by_input_index = getattr(executor, "groups_by_input_index", None) or {}
+    for _key, value in sorted(groups_by_input_index.items()):
+        add_group(value)
+    return groups
+
+
+def _memory_trace_summary(executor: Any) -> dict[str, Any]:
+    summaries: list[dict[str, Any]] = []
+    timing_keys = (
+        "read_bundle_s",
+        "load_keys_s",
+        "load_plaintexts_s",
+        "eval_s",
+        "eval_total_s",
+        "unload_s",
+        "trim_s",
+    )
+    for group_index, group in enumerate(_executor_unified_groups(executor)):
+        events = list(getattr(group, "memory_trace", []) or [])
+        eval_group_events = [event for event in events if str(event.get("event")) == "before_eval_group_memory_bounded"]
+        after_group_events = [event for event in events if str(event.get("event")) == "after_eval_group_memory_bounded"]
+        chunk_events = [event for event in events if str(event.get("event")) == "after_eval_chunk_unload"]
+        timing_totals = {key: 0.0 for key in timing_keys}
+        for event in after_group_events:
+            timing = event.get("timing", {}) or {}
+            for key in timing_keys:
+                timing_totals[key] += float(timing.get(key, 0.0))
+        chunk_counts = [int(event.get("chunk_count", 0)) for event in eval_group_events]
+        budgets = [int(event.get("eval_budget_bytes", 0)) for event in eval_group_events]
+        summaries.append(
+            {
+                "group_index": int(group_index),
+                "event_count": int(len(events)),
+                "eval_group_count": int(len(eval_group_events)),
+                "chunk_counts": chunk_counts[-8:],
+                "eval_budget_bytes": budgets[-8:],
+                "timing_totals": timing_totals,
+                "last_chunks": [
+                    {
+                        "chunk_index": int(event.get("chunk_index", -1)),
+                        "chunk_transform_count": int(event.get("chunk_transform_count", 0)),
+                        "timing": dict(event.get("timing", {}) or {}),
+                        "linear_transform_device_bytes": dict(event.get("linear_transform_device_bytes", {}) or {}),
+                    }
+                    for event in chunk_events[-8:]
+                ],
+            }
+        )
+    return {"group_count": int(len(summaries)), "groups": summaries}
+
+
 def _collect_region_audit(net: torch.nn.Module) -> dict[str, Any]:
     rows = []
     for name, module in net.named_modules():
@@ -354,6 +422,7 @@ def _collect_region_audit(net: torch.nn.Module) -> dict[str, Any]:
                 "compile_count": int(getattr(executor, "compile_count", 0)),
                 "execute_count": int(getattr(runtime, "execute_count", 0)),
                 "last_runtime_timing": dict(getattr(executor, "last_runtime_timing", {})),
+                "memory_trace_summary": _memory_trace_summary(executor),
                 "lazy_region_compile": bool(getattr(module, "region_first_probe_lazy_region_compile", False)),
             }
         )
