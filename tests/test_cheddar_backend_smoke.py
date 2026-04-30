@@ -8,6 +8,7 @@ import h5py
 import pytest
 import torch
 
+from orion.backend.python import compile_cache
 from orion.core.orion import Scheme
 from orion.nn.unified_transform import UnifiedTransformGroup
 
@@ -348,6 +349,18 @@ def test_cheddar_regular_linear_transform_save_and_load_end_to_end(tmp_path: Pat
 
         layer.diagonals, layer.on_bias, layer.output_rotations = save_scheme.lt_evaluator.load_transforms(layer)
         layer.transform_ids = save_scheme.lt_evaluator.generate_transforms(layer)
+        compile_cache.write_manifest(
+            str(tmp_path / "compile_manifest.json"),
+            {
+                "schema_version": compile_cache.SCHEMA_VERSION,
+                "cache_format_version": compile_cache.CACHE_FORMAT_VERSION,
+                "fingerprint": {},
+                "bootstrap_plan": {},
+                "transform_metadata": compile_cache.collect_transform_metadata([layer]),
+                "provider_metadata": {"rows": [], "sha256": ""},
+                "sha256": "",
+            },
+        )
 
         with h5py.File(diags_path, "r") as handle:
             assert "plaintexts" in handle["fake_lt"]

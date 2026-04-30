@@ -125,6 +125,7 @@ struct LinearTransformState {
   bool metadata_cached = false;
   unsigned long long cached_device_bytes = 0;
   int cached_uses_streaming = 0;
+  int cached_width = 0;
   std::vector<std::pair<int, int>> cached_rotation_key_requests;
   bool singleton = false;
   int singleton_diag_idx = 0;
@@ -155,6 +156,15 @@ struct LinearTransformState {
         level(transform_level),
         bs(1),
         gs(1) {}
+
+  LinearTransformState(std::vector<int> indices, int transform_level,
+                       int width, int baby_step, int giant_step)
+      : diag_indices(std::move(indices)),
+        level(transform_level),
+        bs(baby_step),
+        gs(giant_step) {
+    cached_width = std::max(1, width);
+  }
 };
 
 struct SharedCacheBucket {
@@ -403,12 +413,32 @@ LinearTransform &EnsureTransformLoaded(LinearTransformState &state) {
   return *state.transform;
 }
 
+int LinearTransformWidth(const LinearTransformState &state) {
+  if (!state.matrix.empty()) {
+    return state.matrix.GetWidth();
+  }
+  return std::max(1, state.cached_width);
+}
+
+std::vector<int> LinearTransformDiagIndicesForLayout(
+    const LinearTransformState &state) {
+  if (state.matrix.empty()) {
+    return state.diag_indices;
+  }
+  std::vector<int> indices;
+  indices.reserve(state.matrix.size());
+  for (const auto &[diag_idx, _] : state.matrix) {
+    indices.push_back(diag_idx);
+  }
+  return indices;
+}
+
 int EstimateLinearTransformStride(const LinearTransformState &state) {
-  const int width = state.matrix.GetWidth();
+  const int width = LinearTransformWidth(state);
   int gcd_rot = 0;
   int max_rot = 0;
   int num_pt = 0;
-  for (const auto &[diag_idx, _] : state.matrix) {
+  for (const int diag_idx : LinearTransformDiagIndicesForLayout(state)) {
     ++num_pt;
     int rot = diag_idx % width;
     if (rot < 0) {
@@ -435,9 +465,9 @@ unsigned long long EstimateLinearTransformStateDeviceBytes(
     const LinearTransformState &state) {
   const int stride = EstimateLinearTransformStride(state);
   const int gs_stride = std::max(1, stride * state.bs);
-  const int width = state.matrix.GetWidth();
+  const int width = LinearTransformWidth(state);
   std::set<std::pair<int, int>> plaintext_slots;
-  for (const auto &[diag_idx, _] : state.matrix) {
+  for (const int diag_idx : LinearTransformDiagIndicesForLayout(state)) {
     int rot = diag_idx % width;
     if (rot < 0) {
       rot += width;
@@ -468,9 +498,9 @@ LinearTransformLayout DescribeLinearTransformLayout(
   LinearTransformLayout layout;
   layout.stride = EstimateLinearTransformStride(state);
   layout.gs_stride = std::max(1, layout.stride * state.bs);
-  const int width = state.matrix.GetWidth();
+  const int width = LinearTransformWidth(state);
   std::set<int> giant_step_set;
-  for (const auto &[diag_idx, _] : state.matrix) {
+  for (const int diag_idx : LinearTransformDiagIndicesForLayout(state)) {
     int rot = diag_idx % width;
     if (rot < 0) {
       rot += width;
@@ -603,6 +633,7 @@ void CacheLinearTransformMetadata(LinearTransformState &state) {
   if (state.metadata_cached) {
     return;
   }
+  state.cached_width = LinearTransformWidth(state);
   state.cached_rotation_key_requests.clear();
   if (state.singleton) {
     const int key = SingletonLinearTransformRotationKey(state);
@@ -1350,11 +1381,10 @@ cheddar::StripedMatrix BuildComplexStripedMatrix(const int *diag_idxs,
 }
 
 std::pair<int, int> ChooseLinearTransformSplit(
-    const cheddar::StripedMatrix &matrix, float bsgs_ratio) {
-  const int width = matrix.GetWidth();
+    const std::vector<int> &diag_indices, int width, float bsgs_ratio) {
   int stride = 0;
   int max_rot = 0;
-  for (const auto &[diag_idx, _] : matrix) {
+  for (const int diag_idx : diag_indices) {
     const int rot = NormalizeRotationIndex(diag_idx, width);
     if (rot != 0) {
       stride = stride == 0 ? rot : std::gcd(stride, rot);
@@ -1381,6 +1411,16 @@ std::pair<int, int> ChooseLinearTransformSplit(
   return {bs, gs};
 }
 
+std::pair<int, int> ChooseLinearTransformSplit(
+    const cheddar::StripedMatrix &matrix, float bsgs_ratio) {
+  std::vector<int> diag_indices;
+  diag_indices.reserve(matrix.size());
+  for (const auto &[diag_idx, _] : matrix) {
+    diag_indices.push_back(diag_idx);
+  }
+  return ChooseLinearTransformSplit(diag_indices, matrix.GetWidth(), bsgs_ratio);
+}
+
 int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
                                  int level, float bsgs_ratio) {
   if (level < 0 || level > g_scheme->param->default_encryption_level_) {
@@ -1402,6 +1442,27 @@ int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
   return g_scheme->transforms.Add(
       LinearTransformState(std::unique_ptr<LinearTransform>(), matrix,
                            std::move(diag_indices), level, bs, gs));
+}
+
+int AddLinearTransformFromDescriptor(const int *diag_idxs, int diag_count,
+                                     int width, int level,
+                                     float bsgs_ratio) {
+  if (level < 0 || level > g_scheme->param->default_encryption_level_) {
+    throw std::runtime_error(
+        "linear transform level is outside supported preset range");
+  }
+  std::vector<int> diag_indices;
+  diag_indices.reserve(std::max(0, diag_count));
+  const int normalized_width = std::max(1, width);
+  for (int i = 0; i < diag_count; ++i) {
+    diag_indices.push_back(NormalizeRotationIndex(diag_idxs[i], normalized_width));
+  }
+  const auto [bs, gs] =
+      ChooseLinearTransformSplit(diag_indices, normalized_width, bsgs_ratio);
+  LinearTransformState state(std::move(diag_indices), level, normalized_width,
+                             bs, gs);
+  CacheLinearTransformMetadata(state);
+  return g_scheme->transforms.Add(std::move(state));
 }
 
 int SingletonLinearTransformRotationKey(const LinearTransformState &state) {
@@ -2357,11 +2418,39 @@ void NewLinearTransformEvaluator() { RequireScheme(); }
 
 int GenerateLinearTransform(const int *diagIdxs, int diagIdxsLen,
                             const float *diagData, int diagDataLen, int level,
-                            float bsgsRatio, const char * /*ioMode*/) {
+                            float bsgsRatio, const char *ioMode) {
   RequireScheme();
+  if ((ioMode != nullptr && std::strcmp(ioMode, "load") == 0) ||
+      diagDataLen == 0) {
+    return AddLinearTransformFromDescriptor(
+        diagIdxs, diagIdxsLen, DefaultRotationWidth(), level, bsgsRatio);
+  }
   return AddLinearTransformFromMatrix(
       BuildRealStripedMatrix(diagIdxs, diagIdxsLen, diagData, diagDataLen),
       level, bsgsRatio);
+}
+
+ArrayResultInt GenerateLinearTransformsBatch(
+    int numTransforms, const int *const *diagIdxsArray, const int *diagIdxsLens,
+    const float *const *diagDataArray, const int *diagDataLens,
+    const int *levels, float bsgsRatio, const char *ioMode) {
+  RequireScheme();
+  std::vector<int> ids;
+  ids.reserve(std::max(0, numTransforms));
+  const bool descriptor_only = ioMode != nullptr && std::strcmp(ioMode, "load") == 0;
+  for (int i = 0; i < numTransforms; ++i) {
+    if (descriptor_only || diagDataLens[i] == 0) {
+      ids.push_back(AddLinearTransformFromDescriptor(
+          diagIdxsArray[i], diagIdxsLens[i], DefaultRotationWidth(), levels[i],
+          bsgsRatio));
+    } else {
+      ids.push_back(AddLinearTransformFromMatrix(
+          BuildRealStripedMatrix(diagIdxsArray[i], diagIdxsLens[i],
+                                 diagDataArray[i], diagDataLens[i]),
+          levels[i], bsgsRatio));
+    }
+  }
+  return MakeIntArrayResult(ids);
 }
 
 int EvaluateLinearTransform(int transformID, int ciphertextID) {

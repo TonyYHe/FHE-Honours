@@ -3,6 +3,7 @@ package main
 import (
 	"C"
 	"math"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -17,6 +18,25 @@ import (
 
 var ltHeap = NewHeapAllocator()
 
+func ltCompileWorkerCount(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if raw := os.Getenv("ORION_LATTIGO_COMPILE_WORKERS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			workers = parsed
+		}
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	return workers
+}
+
 func encodeFloatTransformsParallel(
 	diagonalsList []lintrans.Diagonals[float64],
 	transforms []lintrans.LinearTransformation,
@@ -25,13 +45,7 @@ func encodeFloatTransformsParallel(
 	if n == 0 {
 		return nil
 	}
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > n {
-		workers = n
-	}
+	workers := ltCompileWorkerCount(n)
 	jobs := make(chan int, n)
 	var wg sync.WaitGroup
 	var once sync.Once
@@ -74,13 +88,7 @@ func encodeUnifiedComplexTransformsParallel(
 	if n == 0 {
 		return nil
 	}
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > n {
-		workers = n
-	}
+	workers := ltCompileWorkerCount(n)
 	jobs := make(chan int, n)
 	var wg sync.WaitGroup
 	var once sync.Once

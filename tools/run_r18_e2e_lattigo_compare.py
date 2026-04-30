@@ -740,6 +740,9 @@ def _run_one(
         payload["region_audit_after_compile"] = _collect_region_audit(net)
         payload["bootstrap_report_after_compile"] = _collect_bootstrap_report(net)
         payload["rotation_report_after_compile"] = _collect_rotation_report(net, mode=mode)
+        get_compile_load_profile = getattr(getattr(scheme, "lt_evaluator", None), "get_compile_load_profile", None)
+        if callable(get_compile_load_profile):
+            payload["compile_load_profile_after_compile"] = get_compile_load_profile()
         Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
         if bool(compile_only):

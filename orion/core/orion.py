@@ -393,6 +393,9 @@ class Scheme:
         if io_mode == "load":
             compile_manifest = compile_cache.read_manifest(compile_manifest_path)
             compile_cache.validate_manifest_identity(compile_manifest, params=self.params, net=net)
+        set_compile_manifest = getattr(self.lt_evaluator, "set_compile_manifest", None)
+        if callable(set_compile_manifest):
+            set_compile_manifest(compile_manifest)
 
         last_linear = None
         for node in reversed(topo_sort):
@@ -401,13 +404,20 @@ class Scheme:
                 last_linear = node
                 break
 
-        # Now we can generate the diagonals 
-        print("\n{3} Generating matrix diagonals...", flush=True)
-        for node in topo_sort:
-            module = network_dag.nodes[node]["module"]
-            if isinstance(module, LinearTransform):
-                print(f"\nPacking {node}:")
-                module.generate_diagonals(last=(node == last_linear))
+        if io_mode == "load":
+            print("\n{3} Restoring cached matrix descriptors...", flush=True)
+            for node in topo_sort:
+                module = network_dag.nodes[node]["module"]
+                if isinstance(module, LinearTransform):
+                    module.load_cached_transform_metadata()
+        else:
+            # Now we can generate the diagonals.
+            print("\n{3} Generating matrix diagonals...", flush=True)
+            for node in topo_sort:
+                module = network_dag.nodes[node]["module"]
+                if isinstance(module, LinearTransform):
+                    print(f"\nPacking {node}:")
+                    module.generate_diagonals(last=(node == last_linear))
 
         #------------------------------#
         #   Find and place bootstraps  # 

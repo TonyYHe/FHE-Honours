@@ -76,7 +76,7 @@ class CheddarLibrary(LattigoLibrary):
         self.lt_outputs_are_rescaled = True
         self.align_addition_scales = True
         self.load_plaintext_diagonals_requires_payload = False
-        self.supports_index_only_linear_transform_load = False
+        self.supports_index_only_linear_transform_load = True
         self.saved_io_prefetch_requires_device_memory = True
         self.saved_io_device_prefetch_enabled = (
             os.environ.get("ORION_CHEDDAR_GPU_PREFETCH", "1").lower()

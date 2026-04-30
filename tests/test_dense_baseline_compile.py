@@ -205,6 +205,21 @@ def test_dense_compile_batches_independent_transforms_without_unified_api() -> N
 
     assert backend.batch_called is True
     assert transform_ids == {(0, 0): 101, (0, 1): 102}
+    profile = evaluator.get_compile_load_profile()
+    assert {
+        "read_s",
+        "diag_generate_s",
+        "encode_s",
+        "decode_s",
+        "serialize_s",
+        "device_commit_s",
+        "key_prepare_s",
+        "wait_s",
+        "peak_host_bytes",
+        "peak_device_bytes",
+    }.issubset(profile)
+    assert profile["diag_generate_s"] >= 0.0
+    assert profile["encode_s"] >= 0.0
 
 
 def _cache_config(tmp_path, *, io_mode: str) -> dict:
@@ -302,6 +317,16 @@ def test_load_mode_reuses_cached_diagonals_without_repacking(tmp_path, monkeypat
         layer = _tiny_cached_conv(weight)
         layer.generate_diagonals(last=False)
         layer.compile()
+        manifest = {
+            "schema_version": compile_cache.SCHEMA_VERSION,
+            "cache_format_version": compile_cache.CACHE_FORMAT_VERSION,
+            "fingerprint": {},
+            "bootstrap_plan": {},
+            "transform_metadata": compile_cache.collect_transform_metadata([layer]),
+            "provider_metadata": {"rows": [], "sha256": ""},
+            "sha256": "",
+        }
+        compile_cache.write_manifest(str(tmp_path / "compile_manifest.json"), manifest)
     finally:
         save_scheme.delete_scheme()
 
@@ -344,6 +369,8 @@ def test_load_mode_uses_cached_compile_plan(tmp_path, monkeypatch) -> None:
     manifest_path = tmp_path / "compile_manifest.json"
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text())
+    assert manifest["schema_version"] == 3
+    assert manifest["cache_format_version"] == "compile-plan-v3"
     assert manifest["bootstrap_plan"]["input_level"] == save_input_level
     assert manifest["transform_metadata"]["layers"]
 
@@ -351,6 +378,13 @@ def test_load_mode_uses_cached_compile_plan(tmp_path, monkeypatch) -> None:
         raise AssertionError("load mode should reuse the cached bootstrap plan")
 
     monkeypatch.setattr(orion_core.BootstrapSolver, "solve", fail_solve)
+    monkeypatch.setattr(
+        packing,
+        "pack_conv2d",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("load mode should not repack cached conv diagonals")
+        ),
+    )
 
     load_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="load"))
     try:
@@ -360,6 +394,26 @@ def test_load_mode_uses_cached_compile_plan(tmp_path, monkeypatch) -> None:
         assert orion.compile(layer) == save_input_level
     finally:
         load_scheme.delete_scheme()
+
+
+def test_load_mode_rejects_v2_compile_manifest(tmp_path) -> None:
+    manifest_path = tmp_path / "compile_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "cache_format_version": "compile-plan-v2",
+                "fingerprint": {},
+                "bootstrap_plan": {},
+                "transform_metadata": {"layers": []},
+                "provider_metadata": {"rows": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Stale compile cache manifest"):
+        compile_cache.read_manifest(str(manifest_path))
 
 
 def test_compile_manifest_keeps_entry_fingerprint_after_compile_mutates_model(tmp_path, monkeypatch) -> None:

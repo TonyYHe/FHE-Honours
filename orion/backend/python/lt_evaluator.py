@@ -1,9 +1,12 @@
 import h5py
 import ctypes
 import os
+import time
 import torch
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
+from . import compile_cache
 from .io_prefetch import (
     AsyncIOPrefetcher,
     estimate_linear_transform_device_bytes,
@@ -13,6 +16,20 @@ from orion.backend.python.tensors import CipherTensor
 
 
 _ENCODED_HOIST_PAYLOAD_DATASET = "__encoded_hoist_payload__"
+
+
+_COMPILE_PROFILE_KEYS = (
+    "read_s",
+    "diag_generate_s",
+    "encode_s",
+    "decode_s",
+    "serialize_s",
+    "device_commit_s",
+    "key_prepare_s",
+    "wait_s",
+    "peak_host_bytes",
+    "peak_device_bytes",
+)
 
 
 class NewEvaluator:
@@ -28,6 +45,8 @@ class NewEvaluator:
         self.keys_path = self.params.get_keys_path()
 
         self.saved_rotation_keys = set()
+        self.compile_manifest = None
+        self.compile_load_profile = {key: 0.0 for key in _COMPILE_PROFILE_KEYS}
         self._transform_io_prefetcher = AsyncIOPrefetcher()
         self._transform_io_lookahead = self._read_transform_io_lookahead()
         self._transform_io_size_cache: dict[tuple[str, int, int, int], int] = {}
@@ -40,6 +59,25 @@ class NewEvaluator:
         self._saved_io_work_order: tuple[object, ...] = ()
         self._saved_io_work_index: dict[object, int] = {}
         self.new_evaluator()
+
+    def set_compile_manifest(self, manifest) -> None:
+        self.compile_manifest = manifest
+
+    def get_compile_load_profile(self) -> dict[str, float]:
+        return {key: float(value) for key, value in self.compile_load_profile.items()}
+
+    def _add_profile(self, key: str, seconds: float) -> None:
+        if key in self.compile_load_profile:
+            self.compile_load_profile[key] += float(seconds)
+
+    def _cached_manifest(self):
+        if self.compile_manifest is not None:
+            return self.compile_manifest
+        if self.io_mode != "load":
+            return None
+        manifest = compile_cache.read_manifest(compile_cache.manifest_path(self.params))
+        self.compile_manifest = manifest
+        return manifest
 
     def new_evaluator(self):
         self.backend.NewLinearTransformEvaluator()
@@ -212,15 +250,43 @@ class NewEvaluator:
             diags_data.extend(float(value) for value in values)
         return diags_idxs, diags_data
 
+    def _lt_worker_count(self, item_count: int) -> int:
+        if item_count <= 1:
+            return 1
+        raw_value = os.environ.get("ORION_LT_COMPILE_WORKERS", "")
+        try:
+            requested = int(raw_value) if raw_value else min(4, int(os.cpu_count() or 1))
+        except (TypeError, ValueError):
+            requested = 4
+        return max(1, min(int(item_count), int(requested)))
+
+    def _build_block_payload(self, item):
+        (row, col), diags = item
+        diags_idxs, diags_data = self._flatten_diagonals(diags)
+        return int(row), int(col), diags_idxs, diags_data
+
     def _generate_transforms_batch(self, diagonals, *, level: int, bsgs_ratio: float):
         generate_batch = getattr(self.backend, "GenerateLinearTransformsBatch", None)
         if not callable(generate_batch) or len(diagonals) <= 1:
             return None
 
-        block_payloads = []
-        for (row, col), diags in diagonals.items():
-            diags_idxs, diags_data = self._flatten_diagonals(diags)
-            block_payloads.append((int(row), int(col), diags_idxs, diags_data))
+        started = time.perf_counter()
+        items = list(diagonals.items())
+        workers = self._lt_worker_count(len(items))
+        if workers <= 1:
+            block_payloads = [self._build_block_payload(item) for item in items]
+        else:
+            futures = []
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-lt-build") as pool:
+                for index, item in enumerate(items):
+                    futures.append((index, pool.submit(self._build_block_payload, item)))
+                ordered = [None] * len(futures)
+                wait_started = time.perf_counter()
+                for index, future in futures:
+                    ordered[index] = future.result()
+                self._add_profile("wait_s", time.perf_counter() - wait_started)
+            block_payloads = list(ordered)
+        self._add_profile("diag_generate_s", time.perf_counter() - started)
 
         num_transforms = len(block_payloads)
         diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
@@ -241,6 +307,7 @@ class NewEvaluator:
             diag_data_ptrs[index] = array
             diag_data_lens[index] = len(diags_data)
 
+        encode_started = time.perf_counter()
         lintransf_ids = list(
             generate_batch(
                 int(num_transforms),
@@ -253,6 +320,7 @@ class NewEvaluator:
                 str(self.io_mode),
             )
         )
+        self._add_profile("encode_s", time.perf_counter() - encode_started)
         return [
             (row, col, diags_idxs, int(lintransf_id))
             for (row, col, diags_idxs, _diags_data), lintransf_id in zip(block_payloads, lintransf_ids)
@@ -290,6 +358,7 @@ class NewEvaluator:
         return self.backend.GenerateAndSerializeRotationKey(int(key))
 
     def generate_rotation_keys(self, transform_id):
+        started = time.perf_counter()
         curr_keys = self.get_required_rotation_key_requests(transform_id)
 
         # Only generate keys that don't exist yet. Depending on the I/O
@@ -315,6 +384,7 @@ class NewEvaluator:
                         f.create_dataset(key_str, data=serial_key)
                     finally:
                         self.backend.FreeCArray(ptr)
+        self._add_profile("key_prepare_s", time.perf_counter() - started)
 
     def save_transforms(self, linear_layer):
         layer_name = linear_layer.name
@@ -359,10 +429,25 @@ class NewEvaluator:
 
         layer_name = linear_layer.name
         on_bias = linear_layer.on_bias
+        manifest = self._cached_manifest() if self.io_mode == "load" else None
+        if (
+            manifest is not None
+            and bool(getattr(self.backend, "supports_index_only_linear_transform_load", False))
+        ):
+            return (
+                compile_cache.transform_blocks_from_manifest(manifest, str(layer_name)),
+                on_bias,
+                compile_cache.transform_output_rotations(manifest, str(layer_name)),
+            )
 
+        read_started = time.perf_counter()
         with h5py.File(self.diags_path, "r") as f:
             layer = f[layer_name]
-            output_rotations = int(layer["output_rotations"][()])
+            output_rotations = (
+                compile_cache.transform_output_rotations(manifest, str(layer_name))
+                if manifest is not None
+                else int(layer["output_rotations"][()])
+            )
 
             # Load the diagonals back into the correct struct
             all_diagonals = {}
@@ -385,13 +470,14 @@ class NewEvaluator:
                         diags[int(diag_idx)] = diag_data
                 all_diagonals[(row, col)] = diags
 
+        self._add_profile("read_s", time.perf_counter() - read_started)
         return all_diagonals, on_bias, output_rotations
 
     def load_transform_metadata(self, linear_layer):
-        self._verify_layer_compatibility(
-            linear_layer,
-            check_output_rotations=False,
-        )
+        manifest = self._cached_manifest() if self.io_mode == "load" else None
+        if manifest is not None:
+            return compile_cache.transform_output_rotations(manifest, str(linear_layer.name))
+        self._verify_layer_compatibility(linear_layer, check_output_rotations=False)
         with h5py.File(self.diags_path, "r") as f:
             return int(f[linear_layer.name]["output_rotations"][()])
 
@@ -597,40 +683,44 @@ class NewEvaluator:
                 raise ValueError(error_msg)
             
     def save_plaintext_diagonals(self, layer_name, lintransf_id, row, col, diag_idxs):
-        with h5py.File(self.diags_path, "a") as f:
-            layer = f.require_group(layer_name)
-            plaintext_group = layer.require_group("plaintexts")
-            block_idx = f"{row}_{col}"
-            if block_idx in plaintext_group:
-                del plaintext_group[block_idx]
-            block_group = plaintext_group.create_group(block_idx)
+        started = time.perf_counter()
+        try:
+            with h5py.File(self.diags_path, "a") as f:
+                layer = f.require_group(layer_name)
+                plaintext_group = layer.require_group("plaintexts")
+                block_idx = f"{row}_{col}"
+                if block_idx in plaintext_group:
+                    del plaintext_group[block_idx]
+                block_group = plaintext_group.create_group(block_idx)
 
-            if not self._plaintext_payload_required():
-                for diag_idx in diag_idxs:
-                    block_group.create_dataset(str(int(diag_idx)), data=np.zeros((0,), dtype=np.uint8))
-                self.backend.RemovePlaintextDiagonals(int(lintransf_id))
-                return
-
-            if self._encoded_plaintext_payload_supported():
-                serial_payload, payload_ptr = self.backend.SerializeLinearTransformPlaintexts(
-                    int(lintransf_id)
-                )
-                try:
-                    block_group.create_dataset(
-                        _ENCODED_HOIST_PAYLOAD_DATASET,
-                        data=serial_payload,
+                if self._encoded_plaintext_payload_supported():
+                    serial_payload, payload_ptr = self.backend.SerializeLinearTransformPlaintexts(
+                        int(lintransf_id)
                     )
-                finally:
-                    self.backend.FreeCArray(payload_ptr)
+                    try:
+                        block_group.create_dataset(
+                            _ENCODED_HOIST_PAYLOAD_DATASET,
+                            data=serial_payload,
+                        )
+                    finally:
+                        self.backend.FreeCArray(payload_ptr)
+                        self.backend.RemovePlaintextDiagonals(int(lintransf_id))
+                    return
+
+                if not self._plaintext_payload_required():
+                    for diag_idx in diag_idxs:
+                        block_group.create_dataset(str(int(diag_idx)), data=np.zeros((0,), dtype=np.uint8))
                     self.backend.RemovePlaintextDiagonals(int(lintransf_id))
-                return
+                    return
 
-            for diag_idx in diag_idxs:
-                diag_serial, diag_ptr = self.backend.SerializeDiagonal(lintransf_id, diag_idx)
-                block_group.create_dataset(str(diag_idx), data=diag_serial)
+                for diag_idx in diag_idxs:
+                    diag_serial, diag_ptr = self.backend.SerializeDiagonal(lintransf_id, diag_idx)
+                    block_group.create_dataset(str(diag_idx), data=diag_serial)
 
-                # Now that it's saved, we'll free the memory
-                self.backend.FreeCArray(diag_ptr)
+                    # Now that it's saved, we'll free the memory
+                    self.backend.FreeCArray(diag_ptr)
+        finally:
+            self._add_profile("serialize_s", time.perf_counter() - started)
 
     def _plaintext_payload_required(self) -> bool:
         return bool(getattr(self.backend, "load_plaintext_diagonals_requires_payload", True))
