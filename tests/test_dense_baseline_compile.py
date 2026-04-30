@@ -222,6 +222,47 @@ def test_dense_compile_batches_independent_transforms_without_unified_api() -> N
     assert profile["encode_s"] >= 0.0
 
 
+def test_transform_metadata_validation_ignores_rotation_request_order() -> None:
+    params = SimpleNamespace(
+        get_logscale=lambda: 35,
+        get_slots=lambda: 8,
+        get_backend=lambda: "python",
+    )
+    layer = SimpleNamespace(
+        name="cached_conv",
+        diagonals={(0, 0): {3: [0.0, 0.0], 1: [1.0, 1.0]}},
+        transform_ids={(0, 0): 42},
+        level=5,
+        depth=1,
+        input_shape=torch.Size((1, 1, 2, 2)),
+        output_shape=torch.Size((1, 1, 2, 2)),
+        fhe_input_shape=torch.Size((1, 1, 2, 2)),
+        fhe_output_shape=torch.Size((1, 1, 2, 2)),
+        bsgs_ratio=2.0,
+        output_rotations=0,
+        on_weight=torch.empty(1, 1),
+        scheme=SimpleNamespace(
+            params=params,
+            lt_evaluator=SimpleNamespace(
+                get_required_rotation_key_requests=lambda _transform_id: (
+                    (7, None),
+                    (1, 3),
+                    (5, None),
+                )
+            ),
+        ),
+    )
+    metadata = compile_cache.collect_transform_metadata([layer])
+    cached_metadata = json.loads(json.dumps(metadata))
+    requests = cached_metadata["layers"][0]["blocks"][0]["descriptor"]["rotation_requests"]
+    cached_metadata["layers"][0]["blocks"][0]["descriptor"]["rotation_requests"] = list(reversed(requests))
+
+    compile_cache.validate_transform_metadata(
+        {"transform_metadata": cached_metadata},
+        [layer],
+    )
+
+
 def _cache_config(tmp_path, *, io_mode: str) -> dict:
     return {
         "ckks_params": {

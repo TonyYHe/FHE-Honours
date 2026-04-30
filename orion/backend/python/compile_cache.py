@@ -480,6 +480,20 @@ def validate_transform_metadata(manifest: dict[str, Any], linear_layers: list[Li
             copied = dict(block)
             descriptor = dict(copied.get("descriptor", {}))
             descriptor.pop("transform_id", None)
+            if "rotation_requests" in descriptor:
+                descriptor["rotation_requests"] = sorted(
+                    (
+                        {
+                            "key": int(request.get("key")),
+                            "level": None if request.get("level") is None else int(request.get("level")),
+                        }
+                        for request in descriptor.get("rotation_requests", [])
+                    ),
+                    key=lambda request: (
+                        int(request["key"]),
+                        -1 if request["level"] is None else int(request["level"]),
+                    ),
+                )
             copied["descriptor"] = descriptor
             out.append(copied)
         return out
