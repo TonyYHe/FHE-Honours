@@ -429,12 +429,16 @@ class PythonBackend:
     # ----------------- #
 
     def GenerateLinearTransform(self, diags_idxs, diags_data, level, _bsgs_ratio, _io_mode):
-        slots = int(len(diags_data) // max(1, len(diags_idxs))) if diags_idxs else self._num_slots
+        io_mode = _io_mode.decode() if isinstance(_io_mode, bytes) else str(_io_mode)
+        slots = int(self._num_slots) if io_mode == "load" else int(len(diags_data) // max(1, len(diags_idxs))) if diags_idxs else self._num_slots
         diagonals = []
-        cursor = 0
-        for _ in diags_idxs:
-            diagonals.append(self._clone_values(diags_data[cursor:cursor + slots]))
-            cursor += slots
+        if io_mode == "load":
+            diagonals = [torch.zeros((int(slots),), dtype=torch.float32) for _ in diags_idxs]
+        else:
+            cursor = 0
+            for _ in diags_idxs:
+                diagonals.append(self._clone_values(diags_data[cursor:cursor + slots]))
+                cursor += slots
         return self._store_linear_transform([int(idx) for idx in diags_idxs], diagonals, int(level), int(slots))
 
     def GenerateLinearTransformsBatch(
@@ -512,6 +516,30 @@ class PythonBackend:
                 diagonals.append(torch.tensor(values, dtype=torch.complex64))
                 cursor += int(2 * slots)
             out.append(self._store_linear_transform(diag_indices, diagonals, int(levels_array[transform_index]), int(slots)))
+        return out
+
+    def GenerateLinearTransformsUnifiedLoad(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, levels_array):
+        out: list[int] = []
+        count = int(num_transforms)
+        slots = int(self._num_slots)
+        for transform_index in range(int(count)):
+            diag_len = int(diag_idxs_lens[transform_index])
+            diag_indices = [
+                int(diag_idxs_ptrs[transform_index][diag_index])
+                for diag_index in range(int(diag_len))
+            ]
+            diagonals = [
+                torch.zeros((slots,), dtype=torch.float32)
+                for _diag_index in diag_indices
+            ]
+            out.append(
+                self._store_linear_transform(
+                    diag_indices,
+                    diagonals,
+                    int(levels_array[transform_index]),
+                    int(slots),
+                )
+            )
         return out
 
     def GetLinearTransformRotationKeys(self, transform_id):

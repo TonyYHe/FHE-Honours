@@ -93,6 +93,7 @@ class CheddarLibrary(LattigoLibrary):
             os.environ.get("ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOADS", "1").lower()
             not in ("0", "false", "no", "off")
         )
+        self.supports_streaming_encoded_plaintext_payload_cache = True
         encoded_payload_max = os.environ.get(
             "ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOAD_MAX_DEVICE_BYTES",
             str(4 * 1024**3),
@@ -162,6 +163,18 @@ class CheddarLibrary(LattigoLibrary):
             ],
             restype=None,
         )
+        generate_unified_load = getattr(self.lib, "GenerateLinearTransformsUnifiedLoad", None)
+        if generate_unified_load is not None:
+            self.GenerateLinearTransformsUnifiedLoad = LattigoFunction(
+                generate_unified_load,
+                argtypes=[
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ],
+                restype=ArrayResultInt,
+            )
         self.ReleaseLinearTransformMatrix = LattigoFunction(
             self.lib.ReleaseLinearTransformMatrix,
             argtypes=[ctypes.c_int],

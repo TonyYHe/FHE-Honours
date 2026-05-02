@@ -29,7 +29,7 @@ DEFAULT_OUT = Path("/tmp/orion_u22_unique_nodes_local.json")
 DECODER_TCONV_NODES = ("up4", "up3", "up2", "up1")
 DATASET_SPECS = {
     "tiny": {"image_size": 64, "logn": 15},
-    "imagenet": {"image_size": 256, "logn": 17},
+    "imagenet": {"image_size": 256, "logn": 16},
 }
 
 

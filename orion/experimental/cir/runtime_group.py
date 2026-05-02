@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 import json
 import os
+import sys
 import time
 
 import torch
@@ -41,6 +42,26 @@ from .r18_e2e_bridges import (
 
 DEFAULT_R18_TINY_E2E_OUT = Path("/tmp/orion_r18_tiny_region_first_e2e.json")
 DEFAULT_R18_ACTUAL_E2E_OUT = Path("/tmp/orion_r18_actual_region_first_e2e.json")
+
+
+def _region_compile_workers(item_count: int) -> int:
+    raw = os.environ.get("ORION_REGION_COMPILE_WORKERS", "1")
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        requested = 1
+    return max(1, min(int(item_count), int(requested)))
+
+
+def _region_compile_trace_enabled() -> bool:
+    return os.environ.get("ORION_REGION_COMPILE_TRACE", "0").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _region_compile_trace(event: str, **fields: Any) -> None:
+    if not _region_compile_trace_enabled():
+        return
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[region_compile] event={event} {payload}", file=sys.stderr, flush=True)
 
 
 def transforms_from_conv_scheme_plan(
@@ -397,7 +418,7 @@ class FullConvRegionRuntimeExecutor:
             self.plans = tuple(plans)
             return
 
-        workers = min(len(tasks), max(1, int(os.cpu_count() or 1)))
+        workers = _region_compile_workers(len(tasks))
 
         def _build_plan(task: tuple[Any, dict[str, Any]]) -> Any:
             builder, kwargs = task
@@ -410,13 +431,31 @@ class FullConvRegionRuntimeExecutor:
     def compile(self, scheme: Any) -> None:
         if self.groups:
             return
+        _region_compile_trace(
+            "full_conv_compile_start",
+            output_node=self.output_node_id,
+            plan_count=len(self.plans) if self.plans else len(self._plan_builders),
+        )
+        total_started = time.perf_counter()
         prepare_plans_started = time.time()
         self._ensure_plans()
         self.last_runtime_timing["prepare_plans_s"] = float(time.time() - prepare_plans_started)
+        _region_compile_trace(
+            "full_conv_prepare_plans_done",
+            output_node=self.output_node_id,
+            seconds=f"{self.last_runtime_timing['prepare_plans_s']:.6f}",
+            plan_count=len(self.plans),
+        )
         from orion.nn.unified_transform import UnifiedTransformGroup
 
         level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
         prepare_transforms_started = time.time()
+        _region_compile_trace(
+            "full_conv_prepare_transforms_start",
+            output_node=self.output_node_id,
+            plan_count=len(self.plans),
+            bank_count=self.bank_count,
+        )
         if len(self.plans) <= 1:
             prepared_transforms = [
                 transforms_from_conv_scheme_plan(
@@ -429,7 +468,7 @@ class FullConvRegionRuntimeExecutor:
                 for plan in self.plans
             ]
         else:
-            workers = min(len(self.plans), max(1, int(os.cpu_count() or 1)))
+            workers = _region_compile_workers(len(self.plans))
 
             def _build_transforms(plan: Any) -> list[Any]:
                 transforms, _bank_ids = transforms_from_conv_scheme_plan(
@@ -444,16 +483,42 @@ class FullConvRegionRuntimeExecutor:
             with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-region-transform") as executor:
                 prepared_transforms = list(executor.map(_build_transforms, self.plans))
         self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
+        _region_compile_trace(
+            "full_conv_prepare_transforms_done",
+            output_node=self.output_node_id,
+            seconds=f"{self.last_runtime_timing['prepare_transforms_s']:.6f}",
+            group_count=len(prepared_transforms),
+            transform_count=sum(len(value) for value in prepared_transforms),
+        )
 
         compile_started = time.time()
-        for transforms in prepared_transforms:
+        for group_index, transforms in enumerate(prepared_transforms):
+            _region_compile_trace(
+                "full_conv_compile_group_start",
+                output_node=self.output_node_id,
+                group_index=group_index,
+                transform_count=len(transforms),
+            )
+            group_started = time.perf_counter()
             group = UnifiedTransformGroup(transforms)
             group.compile_unified(scheme.backend)
+            _region_compile_trace(
+                "full_conv_compile_group_done",
+                output_node=self.output_node_id,
+                group_index=group_index,
+                seconds=f"{time.perf_counter() - group_started:.6f}",
+            )
             self.transforms_by_block.append(transforms)
             self.groups.append(group)
         self.bias_plaintexts = self._compile_bias_plaintexts(scheme)
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+        _region_compile_trace(
+            "full_conv_compile_done",
+            output_node=self.output_node_id,
+            seconds=f"{time.perf_counter() - total_started:.6f}",
+            compile_unified_s=f"{self.last_runtime_timing['compile_unified_s']:.6f}",
+        )
 
     def _complex_sources_from_ids(self, source_ct: Any) -> tuple[Any, ...]:
         from orion.backend.python.tensors import CipherTensor

@@ -3,14 +3,16 @@ package main
 import (
 	"C"
 
+	"runtime"
+	"runtime/debug"
+	"time"
+
 	"github.com/realqhc/lattigo/v6/circuits/ckks/bootstrapping"
+	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
 	"github.com/realqhc/lattigo/v6/circuits/ckks/polynomial"
 	"github.com/realqhc/lattigo/v6/core/rlwe"
 	"github.com/realqhc/lattigo/v6/ring"
 	"github.com/realqhc/lattigo/v6/schemes/ckks"
-)
-import (
-	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
 )
 
 type Scheme struct {
@@ -30,6 +32,16 @@ type Scheme struct {
 }
 
 var scheme Scheme
+var runtimeMemoryTrimSeconds float64
+
+func trimRuntimeMemory() float64 {
+	started := time.Now()
+	runtime.GC()
+	debug.FreeOSMemory()
+	elapsed := time.Since(started).Seconds()
+	runtimeMemoryTrimSeconds += elapsed
+	return elapsed
+}
 
 //export NewScheme
 func NewScheme(
@@ -97,4 +109,39 @@ func DeleteScheme() {
 	polyHeap.Reset()
 	ptHeap.Reset()
 	ctHeap.Reset()
+	trimRuntimeMemory()
+}
+
+//export TrimRuntimeMemory
+func TrimRuntimeMemory() C.double {
+	return C.double(trimRuntimeMemory())
+}
+
+//export ConsumeRuntimeMemoryTrimSeconds
+func ConsumeRuntimeMemoryTrimSeconds() C.double {
+	elapsed := runtimeMemoryTrimSeconds
+	runtimeMemoryTrimSeconds = 0
+	return C.double(elapsed)
+}
+
+//export GetRuntimeMemoryStats
+func GetRuntimeMemoryStats() (*C.ulonglong, C.ulonglong) {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	values := []uint64{
+		stats.Alloc,
+		stats.TotalAlloc,
+		stats.Sys,
+		stats.HeapAlloc,
+		stats.HeapSys,
+		stats.HeapIdle,
+		stats.HeapReleased,
+		stats.HeapInuse,
+		stats.StackInuse,
+		stats.MSpanInuse,
+		stats.MCacheInuse,
+		uint64(stats.NumGC),
+	}
+	arrPtr, length := SliceToCArray(values, convertUint64ToCULonglong)
+	return arrPtr, C.ulonglong(length)
 }

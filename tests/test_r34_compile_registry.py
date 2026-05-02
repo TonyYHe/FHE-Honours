@@ -26,7 +26,6 @@ from orion.experimental.cir.ir import (
     TensorRegion,
 )
 from orion.experimental import R34CompileRegistry
-from orion.experimental.r34_phase1 import R34DenseSingleFlowRuntimeExecutor
 from orion.nn.module import Module
 from orion.models.resnet import ResNet34
 
@@ -100,7 +99,7 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     assert getattr(stem_conv, "region_family_label") == "stem_conv"
     assert getattr(stem_conv, "region_source_group_count") == 3
     assert getattr(stem_conv, "region_kernel_policy") == "inter_group_hybrid"
-    assert isinstance(stem_conv.region_runtime.executor, R34DenseSingleFlowRuntimeExecutor)
+    assert isinstance(stem_conv.region_runtime.executor, InputPairConvRuntimeExecutor)
     assert stem_conv.region_runtime.executable is True
 
     assert getattr(stem_pool, "region_family_label") == "stem_pool"

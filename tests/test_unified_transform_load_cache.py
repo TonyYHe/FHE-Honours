@@ -15,6 +15,8 @@ class _Backend:
         self.encoded_serialized: list[int] = []
         self.encoded_loaded: list[tuple[int, tuple[int, ...]]] = []
         self.loaded_transform_keys: list[tuple[int, int, tuple[int, ...]]] = []
+        self.unified_encode_calls = 0
+        self.unified_load_calls: list[tuple[tuple[int, ...], ...]] = []
         self.rotation_keys = {11: [1, 3], 12: [1, 5]}
         self.load_plaintext_diagonals_requires_payload = False
         self.prefer_encoded_plaintext_payload_cache = True
@@ -30,6 +32,27 @@ class _Backend:
         _diag_data_lens,
         _levels_array,
     ):
+        self.unified_encode_calls += 1
+        ids = [self._next_transform_id + i for i in range(int(num_transforms))]
+        self._next_transform_id += int(num_transforms)
+        return ids
+
+    def GenerateLinearTransformsUnifiedLoad(
+        self,
+        num_transforms,
+        diag_idxs_ptrs,
+        diag_idxs_lens,
+        _levels_array,
+    ):
+        descriptors = []
+        for transform_index in range(int(num_transforms)):
+            descriptors.append(
+                tuple(
+                    int(diag_idxs_ptrs[transform_index][diag_index])
+                    for diag_index in range(int(diag_idxs_lens[transform_index]))
+                )
+            )
+        self.unified_load_calls.append(tuple(descriptors))
         ids = [self._next_transform_id + i for i in range(int(num_transforms))]
         self._next_transform_id += int(num_transforms)
         return ids
@@ -132,6 +155,8 @@ def test_unified_transform_load_mode_backfills_missing_rotation_keys(tmp_path) -
 
     load_group.compile_unified(load_backend)
 
+    assert load_backend.unified_encode_calls == 0
+    assert load_backend.unified_load_calls == [((0, 1), (0, 2))]
     assert load_backend.generated_keys == [5]
     assert load_backend.encoded_serialized == []
     assert load_backend.serialized == []

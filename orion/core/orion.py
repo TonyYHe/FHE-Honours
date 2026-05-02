@@ -1,8 +1,16 @@
 import time
 import math
 import os
+import contextlib
+import io
+import multiprocessing as mp
+import shutil
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Union, Dict, Any
 
+import h5py
 import yaml
 import torch
 from tqdm import tqdm
@@ -30,8 +38,279 @@ from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
 
 
+class _PackWorkerParams:
+    def __init__(self, *, slots: int, embedding_method: str) -> None:
+        self._slots = int(slots)
+        self._embedding_method = str(embedding_method)
+
+    def get_slots(self) -> int:
+        return int(self._slots)
+
+    def get_embedding_method(self) -> str:
+        return str(self._embedding_method)
+
+
+class _PackWorkerScheme:
+    def __init__(self, *, slots: int, embedding_method: str) -> None:
+        self.params = _PackWorkerParams(slots=int(slots), embedding_method=str(embedding_method))
+
+
+def _dense_pack_worker_count() -> int:
+    raw_value = os.environ.get("ORION_DENSE_PACK_WORKERS", "")
+    try:
+        return max(1, int(raw_value)) if raw_value else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _parse_size_bytes(raw_value: str | None, default: int) -> int:
+    if raw_value is None or str(raw_value).strip() == "":
+        return int(default)
+    value = str(raw_value).strip().lower()
+    multipliers = {
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+    }
+    for suffix, multiplier in sorted(multipliers.items(), key=lambda item: -len(item[0])):
+        if value.endswith(suffix):
+            return int(float(value[: -len(suffix)].strip()) * int(multiplier))
+    return int(float(value))
+
+
+def _mem_available_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    return int(parts[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _dense_pack_worker_budget(target_workers: int) -> tuple[int, int | None, int, int]:
+    reserve_raw = os.environ.get("ORION_DENSE_PACK_MEMORY_RESERVE_BYTES")
+    if reserve_raw is None:
+        reserve_raw = os.environ.get("ORION_DENSE_PACK_MEMORY_RESERVE_GB", "80g")
+        if str(reserve_raw).strip().replace(".", "", 1).isdigit():
+            reserve_raw = f"{reserve_raw}g"
+    worker_raw = os.environ.get("ORION_DENSE_PACK_WORKER_MEMORY_BYTES")
+    if worker_raw is None:
+        worker_raw = os.environ.get("ORION_DENSE_PACK_WORKER_MEMORY_GB", "24g")
+        if str(worker_raw).strip().replace(".", "", 1).isdigit():
+            worker_raw = f"{worker_raw}g"
+    reserve = _parse_size_bytes(
+        reserve_raw,
+        80 * 1024**3,
+    )
+    per_worker = _parse_size_bytes(
+        worker_raw,
+        24 * 1024**3,
+    )
+    available = _mem_available_bytes()
+    if available is None or per_worker <= 0:
+        return int(target_workers), available, int(reserve), int(per_worker)
+    budget_workers = max(1, int((int(available) - int(reserve)) // int(per_worker)))
+    return max(1, min(int(target_workers), int(budget_workers))), int(available), int(reserve), int(per_worker)
+
+
+def _dense_pack_start_method() -> str:
+    return os.environ.get("ORION_DENSE_PACK_START_METHOD", "spawn").strip() or "spawn"
+
+
+def _linear_transform_pack_kind(module: Any) -> str | None:
+    class_name = type(module).__name__
+    if class_name == "Conv2d":
+        return "conv2d"
+    if class_name == "ConvTranspose2d":
+        return "conv_transpose2d"
+    if class_name == "Linear":
+        return "linear"
+    return None
+
+
+def _linear_transform_uses_dense_pack(module: Any) -> bool:
+    if bool(getattr(module, "region_first_probe_dense_bypass", False)):
+        return False
+    runtime = getattr(module, "region_runtime", None)
+    runtime_supported = bool(
+        runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(module.scheme)
+    )
+    return not (
+        runtime is not None
+        and bool(getattr(runtime, "executable", False))
+        and bool(getattr(module, "region_first_skip_dense_pack", False))
+        and bool(runtime_supported)
+    )
+
+
+def _shape_list(value: Any) -> list[int]:
+    return [int(item) for item in tuple(value)]
+
+
+def _parallel_pack_snapshot(node: str, module: Any, *, last: bool, temp_dir: Path) -> dict[str, Any]:
+    fields = {
+        "node": str(node),
+        "layer_name": str(module.name),
+        "kind": _linear_transform_pack_kind(module),
+        "last": bool(last),
+        "temp_path": str(Path(temp_dir) / f"{len(str(node))}_{abs(hash(str(node))) & 0xffffffff:x}.h5"),
+        "slots": int(module.scheme.params.get_slots()),
+        "embedding_method": str(module.scheme.params.get_embedding_method()),
+        "on_weight": module.on_weight.detach().cpu(),
+        "on_bias": module.on_bias.detach().cpu().numpy(),
+        "input_shape": _shape_list(module.input_shape),
+        "output_shape": _shape_list(module.output_shape),
+        "fhe_input_shape": _shape_list(module.fhe_input_shape),
+        "fhe_output_shape": _shape_list(module.fhe_output_shape),
+        "input_min": float(module.input_min.item() if hasattr(module.input_min, "item") else module.input_min),
+        "input_max": float(module.input_max.item() if hasattr(module.input_max, "item") else module.input_max),
+        "output_min": float(module.output_min.item() if hasattr(module.output_min, "item") else module.output_min),
+        "output_max": float(module.output_max.item() if hasattr(module.output_max, "item") else module.output_max),
+        "input_gap": int(getattr(module, "input_gap", 1)),
+        "output_gap": int(getattr(module, "output_gap", 1)),
+        "bsgs_ratio": float(getattr(module, "bsgs_ratio", 0.0)),
+    }
+    for attr in (
+        "groups",
+        "in_channels",
+        "out_channels",
+        "in_features",
+        "out_features",
+        "kernel_size",
+        "stride",
+        "padding",
+        "dilation",
+        "output_padding",
+    ):
+        if hasattr(module, attr):
+            fields[attr] = getattr(module, attr)
+    return fields
+
+
+def _module_from_pack_snapshot(snapshot: dict[str, Any]) -> Any:
+    layer = SimpleNamespace()
+    layer.scheme = _PackWorkerScheme(
+        slots=int(snapshot["slots"]),
+        embedding_method=str(snapshot["embedding_method"]),
+    )
+    layer.on_weight = snapshot["on_weight"]
+    layer.on_bias = torch.tensor(snapshot["on_bias"], dtype=torch.float32)
+    layer.input_shape = torch.Size(snapshot["input_shape"])
+    layer.output_shape = torch.Size(snapshot["output_shape"])
+    layer.fhe_input_shape = torch.Size(snapshot["fhe_input_shape"])
+    layer.fhe_output_shape = torch.Size(snapshot["fhe_output_shape"])
+    layer.input_gap = int(snapshot.get("input_gap", 1))
+    layer.output_gap = int(snapshot.get("output_gap", 1))
+    for attr in (
+        "groups",
+        "in_channels",
+        "out_channels",
+        "in_features",
+        "out_features",
+        "kernel_size",
+        "stride",
+        "padding",
+        "dilation",
+        "output_padding",
+    ):
+        if attr in snapshot:
+            setattr(layer, attr, snapshot[attr])
+    return layer
+
+
+def _write_packed_layer_h5(snapshot: dict[str, Any], diagonals: dict, output_rotations: int) -> None:
+    path = Path(snapshot["temp_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    with h5py.File(path, "w") as handle:
+        layer = handle.create_group(str(snapshot["layer_name"]))
+        layer.create_dataset("embedding_method", data=str(snapshot["embedding_method"]))
+        layer.create_dataset("output_rotations", data=int(output_rotations))
+        layer.create_dataset("on_bias", data=snapshot["on_bias"])
+        layer.create_dataset("input_shape", data=list(snapshot["input_shape"]))
+        layer.create_dataset("output_shape", data=list(snapshot["output_shape"]))
+        layer.create_dataset("input_min", data=float(snapshot["input_min"]))
+        layer.create_dataset("input_max", data=float(snapshot["input_max"]))
+        layer.create_dataset("output_min", data=float(snapshot["output_min"]))
+        layer.create_dataset("output_max", data=float(snapshot["output_max"]))
+        diags_group = layer.create_group("diagonals")
+        for row, col in sorted((int(row), int(col)) for row, col in diagonals.keys()):
+            block_group = diags_group.create_group(f"{int(row)}_{int(col)}")
+            for diag_idx in sorted(int(idx) for idx in diagonals[(row, col)].keys()):
+                block_group.create_dataset(str(int(diag_idx)), data=diagonals[(row, col)][int(diag_idx)])
+
+
+def _dense_pack_worker(snapshot: dict[str, Any]) -> dict[str, Any]:
+    from orion.core import packing
+
+    layer = _module_from_pack_snapshot(snapshot)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        if snapshot["kind"] == "conv2d":
+            diagonals, output_rotations = packing.pack_conv2d(layer, bool(snapshot["last"]))
+        elif snapshot["kind"] == "conv_transpose2d":
+            diagonals, output_rotations = packing.pack_conv_transpose2d(layer, bool(snapshot["last"]))
+        elif snapshot["kind"] == "linear":
+            diagonals, output_rotations = packing.pack_linear(layer, bool(snapshot["last"]))
+        else:
+            raise ValueError(f"Unsupported dense pack kind: {snapshot['kind']}")
+    _write_packed_layer_h5(snapshot, diagonals, int(output_rotations))
+    return {
+        "node": str(snapshot["node"]),
+        "layer_name": str(snapshot["layer_name"]),
+        "temp_path": str(snapshot["temp_path"]),
+        "output_rotations": int(output_rotations),
+        "log": output.getvalue(),
+    }
+
+
+def _commit_packed_layer(diags_path: str, result: dict[str, Any]) -> None:
+    print(result.get("log", ""), end="", flush=True)
+    print("└── saving... ", end="", flush=True)
+    temp_path = Path(result["temp_path"])
+    with h5py.File(diags_path, "a") as dst, h5py.File(temp_path, "r") as src:
+        layer_name = str(result["layer_name"])
+        if layer_name in dst:
+            del dst[layer_name]
+        src.copy(src[layer_name], dst, name=layer_name)
+    temp_path.unlink(missing_ok=True)
+    print("done!", flush=True)
+
+
 def _region_first_mode_options(mode: str) -> dict[str, Any]:
     normalized = str(mode or "").lower()
+    r18_allowed_stages = None
+    r18_probe_stage_allowed_stages = None
+    r18_stage_prefix = "r18_tiny_e2e_stage"
+    if normalized.startswith(r18_stage_prefix):
+        suffix = normalized[len(r18_stage_prefix) :]
+        allowed = []
+        for char in suffix:
+            if char in "1234":
+                allowed.append(f"stage{char}")
+        if allowed:
+            r18_allowed_stages = tuple(dict.fromkeys(allowed))
+    r18_probe_stage_prefix = "r18_tiny_e2e_probe_precompile_stage"
+    if normalized.startswith(r18_probe_stage_prefix):
+        suffix = normalized[len(r18_probe_stage_prefix) :]
+        allowed = []
+        for char in suffix:
+            if char == "0":
+                allowed.append("stage1")
+            elif char in "1234":
+                allowed.append(f"stage{char}")
+        if allowed:
+            r18_probe_stage_allowed_stages = tuple(dict.fromkeys(allowed))
+            r18_allowed_stages = r18_probe_stage_allowed_stages
     r18_modes = {
         "r18_tiny",
         "r18_tiny_e2e",
@@ -76,20 +355,20 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         u22_allowed_nodes = ("up1", "up2", "up3", "up4")
     elif u22_mode_base is not None and u22_allowed_nodes is None:
         u22_allowed_nodes = ("up4", "up3")
-    is_enabled = normalized in r18_modes or normalized == "r34_imgnet_phase1" or u22_mode_base is not None
-    is_r18 = normalized in r18_modes
-    is_probe_dense_bypass = normalized in {
+    is_enabled = normalized in r18_modes or r18_allowed_stages is not None or normalized == "r34_imgnet_phase1" or u22_mode_base is not None
+    is_r18 = normalized in r18_modes or r18_allowed_stages is not None
+    is_probe_dense_bypass = r18_probe_stage_allowed_stages is not None or normalized in {
         "r18_tiny_e2e_probe",
         "r18_tiny_e2e_probe_precompile",
         "r18_tiny_e2e_probe_precompile_no_stem_bypass",
         "r18_tiny_e2e_probe_precompile_stage0",
     }
-    is_probe_stem_bypass = normalized in {
+    is_probe_stem_bypass = r18_probe_stage_allowed_stages is not None or normalized in {
         "r18_tiny_e2e_probe",
         "r18_tiny_e2e_probe_precompile",
         "r18_tiny_e2e_probe_precompile_stage0",
     }
-    is_precompiled_probe = normalized in {
+    is_precompiled_probe = r18_probe_stage_allowed_stages is not None or normalized in {
         "r18_tiny_e2e_probe_precompile",
         "r18_tiny_e2e_probe_precompile_no_stem_bypass",
         "r18_tiny_e2e_probe_precompile_stage0",
@@ -102,7 +381,11 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         "is_u22_phase1": bool(u22_mode_base is not None),
         "u22_allowed_nodes": u22_allowed_nodes,
         "u22_conv_kernels": bool(u22_conv_kernels),
-        "allowed_stages": ("stage1",) if normalized == "r18_tiny_e2e_probe_precompile_stage0" else None,
+        "allowed_stages": (
+            r18_allowed_stages
+            if r18_allowed_stages is not None
+            else (("stage1",) if normalized == "r18_tiny_e2e_probe_precompile_stage0" else None)
+        ),
         "attach_probe_dense_bypass": bool(is_probe_dense_bypass),
         "attach_probe_stem_activation_bypass": bool(is_probe_stem_bypass),
         "lazy_region_compile": bool(normalized == "r18_tiny_e2e_probe"),
@@ -280,6 +563,108 @@ class Scheme:
                 module.fit()
         print(f"done! [{time.time()-start:.3f} secs.]")
 
+    def _generate_matrix_diagonals_sequential(self, network_dag, topo_sort, last_linear) -> None:
+        for node in topo_sort:
+            module = network_dag.nodes[node]["module"]
+            if isinstance(module, LinearTransform):
+                print(f"\nPacking {node}:")
+                module.generate_diagonals(last=(node == last_linear))
+
+    def _generate_matrix_diagonals_parallel_save(self, network_dag, topo_sort, last_linear) -> bool:
+        target_workers = _dense_pack_worker_count()
+        workers, mem_available, mem_reserve, worker_memory = _dense_pack_worker_budget(int(target_workers))
+        if self.params.get_io_mode() != "save" or workers <= 1:
+            return False
+
+        dense_nodes: list[str] = []
+        for node in topo_sort:
+            module = network_dag.nodes[node]["module"]
+            if not isinstance(module, LinearTransform):
+                continue
+            if (
+                _linear_transform_pack_kind(module) is not None
+                and _linear_transform_uses_dense_pack(module)
+                and not module.load_cached_transform_metadata()
+            ):
+                dense_nodes.append(str(node))
+
+        if len(dense_nodes) <= 1:
+            return False
+
+        temp_dir = Path(self.lt_evaluator.diags_path).parent / ".dense_pack_tmp"
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        start_method = _dense_pack_start_method()
+        mem_note = (
+            "unknown"
+            if mem_available is None
+            else f"available={mem_available / 1024**3:.1f}GiB, reserve={mem_reserve / 1024**3:.1f}GiB, per_worker={worker_memory / 1024**3:.1f}GiB"
+        )
+        print(
+            f"├── Parallel dense packing enabled: target_workers={target_workers}, "
+            f"effective_workers={workers}, layers={len(dense_nodes)}, "
+            f"start_method={start_method}, memory_budget=({mem_note})",
+            flush=True,
+        )
+
+        snapshots: list[tuple[str, dict[str, Any]]] = []
+        dense_node_set = set(dense_nodes)
+        for node in topo_sort:
+            module = network_dag.nodes[node]["module"]
+            if str(node) in dense_node_set:
+                snapshots.append(
+                    (
+                        str(node),
+                        _parallel_pack_snapshot(
+                            str(node),
+                            module,
+                            last=(node == last_linear),
+                            temp_dir=temp_dir,
+                        ),
+                    )
+                )
+
+        futures: dict[str, Any] = {}
+        snapshot_by_node = {node: snapshot for node, snapshot in snapshots}
+        snapshot_nodes = [node for node, _snapshot in snapshots]
+        submit_index = 0
+        max_workers = min(int(workers), len(snapshot_nodes))
+        context = mp.get_context(start_method)
+
+        def submit_next(executor) -> None:
+            nonlocal submit_index
+            if submit_index >= len(snapshot_nodes):
+                return
+            submit_node = snapshot_nodes[submit_index]
+            futures[submit_node] = executor.submit(_dense_pack_worker, snapshot_by_node[submit_node])
+            submit_index += 1
+
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=context) as executor:
+                for _ in range(max_workers):
+                    submit_next(executor)
+
+                for node in topo_sort:
+                    module = network_dag.nodes[node]["module"]
+                    if not isinstance(module, LinearTransform):
+                        continue
+                    if str(node) not in futures:
+                        print(f"\nPacking {node}:")
+                        module.generate_diagonals(last=(node == last_linear))
+                        continue
+
+                    print(f"\nPacking {node}:")
+                    result = futures.pop(str(node)).result()
+                    module.output_rotations = int(result["output_rotations"])
+                    module.diagonals = {}
+                    _commit_packed_layer(self.lt_evaluator.diags_path, result)
+                    submit_next(executor)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return True
+
     def compile(self, net):
         self._check_initialization()
 
@@ -349,13 +734,14 @@ class Scheme:
                 from orion.experimental.cir.runtime_group import RegionFirstCompileRegistry
 
                 allowed_stages = region_first_options["allowed_stages"]
-                if experimental_region_first in {
+                use_r18_e2e_registry = experimental_region_first in {
                     "r18_tiny_e2e",
                     "r18_tiny_e2e_probe",
                     "r18_tiny_e2e_probe_precompile",
                     "r18_tiny_e2e_probe_precompile_no_stem_bypass",
                     "r18_tiny_e2e_probe_precompile_stage0",
-                }:
+                } or allowed_stages is not None
+                if use_r18_e2e_registry:
                     self.region_first_registry = RegionFirstCompileRegistry.for_r18_tiny_e2e(
                         network_dag,
                         allowed_stages=allowed_stages,
@@ -413,11 +799,8 @@ class Scheme:
         else:
             # Now we can generate the diagonals.
             print("\n{3} Generating matrix diagonals...", flush=True)
-            for node in topo_sort:
-                module = network_dag.nodes[node]["module"]
-                if isinstance(module, LinearTransform):
-                    print(f"\nPacking {node}:")
-                    module.generate_diagonals(last=(node == last_linear))
+            if not self._generate_matrix_diagonals_parallel_save(network_dag, topo_sort, last_linear):
+                self._generate_matrix_diagonals_sequential(network_dag, topo_sort, last_linear)
 
         #------------------------------#
         #   Find and place bootstraps  # 
@@ -490,6 +873,11 @@ class Scheme:
 
         btp_placer = BootstrapPlacer(net, network_dag)
         btp_placer.place_bootstraps()
+        if io_mode == "load" and compile_manifest is not None:
+            compile_cache.apply_provider_metadata(
+                network_dag,
+                compile_manifest.get("provider_metadata", {}),
+            )
 
         #------------------------------------------#
         #   Compile Orion modules in the network   #

@@ -1,5 +1,6 @@
 import h5py
 import ctypes
+import gc
 import os
 import time
 import torch
@@ -12,6 +13,7 @@ from .io_prefetch import (
     estimate_linear_transform_device_bytes,
     should_prefetch_saved_io,
 )
+from .memory_lifecycle import guard_host_memory
 from orion.backend.python.tensors import CipherTensor
 
 
@@ -58,6 +60,7 @@ class NewEvaluator:
         self._saved_io_external_device_bytes: dict[object, object] = {}
         self._saved_io_work_order: tuple[object, ...] = ()
         self._saved_io_work_index: dict[object, int] = {}
+        self._dense_host_plaintext_payload_cache: dict[int, np.ndarray] = {}
         self.new_evaluator()
 
     def set_compile_manifest(self, manifest) -> None:
@@ -69,6 +72,22 @@ class NewEvaluator:
     def _add_profile(self, key: str, seconds: float) -> None:
         if key in self.compile_load_profile:
             self.compile_load_profile[key] += float(seconds)
+
+    def _forward_memory_guard(
+        self,
+        *,
+        reason: str,
+        needed_bytes: int = 0,
+        force_trim: bool = False,
+        raise_on_low: bool = True,
+    ) -> dict[str, object]:
+        return guard_host_memory(
+            self.backend,
+            reason=str(reason),
+            needed_bytes=int(max(0, int(needed_bytes or 0))),
+            force_trim=bool(force_trim),
+            raise_on_low=bool(raise_on_low),
+        )
 
     def _cached_manifest(self):
         if self.compile_manifest is not None:
@@ -197,6 +216,15 @@ class NewEvaluator:
         diagonals = linear_layer.diagonals 
         level = linear_layer.level
         bsgs_ratio = linear_layer.bsgs_ratio
+        if self.io_mode == "save":
+            linear_layer._compile_cache_diag_indices_by_block = {
+                (int(row), int(col)): tuple(sorted(int(idx) for idx in diags.keys()))
+                for (row, col), diags in diagonals.items()
+            }
+            linear_layer._compile_cache_slot_count_by_block = {
+                (int(row), int(col)): self._slot_count_from_diags(diags)
+                for (row, col), diags in diagonals.items()
+            }
 
         batch_ids = self._generate_transforms_batch(
             diagonals,
@@ -208,10 +236,14 @@ class NewEvaluator:
             for row, col, diags_idxs, lintransf_id in batch_ids:
                 lintransf_ids[(row, col)] = int(lintransf_id)
                 self.generate_rotation_keys(int(lintransf_id))
+                self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
                 if self.io_mode == "save":
                     self.save_plaintext_diagonals(
                         layer_name, int(lintransf_id), int(row), int(col), diags_idxs
                     )
+            if self.io_mode == "save":
+                linear_layer.diagonals = {}
+                gc.collect()
             return lintransf_ids
 
         # Generate all linear transforms block by block.
@@ -230,12 +262,63 @@ class NewEvaluator:
             # Now we can generate any new rotation keys needed for
             # this linear transform.
             self.generate_rotation_keys(lintransf_id)
+            self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
             if self.io_mode == "save":
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
 
+        if self.io_mode == "save":
+            linear_layer.diagonals = {}
+            gc.collect()
         return lintransf_ids
+
+    def _dense_host_payload_cache_enabled(self) -> bool:
+        override = os.environ.get("ORION_DENSE_LT_HOST_PAYLOAD_CACHE")
+        if override is None:
+            return False
+        if override.lower() in ("0", "false", "no", "off"):
+            return False
+        if self.io_mode != "none":
+            return False
+        return self._encoded_plaintext_payload_supported()
+
+    def _cache_dense_host_plaintexts_if_enabled(self, transform_id: int) -> None:
+        if not self._dense_host_payload_cache_enabled():
+            return
+        transform_id = int(transform_id)
+        if transform_id in self._dense_host_plaintext_payload_cache:
+            return
+        load_batch = getattr(self.backend, "LoadPlaintextDiagonalsBatch", None)
+        if callable(load_batch):
+            load_batch([], [], [], [], int(transform_id))
+        else:
+            loader = getattr(self.backend, "LoadLinearTransformPlaintexts", None)
+            if not callable(loader):
+                return
+            loader(np.zeros((0,), dtype=np.uint8), int(transform_id))
+        serial_payload, payload_ptr = self.backend.SerializeLinearTransformPlaintexts(int(transform_id))
+        try:
+            self._dense_host_plaintext_payload_cache[int(transform_id)] = np.asarray(
+                serial_payload,
+                dtype=np.uint8,
+            ).copy()
+        finally:
+            self.backend.FreeCArray(payload_ptr)
+            self.backend.RemovePlaintextDiagonals(int(transform_id))
+
+    def _slot_count_from_diags(self, diags):
+        for diag in diags.values():
+            try:
+                length = int(len(diag))
+            except TypeError:
+                continue
+            if length > 0:
+                return int(length)
+        params = getattr(self.scheme, "params", None)
+        if params is not None and hasattr(params, "get_slots"):
+            return int(params.get_slots())
+        return 0
 
     def _flatten_diagonals(self, diags):
         diags_idxs, diags_data = [], []
@@ -264,6 +347,20 @@ class NewEvaluator:
         (row, col), diags = item
         diags_idxs, diags_data = self._flatten_diagonals(diags)
         return int(row), int(col), diags_idxs, diags_data
+
+    def load_transform_shell_metadata(self, layer_name: str):
+        with h5py.File(self.diags_path, "r") as handle:
+            layer = handle[str(layer_name)]
+            output_rotations = int(layer["output_rotations"][()])
+            diagonals: dict[tuple[int, int], dict[int, list[float]]] = {}
+            for block_name in layer["diagonals"].keys():
+                row_raw, col_raw = str(block_name).split("_", 1)
+                block = layer["diagonals"][str(block_name)]
+                diagonals[(int(row_raw), int(col_raw))] = {
+                    int(diag_name): []
+                    for diag_name in block.keys()
+                }
+        return diagonals, int(output_rotations)
 
     def _generate_transforms_batch(self, diagonals, *, level: int, bsgs_ratio: float):
         generate_batch = getattr(self.backend, "GenerateLinearTransformsBatch", None)
@@ -496,6 +593,27 @@ class NewEvaluator:
             for i in range(rows)
             for j in range(cols)
         ]
+        use_dense_shared_cache = self._dense_shared_cache_enabled(rows=rows, cols=cols)
+        linear_layer._last_dense_shared_cache_eval = {
+            "enabled": bool(use_dense_shared_cache),
+            "group_count": int(cols) if bool(use_dense_shared_cache) else 0,
+            "group_axis": "input_column" if bool(use_dense_shared_cache) else "",
+            "transform_count": int(rows * cols),
+            "io_mode": str(self.io_mode),
+            "host_payload_cache": bool(self._dense_host_payload_cache_enabled()),
+            "host_payload_cache_count": int(len(self._dense_host_plaintext_payload_cache)),
+        }
+        if bool(use_dense_shared_cache):
+            return self._evaluate_transforms_with_dense_shared_cache(
+                linear_layer,
+                in_ctensor,
+                rows=int(rows),
+                cols=int(cols),
+                transform_ids=transform_ids,
+                out_shape=out_shape,
+                fhe_out_shape=fhe_out_shape,
+                skip_post_rescale=bool(skip_post_rescale),
+            )
         prefetch_sequence, use_global_prefetch_sequence = self._transform_prefetch_sequence(
             layer_name,
             work_items,
@@ -521,6 +639,15 @@ class NewEvaluator:
 
                 if self.io_mode != "none":
                     current_key = self._transform_io_key(layer_name, int(i), int(j), int(t_id))
+                    self._forward_memory_guard(
+                        reason=f"before_lt_block_load:{layer_name}:{int(i)}:{int(j)}",
+                        needed_bytes=self._estimate_transform_device_bytes(
+                            layer_name,
+                            int(i),
+                            int(j),
+                            int(t_id),
+                        ),
+                    )
                     bundle = self._transform_io_prefetcher.consume(current_key)
                     if bundle is None:
                         bundle = self._read_transform_io_bundle(
@@ -559,6 +686,13 @@ class NewEvaluator:
                 if self.io_mode != "none":
                     self.remove_rotation_keys(t_id)
                     self.remove_plaintext_diagonals(t_id)
+                    if bundle is not None:
+                        bundle.clear()
+                    self._forward_memory_guard(
+                        reason=f"after_lt_block_unload:{layer_name}:{int(i)}:{int(j)}",
+                        force_trim=True,
+                        raise_on_low=False,
+                    )
                 work_index += 1
             
             # We know the output of this accumulation will just be one ciphertext
@@ -570,6 +704,80 @@ class NewEvaluator:
                 cts_out.append(ct_out_rescaled)
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
+
+    def _dense_shared_cache_enabled(self, *, rows: int, cols: int) -> bool:
+        override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
+        if override is not None and override.lower() in ("0", "false", "no", "off"):
+            return False
+        if not callable(getattr(self.backend, "EvaluateLinearTransformsWithSharedCache", None)):
+            return False
+        if self.io_mode != "none":
+            # Save/load mode needs coordinated chunk IO and eviction. Keep the
+            # established scalar path there until the cached path is taught the
+            # same column-wise schedule.
+            return False
+        return int(rows) > 1 and int(cols) > 0
+
+    def _evaluate_transforms_with_dense_shared_cache(
+        self,
+        linear_layer,
+        in_ctensor,
+        *,
+        rows: int,
+        cols: int,
+        transform_ids,
+        out_shape,
+        fhe_out_shape,
+        skip_post_rescale: bool,
+    ):
+        cts_out = [None for _ in range(int(rows))]
+        for j in range(int(cols)):
+            column_ids = [int(transform_ids[i][j]) for i in range(int(rows))]
+            loaded_from_host_cache: list[int] = []
+            if self._dense_host_payload_cache_enabled():
+                for transform_id in column_ids:
+                    payload = self._dense_host_plaintext_payload_cache.get(int(transform_id))
+                    if payload is None:
+                        continue
+                    self.backend.LoadLinearTransformPlaintexts(payload, int(transform_id))
+                    loaded_from_host_cache.append(int(transform_id))
+            transform_ids_array = (ctypes.c_int * len(column_ids))(*column_ids)
+            try:
+                result_ids = list(
+                    self.backend.EvaluateLinearTransformsWithSharedCache(
+                        transform_ids_array,
+                        len(column_ids),
+                        int(in_ctensor.ids[j]),
+                    )
+                )
+            finally:
+                for transform_id in loaded_from_host_cache:
+                    self.backend.RemovePlaintextDiagonals(int(transform_id))
+                if loaded_from_host_cache:
+                    self._forward_memory_guard(
+                        reason="after_dense_shared_cache_unload",
+                        force_trim=True,
+                        raise_on_low=False,
+                    )
+            if len(result_ids) != len(column_ids):
+                raise RuntimeError(
+                    "EvaluateLinearTransformsWithSharedCache returned "
+                    f"{len(result_ids)} outputs for {len(column_ids)} dense transforms"
+                )
+            for i, res in enumerate(result_ids):
+                ct = CipherTensor(self.scheme, int(res), out_shape, fhe_out_shape)
+                cts_out[int(i)] = ct if cts_out[int(i)] is None else cts_out[int(i)] + ct
+
+        output_ids = []
+        for i, ct_out in enumerate(cts_out):
+            if ct_out is None:
+                raise RuntimeError(f"dense shared-cache LT missing output row {int(i)}")
+            if bool(skip_post_rescale):
+                output_ids.append(int(ct_out.ids[0]))
+                ct_out.ids = []
+            else:
+                output_ids.append(int(self.evaluator.rescale(ct_out.ids[0], in_place=False)))
+        return CipherTensor(self.scheme, output_ids, out_shape, fhe_out_shape)
 
     def _transform_id_matrix(self, transform_ids: dict, *, input_cols: int):
         work_items = self._work_items_from_transform_ids(transform_ids)
@@ -719,6 +927,7 @@ class NewEvaluator:
 
                     # Now that it's saved, we'll free the memory
                     self.backend.FreeCArray(diag_ptr)
+                self.backend.RemovePlaintextDiagonals(int(lintransf_id))
         finally:
             self._add_profile("serialize_s", time.perf_counter() - started)
 
@@ -1052,6 +1261,7 @@ class NewEvaluator:
                     encoded_payload,
                     int(transform_id),
                 )
+                bundle["encoded_plaintext_payload"] = None
                 return
             diag_indices = list(bundle.get("diag_indices", ()))
             if hasattr(self.backend, "LoadPlaintextDiagonalsBatch"):
@@ -1062,6 +1272,10 @@ class NewEvaluator:
                     diag_indices,
                     int(transform_id),
                 )
+                bundle["payload"] = np.zeros((0,), dtype=np.uint8)
+                bundle["offsets"] = ()
+                bundle["lengths"] = ()
+                bundle["plaintexts"] = ()
                 return
             for diag_idx, serial_diag in bundle.get("plaintexts", ()):
                 self.backend.LoadPlaintextDiagonal(
@@ -1069,6 +1283,7 @@ class NewEvaluator:
                     transform_id,
                     int(diag_idx),
                 )
+            bundle["plaintexts"] = ()
             return
         with h5py.File(self.diags_path, "r") as f:
             layer = f[layer_name]
@@ -1083,6 +1298,7 @@ class NewEvaluator:
                     payload,
                     int(transform_id),
                 )
+                del payload
                 return
             if not self._plaintext_payload_required() and hasattr(self.backend, "LoadPlaintextDiagonalsBatch"):
                 diag_indices = sorted(int(diag_idx) for diag_idx in block.keys())
@@ -1172,6 +1388,7 @@ class NewEvaluator:
                     load_transform_key(serial_key, int(key_value), int(transform_id))
                 else:
                     self.backend.LoadRotationKey(serial_key, int(key_value))
+            bundle["rotation_keys"] = ()
             return
         keys = self.get_required_rotation_key_requests(transform_id)
 

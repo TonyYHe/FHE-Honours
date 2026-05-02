@@ -17,7 +17,6 @@ from orion.experimental.cir.transition_pool_provider import (
     BranchPairConvRuntimeExecutor,
     InputPairConvRuntimeExecutor,
 )
-from orion.experimental.r34_phase1 import R34DenseSingleFlowRuntimeExecutor
 from orion.models.resnet import ResNet34
 from orion.nn.module import Module
 
@@ -231,8 +230,7 @@ def test_r34_single_flow_lattigo_runtime_matches_reference(node_name: str) -> No
     _init_lattigo_scheme()
     try:
         _dag, module = _compile_module(str(node_name))
-        expected_executor = R34DenseSingleFlowRuntimeExecutor if str(node_name) == "conv1" else InputPairConvRuntimeExecutor
-        assert isinstance(module.region_runtime.executor, expected_executor)
+        assert isinstance(module.region_runtime.executor, InputPairConvRuntimeExecutor)
 
         torch.manual_seed(abs(hash(str(node_name))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)

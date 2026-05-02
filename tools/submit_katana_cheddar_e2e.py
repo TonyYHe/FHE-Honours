@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -28,6 +29,11 @@ def _render_pbs(args: argparse.Namespace) -> str:
     network = str(args.network)
     mode = str(args.mode)
     phase = str(args.phase)
+    provider_mode_line = (
+        f"  --provider-mode {shlex.quote(str(args.provider_mode))} \\\n"
+        if args.provider_mode
+        else ""
+    )
     run_dir = run_root / job_name
     cache_dir = cache_root / network / mode
     pbs_stdout = run_root / f"{job_name}.pbs.out"
@@ -45,13 +51,17 @@ exit 2
     else:
         compile_block = ""
         if phase in {"compile_forward", "compile_only"}:
+            compile_payload_env = ""
+            if phase == "compile_only":
+                compile_payload_env = """  ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOADS=0 \\
+  ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS=0 \\
+"""
             compile_block = f"""env \\
   ORION_COMPILE_SKIP_BOOTSTRAPPER_GENERATION=1 \\
   ORION_UNIFIED_LT_PREPARE_SHARED_CACHE_PLAN=0 \\
   ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE=1 \\
   ORION_UNIFIED_LT_RELEASE_INDEX_ONLY_RAW_MATRICES_AFTER_SAVE=1 \\
-  ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOADS=0 \\
-  ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS=0 \\
+{compile_payload_env}\
   /usr/bin/time -v "${{UV_RUN[@]}}" python tools/run_lattigo_e2e_compare.py \\
   --backend cheddar \\
   --network {network} \\
@@ -59,6 +69,7 @@ exit 2
   --io-mode save \\
   --io-dir "{cache_dir}" \\
   --compile-only \\
+{provider_mode_line}\
   --out "{out_compile}"
 """
 
@@ -76,6 +87,7 @@ exit 2
   --forward-runs {int(args.forward_runs)} \\
   --profile-modules \\
   --trace-forward-memory \\
+{provider_mode_line}\
   --out "{out_forward}"
 """
 
@@ -132,6 +144,8 @@ export ORION_UNIFIED_LT_PLAINTEXT_RESIDENCY=1
 export ORION_CHEDDAR_SHARED_CACHE_PLAN_PERSIST=1
 export ORION_CHEDDAR_GPU_PREFETCH=0
 export ORION_LATTIGO_BOOTSTRAP_MANY=0
+export ORION_CHEDDAR_SAVE_PLAINTEXT_PAYLOAD_MAX_DEVICE_BYTES="{args.payload_max_device_bytes}"
+export ORION_UNIFIED_LT_ENCODED_PLAINTEXT_MAX_DEVICE_BYTES="{args.payload_max_device_bytes}"
 mkdir -p "{run_dir}" "{cache_dir}" "$TMPDIR" "$UV_CACHE_DIR"
 if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -168,11 +182,13 @@ def main() -> int:
     parser.add_argument("--network", choices=("r18_tiny", "r34_imgnet", "u22_64_base32", "u22_256_base32"), default="r18_tiny")
     parser.add_argument("--mode", choices=("dense", "provider"), default="provider")
     parser.add_argument("--phase", choices=("compile_forward", "compile_only", "forward_only", "cpu_compile"), default="compile_forward")
+    parser.add_argument("--provider-mode", default=None)
     parser.add_argument("--job-name", default=None)
     parser.add_argument("--gpu-model", default="H200")
     parser.add_argument("--ncpus", type=int, default=8)
     parser.add_argument("--mem", default="96gb")
     parser.add_argument("--walltime", default="02:00:00")
+    parser.add_argument("--payload-max-device-bytes", default=str(4 * 1024**3))
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--forward-runs", type=int, default=3)
     parser.add_argument("--script-out", type=Path, default=None)

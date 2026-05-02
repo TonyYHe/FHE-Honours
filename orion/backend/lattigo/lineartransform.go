@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
+	commonlintrans "github.com/realqhc/lattigo/v6/circuits/common/lintrans"
 	"github.com/realqhc/lattigo/v6/core/rlwe"
 	"github.com/realqhc/lattigo/v6/ring"
 	"github.com/realqhc/lattigo/v6/ring/ringqp"
@@ -114,6 +115,78 @@ func encodeUnifiedComplexTransformsParallel(
 	close(jobs)
 	wg.Wait()
 	return firstErr
+}
+
+func optimalUnifiedBSGSLogRatio(params []lintrans.Parameters) int {
+	if len(params) == 0 {
+		return 1
+	}
+	slots := 1 << params[0].LogDimensions.Cols
+	diagonalSets := make([][]int, len(params))
+	for i, param := range params {
+		diagonalSets[i] = param.DiagonalsIndexList
+	}
+	optimalN1, _ := commonlintrans.FindOptimalUnifiedBSGSRatio(diagonalSets, slots)
+	logRatio := 0
+	for lr := 0; lr < 16; lr++ {
+		if (1 << lr) >= optimalN1 {
+			logRatio = lr
+			break
+		}
+	}
+	return logRatio
+}
+
+func applyOptimalUnifiedBSGSRatio(params []lintrans.Parameters) {
+	logRatio := optimalUnifiedBSGSLogRatio(params)
+	for i := range params {
+		params[i].LogBabyStepGiantStepRatio = logRatio
+	}
+}
+
+func newUnifiedLoadTransformations(params []lintrans.Parameters) []lintrans.LinearTransformation {
+	if len(params) == 0 {
+		return nil
+	}
+
+	slots := 1 << params[0].LogDimensions.Cols
+	diagonalSets := make([][]int, len(params))
+	for i, param := range params {
+		diagonalSets[i] = param.DiagonalsIndexList
+	}
+
+	optimalN1, _ := commonlintrans.FindOptimalUnifiedBSGSRatio(diagonalSets, slots)
+	logRatio := optimalUnifiedBSGSLogRatio(params)
+	transforms := make([]lintrans.LinearTransformation, len(params))
+	for i, param := range params {
+		vec := make(map[int]ringqp.Poly)
+		index, _, _ := commonlintrans.BSGSIndex(param.DiagonalsIndexList, slots, optimalN1)
+		for j := range index {
+			for _, k := range index[j] {
+				vec[j+k] = ringqp.Poly{}
+			}
+		}
+
+		transforms[i] = lintrans.LinearTransformation{
+			MetaData: &rlwe.MetaData{
+				PlaintextMetaData: rlwe.PlaintextMetaData{
+					LogDimensions: param.LogDimensions,
+					Scale:         param.Scale,
+					IsBatched:     true,
+				},
+				CiphertextMetaData: rlwe.CiphertextMetaData{
+					IsNTT:        true,
+					IsMontgomery: true,
+				},
+			},
+			LogBabyStepGiantStepRatio: logRatio,
+			N1:                        optimalN1,
+			LevelQ:                    param.LevelQ,
+			LevelP:                    param.LevelP,
+			Vec:                       vec,
+		}
+	}
+	return transforms
 }
 
 func AddLinearTransform(lt lintrans.LinearTransformation) int {
@@ -539,6 +612,7 @@ func GenerateLinearTransformsUnified(
 		}
 	}
 
+	applyOptimalUnifiedBSGSRatio(params)
 	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
 	if err := encodeUnifiedFloatTransformsParallel(diagonalsList, transforms); err != nil {
 		panic(err)
@@ -594,11 +668,44 @@ func GenerateLinearTransformsUnifiedComplex(
 		}
 	}
 
+	applyOptimalUnifiedBSGSRatio(params)
 	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
 	if err := encodeUnifiedComplexTransformsParallel(diagonalsList, transforms); err != nil {
 		panic(err)
 	}
 
+	ids := make([]int, n)
+	for i, lt := range transforms {
+		ids[i] = AddLinearTransform(lt)
+	}
+	return SliceToCArray(ids, convertIntToCInt)
+}
+
+//export GenerateLinearTransformsUnifiedLoad
+func GenerateLinearTransformsUnifiedLoad(
+	numTransforms C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	levels *C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	params := make([]lintrans.Parameters, n)
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		params[i] = lintrans.Parameters{
+			DiagonalsIndexList:        diagIdxs,
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: 1,
+		}
+	}
+
+	transforms := newUnifiedLoadTransformations(params)
 	ids := make([]int, n)
 	for i, lt := range transforms {
 		ids[i] = AddLinearTransform(lt)

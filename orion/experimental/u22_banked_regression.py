@@ -57,7 +57,7 @@ U22_BANKED_REGRESSION_CASES: dict[str, U22BankedRegressionCase] = {
 
 _DATASET_SPECS = {
     "tiny": {"image_size": 64, "logn": 15},
-    "imagenet": {"image_size": 256, "logn": 17},
+    "imagenet": {"image_size": 256, "logn": 16},
 }
 
 

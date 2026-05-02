@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -18,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orion.core.orion import scheme
+from orion.backend.python.memory_lifecycle import trim_runtime_memory
 from orion.models.resnet import ResNet18, ResNet20, ResNet34
 from orion.models.unet import UNet22
 from orion.nn.linear import LinearTransform
@@ -180,7 +182,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "input_shape": (1, 1, 64, 64),
         "provider_mode": "u22_64_base32",
         "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=15,
+            logn=16,
             provider_mode=str(provider_mode),
             backend=str(backend),
         ),
@@ -193,7 +195,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "input_shape": (1, 3, 256, 256),
         "provider_mode": "u22_256_base32",
         "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=17,
+            logn=16,
             provider_mode=str(provider_mode),
             backend=str(backend),
         ),
@@ -870,6 +872,9 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     groups = list(getattr(executor, "groups_by_pair", []) or [])
     if groups:
         return _unified_group_rotation_stats(groups)
+    groups = list(getattr(executor, "groups_by_input", []) or [])
+    if groups:
+        return _unified_group_rotation_stats(groups)
     groups_by_input_index = getattr(executor, "groups_by_input_index", None) or {}
     if groups_by_input_index:
         return _unified_group_rotation_stats([group for _input_index, group in sorted(groups_by_input_index.items())])
@@ -1090,6 +1095,8 @@ def _run_forward_attempt(
             net,
             memory_trace_path=memory_trace_path,
         )
+    x0_ct = None
+    out_ct = None
     try:
         x0_ct = _attempt_timed(
             payload,
@@ -1177,6 +1184,17 @@ def _run_forward_attempt(
                 remove_profile()
             except Exception:
                 pass
+        for tensor in (out_ct, x0_ct):
+            release = getattr(tensor, "release", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    pass
+        backend = getattr(scheme, "backend", None)
+        if backend is not None:
+            trim_runtime_memory(backend, reason=f"after_forward_attempt:{int(attempt_index)}")
+        gc.collect()
 
 
 def _run_one(

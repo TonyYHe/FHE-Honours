@@ -13,12 +13,16 @@ class PlainTensor:
         self.on_shape = on_shape or shape
 
     def __del__(self):
+        self.release()
+
+    def release(self):
         if 'sys' in globals() and sys.modules and self.scheme:
             try:
                 for idx in self.ids:
                     self.backend.DeletePlaintext(idx)
             except Exception: 
                 pass # avoids errors for GC at program termination
+        self.ids = []
 
     def __len__(self):
         return len(self.ids)
@@ -92,12 +96,16 @@ class CipherTensor:
         self.on_shape = on_shape or shape
 
     def __del__(self):
+        self.release()
+
+    def release(self):
         if 'sys' in globals() and sys.modules and self.scheme:
             try:
                 for idx in self.ids:
                     self.backend.DeleteCiphertext(idx)
             except Exception: 
                 pass # avoids errors for GC at program termination
+        self.ids = []
 
     def __len__(self):
         return len(self.ids)

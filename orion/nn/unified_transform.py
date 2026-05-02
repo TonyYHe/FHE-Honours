@@ -8,8 +8,11 @@ the same input can be compiled/evaluated through Lattigo's shared BSGS APIs.
 from __future__ import annotations
 
 import ctypes
+import gc
 import os
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from itertools import count
 from typing import Any, Iterable, List
 import h5py
@@ -21,10 +24,36 @@ from orion.backend.python.io_prefetch import (
     estimate_linear_transform_device_bytes,
     should_prefetch_saved_io,
 )
+from orion.backend.python.memory_lifecycle import (
+    guard_host_memory,
+    host_memory_info,
+)
 
 
 _UNIFIED_GROUP_COUNTER = count(1)
 _ENCODED_HOIST_PAYLOAD_DATASET = "__encoded_hoist_payload__"
+
+
+def _unified_compile_workers(item_count: int) -> int:
+    raw = os.environ.get("ORION_UNIFIED_COMPILE_WORKERS")
+    if raw is None:
+        raw = os.environ.get("ORION_REGION_COMPILE_WORKERS", "1")
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        requested = 1
+    return max(1, min(int(item_count), int(requested)))
+
+
+def _unified_compile_trace_enabled() -> bool:
+    return os.environ.get("ORION_UNIFIED_COMPILE_TRACE", "0").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _unified_compile_trace(event: str, **fields: Any) -> None:
+    if not _unified_compile_trace_enabled():
+        return
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[unified_compile] event={event} {payload}", file=sys.stderr, flush=True)
 
 
 class UnifiedTransformGroup:
@@ -157,7 +186,9 @@ class UnifiedTransformGroup:
     def _should_save_encoded_plaintext_payload(self, backend, transform_id: int) -> bool:
         if not self._encoded_plaintext_payload_supported(backend):
             return False
-        if self._transform_uses_backend_streaming(backend, int(transform_id)):
+        if self._transform_uses_backend_streaming(backend, int(transform_id)) and not bool(
+            getattr(backend, "supports_streaming_encoded_plaintext_payload_cache", False)
+        ):
             return False
         override = os.environ.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS")
         if override is not None:
@@ -246,7 +277,23 @@ class UnifiedTransformGroup:
         if not self._plaintext_residency_enabled(backend):
             return False
         if self._transform_uses_backend_streaming(backend, int(transform_id)):
-            return False
+            info = self._host_memory_info()
+            if info is None:
+                return True
+            available = int(info.get("available_bytes", 0))
+            total = int(info.get("total_bytes", 0))
+            explicit = os.environ.get("ORION_UNIFIED_LT_HOST_PLAINTEXT_MIN_FREE_BYTES")
+            if explicit:
+                try:
+                    min_free = max(0, int(explicit))
+                except ValueError:
+                    min_free = 32 * 1024**3
+            else:
+                min_free = max(32 * 1024**3, int(total * 0.08)) if total > 0 else 0
+            if bool(already_loaded):
+                return available >= min_free
+            estimate = int(self._estimate_saved_io_host_bytes_for_transform(backend, int(transform_id)))
+            return available - estimate >= min_free
         info = self._device_memory_info(backend)
         if info is None:
             return False
@@ -320,20 +367,36 @@ class UnifiedTransformGroup:
         except Exception:
             return {}
         names = (
-            "cpp_plan_s",
-            "cpp_level_adjust_s",
-            "cpp_baby_step_s",
-            "cpp_giant_step_s",
-            "cpp_push_s",
-            "cpp_trim_s",
+            (
+                "cpp_plan_s",
+                "cpp_level_adjust_s",
+                "cpp_baby_step_s",
+                "cpp_giant_step_s",
+                "cpp_push_s",
+                "cpp_trim_s",
+            )
+            if len(values) <= 6
+            else (
+                "cpp_plan_s",
+                "cpp_level_adjust_s",
+                "cpp_baby_step_s",
+                "cpp_giant_step_s",
+                "stream_build_map_s",
+                "stream_encode_hoist_s",
+                "stream_load_payload_s",
+                "stream_eval_s",
+                "stream_accumulate_s",
+                "cpp_push_s",
+                "cpp_trim_s",
+            )
         )
         return {name: float(values[index]) for index, name in enumerate(names) if index < len(values)}
 
     def _release_source_diagonals_after_compile_enabled(self) -> bool:
-        return os.environ.get(
-            "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE",
-            "0",
-        ).lower() not in ("0", "false", "no", "off")
+        override = os.environ.get("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE")
+        if override is not None:
+            return override.lower() not in ("0", "false", "no", "off")
+        return self._io_mode in ("save", "load")
 
     def _release_index_only_backend_matrix_after_save_enabled(self) -> bool:
         return os.environ.get(
@@ -404,8 +467,17 @@ class UnifiedTransformGroup:
         return {
             int(transform_id)
             for transform_id in selected_ids
-            if not self._transform_uses_backend_streaming(backend, int(transform_id))
+            if (
+                not self._transform_uses_backend_streaming(backend, int(transform_id))
+                or bool(getattr(backend, "supports_streaming_encoded_plaintext_payload_cache", False))
+            )
         }
+
+    def _streaming_payload_missing_error(self, transform_id: int) -> RuntimeError:
+        return RuntimeError(
+            "backend streaming linear transform requires an encoded plaintext payload "
+            f"in saved IO cache for transform {int(transform_id)}"
+        )
 
     def _estimate_transform_device_bytes_summary(
         self,
@@ -437,20 +509,69 @@ class UnifiedTransformGroup:
         }
 
     def _host_memory_info(self) -> dict[str, int] | None:
+        return host_memory_info()
+
+    def _runtime_memory_stats(self, backend) -> dict[str, int] | None:
+        get_stats = getattr(backend, "GetRuntimeMemoryStats", None)
+        if not callable(get_stats):
+            return None
         try:
-            values: dict[str, int] = {}
-            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
-                for line in handle:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[0].endswith(":"):
-                        values[parts[0][:-1]] = int(parts[1]) * 1024
-        except OSError:
+            values = [int(value) for value in list(get_stats())]
+        except Exception:
             return None
-        total = values.get("MemTotal")
-        available = values.get("MemAvailable")
-        if total is None or available is None:
-            return None
-        return {"total_bytes": int(total), "available_bytes": int(available)}
+        names = (
+            "alloc_bytes",
+            "total_alloc_bytes",
+            "sys_bytes",
+            "heap_alloc_bytes",
+            "heap_sys_bytes",
+            "heap_idle_bytes",
+            "heap_released_bytes",
+            "heap_inuse_bytes",
+            "stack_inuse_bytes",
+            "mspan_inuse_bytes",
+            "mcache_inuse_bytes",
+            "num_gc",
+        )
+        return {name: int(values[index]) for index, name in enumerate(names) if index < len(values)}
+
+    def _forward_memory_guard(
+        self,
+        backend,
+        *,
+        reason: str,
+        transform_ids: Iterable[int] | None = None,
+        needed_bytes: int = 0,
+        force_trim: bool = False,
+        raise_on_low: bool = True,
+        stream_plaintexts: bool = False,
+    ) -> dict[str, Any]:
+        ids = [int(value) for value in (transform_ids if transform_ids is not None else ())]
+        estimated = int(max(0, int(needed_bytes or 0)))
+        if not estimated and ids:
+            estimated = int(
+                sum(
+                    int(
+                        self._estimate_transform_load_resident_bytes(
+                            backend,
+                            int(transform_id),
+                            stream_plaintexts=bool(stream_plaintexts),
+                        )
+                    )
+                    for transform_id in ids
+                )
+            )
+        event = guard_host_memory(
+            backend,
+            reason=str(reason),
+            needed_bytes=int(estimated),
+            force_trim=bool(force_trim),
+            raise_on_low=bool(raise_on_low),
+        )
+        runtime_stats = self._runtime_memory_stats(backend)
+        if runtime_stats is not None:
+            event["runtime_memory"] = runtime_stats
+        return event
 
     def _host_eval_budget_bytes(self) -> int:
         info = self._host_memory_info()
@@ -519,6 +640,27 @@ class UnifiedTransformGroup:
         except ValueError:
             return 1.35
 
+    def _stream_plaintext_diag_load_enabled(self, backend) -> bool:
+        if not self._memory_bounded_eval_enabled(backend):
+            return False
+        if not self._plaintext_payload_required(backend):
+            return False
+        raw = os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "1")
+        return raw.strip().lower() not in ("0", "false", "no", "off")
+
+    def _stream_plaintext_diag_load_chunk_bytes(self) -> int:
+        raw = os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_BYTES")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        raw_gib = os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "0.5")
+        try:
+            return max(1, int(float(raw_gib) * 1024**3))
+        except ValueError:
+            return 512 * 1024**2
+
     def _estimate_transform_eval_resident_bytes(self, backend, transform_id: int) -> int:
         backend_estimate = int(estimate_linear_transform_device_bytes(backend, int(transform_id)))
         if backend_estimate > 0:
@@ -528,6 +670,19 @@ class UnifiedTransformGroup:
             return max(1, int(saved_bytes * self._saved_payload_resident_multiplier()))
         return 1
 
+    def _estimate_transform_load_resident_bytes(
+        self,
+        backend,
+        transform_id: int,
+        *,
+        stream_plaintexts: bool = False,
+    ) -> int:
+        saved_bytes = int(self._estimate_saved_io_host_bytes_for_transform(backend, int(transform_id)))
+        load_bytes = int(saved_bytes)
+        if bool(stream_plaintexts) and saved_bytes > 0:
+            load_bytes = min(saved_bytes, int(self._stream_plaintext_diag_load_chunk_bytes()))
+        return int(self._estimate_transform_eval_resident_bytes(backend, int(transform_id))) + int(load_bytes)
+
     def _record_memory_event(
         self,
         event: str,
@@ -536,9 +691,15 @@ class UnifiedTransformGroup:
         **extra: Any,
     ) -> None:
         payload: dict[str, Any] = {"event": str(event)}
+        host_info = self._host_memory_info()
+        if host_info is not None:
+            payload["host_memory"] = host_info
         memory_info = self._device_memory_info(backend)
         if memory_info is not None:
             payload["device_memory"] = memory_info
+        runtime_stats = self._runtime_memory_stats(backend)
+        if runtime_stats is not None:
+            payload["runtime_memory"] = runtime_stats
         payload["linear_transform_device_bytes"] = self._estimate_transform_device_bytes_summary(
             backend,
             transform_ids,
@@ -637,6 +798,8 @@ class UnifiedTransformGroup:
         return scheduler
 
     def _register_shared_saved_io_work_unit(self, backend) -> None:
+        if self._memory_bounded_eval_enabled(backend):
+            return
         scheduler = self._shared_saved_io_scheduler()
         if scheduler is None:
             return
@@ -826,6 +989,7 @@ class UnifiedTransformGroup:
         prefetch: bool,
         transform_ids: Iterable[int] | None = None,
         required_keys: Iterable[tuple[int, int | None]] | None = None,
+        include_plaintexts: bool = True,
     ) -> dict[str, object] | None:
         if prefetch:
             if not should_prefetch_saved_io(
@@ -848,10 +1012,10 @@ class UnifiedTransformGroup:
                     key_name = self._rotation_key_storage_name(int(key), level)
                     if key_name not in handle and str(int(key)) in handle:
                         key_name = str(int(key))
-                    rotation_keys.append((int(key), np.asarray(handle[key_name][()], dtype=np.uint8).copy()))
+                    rotation_keys.append((int(key), np.asarray(handle[key_name][()], dtype=np.uint8)))
             bundle["rotation_keys"] = tuple(rotation_keys)
 
-        if self._offloaded_plaintext_diagonals:
+        if bool(include_plaintexts) and self._offloaded_plaintext_diagonals:
             selected_ids = self._plaintext_load_transform_ids(backend, transform_ids)
             selected_ids -= set(int(value) for value in self._resident_plaintext_transform_ids)
             handle, root = self._storage_group("r")
@@ -867,13 +1031,15 @@ class UnifiedTransformGroup:
                             "encoded_payload": np.asarray(
                                 transform_group[_ENCODED_HOIST_PAYLOAD_DATASET][()],
                                 dtype=np.uint8,
-                            ).reshape(-1).copy(),
+                            ).reshape(-1),
                             "payload": np.zeros((0,), dtype=np.uint8),
                             "offsets": (),
                             "lengths": (),
                             "diag_indices": tuple(int(idx) for idx in diag_indices),
                         }
                         continue
+                    if self._transform_uses_backend_streaming(backend, int(transform_id)):
+                        raise self._streaming_payload_missing_error(int(transform_id))
                     if not self._plaintext_payload_required(backend):
                         plaintexts[int(transform_id)] = {
                             "payload": np.zeros((0,), dtype=np.uint8),
@@ -883,7 +1049,7 @@ class UnifiedTransformGroup:
                         }
                         continue
                     plaintexts[int(transform_id)] = {
-                        "payload": np.asarray(transform_group["diag_payload"][:], dtype=np.uint8).copy(),
+                        "payload": np.asarray(transform_group["diag_payload"][:], dtype=np.uint8),
                         "offsets": tuple(int(v) for v in transform_group["diag_offsets"][:].tolist()),
                         "lengths": tuple(int(v) for v in transform_group["diag_lengths"][:].tolist()),
                         "diag_indices": tuple(int(v) for v in diag_indices),
@@ -943,6 +1109,7 @@ class UnifiedTransformGroup:
                         backend.LoadRotationKey(serial_key, int(key))
                         loaded_requests.append((int(key), _level))
                 self._mark_rotation_keys_resident(backend, target_ids, loaded_requests)
+                bundle["rotation_keys"] = ()
                 return
             if callable(load_transform_key) and target_ids:
                 first_transform_id = int(target_ids[0])
@@ -955,9 +1122,11 @@ class UnifiedTransformGroup:
                         serial_key = serial_by_key.get(int(key))
                         if serial_key is not None:
                             load_transform_key(serial_key, int(key), int(transform_id))
+                bundle["rotation_keys"] = ()
                 return
             for key, serial_key in bundle.get("rotation_keys", ()):
                 backend.LoadRotationKey(serial_key, int(key))
+            bundle["rotation_keys"] = ()
             return
         with h5py.File(self._keys_path, "r") as handle:
             if use_shared_keys:
@@ -1175,7 +1344,7 @@ class UnifiedTransformGroup:
         )
         if not selected_ids:
             return
-        if bundle is not None:
+        if bundle is not None and bundle.get("plaintexts"):
             for transform_id, payload in bundle.get("plaintexts", {}).items():
                 if int(transform_id) not in selected_ids:
                     continue
@@ -1187,6 +1356,13 @@ class UnifiedTransformGroup:
                         encoded_payload,
                         int(transform_id),
                     )
+                    payload["encoded_payload"] = None
+                    if self._can_keep_plaintexts_resident(
+                        backend,
+                        int(transform_id),
+                        already_loaded=True,
+                    ):
+                        self._mark_plaintexts_resident(int(transform_id))
                     continue
                 backend.LoadPlaintextDiagonalsBatch(
                     payload["payload"],
@@ -1195,6 +1371,10 @@ class UnifiedTransformGroup:
                     list(payload["diag_indices"]),
                     int(transform_id),
                 )
+                payload["payload"] = np.zeros((0,), dtype=np.uint8)
+                payload["offsets"] = ()
+                payload["lengths"] = ()
+            bundle["plaintexts"] = {}
             return
         handle, root = self._storage_group("r")
         try:
@@ -1212,17 +1392,71 @@ class UnifiedTransformGroup:
                         payload,
                         int(transform_id),
                     )
+                    if self._can_keep_plaintexts_resident(
+                        backend,
+                        int(transform_id),
+                        already_loaded=True,
+                    ):
+                        self._mark_plaintexts_resident(int(transform_id))
+                    continue
+                if self._transform_uses_backend_streaming(backend, int(transform_id)):
+                    raise self._streaming_payload_missing_error(int(transform_id))
+                offsets = [int(v) for v in transform_group["diag_offsets"][:].tolist()]
+                lengths = [int(v) for v in transform_group["diag_lengths"][:].tolist()]
+                stored_diag_indices = [int(v) for v in transform_group["diag_indices"][:].tolist()]
+                if self._stream_plaintext_diag_load_enabled(backend):
+                    payload_ds = transform_group["diag_payload"]
+                    chunk_limit = int(self._stream_plaintext_diag_load_chunk_bytes())
+                    index = 0
+                    while index < len(stored_diag_indices):
+                        start = int(offsets[index])
+                        end = int(start + lengths[index])
+                        next_index = int(index + 1)
+                        while next_index < len(stored_diag_indices):
+                            candidate_end = int(offsets[next_index] + lengths[next_index])
+                            if candidate_end - start > chunk_limit:
+                                break
+                            end = int(candidate_end)
+                            next_index += 1
+                        guard = self._forward_memory_guard(
+                            backend,
+                            reason=(
+                                f"before_plaintext_stream_load:{self._storage_key}:"
+                                f"{int(transform_id)}:{int(index)}"
+                            ),
+                            needed_bytes=int(end - start),
+                            raise_on_low=True,
+                        )
+                        self._record_memory_event(
+                            "before_plaintext_stream_load",
+                            backend,
+                            (int(transform_id),),
+                            stream_start_index=int(index),
+                            stream_end_index=int(next_index),
+                            stream_bytes=int(end - start),
+                            memory_guard=guard,
+                        )
+                        payload = np.asarray(payload_ds[start:end], dtype=np.uint8)
+                        backend.LoadPlaintextDiagonalsBatch(
+                            payload,
+                            [int(offsets[i] - start) for i in range(index, next_index)],
+                            [int(lengths[i]) for i in range(index, next_index)],
+                            [int(stored_diag_indices[i]) for i in range(index, next_index)],
+                            int(transform_id),
+                        )
+                        del payload
+                        index = int(next_index)
+                    del offsets, lengths, stored_diag_indices
                     continue
                 payload = np.asarray(transform_group["diag_payload"][:], dtype=np.uint8)
-                offsets = transform_group["diag_offsets"][:].tolist()
-                lengths = transform_group["diag_lengths"][:].tolist()
                 backend.LoadPlaintextDiagonalsBatch(
                     payload,
                     offsets,
                     lengths,
-                    list(diag_indices),
+                    stored_diag_indices or list(diag_indices),
                     int(transform_id),
                 )
+                del payload, offsets, lengths, stored_diag_indices
         finally:
             handle.close()
 
@@ -1266,31 +1500,38 @@ class UnifiedTransformGroup:
                         return True
         return False
 
-    def _flatten_transform_diagonals(self, transform, *, has_complex: bool) -> tuple[list[int], list[float], int]:
+    def _flatten_transform_diagonals(self, transform, *, has_complex: bool) -> tuple[np.ndarray, np.ndarray, int]:
         all_diagonals: dict[int, torch.Tensor] = {}
         for _block_key, block_diags in getattr(transform, "diagonals", {}).items():
             for diag_idx, diag_values in block_diags.items():
                 if isinstance(diag_values, torch.Tensor):
-                    values = diag_values.detach().clone().reshape(-1)
+                    values = diag_values.detach().reshape(-1)
                 else:
                     values = torch.as_tensor(list(diag_values))
                 all_diagonals.setdefault(int(diag_idx), values)
         if not all_diagonals:
             raise ValueError("all transforms must have generated diagonals before unified compilation")
 
-        diag_idxs = sorted(all_diagonals.keys())
-        diag_data_flat: list[float] = []
+        diag_idxs = np.asarray(sorted(all_diagonals.keys()), dtype=np.int32)
+        chunks: list[np.ndarray] = []
         for idx in diag_idxs:
             values = all_diagonals[int(idx)].reshape(-1)
             if has_complex:
                 if not bool(torch.is_complex(values)):
                     values = values.to(dtype=torch.complex64)
-                real = values.real.to(dtype=torch.float64).tolist()
-                imag = values.imag.to(dtype=torch.float64).tolist()
-                for real_value, imag_value in zip(real, imag):
-                    diag_data_flat.extend((float(real_value), float(imag_value)))
+                values = values.detach().cpu()
+                real = values.real.to(dtype=torch.float64).numpy().reshape(-1)
+                imag = values.imag.to(dtype=torch.float64).numpy().reshape(-1)
+                interleaved = np.empty(int(real.size) * 2, dtype=np.float64)
+                interleaved[0::2] = real
+                interleaved[1::2] = imag
+                chunks.append(interleaved)
             else:
-                diag_data_flat.extend(float(value) for value in values.to(dtype=torch.float32).tolist())
+                chunks.append(values.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1))
+        if chunks:
+            diag_data_flat = np.ascontiguousarray(np.concatenate(chunks), dtype=np.float64 if has_complex else np.float32)
+        else:
+            diag_data_flat = np.zeros((0,), dtype=np.float64 if has_complex else np.float32)
 
         level = getattr(transform, "level", None)
         if level is None:
@@ -1300,7 +1541,7 @@ class UnifiedTransformGroup:
     def _generate_unified_backend_batch(
         self,
         backend,
-        payloads: list[tuple[list[int], list[float], int]],
+        payloads: list[tuple[np.ndarray, np.ndarray, int]],
         *,
         has_complex: bool,
     ) -> list[int]:
@@ -1313,13 +1554,13 @@ class UnifiedTransformGroup:
 
         owned_arrays: list[object] = []
         for idx, (diag_idxs, diag_data, _level) in enumerate(payloads):
-            idx_array = (ctypes.c_int * len(diag_idxs))(*diag_idxs)
-            data_array = (array_type * len(diag_data))(*diag_data)
+            idx_array = np.ascontiguousarray(diag_idxs, dtype=np.int32)
+            data_array = np.ascontiguousarray(diag_data, dtype=np.float64 if has_complex else np.float32)
             owned_arrays.extend((idx_array, data_array))
-            diag_idxs_ptrs[idx] = idx_array
-            diag_idxs_lens[idx] = len(diag_idxs)
-            diag_data_ptrs[idx] = data_array
-            diag_data_lens[idx] = len(diag_data)
+            diag_idxs_ptrs[idx] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+            diag_idxs_lens[idx] = int(idx_array.size)
+            diag_data_ptrs[idx] = data_array.ctypes.data_as(ctypes.POINTER(array_type))
+            diag_data_lens[idx] = int(data_array.size)
 
         levels_array = (ctypes.c_int * num_transforms)(*[int(level) for _diag_idxs, _diag_data, level in payloads])
         owned_arrays.append(levels_array)
@@ -1329,7 +1570,15 @@ class UnifiedTransformGroup:
             if has_complex and hasattr(backend, "GenerateLinearTransformsUnifiedComplex")
             else backend.GenerateLinearTransformsUnified
         )
-        return list(
+        _unified_compile_trace(
+            "backend_generate_start",
+            group=self._storage_key,
+            transforms=num_transforms,
+            has_complex=int(bool(has_complex)),
+            diag_data_total=sum(int(payload[1].size) for payload in payloads),
+        )
+        started = time.perf_counter()
+        ids = list(
             generate(
                 num_transforms,
                 diag_idxs_ptrs,
@@ -1339,6 +1588,95 @@ class UnifiedTransformGroup:
                 levels_array,
             )
         )
+        _unified_compile_trace(
+            "backend_generate_done",
+            group=self._storage_key,
+            transforms=num_transforms,
+            seconds=f"{time.perf_counter() - started:.6f}",
+        )
+        return ids
+
+    def _cached_transform_descriptors(self) -> list[tuple[list[int], int]]:
+        handle, root = self._storage_group("r")
+        try:
+            if self._storage_key not in root:
+                raise RuntimeError(
+                    f"Missing cached unified transform group '{self._storage_key}' in {self._diags_path}."
+                )
+            storage = root[self._storage_key]
+            transform_names = sorted(storage.keys(), key=lambda value: int(value))
+            if len(transform_names) != len(self.transforms):
+                raise RuntimeError(
+                    "Cached unified transform group size mismatch. "
+                    f"group={self._storage_key} cached={len(transform_names)} expected={len(self.transforms)}. "
+                    "Re-run with io_mode='save' to rebuild the cache."
+                )
+            descriptors: list[tuple[list[int], int]] = []
+            for transform_name, transform in zip(transform_names, self.transforms):
+                transform_group = storage[str(transform_name)]
+                diag_indices = [
+                    int(value)
+                    for value in np.asarray(transform_group["diag_indices"][:], dtype=np.int32).reshape(-1)
+                ]
+                level = getattr(transform, "level", None)
+                if level is None:
+                    level = len(transform.scheme.params.get_logq()) - 1
+                descriptors.append((diag_indices, int(level)))
+            return descriptors
+        finally:
+            handle.close()
+
+    def _generate_unified_backend_load_batch(
+        self,
+        backend,
+        descriptors: list[tuple[list[int], int]],
+    ) -> list[int]:
+        generate = getattr(backend, "GenerateLinearTransformsUnifiedLoad", None)
+        if not callable(generate):
+            raise RuntimeError(
+                "Backend does not support cached unified transform load. "
+                "Rebuild the backend shared library or run with io_mode='save'."
+            )
+
+        num_transforms = len(descriptors)
+        diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
+        diag_idxs_lens = (ctypes.c_int * num_transforms)()
+        owned_arrays: list[object] = []
+        for idx, (diag_idxs, _level) in enumerate(descriptors):
+            idx_array = np.ascontiguousarray(diag_idxs, dtype=np.int32)
+            owned_arrays.append(idx_array)
+            diag_idxs_ptrs[idx] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+            diag_idxs_lens[idx] = int(idx_array.size)
+        levels_array = (ctypes.c_int * num_transforms)(*[int(level) for _diag_idxs, level in descriptors])
+        owned_arrays.append(levels_array)
+        return list(generate(num_transforms, diag_idxs_ptrs, diag_idxs_lens, levels_array))
+
+    def _compile_unified_cached_load(self, backend) -> bool:
+        if self._io_mode != "load" or not self._diags_path:
+            return False
+        if not callable(getattr(backend, "GenerateLinearTransformsUnifiedLoad", None)):
+            return False
+
+        descriptors = self._cached_transform_descriptors()
+        self.unified_ids = self._generate_unified_backend_load_batch(backend, descriptors)
+        if len(self.unified_ids) != len(descriptors):
+            raise RuntimeError("backend returned unexpected transform count for cached unified load")
+        self._diag_indices_by_transform = {
+            int(transform_id): tuple(int(idx) for idx in diag_indices)
+            for transform_id, (diag_indices, _level) in zip(self.unified_ids, descriptors)
+        }
+        self._required_keys = ()
+        self._required_keys_by_transform = {}
+        for transform_id in self.unified_ids:
+            self._record_transform_key_requests(backend, int(transform_id))
+        for transform in self.transforms:
+            self._clear_source_diagonals_after_compile(transform)
+        self._offloaded_plaintext_diagonals = True
+        self._prefetch_host_bytes = None
+        self._prefetch_device_bytes = None
+        self._saved_io_host_bytes_by_transform = None
+        gc.collect()
+        return True
 
     def _record_transform_key_requests(self, backend, transform_id: int) -> None:
         requests = tuple((int(key), level) for key, level in self._rotation_key_requests(backend, int(transform_id)))
@@ -1353,16 +1691,36 @@ class UnifiedTransformGroup:
         self._required_keys = tuple(sorted((int(key), level) for key, level in merged.items()))
 
     def _compile_rotation_keys(self, backend) -> None:
+        _unified_compile_trace("rotation_keys_start", group=self._storage_key, required=len(self._required_keys))
+        started = time.perf_counter()
         if self._should_save_rotation_keys():
             self._ensure_serialized_rotation_keys_available(backend)
         elif self._should_offload_rotation_keys():
             self._ensure_serialized_rotation_keys_available(backend)
+            _unified_compile_trace(
+                "rotation_keys_done",
+                group=self._storage_key,
+                required=len(self._required_keys),
+                seconds=f"{time.perf_counter() - started:.6f}",
+            )
             return
         else:
             for key, level in self._required_keys:
                 self._generate_rotation_key(backend, int(key), level)
+        _unified_compile_trace(
+            "rotation_keys_done",
+            group=self._storage_key,
+            required=len(self._required_keys),
+            seconds=f"{time.perf_counter() - started:.6f}",
+        )
 
     def _compile_unified_streaming(self, backend, *, has_complex: bool) -> None:
+        _unified_compile_trace(
+            "streaming_compile_start",
+            group=self._storage_key,
+            transforms=len(self.transforms),
+            has_complex=int(bool(has_complex)),
+        )
         self.unified_ids = []
         self._diag_indices_by_transform = {}
         self._required_keys = ()
@@ -1376,9 +1734,43 @@ class UnifiedTransformGroup:
             if self._storage_key in root:
                 del root[self._storage_key]
             storage = root.create_group(self._storage_key)
+        flatten_workers = _unified_compile_workers(len(self.transforms))
+        flatten_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="orion-unified-stream-flatten")
+            if flatten_workers > 1 and len(self.transforms) > 1
+            else None
+        )
+        next_payload = (
+            flatten_executor.submit(self._flatten_transform_diagonals, self.transforms[0], has_complex=has_complex)
+            if flatten_executor is not None
+            else None
+        )
         try:
             for transform_index, transform in enumerate(self.transforms):
-                payload = self._flatten_transform_diagonals(transform, has_complex=has_complex)
+                _unified_compile_trace("streaming_flatten_start", group=self._storage_key, transform_index=transform_index)
+                flatten_started = time.perf_counter()
+                if next_payload is not None:
+                    payload = next_payload.result()
+                    next_index = int(transform_index) + 1
+                    next_payload = (
+                        flatten_executor.submit(
+                            self._flatten_transform_diagonals,
+                            self.transforms[next_index],
+                            has_complex=has_complex,
+                        )
+                        if flatten_executor is not None and next_index < len(self.transforms)
+                        else None
+                    )
+                else:
+                    payload = self._flatten_transform_diagonals(transform, has_complex=has_complex)
+                _unified_compile_trace(
+                    "streaming_flatten_done",
+                    group=self._storage_key,
+                    transform_index=transform_index,
+                    diag_count=int(payload[0].size),
+                    data_count=int(payload[1].size),
+                    seconds=f"{time.perf_counter() - flatten_started:.6f}",
+                )
                 self._record_memory_event(
                     "before_compile_transform",
                     backend,
@@ -1420,10 +1812,15 @@ class UnifiedTransformGroup:
                     transform_index=int(transform_index),
                     transform_id=transform_id,
                 )
+                del payload
+                gc.collect()
         finally:
+            if flatten_executor is not None:
+                flatten_executor.shutdown(wait=True)
             if handle is not None:
                 handle.close()
         self._offloaded_plaintext_diagonals = bool(save_plaintexts or load_plaintexts)
+        _unified_compile_trace("streaming_compile_done", group=self._storage_key, transforms=len(self.unified_ids))
         self._prefetch_host_bytes = None
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None
@@ -1434,21 +1831,58 @@ class UnifiedTransformGroup:
         if not self.transforms:
             raise ValueError("UnifiedTransformGroup requires at least one transform")
 
+        _unified_compile_trace("compile_group_start", group=self._storage_key, transforms=len(self.transforms))
+        group_started = time.perf_counter()
         self._configure_io()
         self._prefetch_host_bytes = None
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None
         self._resident_plaintext_transform_ids = set()
         self.memory_trace = []
-        has_complex = self._transforms_have_complex_diagonals()
         self._record_memory_event("before_compile_group", backend, ())
-        if self._memory_bounded_compile_enabled(backend):
+        if self._compile_unified_cached_load(backend):
+            pass
+        elif self._memory_bounded_compile_enabled(backend):
+            complex_started = time.perf_counter()
+            has_complex = self._transforms_have_complex_diagonals()
+            _unified_compile_trace(
+                "detect_complex_done",
+                group=self._storage_key,
+                has_complex=int(bool(has_complex)),
+                seconds=f"{time.perf_counter() - complex_started:.6f}",
+            )
             self._compile_unified_streaming(backend, has_complex=has_complex)
         else:
-            payloads = [
-                self._flatten_transform_diagonals(transform, has_complex=has_complex)
-                for transform in self.transforms
-            ]
+            complex_started = time.perf_counter()
+            has_complex = self._transforms_have_complex_diagonals()
+            _unified_compile_trace(
+                "detect_complex_done",
+                group=self._storage_key,
+                has_complex=int(bool(has_complex)),
+                seconds=f"{time.perf_counter() - complex_started:.6f}",
+            )
+            workers = _unified_compile_workers(len(self.transforms))
+            flatten_started = time.perf_counter()
+            _unified_compile_trace("flatten_all_start", group=self._storage_key, transforms=len(self.transforms), workers=workers)
+            if workers > 1 and len(self.transforms) > 1:
+                with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-unified-flatten") as executor:
+                    payloads = list(
+                        executor.map(
+                            lambda transform: self._flatten_transform_diagonals(transform, has_complex=has_complex),
+                            self.transforms,
+                        )
+                    )
+            else:
+                payloads = [
+                    self._flatten_transform_diagonals(transform, has_complex=has_complex)
+                    for transform in self.transforms
+                ]
+            _unified_compile_trace(
+                "flatten_all_done",
+                group=self._storage_key,
+                transforms=len(payloads),
+                seconds=f"{time.perf_counter() - flatten_started:.6f}",
+            )
             self.unified_ids = self._generate_unified_backend_batch(backend, payloads, has_complex=has_complex)
             self._diag_indices_by_transform = {
                 int(transform_id): tuple(int(idx) for idx in diag_idxs)
@@ -1461,6 +1895,7 @@ class UnifiedTransformGroup:
             for transform in self.transforms:
                 self._clear_source_diagonals_after_compile(transform)
             del payloads
+            gc.collect()
         self.is_compiled = True
 
         self._compile_rotation_keys(backend)
@@ -1472,6 +1907,12 @@ class UnifiedTransformGroup:
         self._prepare_shared_cache_plans(backend)
         self._record_memory_event("after_compile_group", backend)
         self._register_shared_saved_io_work_unit(backend)
+        _unified_compile_trace(
+            "compile_group_done",
+            group=self._storage_key,
+            transforms=len(self.unified_ids or ()),
+            seconds=f"{time.perf_counter() - group_started:.6f}",
+        )
 
     def get_transform_ids(self, transform) -> dict[tuple[int, int], int]:
         if not self.is_compiled or self.unified_ids is None:
@@ -1504,6 +1945,11 @@ class UnifiedTransformGroup:
             else self._io_prefetcher.consume(self._storage_key)
         )
         if bundle is None and (self._should_offload_rotation_keys() or self._offloaded_plaintext_diagonals):
+            self._forward_memory_guard(
+                backend,
+                reason=f"before_unified_group_load:{self._storage_key}",
+                transform_ids=self.unified_ids,
+            )
             bundle = self._read_saved_io_bundle(
                 backend,
                 prefetch=False,
@@ -1533,11 +1979,22 @@ class UnifiedTransformGroup:
             self._record_memory_event("after_eval_group", backend)
             self._unload_plaintext_diagonals(backend)
             self._unload_rotation_keys(backend)
+            if bundle is not None:
+                bundle.clear()
+            trim_event = self._forward_memory_guard(
+                backend,
+                reason=f"after_unified_group_unload:{self._storage_key}",
+                transform_ids=self.unified_ids,
+                force_trim=True,
+                raise_on_low=False,
+            )
+            self._record_memory_event("after_eval_group_trim", backend, self.unified_ids, memory_guard=trim_event)
 
     def _evaluate_unified_memory_bounded(self, ct_input_id: int, backend) -> list[int]:
         if self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
         chunks = self._memory_bounded_chunks(backend)
+        stream_plaintexts = bool(self._stream_plaintext_diag_load_enabled(backend))
         output_id_by_transform: dict[int, int] = {}
         group_timing = {
             "read_bundle_s": 0.0,
@@ -1551,23 +2008,14 @@ class UnifiedTransformGroup:
             "cpp_level_adjust_s": 0.0,
             "cpp_baby_step_s": 0.0,
             "cpp_giant_step_s": 0.0,
+            "stream_build_map_s": 0.0,
+            "stream_encode_hoist_s": 0.0,
+            "stream_load_payload_s": 0.0,
+            "stream_eval_s": 0.0,
+            "stream_accumulate_s": 0.0,
             "cpp_push_s": 0.0,
             "cpp_trim_s": 0.0,
         }
-        scheduler = self._shared_saved_io_scheduler()
-        prefetch_key = self._saved_io_prefetch_key()
-        prefetched_group_bundle = None
-        if scheduler is not None:
-            using_shared_prefetch = bool(
-                scheduler.fill_saved_io_prefetch_window(
-                    prefetch_key,
-                    include_current=True,
-                    scratch_reserve_bytes=0,
-                )
-            )
-            if using_shared_prefetch:
-                prefetched_group_bundle = scheduler.consume_saved_io_prefetch(prefetch_key)
-
         def add_timing(chunk_timing: dict[str, float], key: str, value: float) -> None:
             chunk_timing[key] = float(chunk_timing.get(key, 0.0) + float(value))
             group_timing[key] = float(group_timing.get(key, 0.0) + float(value))
@@ -1585,20 +2033,35 @@ class UnifiedTransformGroup:
                 prefetch=False,
                 transform_ids=chunk_ids,
                 required_keys=chunk_required_keys(chunk_ids),
+                include_plaintexts=not stream_plaintexts,
             )
 
         def schedule_chunk_prefetch(next_index: int) -> None:
-            if prefetched_group_bundle is not None or next_index >= len(chunks):
+            if next_index >= len(chunks):
                 return
             next_ids = [int(value) for value in chunks[int(next_index)]]
-            next_host_bytes = int(
-                sum(
-                    int(self._estimate_saved_io_host_bytes_for_transform(backend, int(transform_id)))
-                    for transform_id in next_ids
+            next_host_bytes = 0
+            if not stream_plaintexts:
+                next_host_bytes = int(
+                    sum(
+                        int(self._estimate_saved_io_host_bytes_for_transform(backend, int(transform_id)))
+                        for transform_id in next_ids
+                    )
                 )
-            )
             if not should_prefetch_saved_io(next_host_bytes, backend=None, device_bytes=0):
                 return
+            memory_info = self._host_memory_info()
+            if memory_info is not None:
+                guard = self._forward_memory_guard(
+                    backend,
+                    reason=f"before_unified_chunk_prefetch:{self._storage_key}:{int(next_index)}",
+                    transform_ids=next_ids,
+                    needed_bytes=int(next_host_bytes),
+                    raise_on_low=False,
+                )
+                after = guard.get("after") or guard.get("before") or {}
+                if int(after.get("available_bytes", 0)) - int(next_host_bytes) < int(guard.get("min_available_bytes", 0)):
+                    return
             self._io_prefetcher.submit(
                 chunk_prefetch_key(int(next_index)),
                 lambda ids=next_ids: read_chunk_bundle(ids),
@@ -1612,6 +2075,8 @@ class UnifiedTransformGroup:
             self.unified_ids,
             chunk_count=int(len(chunks)),
             eval_budget_bytes=int(self._eval_budget_bytes(backend)),
+            stream_plaintexts=bool(stream_plaintexts),
+            stream_plaintext_chunk_bytes=int(self._stream_plaintext_diag_load_chunk_bytes()) if stream_plaintexts else 0,
         )
         for chunk_index, chunk_ids in enumerate(chunks):
             chunk_timing = {
@@ -1626,11 +2091,22 @@ class UnifiedTransformGroup:
                 "cpp_level_adjust_s": 0.0,
                 "cpp_baby_step_s": 0.0,
                 "cpp_giant_step_s": 0.0,
+                "stream_build_map_s": 0.0,
+                "stream_encode_hoist_s": 0.0,
+                "stream_load_payload_s": 0.0,
+                "stream_eval_s": 0.0,
+                "stream_accumulate_s": 0.0,
                 "cpp_push_s": 0.0,
                 "cpp_trim_s": 0.0,
             }
             required_keys = self._required_keys_for_transform_ids(chunk_ids)
             required_keys_to_load = self._rotation_key_requests_to_load(backend, chunk_ids, required_keys)
+            memory_guard = self._forward_memory_guard(
+                backend,
+                reason=f"before_unified_chunk_load:{self._storage_key}:{int(chunk_index)}",
+                transform_ids=chunk_ids,
+                stream_plaintexts=bool(stream_plaintexts),
+            )
             self._record_memory_event(
                 "before_eval_chunk_load",
                 backend,
@@ -1638,25 +2114,19 @@ class UnifiedTransformGroup:
                 chunk_index=int(chunk_index),
                 chunk_transform_count=int(len(chunk_ids)),
                 timing=dict(chunk_timing),
+                memory_guard=memory_guard,
             )
             read_started = time.perf_counter()
-            bundle = prefetched_group_bundle
-            if bundle is None:
-                bundle = self._io_prefetcher.consume(chunk_prefetch_key(int(chunk_index)))
+            bundle = self._io_prefetcher.consume(chunk_prefetch_key(int(chunk_index)))
             if bundle is None:
                 bundle = self._read_saved_io_bundle(
                     backend,
                     prefetch=False,
                     transform_ids=chunk_ids,
                     required_keys=required_keys_to_load,
+                    include_plaintexts=not stream_plaintexts,
                 )
             add_timing(chunk_timing, "read_bundle_s", time.perf_counter() - read_started)
-            if chunk_index == 0 and scheduler is not None:
-                scheduler.fill_saved_io_prefetch_window(
-                    prefetch_key,
-                    include_current=False,
-                    scratch_reserve_bytes=0,
-                )
             schedule_chunk_prefetch(int(chunk_index) + 1)
             load_keys_started = time.perf_counter()
             self._load_rotation_keys(
@@ -1667,7 +2137,11 @@ class UnifiedTransformGroup:
             )
             add_timing(chunk_timing, "load_keys_s", time.perf_counter() - load_keys_started)
             load_plaintexts_started = time.perf_counter()
-            self._load_plaintext_diagonals(backend, bundle, transform_ids=chunk_ids)
+            self._load_plaintext_diagonals(
+                backend,
+                None if stream_plaintexts else bundle,
+                transform_ids=chunk_ids,
+            )
             add_timing(chunk_timing, "load_plaintexts_s", time.perf_counter() - load_plaintexts_started)
             self._record_memory_event(
                 "after_eval_chunk_load",
@@ -1713,6 +2187,15 @@ class UnifiedTransformGroup:
                 self._unload_plaintext_diagonals(backend, transform_ids=chunk_ids)
                 self._unload_rotation_keys(backend, transform_ids=chunk_ids)
                 add_timing(chunk_timing, "unload_s", time.perf_counter() - unload_started)
+                if bundle is not None:
+                    bundle.clear()
+                trim_event = self._forward_memory_guard(
+                    backend,
+                    reason=f"after_unified_chunk_unload:{self._storage_key}:{int(chunk_index)}",
+                    transform_ids=chunk_ids,
+                    force_trim=True,
+                    raise_on_low=False,
+                )
                 self._record_memory_event(
                     "after_eval_chunk_unload",
                     backend,
@@ -1720,6 +2203,7 @@ class UnifiedTransformGroup:
                     chunk_index=int(chunk_index),
                     chunk_transform_count=int(len(chunk_ids)),
                     timing=dict(chunk_timing),
+                    memory_guard=trim_event,
                 )
         self._record_memory_event("after_eval_group_memory_bounded", backend, self.unified_ids, timing=dict(group_timing))
         return [int(output_id_by_transform[int(transform_id)]) for transform_id in self.unified_ids]
@@ -1760,6 +2244,13 @@ class UnifiedTransformGroup:
         if self.unified_ids is not None:
             for transform_id in self.unified_ids:
                 backend.DeleteLinearTransform(int(transform_id))
+            self._forward_memory_guard(
+                backend,
+                reason=f"after_unified_group_cleanup:{self._storage_key}",
+                transform_ids=self.unified_ids,
+                force_trim=True,
+                raise_on_low=False,
+            )
         self._delete_offloaded_storage()
         self.unified_ids = None
         self.is_compiled = False

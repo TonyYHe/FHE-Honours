@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -122,6 +123,11 @@ struct LinearTransformState {
   std::unique_ptr<EvkMap> rotation_keys;
   cheddar::StripedMatrix matrix;
   std::vector<int> diag_indices;
+  struct StreamingPlaintextPayloadChunk {
+    std::vector<int> giant_steps;
+    std::vector<unsigned char> payload;
+  };
+  std::vector<StreamingPlaintextPayloadChunk> streaming_plaintext_payload_chunks;
   bool metadata_cached = false;
   unsigned long long cached_device_bytes = 0;
   int cached_uses_streaming = 0;
@@ -182,6 +188,11 @@ struct SharedCacheEvalProfile {
   double level_adjust_s = 0.0;
   double baby_step_s = 0.0;
   double giant_step_s = 0.0;
+  double stream_build_map_s = 0.0;
+  double stream_encode_hoist_s = 0.0;
+  double stream_load_payload_s = 0.0;
+  double stream_eval_s = 0.0;
+  double stream_accumulate_s = 0.0;
   double push_s = 0.0;
   double trim_s = 0.0;
 };
@@ -216,6 +227,14 @@ void AccumulateSharedCacheEvalProfile(const SharedCacheEvalProfile &profile) {
   g_shared_cache_eval_profile.level_adjust_s += profile.level_adjust_s;
   g_shared_cache_eval_profile.baby_step_s += profile.baby_step_s;
   g_shared_cache_eval_profile.giant_step_s += profile.giant_step_s;
+  g_shared_cache_eval_profile.stream_build_map_s += profile.stream_build_map_s;
+  g_shared_cache_eval_profile.stream_encode_hoist_s +=
+      profile.stream_encode_hoist_s;
+  g_shared_cache_eval_profile.stream_load_payload_s +=
+      profile.stream_load_payload_s;
+  g_shared_cache_eval_profile.stream_eval_s += profile.stream_eval_s;
+  g_shared_cache_eval_profile.stream_accumulate_s +=
+      profile.stream_accumulate_s;
   g_shared_cache_eval_profile.push_s += profile.push_s;
   g_shared_cache_eval_profile.trim_s += profile.trim_s;
 }
@@ -577,6 +596,18 @@ bool EnvValueIsTrue(const char *value) {
           std::strcmp(value, "force") == 0);
 }
 
+bool StreamingPlaintextPayloadCacheEnabled() {
+  return !EnvValueIsFalse(std::getenv("ORION_CHEDDAR_LT_STREAM_PAYLOAD_CACHE"));
+}
+
+bool StreamingPlaintextPayloadProfileEnabled() {
+  return EnvValueIsTrue(std::getenv("ORION_CHEDDAR_LT_STREAM_PAYLOAD_PROFILE"));
+}
+
+bool StreamingPlaintextPayloadPipelineEnabled() {
+  return EnvValueIsTrue(std::getenv("ORION_CHEDDAR_LT_STREAM_PAYLOAD_PIPELINE"));
+}
+
 unsigned long long LinearTransformFullLoadBudgetBytes() {
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
@@ -669,7 +700,6 @@ void ReleaseLinearTransformMatrixState(LinearTransformState &state) {
   CacheLinearTransformMetadata(state);
   state.transform.reset();
   state.matrix = cheddar::StripedMatrix();
-  state.diag_indices.clear();
 }
 
 unsigned long long LinearTransformPlaintextBytesPerSlot(
@@ -683,8 +713,8 @@ unsigned long long LinearTransformPlaintextBytesPerSlot(
 std::map<int, unsigned long long> EstimatePlaintextBytesByGiantStep(
     const LinearTransformState &state, const LinearTransformLayout &layout) {
   std::map<int, std::set<int>> baby_steps_by_giant_step;
-  const int width = state.matrix.GetWidth();
-  for (const auto &[diag_idx, _] : state.matrix) {
+  const int width = LinearTransformWidth(state);
+  for (const int diag_idx : LinearTransformDiagIndicesForLayout(state)) {
     int rot = diag_idx % width;
     if (rot < 0) {
       rot += width;
@@ -709,6 +739,12 @@ unsigned long long CiphertextDeviceBytesForNP(const cheddar::NPInfo &np,
   return polys * static_cast<unsigned long long>(np.GetNumTotal()) *
          static_cast<unsigned long long>(g_scheme->param->degree_) *
          static_cast<unsigned long long>(sizeof(word));
+}
+
+unsigned long long LinearTransformCiphertextBytesAtLevel(
+    const LinearTransformState &state) {
+  const auto np = g_scheme->param->LevelToNP(state.level, g_scheme->param->alpha_);
+  return CiphertextDeviceBytesForNP(np);
 }
 
 unsigned long long StreamingGiantStepMemoryBudgetBytes() {
@@ -756,7 +792,7 @@ std::vector<std::vector<int>> BuildStreamingGiantStepChunks(
   const auto bytes_by_gs = EstimatePlaintextBytesByGiantStep(state, layout);
   const unsigned long long ct_bytes =
       bs_cache.empty()
-          ? 0ULL
+          ? LinearTransformCiphertextBytesAtLevel(state)
           : CiphertextDeviceBytesForNP(bs_cache.begin()->second.GetNP());
   const unsigned long long budget =
       fixed_chunk > 0 ? ~0ULL : StreamingGiantStepMemoryBudgetBytes();
@@ -1159,11 +1195,98 @@ Pt ReadPlaintextPayload(const unsigned char *&cursor,
   return plaintext;
 }
 
-std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
-    LinearTransformState &state) {
-  const LinearTransform &transform = EnsureTransformLoaded(state);
-  const auto &plaintext_map = transform.GetPlaintextMap();
+bool HasStreamingPlaintextPayloadCache(const LinearTransformState &state);
+void EnsureLinearTransformStreamingPlaintextPayloadCache(
+    LinearTransformState &state);
 
+struct SerializedPlaintextMapHeader {
+  int level = 0;
+  int bs = 0;
+  int gs = 0;
+  std::uint64_t record_count = 0;
+  const unsigned char *records_begin = nullptr;
+  const unsigned char *end = nullptr;
+};
+
+SerializedPlaintextMapHeader ReadSerializedPlaintextMapHeader(
+    const unsigned char *&cursor, const unsigned char *end) {
+  const std::uint32_t magic = ReadPod<std::uint32_t>(cursor, end);
+  const std::uint32_t version = ReadPod<std::uint32_t>(cursor, end);
+  if (magic != kLinearTransformPlaintextsMagic ||
+      version != kLinearTransformPlaintextsVersion) {
+    AbortWithMessage("unsupported linear transform plaintext payload");
+  }
+  SerializedPlaintextMapHeader header;
+  header.level = ReadPod<std::int32_t>(cursor, end);
+  header.bs = ReadPod<std::int32_t>(cursor, end);
+  header.gs = ReadPod<std::int32_t>(cursor, end);
+  header.record_count = ReadPod<std::uint64_t>(cursor, end);
+  header.records_begin = cursor;
+  header.end = end;
+  return header;
+}
+
+void ValidatePlaintextMapHeader(const LinearTransformState &state,
+                                const SerializedPlaintextMapHeader &header) {
+  if (header.level != state.level || header.bs != state.bs ||
+      header.gs != state.gs) {
+    AbortWithMessage("linear transform plaintext payload does not match transform");
+  }
+}
+
+void AppendPlaintextMapHeader(std::vector<unsigned char> &payload, int level,
+                              int bs, int gs, std::uint64_t record_count) {
+  AppendPod(payload, kLinearTransformPlaintextsMagic);
+  AppendPod(payload, kLinearTransformPlaintextsVersion);
+  AppendPod(payload, static_cast<std::int32_t>(level));
+  AppendPod(payload, static_cast<std::int32_t>(bs));
+  AppendPod(payload, static_cast<std::int32_t>(gs));
+  AppendPod(payload, record_count);
+}
+
+void SkipPlaintextPayloadBytes(const unsigned char *&cursor,
+                               const unsigned char *end) {
+  const int num_main = ReadPod<std::int32_t>(cursor, end);
+  const int num_ter = ReadPod<std::int32_t>(cursor, end);
+  const int num_aux = ReadPod<std::int32_t>(cursor, end);
+  (void)ReadPod<std::int32_t>(cursor, end);
+  (void)ReadPod<double>(cursor, end);
+  const std::uint64_t word_count = ReadPod<std::uint64_t>(cursor, end);
+  const cheddar::NPInfo np(num_main, num_ter, num_aux);
+  const std::uint64_t expected_word_count =
+      static_cast<std::uint64_t>(np.GetNumTotal()) *
+      static_cast<std::uint64_t>(g_scheme->param->degree_);
+  if (word_count != expected_word_count) {
+    AbortWithMessage("serialized plaintext payload has invalid size");
+  }
+  const std::uint64_t byte_count = word_count * sizeof(word);
+  if (static_cast<std::uint64_t>(end - cursor) < byte_count) {
+    AbortWithMessage("serialized word payload is truncated");
+  }
+  cursor += byte_count;
+}
+
+struct SerializedPlaintextRecordRef {
+  int gs_idx = 0;
+  int bs_idx = 0;
+  const unsigned char *begin = nullptr;
+  const unsigned char *end = nullptr;
+};
+
+SerializedPlaintextRecordRef ReadSerializedPlaintextRecordRef(
+    const unsigned char *&cursor, const unsigned char *end) {
+  SerializedPlaintextRecordRef record;
+  record.begin = cursor;
+  record.gs_idx = ReadPod<std::int32_t>(cursor, end);
+  record.bs_idx = ReadPod<std::int32_t>(cursor, end);
+  SkipPlaintextPayloadBytes(cursor, end);
+  record.end = cursor;
+  return record;
+}
+
+std::vector<unsigned char> SerializePlaintextMapBytes(
+    int level, int bs, int gs,
+    const LinearTransform::PlaintextMap &plaintext_map) {
   std::uint64_t record_count = 0;
   std::size_t payload_bytes = 2 * sizeof(std::uint32_t) +
                               3 * sizeof(std::int32_t) +
@@ -1178,12 +1301,7 @@ std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
 
   std::vector<unsigned char> payload;
   payload.reserve(payload_bytes);
-  AppendPod(payload, kLinearTransformPlaintextsMagic);
-  AppendPod(payload, kLinearTransformPlaintextsVersion);
-  AppendPod(payload, static_cast<std::int32_t>(state.level));
-  AppendPod(payload, static_cast<std::int32_t>(state.bs));
-  AppendPod(payload, static_cast<std::int32_t>(state.gs));
-  AppendPod(payload, record_count);
+  AppendPlaintextMapHeader(payload, level, bs, gs, record_count);
   for (const auto &[gs_idx, bs_map] : plaintext_map) {
     for (const auto &[bs_idx, plaintext] : bs_map) {
       AppendPod(payload, static_cast<std::int32_t>(gs_idx));
@@ -1194,27 +1312,17 @@ std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
   return payload;
 }
 
-void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
-                                        const unsigned char *data,
-                                        std::size_t size) {
+LinearTransform::PlaintextMap DeserializePlaintextMapBytes(
+    const LinearTransformState &state, const unsigned char *data,
+    std::size_t size) {
   const unsigned char *cursor = data;
   const unsigned char *end = data + size;
-  const std::uint32_t magic = ReadPod<std::uint32_t>(cursor, end);
-  const std::uint32_t version = ReadPod<std::uint32_t>(cursor, end);
-  if (magic != kLinearTransformPlaintextsMagic ||
-      version != kLinearTransformPlaintextsVersion) {
-    AbortWithMessage("unsupported linear transform plaintext payload");
-  }
-  const int level = ReadPod<std::int32_t>(cursor, end);
-  const int bs = ReadPod<std::int32_t>(cursor, end);
-  const int gs = ReadPod<std::int32_t>(cursor, end);
-  const std::uint64_t record_count = ReadPod<std::uint64_t>(cursor, end);
-  if (level != state.level || bs != state.bs || gs != state.gs) {
-    AbortWithMessage("linear transform plaintext payload does not match transform");
-  }
+  const SerializedPlaintextMapHeader header =
+      ReadSerializedPlaintextMapHeader(cursor, end);
+  ValidatePlaintextMapHeader(state, header);
 
   LinearTransform::PlaintextMap plaintext_map;
-  for (std::uint64_t record = 0; record < record_count; ++record) {
+  for (std::uint64_t record = 0; record < header.record_count; ++record) {
     const int gs_idx = ReadPod<std::int32_t>(cursor, end);
     const int bs_idx = ReadPod<std::int32_t>(cursor, end);
     plaintext_map[gs_idx].emplace(bs_idx, ReadPlaintextPayload(cursor, end));
@@ -1222,6 +1330,134 @@ void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
   if (cursor != end) {
     AbortWithMessage("linear transform plaintext payload has trailing bytes");
   }
+  return plaintext_map;
+}
+
+std::vector<unsigned char> SerializeStreamingPlaintextPayloadChunksBytes(
+    const LinearTransformState &state) {
+  std::uint64_t record_count = 0;
+  std::size_t payload_bytes = 2 * sizeof(std::uint32_t) +
+                              3 * sizeof(std::int32_t) +
+                              sizeof(std::uint64_t);
+  std::vector<std::pair<const unsigned char *, const unsigned char *>>
+      record_ranges;
+  record_ranges.reserve(state.streaming_plaintext_payload_chunks.size());
+  for (const auto &chunk : state.streaming_plaintext_payload_chunks) {
+    const unsigned char *cursor = chunk.payload.data();
+    const unsigned char *end = chunk.payload.data() + chunk.payload.size();
+    const SerializedPlaintextMapHeader header =
+        ReadSerializedPlaintextMapHeader(cursor, end);
+    ValidatePlaintextMapHeader(state, header);
+    record_count += header.record_count;
+    payload_bytes += static_cast<std::size_t>(end - header.records_begin);
+    record_ranges.emplace_back(header.records_begin, end);
+    cursor = header.records_begin;
+    for (std::uint64_t record = 0; record < header.record_count; ++record) {
+      (void)ReadSerializedPlaintextRecordRef(cursor, end);
+    }
+    if (cursor != end) {
+      AbortWithMessage("linear transform plaintext payload has trailing bytes");
+    }
+  }
+
+  std::vector<unsigned char> payload;
+  payload.reserve(payload_bytes);
+  AppendPlaintextMapHeader(payload, state.level, state.bs, state.gs,
+                           record_count);
+  for (const auto &[begin, end] : record_ranges) {
+    AppendRawBytes(payload, begin, static_cast<std::size_t>(end - begin));
+  }
+  return payload;
+}
+
+std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
+    LinearTransformState &state) {
+  if (ShouldStreamLinearTransform(state)) {
+    EnsureLinearTransformStreamingPlaintextPayloadCache(state);
+    if (HasStreamingPlaintextPayloadCache(state)) {
+      return SerializeStreamingPlaintextPayloadChunksBytes(state);
+    }
+  }
+  const LinearTransform &transform = EnsureTransformLoaded(state);
+  return SerializePlaintextMapBytes(state.level, state.bs, state.gs,
+                                    transform.GetPlaintextMap());
+}
+
+void LoadLinearTransformStreamingPlaintextsBytes(LinearTransformState &state,
+                                                 const unsigned char *data,
+                                                 std::size_t size) {
+  const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  const std::vector<std::vector<int>> chunks =
+      BuildStreamingGiantStepChunks(state, layout, {});
+  std::map<int, std::size_t> chunk_index_by_gs;
+  for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
+    for (const int gs_idx : chunks[chunk_index]) {
+      chunk_index_by_gs[gs_idx] = chunk_index;
+    }
+  }
+  std::vector<std::vector<SerializedPlaintextRecordRef>> records_by_chunk(
+      chunks.size());
+
+  const unsigned char *cursor = data;
+  const unsigned char *end = data + size;
+  const SerializedPlaintextMapHeader header =
+      ReadSerializedPlaintextMapHeader(cursor, end);
+  ValidatePlaintextMapHeader(state, header);
+  for (std::uint64_t record = 0; record < header.record_count; ++record) {
+    SerializedPlaintextRecordRef record_ref =
+        ReadSerializedPlaintextRecordRef(cursor, end);
+    const auto chunk_it = chunk_index_by_gs.find(record_ref.gs_idx);
+    if (chunk_it == chunk_index_by_gs.end()) {
+      AbortWithMessage("linear transform plaintext payload has unexpected giant step");
+    }
+    records_by_chunk[chunk_it->second].push_back(record_ref);
+  }
+  if (cursor != end) {
+    AbortWithMessage("linear transform plaintext payload has trailing bytes");
+  }
+
+  state.streaming_plaintext_payload_chunks.clear();
+  state.streaming_plaintext_payload_chunks.reserve(chunks.size());
+  for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
+    const auto &records = records_by_chunk[chunk_index];
+    if (records.empty()) {
+      continue;
+    }
+    LinearTransformState::StreamingPlaintextPayloadChunk cached_chunk;
+    cached_chunk.giant_steps = chunks[chunk_index];
+    std::size_t chunk_payload_bytes = 2 * sizeof(std::uint32_t) +
+                                      3 * sizeof(std::int32_t) +
+                                      sizeof(std::uint64_t);
+    for (const SerializedPlaintextRecordRef &record : records) {
+      chunk_payload_bytes += static_cast<std::size_t>(record.end - record.begin);
+    }
+    cached_chunk.payload.reserve(chunk_payload_bytes);
+    AppendPlaintextMapHeader(cached_chunk.payload, state.level, state.bs,
+                             state.gs,
+                             static_cast<std::uint64_t>(records.size()));
+    for (const SerializedPlaintextRecordRef &record : records) {
+      AppendRawBytes(cached_chunk.payload, record.begin,
+                     static_cast<std::size_t>(record.end - record.begin));
+    }
+    state.streaming_plaintext_payload_chunks.push_back(std::move(cached_chunk));
+  }
+  CacheLinearTransformMetadata(state);
+  state.transform.reset();
+  state.matrix = cheddar::StripedMatrix();
+  if (!PersistSharedCachePlans()) {
+    g_scheme->shared_cache_plans.clear();
+  }
+}
+
+void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
+                                        const unsigned char *data,
+                                        std::size_t size) {
+  if (ShouldStreamLinearTransform(state)) {
+    LoadLinearTransformStreamingPlaintextsBytes(state, data, size);
+    return;
+  }
+  LinearTransform::PlaintextMap plaintext_map =
+      DeserializePlaintextMapBytes(state, data, size);
 
   state.transform.reset();
   state.transform = std::make_unique<LinearTransform>(
@@ -1231,6 +1467,124 @@ void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
   if (!PersistSharedCachePlans()) {
     g_scheme->shared_cache_plans.clear();
   }
+}
+
+bool HasStreamingPlaintextPayloadCache(const LinearTransformState &state) {
+  return !state.streaming_plaintext_payload_chunks.empty();
+}
+
+void EnsureLinearTransformStreamingPlaintextPayloadCache(
+    LinearTransformState &state) {
+  if (!StreamingPlaintextPayloadCacheEnabled() || state.singleton ||
+      HasStreamingPlaintextPayloadCache(state) || !ShouldStreamLinearTransform(state)) {
+    return;
+  }
+  if (state.matrix.empty()) {
+    AbortWithMessage("streaming plaintext payload cache requires raw matrix");
+  }
+
+  const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  const std::vector<std::vector<int>> chunks =
+      BuildStreamingGiantStepChunks(state, layout, {});
+  const bool profile_enabled = StreamingPlaintextPayloadProfileEnabled();
+  const bool pipeline_enabled =
+      StreamingPlaintextPayloadPipelineEnabled() && chunks.size() > 1;
+  const auto total_started = std::chrono::steady_clock::now();
+  double build_map_s = 0.0;
+  double hoist_encode_s = 0.0;
+  double serialize_s = 0.0;
+  std::size_t nonempty_chunks = 0;
+  std::size_t payload_bytes = 0;
+  std::size_t max_payload_bytes = 0;
+
+  struct ChunkBuildResult {
+    cheddar::PlainHoistMap map;
+    double seconds = 0.0;
+  };
+
+  auto build_chunk_map = [&](std::size_t chunk_index) -> ChunkBuildResult {
+    const auto build_started = std::chrono::steady_clock::now();
+    ChunkBuildResult result;
+    result.map = BuildPlainHoistMapForGiantSteps(
+        state, layout, chunks.at(chunk_index));
+    result.seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      build_started)
+            .count();
+    return result;
+  };
+
+  state.streaming_plaintext_payload_chunks.clear();
+  state.streaming_plaintext_payload_chunks.reserve(chunks.size());
+  std::future<ChunkBuildResult> next_build;
+  if (pipeline_enabled) {
+    next_build =
+        std::async(std::launch::async, build_chunk_map, std::size_t{0});
+  }
+  for (std::size_t chunk_index = 0; chunk_index < chunks.size();
+       ++chunk_index) {
+    ChunkBuildResult chunk_build;
+    if (pipeline_enabled) {
+      chunk_build = next_build.get();
+      if (chunk_index + 1 < chunks.size()) {
+        next_build = std::async(std::launch::async, build_chunk_map,
+                                chunk_index + 1);
+      }
+    } else {
+      chunk_build = build_chunk_map(chunk_index);
+    }
+    build_map_s += chunk_build.seconds;
+    cheddar::PlainHoistMap &chunk_map = chunk_build.map;
+    if (chunk_map.empty()) {
+      continue;
+    }
+    ++nonempty_chunks;
+    const auto hoist_started = std::chrono::steady_clock::now();
+    HoistHandler chunk_hoist(g_scheme->context, chunk_map, state.level,
+                             g_scheme->param->GetScale(state.level), true);
+    hoist_encode_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      hoist_started)
+            .count();
+    LinearTransformState::StreamingPlaintextPayloadChunk cached_chunk;
+    cached_chunk.giant_steps = chunks.at(chunk_index);
+    const auto serialize_started = std::chrono::steady_clock::now();
+    cached_chunk.payload = SerializePlaintextMapBytes(
+        state.level, state.bs, state.gs, chunk_hoist.GetPlaintextMap());
+    serialize_s +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      serialize_started)
+            .count();
+    payload_bytes += cached_chunk.payload.size();
+    max_payload_bytes = std::max(max_payload_bytes, cached_chunk.payload.size());
+    state.streaming_plaintext_payload_chunks.push_back(std::move(cached_chunk));
+  }
+  if (profile_enabled) {
+    const double total_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      total_started)
+            .count();
+    std::fprintf(
+        stderr,
+        "Cheddar streaming payload compile profile: chunks=%zu nonempty=%zu "
+        "pipeline=%d build_map_s=%.6f hoist_encode_s=%.6f "
+        "serialize_s=%.6f total_s=%.6f payload_bytes=%zu "
+        "max_payload_bytes=%zu diag_count=%zu bs=%d gs=%d level=%d\n",
+        chunks.size(), nonempty_chunks, pipeline_enabled ? 1 : 0, build_map_s,
+        hoist_encode_s, serialize_s, total_s, payload_bytes, max_payload_bytes,
+        state.matrix.size(), state.bs, state.gs, state.level);
+    std::fflush(stderr);
+  }
+  CacheLinearTransformMetadata(state);
+  state.transform.reset();
+  state.matrix = cheddar::StripedMatrix();
+}
+
+LinearTransform::PlaintextMap LoadStreamingPlaintextPayloadChunk(
+    const LinearTransformState &state,
+    const LinearTransformState::StreamingPlaintextPayloadChunk &chunk) {
+  return DeserializePlaintextMapBytes(state, chunk.payload.data(),
+                                      chunk.payload.size());
 }
 
 template <typename Fn>
@@ -1439,9 +1793,10 @@ int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
   for (const auto &[diag_idx, _] : matrix) {
     diag_indices.push_back(diag_idx);
   }
-  return g_scheme->transforms.Add(
-      LinearTransformState(std::unique_ptr<LinearTransform>(), matrix,
-                           std::move(diag_indices), level, bs, gs));
+  LinearTransformState state(std::unique_ptr<LinearTransform>(), matrix,
+                             std::move(diag_indices), level, bs, gs);
+  EnsureLinearTransformStreamingPlaintextPayloadCache(state);
+  return g_scheme->transforms.Add(std::move(state));
 }
 
 int AddLinearTransformFromDescriptor(const int *diag_idxs, int diag_count,
@@ -1463,6 +1818,10 @@ int AddLinearTransformFromDescriptor(const int *diag_idxs, int diag_count,
                              bs, gs);
   CacheLinearTransformMetadata(state);
   return g_scheme->transforms.Add(std::move(state));
+}
+
+int DefaultLinearTransformDescriptorWidth() {
+  return std::max(1, g_scheme->param->degree_ / 2);
 }
 
 int SingletonLinearTransformRotationKey(const LinearTransformState &state) {
@@ -1553,26 +1912,70 @@ void PrepareLinearTransformRotationKeysAtLevel(
 
 void EvaluateLinearTransformGiantStepStreaming(
     const LinearTransformState &state, Ct &output,
-    const std::map<int, Ct> &bs_cache, const EvkMap &evk_map) {
+    const std::map<int, Ct> &bs_cache, const EvkMap &evk_map,
+    SharedCacheEvalProfile *profile = nullptr) {
   const LinearTransformLayout layout = DescribeLinearTransformLayout(state);
+  const bool use_cached_payloads = HasStreamingPlaintextPayloadCache(state);
   const std::vector<std::vector<int>> chunks =
-      BuildStreamingGiantStepChunks(state, layout, bs_cache);
+      use_cached_payloads ? std::vector<std::vector<int>>()
+                          : BuildStreamingGiantStepChunks(state, layout, bs_cache);
+  if (use_cached_payloads &&
+      EnvValueIsTrue(std::getenv("ORION_CHEDDAR_LT_STREAM_LOG"))) {
+    std::fprintf(stderr,
+                 "Cheddar cached streaming LT: %zu giant steps in %zu chunks\n",
+                 layout.giant_steps.size(),
+                 state.streaming_plaintext_payload_chunks.size());
+  }
   bool initialized = false;
   Ct accumulated_output;
-  for (const std::vector<int> &chunk : chunks) {
-    cheddar::PlainHoistMap chunk_map =
-        BuildPlainHoistMapForGiantSteps(state, layout, chunk);
-    if (chunk_map.empty()) {
-      continue;
-    }
+  const std::size_t chunk_count =
+      use_cached_payloads ? state.streaming_plaintext_payload_chunks.size()
+                          : chunks.size();
+  for (std::size_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
     Ct partial_output;
-    {
-      HoistHandler chunk_hoist(g_scheme->context, chunk_map, state.level,
-                               g_scheme->param->GetScale(state.level), true);
+    if (use_cached_payloads) {
+      const auto load_started = std::chrono::steady_clock::now();
+      LinearTransform::PlaintextMap plaintext_map = LoadStreamingPlaintextPayloadChunk(
+          state, state.streaming_plaintext_payload_chunks.at(chunk_index));
+      HoistHandler chunk_hoist(g_scheme->context, std::move(plaintext_map),
+                               state.level,
+                               g_scheme->param->GetScale(state.level));
+      if (profile != nullptr) {
+        AddDuration(profile->stream_load_payload_s, load_started);
+      }
+      const auto eval_started = std::chrono::steady_clock::now();
       chunk_hoist.EvaluateGiantStep(g_scheme->context, partial_output, bs_cache,
                                     evk_map, kUseMinKSLinearTransforms);
       SynchronizeCudaAfterStreamingChunk();
+      if (profile != nullptr) {
+        AddDuration(profile->stream_eval_s, eval_started);
+      }
+    } else {
+      const std::vector<int> &chunk = chunks.at(chunk_index);
+      const auto build_started = std::chrono::steady_clock::now();
+      cheddar::PlainHoistMap chunk_map =
+          BuildPlainHoistMapForGiantSteps(state, layout, chunk);
+      if (profile != nullptr) {
+        AddDuration(profile->stream_build_map_s, build_started);
+      }
+      if (chunk_map.empty()) {
+        continue;
+      }
+      const auto encode_started = std::chrono::steady_clock::now();
+      HoistHandler chunk_hoist(g_scheme->context, chunk_map, state.level,
+                               g_scheme->param->GetScale(state.level), true);
+      if (profile != nullptr) {
+        AddDuration(profile->stream_encode_hoist_s, encode_started);
+      }
+      const auto eval_started = std::chrono::steady_clock::now();
+      chunk_hoist.EvaluateGiantStep(g_scheme->context, partial_output, bs_cache,
+                                    evk_map, kUseMinKSLinearTransforms);
+      SynchronizeCudaAfterStreamingChunk();
+      if (profile != nullptr) {
+        AddDuration(profile->stream_eval_s, eval_started);
+      }
     }
+    const auto accumulate_started = std::chrono::steady_clock::now();
     if (!initialized) {
       accumulated_output = std::move(partial_output);
       initialized = true;
@@ -1580,6 +1983,9 @@ void EvaluateLinearTransformGiantStepStreaming(
       Ct sum;
       g_scheme->context->Add(sum, accumulated_output, partial_output);
       accumulated_output = std::move(sum);
+    }
+    if (profile != nullptr) {
+      AddDuration(profile->stream_accumulate_s, accumulate_started);
     }
   }
   if (!initialized) {
@@ -2067,6 +2473,11 @@ ArrayResultDouble ConsumeSharedCacheEvalProfileSeconds() {
       g_shared_cache_eval_profile.level_adjust_s,
       g_shared_cache_eval_profile.baby_step_s,
       g_shared_cache_eval_profile.giant_step_s,
+      g_shared_cache_eval_profile.stream_build_map_s,
+      g_shared_cache_eval_profile.stream_encode_hoist_s,
+      g_shared_cache_eval_profile.stream_load_payload_s,
+      g_shared_cache_eval_profile.stream_eval_s,
+      g_shared_cache_eval_profile.stream_accumulate_s,
       g_shared_cache_eval_profile.push_s,
       g_shared_cache_eval_profile.trim_s,
   };
@@ -2625,6 +3036,20 @@ ArrayResultInt GenerateLinearTransformsUnifiedComplex(
   return MakeIntArrayResult(ids);
 }
 
+ArrayResultInt GenerateLinearTransformsUnifiedLoad(
+    int numTransforms, const int *const *diagIdxsArray, const int *diagIdxsLens,
+    const int *levels) {
+  RequireScheme();
+  std::vector<int> ids;
+  ids.reserve(numTransforms);
+  const int width = DefaultLinearTransformDescriptorWidth();
+  for (int i = 0; i < numTransforms; ++i) {
+    ids.push_back(AddLinearTransformFromDescriptor(
+        diagIdxsArray[i], diagIdxsLens[i], width, levels[i], 2.0f));
+  }
+  return MakeIntArrayResult(ids);
+}
+
 ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
                                                        int numTransforms,
                                                        int ciphertextID) {
@@ -2713,7 +3138,7 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
       if (ShouldStreamLinearTransform(*eval_transform_state)) {
         EvaluateLinearTransformGiantStepStreaming(
             *eval_transform_state, output, bs_cache,
-            LinearTransformEvkMap(transform_state));
+            LinearTransformEvkMap(transform_state), &profile);
       } else {
         LinearTransform &transform = EnsureTransformLoaded(*eval_transform_state);
         transform.EvaluateGiantStep(g_scheme->context, output, bs_cache,

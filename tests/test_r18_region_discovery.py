@@ -109,3 +109,25 @@ def test_region_first_mode_options_leave_honest_r18_e2e_without_probe_bypasses()
     assert options["attach_probe_stem_activation_bypass"] is False
     assert options["probe_region_precompiled"] is False
     assert options["probe_publishable"] is False
+
+
+def test_region_first_mode_options_can_filter_r18_e2e_stages() -> None:
+    options = _region_first_mode_options("r18_tiny_e2e_stage24")
+
+    assert options["enabled"] is True
+    assert options["is_r18"] is True
+    assert options["allowed_stages"] == ("stage2", "stage4")
+    assert options["attach_probe_dense_bypass"] is False
+    assert options["attach_probe_stem_activation_bypass"] is False
+
+
+def test_region_first_mode_options_can_probe_precompile_one_stage() -> None:
+    options = _region_first_mode_options("r18_tiny_e2e_probe_precompile_stage4")
+
+    assert options["enabled"] is True
+    assert options["is_r18"] is True
+    assert options["allowed_stages"] == ("stage4",)
+    assert options["attach_probe_dense_bypass"] is True
+    assert options["attach_probe_stem_activation_bypass"] is True
+    assert options["probe_region_precompiled"] is True
+    assert options["lazy_region_compile"] is False

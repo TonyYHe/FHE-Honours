@@ -639,10 +639,10 @@ _PHASE1_KERNEL_BINDINGS: tuple[KernelBinding, ...] = (
     KernelBinding(
         family_label="stem_conv",
         provider_key="r34_stem_conv_inter_group_hybrid_policy",
-        provider_kind="python_single_flow",
+        provider_kind="tile_local_transition_bridge",
         materializer="policy_inter_group_hybrid",
         phase1_status="implemented",
-        note="Stem conv7x7 currently uses the Python single-flow runtime under the same source-group policy; non-Python backends still fall back.",
+        note="Stem conv7x7 uses the shared-rotation input-pair provider under the same source-group policy.",
     ),
     KernelBinding(
         family_label="stem_pool",
@@ -1231,6 +1231,7 @@ class R34TransitionHybridRuntimeExecutor:
         self.shortcut_bias_vector = packing.construct_conv2d_bias(self.shortcut_module).to(dtype=torch.float32)
 
         groups: list[Any] = []
+        compile_started = __import__("time").time()
         for col_index in range(int(self.cols)):
             transforms: list[Any] = []
             for row_index in range(int(self.rows)):
@@ -1249,12 +1250,13 @@ class R34TransitionHybridRuntimeExecutor:
                         output_shape=torch.Size([1, int(self.slots)]),
                     )
                 )
-            groups.append(UnifiedTransformGroup(transforms))
-        self.last_runtime_timing["prepare_transforms_s"] = float(__import__("time").time() - prepared_started)
-
-        compile_started = __import__("time").time()
-        for group in groups:
+            group = UnifiedTransformGroup(transforms)
             group.compile_unified(scheme.backend)
+            groups.append(group)
+            for row_index in range(int(self.rows)):
+                conv_diagonals.pop((int(row_index), int(col_index)), None)
+                shortcut_diagonals.pop((int(row_index), int(col_index)), None)
+        self.last_runtime_timing["prepare_transforms_s"] = float(__import__("time").time() - prepared_started)
         self.groups_by_input_block = groups
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(__import__("time").time() - compile_started)
@@ -1368,6 +1370,7 @@ class R34DenseSingleFlowRuntimeExecutor:
             "postprocess_s": 0.0,
         }
         self._proxy: _DenseTransformProxy | None = None
+        self._compile_cache_metadata: dict[str, Any] = {}
 
     def supports_scheme(self, scheme: Any | None) -> bool:
         return scheme is not None
@@ -1379,21 +1382,41 @@ class R34DenseSingleFlowRuntimeExecutor:
         depth = 0 if self.assigned_depth is None else int(self.assigned_depth)
         return max(0, int(self._level(scheme)) - int(depth))
 
+    def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
+        self._compile_cache_metadata = dict(metadata or {})
+
+    def compile_cache_metadata(self) -> dict[str, Any]:
+        return {
+            "layer_name": f"{self.output_node_id}_dense_runtime",
+            "rows": int(self.rows),
+            "cols": int(self.cols),
+            "output_rotations": int(self.output_rotations),
+        }
+
     def compile(self, scheme: Any) -> None:
         if self._proxy is not None:
             return
         prepare_started = time.time()
-        diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
+        layer_name = f"{self.output_node_id}_dense_runtime"
+        io_mode = str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower()
+        if io_mode == "load" and self._compile_cache_metadata:
+            load_shell = getattr(scheme.lt_evaluator, "load_transform_shell_metadata", None)
+            if not callable(load_shell):
+                raise RuntimeError("cached R34 dense runtime load requires lt_evaluator.load_transform_shell_metadata")
+            diagonals, output_rotations = load_shell(str(self._compile_cache_metadata.get("layer_name", layer_name)))
+        else:
+            diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
         level = self._level(scheme)
         self.output_rotations = int(output_rotations)
         self._proxy = _DenseTransformProxy(
-            name=f"{self.output_node_id}_dense_runtime",
+            name=layer_name,
             diagonals=diagonals,
             level=int(level),
             bsgs_ratio=float(getattr(self.module, "bsgs_ratio", 2.0)),
             output_shape=self.output_shape,
             fhe_output_shape=self.fhe_output_shape,
         )
+        diagonals.clear()
         bias = packing.construct_conv2d_bias(self.module)
         self.on_bias_ptxt = scheme.encoder.encode(bias, self._bias_level(scheme))
         self.last_runtime_timing = {
@@ -1555,7 +1578,7 @@ def _r34_direct_runtime_from_modules(
     module = modules[0]
     if not _r34_direct_module_compatible(module, contract):
         return group
-    if str(group.stage) in {"stem_pool", "global_avgpool_exit"}:
+    if str(group.stage) in {"stem_conv", "stem_pool", "global_avgpool_exit"}:
         executor = InputPairConvRuntimeExecutor(module=module, output_node_id=str(group.conv_nodes[0]))
     else:
         executor = R34DenseSingleFlowRuntimeExecutor(

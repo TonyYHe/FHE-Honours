@@ -18,7 +18,7 @@ from orion.nn.module import Module
 
 DATASET_SPECS = {
     "tiny": {"image_size": 64, "logn": 15, "input_channels": 3},
-    "imagenet": {"image_size": 256, "logn": 17, "input_channels": 3},
+    "imagenet": {"image_size": 256, "logn": 16, "input_channels": 3},
     "montgomery_lung_64": {"image_size": 64, "logn": 15, "input_channels": 1},
 }
 
@@ -395,5 +395,60 @@ def test_u22_tconv_provider_runtime_handles_multi_input_and_output_blocks_on_pyt
         assert float((result - reference).abs().max().item()) <= 1.0e-5
         assert float((no_hybrid_result - reference).abs().max().item()) <= 1.0e-5
         assert float((result - no_hybrid_result).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_tconv_provider_splits_one_plane_across_many_ciphertexts_on_python_backend() -> None:
+    _init_python_scheme(logn=8)
+    try:
+        torch.manual_seed(23)
+        module = ConvTranspose2d(
+            in_channels=8,
+            out_channels=4,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            output_padding=0,
+            groups=1,
+            bias=True,
+        )
+        module.eval()
+        module.init_orion_params()
+        module.input_shape = torch.Size((1, 8, 4, 4))
+        module.output_shape = torch.Size((1, 4, 8, 8))
+        module.input_gap = 4
+        module.output_gap = 2
+        module.fhe_input_shape = torch.Size((1, 1, 16, 16))
+        module.fhe_output_shape = torch.Size((1, 1, 16, 16))
+        module.set_level(len(scheme.params.get_logq()) - 1)
+
+        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="split_plane_tconv")
+        assert runtime.supports_scheme(scheme) is True
+
+        torch.manual_seed(29)
+        x = torch.randn(tuple(int(v) for v in module.input_shape), dtype=torch.float32)
+        source = _encode_input(module, x[0])
+        out = runtime(source)
+        result = _decode_output(module, out["split_plane_tconv"])
+        reference = F.conv_transpose2d(
+            x,
+            module.on_weight.detach().to(dtype=torch.float32),
+            module.on_bias.detach().to(dtype=torch.float32),
+            stride=tuple(int(v) for v in module.stride),
+            padding=tuple(int(v) for v in module.padding),
+            output_padding=tuple(int(v) for v in module.output_padding),
+            groups=int(module.groups),
+            dilation=tuple(int(v) for v in module.dilation),
+        )[0]
+
+        assert len(source.ids) == 2
+        assert runtime.input_block_count == 2
+        assert runtime.output_block_count == 2
+        assert len(out["split_plane_tconv"].ids) == 2
+        assert runtime.input_block_pairs == [(0, 1)]
+        assert len(runtime.groups) == 1
+        assert runtime.block_evaluate_count == 1
+        assert float((result - reference).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()

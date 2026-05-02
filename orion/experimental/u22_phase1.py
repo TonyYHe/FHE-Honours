@@ -316,6 +316,8 @@ class TconvK2S2PythonRuntimeExecutor:
         self.complex_input_block_flags: list[bool] = []
         self.output_block_count = 0
         self.input_block_count = 0
+        self.input_total_slots = 0
+        self.output_total_slots = 0
         self.compile_count = 0
         self.block_evaluate_count = 0
         self.real_projection_count = 0
@@ -423,9 +425,7 @@ class TconvK2S2PythonRuntimeExecutor:
         if backend not in {"python", "lattigo", "cheddar"}:
             return False
         slots = int(scheme.params.get_slots())
-        input_plane = int(torch.Size(getattr(self.module, "fhe_input_shape"))[2:].numel())
-        output_plane = int(torch.Size(getattr(self.module, "fhe_output_shape"))[2:].numel())
-        return int(max(input_plane, output_plane)) <= int(slots)
+        return int(slots) > 0
 
     def _block_layout(self, *, scheme: Any) -> dict[str, int]:
         slots = int(scheme.params.get_slots())
@@ -439,12 +439,16 @@ class TconvK2S2PythonRuntimeExecutor:
         output_plane = int(on_ho * on_wo)
         input_channels_per_block = max(1, int(slots // input_plane))
         output_channels_per_block = max(1, int(slots // output_plane))
+        input_total_slots = int(on_ci * on_hi * on_wi)
+        output_total_slots = int(on_co * on_ho * on_wo)
         return {
             "slots": int(slots),
             "input_channels_per_block": int(input_channels_per_block),
             "output_channels_per_block": int(output_channels_per_block),
-            "input_block_count": int(math.ceil(int(on_ci) / int(input_channels_per_block))),
-            "output_block_count": int(math.ceil(int(on_co) / int(output_channels_per_block))),
+            "input_block_count": int(math.ceil(int(input_total_slots) / int(slots))),
+            "output_block_count": int(math.ceil(int(output_total_slots) / int(slots))),
+            "input_total_slots": int(input_total_slots),
+            "output_total_slots": int(output_total_slots),
         }
 
     def compile(self, scheme: Any) -> None:
@@ -547,6 +551,8 @@ class TconvK2S2PythonRuntimeExecutor:
         slots = int(layout["slots"])
         self.input_block_count = int(layout["input_block_count"])
         self.output_block_count = int(layout["output_block_count"])
+        self.input_total_slots = int(layout["input_total_slots"])
+        self.output_total_slots = int(layout["output_total_slots"])
 
         diagonal_entries: list[list[dict[int, dict[int, float]]]] = [
             [

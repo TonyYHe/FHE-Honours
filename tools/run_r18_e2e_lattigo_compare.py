@@ -539,6 +539,9 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     groups = list(getattr(executor, "groups_by_pair", []) or [])
     if groups:
         return _unified_group_rotation_stats(groups)
+    groups = list(getattr(executor, "groups_by_input", []) or [])
+    if groups:
+        return _unified_group_rotation_stats(groups)
     groups_by_input_index = getattr(executor, "groups_by_input_index", None) or {}
     if groups_by_input_index:
         return _unified_group_rotation_stats([group for _input_index, group in sorted(groups_by_input_index.items())])

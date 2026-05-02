@@ -719,6 +719,30 @@ def test_unified_transform_group_registers_shared_saved_io_prefetch(tmp_path) ->
     assert scheduler.unregistered == [("unified", group._storage_key)]
 
 
+def test_memory_bounded_unified_group_skips_full_group_prefetch(tmp_path) -> None:
+    diags_path = tmp_path / "unified_diagonals.h5"
+    scheduler = _FakeSavedIOScheduler()
+    transforms = (
+        _fake_transform({0: [1.0, 0.0, 0.0, 0.0]}, io_mode="save", diags_path=str(diags_path)),
+        _fake_transform({0: [2.0, 0.0, 0.0, 0.0]}, io_mode="save", diags_path=str(diags_path)),
+    )
+    for transform in transforms:
+        transform.scheme.lt_evaluator = scheduler
+
+    backend = _FakeBackend()
+    backend.memory_bounded_unified_transforms = True
+    backend.memory_bounded_unified_evaluate = True
+    backend.unified_transform_eval_budget_bytes = 100
+    group = UnifiedTransformGroup(transforms)
+
+    group.compile_unified(backend)
+    outputs = group.evaluate_unified(7, backend)
+
+    assert outputs == [100, 100]
+    assert scheduler.registered == []
+    assert backend.evaluated == [([11], 7), ([12], 7)]
+
+
 def test_unified_transform_group_skips_payloads_when_backend_does_not_need_them(tmp_path) -> None:
     diags_path = tmp_path / "unified_diagonals.h5"
     transforms = (

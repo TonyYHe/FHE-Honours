@@ -193,6 +193,31 @@ def _slot_count_from_diags(module, diags: dict[int, Any]) -> int:
     return 0
 
 
+def _compiled_diag_indices_by_block(module) -> dict[tuple[int, int], tuple[int, ...]]:
+    saved = getattr(module, "_compile_cache_diag_indices_by_block", None)
+    if not isinstance(saved, dict):
+        return {}
+    out: dict[tuple[int, int], tuple[int, ...]] = {}
+    for key, indices in saved.items():
+        try:
+            row, col = key
+        except (TypeError, ValueError):
+            continue
+        out[(int(row), int(col))] = tuple(sorted(int(idx) for idx in indices))
+    return out
+
+
+def _compiled_slot_count(module, key: tuple[int, int]) -> int:
+    saved = getattr(module, "_compile_cache_slot_count_by_block", None)
+    if isinstance(saved, dict) and key in saved:
+        return int(saved[key])
+    scheme = getattr(module, "scheme", None)
+    params = getattr(scheme, "params", None)
+    if params is not None and hasattr(params, "get_slots"):
+        return int(params.get_slots())
+    return 0
+
+
 def _rotation_requests_for_layer(layer: LinearTransform, transform_id: int | None) -> list[dict[str, int | None]]:
     if transform_id is None:
         return []
@@ -299,9 +324,16 @@ def collect_transform_metadata(linear_layers: list[LinearTransform]) -> dict[str
     for layer in linear_layers:
         blocks = []
         diagonals = getattr(layer, "diagonals", {}) or {}
-        for key in sorted(diagonals):
+        saved_diag_indices = _compiled_diag_indices_by_block(layer)
+        block_keys = sorted(set(diagonals) | set(saved_diag_indices))
+        for key in block_keys:
             row, col = key
-            diag_indices = sorted(int(idx) for idx in diagonals[key].keys())
+            if key in diagonals:
+                diag_indices = sorted(int(idx) for idx in diagonals[key].keys())
+                slot_count = _slot_count_from_diags(layer, diagonals[key])
+            else:
+                diag_indices = list(saved_diag_indices[key])
+                slot_count = _compiled_slot_count(layer, key)
             transform_id = None
             transform_ids = getattr(layer, "transform_ids", {}) or {}
             if key in transform_ids:
@@ -318,14 +350,19 @@ def collect_transform_metadata(linear_layers: list[LinearTransform]) -> dict[str
                         level=_module_level(layer),
                         scale=_module_scale(layer),
                         bsgs_ratio=float(getattr(layer, "bsgs_ratio", 0.0)),
-                        slot_count=_slot_count_from_diags(layer, diagonals[key]),
+                        slot_count=int(slot_count),
                         rotation_requests=_rotation_requests_for_layer(layer, transform_id),
                         transform_id=transform_id,
                         payload_refs=_payload_refs(layer, int(row), int(col)),
                     )
                 ),
             }
-            block.update(_diag_index_digest(diagonals[key]))
+            block.update(
+                {
+                    "diag_count": int(len(diag_indices)),
+                    "diag_indices_sha256": _hash_json(diag_indices),
+                }
+            )
             blocks.append(block)
         layers.append(
             {
@@ -358,6 +395,11 @@ def collect_provider_metadata(network_dag) -> dict[str, Any]:
         if runtime is None:
             continue
         executor = getattr(runtime, "executor", None)
+        executor_metadata = {}
+        if executor is not None:
+            get_metadata = getattr(executor, "compile_cache_metadata", None)
+            if callable(get_metadata):
+                executor_metadata = dict(get_metadata() or {})
         rows.append(
             {
                 "node": str(node),
@@ -366,11 +408,34 @@ def collect_provider_metadata(network_dag) -> dict[str, Any]:
                 "executable": bool(getattr(runtime, "executable", False)),
                 "assigned_level": None if getattr(runtime, "assigned_level", None) is None else int(runtime.assigned_level),
                 "assigned_depth": None if getattr(runtime, "assigned_depth", None) is None else int(runtime.assigned_depth),
+                "executor_metadata": executor_metadata,
             }
         )
     payload = {"rows": rows}
     payload["sha256"] = _hash_json(payload)
     return payload
+
+
+def apply_provider_metadata(network_dag, provider_metadata: dict[str, Any]) -> None:
+    rows = {
+        str(row.get("node")): row
+        for row in list((provider_metadata or {}).get("rows", []))
+        if isinstance(row, dict) and row.get("node") is not None
+    }
+    for node in network_dag.nodes:
+        row = rows.get(str(node))
+        if row is None:
+            continue
+        module = network_dag.nodes[node].get("module")
+        runtime = getattr(module, "region_runtime", None) if module is not None else None
+        executor = getattr(runtime, "executor", None) if runtime is not None else None
+        if executor is None:
+            continue
+        metadata = dict(row.get("executor_metadata") or {})
+        setattr(executor, "_compile_cache_metadata", metadata)
+        load_metadata = getattr(executor, "load_compile_cache_metadata", None)
+        if callable(load_metadata):
+            load_metadata(metadata)
 
 
 def build_manifest(

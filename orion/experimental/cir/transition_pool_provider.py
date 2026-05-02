@@ -52,6 +52,10 @@ def _transform_proxy(
     )
 
 
+def _cached_transform_shell(*, level: int, scheme: Any) -> Any:
+    return SimpleNamespace(diagonals={}, level=int(level), scheme=scheme)
+
+
 def _diag_tensor(value: Any, *, slots: int) -> torch.Tensor:
     if value is None:
         return torch.zeros((int(slots),), dtype=torch.float32)
@@ -192,6 +196,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             "input_pack_s": 0.0,
             "real_extract_s": 0.0,
         }
+        self._compile_cache_metadata: dict[str, Any] = {}
 
     def supports_scheme(self, scheme: Any | None) -> bool:
         if scheme is None:
@@ -202,8 +207,60 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
 
+    def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
+        self._compile_cache_metadata = dict(metadata or {})
+
+    def compile_cache_metadata(self) -> dict[str, Any]:
+        return {
+            "kind": self.kernel_kind,
+            "rows": int(self.rows),
+            "cols": int(self.cols),
+            "output_rotations": int(self.output_rotations),
+            "groups": [
+                {
+                    "storage_key": str(getattr(group, "_storage_key", "")),
+                    "row_indices": [int(value) for value in self.row_indices_by_pair[index]],
+                    "input_block_pair": [
+                        int(self.input_block_pairs[index][0]),
+                        None if self.input_block_pairs[index][1] is None else int(self.input_block_pairs[index][1]),
+                    ],
+                    "pair_is_complex": bool(self.pair_is_complex[index]),
+                }
+                for index, group in enumerate(self.groups_by_pair)
+            ],
+        }
+
+    def _compile_from_cache_metadata(self, scheme: Any) -> bool:
+        metadata = dict(self._compile_cache_metadata or {})
+        if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
+            return False
+        self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
+        self.rows = int(metadata.get("rows", 0))
+        self.cols = int(metadata.get("cols", 0))
+        self.output_rotations = int(metadata.get("output_rotations", 0))
+        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        level = int(self._level(scheme))
+        compile_started = time.perf_counter()
+        for group_meta in list(metadata.get("groups", [])):
+            row_indices = tuple(int(value) for value in group_meta.get("row_indices", []))
+            group = UnifiedTransformGroup(
+                [_cached_transform_shell(level=int(level), scheme=scheme) for _row in row_indices]
+            )
+            group._storage_key = str(group_meta["storage_key"])
+            group.compile_unified(scheme.backend)
+            pair = list(group_meta.get("input_block_pair", []))
+            self.groups_by_pair.append(group)
+            self.row_indices_by_pair.append(row_indices)
+            self.input_block_pairs.append((int(pair[0]), None if len(pair) < 2 or pair[1] is None else int(pair[1])))
+            self.pair_is_complex.append(bool(group_meta.get("pair_is_complex", False)))
+        self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
+        return True
+
     def compile(self, scheme: Any) -> None:
         if self.groups_by_pair:
+            return
+        if self._compile_from_cache_metadata(scheme):
             return
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         prepare_started = time.perf_counter()
@@ -228,6 +285,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             )
             for (row, col), diag in diagonals.items()
         }
+        diagonals.clear()
         self.last_runtime_timing["prepare_transforms_s"] = float(time.perf_counter() - prepare_started)
 
         compile_started = time.perf_counter()
@@ -258,6 +316,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             self.row_indices_by_pair.append(tuple(int(row) for row, _transform in entries))
             self.input_block_pairs.append((int(left_col), int(right_col) if has_right else None))
             self.pair_is_complex.append(bool(has_right))
+            for row, _transform in entries:
+                transforms_by_row_col.pop((int(row), int(left_col)), None)
+                if has_right:
+                    transforms_by_row_col.pop((int(row), int(right_col)), None)
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
 
@@ -298,7 +360,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                     extract_started = time.perf_counter()
                     conj = partial.conjugate(in_place=False)
                     partial, conj = _align_ciphertexts_for_add(partial, conj)
-                    partial = partial + conj
+                    partial = partial.add(conj, in_place=True)
                     self.last_runtime_timing["real_extract_s"] += float(time.perf_counter() - extract_started)
                 if partials[int(row)] is None:
                     partials[int(row)] = partial
@@ -366,7 +428,10 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             "compile_unified_s": 0.0,
             "evaluate_unified_s": 0.0,
             "postprocess_s": 0.0,
+            "branch_extract_s": 0.0,
+            "bias_s": 0.0,
         }
+        self._compile_cache_metadata: dict[str, Any] = {}
 
     def supports_scheme(self, scheme: Any | None) -> bool:
         if scheme is None:
@@ -377,8 +442,55 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
 
+    def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
+        self._compile_cache_metadata = dict(metadata or {})
+
+    def compile_cache_metadata(self) -> dict[str, Any]:
+        return {
+            "kind": self.kernel_kind,
+            "rows": int(self.rows),
+            "cols": int(self.cols),
+            "output_rotations": int(self.output_rotations),
+            "groups": [
+                {
+                    "storage_key": str(getattr(group, "_storage_key", "")),
+                    "row_indices": [int(value) for value in self.row_indices_by_input[index]],
+                    "input_index": int(index),
+                }
+                for index, group in enumerate(self.groups_by_input)
+            ],
+        }
+
+    def _compile_from_cache_metadata(self, scheme: Any) -> bool:
+        metadata = dict(self._compile_cache_metadata or {})
+        if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
+            return False
+        self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
+        self.rows = int(metadata.get("rows", 0))
+        self.cols = int(metadata.get("cols", 0))
+        self.output_rotations = int(metadata.get("output_rotations", 0))
+        self.conv_bias_vector = packing.construct_conv2d_bias(self.conv_module).to(dtype=torch.float32)
+        self.shortcut_bias_vector = packing.construct_conv2d_bias(self.shortcut_module).to(dtype=torch.float32)
+        level = int(self._level(scheme))
+        compile_started = time.perf_counter()
+        groups = sorted(list(metadata.get("groups", [])), key=lambda item: int(item.get("input_index", 0)))
+        for group_meta in groups:
+            row_indices = tuple(int(value) for value in group_meta.get("row_indices", []))
+            group = UnifiedTransformGroup(
+                [_cached_transform_shell(level=int(level), scheme=scheme) for _row in row_indices]
+            )
+            group._storage_key = str(group_meta["storage_key"])
+            group.compile_unified(scheme.backend)
+            self.groups_by_input.append(group)
+            self.row_indices_by_input.append(row_indices)
+        self.compile_count += 1
+        self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
+        return True
+
     def compile(self, scheme: Any) -> None:
         if self.groups_by_input:
+            return
+        if self._compile_from_cache_metadata(scheme):
             return
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         prepare_started = time.perf_counter()
@@ -421,6 +533,8 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             )
             for (row, col), diag in shortcut_diags.items()
         }
+        conv_diags.clear()
+        shortcut_diags.clear()
         self.conv_bias_vector = packing.construct_conv2d_bias(self.conv_module).to(dtype=torch.float32)
         self.shortcut_bias_vector = packing.construct_conv2d_bias(self.shortcut_module).to(dtype=torch.float32)
         self.last_runtime_timing["prepare_transforms_s"] = float(time.perf_counter() - prepare_started)
@@ -449,12 +563,17 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             group.compile_unified(scheme.backend)
             self.groups_by_input.append(group)
             self.row_indices_by_input.append(tuple(int(row) for row, _transform in entries))
+            for row, _transform in entries:
+                conv_by_row_col.pop((int(row), int(col)), None)
+                shortcut_by_row_col.pop((int(row), int(col)), None)
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
 
     def __call__(self, source_ct: Any) -> dict[str, Any]:
         scheme = source_ct.scheme
-        self.last_runtime_timing.update({"evaluate_unified_s": 0.0, "postprocess_s": 0.0})
+        self.last_runtime_timing.update(
+            {"evaluate_unified_s": 0.0, "postprocess_s": 0.0, "branch_extract_s": 0.0, "bias_s": 0.0}
+        )
         self.compile(scheme)
         ids = tuple(int(value) for value in getattr(source_ct, "ids", ()))
         if len(ids) < int(self.cols):
@@ -486,10 +605,14 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 raise RuntimeError(f"branch-pair provider missing output row {row}")
             ct = _rescale_cipher_tensor(ct)
             ct = _apply_output_rotations(ct, int(self.output_rotations))
+            extract_started = time.perf_counter()
             conj = ct.conjugate(in_place=False)
             ct, conj = _align_ciphertexts_for_add(ct, conj)
-            conv = ct + conj
-            shortcut = (ct - conj).mul_imaginary_unit(-1, in_place=False)
+            shortcut = ct - conj
+            conv = ct.add(conj, in_place=True)
+            shortcut = shortcut.mul_imaginary_unit(-1, in_place=True)
+            self.last_runtime_timing["branch_extract_s"] += float(time.perf_counter() - extract_started)
+            bias_started = time.perf_counter()
             conv = self._add_bias(
                 conv,
                 bias_vector=self.conv_bias_vector,
@@ -502,6 +625,7 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 row_index=int(row),
                 cache=self._shortcut_bias_plaintext_cache,
             )
+            self.last_runtime_timing["bias_s"] += float(time.perf_counter() - bias_started)
             conv.set_scale(int(scheme.params.get_default_scale()))
             shortcut.set_scale(int(scheme.params.get_default_scale()))
             conv_ids.append(int(conv.ids[0]))

@@ -266,6 +266,9 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     groups = list(getattr(executor, "groups_by_input_block", []) or [])
     if groups:
         return _unified_group_rotation_stats(groups)
+    groups = list(getattr(executor, "groups_by_input", []) or [])
+    if groups:
+        return _unified_group_rotation_stats(groups)
     groups_by_input_index = getattr(executor, "groups_by_input_index", None) or {}
     if groups_by_input_index:
         return _unified_group_rotation_stats([group for _input_index, group in sorted(groups_by_input_index.items())])
@@ -333,6 +336,21 @@ def _bench_dense_single(node_name: str, *, repeats: int, seed: int) -> dict[str,
     compile_s = float(generate_diagonals_s + compile_backend_s)
     module.he_mode = True
     cols = _dense_cols(module)
+    if int(repeats) <= 0:
+        return {
+            "path": "dense",
+            "node": str(node_name),
+            "compile_s": float(compile_s),
+            "generate_diagonals_s": float(generate_diagonals_s),
+            "compile_backend_s": float(compile_backend_s),
+            "warmup_s": 0.0,
+            "rotation_stats": _linear_transform_rotation_stats(module),
+            "source_ciphertext_count": int(cols),
+            "output_ciphertext_count": int(len(getattr(module, "transform_ids", {})) // max(1, cols)),
+            "hot_run_s": [],
+            "hot_run_median_s": None,
+            "compile_only": True,
+        }
     warm_source = _prebuilt_sources(module, count=int(cols), repeats=1, seed=int(seed))[0]
     warm_started = time.perf_counter()
     _ = module(warm_source)
@@ -393,6 +411,27 @@ def _bench_provider_single(node_name: str, *, repeats: int, seed: int) -> dict[s
     compile_s = float(generate_diagonals_s + compile_backend_s)
     module.he_mode = True
     executor = runtime.executor
+    if int(repeats) <= 0:
+        return {
+            "status": "ok",
+            "path": "provider",
+            "node": str(node_name),
+            "compile_s": float(compile_s),
+            "generate_diagonals_s": float(generate_diagonals_s),
+            "compile_backend_s": float(compile_backend_s),
+            "warmup_s": 0.0,
+            "attach_audit": attach,
+            "runtime_supported": True,
+            "executor": type(executor).__name__,
+            "rotation_stats": _provider_rotation_stats(executor),
+            "source_ciphertext_count": int(executor.cols),
+            "output_ciphertext_count": int(executor.rows),
+            "hot_run_s": [],
+            "hot_run_median_s": None,
+            "executor_last_runtime_timing": dict(executor.last_runtime_timing),
+            "executor_hot_runtime_timings": [],
+            "compile_only": True,
+        }
     warm_source = _prebuilt_sources(module, count=int(executor.cols), repeats=1, seed=int(seed))[0]
     warm_started = time.perf_counter()
     _ = module(warm_source)
@@ -446,6 +485,32 @@ def _bench_dense_pair(node_names: tuple[str, str], *, repeats: int, seed: int) -
     _emit_phase("dense_pair_compile_done", nodes=list(node_names), seconds=float(compile_backend_s))
     compile_s = float(generate_diagonals_s + compile_backend_s)
     cols = _dense_cols(left)
+    if int(repeats) <= 0:
+        left_rotation_stats = _linear_transform_rotation_stats(left)
+        right_rotation_stats = _linear_transform_rotation_stats(right)
+        return {
+            "path": "dense_pair",
+            "nodes": list(node_names),
+            "compile_s": float(compile_s),
+            "generate_diagonals_s": float(generate_diagonals_s),
+            "compile_backend_s": float(compile_backend_s),
+            "warmup_s": 0.0,
+            "rotation_stats": {
+                "source": "lattigo_transform_rotation_keys_pair_sum",
+                "left": left_rotation_stats,
+                "right": right_rotation_stats,
+                "rotation_eval_count_estimate": int(
+                    left_rotation_stats["rotation_eval_count_estimate"]
+                    + right_rotation_stats["rotation_eval_count_estimate"]
+                ),
+            },
+            "source_ciphertext_count": int(cols),
+            "left_output_ciphertext_count": int(len(left.transform_ids) // max(1, cols)),
+            "right_output_ciphertext_count": int(len(right.transform_ids) // max(1, cols)),
+            "hot_run_s": [],
+            "hot_run_median_s": None,
+            "compile_only": True,
+        }
     warm_source = _prebuilt_sources(left, count=int(cols), repeats=1, seed=int(seed))[0]
     warm_started = time.perf_counter()
     _ = left(warm_source)
@@ -523,6 +588,27 @@ def _bench_provider_pair(node_names: tuple[str, str], *, repeats: int, seed: int
     compile_s = float(generate_diagonals_s + compile_backend_s)
     left.he_mode = True
     right.he_mode = True
+    if int(repeats) <= 0:
+        return {
+            "status": "ok",
+            "path": "provider_pair",
+            "nodes": list(node_names),
+            "compile_s": float(compile_s),
+            "generate_diagonals_s": float(generate_diagonals_s),
+            "compile_backend_s": float(compile_backend_s),
+            "warmup_s": 0.0,
+            "attach_audit": attach,
+            "runtime_supported": True,
+            "executor": type(executor).__name__,
+            "rotation_stats": _provider_rotation_stats(executor),
+            "source_ciphertext_count": int(executor.cols),
+            "output_ciphertext_count_per_branch": int(executor.rows),
+            "hot_run_s": [],
+            "hot_run_median_s": None,
+            "executor_last_runtime_timing": dict(executor.last_runtime_timing),
+            "executor_hot_runtime_timings": [],
+            "compile_only": True,
+        }
     warm_source = _prebuilt_sources(left, count=int(executor.cols), repeats=1, seed=int(seed))[0]
     warm_started = time.perf_counter()
     _ = left(warm_source)
@@ -587,6 +673,8 @@ def _bench_case(case_name: str, *, repeats: int) -> dict[str, Any]:
         provider = _run_once(
             lambda: _bench_provider_pair(tuple(str(v) for v in spec["nodes"]), repeats=int(repeats), seed=int(spec["seed"]))
         )
+    dense_hot = dense.get("hot_run_median_s")
+    provider_hot = provider.get("hot_run_median_s")
     return {
         "case": str(case_name),
         "kind": str(spec["kind"]),
@@ -594,13 +682,15 @@ def _bench_case(case_name: str, *, repeats: int) -> dict[str, Any]:
         "provider": provider,
         "delta": {
             "compile_s": float(provider["compile_s"] - dense["compile_s"]),
-            "hot_run_median_s": float(provider["hot_run_median_s"] - dense["hot_run_median_s"]),
+            "hot_run_median_s": None
+            if dense_hot is None or provider_hot is None
+            else float(float(provider_hot) - float(dense_hot)),
         },
         "speedup": {
             "compile_ratio_dense_over_provider": None if float(provider["compile_s"]) == 0.0 else float(dense["compile_s"] / provider["compile_s"]),
             "hot_run_ratio_dense_over_provider": None
-            if float(provider["hot_run_median_s"]) == 0.0
-            else float(dense["hot_run_median_s"] / provider["hot_run_median_s"]),
+            if dense_hot is None or provider_hot is None or float(provider_hot) == 0.0
+            else float(float(dense_hot) / float(provider_hot)),
         },
     }
 
@@ -751,6 +841,8 @@ def main() -> int:
         ):
             dense = dict(dense_entry["result"])
             provider = dict(provider_entry["result"])
+            dense_hot = dense.get("hot_run_median_s")
+            provider_hot = provider.get("hot_run_median_s")
             case_payload.update(
                 {
                     "status": "ok",
@@ -759,13 +851,15 @@ def main() -> int:
                     "provider": provider,
                     "delta": {
                         "compile_s": float(provider["compile_s"] - dense["compile_s"]),
-                        "hot_run_median_s": float(provider["hot_run_median_s"] - dense["hot_run_median_s"]),
+                        "hot_run_median_s": None
+                        if dense_hot is None or provider_hot is None
+                        else float(float(provider_hot) - float(dense_hot)),
                     },
                     "speedup": {
                         "compile_ratio_dense_over_provider": None if float(provider["compile_s"]) == 0.0 else float(dense["compile_s"] / provider["compile_s"]),
                         "hot_run_ratio_dense_over_provider": None
-                        if float(provider["hot_run_median_s"]) == 0.0
-                        else float(dense["hot_run_median_s"] / provider["hot_run_median_s"]),
+                        if dense_hot is None or provider_hot is None or float(provider_hot) == 0.0
+                        else float(float(dense_hot) / float(provider_hot)),
                     },
                 }
             )

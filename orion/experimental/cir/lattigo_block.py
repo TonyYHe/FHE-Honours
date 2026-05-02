@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
+import time
 from dataclasses import dataclass
 
 import torch
@@ -21,6 +24,20 @@ from .ir import (
 
 
 RING_SLOT_COUNT = 32768
+
+
+def _plan_trace_enabled() -> bool:
+    for name in ("ORION_CIR_PLAN_TRACE", "ORION_REGION_COMPILE_TRACE"):
+        if os.environ.get(name, "0").strip().lower() not in ("", "0", "false", "no", "off"):
+            return True
+    return False
+
+
+def _plan_trace(event: str, **fields: object) -> None:
+    if not _plan_trace_enabled():
+        return
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[cir_plan] event={event} {payload}", file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -109,6 +126,19 @@ def _coalesce_complex_rows(keys: torch.Tensor, values: torch.Tensor) -> tuple[to
     return unique.to(dtype=torch.int64), out_values
 
 
+def _shift_segments(shifts: torch.Tensor) -> list[tuple[int, int, int]]:
+    if int(shifts.numel()) == 0:
+        return []
+    unique, counts = torch.unique_consecutive(shifts.to(dtype=torch.int64), return_counts=True)
+    segments: list[tuple[int, int, int]] = []
+    start = 0
+    for shift, count in zip(unique.tolist(), counts.tolist()):
+        end = int(start + int(count))
+        segments.append((int(shift), int(start), int(end)))
+        start = int(end)
+    return segments
+
+
 def _pack_chw(
     tensor: torch.Tensor,
     *,
@@ -160,6 +190,8 @@ def _build_bank_terms(
     family_id: str,
     case_name: str,
 ) -> tuple[tuple[CanonicalTemplateEntry, ...], tuple[PreparedPlaintext, ...], tuple[LinearTransformTerm, ...]]:
+    _plan_trace("bank_terms_start", stage=spec.stage, bank_index=bank_index, c=spec.c, h=spec.h, w=spec.w)
+    total_started = time.perf_counter()
     surface_c = int(spec.surface_c)
     oc_start = int(bank_index) * int(surface_c)
     input_start = int(input_pair_index) * int(spec.c_pair)
@@ -168,6 +200,7 @@ def _build_bank_terms(
     ic_local = torch.arange(int(surface_c), dtype=torch.int64)
     for kh in range(3):
         for kw in range(3):
+            chunk_started = time.perf_counter()
             oh, ow, ih, iw = _valid_spatial(kh, kw, h=int(spec.h), w=int(spec.w))
             src_slots = _idx_chw_gap_tensor(
                 ic_local[:, None],
@@ -198,20 +231,34 @@ def _build_bank_terms(
             coalesced_keys, coalesced_vals = _coalesce_complex_rows(keys, vals)
             chunk_keys.append(coalesced_keys)
             chunk_values.append(coalesced_vals)
+            _plan_trace(
+                "bank_terms_chunk_done",
+                stage=spec.stage,
+                bank_index=bank_index,
+                kh=kh,
+                kw=kw,
+                rows=int(coalesced_keys.numel()),
+                seconds=f"{time.perf_counter() - chunk_started:.6f}",
+            )
 
     templates: list[CanonicalTemplateEntry] = []
     plaintexts: list[PreparedPlaintext] = []
     terms: list[LinearTransformTerm] = []
+    coalesce_started = time.perf_counter()
     all_keys, all_values = _coalesce_complex_rows(torch.cat(chunk_keys), torch.cat(chunk_values))
+    _plan_trace(
+        "bank_terms_coalesce_done",
+        stage=spec.stage,
+        bank_index=bank_index,
+        rows=int(all_keys.numel()),
+        seconds=f"{time.perf_counter() - coalesce_started:.6f}",
+    )
     shifts = torch.div(all_keys, int(RING_SLOT_COUNT), rounding_mode="floor").to(dtype=torch.int64)
     output_slot_values = torch.remainder(all_keys, int(RING_SLOT_COUNT)).to(dtype=torch.int64)
-    for term_index, shift in enumerate(torch.unique_consecutive(shifts).tolist()):
-        mask = shifts == int(shift)
-        output_slots = output_slot_values[mask].to(dtype=torch.int64)
-        values = all_values[mask].to(dtype=torch.complex64)
-        order = torch.argsort(output_slots)
-        output_slots = output_slots.index_select(0, order)
-        values = values.index_select(0, order)
+    for term_index, (shift, start, end) in enumerate(_shift_segments(shifts)):
+        length = int(end - start)
+        output_slots = output_slot_values.narrow(0, int(start), int(length)).to(dtype=torch.int64).clone()
+        values = all_values.narrow(0, int(start), int(length)).to(dtype=torch.complex64).clone()
         template_id = f"{case_name}_bank{int(bank_index)}_template_{int(term_index)}"
         plaintext_id = f"{case_name}_bank{int(bank_index)}_pt_{int(term_index)}"
         templates.append(
@@ -247,6 +294,14 @@ def _build_bank_terms(
                 bank_id=_bank_id(spec, int(bank_index)),
             )
         )
+    _plan_trace(
+        "bank_terms_done",
+        stage=spec.stage,
+        bank_index=bank_index,
+        template_count=len(templates),
+        term_count=len(terms),
+        seconds=f"{time.perf_counter() - total_started:.6f}",
+    )
     return tuple(templates), tuple(plaintexts), tuple(terms)
 
 
@@ -263,6 +318,8 @@ def build_r18_same_stage_shared_block_plan(
     input_gap: int | None = None,
     output_gap: int | None = None,
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+    _plan_trace("same_stage_plan_start", stage=spec.stage, input_pair_index=input_pair_index, bank_count=bank_count)
+    total_started = time.perf_counter()
     torch.manual_seed(0)
     expected_shape = (int(spec.c), int(spec.c), 3, 3)
     if weight_override is None:
@@ -307,6 +364,7 @@ def build_r18_same_stage_shared_block_plan(
     banks: list[SharedOutputBank] = []
     regions: list[TensorRegion] = []
     for bank_index in range(int(bank_count)):
+        bank_started = time.perf_counter()
         templates, plaintexts, terms = _build_bank_terms(
             spec=spec,
             weight=weight,
@@ -339,6 +397,13 @@ def build_r18_same_stage_shared_block_plan(
                 w_start=0,
                 w_end=int(spec.w),
             )
+        )
+        _plan_trace(
+            "same_stage_bank_done",
+            stage=spec.stage,
+            bank_index=bank_index,
+            term_count=len(terms),
+            seconds=f"{time.perf_counter() - bank_started:.6f}",
         )
     step = LinearTransformStep(
         step_id=f"{case_name}_shared_lt",
@@ -407,6 +472,7 @@ def build_r18_same_stage_shared_block_plan(
     )
     input_start = int(input_pair_index) * int(spec.c_pair)
     surface_c = int(spec.surface_c)
+    pack_started = time.perf_counter()
     inputs = {
         "source_0_lane_0": PlainCipherTensor(_pack_chw(x[input_start : input_start + surface_c], channels=int(surface_c), h=int(spec.h), w=int(spec.w), gap=int(spec.gap)), label="source_0_lane_0"),
         "source_1_lane_0": PlainCipherTensor(
@@ -414,7 +480,16 @@ def build_r18_same_stage_shared_block_plan(
             label="source_1_lane_0",
         ),
     }
+    _plan_trace("same_stage_pack_done", stage=spec.stage, seconds=f"{time.perf_counter() - pack_started:.6f}")
+    ref_started = time.perf_counter()
     reference = F.conv2d(x[input_start : input_start + int(spec.c_pair)].unsqueeze(0), weight[: int(bank_count * int(surface_c)), input_start : input_start + int(spec.c_pair)], bias=None, stride=1, padding=1)[0]
+    _plan_trace(
+        "same_stage_plan_done",
+        stage=spec.stage,
+        term_count=len(all_terms),
+        reference_s=f"{time.perf_counter() - ref_started:.6f}",
+        seconds=f"{time.perf_counter() - total_started:.6f}",
+    )
     return plan, inputs, reference
 
 
@@ -919,6 +994,8 @@ def _build_compact_intra_rows(
     spec: R18CompactStageSpec,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _plan_trace("compact_rows_start", stage=spec.stage, c=spec.c, h=spec.h, w=spec.w, gap=spec.gap)
+    total_started = time.perf_counter()
     c = int(spec.c)
     h = int(spec.h)
     w = int(spec.w)
@@ -936,6 +1013,7 @@ def _build_compact_intra_rows(
         for kw in range(3):
             oh, ow, ih, iw = _valid_spatial(kh, kw, h=h, w=w)
             for oc0 in range(0, int(c), 32):
+                chunk_started = time.perf_counter()
                 oc = torch.arange(int(oc0), int(min(int(c), int(oc0 + 32))), dtype=torch.int64)
                 out_phase = torch.remainder(oc, int(phase_count))
                 out_half = torch.div(out_phase, int(gap), rounding_mode="floor") >= int(gap // 2)
@@ -954,9 +1032,26 @@ def _build_compact_intra_rows(
                 coalesced_keys, coalesced_vals = _coalesce_complex_rows(keys, vals)
                 chunk_keys.append(coalesced_keys)
                 chunk_values.append(coalesced_vals)
+                _plan_trace(
+                    "compact_rows_chunk_done",
+                    stage=spec.stage,
+                    kh=kh,
+                    kw=kw,
+                    oc0=oc0,
+                    rows=int(coalesced_keys.numel()),
+                    seconds=f"{time.perf_counter() - chunk_started:.6f}",
+                )
+    coalesce_started = time.perf_counter()
     all_keys, all_values = _coalesce_complex_rows(torch.cat(chunk_keys), torch.cat(chunk_values))
+    _plan_trace(
+        "compact_rows_coalesce_done",
+        stage=spec.stage,
+        rows=int(all_keys.numel()),
+        seconds=f"{time.perf_counter() - coalesce_started:.6f}",
+    )
     shifts = torch.div(all_keys, int(RING_SLOT_COUNT), rounding_mode="floor").to(dtype=torch.int64)
     output_slots = torch.remainder(all_keys, int(RING_SLOT_COUNT)).to(dtype=torch.int64)
+    _plan_trace("compact_rows_done", stage=spec.stage, rows=int(shifts.numel()), seconds=f"{time.perf_counter() - total_started:.6f}")
     return shifts, output_slots, all_values.to(dtype=torch.complex64)
 
 
@@ -1030,6 +1125,8 @@ def build_r18_stage4_compact_intra_plan(
     input_gap: int | None = None,
     output_gap: int | None = None,
 ) -> tuple[ConvSchemePlan, dict[str, PlainCipherTensor], torch.Tensor]:
+    _plan_trace("stage4_plan_start")
+    total_started = time.perf_counter()
     spec = R18_STAGE4_SPEC
     torch.manual_seed(0)
     expected_shape = (int(spec.c), int(spec.c), 3, 3)
@@ -1065,16 +1162,19 @@ def build_r18_stage4_compact_intra_plan(
         bias_source = "accepted_not_folded"
     else:
         bias_source = "none"
+    rows_started = time.perf_counter()
     shifts, output_slots, values = _build_compact_intra_rows(spec=spec, weight=weight)
+    _plan_trace("stage4_rows_done", rows=int(shifts.numel()), seconds=f"{time.perf_counter() - rows_started:.6f}")
     case_name = "orion_vendored_r18_stage4_same_compact_intra"
     family_id = f"{case_name}_family"
     templates: list[CanonicalTemplateEntry] = []
     plaintexts: list[PreparedPlaintext] = []
     terms: list[LinearTransformTerm] = []
-    for index, shift in enumerate(torch.unique_consecutive(shifts).tolist()):
-        mask = shifts == int(shift)
-        term_outputs = output_slots[mask].to(dtype=torch.int64)
-        term_values = values[mask].to(dtype=torch.complex64)
+    materialize_started = time.perf_counter()
+    for index, (shift, start, end) in enumerate(_shift_segments(shifts)):
+        length = int(end - start)
+        term_outputs = output_slots.narrow(0, int(start), int(length)).to(dtype=torch.int64).clone()
+        term_values = values.narrow(0, int(start), int(length)).to(dtype=torch.complex64).clone()
         template_id = f"{case_name}_template_{int(index)}"
         plaintext_id = f"{case_name}_pt_{int(index)}"
         templates.append(
@@ -1110,6 +1210,11 @@ def build_r18_stage4_compact_intra_plan(
                 bank_id="r18_stage4_compact_bank_0",
             )
         )
+    _plan_trace(
+        "stage4_terms_done",
+        term_count=len(terms),
+        seconds=f"{time.perf_counter() - materialize_started:.6f}",
+    )
     bank = SharedOutputBank(
         bank_id="r18_stage4_compact_bank_0",
         target_index=0,
@@ -1167,9 +1272,17 @@ def build_r18_stage4_compact_intra_plan(
             f"bias_source={bias_source}",
         ),
     )
+    pack_started = time.perf_counter()
     packed = _pack_chw(x, channels=int(spec.c), h=int(spec.h), w=int(spec.w), gap=int(spec.gap))
+    _plan_trace("stage4_pack_done", seconds=f"{time.perf_counter() - pack_started:.6f}")
     inputs = {"source_0_lane_0": PlainCipherTensor(packed, label="source_0_lane_0")}
+    ref_started = time.perf_counter()
     reference = F.conv2d(x.unsqueeze(0), weight, bias=None, stride=1, padding=1)[0]
+    _plan_trace(
+        "stage4_plan_done",
+        reference_s=f"{time.perf_counter() - ref_started:.6f}",
+        seconds=f"{time.perf_counter() - total_started:.6f}",
+    )
     return plan, inputs, reference
 
 
