@@ -835,8 +835,6 @@ class UnifiedTransformGroup:
         )
         for chunk_index, chunk_ids in enumerate(chunks):
             chunk_ids = [int(value) for value in chunk_ids]
-            if len(chunk_ids) <= 1:
-                continue
             load_started = time.perf_counter()
             required_keys = self._rotation_key_requests_to_load(
                 backend,
@@ -872,6 +870,20 @@ class UnifiedTransformGroup:
                     chunk_transform_count=int(len(chunk_ids)),
                     timing={"prepare_load_s": load_s},
                     reason="plaintexts_not_resident_after_prepare_load",
+                )
+                continue
+            if len(chunk_ids) <= 1:
+                self._record_memory_event(
+                    "after_prepare_shared_cache_plan",
+                    backend,
+                    chunk_ids,
+                    chunk_index=int(chunk_index),
+                    chunk_transform_count=int(len(chunk_ids)),
+                    timing={
+                        "prepare_load_s": load_s,
+                        "prepare_shared_cache_plan_s": 0.0,
+                    },
+                    reason="single_transform_preload_only",
                 )
                 continue
             transform_ids_array = (ctypes.c_int * len(chunk_ids))(*chunk_ids)

@@ -10,6 +10,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <set>
@@ -988,6 +989,49 @@ T ReadPod(const unsigned char *&cursor, const unsigned char *end) {
   return value;
 }
 
+bool PinnedPlaintextStagingEnabled() {
+  return !EnvValueIsFalse(std::getenv("ORION_CHEDDAR_PINNED_PLAINTEXT_STAGING"));
+}
+
+bool CopySerializedWordsToDeviceViaPinnedStaging(
+    cheddar::DeviceVector<word> &dst, const unsigned char *src,
+    std::size_t byte_count) {
+  if (!PinnedPlaintextStagingEnabled() || byte_count == 0) {
+    return false;
+  }
+  struct PinnedStagingBuffer {
+    void *ptr = nullptr;
+    std::size_t capacity = 0;
+
+    ~PinnedStagingBuffer() {
+      if (ptr != nullptr) {
+        cudaFreeHost(ptr);
+      }
+    }
+  };
+  static std::mutex staging_mutex;
+  static PinnedStagingBuffer staging;
+
+  std::lock_guard<std::mutex> lock(staging_mutex);
+  if (byte_count > staging.capacity) {
+    void *next = nullptr;
+    const cudaError_t alloc_status = cudaHostAlloc(&next, byte_count, 0);
+    if (alloc_status != cudaSuccess || next == nullptr) {
+      return false;
+    }
+    if (staging.ptr != nullptr) {
+      cudaFreeHost(staging.ptr);
+    }
+    staging.ptr = next;
+    staging.capacity = byte_count;
+  }
+  std::memcpy(staging.ptr, src, byte_count);
+  cudaMemcpyAsync(dst.data(), staging.ptr, byte_count, cudaMemcpyHostToDevice,
+                  dst.stream());
+  cudaStreamSynchronize(dst.stream());
+  return true;
+}
+
 void CopySerializedWordsToDevice(cheddar::DeviceVector<word> &dst,
                                  const unsigned char *&cursor,
                                  const unsigned char *end,
@@ -999,15 +1043,7 @@ void CopySerializedWordsToDevice(cheddar::DeviceVector<word> &dst,
   }
 
   dst.resize(static_cast<int>(count));
-  void *pinned = nullptr;
-  const cudaError_t alloc_status = cudaHostAlloc(&pinned, byte_count, 0);
-  if (alloc_status == cudaSuccess && pinned != nullptr) {
-    std::memcpy(pinned, cursor, byte_count);
-    cudaMemcpyAsync(dst.data(), pinned, byte_count, cudaMemcpyHostToDevice,
-                    dst.stream());
-    cudaStreamSynchronize(dst.stream());
-    cudaFreeHost(pinned);
-  } else {
+  if (!CopySerializedWordsToDeviceViaPinnedStaging(dst, cursor, byte_count)) {
     cheddar::HostVector<word> host(count);
     std::memcpy(host.data(), cursor, byte_count);
     cheddar::CopyHostToDevice(dst, host);
