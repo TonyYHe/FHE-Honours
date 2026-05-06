@@ -8,6 +8,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -59,6 +60,7 @@ BACKENDS = ("lattigo", "cheddar")
 PATHS = ("dense", "provider", "provider_no_hybrid", "provider_no_family", "provider_no_tile_family_sharing")
 LOGN_OVERRIDE_ENV = "ORION_NODE_BENCH_LOGN_OVERRIDE"
 CKKS_PROFILE_ENV = "ORION_NODE_BENCH_CKKS_PROFILE"
+_ACTIVE_CHEDDAR_BENCH_IO_DIR: Path | None = None
 
 PATH_DESCRIPTIONS = {
     "dense": "baseline Orion dense LinearTransform path",
@@ -372,11 +374,14 @@ def _unified_group_memory_traces(module: Any) -> list[dict[str, Any]]:
 
 
 def _build_config(network: str, *, backend: str) -> dict[str, Any]:
+    global _ACTIVE_CHEDDAR_BENCH_IO_DIR
+    _ACTIVE_CHEDDAR_BENCH_IO_DIR = None
     ckks_spec = _profile_ckks_spec(str(network), backend=str(backend))
     if str(backend) == "cheddar":
         io_root = Path(os.environ.get("ORION_CHEDDAR_IO_ROOT", tempfile.gettempdir()))
         io_root.mkdir(parents=True, exist_ok=True)
         io_dir = Path(tempfile.mkdtemp(prefix=f"orion_cheddar_{network}_", dir=str(io_root)))
+        _ACTIVE_CHEDDAR_BENCH_IO_DIR = Path(io_dir)
         io_mode = os.environ.get("ORION_CHEDDAR_IO_MODE", "save")
         diags_path = os.environ.get("ORION_CHEDDAR_DIAGS_PATH", str(io_dir / "diagonals.h5"))
         keys_path = os.environ.get("ORION_CHEDDAR_KEYS_PATH", str(io_dir / "keys.h5"))
@@ -440,6 +445,22 @@ def _cleanup_scheme() -> None:
     except Exception:
         pass
     gc.collect()
+
+
+def _cleanup_active_cheddar_io_dir() -> None:
+    global _ACTIVE_CHEDDAR_BENCH_IO_DIR
+    io_dir = _ACTIVE_CHEDDAR_BENCH_IO_DIR
+    _ACTIVE_CHEDDAR_BENCH_IO_DIR = None
+    if io_dir is None:
+        return
+    if os.environ.get("ORION_NODE_BENCH_CLEAN_CHEDDAR_IO", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    shutil.rmtree(Path(io_dir), ignore_errors=True)
 
 
 def _init_orion_modules(net: torch.nn.Module, *, fit: bool = False) -> None:
@@ -1874,6 +1895,7 @@ def _bench_path(
         return result
     finally:
         _cleanup_scheme()
+        _cleanup_active_cheddar_io_dir()
         _restore_unified_individual_eval_ablation(unified_eval_restore)
         if previous_no_family_env is None:
             os.environ.pop("ORION_UNIFIED_LT_INDIVIDUAL_EVAL", None)
