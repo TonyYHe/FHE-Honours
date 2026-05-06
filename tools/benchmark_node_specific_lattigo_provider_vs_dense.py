@@ -56,7 +56,7 @@ except ModuleNotFoundError:
 DEFAULT_OUT = Path("/tmp/orion_node_specific_lattigo_cheddar_provider_vs_dense.json")
 DEFAULT_CSV_OUT = Path("/tmp/orion_node_specific_lattigo_cheddar_provider_vs_dense.csv")
 BACKENDS = ("lattigo", "cheddar")
-PATHS = ("dense", "provider", "provider_no_hybrid", "provider_no_bsgs", "provider_no_tile_family_sharing")
+PATHS = ("dense", "provider", "provider_no_hybrid", "provider_no_family", "provider_no_tile_family_sharing")
 LOGN_OVERRIDE_ENV = "ORION_NODE_BENCH_LOGN_OVERRIDE"
 CKKS_PROFILE_ENV = "ORION_NODE_BENCH_CKKS_PROFILE"
 
@@ -67,7 +67,7 @@ PATH_DESCRIPTIONS = {
         "provider ablation with real/imag hybrid packing disabled while preserving "
         "channelwise split and cross-channel rotation sharing via UnifiedTransformGroup"
     ),
-    "provider_no_bsgs": (
+    "provider_no_family": (
         "provider ablation with BSGS preserved but UnifiedTransformGroup family sharing disabled; "
         "each compiled LinearTransform is evaluated one by one"
     ),
@@ -540,7 +540,7 @@ def _is_provider_path(path_kind: str) -> bool:
     return str(path_kind) in {
         "provider",
         "provider_no_hybrid",
-        "provider_no_bsgs",
+        "provider_no_family",
         "provider_no_tile_family_sharing",
     }
 
@@ -1438,7 +1438,7 @@ def _provider_rotation_stats(module: Any, *, path_kind: str = "provider") -> dic
     if groups:
         stats = _unified_group_rotation_stats(
             groups,
-            family_sharing=str(path_kind) != "provider_no_bsgs",
+            family_sharing=str(path_kind) != "provider_no_family",
         )
     elif getattr(executor, "transform_ids", None):
         stats = _executor_transform_rotation_stats(executor)
@@ -1455,7 +1455,7 @@ def _provider_rotation_stats(module: Any, *, path_kind: str = "provider") -> dic
     stats["compact_source_contract"] = bool(getattr(executor, "requires_compact_source", False))
     stats["ct_pt_hybrid_packing"] = bool(getattr(executor, "use_ct_pt_hybrid_packing", False))
     stats["tile_family_sharing"] = not bool(getattr(executor, "disable_tile_family_sharing", False))
-    stats["bsgs_family_sharing"] = str(path_kind) != "provider_no_bsgs"
+    stats["bsgs_family_sharing"] = str(path_kind) != "provider_no_family"
     stats["input_block_pairs"] = [
         [int(left), None if right is None else int(right)]
         for left, right in list(getattr(executor, "input_block_pairs", ()) or ())
@@ -1645,12 +1645,12 @@ def _bench_path(
     case = _case_by_name(str(network), str(case_name))
     provider = _is_provider_path(str(path_kind))
     no_hybrid_ablation = str(path_kind) == "provider_no_hybrid"
-    no_bsgs_ablation = str(path_kind) == "provider_no_bsgs"
+    no_family_ablation = str(path_kind) == "provider_no_family"
     no_tile_family_ablation = str(path_kind) == "provider_no_tile_family_sharing"
     previous_no_family_env = os.environ.get("ORION_UNIFIED_LT_INDIVIDUAL_EVAL")
     previous_no_tile_family_env = os.environ.get("ORION_U22_DISABLE_TILE_FAMILY_SHARING")
     unified_eval_restore = None
-    if bool(no_bsgs_ablation):
+    if bool(no_family_ablation):
         os.environ["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] = "1"
         unified_eval_restore = _install_unified_individual_eval_ablation()
     else:
@@ -1837,12 +1837,12 @@ def _bench_path(
                 "attach_audit": dict(attach_audit) if bool(provider) else {},
                 "provider_fallback_audit": dict(provider_fallback_audit),
                 "no_hybrid_audit": dict(no_hybrid_audit),
-                "no_bsgs_audit": {
-                    "enabled": bool(no_bsgs_ablation),
-                    "env": "ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1" if bool(no_bsgs_ablation) else "",
+                "no_family_audit": {
+                    "enabled": bool(no_family_ablation),
+                    "env": "ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1" if bool(no_family_ablation) else "",
                     "mode": (
-                        "unified_lt_individual_eval_no_bsgs_family_sharing_bsgs_preserved"
-                        if bool(no_bsgs_ablation)
+                        "unified_lt_individual_eval_no_family_sharing_bsgs_preserved"
+                        if bool(no_family_ablation)
                         else ""
                     ),
                 },
@@ -1988,41 +1988,41 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
         )
         update_payload["provider_no_hybrid"] = no_hybrid
 
-    if "provider_no_bsgs" in paths:
-        no_bsgs_entry = dict(paths.get("provider_no_bsgs", {}))
-        if no_bsgs_entry.get("status") != "ok":
+    if "provider_no_family" in paths:
+        no_family_entry = dict(paths.get("provider_no_family", {}))
+        if no_family_entry.get("status") != "ok":
             case_payload.update(update_payload)
             case_payload["status"] = "partial"
             return
-        no_bsgs = dict(no_bsgs_entry["result"])
-        if no_bsgs.get("status") != "ok":
+        no_family = dict(no_family_entry["result"])
+        if no_family.get("status") != "ok":
             case_payload.update(update_payload)
-            case_payload["provider_no_bsgs"] = no_bsgs
+            case_payload["provider_no_family"] = no_family
             case_payload["status"] = "partial"
             return
-        no_bsgs_mean = float(no_bsgs["hot_run_mean_s"])
-        no_bsgs_rotations = int(no_bsgs.get("rotation_eval_count", 0))
+        no_family_mean = float(no_family["hot_run_mean_s"])
+        no_family_rotations = int(no_family.get("rotation_eval_count", 0))
         deltas.update(
             {
-                "compile_s_provider_no_bsgs_minus_dense": float(no_bsgs["compile_s"] - dense["compile_s"]),
-                "hot_run_mean_s_provider_no_bsgs_minus_dense": float(no_bsgs_mean - dense_mean),
-                "rotation_eval_count_provider_no_bsgs_minus_dense": int(no_bsgs_rotations - dense_rotations),
-                "compile_s_provider_no_bsgs_minus_provider": float(no_bsgs["compile_s"] - provider["compile_s"]),
-                "hot_run_mean_s_provider_no_bsgs_minus_provider": float(no_bsgs_mean - provider_mean),
-                "rotation_eval_count_provider_no_bsgs_minus_provider": int(no_bsgs_rotations - provider_rotations),
+                "compile_s_provider_no_family_minus_dense": float(no_family["compile_s"] - dense["compile_s"]),
+                "hot_run_mean_s_provider_no_family_minus_dense": float(no_family_mean - dense_mean),
+                "rotation_eval_count_provider_no_family_minus_dense": int(no_family_rotations - dense_rotations),
+                "compile_s_provider_no_family_minus_provider": float(no_family["compile_s"] - provider["compile_s"]),
+                "hot_run_mean_s_provider_no_family_minus_provider": float(no_family_mean - provider_mean),
+                "rotation_eval_count_provider_no_family_minus_provider": int(no_family_rotations - provider_rotations),
             }
         )
         speedups.update(
             {
-                "time_dense_over_provider_no_bsgs": _speedup(dense_mean, no_bsgs_mean),
-                "rotation_dense_over_provider_no_bsgs": _speedup(dense_rotations, no_bsgs_rotations),
-                "compile_dense_over_provider_no_bsgs": _speedup(float(dense["compile_s"]), float(no_bsgs["compile_s"])),
-                "time_provider_no_bsgs_over_provider": _speedup(no_bsgs_mean, provider_mean),
-                "rotation_provider_no_bsgs_over_provider": _speedup(no_bsgs_rotations, provider_rotations),
-                "compile_provider_no_bsgs_over_provider": _speedup(float(no_bsgs["compile_s"]), float(provider["compile_s"])),
+                "time_dense_over_provider_no_family": _speedup(dense_mean, no_family_mean),
+                "rotation_dense_over_provider_no_family": _speedup(dense_rotations, no_family_rotations),
+                "compile_dense_over_provider_no_family": _speedup(float(dense["compile_s"]), float(no_family["compile_s"])),
+                "time_provider_no_family_over_provider": _speedup(no_family_mean, provider_mean),
+                "rotation_provider_no_family_over_provider": _speedup(no_family_rotations, provider_rotations),
+                "compile_provider_no_family_over_provider": _speedup(float(no_family["compile_s"]), float(provider["compile_s"])),
             }
         )
-        update_payload["provider_no_bsgs"] = no_bsgs
+        update_payload["provider_no_family"] = no_family
 
     if "provider_no_tile_family_sharing" in paths:
         no_tile_entry = dict(paths.get("provider_no_tile_family_sharing", {}))
@@ -2215,25 +2215,25 @@ def _flatten_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "provider_no_hybrid_mode": str(no_hybrid.get("no_hybrid_audit", {}).get("mode", "")),
                     }
                 )
-            if "provider_no_bsgs" in case:
-                no_bsgs = dict(case["provider_no_bsgs"])
+            if "provider_no_family" in case:
+                no_family = dict(case["provider_no_family"])
                 row.update(
                     {
-                        "provider_no_bsgs_mean_s": float(no_bsgs["hot_run_mean_s"]),
-                        "time_speedup_dense_over_provider_no_bsgs": case["speedup"][
-                            "time_dense_over_provider_no_bsgs"
+                        "provider_no_family_mean_s": float(no_family["hot_run_mean_s"]),
+                        "time_speedup_dense_over_provider_no_family": case["speedup"][
+                            "time_dense_over_provider_no_family"
                         ],
-                        "time_provider_no_bsgs_over_provider": case["speedup"][
-                            "time_provider_no_bsgs_over_provider"
+                        "time_provider_no_family_over_provider": case["speedup"][
+                            "time_provider_no_family_over_provider"
                         ],
-                        "provider_no_bsgs_rotations": int(no_bsgs["rotation_eval_count"]),
-                        "rotation_speedup_dense_over_provider_no_bsgs": case["speedup"][
-                            "rotation_dense_over_provider_no_bsgs"
+                        "provider_no_family_rotations": int(no_family["rotation_eval_count"]),
+                        "rotation_speedup_dense_over_provider_no_family": case["speedup"][
+                            "rotation_dense_over_provider_no_family"
                         ],
-                        "rotation_provider_no_bsgs_over_provider": case["speedup"][
-                            "rotation_provider_no_bsgs_over_provider"
+                        "rotation_provider_no_family_over_provider": case["speedup"][
+                            "rotation_provider_no_family_over_provider"
                         ],
-                        "provider_no_bsgs_mode": str(no_bsgs.get("no_bsgs_audit", {}).get("mode", "")),
+                        "provider_no_family_mode": str(no_family.get("no_family_audit", {}).get("mode", "")),
                     }
                 )
             if "provider_no_tile_family_sharing" in case:
@@ -2289,7 +2289,7 @@ CSV_COLUMNS = (
     "effective_backend_path",
     "executor",
     "no_hybrid_mode",
-    "no_bsgs_mode",
+    "no_family_mode",
     "no_tile_family_mode",
     "compile_once",
     "compile_s",
@@ -2330,12 +2330,12 @@ CSV_COLUMNS = (
     "time_provider_no_hybrid_over_provider",
     "rotation_provider_no_hybrid_over_provider",
     "compile_provider_no_hybrid_over_provider",
-    "time_speedup_dense_over_provider_no_bsgs",
-    "rotation_speedup_dense_over_provider_no_bsgs",
-    "compile_speedup_dense_over_provider_no_bsgs",
-    "time_provider_no_bsgs_over_provider",
-    "rotation_provider_no_bsgs_over_provider",
-    "compile_provider_no_bsgs_over_provider",
+    "time_speedup_dense_over_provider_no_family",
+    "rotation_speedup_dense_over_provider_no_family",
+    "compile_speedup_dense_over_provider_no_family",
+    "time_provider_no_family_over_provider",
+    "rotation_provider_no_family_over_provider",
+    "compile_provider_no_family_over_provider",
     "time_speedup_dense_over_provider_no_tile_family_sharing",
     "rotation_speedup_dense_over_provider_no_tile_family_sharing",
     "compile_speedup_dense_over_provider_no_tile_family_sharing",
@@ -2408,12 +2408,12 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "time_provider_no_hybrid_over_provider": speedup.get("time_provider_no_hybrid_over_provider"),
                     "rotation_provider_no_hybrid_over_provider": speedup.get("rotation_provider_no_hybrid_over_provider"),
                     "compile_provider_no_hybrid_over_provider": speedup.get("compile_provider_no_hybrid_over_provider"),
-                    "time_speedup_dense_over_provider_no_bsgs": speedup.get("time_dense_over_provider_no_bsgs"),
-                    "rotation_speedup_dense_over_provider_no_bsgs": speedup.get("rotation_dense_over_provider_no_bsgs"),
-                    "compile_speedup_dense_over_provider_no_bsgs": speedup.get("compile_dense_over_provider_no_bsgs"),
-                    "time_provider_no_bsgs_over_provider": speedup.get("time_provider_no_bsgs_over_provider"),
-                    "rotation_provider_no_bsgs_over_provider": speedup.get("rotation_provider_no_bsgs_over_provider"),
-                    "compile_provider_no_bsgs_over_provider": speedup.get("compile_provider_no_bsgs_over_provider"),
+                    "time_speedup_dense_over_provider_no_family": speedup.get("time_dense_over_provider_no_family"),
+                    "rotation_speedup_dense_over_provider_no_family": speedup.get("rotation_dense_over_provider_no_family"),
+                    "compile_speedup_dense_over_provider_no_family": speedup.get("compile_dense_over_provider_no_family"),
+                    "time_provider_no_family_over_provider": speedup.get("time_provider_no_family_over_provider"),
+                    "rotation_provider_no_family_over_provider": speedup.get("rotation_provider_no_family_over_provider"),
+                    "compile_provider_no_family_over_provider": speedup.get("compile_provider_no_family_over_provider"),
                     "time_speedup_dense_over_provider_no_tile_family_sharing": speedup.get(
                         "time_dense_over_provider_no_tile_family_sharing"
                     ),
@@ -2438,7 +2438,7 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     rotation_stats = dict(result.get("rotation_stats", {}) or {})
                     module = dict(result.get("module", {}) or {})
                     no_hybrid_audit = dict(result.get("no_hybrid_audit", {}) or {})
-                    no_bsgs_audit = dict(result.get("no_bsgs_audit", {}) or {})
+                    no_family_audit = dict(result.get("no_family_audit", {}) or {})
                     no_tile_family_audit = dict(result.get("no_tile_family_audit", {}) or {})
                     row.update(
                         {
@@ -2447,7 +2447,7 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "effective_backend_path": str(result.get("effective_backend_path", "")),
                             "executor": str(result.get("executor", rotation_stats.get("executor", ""))),
                             "no_hybrid_mode": str(no_hybrid_audit.get("mode", "")),
-                            "no_bsgs_mode": str(no_bsgs_audit.get("mode", "")),
+                            "no_family_mode": str(no_family_audit.get("mode", "")),
                             "no_tile_family_mode": str(no_tile_family_audit.get("mode", "")),
                             "compile_once": result.get("compile_once", ""),
                             "compile_s": result.get("compile_s"),
@@ -2599,7 +2599,7 @@ def main() -> int:
             "status": "running",
             "scope": (
                 "node-specific multi-backend dense vs provider with real/imag no-hybrid and "
-                "no-BSGS-family-sharing ablations for unique optimized CONV/TCONV"
+                "no-family-sharing ablations for unique optimized CONV/TCONV"
             ),
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "repo_root": str(REPO_ROOT),
