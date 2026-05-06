@@ -135,6 +135,7 @@ struct LinearTransformState {
   int cached_width = 0;
   std::vector<std::pair<int, int>> cached_rotation_key_requests;
   bool singleton = false;
+  bool diagonal_fallback = false;
   int singleton_diag_idx = 0;
   std::vector<Complex> singleton_values;
   int level = 0;
@@ -481,7 +482,7 @@ int EstimateLinearTransformStride(const LinearTransformState &state) {
   return gcd_rot;
 }
 
-unsigned long long EstimateLinearTransformStateDeviceBytes(
+std::set<std::pair<int, int>> LinearTransformPlaintextSlots(
     const LinearTransformState &state) {
   const int stride = EstimateLinearTransformStride(state);
   const int gs_stride = std::max(1, stride * state.bs);
@@ -496,6 +497,18 @@ unsigned long long EstimateLinearTransformStateDeviceBytes(
     const int gs_rot = rot - bs_rot;
     plaintext_slots.emplace(gs_rot, bs_rot);
   }
+  return plaintext_slots;
+}
+
+std::size_t LinearTransformPlaintextSlotCount(
+    const LinearTransformState &state) {
+  return LinearTransformPlaintextSlots(state).size();
+}
+
+unsigned long long EstimateLinearTransformStateDeviceBytes(
+    const LinearTransformState &state) {
+  const std::set<std::pair<int, int>> plaintext_slots =
+      LinearTransformPlaintextSlots(state);
 
   const auto np = g_scheme->param->LevelToNP(state.level, g_scheme->param->alpha_);
   const unsigned long long bytes_per_plaintext =
@@ -635,10 +648,13 @@ unsigned long long LinearTransformFullLoadBudgetBytes() {
 }
 
 bool ShouldStreamLinearTransform(const LinearTransformState &state) {
+  if (!state.streaming_plaintext_payload_chunks.empty()) {
+    return true;
+  }
   if (state.metadata_cached && state.matrix.empty()) {
     return state.cached_uses_streaming != 0;
   }
-  if (state.singleton) {
+  if (state.singleton || state.diagonal_fallback) {
     return false;
   }
   const char *mode = std::getenv("ORION_CHEDDAR_LT_STREAMING");
@@ -695,7 +711,7 @@ void CacheLinearTransformMetadata(LinearTransformState &state) {
 }
 
 void ReleaseLinearTransformMatrixState(LinearTransformState &state) {
-  if (state.singleton || state.matrix.empty()) {
+  if (state.singleton || state.diagonal_fallback || state.matrix.empty()) {
     return;
   }
   CacheLinearTransformMetadata(state);
@@ -1406,8 +1422,21 @@ std::vector<unsigned char> SerializeStreamingPlaintextPayloadChunksBytes(
   return payload;
 }
 
+std::vector<unsigned char> SerializeEmptyLinearTransformPlaintextsBytes(
+    const LinearTransformState &state) {
+  std::vector<unsigned char> payload;
+  AppendPlaintextMapHeader(payload, state.level, state.bs, state.gs, 0);
+  return payload;
+}
+
 std::vector<unsigned char> SerializeLinearTransformPlaintextsBytes(
     LinearTransformState &state) {
+  if (HasStreamingPlaintextPayloadCache(state)) {
+    return SerializeStreamingPlaintextPayloadChunksBytes(state);
+  }
+  if (state.singleton || state.diagonal_fallback) {
+    return SerializeEmptyLinearTransformPlaintextsBytes(state);
+  }
   if (ShouldStreamLinearTransform(state)) {
     EnsureLinearTransformStreamingPlaintextPayloadCache(state);
     if (HasStreamingPlaintextPayloadCache(state)) {
@@ -1488,7 +1517,10 @@ void LoadLinearTransformStreamingPlaintextsBytes(LinearTransformState &state,
 void LoadLinearTransformPlaintextsBytes(LinearTransformState &state,
                                         const unsigned char *data,
                                         std::size_t size) {
-  if (ShouldStreamLinearTransform(state)) {
+  if (state.singleton || state.diagonal_fallback) {
+    return;
+  }
+  if (HasStreamingPlaintextPayloadCache(state) || ShouldStreamLinearTransform(state)) {
     LoadLinearTransformStreamingPlaintextsBytes(state, data, size);
     return;
   }
@@ -1512,6 +1544,7 @@ bool HasStreamingPlaintextPayloadCache(const LinearTransformState &state) {
 void EnsureLinearTransformStreamingPlaintextPayloadCache(
     LinearTransformState &state) {
   if (!StreamingPlaintextPayloadCacheEnabled() || state.singleton ||
+      state.diagonal_fallback ||
       HasStreamingPlaintextPayloadCache(state) || !ShouldStreamLinearTransform(state)) {
     return;
   }
@@ -1831,7 +1864,12 @@ int AddLinearTransformFromMatrix(const cheddar::StripedMatrix &matrix,
   }
   LinearTransformState state(std::unique_ptr<LinearTransform>(), matrix,
                              std::move(diag_indices), level, bs, gs);
-  EnsureLinearTransformStreamingPlaintextPayloadCache(state);
+  state.diagonal_fallback = LinearTransformPlaintextSlotCount(state) <= 1;
+  if (state.diagonal_fallback) {
+    CacheLinearTransformMetadata(state);
+  } else {
+    EnsureLinearTransformStreamingPlaintextPayloadCache(state);
+  }
   return g_scheme->transforms.Add(std::move(state));
 }
 
@@ -1899,9 +1937,59 @@ int EvaluateSingletonLinearTransform(const LinearTransformState &state,
   return PushCiphertext(std::move(output));
 }
 
-bool HasSingletonLinearTransform(const std::vector<int> &ordered_ids) {
+int EvaluateDiagonalFallbackLinearTransform(const LinearTransformState &state,
+                                            int ciphertext_id) {
+  if (state.matrix.empty()) {
+    AbortWithMessage(
+        "linear transform diagonal fallback requires raw matrix values");
+  }
+  const Ct &input = RetrieveCiphertext(ciphertext_id);
+  const int input_level = CiphertextLevel(input);
+  if (input_level < state.level) {
+    AbortWithMessage("input ciphertext level is below the linear transform level");
+  }
+  Ct leveled_input;
+  const Ct &eval_input = CiphertextAtLevel(leveled_input, input, state.level);
+  const int width = std::max(1, state.matrix.GetWidth());
+
+  bool initialized = false;
+  Ct accumulated;
+  for (const auto &[diag_idx, diag_values] : state.matrix) {
+    const int rotation = NormalizeRotationIndex(diag_idx, width);
+    Ct rotated;
+    const Ct *mul_input = &eval_input;
+    if (rotation != 0) {
+      EnsureRotationKeyPrepared(rotation, state.level);
+      g_scheme->context->HRot(rotated, eval_input,
+                              g_scheme->interface->GetRotationKey(rotation),
+                              rotation);
+      mul_input = &rotated;
+    }
+    Pt plaintext = EncodeMessage(diag_values, state.level,
+                                 g_scheme->param->GetScale(state.level));
+    Ct multiplied;
+    g_scheme->context->Mult(multiplied, *mul_input, plaintext);
+    if (!initialized) {
+      accumulated = std::move(multiplied);
+      initialized = true;
+    } else {
+      Ct sum;
+      g_scheme->context->Add(sum, accumulated, multiplied);
+      accumulated = std::move(sum);
+    }
+  }
+  if (!initialized) {
+    AbortWithMessage("linear transform diagonal fallback has no diagonals");
+  }
+  Ct output;
+  g_scheme->context->Rescale(output, accumulated);
+  return PushCiphertext(std::move(output));
+}
+
+bool HasIndividualLinearTransform(const std::vector<int> &ordered_ids) {
   for (int transform_id : ordered_ids) {
-    if (RetrieveTransform(transform_id).singleton) {
+    const LinearTransformState &state = RetrieveTransform(transform_id);
+    if (state.singleton || state.diagonal_fallback) {
       return true;
     }
   }
@@ -2133,9 +2221,10 @@ LinearTransformState MakeLinearTransformLevelView(
                                 state.singleton_diag_idx,
                                 state.singleton_values);
   }
-  return LinearTransformState(std::unique_ptr<LinearTransform>(), state.matrix,
-                              state.diag_indices, eval_level, state.bs,
-                              state.gs);
+  LinearTransformState view(std::unique_ptr<LinearTransform>(), state.matrix,
+                            state.diag_indices, eval_level, state.bs, state.gs);
+  view.diagonal_fallback = state.diagonal_fallback;
+  return view;
 }
 
 std::set<int> SharedCacheBabyStepsForLevel(
@@ -2909,6 +2998,12 @@ int EvaluateLinearTransform(int transformID, int ciphertextID) {
     TrimDeviceMemoryPoolIfRequested();
     return output_id;
   }
+  if (state.diagonal_fallback) {
+    const int output_id =
+        EvaluateDiagonalFallbackLinearTransform(state, ciphertextID);
+    TrimDeviceMemoryPoolIfRequested();
+    return output_id;
+  }
   if (ShouldStreamLinearTransform(state)) {
     const int output_id = EvaluateLinearTransformStreaming(state, ciphertextID);
     TrimDeviceMemoryPoolIfRequested();
@@ -3024,6 +3119,9 @@ ArrayResultUInt64 EstimateLinearTransformDeviceBytes(int transformID) {
 int LinearTransformUsesStreaming(int transformID) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
+  if (HasStreamingPlaintextPayloadCache(state)) {
+    return 1;
+  }
   if (state.metadata_cached && state.matrix.empty()) {
     return state.cached_uses_streaming;
   }
@@ -3096,7 +3194,7 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
   for (int i = 0; i < numTransforms; ++i) {
     ordered_ids.push_back(transformIDs[i]);
   }
-  if (HasSingletonLinearTransform(ordered_ids)) {
+  if (HasIndividualLinearTransform(ordered_ids)) {
     std::vector<int> output_ids;
     output_ids.reserve(numTransforms);
     const auto eval_started = std::chrono::steady_clock::now();
@@ -3211,6 +3309,9 @@ void PrepareLinearTransformsSharedCachePlan(const int *transformIDs,
   for (int i = 0; i < numTransforms; ++i) {
     ordered_ids.push_back(transformIDs[i]);
   }
+  if (HasIndividualLinearTransform(ordered_ids)) {
+    return;
+  }
   (void)GetOrBuildSharedCachePlan(ordered_ids);
 }
 
@@ -3298,7 +3399,8 @@ void LoadPlaintextDiagonal(const unsigned char * /*data*/,
                            unsigned long /*diagIdx*/) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
-  if (state.singleton) {
+  if (state.singleton || state.diagonal_fallback ||
+      HasStreamingPlaintextPayloadCache(state)) {
     return;
   }
   if (lenData == 0) {
@@ -3321,7 +3423,8 @@ void LoadPlaintextDiagonalsBatch(const unsigned char * /*data*/,
                                  int transformID) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
-  if (state.singleton) {
+  if (state.singleton || state.diagonal_fallback ||
+      HasStreamingPlaintextPayloadCache(state)) {
     return;
   }
   if (lenData == 0) {
@@ -3338,7 +3441,7 @@ void LoadLinearTransformPlaintexts(const unsigned char *data,
                                    int transformID) {
   RequireScheme();
   LinearTransformState &state = RetrieveTransform(transformID);
-  if (state.singleton) {
+  if (state.singleton || state.diagonal_fallback) {
     return;
   }
   if (lenData == 0) {

@@ -188,6 +188,29 @@ E2E_CKKS_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
+CHEDDAR_E2E_CKKS_OVERRIDES: dict[str, dict[str, Any]] = {
+    # Cheddar's current C++ adapter only exposes its LogScale=40 preset. Keep
+    # Lattigo on the U22 full-graph profile above, but replay U22 Cheddar rows
+    # with the compatible preset instead of aborting at NewScheme().
+    "u22_64_base32": {
+        "logn": 16,
+        "logq": (55, 40, 40, 40, 40),
+        "logp": (61, 61, 61),
+        "logscale": 40,
+        "h": 192,
+        "boot_logp": (),
+    },
+    "u22_256_base32": {
+        "logn": 16,
+        "logq": (55, 40, 40, 40, 40),
+        "logp": (61, 61, 61),
+        "logscale": 40,
+        "h": 192,
+        "boot_logp": (),
+    },
+}
+
+
 def _ckks_profile() -> str:
     return str(os.environ.get(CKKS_PROFILE_ENV, "e2e")).strip().lower() or "e2e"
 
@@ -228,7 +251,10 @@ def _profile_ckks_spec(network: str, *, backend: str) -> dict[str, Any]:
         return _kernel_ckks_spec(str(network), backend=str(backend))
     if profile != "e2e":
         raise ValueError(f"unknown CKKS profile {profile!r}; expected 'e2e' or 'kernel'")
-    spec = dict(E2E_CKKS_SPECS[str(network)])
+    if str(backend) == "cheddar" and str(network) in CHEDDAR_E2E_CKKS_OVERRIDES:
+        spec = dict(CHEDDAR_E2E_CKKS_OVERRIDES[str(network)])
+    else:
+        spec = dict(E2E_CKKS_SPECS[str(network)])
     spec["logn"] = int(_effective_logn(str(network), base_logn=int(spec["logn"])))
     return spec
 

@@ -57,7 +57,6 @@ def trim_runtime_memory(backend: Any, *, reason: str = "") -> dict[str, Any]:
 
 
 def forward_min_available_bytes() -> int:
-    info = host_memory_info()
     explicit = os.environ.get("ORION_FORWARD_MIN_AVAILABLE_BYTES")
     if explicit:
         try:
@@ -70,11 +69,7 @@ def forward_min_available_bytes() -> int:
             return max(0, int(float(explicit_gb) * 1024**3))
         except ValueError:
             pass
-    if info is None:
-        return 0
-    total = int(info["total_bytes"])
-    reserve = max(8 * 1024**3, int(total * 0.15))
-    return int(min(reserve, max(1 * 1024**3, int(total * 0.50))))
+    return 0
 
 
 def host_memory_guard_enabled() -> bool:
