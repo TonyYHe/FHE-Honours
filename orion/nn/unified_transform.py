@@ -45,6 +45,34 @@ def _unified_compile_workers(item_count: int) -> int:
     return max(1, min(int(item_count), int(requested)))
 
 
+def _unified_stream_compile_batch_limit(item_count: int, workers: int) -> int:
+    raw = os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS")
+    if raw is None:
+        raw = os.environ.get("ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS")
+    if raw is None:
+        requested = int(workers)
+    else:
+        try:
+            requested = int(raw)
+        except (TypeError, ValueError):
+            requested = int(workers)
+    return max(1, min(int(item_count), int(requested)))
+
+
+def _unified_stream_compile_batch_bytes() -> int:
+    raw = os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_BYTES")
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    raw_gib = os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "4")
+    try:
+        return max(0, int(float(raw_gib) * 1024**3))
+    except ValueError:
+        return 4 * 1024**3
+
+
 def _unified_compile_trace_enabled() -> bool:
     return os.environ.get("ORION_UNIFIED_COMPILE_TRACE", "0").strip().lower() not in ("", "0", "false", "no", "off")
 
@@ -404,6 +432,12 @@ class UnifiedTransformGroup:
             "0",
         ).lower() not in ("0", "false", "no", "off")
 
+    def _force_compile_trim_each_transform_enabled(self) -> bool:
+        return os.environ.get(
+            "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM",
+            "0",
+        ).strip().lower() not in ("", "0", "false", "no", "off")
+
     def _release_backend_matrix_after_save(
         self,
         backend,
@@ -660,6 +694,19 @@ class UnifiedTransformGroup:
             return max(1, int(float(raw_gib) * 1024**3))
         except ValueError:
             return 512 * 1024**2
+
+    def _stream_plaintext_diag_save_chunk_bytes(self) -> int:
+        raw = os.environ.get("ORION_UNIFIED_LT_STREAM_SAVE_CHUNK_BYTES")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        raw_mib = os.environ.get("ORION_UNIFIED_LT_STREAM_SAVE_CHUNK_MB", "16")
+        try:
+            return max(1, int(float(raw_mib) * 1024**2))
+        except ValueError:
+            return 16 * 1024**2
 
     def _estimate_transform_eval_resident_bytes(self, backend, transform_id: int) -> int:
         backend_estimate = int(estimate_linear_transform_device_bytes(backend, int(transform_id)))
@@ -1291,28 +1338,33 @@ class UnifiedTransformGroup:
             )
             return
 
-        payload_chunks: list[np.ndarray] = []
         offsets: list[int] = []
         lengths: list[int] = []
         cursor = 0
+        payload_ds = transform_group.create_dataset(
+            "diag_payload",
+            shape=(0,),
+            maxshape=(None,),
+            chunks=(int(self._stream_plaintext_diag_save_chunk_bytes()),),
+            dtype=np.uint8,
+        )
         for diag_idx in diag_indices:
             serial_diag, diag_ptr = backend.SerializeDiagonal(
                 int(transform_id),
                 int(diag_idx),
             )
             try:
-                serial_arr = np.asarray(serial_diag, dtype=np.uint8).reshape(-1).copy()
+                serial_arr = np.asarray(serial_diag, dtype=np.uint8).reshape(-1)
+                length = int(serial_arr.size)
                 offsets.append(int(cursor))
-                lengths.append(int(serial_arr.size))
-                payload_chunks.append(serial_arr)
-                cursor += int(serial_arr.size)
+                lengths.append(int(length))
+                if length:
+                    next_cursor = int(cursor + length)
+                    payload_ds.resize((next_cursor,))
+                    payload_ds[int(cursor):next_cursor] = serial_arr
+                    cursor = int(next_cursor)
             finally:
                 backend.FreeCArray(diag_ptr)
-        payload = (
-            np.concatenate(payload_chunks)
-            if payload_chunks
-            else np.zeros((0,), dtype=np.uint8)
-        )
         transform_group.create_dataset(
             "diag_indices",
             data=np.asarray(diag_indices, dtype=np.int32),
@@ -1325,12 +1377,12 @@ class UnifiedTransformGroup:
             "diag_lengths",
             data=np.asarray(lengths, dtype=np.uint64),
         )
-        transform_group.create_dataset("diag_payload", data=payload)
         if self._can_keep_plaintexts_resident(
             backend,
             int(transform_id),
             already_loaded=False,
         ):
+            payload = np.asarray(payload_ds[:], dtype=np.uint8)
             backend.LoadPlaintextDiagonalsBatch(
                 payload,
                 offsets,
@@ -1747,84 +1799,90 @@ class UnifiedTransformGroup:
                 del root[self._storage_key]
             storage = root.create_group(self._storage_key)
         flatten_workers = _unified_compile_workers(len(self.transforms))
+        batch_limit = _unified_stream_compile_batch_limit(len(self.transforms), int(flatten_workers))
+        batch_byte_limit = int(_unified_stream_compile_batch_bytes())
         flatten_executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="orion-unified-stream-flatten")
+            ThreadPoolExecutor(
+                max_workers=max(1, min(int(flatten_workers), int(batch_limit))),
+                thread_name_prefix="orion-unified-stream-flatten",
+            )
             if flatten_workers > 1 and len(self.transforms) > 1
             else None
         )
-        next_payload = (
-            flatten_executor.submit(self._flatten_transform_diagonals, self.transforms[0], has_complex=has_complex)
-            if flatten_executor is not None
-            else None
-        )
+        force_compile_trim = self._force_compile_trim_each_transform_enabled()
         try:
-            for transform_index, transform in enumerate(self.transforms):
-                _unified_compile_trace("streaming_flatten_start", group=self._storage_key, transform_index=transform_index)
+            transform_index = 0
+            while transform_index < len(self.transforms):
+                batch_end = min(len(self.transforms), int(transform_index + int(batch_limit)))
+                batch_indices = list(range(int(transform_index), int(batch_end)))
+                _unified_compile_trace(
+                    "streaming_flatten_batch_start",
+                    group=self._storage_key,
+                    start=int(batch_indices[0]),
+                    end=int(batch_indices[-1] + 1),
+                    workers=(0 if flatten_executor is None else min(int(flatten_workers), int(batch_limit))),
+                )
                 flatten_started = time.perf_counter()
-                if next_payload is not None:
-                    payload = next_payload.result()
-                    next_index = int(transform_index) + 1
-                    next_payload = (
-                        flatten_executor.submit(
-                            self._flatten_transform_diagonals,
-                            self.transforms[next_index],
-                            has_complex=has_complex,
+                if flatten_executor is not None:
+                    payloads = list(
+                        flatten_executor.map(
+                            lambda index: self._flatten_transform_diagonals(
+                                self.transforms[int(index)],
+                                has_complex=has_complex,
+                            ),
+                            batch_indices,
                         )
-                        if flatten_executor is not None and next_index < len(self.transforms)
-                        else None
                     )
                 else:
-                    payload = self._flatten_transform_diagonals(transform, has_complex=has_complex)
+                    payloads = [
+                        self._flatten_transform_diagonals(self.transforms[int(index)], has_complex=has_complex)
+                        for index in batch_indices
+                    ]
                 _unified_compile_trace(
-                    "streaming_flatten_done",
+                    "streaming_flatten_batch_done",
                     group=self._storage_key,
-                    transform_index=transform_index,
-                    diag_count=int(payload[0].size),
-                    data_count=int(payload[1].size),
+                    start=int(batch_indices[0]),
+                    end=int(batch_indices[-1] + 1),
+                    transforms=len(payloads),
+                    diag_count=sum(int(payload[0].size) for payload in payloads),
+                    data_count=sum(int(payload[1].size) for payload in payloads),
                     seconds=f"{time.perf_counter() - flatten_started:.6f}",
                 )
-                self._record_memory_event(
-                    "before_compile_transform",
-                    backend,
-                    (),
-                    transform_index=int(transform_index),
-                )
-                ids = self._generate_unified_backend_batch(backend, [payload], has_complex=has_complex)
-                if len(ids) != 1:
-                    raise RuntimeError("backend returned unexpected transform count for streaming unified compile")
-                transform_id = int(ids[0])
-                self.unified_ids.append(transform_id)
-                self._diag_indices_by_transform[transform_id] = tuple(int(idx) for idx in payload[0])
-                self._record_transform_key_requests(backend, transform_id)
-                self._record_memory_event(
-                    "after_compile_transform",
-                    backend,
-                    (transform_id,),
-                    transform_index=int(transform_index),
-                    transform_id=transform_id,
-                )
-                if save_plaintexts:
-                    if storage is None:
-                        raise RuntimeError("missing unified transform plaintext storage")
-                    self._save_and_unload_plaintext_diagonals_for_transform(
+
+                queued: list[tuple[int, tuple[np.ndarray, np.ndarray, int]]] = []
+                queued_bytes = 0
+                for index, payload in zip(batch_indices, payloads):
+                    payload_bytes = int(payload[0].nbytes + payload[1].nbytes)
+                    if (
+                        queued
+                        and int(batch_byte_limit) > 0
+                        and int(queued_bytes + payload_bytes) > int(batch_byte_limit)
+                    ):
+                        self._compile_unified_streaming_payload_batch(
+                            backend,
+                            queued,
+                            has_complex=has_complex,
+                            save_plaintexts=save_plaintexts,
+                            load_plaintexts=load_plaintexts,
+                            storage=storage,
+                            force_compile_trim=force_compile_trim,
+                        )
+                        queued = []
+                        queued_bytes = 0
+                    queued.append((int(index), payload))
+                    queued_bytes += int(payload_bytes)
+                if queued:
+                    self._compile_unified_streaming_payload_batch(
                         backend,
-                        storage,
-                        transform_id,
-                        payload[0],
+                        queued,
+                        has_complex=has_complex,
+                        save_plaintexts=save_plaintexts,
+                        load_plaintexts=load_plaintexts,
+                        storage=storage,
+                        force_compile_trim=force_compile_trim,
                     )
-                elif load_plaintexts:
-                    remove_plaintexts = getattr(backend, "RemovePlaintextDiagonals", None)
-                    if callable(remove_plaintexts):
-                        remove_plaintexts(int(transform_id))
-                self._clear_source_diagonals_after_compile(transform)
-                self._record_memory_event(
-                    "after_offload_transform",
-                    backend,
-                    (transform_id,),
-                    transform_index=int(transform_index),
-                    transform_id=transform_id,
-                )
-                del payload
+                transform_index = int(batch_end)
+                del payloads
                 gc.collect()
         finally:
             if flatten_executor is not None:
@@ -1836,6 +1894,82 @@ class UnifiedTransformGroup:
         self._prefetch_host_bytes = None
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None
+
+    def _compile_unified_streaming_payload_batch(
+        self,
+        backend,
+        items: list[tuple[int, tuple[np.ndarray, np.ndarray, int]]],
+        *,
+        has_complex: bool,
+        save_plaintexts: bool,
+        load_plaintexts: bool,
+        storage,
+        force_compile_trim: bool,
+    ) -> None:
+        if not items:
+            return
+        payloads = [payload for _index, payload in items]
+        indices = [int(index) for index, _payload in items]
+        needed_bytes = int(sum(int(payload[0].nbytes + payload[1].nbytes) for payload in payloads))
+        self._record_memory_event(
+            "before_compile_transform_batch",
+            backend,
+            (),
+            transform_indices=tuple(indices),
+            batch_size=len(items),
+            payload_bytes=int(needed_bytes),
+        )
+        self._forward_memory_guard(
+            backend,
+            reason=f"before_compile_transform_batch:{self._storage_key}:{indices[0]}:{indices[-1]}",
+            needed_bytes=int(needed_bytes),
+            force_trim=force_compile_trim,
+            raise_on_low=True,
+        )
+        ids = self._generate_unified_backend_batch(backend, payloads, has_complex=has_complex)
+        if len(ids) != len(payloads):
+            raise RuntimeError("backend returned unexpected transform count for streaming unified compile batch")
+        transform_ids = [int(value) for value in ids]
+        self.unified_ids.extend(transform_ids)
+        for transform_id, payload in zip(transform_ids, payloads):
+            self._diag_indices_by_transform[int(transform_id)] = tuple(int(idx) for idx in payload[0])
+            self._record_transform_key_requests(backend, int(transform_id))
+        self._record_memory_event(
+            "after_compile_transform_batch",
+            backend,
+            transform_ids,
+            transform_indices=tuple(indices),
+            compiled_transform_ids=tuple(transform_ids),
+            batch_size=len(items),
+        )
+        remove_plaintexts = getattr(backend, "RemovePlaintextDiagonals", None)
+        for transform_index, transform_id, payload in zip(indices, transform_ids, payloads):
+            if save_plaintexts:
+                if storage is None:
+                    raise RuntimeError("missing unified transform plaintext storage")
+                self._save_and_unload_plaintext_diagonals_for_transform(
+                    backend,
+                    storage,
+                    int(transform_id),
+                    payload[0],
+                )
+            elif load_plaintexts and callable(remove_plaintexts):
+                remove_plaintexts(int(transform_id))
+            self._clear_source_diagonals_after_compile(self.transforms[int(transform_index)])
+            self._record_memory_event(
+                "after_offload_transform",
+                backend,
+                (int(transform_id),),
+                transform_index=int(transform_index),
+                transform_id=int(transform_id),
+            )
+        self._forward_memory_guard(
+            backend,
+            reason=f"after_compile_transform_batch_offload:{self._storage_key}:{indices[0]}:{indices[-1]}",
+            transform_ids=transform_ids,
+            force_trim=force_compile_trim,
+            raise_on_low=True,
+        )
 
     def compile_unified(self, backend) -> None:
         if self.is_compiled:

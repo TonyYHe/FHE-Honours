@@ -299,9 +299,172 @@ def _same_shape_delta_groups(spec: R34SameShapeStageSpec) -> dict[int, tuple[tor
     return groups
 
 
+_SAME_SHAPE_GEOMETRY_CACHE: dict[
+    tuple[int, int, int, int],
+    tuple[
+        torch.Tensor,
+        dict[int, tuple[torch.Tensor, torch.Tensor]],
+        tuple[tuple[int, int, torch.Tensor, torch.Tensor, int], ...],
+    ],
+] = {}
+
+
+def _same_shape_geometry(
+    spec: R34SameShapeStageSpec,
+) -> tuple[
+    torch.Tensor,
+    dict[int, tuple[torch.Tensor, torch.Tensor]],
+    tuple[tuple[int, int, torch.Tensor, torch.Tensor, int], ...],
+]:
+    key = (int(spec.c), int(spec.h), int(spec.w), int(spec.gap))
+    cached = _SAME_SHAPE_GEOMETRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    base_indices = _channel_base_indices(
+        channels=int(spec.c),
+        height=int(spec.h),
+        width=int(spec.w),
+        gap=int(spec.gap),
+    )
+    delta_groups = _same_shape_delta_groups(spec)
+    spatial_parts: list[tuple[int, int, torch.Tensor, torch.Tensor, int]] = []
+    for kh in range(3):
+        for kw in range(3):
+            out_spatial, src_spatial, spatial_offset = _same_shape_spatial_parts(spec=spec, kh=int(kh), kw=int(kw))
+            if int(out_spatial.numel()) == 0:
+                continue
+            spatial_parts.append((int(kh), int(kw), out_spatial, src_spatial, int(spatial_offset)))
+    cached = (base_indices, delta_groups, tuple(spatial_parts))
+    _SAME_SHAPE_GEOMETRY_CACHE[key] = cached
+    return cached
+
+
 def _bsgs_meta_for_shifts(shifts: set[int]) -> tuple[int, tuple[int, ...], tuple[int, ...], ExecutionStats]:
     ordered = tuple(sorted(int(value) for value in shifts))
     return 0, ordered, (), ExecutionStats(rotations=int(len(ordered)), ct_pt_mults=int(len(ordered)), adds=int(len(ordered)))
+
+
+_SAME_SHAPE_FAST_SLOT_CACHE: dict[tuple[int, int, int, int, int, int, int, int, int, int], torch.Tensor] = {}
+
+
+def _same_shape_cached_fast_output_slots(
+    *,
+    spec: R34SameShapeStageSpec,
+    slot_count: int,
+    output_offset_start: int,
+    input_offset_start: int,
+    output_phase_offset: int,
+    input_phase_offset: int,
+    kh: int,
+    kw: int,
+    out_spatial: torch.Tensor,
+    src_spatial: torch.Tensor,
+) -> torch.Tensor:
+    key = (
+        int(spec.h),
+        int(spec.w),
+        int(spec.gap),
+        int(slot_count),
+        int(output_offset_start),
+        int(input_offset_start),
+        int(output_phase_offset),
+        int(input_phase_offset),
+        int(kh),
+        int(kw),
+    )
+    cached = _SAME_SHAPE_FAST_SLOT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    output_offset_end = int(output_offset_start + slot_count)
+    input_offset_end = int(input_offset_start + slot_count)
+    out_local = int(output_phase_offset) + out_spatial
+    src_local = int(input_phase_offset) + src_spatial
+    valid = (
+        (out_local >= int(output_offset_start))
+        & (out_local < int(output_offset_end))
+        & (src_local >= int(input_offset_start))
+        & (src_local < int(input_offset_end))
+    )
+    if bool(torch.any(valid).item()):
+        output_slots = (out_local[valid] - int(output_offset_start)).to(dtype=torch.int64)
+    else:
+        output_slots = torch.empty((0,), dtype=torch.int64)
+    _SAME_SHAPE_FAST_SLOT_CACHE[key] = output_slots
+    return output_slots
+
+
+def _same_shape_single_group_terms(
+    *,
+    spec: R34SameShapeStageSpec,
+    weight: torch.Tensor,
+    output_block_index: int,
+    input_block_index: int,
+    output_start: int,
+    output_end: int,
+    input_start: int,
+    input_end: int,
+    spatial_parts: tuple[tuple[int, int, torch.Tensor, torch.Tensor, int], ...],
+) -> list[tuple[int, torch.Tensor, torch.Tensor]] | None:
+    gap = max(1, int(spec.gap))
+    phase_count = int(gap * gap)
+    packed_w = int(spec.w * gap)
+    group_block = int(spec.h * gap * packed_w)
+    slot_count = _spec_slot_count(spec)
+    if int(group_block) <= 0 or int(group_block) % int(slot_count) != 0:
+        return None
+    if int(output_end) <= int(output_start) or int(input_end) <= int(input_start):
+        return []
+    output_group = int(output_start // int(group_block))
+    input_group = int(input_start // int(group_block))
+    if (
+        int(output_group * phase_count) >= int(spec.c)
+        or int(input_group * phase_count) >= int(spec.c)
+        or int(output_end - 1) // int(group_block) != int(output_group)
+        or int(input_end - 1) // int(group_block) != int(input_group)
+    ):
+        return None
+
+    output_offset_start = int(output_start - int(output_group) * int(group_block))
+    input_offset_start = int(input_start - int(input_group) * int(group_block))
+    fast_terms: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+    for output_phase in range(int(phase_count)):
+        output_channel = int(output_group * phase_count + output_phase)
+        if int(output_channel) >= int(spec.c):
+            continue
+        output_phase_offset = int((output_phase // gap) * packed_w + (output_phase % gap))
+        for input_phase in range(int(phase_count)):
+            input_channel = int(input_group * phase_count + input_phase)
+            if int(input_channel) >= int(spec.c):
+                continue
+            input_phase_offset = int((input_phase // gap) * packed_w + (input_phase % gap))
+            for kh, kw, out_spatial, src_spatial, spatial_offset in spatial_parts:
+                coeff = float(weight[int(output_channel), int(input_channel), int(kh), int(kw)])
+                if coeff == 0.0:
+                    continue
+                output_slots = _same_shape_cached_fast_output_slots(
+                    spec=spec,
+                    slot_count=int(slot_count),
+                    output_offset_start=int(output_offset_start),
+                    input_offset_start=int(input_offset_start),
+                    output_phase_offset=int(output_phase_offset),
+                    input_phase_offset=int(input_phase_offset),
+                    kh=int(kh),
+                    kw=int(kw),
+                    out_spatial=out_spatial,
+                    src_spatial=src_spatial,
+                )
+                if int(output_slots.numel()) == 0:
+                    continue
+                values = torch.full((int(output_slots.numel()),), float(coeff), dtype=torch.float32)
+                shift = (
+                    int(output_phase_offset)
+                    - int(input_phase_offset)
+                    + int(spatial_offset)
+                    - int(output_offset_start)
+                    + int(input_offset_start)
+                )
+                fast_terms.append((int(shift), output_slots, values))
+    return fast_terms
 
 
 def _build_orion_same_shape_block_lt_assets(
@@ -318,18 +481,86 @@ def _build_orion_same_shape_block_lt_assets(
     output_end = min(int(output_length), int(output_start + int(slot_count)))
     input_start = int(input_block_index) * int(slot_count)
     input_end = min(int(output_length), int(input_start + int(slot_count)))
-    base_indices = _channel_base_indices(channels=int(spec.c), height=int(spec.h), width=int(spec.w), gap=int(spec.gap))
-    delta_groups = _same_shape_delta_groups(spec)
-    spatial_parts: list[tuple[int, int, torch.Tensor, torch.Tensor]] = []
+    base_indices, delta_groups, spatial_parts = _same_shape_geometry(spec)
     candidate_shifts: set[int] = set()
-    for kh in range(3):
-        for kw in range(3):
-            out_spatial, src_spatial, spatial_offset = _same_shape_spatial_parts(spec=spec, kh=int(kh), kw=int(kw))
-            if int(out_spatial.numel()) == 0:
-                continue
-            spatial_parts.append((int(kh), int(kw), out_spatial, src_spatial))
-            for delta in delta_groups:
-                candidate_shifts.add(int(delta) + int(spatial_offset) - int(output_start) + int(input_start))
+    fast_terms = _same_shape_single_group_terms(
+        spec=spec,
+        weight=weight,
+        output_block_index=int(output_block_index),
+        input_block_index=int(input_block_index),
+        output_start=int(output_start),
+        output_end=int(output_end),
+        input_start=int(input_start),
+        input_end=int(input_end),
+        spatial_parts=spatial_parts,
+    )
+    if fast_terms is not None:
+        template_entries: list[CanonicalTemplateEntry] = []
+        prepared_plaintexts: list[PreparedPlaintext] = []
+        terms: list[LinearTransformTerm] = []
+        for shift, output_slots, values in fast_terms:
+            term_index = int(len(terms))
+            template_id = f"orion_vendored_r34_{spec.stage}_same_t{int(output_block_index)}_c{int(input_block_index)}_template_{int(term_index)}"
+            plaintext_id = f"orion_vendored_r34_{spec.stage}_same_t{int(output_block_index)}_c{int(input_block_index)}_pt_{int(term_index)}"
+            template_entries.append(
+                CanonicalTemplateEntry(
+                    template_id=str(template_id),
+                    family_id=str(family_id),
+                    key=(int(output_block_index), int(shift)),
+                    fine_shift=int(shift),
+                    indices=output_slots,
+                    note="vendored HaloED Orion-layout same-shape template",
+                )
+            )
+            prepared_plaintexts.append(
+                PreparedPlaintext(
+                    plaintext_id=str(plaintext_id),
+                    template_id=str(template_id),
+                    level=0,
+                    scale=1.0,
+                    slot_count=int(slot_count),
+                    values=values,
+                    note="prepared:orion_same_shape_fast_gap1",
+                )
+            )
+            terms.append(
+                LinearTransformTerm(
+                    term_id=f"orion_vendored_r34_{spec.stage}_same_t{int(output_block_index)}_c{int(input_block_index)}_term_{int(term_index)}",
+                    shift=int(shift),
+                    plaintext_id=str(plaintext_id),
+                    template_id=str(template_id),
+                    lookup_indices=torch.arange(int(output_slots.numel()), dtype=torch.int64),
+                    output_slot_indices=output_slots,
+                    note="vendored HaloED Orion-layout same-shape term",
+                )
+            )
+        if not terms:
+            return tuple(template_entries), tuple(prepared_plaintexts), None
+        shift_set = {int(term.shift) for term in terms}
+        selected_n1, baby_shifts, giant_shifts, lt_base_cost = _bsgs_meta_for_shifts(shift_set)
+        step = LinearTransformStep(
+            step_id=f"orion_vendored_r34_{spec.stage}_same_lt_t{int(output_block_index)}_c{int(input_block_index)}",
+            input_id=f"orion_source_block_{int(input_block_index)}",
+            target_index=int(output_block_index),
+            selected_n1=int(selected_n1),
+            baby_shifts=tuple(int(v) for v in baby_shifts),
+            giant_shifts=tuple(int(v) for v in giant_shifts),
+            terms=tuple(terms),
+            required_rotations=tuple(int(v) for v in baby_shifts),
+            prepared_plaintext_ids=tuple(str(pt.plaintext_id) for pt in prepared_plaintexts),
+            expected_cost=ExecutionStats(
+                rotations=int(lt_base_cost.rotations),
+                ct_pt_mults=int(len(terms)),
+                adds=int(len(terms)),
+            ),
+            representation="real_bsgs",
+            note="vendored HaloED Orion-layout same-shape block LT",
+        )
+        return tuple(template_entries), tuple(prepared_plaintexts), step
+
+    for _kh, _kw, _out_spatial, _src_spatial, spatial_offset in spatial_parts:
+        for delta in delta_groups:
+            candidate_shifts.add(int(delta) + int(spatial_offset) - int(output_start) + int(input_start))
 
     template_entries: list[CanonicalTemplateEntry] = []
     prepared_plaintexts: list[PreparedPlaintext] = []
@@ -337,8 +568,7 @@ def _build_orion_same_shape_block_lt_assets(
     for shift in sorted(candidate_shifts):
         output_parts: list[torch.Tensor] = []
         value_parts: list[torch.Tensor] = []
-        for kh, kw, out_spatial, src_spatial in spatial_parts:
-            spatial_offset = int((out_spatial[0] - src_spatial[0]).item())
+        for kh, kw, out_spatial, src_spatial, spatial_offset in spatial_parts:
             needed_delta = int(shift) - int(spatial_offset) + int(output_start) - int(input_start)
             group = delta_groups.get(int(needed_delta))
             if group is None:
@@ -611,9 +841,19 @@ def _transform_from_plan_step(
     level: int,
     scheme: Any,
     name: str,
+    prepared_by_id: dict[str, PreparedPlaintext] | None = None,
+    template_by_id: dict[str, CanonicalTemplateEntry] | None = None,
 ) -> Any:
-    prepared = {str(plain.plaintext_id): plain for plain in plan.prepared_plaintexts}
-    templates = {str(entry.template_id): entry for family in plan.family_templates for entry in family.template_entries}
+    prepared = (
+        prepared_by_id
+        if prepared_by_id is not None
+        else {str(plain.plaintext_id): plain for plain in plan.prepared_plaintexts}
+    )
+    templates = (
+        template_by_id
+        if template_by_id is not None
+        else {str(entry.template_id): entry for family in plan.family_templates for entry in family.template_entries}
+    )
     slots = int(plan.ring_slot_count)
     diag_tensors: dict[int, torch.Tensor] = {}
     for term in step.terms:
@@ -630,7 +870,7 @@ def _transform_from_plan_step(
         diag.index_add_(0, output_indices, values.to(dtype=value_dtype))
     return SimpleNamespace(
         name=str(name),
-        diagonals={(0, 0): {int(index): diag.tolist() for index, diag in sorted(diag_tensors.items())}},
+        diagonals={(0, 0): {int(index): diag for index, diag in sorted(diag_tensors.items())}},
         level=int(level),
         scheme=scheme,
         fhe_output_shape=torch.Size([1, int(slots)]),
@@ -834,6 +1074,12 @@ class R34OrionSameShapeRuntimeExecutor:
         self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
 
         compile_started = time.time()
+        prepared_by_id = {str(plain.plaintext_id): plain for plain in plan.prepared_plaintexts}
+        template_by_id = {
+            str(entry.template_id): entry
+            for family in plan.family_templates
+            for entry in family.template_entries
+        }
         for input_index, steps in sorted(steps_by_input_index.items()):
             ordered = [
                 (
@@ -844,6 +1090,8 @@ class R34OrionSameShapeRuntimeExecutor:
                         level=int(level),
                         scheme=scheme,
                         name=f"{self.output_node_id}_{step.input_id}_t{int(step.target_index)}",
+                        prepared_by_id=prepared_by_id,
+                        template_by_id=template_by_id,
                     ),
                 )
                 for step in sorted(steps, key=lambda value: int(value.target_index))
@@ -1004,6 +1252,12 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
         self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
 
         compile_started = time.time()
+        prepared_by_id = {str(plain.plaintext_id): plain for plain in plan.prepared_plaintexts}
+        template_by_id = {
+            str(entry.template_id): entry
+            for family in plan.family_templates
+            for entry in family.template_entries
+        }
         for left_input_index in range(0, int(self.cols), 2):
             right_input_index = int(left_input_index + 1)
             has_right = int(right_input_index) < int(self.cols)
@@ -1022,6 +1276,8 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                             level=int(level),
                             scheme=scheme,
                             name=f"{self.output_node_id}_{left_step.input_id}_t{int(left_step.target_index)}",
+                            prepared_by_id=prepared_by_id,
+                            template_by_id=template_by_id,
                         )
                     )
                     right_transform = (
@@ -1033,6 +1289,8 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                             level=int(level),
                             scheme=scheme,
                             name=f"{self.output_node_id}_{right_step.input_id}_t{int(right_step.target_index)}",
+                            prepared_by_id=prepared_by_id,
+                            template_by_id=template_by_id,
                         )
                     )
                     if left_transform is None and right_transform is None:
@@ -1065,6 +1323,8 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                             level=int(level),
                             scheme=scheme,
                             name=f"{self.output_node_id}_{step.input_id}_t{int(step.target_index)}",
+                            prepared_by_id=prepared_by_id,
+                            template_by_id=template_by_id,
                         )
                     )
                     if transform is not None:
@@ -1463,25 +1723,49 @@ def _build_orion_same_shape_direct_transform(
     output_end = min(int(output_length), int(output_start + int(slot_count)))
     input_start = int(input_block_index) * int(slot_count)
     input_end = min(int(output_length), int(input_start + int(slot_count)))
-    base_indices = _channel_base_indices(channels=int(spec.c), height=int(spec.h), width=int(spec.w), gap=int(spec.gap))
-    delta_groups = _same_shape_delta_groups(spec)
-    spatial_parts: list[tuple[int, int, torch.Tensor, torch.Tensor]] = []
+    base_indices, delta_groups, spatial_parts = _same_shape_geometry(spec)
     candidate_shifts: set[int] = set()
-    for kh in range(3):
-        for kw in range(3):
-            out_spatial, src_spatial, spatial_offset = _same_shape_spatial_parts(spec=spec, kh=int(kh), kw=int(kw))
-            if int(out_spatial.numel()) == 0:
-                continue
-            spatial_parts.append((int(kh), int(kw), out_spatial, src_spatial))
-            for delta in delta_groups:
-                candidate_shifts.add(int(delta) + int(spatial_offset) - int(output_start) + int(input_start))
+    fast_terms = _same_shape_single_group_terms(
+        spec=spec,
+        weight=weight,
+        output_block_index=int(output_block_index),
+        input_block_index=int(input_block_index),
+        output_start=int(output_start),
+        output_end=int(output_end),
+        input_start=int(input_start),
+        input_end=int(input_end),
+        spatial_parts=spatial_parts,
+    )
+    if fast_terms is not None:
+        diag_tensors: dict[int, torch.Tensor] = {}
+        for shift, output_slots, values in fast_terms:
+            diag_index = (-int(shift)) % int(slot_count)
+            diag = diag_tensors.setdefault(int(diag_index), torch.zeros((int(slot_count),), dtype=torch.float32))
+            diag.index_add_(0, output_slots, values)
+        if not diag_tensors:
+            raise RuntimeError(
+                f"{spec.family_label} produced no diagonals for output block {output_block_index} input block {input_block_index}"
+            )
+        return SimpleNamespace(
+            name=str(name),
+            diagonals={(0, 0): {int(index): diag for index, diag in sorted(diag_tensors.items())}},
+            level=int(level),
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, int(slot_count)]),
+            output_shape=torch.Size([1, int(slot_count)]),
+            target_index=int(output_block_index),
+            input_id=f"orion_source_block_{int(input_block_index)}",
+        )
+
+    for _kh, _kw, _out_spatial, _src_spatial, spatial_offset in spatial_parts:
+        for delta in delta_groups:
+            candidate_shifts.add(int(delta) + int(spatial_offset) - int(output_start) + int(input_start))
 
     diag_tensors: dict[int, torch.Tensor] = {}
     for shift in sorted(candidate_shifts):
         output_parts: list[torch.Tensor] = []
         value_parts: list[torch.Tensor] = []
-        for kh, kw, out_spatial, src_spatial in spatial_parts:
-            spatial_offset = int((out_spatial[0] - src_spatial[0]).item())
+        for kh, kw, out_spatial, src_spatial, spatial_offset in spatial_parts:
             needed_delta = int(shift) - int(spatial_offset) + int(output_start) - int(input_start)
             group = delta_groups.get(int(needed_delta))
             if group is None:

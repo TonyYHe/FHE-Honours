@@ -20,6 +20,7 @@ DATASET_SPECS = {
     "tiny": {"image_size": 64, "logn": 15, "input_channels": 3},
     "imagenet": {"image_size": 256, "logn": 16, "input_channels": 3},
     "montgomery_lung_64": {"image_size": 64, "logn": 15, "input_channels": 1},
+    "kvasir_polyp_256": {"image_size": 256, "logn": 16, "input_channels": 3},
 }
 
 DECODER_TCONV_NODES = ("up4", "up3", "up2", "up1")
@@ -174,7 +175,7 @@ def test_u22_64_default_provider_mode_selects_all_decoder_tconvs_and_conv_kernel
     imagenet_opts = _region_first_mode_options("u22_256_base32")
     assert imagenet_opts["enabled"] is True
     assert imagenet_opts["is_u22_phase1"] is True
-    assert imagenet_opts["u22_allowed_nodes"] == ("up4", "up3")
+    assert imagenet_opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
     assert imagenet_opts["u22_conv_kernels"] is True
 
     ablation_opts = _region_first_mode_options("u22_64_base32_up1234_noconv")
@@ -270,6 +271,36 @@ def test_u22_64_base32_provider_mode_attaches_all_linear_and_pool_nodes() -> Non
         assert audit["graph_audit"]["selected_generic_conv_count"] == 7
         assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
         assert dag.nodes["dec1b"]["module"].region_runtime.stage == "channel_transition"
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_256_base32_provider_mode_skips_dense_tconv_pack_for_all_decoder_nodes(monkeypatch) -> None:
+    def fail_pack_conv_transpose2d(*_args, **_kwargs):
+        raise AssertionError("u22_256_base32 provider mode must not dense-pack decoder ConvTranspose2d nodes")
+
+    monkeypatch.setattr(packing, "pack_conv_transpose2d", fail_pack_conv_transpose2d)
+    opts = _region_first_mode_options("u22_256_base32")
+    _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
+    try:
+        dag = _prepared_dag(dataset="kvasir_polyp_256", base_channels=32)
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=opts["u22_allowed_nodes"],
+            enable_conv_kernels=bool(opts["u22_conv_kernels"]),
+        )
+        audit = registry.attach_to_dag(dag)
+        _set_compile_level(dag)
+
+        attached = {row["node"] for row in audit["attached"]}
+        assert set(DECODER_TCONV_NODES).issubset(attached)
+        assert audit["graph_audit"]["selected_tconv_count"] == 4
+        assert audit["graph_audit"]["allowed_nodes"] == ["up1", "up2", "up3", "up4"]
+        for node_name in DECODER_TCONV_NODES:
+            module = dag.nodes[str(node_name)]["module"]
+            assert getattr(module, "region_first_skip_dense_pack", False) is True
+            module.generate_diagonals(last=False)
+            assert module.diagonals == {}
     finally:
         scheme.delete_scheme()
 
@@ -395,6 +426,89 @@ def test_u22_tconv_provider_runtime_handles_multi_input_and_output_blocks_on_pyt
         assert float((result - reference).abs().max().item()) <= 1.0e-5
         assert float((no_hybrid_result - reference).abs().max().item()) <= 1.0e-5
         assert float((result - no_hybrid_result).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_tconv_no_hybrid_skips_empty_source_output_block_shells_on_python_backend() -> None:
+    _init_python_scheme(logn=10)
+    try:
+        torch.manual_seed(31)
+        module = ConvTranspose2d(
+            in_channels=32,
+            out_channels=16,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            output_padding=0,
+            groups=1,
+            bias=True,
+        )
+        module.eval()
+        module.init_orion_params()
+        module.input_shape = torch.Size((1, 32, 8, 8))
+        module.output_shape = torch.Size((1, 16, 16, 16))
+        module.input_gap = 4
+        module.output_gap = 2
+        module.fhe_input_shape = torch.Size((1, 2, 32, 32))
+        module.fhe_output_shape = torch.Size((1, 4, 32, 32))
+        module.set_level(len(scheme.params.get_logq()) - 1)
+
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="synthetic_u22_tconv_no_hybrid_skip_empty",
+            use_ct_pt_hybrid_packing=False,
+        )
+        runtime.compile(scheme)
+
+        assert runtime.input_block_count == 4
+        assert runtime.output_block_count == 8
+        assert runtime.compiled_transform_count == 16
+        assert runtime.skipped_empty_transform_count == 16
+        assert sum(len(group.transforms) for group in runtime.groups) == runtime.compiled_transform_count
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_tconv_no_tile_family_sharing_splits_output_tiles_on_python_backend() -> None:
+    _init_python_scheme(logn=10)
+    try:
+        torch.manual_seed(32)
+        module = ConvTranspose2d(
+            in_channels=32,
+            out_channels=16,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            output_padding=0,
+            groups=1,
+            bias=True,
+        )
+        module.eval()
+        module.init_orion_params()
+        module.input_shape = torch.Size((1, 32, 8, 8))
+        module.output_shape = torch.Size((1, 16, 16, 16))
+        module.input_gap = 4
+        module.output_gap = 2
+        module.fhe_input_shape = torch.Size((1, 2, 32, 32))
+        module.fhe_output_shape = torch.Size((1, 4, 32, 32))
+        module.set_level(len(scheme.params.get_logq()) - 1)
+
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="synthetic_u22_tconv_no_tile_family",
+            use_ct_pt_hybrid_packing=True,
+            disable_tile_family_sharing=True,
+        )
+        runtime.compile(scheme)
+
+        assert runtime.use_ct_pt_hybrid_packing is True
+        assert runtime.disable_tile_family_sharing is True
+        assert runtime.input_block_count == 4
+        assert runtime.output_block_count == 8
+        assert runtime.compiled_transform_count == 16
+        assert len(runtime.groups) == 16
+        assert all(len(group.transforms) == 1 for group in runtime.groups)
     finally:
         scheme.delete_scheme()
 

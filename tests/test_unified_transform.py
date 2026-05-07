@@ -10,6 +10,7 @@ import torch
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core.orion import scheme
+from orion.nn import unified_transform as unified_transform_module
 from orion.nn.unified_transform import UnifiedTransformGroup, can_use_unified_bsgs
 
 
@@ -297,6 +298,34 @@ def test_unified_transform_group_offloads_plaintext_diagonals_when_saving(tmp_pa
         assert len(handle["__unified_transform_groups__"].keys()) == 0
 
 
+def test_unified_transform_group_streams_plaintext_save_without_concatenate(tmp_path, monkeypatch) -> None:
+    diags_path = tmp_path / "unified_diagonals.h5"
+    backend = _FakeBackend()
+    group = UnifiedTransformGroup([])
+
+    def fail_concatenate(*_args, **_kwargs):
+        raise AssertionError("plaintext save should not concatenate all diagonal payloads")
+
+    monkeypatch.setattr(unified_transform_module.np, "concatenate", fail_concatenate)
+    with h5py.File(diags_path, "w") as handle:
+        storage = handle.create_group("payloads")
+        group._save_and_unload_plaintext_diagonals_for_transform(
+            backend,
+            storage,
+            11,
+            (0, 1, 2),
+        )
+
+    assert backend.serialized == [(11, 0), (11, 1), (11, 2)]
+    assert backend.removed_plaintext_diagonals == [11]
+    with h5py.File(diags_path, "r") as handle:
+        transform_group = handle["payloads"]["11"]
+        assert transform_group["diag_indices"][:].tolist() == [0, 1, 2]
+        assert transform_group["diag_offsets"][:].tolist() == [0, 2, 4]
+        assert transform_group["diag_lengths"][:].tolist() == [2, 2, 2]
+        assert transform_group["diag_payload"][:].tolist() == [11, 0, 11, 1, 11, 2]
+
+
 def test_unified_transform_group_streams_compile_and_chunks_eval_for_memory_bounded_backend(tmp_path) -> None:
     diags_path = tmp_path / "unified_diagonals.h5"
     keys_path = tmp_path / "unified_keys.h5"
@@ -348,6 +377,44 @@ def test_unified_transform_group_streams_compile_and_chunks_eval_for_memory_boun
     assert backend.removed_transform_keys == [11, 12]
     assert any(event["event"] == "after_offload_transform" for event in group.memory_trace)
     assert any(event["event"] == "before_eval_group_memory_bounded" for event in group.memory_trace)
+
+
+def test_memory_bounded_compile_batches_transforms_when_workers_enabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ORION_UNIFIED_COMPILE_WORKERS", "2")
+    monkeypatch.setenv("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "2")
+    monkeypatch.setenv("ORION_UNIFIED_STREAM_COMPILE_BATCH_BYTES", "0")
+    diags_path = tmp_path / "unified_diagonals.h5"
+    keys_path = tmp_path / "unified_keys.h5"
+    transforms = (
+        _fake_transform(
+            {0: [1.0, 0.0, 0.0, 0.0], 1: [0.0, 2.0, 0.0, 0.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+            keys_path=str(keys_path),
+        ),
+        _fake_transform(
+            {0: [3.0, 0.0, 0.0, 0.0], 2: [0.0, 4.0, 0.0, 0.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+            keys_path=str(keys_path),
+        ),
+    )
+    backend = _FakeBackend()
+    backend.memory_bounded_unified_transforms = True
+    group = UnifiedTransformGroup(transforms)
+
+    group.compile_unified(backend)
+
+    assert group.unified_ids == [11, 12]
+    assert [entry["num_transforms"] for entry in backend.generated] == [2]
+    assert backend.serialized == [(11, 0), (11, 1), (12, 0), (12, 2)]
+    assert backend.removed_plaintext_diagonals == [11, 12]
+    batch_events = [
+        event for event in group.memory_trace
+        if event["event"] == "before_compile_transform_batch"
+    ]
+    assert batch_events
+    assert batch_events[-1]["batch_size"] == 2
 
 
 def test_memory_bounded_load_streams_compile_to_match_saved_payload_layout(tmp_path) -> None:

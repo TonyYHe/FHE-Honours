@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from types import SimpleNamespace
 from dataclasses import dataclass
@@ -9,12 +10,17 @@ from typing import Any
 import torch
 
 from orion.core import packing
-from orion.experimental.cir.lattigo_block import _slot_index
+from orion.experimental.cir.lattigo_block import _idx_chw_gap_tensor
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
 from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.pooling import AvgPool2d
 from orion.nn.unified_transform import UnifiedTransformGroup
+
+
+def _env_truthy(name: str) -> bool:
+    raw = os.environ.get(str(name), "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 try:
     from orion.experimental.cir.runtime_group import _add_plaintext_for_add, _align_ciphertexts_for_add, _rescale_cipher_tensor
@@ -301,6 +307,7 @@ class TconvK2S2PythonRuntimeExecutor:
         output_node_id: str,
         use_ct_pt_hybrid_packing: bool = True,
         project_complex_inputs_to_real: bool = True,
+        disable_tile_family_sharing: bool | None = None,
     ) -> None:
         if not _u22_tconv_module_supported(module):
             raise ValueError("U22 experimental tconv kernel only supports k=2, s=2, gap-halving ConvTranspose2d layers")
@@ -308,6 +315,11 @@ class TconvK2S2PythonRuntimeExecutor:
         self.output_node_id = str(output_node_id)
         self.use_ct_pt_hybrid_packing = bool(use_ct_pt_hybrid_packing)
         self.project_complex_inputs_to_real = bool(project_complex_inputs_to_real)
+        self.disable_tile_family_sharing = (
+            _env_truthy("ORION_U22_DISABLE_TILE_FAMILY_SHARING")
+            if disable_tile_family_sharing is None
+            else bool(disable_tile_family_sharing)
+        )
         self.assigned_level: int | None = None
         self.assigned_depth: int | None = None
         self.groups: list[UnifiedTransformGroup] = []
@@ -321,6 +333,8 @@ class TconvK2S2PythonRuntimeExecutor:
         self.compile_count = 0
         self.block_evaluate_count = 0
         self.real_projection_count = 0
+        self.compiled_transform_count = 0
+        self.skipped_empty_transform_count = 0
         self._bias_vector: torch.Tensor | None = None
         self._bias_ptxt_cache: dict[tuple[int, int], Any] = {}
         self.last_runtime_timing: dict[str, float] = {
@@ -470,27 +484,45 @@ class TconvK2S2PythonRuntimeExecutor:
             "total_call_s": 0.0,
         }
         level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
-        prepare_started = time.time()
-        transforms_by_source_block = self._build_transforms_by_source_block(scheme=scheme, level=int(level))
-        self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_started)
+        self._set_block_layout(scheme=scheme)
         self.groups = []
         self.target_indices_by_input_unit = []
         self.input_block_pairs = []
         self.complex_input_block_flags = []
+        self.compiled_transform_count = 0
+        self.skipped_empty_transform_count = 0
 
-        grouped_entries: list[tuple[tuple[int, int | None], bool, list[tuple[int, Any]]]] = []
+        prepare_total = 0.0
+        compile_total = 0.0
         if bool(self.use_ct_pt_hybrid_packing) and int(self.input_block_count) > 1:
             for left_block in range(0, int(self.input_block_count), 2):
+                prepare_started = time.time()
+                left_transforms, left_empty_count = self._build_source_block_transforms(
+                    scheme=scheme,
+                    level=int(level),
+                    source_block=int(left_block),
+                )
                 right_block = int(left_block + 1)
                 has_right = int(right_block) < int(self.input_block_count)
+                right_transforms: list[Any | None] | None = None
+                right_empty_count = 0
+                if bool(has_right):
+                    right_transforms, right_empty_count = self._build_source_block_transforms(
+                        scheme=scheme,
+                        level=int(level),
+                        source_block=int(right_block),
+                    )
+                self.skipped_empty_transform_count += int(left_empty_count + right_empty_count)
                 entries: list[tuple[int, Any]] = []
                 for output_block in range(int(self.output_block_count)):
-                    left_transform = transforms_by_source_block[int(left_block)][int(output_block)]
+                    left_transform = left_transforms[int(output_block)]
                     right_transform = (
-                        transforms_by_source_block[int(right_block)][int(output_block)]
-                        if bool(has_right)
+                        right_transforms[int(output_block)]
+                        if bool(has_right) and right_transforms is not None
                         else None
                     )
+                    if left_transform is None and right_transform is None:
+                        continue
                     if bool(has_right):
                         transform = _merge_optional_tconv_source_block_transforms_to_complex(
                             left_transform,
@@ -501,43 +533,188 @@ class TconvK2S2PythonRuntimeExecutor:
                             ),
                             real_lane_input_scale=(0.25 if bool(self.project_complex_inputs_to_real) else 0.5),
                         )
+                        self._clear_transform_diagonals(left_transform)
+                        self._clear_transform_diagonals(right_transform)
                     else:
                         transform = left_transform
+                    if transform is None:
+                        continue
                     entries.append((int(output_block), transform))
-                grouped_entries.append(
-                    (
-                        (int(left_block), int(right_block) if bool(has_right) else None),
-                        bool(has_right),
-                        entries,
-                    )
+                prepare_total += float(time.time() - prepare_started)
+                if not entries:
+                    continue
+                compile_total += self._compile_entry_groups(
+                    scheme=scheme,
+                    pair=(int(left_block), int(right_block) if bool(has_right) else None),
+                    is_complex=bool(has_right),
+                    entries=entries,
                 )
+                del left_transforms, right_transforms, entries
         else:
-            for source_block, transforms in enumerate(transforms_by_source_block):
-                grouped_entries.append(
-                    (
-                        (int(source_block), None),
-                        False,
-                        [(int(output_block), transform) for output_block, transform in enumerate(transforms)],
-                    )
+            for source_block in range(int(self.input_block_count)):
+                prepare_started = time.time()
+                transforms, empty_count = self._build_source_block_transforms(
+                    scheme=scheme,
+                    level=int(level),
+                    source_block=int(source_block),
                 )
+                self.skipped_empty_transform_count += int(empty_count)
+                entries = [
+                    (int(output_block), transform)
+                    for output_block, transform in enumerate(transforms)
+                    if transform is not None
+                ]
+                prepare_total += float(time.time() - prepare_started)
+                if not entries:
+                    continue
+                compile_total += self._compile_entry_groups(
+                    scheme=scheme,
+                    pair=(int(source_block), None),
+                    is_complex=False,
+                    entries=entries,
+                )
+                del transforms, entries
+        bias_level = max(0, int(level) - max(0, int(self.assigned_depth) if self.assigned_depth is not None else 1))
+        bias_started = time.time()
+        self._compile_bias_plaintexts(scheme=scheme, level=int(bias_level))
+        compile_total += float(time.time() - bias_started)
+        self.compile_count += 1
+        self.last_runtime_timing["prepare_transforms_s"] = float(prepare_total)
+        self.last_runtime_timing["compile_unified_s"] = float(compile_total)
+        self._compiled = True
 
-        compile_started = time.time()
-        for pair, is_complex, entries in grouped_entries:
-            ordered = sorted(entries, key=lambda item: int(item[0]))
+    def _set_block_layout(self, *, scheme: Any) -> None:
+        layout = self._block_layout(scheme=scheme)
+        self.input_block_count = int(layout["input_block_count"])
+        self.output_block_count = int(layout["output_block_count"])
+        self.input_total_slots = int(layout["input_total_slots"])
+        self.output_total_slots = int(layout["output_total_slots"])
+
+    def _compile_entry_groups(
+        self,
+        *,
+        scheme: Any,
+        pair: tuple[int, int | None],
+        is_complex: bool,
+        entries: list[tuple[int, Any]],
+    ) -> float:
+        entry_groups = (
+            [[entry] for entry in sorted(entries, key=lambda item: int(item[0]))]
+            if bool(self.disable_tile_family_sharing)
+            else [sorted(entries, key=lambda item: int(item[0]))]
+        )
+        elapsed = 0.0
+        for ordered in entry_groups:
+            started = time.time()
             transforms = [transform for _target_index, transform in ordered]
             group = UnifiedTransformGroup(transforms)
             group.compile_unified(scheme.backend)
+            elapsed += float(time.time() - started)
             self.groups.append(group)
+            self.compiled_transform_count += int(len(transforms))
             self.target_indices_by_input_unit.append(tuple(int(target_index) for target_index, _transform in ordered))
             self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
             self.complex_input_block_flags.append(bool(is_complex))
-        bias_level = max(0, int(level) - max(0, int(self.assigned_depth) if self.assigned_depth is not None else 1))
-        self._compile_bias_plaintexts(scheme=scheme, level=int(bias_level))
-        self.compile_count += 1
-        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
-        self._compiled = True
+        return float(elapsed)
 
-    def _build_transforms_by_source_block(self, *, scheme: Any, level: int) -> list[list[Any]]:
+    def _clear_transform_diagonals(self, transform: Any | None) -> None:
+        if transform is None:
+            return
+        try:
+            getattr(transform, "diagonals", {}).clear()
+        except Exception:
+            pass
+
+    def _iter_source_positions_for_block(
+        self,
+        *,
+        source_block: int,
+        slots: int,
+        c_in: int,
+        h_in: int,
+        w_in: int,
+        input_gap: int,
+    ):
+        start = int(source_block) * int(slots)
+        stop = min(int(start + int(slots)), int(self.input_total_slots))
+        if int(stop) <= int(start):
+            return
+        gap = max(1, int(input_gap))
+        if int(gap) == 1:
+            plane = int(h_in * w_in)
+            for source_slot in range(int(start), int(stop)):
+                ic = int(source_slot // int(plane))
+                rem = int(source_slot % int(plane))
+                if int(ic) >= int(c_in):
+                    continue
+                yield int(source_slot), int(ic), int(rem // int(w_in)), int(rem % int(w_in))
+            return
+
+        phase_count = int(gap * gap)
+        packed_w = int(w_in * gap)
+        group_block = int(h_in * gap * packed_w)
+        if int(group_block) <= 0:
+            return
+        for source_slot in range(int(start), int(stop)):
+            group = int(source_slot // int(group_block))
+            rem = int(source_slot % int(group_block))
+            packed_h_index = int(rem // int(packed_w))
+            packed_w_index = int(rem % int(packed_w))
+            ih = int(packed_h_index // int(gap))
+            iw = int(packed_w_index // int(gap))
+            if int(ih) >= int(h_in) or int(iw) >= int(w_in):
+                continue
+            phase_h = int(packed_h_index % int(gap))
+            phase_w = int(packed_w_index % int(gap))
+            ic = int(group * phase_count + phase_h * gap + phase_w)
+            if int(ic) >= int(c_in):
+                continue
+            yield int(source_slot), int(ic), int(ih), int(iw)
+
+    def _source_position_tensors_for_block(
+        self,
+        *,
+        source_block: int,
+        slots: int,
+        c_in: int,
+        h_in: int,
+        w_in: int,
+        input_gap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        start = int(source_block) * int(slots)
+        stop = min(int(start + int(slots)), int(self.input_total_slots))
+        if int(stop) <= int(start):
+            empty = torch.empty((0,), dtype=torch.int64)
+            return empty, empty, empty, empty
+        source_slots = torch.arange(int(start), int(stop), dtype=torch.int64)
+        gap = max(1, int(input_gap))
+        if int(gap) == 1:
+            plane = int(h_in * w_in)
+            ic = torch.div(source_slots, int(plane), rounding_mode="floor")
+            rem = torch.remainder(source_slots, int(plane))
+            ih = torch.div(rem, int(w_in), rounding_mode="floor")
+            iw = torch.remainder(rem, int(w_in))
+            valid = ic < int(c_in)
+            return source_slots[valid], ic[valid], ih[valid], iw[valid]
+
+        packed_w = int(w_in * gap)
+        group_block = int(h_in * gap * packed_w)
+        if int(group_block) <= 0:
+            empty = torch.empty((0,), dtype=torch.int64)
+            return empty, empty, empty, empty
+        group = torch.div(source_slots, int(group_block), rounding_mode="floor")
+        rem = torch.remainder(source_slots, int(group_block))
+        packed_h_index = torch.div(rem, int(packed_w), rounding_mode="floor")
+        packed_w_index = torch.remainder(rem, int(packed_w))
+        ih = torch.div(packed_h_index, int(gap), rounding_mode="floor")
+        iw = torch.div(packed_w_index, int(gap), rounding_mode="floor")
+        phase_h = torch.remainder(packed_h_index, int(gap))
+        phase_w = torch.remainder(packed_w_index, int(gap))
+        ic = group * int(gap * gap) + phase_h * int(gap) + phase_w
+        valid = (ih < int(h_in)) & (iw < int(w_in)) & (ic < int(c_in))
+        return source_slots[valid], ic[valid], ih[valid], iw[valid]
+
+    def _build_source_block_transforms(self, *, scheme: Any, level: int, source_block: int) -> tuple[list[Any | None], int]:
         c_in = int(getattr(self.module, "input_shape")[1])
         h_in = int(getattr(self.module, "input_shape")[2])
         w_in = int(getattr(self.module, "input_shape")[3])
@@ -549,62 +726,100 @@ class TconvK2S2PythonRuntimeExecutor:
         output_gap = int(getattr(self.module, "output_gap"))
         layout = self._block_layout(scheme=scheme)
         slots = int(layout["slots"])
-        self.input_block_count = int(layout["input_block_count"])
-        self.output_block_count = int(layout["output_block_count"])
-        self.input_total_slots = int(layout["input_total_slots"])
-        self.output_total_slots = int(layout["output_total_slots"])
 
-        diagonal_entries: list[list[dict[int, dict[int, float]]]] = [
-            [
-                {}
-                for _output_block in range(int(self.output_block_count))
-            ]
-            for _input_block in range(int(self.input_block_count))
+        source_slots, ic, ih, iw = self._source_position_tensors_for_block(
+            source_block=int(source_block),
+            slots=int(slots),
+            c_in=int(c_in),
+            h_in=int(h_in),
+            w_in=int(w_in),
+            input_gap=int(input_gap),
+        )
+        diagonal_parts: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = [
+            []
+            for _output_block in range(int(self.output_block_count))
         ]
-        for ic in range(int(c_in)):
-            for ih in range(int(h_in)):
-                for iw in range(int(w_in)):
-                    src_slot = int(_slot_index(int(ic), int(ih), int(iw), h=int(h_in), w=int(w_in), gap=int(input_gap)))
-                    source_block = int(src_slot // int(slots))
-                    source_local = int(src_slot % int(slots))
-                    for kh in range(2):
-                        oh = int(ih * 2 + kh)
-                        for kw in range(2):
-                            ow = int(iw * 2 + kw)
-                            for oc in range(int(c_out)):
-                                coeff = float(weight[int(ic), int(oc), int(kh), int(kw)])
-                                if coeff == 0.0:
-                                    continue
-                                out_slot = int(_slot_index(int(oc), int(oh), int(ow), h=int(h_out), w=int(w_out), gap=int(output_gap)))
-                                output_block = int(out_slot // int(slots))
-                                output_local = int(out_slot % int(slots))
-                                diag_idx = (int(source_local) - int(output_local)) % int(slots)
-                                row = diagonal_entries[int(source_block)][int(output_block)].setdefault(int(diag_idx), {})
-                                row[int(output_local)] = float(row.get(int(output_local), 0.0) + coeff)
-
-        transforms_by_source_block: list[list[Any]] = []
-        for source_block in range(int(self.input_block_count)):
-            block_transforms: list[Any] = []
-            for output_block in range(int(self.output_block_count)):
-                diagonals: dict[int, list[float]] = {}
-                for diag_idx, slot_values in diagonal_entries[int(source_block)][int(output_block)].items():
-                    diag = torch.zeros((int(slots),), dtype=torch.float32)
-                    indices = torch.tensor(sorted(int(value) for value in slot_values.keys()), dtype=torch.int64)
-                    values = torch.tensor([float(slot_values[int(index)]) for index in indices.tolist()], dtype=torch.float32)
-                    diag.index_copy_(0, indices, values)
-                    diagonals[int(diag_idx)] = diag.tolist()
-                block_transforms.append(
-                    SimpleNamespace(
-                        name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
-                        diagonals={(0, 0): diagonals or {0: [0.0] * int(slots)}},
-                        level=int(level),
-                        scheme=scheme,
-                        fhe_output_shape=torch.Size([1, int(slots)]),
-                        output_shape=torch.Size([1, int(slots)]),
+        if int(source_slots.numel()) > 0:
+            source_local = torch.remainder(source_slots, int(slots))
+            oc = torch.arange(int(c_out), dtype=torch.int64)
+            oc_grid = oc.unsqueeze(0).expand(int(source_slots.numel()), int(c_out))
+            source_grid = source_local.unsqueeze(1)
+            for kh in range(2):
+                oh = ih * 2 + int(kh)
+                oh_grid = oh.unsqueeze(1).expand_as(oc_grid)
+                for kw in range(2):
+                    ow = iw * 2 + int(kw)
+                    coeff = weight[
+                        ic.to(dtype=torch.int64).unsqueeze(1),
+                        oc.unsqueeze(0),
+                        int(kh),
+                        int(kw),
+                    ].to(dtype=torch.float32)
+                    nonzero = coeff != 0
+                    if not bool(torch.any(nonzero).item()):
+                        continue
+                    ow_grid = ow.unsqueeze(1).expand_as(oc_grid)
+                    out_slot = _idx_chw_gap_tensor(
+                        oc_grid,
+                        oh_grid,
+                        ow_grid,
+                        h=int(h_out),
+                        w=int(w_out),
+                        gap=int(output_gap),
                     )
+                    output_block = torch.div(out_slot, int(slots), rounding_mode="floor")
+                    output_local = torch.remainder(out_slot, int(slots))
+                    diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                    valid = nonzero & (output_block >= 0) & (output_block < int(self.output_block_count))
+                    if not bool(torch.any(valid).item()):
+                        continue
+                    flat_blocks = output_block[valid].to(dtype=torch.int64)
+                    flat_diags = diag_idx[valid].to(dtype=torch.int64)
+                    flat_locals = output_local[valid].to(dtype=torch.int64)
+                    flat_values = coeff[valid].to(dtype=torch.float32)
+                    for block in torch.unique(flat_blocks).tolist():
+                        block_value = int(block)
+                        block_mask = flat_blocks == int(block_value)
+                        diagonal_parts[int(block_value)].append(
+                            (
+                                flat_diags[block_mask].clone(),
+                                flat_locals[block_mask].clone(),
+                                flat_values[block_mask].clone(),
+                            )
+                        )
+
+        block_transforms: list[Any | None] = []
+        empty_transform_count = 0
+        for output_block in range(int(self.output_block_count)):
+            diagonals: dict[int, torch.Tensor] = {}
+            if diagonal_parts[int(output_block)]:
+                block_diag_idx = torch.cat([part[0] for part in diagonal_parts[int(output_block)]]).to(dtype=torch.int64)
+                block_output_local = torch.cat([part[1] for part in diagonal_parts[int(output_block)]]).to(dtype=torch.int64)
+                block_values = torch.cat([part[2] for part in diagonal_parts[int(output_block)]]).to(dtype=torch.float32)
+            else:
+                block_diag_idx = torch.empty((0,), dtype=torch.int64)
+                block_output_local = torch.empty((0,), dtype=torch.int64)
+                block_values = torch.empty((0,), dtype=torch.float32)
+            for diag_idx in torch.unique(block_diag_idx).tolist():
+                mask = block_diag_idx == int(diag_idx)
+                diag = torch.zeros((int(slots),), dtype=torch.float32)
+                diag.index_add_(0, block_output_local[mask], block_values[mask])
+                diagonals[int(diag_idx)] = diag
+            if not diagonals:
+                empty_transform_count += 1
+                block_transforms.append(None)
+                continue
+            block_transforms.append(
+                SimpleNamespace(
+                    name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
+                    diagonals={(0, 0): diagonals},
+                    level=int(level),
+                    scheme=scheme,
+                    fhe_output_shape=torch.Size([1, int(slots)]),
+                    output_shape=torch.Size([1, int(slots)]),
                 )
-            transforms_by_source_block.append(block_transforms)
-        return transforms_by_source_block
+            )
+        return block_transforms, int(empty_transform_count)
 
     def _bias_plaintext(self, *, scheme: Any, level: int, output_block: int):
         cache_key = (int(output_block), int(level))
@@ -664,15 +879,21 @@ class TconvK2S2PythonRuntimeExecutor:
         self.last_runtime_io["output_block_count"] = int(self.output_block_count)
         self.last_runtime_io["use_ct_pt_hybrid_packing"] = bool(self.use_ct_pt_hybrid_packing)
         self.last_runtime_io["project_complex_inputs_to_real"] = bool(self.project_complex_inputs_to_real)
+        self.last_runtime_io["disable_tile_family_sharing"] = bool(self.disable_tile_family_sharing)
+        self.last_runtime_io["compiled_transform_count"] = int(self.compiled_transform_count)
+        self.last_runtime_io["skipped_empty_transform_count"] = int(self.skipped_empty_transform_count)
         if len(ids) < int(self.input_block_count):
             raise RuntimeError(
                 "U22 experimental tconv kernel requires one ciphertext per packed input block: "
                 f"expected {self.input_block_count}, got {len(ids)}"
             )
-        if len(self.groups) != int(self.input_block_count):
-            expected = int(math.ceil(int(self.input_block_count) / 2)) if bool(self.use_ct_pt_hybrid_packing) else int(self.input_block_count)
-            if len(self.groups) != int(expected):
-                raise RuntimeError("U22 experimental tconv kernel was not compiled")
+        if not self.groups or not (
+            len(self.groups)
+            == len(self.target_indices_by_input_unit)
+            == len(self.input_block_pairs)
+            == len(self.complex_input_block_flags)
+        ):
+            raise RuntimeError("U22 experimental tconv kernel was not compiled")
         accumulated: list[Any | None] = [None for _ in range(int(self.output_block_count))]
         real_input_ids: dict[int, int] = {}
         owned_temp_ids: list[int] = []

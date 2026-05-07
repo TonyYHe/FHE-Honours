@@ -38,6 +38,11 @@ func ltCompileWorkerCount(n int) int {
 	return workers
 }
 
+func unifiedNoBSGSEnabled() bool {
+	raw := os.Getenv("ORION_LATTIGO_UNIFIED_NO_BSGS")
+	return raw == "1" || raw == "true" || raw == "TRUE" || raw == "yes" || raw == "on"
+}
+
 func encodeFloatTransformsParallel(
 	diagonalsList []lintrans.Diagonals[float64],
 	transforms []lintrans.LinearTransformation,
@@ -144,9 +149,21 @@ func applyOptimalUnifiedBSGSRatio(params []lintrans.Parameters) {
 	}
 }
 
+func newUnifiedNoBSGSTransformations(params []lintrans.Parameters) []lintrans.LinearTransformation {
+	transforms := make([]lintrans.LinearTransformation, len(params))
+	for i, param := range params {
+		param.LogBabyStepGiantStepRatio = -1
+		transforms[i] = lintrans.NewTransformation(scheme.Params, param)
+	}
+	return transforms
+}
+
 func newUnifiedLoadTransformations(params []lintrans.Parameters) []lintrans.LinearTransformation {
 	if len(params) == 0 {
 		return nil
+	}
+	if unifiedNoBSGSEnabled() {
+		return newUnifiedNoBSGSTransformations(params)
 	}
 
 	slots := 1 << params[0].LogDimensions.Cols
@@ -612,8 +629,13 @@ func GenerateLinearTransformsUnified(
 		}
 	}
 
-	applyOptimalUnifiedBSGSRatio(params)
-	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+	var transforms []lintrans.LinearTransformation
+	if unifiedNoBSGSEnabled() {
+		transforms = newUnifiedNoBSGSTransformations(params)
+	} else {
+		applyOptimalUnifiedBSGSRatio(params)
+		transforms = lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+	}
 	if err := encodeUnifiedFloatTransformsParallel(diagonalsList, transforms); err != nil {
 		panic(err)
 	}
@@ -668,8 +690,13 @@ func GenerateLinearTransformsUnifiedComplex(
 		}
 	}
 
-	applyOptimalUnifiedBSGSRatio(params)
-	transforms := lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+	var transforms []lintrans.LinearTransformation
+	if unifiedNoBSGSEnabled() {
+		transforms = newUnifiedNoBSGSTransformations(params)
+	} else {
+		applyOptimalUnifiedBSGSRatio(params)
+		transforms = lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+	}
 	if err := encodeUnifiedComplexTransformsParallel(diagonalsList, transforms); err != nil {
 		panic(err)
 	}

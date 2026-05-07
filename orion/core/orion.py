@@ -351,7 +351,7 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                 allowed.extend(f"up{ch}" for ch in digits)
         if allowed:
             u22_allowed_nodes = tuple(dict.fromkeys(allowed))
-    if u22_mode_base == "u22_64_base32" and u22_allowed_nodes is None:
+    if u22_mode_base in {"u22_64_base32", "u22_256_base32"} and u22_allowed_nodes is None:
         u22_allowed_nodes = ("up1", "up2", "up3", "up4")
     elif u22_mode_base is not None and u22_allowed_nodes is None:
         u22_allowed_nodes = ("up4", "up3")
