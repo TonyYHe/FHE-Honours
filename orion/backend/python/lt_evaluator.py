@@ -497,7 +497,9 @@ class NewEvaluator:
 
         print("└── saving... ", end="", flush=True)
         with h5py.File(self.diags_path, "a") as f:
-            layer = f.require_group(layer_name)
+            if layer_name in f:
+                del f[layer_name]
+            layer = f.create_group(layer_name)
 
             layer.create_dataset("embedding_method", data=self.embed_method)
             layer.create_dataset("output_rotations", data=output_rotations)

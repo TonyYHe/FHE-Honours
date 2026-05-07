@@ -56,6 +56,10 @@ class LinearTransform(Module):
     def get_io_mode(self):
         return self.scheme.params.get_io_mode()
 
+    def _compile_save_resume_enabled(self) -> bool:
+        enabled = getattr(self.scheme.params, "get_compile_save_resume", None)
+        return self.get_io_mode() == "save" and callable(enabled) and bool(enabled())
+
     def save_transforms(self):
         self.scheme.lt_evaluator.save_transforms(self)
 
@@ -63,9 +67,16 @@ class LinearTransform(Module):
         return self.scheme.lt_evaluator.load_transforms(self) 
 
     def load_cached_transform_metadata(self) -> bool:
-        if self.get_io_mode() != "load":
+        io_mode = self.get_io_mode()
+        if io_mode != "load" and not self._compile_save_resume_enabled():
             return False
-        self.output_rotations = self.scheme.lt_evaluator.load_transform_metadata(self)
+        if io_mode == "load":
+            self.output_rotations = self.scheme.lt_evaluator.load_transform_metadata(self)
+        else:
+            try:
+                self.output_rotations = self.scheme.lt_evaluator.load_transform_metadata(self)
+            except (KeyError, OSError, ValueError):
+                return False
         self.diagonals = {}
         return True
 

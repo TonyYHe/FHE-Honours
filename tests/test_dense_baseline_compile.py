@@ -393,6 +393,39 @@ def test_load_mode_reuses_cached_diagonals_without_repacking(tmp_path, monkeypat
         load_scheme.delete_scheme()
 
 
+def test_save_resume_reuses_cached_diagonals_without_repacking(tmp_path, monkeypatch) -> None:
+    torch.manual_seed(22)
+    weight = torch.randn(1, 1, 1, 1)
+
+    save_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="save"))
+    Module.set_scheme(save_scheme)
+    Module.set_margin(save_scheme.params.get_margin())
+    try:
+        layer = _tiny_cached_conv(weight)
+        layer.generate_diagonals(last=False)
+        layer.compile()
+    finally:
+        save_scheme.delete_scheme()
+
+    monkeypatch.setenv("ORION_COMPILE_SAVE_RESUME", "1")
+    resume_scheme = orion.init_scheme(_cache_config(tmp_path, io_mode="save"))
+    Module.set_scheme(resume_scheme)
+    Module.set_margin(resume_scheme.params.get_margin())
+    try:
+        layer = _tiny_cached_conv(weight)
+
+        def fail_pack_conv2d(*_args, **_kwargs):
+            raise AssertionError("save resume should not repack cached conv diagonals")
+
+        monkeypatch.setattr(packing, "pack_conv2d", fail_pack_conv2d)
+        layer.generate_diagonals(last=False)
+        assert layer.diagonals == {}
+        layer.compile()
+        assert layer.transform_ids
+    finally:
+        resume_scheme.delete_scheme()
+
+
 def test_load_mode_uses_cached_compile_plan(tmp_path, monkeypatch) -> None:
     torch.manual_seed(11)
     weight = torch.randn(1, 1, 1, 1)

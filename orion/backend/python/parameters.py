@@ -3,6 +3,9 @@ from typing import Literal, List
 from dataclasses import dataclass, field
 
 
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
+
+
 @dataclass
 class CKKSParameters:
     logn: int
@@ -118,12 +121,20 @@ class NewParameters:
         )
         self.orion_params = OrionParameters(**orion_params)
 
-        # Finally, we'll delete existing keys/diagonals if the user  
-        # specifies to overwrite them.
+        # Finally, we'll delete existing keys/diagonals if the user
+        # specifies to overwrite them. Resume mode keeps a partial save cache
+        # so long compile jobs can continue from the last complete group.
         if self.get_io_mode() == "save" and self.io_paths_exist():
-            self.reset_stored_keys()
-            self.reset_stored_diags()
-            self.reset_compile_manifest()
+            if self.get_compile_save_resume():
+                print(
+                    "Preserving existing compile cache because "
+                    "ORION_COMPILE_SAVE_RESUME is enabled.",
+                    flush=True,
+                )
+            else:
+                self.reset_stored_keys()
+                self.reset_stored_diags()
+                self.reset_compile_manifest()
 
     def __str__(self) -> str:
         border = "=" * 50
@@ -188,6 +199,10 @@ class NewParameters:
 
     def get_io_mode(self):
         return self.orion_params.io_mode.lower()
+
+    def get_compile_save_resume(self):
+        value = os.environ.get("ORION_COMPILE_SAVE_RESUME", "")
+        return value.strip().lower() not in _FALSE_ENV_VALUES
 
     def get_experimental_region_first(self):
         return str(self.orion_params.experimental_region_first).lower()

@@ -105,6 +105,24 @@ class _FakeBackend:
         self.deleted.append(int(transform_id))
 
 
+class _FakeUnifiedLoadBackend(_FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.loaded_shells = []
+
+    def GenerateLinearTransformsUnifiedLoad(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, levels_array):
+        self.loaded_shells.append(
+            {
+                "num_transforms": int(num_transforms),
+                "diag_lengths": [int(diag_idxs_lens[i]) for i in range(int(num_transforms))],
+                "levels": [int(levels_array[i]) for i in range(int(num_transforms))],
+            }
+        )
+        ids = [int(self.next_transform_id + i) for i in range(int(num_transforms))]
+        self.next_transform_id += int(num_transforms)
+        return ids
+
+
 class _FakeSharedRotationBackend(_FakeBackend):
     def __init__(self) -> None:
         super().__init__()
@@ -202,7 +220,15 @@ class _FakeSavedIOScheduler:
         return None
 
 
-def _fake_transform(diagonals, *, level=2, io_mode="none", diags_path="", keys_path=""):
+def _fake_transform(
+    diagonals,
+    *,
+    level=2,
+    io_mode="none",
+    diags_path="",
+    keys_path="",
+    compile_save_resume=False,
+):
     return SimpleNamespace(
         diagonals={(0, 0): dict(diagonals)},
         level=int(level),
@@ -212,6 +238,7 @@ def _fake_transform(diagonals, *, level=2, io_mode="none", diags_path="", keys_p
                 get_io_mode=lambda: str(io_mode),
                 get_diags_path=lambda: str(diags_path),
                 get_keys_path=lambda: str(keys_path),
+                get_compile_save_resume=lambda: bool(compile_save_resume),
             )
         ),
     )
@@ -475,6 +502,55 @@ def test_memory_bounded_load_streams_compile_to_match_saved_payload_layout(tmp_p
             "segments": [(12, 0), (12, 2)],
         },
     ]
+
+
+def test_save_resume_reuses_complete_unified_group(tmp_path) -> None:
+    diags_path = tmp_path / "unified_diagonals.h5"
+    save_transforms = (
+        _fake_transform(
+            {0: [1.0, 0.0, 0.0, 0.0], 1: [0.0, 2.0, 0.0, 0.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+        ),
+        _fake_transform(
+            {0: [3.0, 0.0, 0.0, 0.0], 2: [0.0, 4.0, 0.0, 0.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+        ),
+    )
+    save_backend = _FakeBackend()
+    save_backend.memory_bounded_unified_transforms = True
+    save_group = UnifiedTransformGroup(save_transforms)
+    save_group.compile_unified(save_backend)
+
+    resume_transforms = (
+        _fake_transform(
+            {99: [9.0, 9.0, 9.0, 9.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+            compile_save_resume=True,
+        ),
+        _fake_transform(
+            {101: [10.0, 10.0, 10.0, 10.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+            compile_save_resume=True,
+        ),
+    )
+    resume_backend = _FakeUnifiedLoadBackend()
+    resume_backend.memory_bounded_unified_transforms = True
+    resume_group = UnifiedTransformGroup(resume_transforms)
+    resume_group._storage_key = save_group._storage_key
+
+    resume_group.compile_unified(resume_backend)
+
+    assert resume_backend.loaded_shells == [
+        {"num_transforms": 2, "diag_lengths": [2, 2], "levels": [2, 2]}
+    ]
+    assert resume_backend.generated == []
+    assert resume_backend.serialized == []
+    assert resume_transforms[0].diagonals == {}
+    assert resume_transforms[1].diagonals == {}
 
 
 def test_memory_bounded_eval_schedule_can_change_without_recompile(tmp_path) -> None:

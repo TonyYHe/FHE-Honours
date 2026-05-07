@@ -146,6 +146,11 @@ class UnifiedTransformGroup:
     def _should_save_plaintext_diagonals(self) -> bool:
         return self._io_mode == "save" and bool(self._diags_path)
 
+    def _compile_save_resume_enabled(self) -> bool:
+        params = self._scheme_params()
+        enabled = getattr(params, "get_compile_save_resume", None)
+        return self._io_mode == "save" and callable(enabled) and bool(enabled())
+
     def _should_offload_rotation_keys(self) -> bool:
         return self._io_mode in ("save", "load") and bool(self._keys_path)
 
@@ -1715,13 +1720,27 @@ class UnifiedTransformGroup:
         owned_arrays.append(levels_array)
         return list(generate(num_transforms, diag_idxs_ptrs, diag_idxs_lens, levels_array))
 
-    def _compile_unified_cached_load(self, backend) -> bool:
-        if self._io_mode != "load" or not self._diags_path:
+    def _compile_unified_cached_load(self, backend, *, allow_save_resume: bool = False) -> bool:
+        can_resume_save = bool(allow_save_resume and self._compile_save_resume_enabled())
+        if self._io_mode != "load" and not can_resume_save:
+            return False
+        if not self._diags_path:
             return False
         if not callable(getattr(backend, "GenerateLinearTransformsUnifiedLoad", None)):
             return False
 
-        descriptors = self._cached_transform_descriptors()
+        try:
+            descriptors = self._cached_transform_descriptors()
+        except (KeyError, OSError, RuntimeError):
+            if can_resume_save:
+                return False
+            raise
+        _unified_compile_trace(
+            "compile_group_cached_load",
+            group=self._storage_key,
+            transforms=len(descriptors),
+            save_resume=int(bool(can_resume_save)),
+        )
         self.unified_ids = self._generate_unified_backend_load_batch(backend, descriptors)
         if len(self.unified_ids) != len(descriptors):
             raise RuntimeError("backend returned unexpected transform count for cached unified load")
@@ -1986,7 +2005,7 @@ class UnifiedTransformGroup:
         self._resident_plaintext_transform_ids = set()
         self.memory_trace = []
         self._record_memory_event("before_compile_group", backend, ())
-        if self._compile_unified_cached_load(backend):
+        if self._compile_unified_cached_load(backend, allow_save_resume=True):
             pass
         elif self._memory_bounded_compile_enabled(backend):
             complex_started = time.perf_counter()
