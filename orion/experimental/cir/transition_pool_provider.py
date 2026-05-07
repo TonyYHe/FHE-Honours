@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -54,6 +55,25 @@ def _transform_proxy(
 
 def _cached_transform_shell(*, level: int, scheme: Any) -> Any:
     return SimpleNamespace(diagonals={}, level=int(level), scheme=scheme)
+
+
+def _compile_cached_group_if_available(group: UnifiedTransformGroup, scheme: Any) -> bool:
+    configure = getattr(group, "_configure_io", None)
+    resume_enabled = getattr(group, "_compile_save_resume_enabled", None)
+    cached_descriptors = getattr(group, "_cached_transform_descriptors", None)
+    if not callable(configure) or not callable(resume_enabled) or not callable(cached_descriptors):
+        return False
+    configure()
+    if not bool(resume_enabled()):
+        return False
+    try:
+        descriptors = cached_descriptors()
+    except (KeyError, OSError, RuntimeError):
+        return False
+    if len(descriptors) != len(group.transforms):
+        return False
+    group.compile_unified(scheme.backend)
+    return True
 
 
 def _diag_tensor(value: Any, *, slots: int) -> torch.Tensor:
@@ -197,6 +217,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             "real_extract_s": 0.0,
         }
         self._compile_cache_metadata: dict[str, Any] = {}
+        self._save_resume_precreated_groups_by_pair: dict[
+            int,
+            tuple[Any, tuple[int, ...], tuple[int, int | None], bool, bool],
+        ] = {}
 
     def supports_scheme(self, scheme: Any | None) -> bool:
         if scheme is None:
@@ -257,10 +281,75 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
         return True
 
+    def _compile_from_save_resume_group_cache(self, scheme: Any) -> bool:
+        resume_enabled = getattr(scheme.params, "get_compile_save_resume", None)
+        if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "save":
+            return False
+        if not callable(resume_enabled) or not bool(resume_enabled()):
+            return False
+        try:
+            slots = int(scheme.params.get_slots())
+            rows = int(math.ceil(int(getattr(self.module, "fhe_output_shape").numel()) / int(slots)))
+            cols = int(math.ceil(int(getattr(self.module, "fhe_input_shape").numel()) / int(slots)))
+        except Exception:
+            return False
+        if rows <= 0 or cols <= 0:
+            return False
+
+        level = int(self._level(scheme))
+        pending: list[tuple[Any, tuple[int, ...], tuple[int, int | None], bool, bool]] = []
+        for left_col in range(0, int(cols), 2):
+            right_col = int(left_col + 1)
+            has_right = int(right_col) < int(cols)
+            row_indices = tuple(range(int(rows)))
+            group = UnifiedTransformGroup(
+                [_cached_transform_shell(level=int(level), scheme=scheme) for _row in row_indices]
+            )
+            if not _compile_cached_group_if_available(group, scheme):
+                pending.append(
+                    (
+                        group,
+                        row_indices,
+                        (int(left_col), int(right_col) if has_right else None),
+                        bool(has_right),
+                        False,
+                    )
+                )
+                self._save_resume_precreated_groups_by_pair = {
+                    int(index): entry
+                    for index, entry in enumerate(pending)
+                }
+                return False
+            pending.append(
+                (
+                    group,
+                    row_indices,
+                    (int(left_col), int(right_col) if has_right else None),
+                    bool(has_right),
+                    True,
+                )
+            )
+
+        self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.output_rotations = 0
+        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        for group, row_indices, pair, is_complex, _compiled in pending:
+            self.groups_by_pair.append(group)
+            self.row_indices_by_pair.append(row_indices)
+            self.input_block_pairs.append(pair)
+            self.pair_is_complex.append(bool(is_complex))
+        self.compile_count += 1
+        self._save_resume_precreated_groups_by_pair = {}
+        return True
+
     def compile(self, scheme: Any) -> None:
         if self.groups_by_pair:
             return
         if self._compile_from_cache_metadata(scheme):
+            return
+        if self._compile_from_save_resume_group_cache(scheme):
             return
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         prepare_started = time.perf_counter()
@@ -289,7 +378,9 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.last_runtime_timing["prepare_transforms_s"] = float(time.perf_counter() - prepare_started)
 
         compile_started = time.perf_counter()
-        for left_col in range(0, int(self.cols), 2):
+        precreated_groups = dict(self._save_resume_precreated_groups_by_pair)
+        self._save_resume_precreated_groups_by_pair = {}
+        for pair_index, left_col in enumerate(range(0, int(self.cols), 2)):
             right_col = int(left_col + 1)
             has_right = int(right_col) < int(self.cols)
             entries: list[tuple[int, Any]] = []
@@ -310,8 +401,17 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                 entries.append((int(row), transform))
             if not entries:
                 continue
-            group = UnifiedTransformGroup([transform for _row, transform in entries])
-            group.compile_unified(scheme.backend)
+            precreated = precreated_groups.get(int(pair_index))
+            if precreated is not None and bool(precreated[4]):
+                group = precreated[0]
+            else:
+                group = (
+                    precreated[0]
+                    if precreated is not None
+                    else UnifiedTransformGroup([transform for _row, transform in entries])
+                )
+                group.transforms = [transform for _row, transform in entries]
+                group.compile_unified(scheme.backend)
             self.groups_by_pair.append(group)
             self.row_indices_by_pair.append(tuple(int(row) for row, _transform in entries))
             self.input_block_pairs.append((int(left_col), int(right_col) if has_right else None))
