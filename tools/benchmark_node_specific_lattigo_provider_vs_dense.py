@@ -60,6 +60,9 @@ BACKENDS = ("lattigo", "cheddar")
 PATHS = ("dense", "provider", "provider_no_hybrid", "provider_no_family", "provider_no_tile_family_sharing")
 LOGN_OVERRIDE_ENV = "ORION_NODE_BENCH_LOGN_OVERRIDE"
 CKKS_PROFILE_ENV = "ORION_NODE_BENCH_CKKS_PROFILE"
+CLEAN_CHEDDAR_IO_ENV = "ORION_NODE_BENCH_CLEAN_CHEDDAR_IO"
+MIN_DISK_FREE_GB_ENV = "ORION_NODE_BENCH_MIN_DISK_FREE_GB"
+DISK_WATCHDOG_INTERVAL_S_ENV = "ORION_NODE_BENCH_DISK_WATCHDOG_INTERVAL_S"
 _ACTIVE_CHEDDAR_BENCH_IO_DIR: Path | None = None
 
 PATH_DESCRIPTIONS = {
@@ -269,6 +272,56 @@ def _require_backend(backend: str) -> None:
         raise RuntimeError(f"local {backend_name} shared library has not been built: {lib_path}")
 
 
+def _truthy_env_value(value: str | None) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _safe_path_fragment(value: str) -> str:
+    text = str(value)
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text).strip("_") or "item"
+
+
+def _disk_usage_payload(path: Path) -> dict[str, int | str]:
+    current = Path(path)
+    while not current.exists() and current.parent != current:
+        current = current.parent
+    usage = shutil.disk_usage(str(current))
+    return {
+        "path": str(current),
+        "total_bytes": int(usage.total),
+        "used_bytes": int(usage.used),
+        "free_bytes": int(usage.free),
+    }
+
+
+def _read_text_tail(path: Path, *, limit: int = 4000) -> str:
+    try:
+        size = int(path.stat().st_size)
+    except OSError:
+        return ""
+    try:
+        with path.open("rb") as handle:
+            if size > int(limit):
+                handle.seek(max(0, size - int(limit)))
+            data = handle.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_text_for_json(path: Path, *, limit: int = 64 * 1024 * 1024) -> str:
+    try:
+        size = int(path.stat().st_size)
+    except OSError:
+        return ""
+    if size > int(limit):
+        return _read_text_tail(path, limit=int(limit))
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _jsonable_shape(value: Any) -> list[int]:
     return [int(v) for v in tuple(value)]
 
@@ -457,6 +510,13 @@ def _build_config(network: str, *, backend: str) -> dict[str, Any]:
     return config
 
 
+def _build_config_payload(network: str, *, backend: str) -> dict[str, Any]:
+    config = _build_config(str(network), backend=str(backend))
+    if str(backend) == "cheddar":
+        _cleanup_active_cheddar_io_dir()
+    return config
+
+
 def _init_scheme(network: str, *, backend: str) -> None:
     if str(backend) == "cheddar":
         os.environ.setdefault("ORION_CHEDDAR_GPU_PREFETCH", "0")
@@ -479,12 +539,7 @@ def _cleanup_active_cheddar_io_dir() -> None:
     _ACTIVE_CHEDDAR_BENCH_IO_DIR = None
     if io_dir is None:
         return
-    if os.environ.get("ORION_NODE_BENCH_CLEAN_CHEDDAR_IO", "").strip().lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
+    if not _truthy_env_value(os.environ.get(CLEAN_CHEDDAR_IO_ENV)):
         return
     shutil.rmtree(Path(io_dir), ignore_errors=True)
 
@@ -2128,6 +2183,8 @@ def _run_worker(
     timeout_s: int,
     logn_override: int | None = None,
     ckks_profile: str = "e2e",
+    min_disk_free_gb: float = 0.0,
+    disk_watchdog_interval_s: float = 15.0,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -2148,29 +2205,157 @@ def _run_worker(
     if logn_override is not None:
         command.extend(["--logn-override", str(int(logn_override))])
     command.extend(["--ckks-profile", str(ckks_profile)])
-    started = time.perf_counter()
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=int(timeout_s),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "status": "timeout",
-            "worker_wall_s": float(time.perf_counter() - started),
-            "timeout_s": int(timeout_s),
-            "command": command,
-            "stdout_tail": "" if exc.stdout is None else str(exc.stdout)[-4000:],
-            "stderr_tail": "" if exc.stderr is None else str(exc.stderr)[-4000:],
-        }
 
-    stdout = str(completed.stdout)
-    stderr = str(completed.stderr)
+    env = os.environ.copy()
+    worker_cheddar_io_root: Path | None = None
+    log_dir: Path | None = None
+    disk_watch_path: Path | None = None
+    disk_before: dict[str, int | str] | None = None
+    disk_after: dict[str, int | str] | None = None
+    min_disk_free_bytes = 0
+    if str(backend) == "cheddar":
+        base_io_root = Path(env.get("ORION_CHEDDAR_IO_ROOT", tempfile.gettempdir()))
+        base_io_root.mkdir(parents=True, exist_ok=True)
+        prefix = (
+            "worker_"
+            f"{_safe_path_fragment(network)}_"
+            f"{_safe_path_fragment(case_name)}_"
+            f"{_safe_path_fragment(path_kind)}_"
+        )
+        worker_cheddar_io_root = Path(tempfile.mkdtemp(prefix=prefix, dir=str(base_io_root)))
+        env["ORION_CHEDDAR_IO_ROOT"] = str(worker_cheddar_io_root)
+        disk_watch_path = worker_cheddar_io_root
+        disk_before = _disk_usage_payload(base_io_root)
+        min_disk_free_bytes = int(max(0.0, float(min_disk_free_gb)) * (1024**3))
+        if min_disk_free_bytes > 0 and int(disk_before["free_bytes"]) < min_disk_free_bytes:
+            shutil.rmtree(worker_cheddar_io_root, ignore_errors=True)
+            return {
+                "status": "failed",
+                "failure_kind": "disk_watermark",
+                "message": (
+                    "Skipping Cheddar worker because free disk is below "
+                    f"{float(min_disk_free_gb):.3g} GiB watermark."
+                ),
+                "worker_wall_s": 0.0,
+                "command": command,
+                "cheddar_io_root": str(worker_cheddar_io_root),
+                "cheddar_io_root_cleaned": True,
+                "disk_before": disk_before,
+                "min_disk_free_bytes": int(min_disk_free_bytes),
+            }
+
+    started = time.perf_counter()
+    killed_reason = ""
+    killed_disk: dict[str, int | str] | None = None
+    stdout = ""
+    stderr = ""
+    returncode: int | None = None
+    try:
+        log_parent = worker_cheddar_io_root if worker_cheddar_io_root is not None else Path(tempfile.gettempdir())
+        log_dir = Path(tempfile.mkdtemp(prefix="orion_node_worker_logs_", dir=str(log_parent)))
+        stdout_path = log_dir / "stdout.txt"
+        stderr_path = log_dir / "stderr.txt"
+        with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as stderr_handle:
+            process = subprocess.Popen(
+                command,
+                cwd=str(REPO_ROOT),
+                env=env,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+            )
+            deadline = float(started + int(timeout_s))
+            interval = max(1.0, float(disk_watchdog_interval_s))
+            while True:
+                returncode = process.poll()
+                if returncode is not None:
+                    break
+                now = time.perf_counter()
+                if now >= deadline:
+                    killed_reason = "timeout"
+                    process.terminate()
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    returncode = process.returncode
+                    break
+                if min_disk_free_bytes > 0 and disk_watch_path is not None:
+                    disk_now = _disk_usage_payload(disk_watch_path)
+                    if int(disk_now["free_bytes"]) < min_disk_free_bytes:
+                        killed_reason = "disk_watermark"
+                        killed_disk = disk_now
+                        process.terminate()
+                        try:
+                            process.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        returncode = process.returncode
+                        break
+                sleep_s = min(interval, max(0.1, deadline - now))
+                try:
+                    returncode = process.wait(timeout=float(sleep_s))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        stdout = _read_text_for_json(stdout_path)
+        stderr = _read_text_for_json(stderr_path)
+        if disk_watch_path is not None:
+            disk_after = _disk_usage_payload(disk_watch_path)
+    finally:
+        if log_dir is not None:
+            shutil.rmtree(log_dir, ignore_errors=True)
+        cleaned_io_root = False
+        if worker_cheddar_io_root is not None and _truthy_env_value(env.get(CLEAN_CHEDDAR_IO_ENV)):
+            shutil.rmtree(worker_cheddar_io_root, ignore_errors=True)
+            cleaned_io_root = True
+
     worker_wall_s = float(time.perf_counter() - started)
+    common_payload: dict[str, Any] = {
+        "worker_wall_s": float(worker_wall_s),
+        "command": command,
+    }
+    if worker_cheddar_io_root is not None:
+        common_payload.update(
+            {
+                "cheddar_io_root": str(worker_cheddar_io_root),
+                "cheddar_io_root_cleaned": bool(cleaned_io_root),
+                "disk_before": disk_before,
+                "disk_after": disk_after,
+                "min_disk_free_bytes": int(min_disk_free_bytes),
+            }
+        )
+    if killed_reason == "timeout":
+        common_payload.update(
+            {
+                "status": "timeout",
+                "timeout_s": int(timeout_s),
+                "returncode": None if returncode is None else int(returncode),
+                "stdout_tail": stdout[-4000:],
+                "stderr_tail": stderr[-4000:],
+            }
+        )
+        return common_payload
+    if killed_reason == "disk_watermark":
+        common_payload.update(
+            {
+                "status": "failed",
+                "failure_kind": "disk_watermark",
+                "message": (
+                    "Terminated Cheddar worker because free disk dropped below "
+                    f"{float(min_disk_free_gb):.3g} GiB watermark."
+                ),
+                "returncode": None if returncode is None else int(returncode),
+                "disk_at_termination": killed_disk,
+                "stdout_tail": stdout[-4000:],
+                "stderr_tail": stderr[-4000:],
+            }
+        )
+        return common_payload
     result: dict[str, Any] | None = None
     for line in reversed(stdout.splitlines()):
         line = line.strip()
@@ -2181,21 +2366,23 @@ def _run_worker(
             break
         except json.JSONDecodeError:
             continue
-    if completed.returncode != 0 or result is None:
-        return {
-            "status": "failed",
-            "returncode": int(completed.returncode),
-            "worker_wall_s": float(worker_wall_s),
-            "command": command,
-            "stdout_tail": stdout[-4000:],
-            "stderr_tail": stderr[-4000:],
+    if returncode != 0 or result is None:
+        common_payload.update(
+            {
+                "status": "failed",
+                "returncode": -999999 if returncode is None else int(returncode),
+                "stdout_tail": stdout[-4000:],
+                "stderr_tail": stderr[-4000:],
+            }
+        )
+        return common_payload
+    common_payload.update(
+        {
+            "status": "ok",
+            "result": result,
         }
-    return {
-        "status": "ok",
-        "worker_wall_s": float(worker_wall_s),
-        "command": command,
-        "result": result,
-    }
+    )
+    return common_payload
 
 
 def _list_cases_payload() -> dict[str, Any]:
@@ -2592,6 +2779,21 @@ def main() -> int:
     )
     parser.add_argument("--timeout-s", type=int, default=28800)
     parser.add_argument(
+        "--min-disk-free-gb",
+        type=float,
+        default=float(os.environ.get(MIN_DISK_FREE_GB_ENV, "25")),
+        help=(
+            "For Cheddar workers, refuse to start or terminate the current worker when the IO filesystem "
+            "drops below this free-space watermark. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--disk-watchdog-interval-s",
+        type=float,
+        default=float(os.environ.get(DISK_WATCHDOG_INTERVAL_S_ENV, "5")),
+        help="Polling interval for the Cheddar worker disk-space watchdog.",
+    )
+    parser.add_argument(
         "--logn-override",
         type=int,
         default=None,
@@ -2658,6 +2860,8 @@ def main() -> int:
             "warmups": int(args.warmups),
             "ckks_profile": str(args.ckks_profile),
             "logn_override": None if args.logn_override is None else int(args.logn_override),
+            "min_disk_free_gb": float(args.min_disk_free_gb),
+            "disk_watchdog_interval_s": float(args.disk_watchdog_interval_s),
             "compile_runs_per_path": 1,
             "rotation_count_note": (
                 "rotation_eval_count is the callback-equivalent BSGS rotation count after planning: "
@@ -2691,7 +2895,7 @@ def main() -> int:
                         "logn": int(_profile_ckks_spec(str(network), backend=str(backend))["logn"]),
                         "default_logn": int(spec["logn"]),
                         "e2e_logn": int(E2E_CKKS_SPECS[str(network)]["logn"]),
-                        "config": _build_config(str(network), backend=str(backend)),
+                        "config": _build_config_payload(str(network), backend=str(backend)),
                     "coverage_note": str(spec["coverage_note"]),
                     "cases": [],
                 }
@@ -2739,6 +2943,8 @@ def main() -> int:
                         timeout_s=int(args.timeout_s),
                         logn_override=None if args.logn_override is None else int(args.logn_override),
                         ckks_profile=str(args.ckks_profile),
+                        min_disk_free_gb=float(args.min_disk_free_gb),
+                        disk_watchdog_interval_s=float(args.disk_watchdog_interval_s),
                     )
                     out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
                     _write_csv(payload, csv_out)
