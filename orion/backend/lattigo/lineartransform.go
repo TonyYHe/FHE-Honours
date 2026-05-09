@@ -85,6 +85,15 @@ func lattigoStreamingLTChunkPlaintexts() int {
 	return 1024
 }
 
+func lattigoStreamingLTSharedTransformLimit() int {
+	if raw := os.Getenv("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 2
+}
+
 func lattigoStreamingLTEnabled(ioMode string, plaintextCount int) bool {
 	if ioMode != "none" || plaintextCount <= 0 {
 		return false
@@ -316,6 +325,14 @@ func (state *lattigoStreamingLTState) encodeChunk(keys []int) lintrans.LinearTra
 	return chunk
 }
 
+func releaseStreamingLTChunkMemory(chunks []lintrans.LinearTransformation) {
+	for i := range chunks {
+		chunks[i].Vec = nil
+	}
+	runtime.GC()
+	debug.FreeOSMemory()
+}
+
 func evaluateStreamingLinearTransformNew(
 	transformID int,
 	state *lattigoStreamingLTState,
@@ -339,15 +356,114 @@ func evaluateStreamingLinearTransformNew(
 			}
 			ctChunk = nil
 		}
-		chunk.Vec = nil
-		runtime.GC()
-		debug.FreeOSMemory()
+		releaseStreamingLTChunkMemory([]lintrans.LinearTransformation{chunk})
 	}
 	if ctOut == nil {
 		return nil, os.ErrInvalid
 	}
 	_ = transformID
 	return ctOut, nil
+}
+
+func evaluateStreamingLinearTransformsWithSharedCacheNew(
+	transformIDs []int,
+	transforms []lintrans.LinearTransformation,
+	ctIn *rlwe.Ciphertext,
+) ([]*rlwe.Ciphertext, error) {
+	n := len(transformIDs)
+	outputs := make([]*rlwe.Ciphertext, n)
+	streamingStates := make([]*lattigoStreamingLTState, n)
+	maxChunks := 0
+	for i, id := range transformIDs {
+		if state, ok := lookupStreamingLTState(id); ok {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			streamingStates[i] = state
+			if len(state.chunks) > maxChunks {
+				maxChunks = len(state.chunks)
+			}
+		}
+	}
+
+	plainTransforms := make([]lintrans.LinearTransformation, 0)
+	plainIndices := make([]int, 0)
+	for i, state := range streamingStates {
+		if state != nil {
+			continue
+		}
+		plainTransforms = append(plainTransforms, transforms[i])
+		plainIndices = append(plainIndices, i)
+	}
+	if len(plainTransforms) > 0 {
+		plainOutputs := make([]*rlwe.Ciphertext, len(plainTransforms))
+		for i, transform := range plainTransforms {
+			plainOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
+		}
+		if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, plainTransforms, plainOutputs); err != nil {
+			return nil, err
+		}
+		for i, outputIndex := range plainIndices {
+			outputs[outputIndex] = plainOutputs[i]
+		}
+	}
+
+	sharedLimit := lattigoStreamingLTSharedTransformLimit()
+	if sharedLimit < 1 {
+		sharedLimit = 1
+	}
+	for chunkIndex := 0; chunkIndex < maxChunks; chunkIndex++ {
+		pendingTransforms := make([]lintrans.LinearTransformation, 0, sharedLimit)
+		pendingIndices := make([]int, 0, sharedLimit)
+		flush := func() error {
+			if len(pendingTransforms) == 0 {
+				return nil
+			}
+			chunkOutputs := make([]*rlwe.Ciphertext, len(pendingTransforms))
+			for i, transform := range pendingTransforms {
+				chunkOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
+			}
+			if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, pendingTransforms, chunkOutputs); err != nil {
+				return err
+			}
+			for i, outputIndex := range pendingIndices {
+				if outputs[outputIndex] == nil {
+					outputs[outputIndex] = chunkOutputs[i]
+				} else {
+					if err := scheme.Evaluator.Add(outputs[outputIndex], chunkOutputs[i], outputs[outputIndex]); err != nil {
+						return err
+					}
+					chunkOutputs[i] = nil
+				}
+			}
+			releaseStreamingLTChunkMemory(pendingTransforms)
+			pendingTransforms = pendingTransforms[:0]
+			pendingIndices = pendingIndices[:0]
+			return nil
+		}
+		for transformIndex, state := range streamingStates {
+			if state == nil || chunkIndex >= len(state.chunks) {
+				continue
+			}
+			pendingTransforms = append(pendingTransforms, state.encodeChunk(state.chunks[chunkIndex]))
+			pendingIndices = append(pendingIndices, transformIndex)
+			if len(pendingTransforms) >= sharedLimit {
+				if err := flush(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if err := flush(); err != nil {
+			return nil, err
+		}
+	}
+
+	for i, output := range outputs {
+		if output == nil {
+			_ = i
+			return nil, os.ErrInvalid
+		}
+	}
+	return outputs, nil
 }
 
 func buildFloatDiagonalsFromC(
@@ -1170,21 +1286,17 @@ func EvaluateLinearTransformsWithSharedCache(
 	)
 
 	if streamingAny {
+		outputs, err := evaluateStreamingLinearTransformsWithSharedCacheNew(
+			transformIDsSlice,
+			transforms,
+			ctIn,
+		)
+		if err != nil {
+			panic(err)
+		}
 		outIDs := make([]int, n)
-		for i, id := range transformIDsSlice {
-			if streamingState, ok := lookupStreamingLTState(id); ok {
-				ctOut, err := evaluateStreamingLinearTransformNew(id, streamingState, ctIn)
-				if err != nil {
-					panic(err)
-				}
-				outIDs[i] = PushCiphertext(ctOut)
-				continue
-			}
-			ctOut, err := scheme.LinEvaluator.EvaluateNew(ctIn, transforms[i])
-			if err != nil {
-				panic(err)
-			}
-			outIDs[i] = PushCiphertext(ctOut)
+		for i, ct := range outputs {
+			outIDs[i] = PushCiphertext(ct)
 		}
 		return SliceToCArray(outIDs, convertIntToCInt)
 	}
