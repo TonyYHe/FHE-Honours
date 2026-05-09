@@ -5,6 +5,8 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"sort"
 	"strconv"
 	"sync"
 	"unsafe"
@@ -18,6 +20,20 @@ import (
 )
 
 var ltHeap = NewHeapAllocator()
+
+type lattigoStreamingLTState struct {
+	shell           lintrans.LinearTransformation
+	slots           int
+	diagData        []float32
+	diagOffsetByKey map[int]int
+	chunks          [][]int
+	mu              sync.Mutex
+}
+
+var (
+	ltStreamingMu     sync.Mutex
+	ltStreamingStates = make(map[int]*lattigoStreamingLTState)
+)
 
 func ltCompileWorkerCount(n int) int {
 	if n <= 1 {
@@ -41,6 +57,323 @@ func ltCompileWorkerCount(n int) int {
 func unifiedNoBSGSEnabled() bool {
 	raw := os.Getenv("ORION_LATTIGO_UNIFIED_NO_BSGS")
 	return raw == "1" || raw == "true" || raw == "TRUE" || raw == "yes" || raw == "on"
+}
+
+func envBool(raw string) bool {
+	return raw == "1" || raw == "true" || raw == "TRUE" || raw == "yes" || raw == "on"
+}
+
+func envOff(raw string) bool {
+	return raw == "0" || raw == "false" || raw == "FALSE" || raw == "no" || raw == "off"
+}
+
+func lattigoStreamingLTMinPlaintexts() int {
+	if raw := os.Getenv("ORION_LATTIGO_STREAMING_LT_MIN_PLAINTEXTS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 8192
+}
+
+func lattigoStreamingLTChunkPlaintexts() int {
+	if raw := os.Getenv("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 1024
+}
+
+func lattigoStreamingLTEnabled(ioMode string, plaintextCount int) bool {
+	if ioMode != "none" || plaintextCount <= 0 {
+		return false
+	}
+	raw := os.Getenv("ORION_LATTIGO_STREAMING_LT")
+	if envOff(raw) {
+		return false
+	}
+	if envBool(raw) || raw == "force" || raw == "always" {
+		return true
+	}
+	if raw == "" {
+		return false
+	}
+	return plaintextCount >= lattigoStreamingLTMinPlaintexts()
+}
+
+func sortedIntKeys[V any](values map[int]V) []int {
+	keys := make([]int, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func normalizeDiagIndex(key, slots int) int {
+	return key & (slots - 1)
+}
+
+func addDiagOffsetAliases(offsets map[int]int, key, offset, slots int) {
+	normalized := normalizeDiagIndex(key, slots)
+	offsets[key] = offset
+	offsets[normalized] = offset
+	if normalized != 0 {
+		offsets[normalized-slots] = offset
+	}
+}
+
+func newLinearTransformationShell(param lintrans.Parameters, explicitN1 int) lintrans.LinearTransformation {
+	slots := 1 << param.LogDimensions.Cols
+	vec := make(map[int]ringqp.Poly)
+	n1 := 0
+	if param.LogBabyStepGiantStepRatio < 0 {
+		for _, diag := range param.DiagonalsIndexList {
+			vec[normalizeDiagIndex(diag, slots)] = ringqp.Poly{}
+		}
+	} else {
+		n1 = explicitN1
+		if n1 <= 0 {
+			n1 = commonlintrans.FindBestBSGSRatio(
+				param.DiagonalsIndexList,
+				slots,
+				param.LogBabyStepGiantStepRatio,
+			)
+		}
+		index, _, _ := commonlintrans.BSGSIndex(param.DiagonalsIndexList, slots, n1)
+		for j := range index {
+			for _, k := range index[j] {
+				vec[normalizeDiagIndex(j+k, slots)] = ringqp.Poly{}
+			}
+		}
+	}
+
+	return lintrans.LinearTransformation{
+		MetaData: &rlwe.MetaData{
+			PlaintextMetaData: rlwe.PlaintextMetaData{
+				LogDimensions: param.LogDimensions,
+				Scale:         param.Scale,
+				IsBatched:     true,
+			},
+			CiphertextMetaData: rlwe.CiphertextMetaData{
+				IsNTT:        true,
+				IsMontgomery: true,
+			},
+		},
+		LogBabyStepGiantStepRatio: param.LogBabyStepGiantStepRatio,
+		N1:                        n1,
+		LevelQ:                    param.LevelQ,
+		LevelP:                    param.LevelP,
+		Vec:                       vec,
+	}
+}
+
+func chunkLinearTransformKeys(shell lintrans.LinearTransformation, chunkLimit int) [][]int {
+	if chunkLimit <= 0 {
+		chunkLimit = lattigoStreamingLTChunkPlaintexts()
+	}
+	appendChunked := func(chunks [][]int, keys []int) [][]int {
+		if len(keys) == 0 {
+			return chunks
+		}
+		for len(keys) > chunkLimit {
+			chunk := append([]int(nil), keys[:chunkLimit]...)
+			chunks = append(chunks, chunk)
+			keys = keys[chunkLimit:]
+		}
+		return append(chunks, append([]int(nil), keys...))
+	}
+
+	if shell.N1 == 0 {
+		return appendChunked(nil, sortedIntKeys(shell.Vec))
+	}
+
+	index, _, _ := commonlintrans.LinearTransformation(shell).BSGSIndex()
+	giants := sortedIntKeys(index)
+	chunks := make([][]int, 0, len(giants))
+	current := make([]int, 0, chunkLimit)
+	slots := 1 << shell.LogDimensions.Cols
+	for _, giant := range giants {
+		group := make([]int, 0, len(index[giant]))
+		for _, baby := range index[giant] {
+			group = append(group, normalizeDiagIndex(giant+baby, slots))
+		}
+		sort.Ints(group)
+		if len(group) > chunkLimit {
+			if len(current) > 0 {
+				chunks = append(chunks, current)
+				current = make([]int, 0, chunkLimit)
+			}
+			chunks = appendChunked(chunks, group)
+			continue
+		}
+		if len(current) > 0 && len(current)+len(group) > chunkLimit {
+			chunks = append(chunks, current)
+			current = make([]int, 0, chunkLimit)
+		}
+		current = append(current, group...)
+	}
+	if len(current) > 0 {
+		chunks = append(chunks, current)
+	}
+	return chunks
+}
+
+func newStreamingLTStateFromC(
+	shell lintrans.LinearTransformation,
+	diagIdxs []int,
+	diagDataC *C.float,
+	diagDataLen C.int,
+) *lattigoStreamingLTState {
+	slots := 1 << shell.LogDimensions.Cols
+	expectedLen := len(diagIdxs) * slots
+	if int(diagDataLen) != expectedLen {
+		panic(
+			"streaming linear transform received mismatched diagonal data length: expected=" +
+				strconv.Itoa(expectedLen) + " actual=" + strconv.Itoa(int(diagDataLen)),
+		)
+	}
+
+	raw := unsafe.Slice(diagDataC, int(diagDataLen))
+	diagData := make([]float32, len(raw))
+	for i, value := range raw {
+		diagData[i] = float32(value)
+	}
+
+	offsets := make(map[int]int, len(diagIdxs)*3)
+	for offset, diag := range diagIdxs {
+		addDiagOffsetAliases(offsets, diag, offset, slots)
+	}
+
+	return &lattigoStreamingLTState{
+		shell:           shell,
+		slots:           slots,
+		diagData:        diagData,
+		diagOffsetByKey: offsets,
+		chunks:          chunkLinearTransformKeys(shell, lattigoStreamingLTChunkPlaintexts()),
+	}
+}
+
+func registerStreamingLTState(transformID int, state *lattigoStreamingLTState) {
+	if state == nil {
+		return
+	}
+	ltStreamingMu.Lock()
+	ltStreamingStates[transformID] = state
+	ltStreamingMu.Unlock()
+}
+
+func lookupStreamingLTState(transformID int) (*lattigoStreamingLTState, bool) {
+	ltStreamingMu.Lock()
+	state, ok := ltStreamingStates[transformID]
+	ltStreamingMu.Unlock()
+	return state, ok
+}
+
+func deleteStreamingLTState(transformID int) {
+	ltStreamingMu.Lock()
+	delete(ltStreamingStates, transformID)
+	ltStreamingMu.Unlock()
+}
+
+func hasStreamingLTState(transformID int) bool {
+	_, ok := lookupStreamingLTState(transformID)
+	return ok
+}
+
+func (state *lattigoStreamingLTState) chunkDiagonals(keys []int) lintrans.Diagonals[float64] {
+	diagonals := make(lintrans.Diagonals[float64], len(keys))
+	for _, key := range keys {
+		offset, ok := state.diagOffsetByKey[key]
+		if !ok {
+			offset, ok = state.diagOffsetByKey[normalizeDiagIndex(key, state.slots)]
+		}
+		if !ok {
+			panic("streaming linear transform missing diagonal key " + strconv.Itoa(key))
+		}
+		start := offset * state.slots
+		values := make([]float64, state.slots)
+		for i := 0; i < state.slots; i++ {
+			values[i] = float64(state.diagData[start+i])
+		}
+		diagonals[key] = values
+	}
+	return diagonals
+}
+
+func (state *lattigoStreamingLTState) encodeChunk(keys []int) lintrans.LinearTransformation {
+	ringQP := scheme.Params.RingQP().AtLevel(state.shell.LevelQ, state.shell.LevelP)
+	vec := make(map[int]ringqp.Poly, len(keys))
+	for _, key := range keys {
+		vec[normalizeDiagIndex(key, state.slots)] = ringQP.NewPoly()
+	}
+	chunk := state.shell
+	chunk.Vec = vec
+	if err := lintrans.Encode(scheme.Encoder, state.chunkDiagonals(keys), chunk); err != nil {
+		panic(err)
+	}
+	return chunk
+}
+
+func evaluateStreamingLinearTransformNew(
+	transformID int,
+	state *lattigoStreamingLTState,
+	ctIn *rlwe.Ciphertext,
+) (*rlwe.Ciphertext, error) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	var ctOut *rlwe.Ciphertext
+	for _, keys := range state.chunks {
+		chunk := state.encodeChunk(keys)
+		ctChunk, err := scheme.LinEvaluator.EvaluateNew(ctIn, chunk)
+		if err != nil {
+			return nil, err
+		}
+		if ctOut == nil {
+			ctOut = ctChunk
+		} else {
+			if err = scheme.Evaluator.Add(ctOut, ctChunk, ctOut); err != nil {
+				return nil, err
+			}
+			ctChunk = nil
+		}
+		chunk.Vec = nil
+		runtime.GC()
+		debug.FreeOSMemory()
+	}
+	if ctOut == nil {
+		return nil, os.ErrInvalid
+	}
+	_ = transformID
+	return ctOut, nil
+}
+
+func buildFloatDiagonalsFromC(
+	diagIdxs []int,
+	diagDataC *C.float,
+	diagDataLen C.int,
+	slots int,
+) lintrans.Diagonals[float64] {
+	expectedLen := len(diagIdxs) * slots
+	if int(diagDataLen) != expectedLen {
+		panic(
+			"linear transform received mismatched diagonal data length: expected=" +
+				strconv.Itoa(expectedLen) + " actual=" + strconv.Itoa(int(diagDataLen)),
+		)
+	}
+	raw := unsafe.Slice(diagDataC, int(diagDataLen))
+	diagonals := make(lintrans.Diagonals[float64], len(diagIdxs))
+	for i, key := range diagIdxs {
+		values := make([]float64, slots)
+		start := i * slots
+		for j := 0; j < slots; j++ {
+			values[j] = float64(raw[start+j])
+		}
+		diagonals[key] = values
+	}
+	return diagonals
 }
 
 func encodeFloatTransformsParallel(
@@ -163,7 +496,12 @@ func newUnifiedLoadTransformations(params []lintrans.Parameters) []lintrans.Line
 		return nil
 	}
 	if unifiedNoBSGSEnabled() {
-		return newUnifiedNoBSGSTransformations(params)
+		transforms := make([]lintrans.LinearTransformation, len(params))
+		for i, param := range params {
+			param.LogBabyStepGiantStepRatio = -1
+			transforms[i] = newLinearTransformationShell(param, 0)
+		}
+		return transforms
 	}
 
 	slots := 1 << params[0].LogDimensions.Cols
@@ -270,6 +608,7 @@ func validateLinearTransformPlaintextLevels(transformID int, transform lintrans.
 
 //export DeleteLinearTransform
 func DeleteLinearTransform(id C.int) {
+	deleteStreamingLTState(int(id))
 	ltHeap.Delete(int(id))
 }
 
@@ -291,30 +630,10 @@ func GenerateLinearTransform(
 
 	// Unload diags data
 	diagIdxs := CArrayToSlice(diagIdxsC, diagIdxsLen, convertCIntToInt)
-	diagDataFlat := []float64(nil)
-	if ioMode != "load" {
-		diagDataFlat = CArrayToSlice(diagDataC, diagDataLen, convertCFloatToFloat)
-	}
-
-	// diagDataFlat is a flattened array of length len(diagIdxs) * slots.
-	// The first element in diagIdxs corresponds to the first [0, slots]
-	// values in diagsDataFlat, and so on. We'll extract these into a
-	// dictionary that can be passed to Lattigo's LinearTransform evaluator.
 	slots := scheme.Params.MaxSlots()
-	diagonals := make(lintrans.Diagonals[float64])
-
-	if ioMode == "load" {
-		for _, key := range diagIdxs {
-			diagonals[key] = nil
-		}
-	} else {
-		for i, key := range diagIdxs {
-			diagonals[key] = diagDataFlat[i*slots : (i+1)*slots]
-		}
-	}
 
 	ltparams := lintrans.Parameters{
-		DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+		DiagonalsIndexList:        diagIdxs,
 		LevelQ:                    int(level),
 		LevelP:                    scheme.Params.MaxLevelP(),
 		Scale:                     rlwe.NewScale(scheme.Params.Q()[int(level)]),
@@ -322,7 +641,16 @@ func GenerateLinearTransform(
 		LogBabyStepGiantStepRatio: int(math.Log(float64(bsgsRatio))),
 	}
 
-	lt := lintrans.NewTransformation(scheme.Params, ltparams)
+	streamingShell := newLinearTransformationShell(ltparams, 0)
+	useStreaming := lattigoStreamingLTEnabled(ioMode, len(streamingShell.Vec))
+	var lt lintrans.LinearTransformation
+	var streamingState *lattigoStreamingLTState
+	if useStreaming {
+		lt = streamingShell
+		streamingState = newStreamingLTStateFromC(lt, diagIdxs, diagDataC, diagDataLen)
+	} else {
+		lt = lintrans.NewTransformation(scheme.Params, ltparams)
+	}
 
 	// ---------------------------- //
 	//  Diagonal Generation/Saving  //
@@ -336,7 +664,8 @@ func GenerateLinearTransform(
 		for _, diag := range diagIdxs {
 			lt.Vec[diag] = ringqp.Poly{}
 		}
-	} else { // otherwise, generate diagonals here.
+	} else if !useStreaming { // otherwise, generate diagonals here.
+		diagonals := buildFloatDiagonalsFromC(diagIdxs, diagDataC, diagDataLen, slots)
 		if err := lintrans.Encode(scheme.Encoder, diagonals, lt); err != nil {
 			panic(err)
 		}
@@ -344,6 +673,7 @@ func GenerateLinearTransform(
 
 	// Return reference to linear transform object we just created
 	ltID := ltHeap.Add(lt)
+	registerStreamingLTState(ltID, streamingState)
 	return C.int(ltID)
 }
 
@@ -368,52 +698,85 @@ func GenerateLinearTransformsBatch(
 
 	transforms := make([]lintrans.LinearTransformation, n)
 	diagonalsList := make([]lintrans.Diagonals[float64], n)
+	streamingStates := make([]*lattigoStreamingLTState, n)
+	diagIdxsList := make([][]int, n)
+	paramsList := make([]lintrans.Parameters, n)
+	shells := make([]lintrans.LinearTransformation, n)
+	totalPlaintexts := 0
 
 	for i := 0; i < n; i++ {
 		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
-		diagDataFlat := []float64(nil)
-		if ioMode != "load" {
-			diagDataFlat = CArrayToSlice(diagDataArraySlice[i], diagDataLensSlice[i], convertCFloatToFloat)
-		}
-
-		diagonals := make(lintrans.Diagonals[float64])
-		if ioMode == "load" {
-			for _, key := range diagIdxs {
-				diagonals[key] = nil
-			}
-		} else {
-			for j, key := range diagIdxs {
-				diagonals[key] = diagDataFlat[j*slots : (j+1)*slots]
-			}
-		}
-		diagonalsList[i] = diagonals
+		diagIdxsList[i] = diagIdxs
 
 		ltparams := lintrans.Parameters{
-			DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+			DiagonalsIndexList:        diagIdxs,
 			LevelQ:                    int(levelsSlice[i]),
 			LevelP:                    scheme.Params.MaxLevelP(),
 			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
 			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
 			LogBabyStepGiantStepRatio: int(math.Log(float64(bsgsRatio))),
 		}
+		paramsList[i] = ltparams
+		shells[i] = newLinearTransformationShell(ltparams, 0)
+		totalPlaintexts += len(shells[i].Vec)
+	}
+
+	streamingBatch := lattigoStreamingLTEnabled(ioMode, totalPlaintexts)
+	streamingAny := false
+	for i := 0; i < n; i++ {
+		diagIdxs := diagIdxsList[i]
+		ltparams := paramsList[i]
+		streamingShell := shells[i]
+		useStreaming := streamingBatch || lattigoStreamingLTEnabled(ioMode, len(streamingShell.Vec))
+		if useStreaming {
+			transforms[i] = streamingShell
+			streamingStates[i] = newStreamingLTStateFromC(
+				streamingShell,
+				diagIdxs,
+				diagDataArraySlice[i],
+				diagDataLensSlice[i],
+			)
+			streamingAny = true
+			continue
+		}
+
 		transforms[i] = lintrans.NewTransformation(scheme.Params, ltparams)
 		if ioMode == "load" {
 			transforms[i].Vec = make(map[int]ringqp.Poly)
 			for _, diag := range diagIdxs {
 				transforms[i].Vec[diag] = ringqp.Poly{}
 			}
+		} else {
+			diagonalsList[i] = buildFloatDiagonalsFromC(
+				diagIdxs,
+				diagDataArraySlice[i],
+				diagDataLensSlice[i],
+				slots,
+			)
 		}
 	}
 
 	if ioMode != "load" {
-		if err := encodeFloatTransformsParallel(diagonalsList, transforms); err != nil {
-			panic(err)
+		if streamingAny {
+			for i := 0; i < n; i++ {
+				if streamingStates[i] != nil {
+					continue
+				}
+				if err := lintrans.Encode(scheme.Encoder, diagonalsList[i], transforms[i]); err != nil {
+					panic(err)
+				}
+			}
+		} else {
+			if err := encodeFloatTransformsParallel(diagonalsList, transforms); err != nil {
+				panic(err)
+			}
 		}
 	}
 
 	ids := make([]int, n)
 	for i, lt := range transforms {
 		ids[i] = AddLinearTransform(lt)
+		registerStreamingLTState(ids[i], streamingStates[i])
 	}
 	return SliceToCArray(ids, convertIntToCInt)
 }
@@ -423,7 +786,6 @@ func EvaluateLinearTransform(transformID, ctxtID C.int) C.int {
 	transform := RetrieveLinearTransform(int(transformID))
 	ctIn := RetrieveCiphertext(int(ctxtID))
 	ensureLinearTransformRotationKeys(transform)
-	validateLinearTransformPlaintextLevels(int(transformID), transform)
 
 	// Update the linear transform evaluator to have the most
 	// recent set of rotation keys.
@@ -431,7 +793,14 @@ func EvaluateLinearTransform(transformID, ctxtID C.int) C.int {
 		scheme.Evaluator.WithKey(scheme.EvalKeys),
 	)
 
-	ctOut, err := scheme.LinEvaluator.EvaluateNew(ctIn, transform)
+	var ctOut *rlwe.Ciphertext
+	var err error
+	if streamingState, ok := lookupStreamingLTState(int(transformID)); ok {
+		ctOut, err = evaluateStreamingLinearTransformNew(int(transformID), streamingState, ctIn)
+	} else {
+		validateLinearTransformPlaintextLevels(int(transformID), transform)
+		ctOut, err = scheme.LinEvaluator.EvaluateNew(ctIn, transform)
+	}
 	if err != nil {
 		panic(err)
 	}
@@ -607,20 +976,14 @@ func GenerateLinearTransformsUnified(
 	levelsSlice := unsafe.Slice(levels, n)
 
 	params := make([]lintrans.Parameters, n)
-	diagonalsList := make([]lintrans.Diagonals[float64], n)
+	diagIdxsList := make([][]int, n)
 
 	for i := 0; i < n; i++ {
 		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
-		diagDataFlat := CArrayToSlice(diagDataArraySlice[i], diagDataLensSlice[i], convertCFloatToFloat)
-
-		diagonals := make(lintrans.Diagonals[float64])
-		for j, key := range diagIdxs {
-			diagonals[key] = diagDataFlat[j*slots : (j+1)*slots]
-		}
-		diagonalsList[i] = diagonals
+		diagIdxsList[i] = diagIdxs
 
 		params[i] = lintrans.Parameters{
-			DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+			DiagonalsIndexList:        diagIdxs,
 			LevelQ:                    int(levelsSlice[i]),
 			LevelP:                    scheme.Params.MaxLevelP(),
 			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
@@ -629,20 +992,61 @@ func GenerateLinearTransformsUnified(
 		}
 	}
 
-	var transforms []lintrans.LinearTransformation
-	if unifiedNoBSGSEnabled() {
-		transforms = newUnifiedNoBSGSTransformations(params)
-	} else {
+	if !unifiedNoBSGSEnabled() {
 		applyOptimalUnifiedBSGSRatio(params)
-		transforms = lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
 	}
-	if err := encodeUnifiedFloatTransformsParallel(diagonalsList, transforms); err != nil {
-		panic(err)
+	transforms := newUnifiedLoadTransformations(params)
+
+	streamingAny := false
+	totalPlaintexts := 0
+	for _, transform := range transforms {
+		totalPlaintexts += len(transform.Vec)
+	}
+	if lattigoStreamingLTEnabled("none", totalPlaintexts) {
+		streamingAny = true
+	} else {
+		for _, transform := range transforms {
+			if lattigoStreamingLTEnabled("none", len(transform.Vec)) {
+				streamingAny = true
+				break
+			}
+		}
+	}
+
+	streamingStates := make([]*lattigoStreamingLTState, n)
+	if streamingAny {
+		for i := range transforms {
+			streamingStates[i] = newStreamingLTStateFromC(
+				transforms[i],
+				diagIdxsList[i],
+				diagDataArraySlice[i],
+				diagDataLensSlice[i],
+			)
+		}
+	} else {
+		if unifiedNoBSGSEnabled() {
+			transforms = newUnifiedNoBSGSTransformations(params)
+		} else {
+			transforms = lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
+		}
+		diagonalsList := make([]lintrans.Diagonals[float64], n)
+		for i := 0; i < n; i++ {
+			diagonalsList[i] = buildFloatDiagonalsFromC(
+				diagIdxsList[i],
+				diagDataArraySlice[i],
+				diagDataLensSlice[i],
+				slots,
+			)
+		}
+		if err := encodeUnifiedFloatTransformsParallel(diagonalsList, transforms); err != nil {
+			panic(err)
+		}
 	}
 
 	ids := make([]int, n)
 	for i, lt := range transforms {
 		ids[i] = AddLinearTransform(lt)
+		registerStreamingLTState(ids[i], streamingStates[i])
 	}
 	return SliceToCArray(ids, convertIntToCInt)
 }
@@ -749,16 +1153,41 @@ func EvaluateLinearTransformsWithSharedCache(
 	transformIDsSlice := CArrayToSlice(transformIDs, numTransforms, convertCIntToInt)
 
 	transforms := make([]lintrans.LinearTransformation, n)
+	streamingAny := false
 	for i, id := range transformIDsSlice {
 		transforms[i] = RetrieveLinearTransform(id)
 		ensureLinearTransformRotationKeys(transforms[i])
-		validateLinearTransformPlaintextLevels(id, transforms[i])
+		if hasStreamingLTState(id) {
+			streamingAny = true
+		} else {
+			validateLinearTransformPlaintextLevels(id, transforms[i])
+		}
 	}
 
 	ctIn := RetrieveCiphertext(int(ctxtID))
 	scheme.LinEvaluator = lintrans.NewEvaluator(
 		scheme.Evaluator.WithKey(scheme.EvalKeys),
 	)
+
+	if streamingAny {
+		outIDs := make([]int, n)
+		for i, id := range transformIDsSlice {
+			if streamingState, ok := lookupStreamingLTState(id); ok {
+				ctOut, err := evaluateStreamingLinearTransformNew(id, streamingState, ctIn)
+				if err != nil {
+					panic(err)
+				}
+				outIDs[i] = PushCiphertext(ctOut)
+				continue
+			}
+			ctOut, err := scheme.LinEvaluator.EvaluateNew(ctIn, transforms[i])
+			if err != nil {
+				panic(err)
+			}
+			outIDs[i] = PushCiphertext(ctOut)
+		}
+		return SliceToCArray(outIDs, convertIntToCInt)
+	}
 
 	outputs := make([]*rlwe.Ciphertext, n)
 	for i := range outputs {
