@@ -330,6 +330,8 @@ class TconvK2S2PythonRuntimeExecutor:
         self.input_block_count = 0
         self.input_total_slots = 0
         self.output_total_slots = 0
+        self.output_fold_block_height = 0
+        self.output_fold_rotations = 0
         self.compile_count = 0
         self.block_evaluate_count = 0
         self.real_projection_count = 0
@@ -347,6 +349,7 @@ class TconvK2S2PythonRuntimeExecutor:
             "partial_rescale_s": 0.0,
             "accumulate_s": 0.0,
             "real_extract_s": 0.0,
+            "output_fold_s": 0.0,
             "bias_s": 0.0,
             "total_call_s": 0.0,
         }
@@ -364,6 +367,7 @@ class TconvK2S2PythonRuntimeExecutor:
                 "partial_rescale_s": 0.0,
                 "accumulate_s": 0.0,
                 "real_extract_s": 0.0,
+                "output_fold_s": 0.0,
                 "bias_s": 0.0,
                 "total_call_s": 0.0,
             }
@@ -375,6 +379,7 @@ class TconvK2S2PythonRuntimeExecutor:
             "evaluate_count": 0,
             "accumulate_add_count": 0,
             "real_extract_count": 0,
+            "output_fold_rotation_count": 0,
             "bias_add_count": 0,
             "input_pack_count": 0,
         }
@@ -480,6 +485,7 @@ class TconvK2S2PythonRuntimeExecutor:
             "partial_rescale_s": 0.0,
             "accumulate_s": 0.0,
             "real_extract_s": 0.0,
+            "output_fold_s": 0.0,
             "bias_s": 0.0,
             "total_call_s": 0.0,
         }
@@ -589,6 +595,19 @@ class TconvK2S2PythonRuntimeExecutor:
         self.output_block_count = int(layout["output_block_count"])
         self.input_total_slots = int(layout["input_total_slots"])
         self.output_total_slots = int(layout["output_total_slots"])
+        self.output_fold_block_height = int(layout["slots"])
+        self.output_fold_rotations = 0
+        embed_method = str(getattr(scheme.params, "get_embedding_method", lambda: "")())
+        if (
+            int(self.output_block_count) == 1
+            and str(embed_method) == "hybrid"
+            and int(self.output_total_slots) > 0
+            and int(self.output_total_slots) < int(layout["slots"])
+        ):
+            block_height = int(_ceil_pow2(int(self.output_total_slots)))
+            if int(block_height) < int(layout["slots"]):
+                self.output_fold_block_height = int(block_height)
+                self.output_fold_rotations = int(math.log2(int(layout["slots"]) // int(block_height)))
 
     def _compile_entry_groups(
         self,
@@ -769,13 +788,21 @@ class TconvK2S2PythonRuntimeExecutor:
                     )
                     output_block = torch.div(out_slot, int(slots), rounding_mode="floor")
                     output_local = torch.remainder(out_slot, int(slots))
-                    diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                    if int(self.output_fold_rotations) > 0 and int(self.output_block_count) == 1:
+                        diag_idx = torch.remainder(
+                            source_grid - output_local,
+                            int(self.output_fold_block_height),
+                        )
+                        output_positions = torch.remainder(source_grid - diag_idx, int(slots))
+                    else:
+                        diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                        output_positions = output_local
                     valid = nonzero & (output_block >= 0) & (output_block < int(self.output_block_count))
                     if not bool(torch.any(valid).item()):
                         continue
                     flat_blocks = output_block[valid].to(dtype=torch.int64)
                     flat_diags = diag_idx[valid].to(dtype=torch.int64)
-                    flat_locals = output_local[valid].to(dtype=torch.int64)
+                    flat_locals = output_positions[valid].to(dtype=torch.int64)
                     flat_values = coeff[valid].to(dtype=torch.float32)
                     for block in torch.unique(flat_blocks).tolist():
                         block_value = int(block)
@@ -842,6 +869,19 @@ class TconvK2S2PythonRuntimeExecutor:
         for output_block in range(int(self.output_block_count)):
             self._bias_plaintext(scheme=scheme, level=int(level), output_block=int(output_block))
 
+    def _apply_output_fold_rotations(self, block_ct: Any) -> Any:
+        rotations = int(self.output_fold_rotations)
+        if int(rotations) <= 0:
+            return block_ct
+        fold_started = time.time()
+        slots = int(block_ct.scheme.params.get_slots())
+        out = block_ct
+        for rotation_index in range(1, int(rotations) + 1):
+            out = out + out.roll(int(slots // (2**int(rotation_index))), in_place=False)
+            self.last_runtime_counts["output_fold_rotation_count"] += 1
+        self.last_runtime_timing["output_fold_s"] += float(time.time() - fold_started)
+        return out
+
     def _assemble_output(self, output_ids: list[int], *, scheme: Any):
         from orion.backend.python.tensors import CipherTensor
 
@@ -882,6 +922,8 @@ class TconvK2S2PythonRuntimeExecutor:
         self.last_runtime_io["disable_tile_family_sharing"] = bool(self.disable_tile_family_sharing)
         self.last_runtime_io["compiled_transform_count"] = int(self.compiled_transform_count)
         self.last_runtime_io["skipped_empty_transform_count"] = int(self.skipped_empty_transform_count)
+        self.last_runtime_io["output_fold_block_height"] = int(self.output_fold_block_height)
+        self.last_runtime_io["output_fold_rotations"] = int(self.output_fold_rotations)
         if len(ids) < int(self.input_block_count):
             raise RuntimeError(
                 "U22 experimental tconv kernel requires one ciphertext per packed input block: "
@@ -966,6 +1008,7 @@ class TconvK2S2PythonRuntimeExecutor:
                 self.last_runtime_timing["real_extract_s"] += float(time.time() - real_extract_started)
                 self.last_runtime_counts["conjugate_count"] += 1
                 self.last_runtime_counts["real_extract_count"] += 1
+            block_ct = self._apply_output_fold_rotations(block_ct)
             final_ids.append(int(block_ct.ids[0]))
             block_ct.ids = []
         self._delete_temp_ciphertext_ids(scheme, owned_temp_ids)

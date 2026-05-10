@@ -327,6 +327,12 @@ def test_u22_decoder_tconv_provider_matches_reference_on_python_backend(monkeypa
         module.generate_diagonals(last=False)
         module.compile()
         module.he_mode = True
+        executor = getattr(runtime, "executor")
+        if (
+            int(getattr(executor, "output_block_count", 0)) == 1
+            and int(getattr(executor, "output_total_slots", 0)) < int(scheme.params.get_slots())
+        ):
+            assert int(getattr(executor, "output_fold_rotations", 0)) > 0
 
         torch.manual_seed(abs(hash((str(dataset), str(node_name)))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)

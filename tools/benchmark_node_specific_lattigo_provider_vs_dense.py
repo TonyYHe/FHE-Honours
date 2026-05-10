@@ -1558,6 +1558,24 @@ def _provider_rotation_stats(module: Any, *, path_kind: str = "provider") -> dic
     stats["ct_pt_hybrid_packing"] = bool(getattr(executor, "use_ct_pt_hybrid_packing", False))
     stats["tile_family_sharing"] = not bool(getattr(executor, "disable_tile_family_sharing", False))
     stats["bsgs_family_sharing"] = str(path_kind) != "provider_no_family"
+    output_rotations = int(
+        getattr(executor, "output_fold_rotations", getattr(executor, "output_rotations", 0)) or 0
+    )
+    output_ct_count = int(
+        getattr(executor, "output_block_count", getattr(executor, "bank_count", 0)) or 0
+    )
+    output_rotation_evals = int(output_rotations * output_ct_count)
+    if int(output_rotation_evals) > 0:
+        stats["output_rotations_per_output_ct"] = int(output_rotations)
+        stats["output_rotation_eval_count"] = int(output_rotation_evals)
+        stats["actual_rotation_callback_count"] = int(stats.get("actual_rotation_callback_count", 0)) + int(
+            output_rotation_evals
+        )
+        stats["reported_unique_key_union_count"] = int(stats.get("reported_unique_key_union_count", 0)) + int(
+            output_rotation_evals
+        )
+        stats["rotation_eval_count"] = int(stats.get("rotation_eval_count", 0)) + int(output_rotation_evals)
+        stats["method"] = f"{stats.get('method', '')}; plus provider output-fold rotations"
     stats["input_block_pairs"] = [
         [int(left), None if right is None else int(right)]
         for left, right in list(getattr(executor, "input_block_pairs", ()) or ())

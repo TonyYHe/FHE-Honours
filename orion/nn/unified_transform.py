@@ -2093,6 +2093,17 @@ class UnifiedTransformGroup:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
         if self._memory_bounded_eval_enabled(backend):
             return self._evaluate_unified_memory_bounded(int(ct_input_id), backend)
+        if (
+            len(self.unified_ids) == 1
+            and not self._should_offload_rotation_keys()
+            and not self._offloaded_plaintext_diagonals
+            and callable(getattr(backend, "EvaluateLinearTransform", None))
+        ):
+            self._record_memory_event("before_eval_single_transform", backend)
+            try:
+                return [int(backend.EvaluateLinearTransform(int(self.unified_ids[0]), int(ct_input_id)))]
+            finally:
+                self._record_memory_event("after_eval_single_transform", backend)
         scheduler = self._shared_saved_io_scheduler()
         prefetch_key = self._saved_io_prefetch_key()
         using_shared_prefetch = False
