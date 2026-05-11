@@ -73,6 +73,21 @@ def _unified_stream_compile_batch_bytes() -> int:
         return 4 * 1024**3
 
 
+def _unified_cached_load_batch_limit() -> int:
+    for name in (
+        "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
+        "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
+    ):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def _unified_compile_trace_enabled() -> bool:
     return os.environ.get("ORION_UNIFIED_COMPILE_TRACE", "0").strip().lower() not in ("", "0", "false", "no", "off")
 
@@ -99,6 +114,7 @@ class UnifiedTransformGroup:
         self._storage_key = f"group_{next(_UNIFIED_GROUP_COUNTER)}"
         self._offloaded_plaintext_diagonals = False
         self._diag_indices_by_transform: dict[int, tuple[int, ...]] = {}
+        self._storage_name_by_transform: dict[int, str] = {}
         self._required_keys: tuple[tuple[int, int | None], ...] = ()
         self._required_keys_by_transform: dict[int, tuple[tuple[int, int | None], ...]] = {}
         self._io_prefetcher = AsyncIOPrefetcher()
@@ -512,6 +528,9 @@ class UnifiedTransformGroup:
             )
         }
 
+    def _storage_name_for_transform(self, transform_id: int) -> str:
+        return str(self._storage_name_by_transform.get(int(transform_id), str(int(transform_id))))
+
     def _streaming_payload_missing_error(self, transform_id: int) -> RuntimeError:
         return RuntimeError(
             "backend streaming linear transform requires an encoded plaintext payload "
@@ -651,7 +670,7 @@ class UnifiedTransformGroup:
             storage = root[self._storage_key]
             for transform_id in self._plaintext_load_transform_ids(backend):
                 total = 0
-                transform_group = storage.get(str(int(transform_id)))
+                transform_group = storage.get(self._storage_name_for_transform(int(transform_id)))
                 if transform_group is None:
                     continue
                 if _ENCODED_HOIST_PAYLOAD_DATASET in transform_group:
@@ -1008,7 +1027,7 @@ class UnifiedTransformGroup:
             try:
                 storage = root[self._storage_key]
                 for transform_id in self._plaintext_load_transform_ids(backend):
-                    transform_group = storage[str(transform_id)]
+                    transform_group = storage[self._storage_name_for_transform(int(transform_id))]
                     if _ENCODED_HOIST_PAYLOAD_DATASET in transform_group:
                         dataset = transform_group[_ENCODED_HOIST_PAYLOAD_DATASET]
                         total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
@@ -1023,7 +1042,7 @@ class UnifiedTransformGroup:
             try:
                 storage = root[self._storage_key]
                 for transform_id in self._plaintext_load_transform_ids(backend):
-                    transform_group = storage[str(transform_id)]
+                    transform_group = storage[self._storage_name_for_transform(int(transform_id))]
                     if _ENCODED_HOIST_PAYLOAD_DATASET in transform_group:
                         dataset = transform_group[_ENCODED_HOIST_PAYLOAD_DATASET]
                         total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
@@ -1089,7 +1108,7 @@ class UnifiedTransformGroup:
                 for transform_id, diag_indices in self._diag_indices_by_transform.items():
                     if int(transform_id) not in selected_ids:
                         continue
-                    transform_group = storage[str(transform_id)]
+                    transform_group = storage[self._storage_name_for_transform(int(transform_id))]
                     if _ENCODED_HOIST_PAYLOAD_DATASET in transform_group:
                         plaintexts[int(transform_id)] = {
                             "encoded_payload": np.asarray(
@@ -1259,6 +1278,8 @@ class UnifiedTransformGroup:
             if self._storage_key in root:
                 del root[self._storage_key]
             storage = root.create_group(self._storage_key)
+            storage.attrs["compile_mode"] = "full"
+            storage.attrs["compile_batch_sizes"] = np.asarray([len(self.unified_ids or ())], dtype=np.int32)
             for transform_id, diag_indices in self._diag_indices_by_transform.items():
                 self._save_and_unload_plaintext_diagonals_for_transform(
                     backend,
@@ -1281,6 +1302,7 @@ class UnifiedTransformGroup:
         diag_indices: Iterable[int],
     ) -> None:
         diag_indices = tuple(int(idx) for idx in diag_indices)
+        self._storage_name_by_transform[int(transform_id)] = str(int(transform_id))
         if str(int(transform_id)) in storage:
             del storage[str(int(transform_id))]
         transform_group = storage.create_group(str(int(transform_id)))
@@ -1451,7 +1473,7 @@ class UnifiedTransformGroup:
             for transform_id, diag_indices in self._diag_indices_by_transform.items():
                 if int(transform_id) not in selected_ids:
                     continue
-                transform_group = storage[str(transform_id)]
+                transform_group = storage[self._storage_name_for_transform(int(transform_id))]
                 if _ENCODED_HOIST_PAYLOAD_DATASET in transform_group:
                     payload = np.asarray(
                         transform_group[_ENCODED_HOIST_PAYLOAD_DATASET][()],
@@ -1665,7 +1687,7 @@ class UnifiedTransformGroup:
         )
         return ids
 
-    def _cached_transform_descriptors(self) -> list[tuple[list[int], int]]:
+    def _cached_transform_descriptors(self) -> list[tuple[str, list[int], int]]:
         handle, root = self._storage_group("r")
         try:
             if self._storage_key not in root:
@@ -1680,7 +1702,7 @@ class UnifiedTransformGroup:
                     f"group={self._storage_key} cached={len(transform_names)} expected={len(self.transforms)}. "
                     "Re-run with io_mode='save' to rebuild the cache."
                 )
-            descriptors: list[tuple[list[int], int]] = []
+            descriptors: list[tuple[str, list[int], int]] = []
             for transform_name, transform in zip(transform_names, self.transforms):
                 transform_group = storage[str(transform_name)]
                 diag_indices = [
@@ -1690,15 +1712,41 @@ class UnifiedTransformGroup:
                 level = getattr(transform, "level", None)
                 if level is None:
                     level = len(transform.scheme.params.get_logq()) - 1
-                descriptors.append((diag_indices, int(level)))
+                descriptors.append((str(transform_name), diag_indices, int(level)))
             return descriptors
         finally:
             handle.close()
 
+    def _cached_load_batch_sizes(self, descriptor_count: int) -> tuple[int, ...]:
+        count_value = int(descriptor_count)
+        if count_value <= 0:
+            return ()
+        handle, root = self._storage_group("r")
+        try:
+            storage = root[self._storage_key]
+            raw_sizes = storage.attrs.get("compile_batch_sizes")
+            if raw_sizes is not None:
+                sizes = tuple(int(value) for value in np.asarray(raw_sizes, dtype=np.int32).reshape(-1).tolist())
+                if sizes and all(int(size) > 0 for size in sizes) and sum(sizes) == count_value:
+                    return sizes
+        finally:
+            handle.close()
+
+        batch_limit = int(_unified_cached_load_batch_limit())
+        if batch_limit <= 0 or batch_limit >= count_value:
+            return (count_value,)
+        sizes: list[int] = []
+        offset = 0
+        while offset < count_value:
+            size = min(int(batch_limit), int(count_value - offset))
+            sizes.append(int(size))
+            offset += int(size)
+        return tuple(sizes)
+
     def _generate_unified_backend_load_batch(
         self,
         backend,
-        descriptors: list[tuple[list[int], int]],
+        descriptors: list[tuple[str, list[int], int]],
     ) -> list[int]:
         generate = getattr(backend, "GenerateLinearTransformsUnifiedLoad", None)
         if not callable(generate):
@@ -1711,12 +1759,12 @@ class UnifiedTransformGroup:
         diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
         diag_idxs_lens = (ctypes.c_int * num_transforms)()
         owned_arrays: list[object] = []
-        for idx, (diag_idxs, _level) in enumerate(descriptors):
+        for idx, (_storage_name, diag_idxs, _level) in enumerate(descriptors):
             idx_array = np.ascontiguousarray(diag_idxs, dtype=np.int32)
             owned_arrays.append(idx_array)
             diag_idxs_ptrs[idx] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
             diag_idxs_lens[idx] = int(idx_array.size)
-        levels_array = (ctypes.c_int * num_transforms)(*[int(level) for _diag_idxs, level in descriptors])
+        levels_array = (ctypes.c_int * num_transforms)(*[int(level) for _storage_name, _diag_idxs, level in descriptors])
         owned_arrays.append(levels_array)
         return list(generate(num_transforms, diag_idxs_ptrs, diag_idxs_lens, levels_array))
 
@@ -1741,12 +1789,34 @@ class UnifiedTransformGroup:
             transforms=len(descriptors),
             save_resume=int(bool(can_resume_save)),
         )
-        self.unified_ids = self._generate_unified_backend_load_batch(backend, descriptors)
+        batch_sizes = self._cached_load_batch_sizes(len(descriptors))
+        self.unified_ids = []
+        offset = 0
+        for batch_index, batch_size in enumerate(batch_sizes):
+            batch = descriptors[int(offset): int(offset + int(batch_size))]
+            if len(batch_sizes) > 1:
+                _unified_compile_trace(
+                    "compile_group_cached_load_batch",
+                    group=self._storage_key,
+                    batch=int(batch_index),
+                    start=int(offset),
+                    end=int(offset + int(batch_size)),
+                    transforms=len(batch),
+                )
+            batch_ids = self._generate_unified_backend_load_batch(backend, batch)
+            if len(batch_ids) != len(batch):
+                raise RuntimeError("backend returned unexpected transform count for cached unified load batch")
+            self.unified_ids.extend(int(value) for value in batch_ids)
+            offset += int(batch_size)
         if len(self.unified_ids) != len(descriptors):
             raise RuntimeError("backend returned unexpected transform count for cached unified load")
         self._diag_indices_by_transform = {
             int(transform_id): tuple(int(idx) for idx in diag_indices)
-            for transform_id, (diag_indices, _level) in zip(self.unified_ids, descriptors)
+            for transform_id, (_storage_name, diag_indices, _level) in zip(self.unified_ids, descriptors)
+        }
+        self._storage_name_by_transform = {
+            int(transform_id): str(storage_name)
+            for transform_id, (storage_name, _diag_indices, _level) in zip(self.unified_ids, descriptors)
         }
         self._required_keys = ()
         self._required_keys_by_transform = {}
@@ -1806,6 +1876,7 @@ class UnifiedTransformGroup:
         )
         self.unified_ids = []
         self._diag_indices_by_transform = {}
+        self._storage_name_by_transform = {}
         self._required_keys = ()
         self._required_keys_by_transform = {}
         save_plaintexts = bool(self._should_save_plaintext_diagonals())
@@ -1817,6 +1888,7 @@ class UnifiedTransformGroup:
             if self._storage_key in root:
                 del root[self._storage_key]
             storage = root.create_group(self._storage_key)
+            storage.attrs["compile_mode"] = "streaming"
         flatten_workers = _unified_compile_workers(len(self.transforms))
         batch_limit = _unified_stream_compile_batch_limit(len(self.transforms), int(flatten_workers))
         batch_byte_limit = int(_unified_stream_compile_batch_bytes())
@@ -1829,6 +1901,7 @@ class UnifiedTransformGroup:
             else None
         )
         force_compile_trim = self._force_compile_trim_each_transform_enabled()
+        compiled_batch_sizes: list[int] = []
         try:
             transform_index = 0
             while transform_index < len(self.transforms):
@@ -1886,6 +1959,7 @@ class UnifiedTransformGroup:
                             storage=storage,
                             force_compile_trim=force_compile_trim,
                         )
+                        compiled_batch_sizes.append(int(len(queued)))
                         queued = []
                         queued_bytes = 0
                     queued.append((int(index), payload))
@@ -1900,10 +1974,13 @@ class UnifiedTransformGroup:
                         storage=storage,
                         force_compile_trim=force_compile_trim,
                     )
+                    compiled_batch_sizes.append(int(len(queued)))
                 transform_index = int(batch_end)
                 del payloads
                 gc.collect()
         finally:
+            if storage is not None and compiled_batch_sizes:
+                storage.attrs["compile_batch_sizes"] = np.asarray(compiled_batch_sizes, dtype=np.int32)
             if flatten_executor is not None:
                 flatten_executor.shutdown(wait=True)
             if handle is not None:
@@ -1952,6 +2029,7 @@ class UnifiedTransformGroup:
         self.unified_ids.extend(transform_ids)
         for transform_id, payload in zip(transform_ids, payloads):
             self._diag_indices_by_transform[int(transform_id)] = tuple(int(idx) for idx in payload[0])
+            self._storage_name_by_transform[int(transform_id)] = str(int(transform_id))
             self._record_transform_key_requests(backend, int(transform_id))
         self._record_memory_event(
             "after_compile_transform_batch",
@@ -1999,6 +2077,7 @@ class UnifiedTransformGroup:
         _unified_compile_trace("compile_group_start", group=self._storage_key, transforms=len(self.transforms))
         group_started = time.perf_counter()
         self._configure_io()
+        self._storage_name_by_transform = {}
         self._prefetch_host_bytes = None
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None
@@ -2052,6 +2131,10 @@ class UnifiedTransformGroup:
             self._diag_indices_by_transform = {
                 int(transform_id): tuple(int(idx) for idx in diag_idxs)
                 for transform_id, (diag_idxs, _diag_data, _level) in zip(self.unified_ids, payloads)
+            }
+            self._storage_name_by_transform = {
+                int(transform_id): str(int(transform_id))
+                for transform_id in self.unified_ids
             }
             self._required_keys = ()
             self._required_keys_by_transform = {}
@@ -2431,6 +2514,7 @@ class UnifiedTransformGroup:
         self.unified_ids = None
         self.is_compiled = False
         self._diag_indices_by_transform = {}
+        self._storage_name_by_transform = {}
         self._offloaded_plaintext_diagonals = False
         self._required_keys = ()
         self._required_keys_by_transform = {}
