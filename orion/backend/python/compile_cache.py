@@ -416,11 +416,66 @@ def collect_provider_metadata(network_dag) -> dict[str, Any]:
     return payload
 
 
+def _provider_storage_group_numbers(row: dict[str, Any]) -> list[int]:
+    values: list[int] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            storage_key = value.get("storage_key")
+            if isinstance(storage_key, str) and storage_key.startswith("group_"):
+                try:
+                    values.append(int(storage_key.split("_", 1)[1]))
+                except (IndexError, ValueError):
+                    pass
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(dict(row.get("executor_metadata") or {}))
+    return values
+
+
+def _synthesize_legacy_tconv_provider_metadata(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    synthesized: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        executor_type = str(row.get("executor_type", ""))
+        if not executor_type.endswith("TconvK2S2PythonRuntimeExecutor"):
+            continue
+        if row.get("executor_metadata"):
+            continue
+
+        previous_numbers: list[int] = []
+        for previous in rows[:index]:
+            previous_numbers.extend(_provider_storage_group_numbers(previous))
+        next_numbers: list[int] = []
+        for following in rows[index + 1:]:
+            next_numbers.extend(_provider_storage_group_numbers(following))
+        if not previous_numbers or not next_numbers:
+            continue
+        start = int(max(previous_numbers) + 1)
+        stop = int(min(next_numbers))
+        if stop <= start:
+            continue
+        synthesized[str(row.get("node"))] = {
+            "kind": "TconvK2S2PythonRuntimeExecutor",
+            "inferred_storage_keys": [f"group_{value}" for value in range(start, stop)],
+            "inferred_from_neighbor_group_gap": True,
+        }
+    return synthesized
+
+
 def apply_provider_metadata(network_dag, provider_metadata: dict[str, Any]) -> None:
-    rows = {
-        str(row.get("node")): row
+    row_list = [
+        dict(row)
         for row in list((provider_metadata or {}).get("rows", []))
         if isinstance(row, dict) and row.get("node") is not None
+    ]
+    synthesized_rows = _synthesize_legacy_tconv_provider_metadata(row_list)
+    rows = {
+        str(row.get("node")): row
+        for row in row_list
     }
     for node in network_dag.nodes:
         row = rows.get(str(node))
@@ -431,7 +486,7 @@ def apply_provider_metadata(network_dag, provider_metadata: dict[str, Any]) -> N
         executor = getattr(runtime, "executor", None) if runtime is not None else None
         if executor is None:
             continue
-        metadata = dict(row.get("executor_metadata") or {})
+        metadata = dict(row.get("executor_metadata") or synthesized_rows.get(str(node), {}))
         setattr(executor, "_compile_cache_metadata", metadata)
         load_metadata = getattr(executor, "load_compile_cache_metadata", None)
         if callable(load_metadata):

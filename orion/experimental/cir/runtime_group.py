@@ -158,6 +158,13 @@ def _delete_ciphertext_id(scheme: Any, ciphertext_id: int) -> None:
         pass
 
 
+def _clamp_scheme_level(scheme: Any, level: int | None) -> int:
+    max_level = max(0, int(len(scheme.params.get_logq()) - 1))
+    if level is None:
+        return int(max_level)
+    return max(0, min(int(level), int(max_level)))
+
+
 class Stage1RuntimeExecutor:
     def __init__(self, *, plan: Any, output_node_ids: tuple[str, ...], real_output_scale: float = 0.5) -> None:
         self.plan = plan
@@ -448,7 +455,7 @@ class FullConvRegionRuntimeExecutor:
         )
         from orion.nn.unified_transform import UnifiedTransformGroup
 
-        level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+        level = _clamp_scheme_level(scheme, self.assigned_level)
         prepare_transforms_started = time.time()
         _region_compile_trace(
             "full_conv_prepare_transforms_start",
@@ -604,7 +611,7 @@ class FullConvRegionRuntimeExecutor:
         return self._complex_sources_from_ids(source_ct)
 
     def _output_level(self, scheme: Any, *, extra_depth: int = 0) -> int:
-        level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+        level = _clamp_scheme_level(scheme, self.assigned_level)
         depth = int(self.assigned_depth) if self.assigned_depth is not None else 1
         return max(0, int(level) - max(0, int(depth)) - max(0, int(extra_depth)))
 
@@ -1708,7 +1715,7 @@ def build_r18_actual_region_first_e2e_report(
             "kind": str(activation),
             "silu_degree": int(silu_degree) if str(activation).lower() == "silu" else None,
             "stem_relu": bool(stem_relu),
-            "expected_bootstraps_reference": 61 if str(activation).lower() == "silu" and int(silu_degree) == 7 and bool(stem_relu) else None,
+            "expected_bootstraps_reference": 69 if str(activation).lower() == "silu" and int(silu_degree) == 7 and bool(stem_relu) else None,
         },
         "input": {"seed": int(seed), "shape": list(sample.shape)},
         "dense_cleartext": {

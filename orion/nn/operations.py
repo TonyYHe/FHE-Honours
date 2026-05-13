@@ -41,11 +41,23 @@ class Bootstrap(Module):
         l_eff = len(self.scheme.params.get_logq()) - 1
         return f"l_eff={l_eff}"
 
+    def _resolve_margin(self):
+        override = os.environ.get("ORION_BOOTSTRAP_MARGIN_OVERRIDE", "").strip()
+        if not override:
+            return float(self.margin)
+        try:
+            return float(override)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid ORION_BOOTSTRAP_MARGIN_OVERRIDE={override!r}; expected a float"
+            ) from exc
+
     def fit(self):
         center = (self.input_min + self.input_max) / 2 
         half_range = (self.input_max - self.input_min) / 2
-        self.low = (center - (self.margin * half_range)).item()
-        self.high = (center + (self.margin * half_range)).item()
+        self.bootstrap_margin = self._resolve_margin()
+        self.low = (center - (self.bootstrap_margin * half_range)).item()
+        self.high = (center + (self.bootstrap_margin * half_range)).item()
 
         # We'll want to scale from [A, B] into [-1, 1] using a value of the
         # form 1 / integer, so that way our multiplication back to the range
@@ -104,6 +116,7 @@ class Bootstrap(Module):
             "input_level": int(self.input_level),
             "bootstrap_slots": int(self.bootstrap_slots),
             "runtime_slots": None if slots is None else int(slots),
+            "margin": float(getattr(self, "bootstrap_margin", self.margin)),
             "prescale": float(self.prescale),
             "postscale": float(self.postscale),
             "constant": float(self.constant),
@@ -141,4 +154,3 @@ class Bootstrap(Module):
             x -= self.constant
 
         return x
-

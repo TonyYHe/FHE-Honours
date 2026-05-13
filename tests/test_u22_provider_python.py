@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -519,6 +521,65 @@ def test_u22_tconv_no_tile_family_sharing_splits_output_tiles_on_python_backend(
         scheme.delete_scheme()
 
 
+def test_u22_tconv_hybrid_rejects_mismatched_adjacent_source_schedules() -> None:
+    _init_python_scheme(logn=8)
+    try:
+        module = ConvTranspose2d(
+            in_channels=8,
+            out_channels=4,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            output_padding=0,
+            groups=1,
+            bias=True,
+        )
+        module.eval()
+        module.init_orion_params()
+        module.input_shape = torch.Size((1, 8, 4, 4))
+        module.output_shape = torch.Size((1, 4, 8, 8))
+        module.input_gap = 4
+        module.output_gap = 2
+        module.fhe_input_shape = torch.Size((1, 1, 16, 16))
+        module.fhe_output_shape = torch.Size((1, 1, 16, 16))
+        module.set_level(len(scheme.params.get_logq()) - 1)
+
+        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="mismatch_tconv")
+
+        def fake_build_source_block_transforms(*, scheme, level: int, source_block: int):
+            slots = int(scheme.params.get_slots())
+            diag_key = 0 if int(source_block) == 0 else 1
+            transforms = [
+                SimpleNamespace(
+                    name=f"fake_src{int(source_block)}_out{int(output_block)}",
+                    diagonals={(0, 0): {int(diag_key): torch.ones((int(slots),), dtype=torch.float32)}},
+                    level=int(level),
+                    scheme=scheme,
+                    fhe_output_shape=torch.Size([1, int(slots)]),
+                    output_shape=torch.Size([1, int(slots)]),
+                )
+                for output_block in range(int(runtime.output_block_count))
+            ]
+            return transforms, 0
+
+        runtime._build_source_block_transforms = fake_build_source_block_transforms
+        runtime.compile(scheme)
+
+        assert runtime.input_block_count == 2
+        assert runtime.output_block_count == 2
+        assert runtime.hybrid_pair_count == 0
+        assert runtime.hybrid_pair_rejected_count == 1
+        assert runtime.input_block_pairs == [(0, None), (1, None)]
+        assert runtime.complex_input_block_flags == [False, False]
+        assert len(runtime.groups) == 2
+        metadata = runtime.compile_cache_metadata()
+        assert metadata["hybrid_pair_rejected_count"] == 1
+        assert all(group["complex_input_block"] is False for group in metadata["groups_by_input_unit"])
+        assert all(group["hybrid_pair_reject_reason"] for group in metadata["groups_by_input_unit"])
+    finally:
+        scheme.delete_scheme()
+
+
 def test_u22_tconv_provider_splits_one_plane_across_many_ciphertexts_on_python_backend() -> None:
     _init_python_scheme(logn=8)
     try:
@@ -567,6 +628,10 @@ def test_u22_tconv_provider_splits_one_plane_across_many_ciphertexts_on_python_b
         assert runtime.output_block_count == 2
         assert len(out["split_plane_tconv"].ids) == 2
         assert runtime.input_block_pairs == [(0, 1)]
+        assert runtime.complex_input_block_flags == [True]
+        assert runtime.hybrid_pair_count == 1
+        assert runtime.hybrid_pair_rejected_count == 0
+        assert runtime.hybrid_pair_schedule_padded_count == 1
         assert len(runtime.groups) == 1
         assert runtime.block_evaluate_count == 1
         assert float((result - reference).abs().max().item()) <= 1.0e-5

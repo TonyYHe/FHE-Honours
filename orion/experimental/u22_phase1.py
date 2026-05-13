@@ -10,12 +10,22 @@ from typing import Any
 import torch
 
 from orion.core import packing
+from orion.experimental.cir.hybrid_schedule import (
+    hybrid_pair_schedule_compatible,
+    hybrid_pair_schedule_reject_reason,
+    mark_hybrid_schedule_padding_allowed,
+    pad_hybrid_pair_to_common_schedule,
+)
 from orion.experimental.cir.lattigo_block import _idx_chw_gap_tensor
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
 from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.pooling import AvgPool2d
 from orion.nn.unified_transform import UnifiedTransformGroup
+
+
+def _cached_transform_shell(*, level: int, scheme: Any) -> Any:
+    return SimpleNamespace(diagonals={}, level=int(level), scheme=scheme)
 
 
 def _env_truthy(name: str) -> bool:
@@ -264,6 +274,9 @@ def _merge_optional_tconv_source_block_transforms_to_complex(
         raise ValueError("at least one source-block transform is required")
     anchor = left if left is not None else right
     slots = int(anchor.fhe_output_shape[-1])
+    if not hybrid_pair_schedule_compatible(left, right, int(slots)):
+        reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+        raise ValueError(f"tconv source-block hybrid merge requires identical schedules: {reason}")
     left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
     right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
     all_keys = sorted({int(key) for key in left_diags.keys()} | {int(key) for key in right_diags.keys()})
@@ -326,6 +339,12 @@ class TconvK2S2PythonRuntimeExecutor:
         self.target_indices_by_input_unit: list[tuple[int, ...]] = []
         self.input_block_pairs: list[tuple[int, int | None]] = []
         self.complex_input_block_flags: list[bool] = []
+        self.hybrid_group_reject_reasons: list[str] = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons: list[str] = []
+        self.hybrid_pair_schedule_padded_count = 0
+        self.hybrid_pair_schedule_pad_reasons: list[str] = []
         self.output_block_count = 0
         self.input_block_count = 0
         self.input_total_slots = 0
@@ -337,6 +356,7 @@ class TconvK2S2PythonRuntimeExecutor:
         self.real_projection_count = 0
         self.compiled_transform_count = 0
         self.skipped_empty_transform_count = 0
+        self._compile_cache_metadata: dict[str, Any] = {}
         self._bias_vector: torch.Tensor | None = None
         self._bias_ptxt_cache: dict[tuple[int, int], Any] = {}
         self.last_runtime_timing: dict[str, float] = {
@@ -384,6 +404,167 @@ class TconvK2S2PythonRuntimeExecutor:
             "input_pack_count": 0,
         }
         self.last_runtime_io = {}
+
+    def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
+        self._compile_cache_metadata = dict(metadata or {})
+
+    def compile_cache_metadata(self) -> dict[str, Any]:
+        return {
+            "kind": type(self).__name__,
+            "input_block_count": int(self.input_block_count),
+            "output_block_count": int(self.output_block_count),
+            "input_total_slots": int(self.input_total_slots),
+            "output_total_slots": int(self.output_total_slots),
+            "output_fold_block_height": int(self.output_fold_block_height),
+            "output_fold_rotations": int(self.output_fold_rotations),
+            "hybrid_pair_count": int(self.hybrid_pair_count),
+            "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
+            "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
+            "hybrid_pair_schedule_padded_count": int(self.hybrid_pair_schedule_padded_count),
+            "hybrid_pair_schedule_pad_reasons": [str(value) for value in self.hybrid_pair_schedule_pad_reasons],
+            "groups_by_input_unit": [
+                {
+                    "storage_key": str(getattr(group, "_storage_key", "")),
+                    "target_indices": [int(value) for value in self.target_indices_by_input_unit[index]],
+                    "input_block_pair": [
+                        int(self.input_block_pairs[index][0]),
+                        None if self.input_block_pairs[index][1] is None else int(self.input_block_pairs[index][1]),
+                    ],
+                    "complex_input_block": bool(self.complex_input_block_flags[index]),
+                    "hybrid_pair_reject_reason": (
+                        str(self.hybrid_group_reject_reasons[index])
+                        if index < len(self.hybrid_group_reject_reasons)
+                        else ""
+                    ),
+                }
+                for index, group in enumerate(self.groups)
+            ],
+        }
+
+    def _compile_cache_group_metadata_from_inferred_keys(self, storage_keys: list[str]) -> list[dict[str, Any]]:
+        keys = [str(value) for value in storage_keys if str(value)]
+        if not keys:
+            return []
+
+        pairs: list[tuple[tuple[int, int | None], bool]] = []
+        if bool(self.use_ct_pt_hybrid_packing) and int(self.input_block_count) > 1:
+            for left_block in range(0, int(self.input_block_count), 2):
+                right_block = int(left_block + 1)
+                has_right = int(right_block) < int(self.input_block_count)
+                pairs.append(((int(left_block), int(right_block) if bool(has_right) else None), bool(has_right)))
+        else:
+            for source_block in range(int(self.input_block_count)):
+                pairs.append(((int(source_block), None), False))
+
+        if len(keys) == len(pairs):
+            return [
+                {
+                    "storage_key": str(storage_key),
+                    "target_indices": [int(index) for index in range(int(self.output_block_count))],
+                    "input_block_pair": [int(pair[0]), None if pair[1] is None else int(pair[1])],
+                    "complex_input_block": bool(is_complex),
+                    "hybrid_pair_reject_reason": "",
+                }
+                for storage_key, (pair, is_complex) in zip(keys, pairs)
+            ]
+
+        expected_split_count = int(len(pairs) * max(1, int(self.output_block_count)))
+        if len(keys) == expected_split_count:
+            rows: list[dict[str, Any]] = []
+            cursor = 0
+            for pair, is_complex in pairs:
+                for output_block in range(int(self.output_block_count)):
+                    rows.append(
+                        {
+                            "storage_key": str(keys[int(cursor)]),
+                            "target_indices": [int(output_block)],
+                            "input_block_pair": [int(pair[0]), None if pair[1] is None else int(pair[1])],
+                            "complex_input_block": bool(is_complex),
+                            "hybrid_pair_reject_reason": "",
+                        }
+                    )
+                    cursor += 1
+            return rows
+
+        raise RuntimeError(
+            f"Cached U22 tconv metadata has {len(keys)} storage keys, expected "
+            f"{len(pairs)} grouped or {expected_split_count} split keys for {self.output_node_id}."
+        )
+
+    def _compile_from_cache_metadata(self, scheme: Any) -> bool:
+        metadata = dict(self._compile_cache_metadata or {})
+        if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
+            return False
+
+        self.last_runtime_timing = {
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "evaluate_unified_s": 0.0,
+            "postprocess_s": 0.0,
+            "projection_s": 0.0,
+            "input_pack_s": 0.0,
+            "partial_rescale_s": 0.0,
+            "accumulate_s": 0.0,
+            "real_extract_s": 0.0,
+            "output_fold_s": 0.0,
+            "bias_s": 0.0,
+            "total_call_s": 0.0,
+        }
+        self._set_block_layout(scheme=scheme)
+        group_rows = list(metadata.get("groups_by_input_unit", []))
+        if not group_rows:
+            group_rows = self._compile_cache_group_metadata_from_inferred_keys(
+                [str(value) for value in metadata.get("inferred_storage_keys", [])]
+            )
+        if not group_rows:
+            return False
+
+        level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
+        self.groups = []
+        self.target_indices_by_input_unit = []
+        self.input_block_pairs = []
+        self.complex_input_block_flags = []
+        self.hybrid_group_reject_reasons = []
+        self.hybrid_pair_count = int(metadata.get("hybrid_pair_count", 0))
+        self.hybrid_pair_rejected_count = int(metadata.get("hybrid_pair_rejected_count", 0))
+        self.hybrid_pair_reject_reasons = [str(value) for value in metadata.get("hybrid_pair_reject_reasons", [])]
+        self.hybrid_pair_schedule_padded_count = int(metadata.get("hybrid_pair_schedule_padded_count", 0))
+        self.hybrid_pair_schedule_pad_reasons = [
+            str(value) for value in metadata.get("hybrid_pair_schedule_pad_reasons", [])
+        ]
+        self.compiled_transform_count = 0
+        self.skipped_empty_transform_count = 0
+
+        compile_started = time.time()
+        for group_meta in group_rows:
+            target_indices = tuple(int(value) for value in group_meta.get("target_indices", []))
+            if not target_indices:
+                continue
+            group = UnifiedTransformGroup(
+                [_cached_transform_shell(level=int(level), scheme=scheme) for _target in target_indices]
+            )
+            group._storage_key = str(group_meta["storage_key"])
+            group.compile_unified(scheme.backend)
+            pair = list(group_meta.get("input_block_pair", []))
+            if not pair:
+                raise RuntimeError(f"Cached U22 tconv metadata missing input block pair for {self.output_node_id}")
+            self.groups.append(group)
+            self.target_indices_by_input_unit.append(target_indices)
+            self.input_block_pairs.append((int(pair[0]), None if len(pair) < 2 or pair[1] is None else int(pair[1])))
+            self.complex_input_block_flags.append(bool(group_meta.get("complex_input_block", False)))
+            self.hybrid_group_reject_reasons.append(str(group_meta.get("hybrid_pair_reject_reason", "")))
+            self.compiled_transform_count += int(len(target_indices))
+        if "hybrid_pair_count" not in metadata:
+            self.hybrid_pair_count = int(sum(1 for value in self.complex_input_block_flags if bool(value)))
+
+        bias_level = max(0, int(level) - max(0, int(self.assigned_depth) if self.assigned_depth is not None else 1))
+        bias_started = time.time()
+        self._compile_bias_plaintexts(scheme=scheme, level=int(bias_level))
+        self.last_runtime_timing["bias_s"] = float(time.time() - bias_started)
+        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+        self.compile_count += 1
+        self._compiled = bool(self.groups)
+        return bool(self.groups)
 
     def _cipher_ids_state(self, ids: list[int] | tuple[int, ...], *, scheme: Any) -> dict[str, Any]:
         levels: list[int | None] = []
@@ -475,6 +656,8 @@ class TconvK2S2PythonRuntimeExecutor:
             return
         if not self.supports_scheme(scheme):
             raise RuntimeError("U22 experimental tconv kernel requires a compatible Python or Lattigo backend")
+        if self._compile_from_cache_metadata(scheme):
+            return
         self.last_runtime_timing = {
             "prepare_transforms_s": 0.0,
             "compile_unified_s": 0.0,
@@ -495,6 +678,12 @@ class TconvK2S2PythonRuntimeExecutor:
         self.target_indices_by_input_unit = []
         self.input_block_pairs = []
         self.complex_input_block_flags = []
+        self.hybrid_group_reject_reasons = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
+        self.hybrid_pair_schedule_padded_count = 0
+        self.hybrid_pair_schedule_pad_reasons = []
         self.compiled_transform_count = 0
         self.skipped_empty_transform_count = 0
 
@@ -519,42 +708,121 @@ class TconvK2S2PythonRuntimeExecutor:
                         source_block=int(right_block),
                     )
                 self.skipped_empty_transform_count += int(left_empty_count + right_empty_count)
-                entries: list[tuple[int, Any]] = []
-                for output_block in range(int(self.output_block_count)):
-                    left_transform = left_transforms[int(output_block)]
-                    right_transform = (
-                        right_transforms[int(output_block)]
-                        if bool(has_right) and right_transforms is not None
-                        else None
-                    )
-                    if left_transform is None and right_transform is None:
-                        continue
-                    if bool(has_right):
-                        transform = _merge_optional_tconv_source_block_transforms_to_complex(
+                if bool(has_right):
+                    candidates: list[tuple[int, Any | None, Any | None]] = []
+                    reject_reasons: list[str] = []
+                    pair_pad_reasons: list[str] = []
+                    for output_block in range(int(self.output_block_count)):
+                        left_transform = left_transforms[int(output_block)]
+                        right_transform = (
+                            right_transforms[int(output_block)]
+                            if right_transforms is not None
+                            else None
+                        )
+                        if left_transform is None and right_transform is None:
+                            continue
+                        left_transform, right_transform, pad_reason = pad_hybrid_pair_to_common_schedule(
                             left_transform,
                             right_transform,
+                            int(scheme.params.get_slots()),
                             name=(
                                 f"{self.output_node_id}_ctpt_hybrid_src"
                                 f"{int(left_block)}_{int(right_block)}_out{int(output_block)}"
                             ),
-                            real_lane_input_scale=(0.25 if bool(self.project_complex_inputs_to_real) else 0.5),
                         )
-                        self._clear_transform_diagonals(left_transform)
-                        self._clear_transform_diagonals(right_transform)
+                        if pad_reason:
+                            pair_pad_reasons.append(f"output_block={int(output_block)}:{pad_reason}")
+                        candidates.append((int(output_block), left_transform, right_transform))
+                        reason = hybrid_pair_schedule_reject_reason(
+                            left_transform,
+                            right_transform,
+                            int(scheme.params.get_slots()),
+                        )
+                        if reason:
+                            reject_reasons.append(f"output_block={int(output_block)}:{reason}")
+                    if not candidates:
+                        entries = []
+                        reason = ""
+                        left_entries = []
+                        right_entries = []
+                    elif reject_reasons:
+                        reason = "; ".join(reject_reasons)
+                        self.hybrid_pair_rejected_count += 1
+                        self.hybrid_pair_reject_reasons.append(
+                            f"input_pair=({int(left_block)},{int(right_block)}):{reason}"
+                        )
+                        left_entries = [
+                            (int(output_block), left_transform)
+                            for output_block, left_transform, _right_transform in candidates
+                            if left_transform is not None
+                        ]
+                        right_entries = [
+                            (int(output_block), right_transform)
+                            for output_block, _left_transform, right_transform in candidates
+                            if right_transform is not None
+                        ]
+                        entries = []
                     else:
-                        transform = left_transform
-                    if transform is None:
-                        continue
-                    entries.append((int(output_block), transform))
+                        entries = [
+                            (
+                                int(output_block),
+                                _merge_optional_tconv_source_block_transforms_to_complex(
+                                    left_transform,
+                                    right_transform,
+                                    name=(
+                                        f"{self.output_node_id}_ctpt_hybrid_src"
+                                        f"{int(left_block)}_{int(right_block)}_out{int(output_block)}"
+                                    ),
+                                    real_lane_input_scale=(0.25 if bool(self.project_complex_inputs_to_real) else 0.5),
+                                ),
+                            )
+                            for output_block, left_transform, right_transform in candidates
+                        ]
+                        self.hybrid_pair_count += 1
+                        if pair_pad_reasons:
+                            self.hybrid_pair_schedule_padded_count += 1
+                            self.hybrid_pair_schedule_pad_reasons.append(
+                                f"input_pair=({int(left_block)},{int(right_block)}):" + "; ".join(pair_pad_reasons)
+                            )
+                        reason = ""
+                        left_entries = []
+                        right_entries = []
+                        for _output_block, left_transform, right_transform in candidates:
+                            self._clear_transform_diagonals(left_transform)
+                            self._clear_transform_diagonals(right_transform)
+                else:
+                    entries = [
+                        (int(output_block), transform)
+                        for output_block, transform in enumerate(left_transforms)
+                        if transform is not None
+                    ]
+                    reason = ""
+                    left_entries = []
+                    right_entries = []
                 prepare_total += float(time.time() - prepare_started)
-                if not entries:
-                    continue
-                compile_total += self._compile_entry_groups(
-                    scheme=scheme,
-                    pair=(int(left_block), int(right_block) if bool(has_right) else None),
-                    is_complex=bool(has_right),
-                    entries=entries,
-                )
+                if entries:
+                    compile_total += self._compile_entry_groups(
+                        scheme=scheme,
+                        pair=(int(left_block), int(right_block) if bool(has_right) else None),
+                        is_complex=bool(has_right),
+                        entries=entries,
+                    )
+                if left_entries:
+                    compile_total += self._compile_entry_groups(
+                        scheme=scheme,
+                        pair=(int(left_block), None),
+                        is_complex=False,
+                        entries=left_entries,
+                        reject_reason=reason,
+                    )
+                if right_entries:
+                    compile_total += self._compile_entry_groups(
+                        scheme=scheme,
+                        pair=(int(right_block), None),
+                        is_complex=False,
+                        entries=right_entries,
+                        reject_reason=reason,
+                    )
                 del left_transforms, right_transforms, entries
         else:
             for source_block in range(int(self.input_block_count)):
@@ -616,6 +884,7 @@ class TconvK2S2PythonRuntimeExecutor:
         pair: tuple[int, int | None],
         is_complex: bool,
         entries: list[tuple[int, Any]],
+        reject_reason: str = "",
     ) -> float:
         entry_groups = (
             [[entry] for entry in sorted(entries, key=lambda item: int(item[0]))]
@@ -634,6 +903,7 @@ class TconvK2S2PythonRuntimeExecutor:
             self.target_indices_by_input_unit.append(tuple(int(target_index) for target_index, _transform in ordered))
             self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
             self.complex_input_block_flags.append(bool(is_complex))
+            self.hybrid_group_reject_reasons.append(str(reject_reason))
         return float(elapsed)
 
     def _clear_transform_diagonals(self, transform: Any | None) -> None:
@@ -643,6 +913,27 @@ class TconvK2S2PythonRuntimeExecutor:
             getattr(transform, "diagonals", {}).clear()
         except Exception:
             pass
+
+    def cleanup(self, backend: Any) -> None:
+        for group in self.groups:
+            if hasattr(group, "cleanup"):
+                group.cleanup(backend)
+        self.groups = []
+        self.target_indices_by_input_unit = []
+        self.input_block_pairs = []
+        self.complex_input_block_flags = []
+        self.hybrid_group_reject_reasons = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
+        self.output_block_count = 0
+        self.input_block_count = 0
+        self.input_total_slots = 0
+        self.output_total_slots = 0
+        self.output_fold_block_height = 0
+        self.output_fold_rotations = 0
+        self._bias_ptxt_cache = {}
+        self._compiled = False
 
     def _iter_source_positions_for_block(
         self,
@@ -837,13 +1128,21 @@ class TconvK2S2PythonRuntimeExecutor:
                 block_transforms.append(None)
                 continue
             block_transforms.append(
-                SimpleNamespace(
-                    name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
-                    diagonals={(0, 0): diagonals},
-                    level=int(level),
-                    scheme=scheme,
-                    fhe_output_shape=torch.Size([1, int(slots)]),
-                    output_shape=torch.Size([1, int(slots)]),
+                mark_hybrid_schedule_padding_allowed(
+                    SimpleNamespace(
+                        name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
+                        diagonals={(0, 0): diagonals},
+                        level=int(level),
+                        scheme=scheme,
+                        fhe_output_shape=torch.Size([1, int(slots)]),
+                        output_shape=torch.Size([1, int(slots)]),
+                    ),
+                    family=(
+                        f"u22_tconv_k2s2:"
+                        f"in_gap={int(input_gap)}:out_gap={int(output_gap)}:"
+                        f"in={int(c_in)}x{int(h_in)}x{int(w_in)}:"
+                        f"out={int(c_out)}x{int(h_out)}x{int(w_out)}"
+                    ),
                 )
             )
         return block_transforms, int(empty_transform_count)
@@ -922,6 +1221,14 @@ class TconvK2S2PythonRuntimeExecutor:
         self.last_runtime_io["disable_tile_family_sharing"] = bool(self.disable_tile_family_sharing)
         self.last_runtime_io["compiled_transform_count"] = int(self.compiled_transform_count)
         self.last_runtime_io["skipped_empty_transform_count"] = int(self.skipped_empty_transform_count)
+        self.last_runtime_io["hybrid_pair_count"] = int(self.hybrid_pair_count)
+        self.last_runtime_io["hybrid_pair_rejected_count"] = int(self.hybrid_pair_rejected_count)
+        self.last_runtime_io["hybrid_pair_reject_reasons"] = [str(value) for value in self.hybrid_pair_reject_reasons]
+        self.last_runtime_io["hybrid_pair_schedule_padded_count"] = int(self.hybrid_pair_schedule_padded_count)
+        self.last_runtime_io["hybrid_pair_schedule_pad_reasons"] = [
+            str(value) for value in self.hybrid_pair_schedule_pad_reasons
+        ]
+        self.last_runtime_io["complex_input_block_flags"] = [bool(value) for value in self.complex_input_block_flags]
         self.last_runtime_io["output_fold_block_height"] = int(self.output_fold_block_height)
         self.last_runtime_io["output_fold_rotations"] = int(self.output_fold_rotations)
         if len(ids) < int(self.input_block_count):
@@ -986,6 +1293,14 @@ class TconvK2S2PythonRuntimeExecutor:
                 block_ct = _rescale_cipher_tensor(block_ct)
                 self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
                 self.last_runtime_counts["rescale_count"] += 1
+                if bool(self.complex_input_block_flags[int(input_unit)]):
+                    real_extract_started = time.time()
+                    conj = block_ct.conjugate(in_place=False)
+                    block_ct, conj = _align_ciphertexts_for_add(block_ct, conj)
+                    block_ct = block_ct + conj
+                    self.last_runtime_timing["real_extract_s"] += float(time.time() - real_extract_started)
+                    self.last_runtime_counts["conjugate_count"] += 1
+                    self.last_runtime_counts["real_extract_count"] += 1
                 if accumulated[int(output_block)] is None:
                     accumulated[int(output_block)] = block_ct
                 else:
@@ -996,18 +1311,9 @@ class TconvK2S2PythonRuntimeExecutor:
                     self.last_runtime_counts["accumulate_add_count"] += 1
         postprocess_started = time.time()
         final_ids: list[int] = []
-        needs_real_lane_extract = any(bool(value) for value in self.complex_input_block_flags)
         for output_block, block_ct in enumerate(accumulated):
             if block_ct is None:
                 raise RuntimeError(f"U22 experimental tconv kernel missing output block {output_block}")
-            if bool(needs_real_lane_extract):
-                real_extract_started = time.time()
-                conj = block_ct.conjugate(in_place=False)
-                block_ct, conj = _align_ciphertexts_for_add(block_ct, conj)
-                block_ct = block_ct + conj
-                self.last_runtime_timing["real_extract_s"] += float(time.time() - real_extract_started)
-                self.last_runtime_counts["conjugate_count"] += 1
-                self.last_runtime_counts["real_extract_count"] += 1
             block_ct = self._apply_output_fold_rotations(block_ct)
             final_ids.append(int(block_ct.ids[0]))
             block_ct.ids = []

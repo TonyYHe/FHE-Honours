@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from orion.core import packing
 from orion.core.region_cir_replay import (
+    DEFAULT_END_TO_END_ARTIFACT,
     build_original_size_cir_replay,
     write_original_size_cir_replay,
 )
+
+
+def _require_end_to_end_artifact() -> None:
+    if not Path(DEFAULT_END_TO_END_ARTIFACT).exists():
+        pytest.skip(f"scripts/cir artifact is not available: {DEFAULT_END_TO_END_ARTIFACT}")
 
 
 def _row(payload: dict, replay_id: str) -> dict:
@@ -17,6 +25,7 @@ def _row(payload: dict, replay_id: str) -> dict:
 
 
 def test_original_size_cir_replay_matches_locked_scripts_cir_stats() -> None:
+    _require_end_to_end_artifact()
     payload = build_original_size_cir_replay()
 
     assert payload["status"] == "ok"
@@ -41,6 +50,7 @@ def test_original_size_cir_replay_matches_locked_scripts_cir_stats() -> None:
 
 
 def test_original_size_replay_publishable_rows_have_execution_gates() -> None:
+    _require_end_to_end_artifact()
     payload = build_original_size_cir_replay()
     publishable = [row for row in payload["rows"] if row["publishable"]]
 
@@ -57,6 +67,7 @@ def test_original_size_replay_publishable_rows_have_execution_gates() -> None:
 
 
 def test_r34_transition_replay_is_non_publishable_cost_surface() -> None:
+    _require_end_to_end_artifact()
     payload = build_original_size_cir_replay()
     row = _row(payload, "r34_transition_compile_surface")
 
@@ -68,6 +79,8 @@ def test_r34_transition_replay_is_non_publishable_cost_surface() -> None:
 
 
 def test_original_size_replay_does_not_call_orion_dense_pack_conv2d(monkeypatch) -> None:
+    _require_end_to_end_artifact()
+
     def fail_pack_conv2d(*_args, **_kwargs):
         raise AssertionError("original-size CIR replay must not call pack_conv2d")
 
@@ -79,6 +92,7 @@ def test_original_size_replay_does_not_call_orion_dense_pack_conv2d(monkeypatch)
 
 
 def test_original_size_replay_artifact_is_written(tmp_path: Path) -> None:
+    _require_end_to_end_artifact()
     out = tmp_path / "orion_original_size_cir_replay.json"
 
     payload = write_original_size_cir_replay(out_path=out)

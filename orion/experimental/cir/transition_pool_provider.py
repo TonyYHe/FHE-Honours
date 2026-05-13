@@ -15,6 +15,10 @@ from orion.experimental.cir.runtime_group import (
     _encode_plaintext_for_add,
     _rescale_cipher_tensor,
 )
+from orion.experimental.cir.hybrid_schedule import (
+    hybrid_pair_schedule_compatible,
+    hybrid_pair_schedule_reject_reason,
+)
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 
@@ -89,6 +93,9 @@ def _merge_input_pair_to_complex(left: Any | None, right: Any | None, *, name: s
         raise ValueError("at least one transform is required")
     anchor = left if left is not None else right
     slots = int(anchor.fhe_output_shape[-1])
+    if not hybrid_pair_schedule_compatible(left, right, int(slots)):
+        reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+        raise ValueError(f"input-pair hybrid merge requires identical schedules: {reason}")
     left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
     right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
     keys = sorted(set(int(key) for key in left_diags) | set(int(key) for key in right_diags))
@@ -200,6 +207,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.row_indices_by_pair: list[tuple[int, ...]] = []
         self.input_block_pairs: list[tuple[int, int | None]] = []
         self.pair_is_complex: list[bool] = []
+        self.hybrid_group_reject_reasons: list[str] = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons: list[str] = []
         self.rows = 0
         self.cols = 0
         self.output_rotations = 0
@@ -240,6 +251,9 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             "rows": int(self.rows),
             "cols": int(self.cols),
             "output_rotations": int(self.output_rotations),
+            "hybrid_pair_count": int(self.hybrid_pair_count),
+            "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
+            "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
             "groups": [
                 {
                     "storage_key": str(getattr(group, "_storage_key", "")),
@@ -249,6 +263,12 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                         None if self.input_block_pairs[index][1] is None else int(self.input_block_pairs[index][1]),
                     ],
                     "pair_is_complex": bool(self.pair_is_complex[index]),
+                    "complex_input_block": bool(self.pair_is_complex[index]),
+                    "hybrid_pair_reject_reason": (
+                        str(self.hybrid_group_reject_reasons[index])
+                        if index < len(self.hybrid_group_reject_reasons)
+                        else ""
+                    ),
                 }
                 for index, group in enumerate(self.groups_by_pair)
             ],
@@ -262,6 +282,9 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.rows = int(metadata.get("rows", 0))
         self.cols = int(metadata.get("cols", 0))
         self.output_rotations = int(metadata.get("output_rotations", 0))
+        self.hybrid_pair_count = int(metadata.get("hybrid_pair_count", 0))
+        self.hybrid_pair_rejected_count = int(metadata.get("hybrid_pair_rejected_count", 0))
+        self.hybrid_pair_reject_reasons = [str(value) for value in metadata.get("hybrid_pair_reject_reasons", [])]
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
         level = int(self._level(scheme))
         compile_started = time.perf_counter()
@@ -276,7 +299,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             self.groups_by_pair.append(group)
             self.row_indices_by_pair.append(row_indices)
             self.input_block_pairs.append((int(pair[0]), None if len(pair) < 2 or pair[1] is None else int(pair[1])))
-            self.pair_is_complex.append(bool(group_meta.get("pair_is_complex", False)))
+            self.pair_is_complex.append(bool(group_meta.get("complex_input_block", group_meta.get("pair_is_complex", False))))
+            self.hybrid_group_reject_reasons.append(str(group_meta.get("hybrid_pair_reject_reason", "")))
+        if "hybrid_pair_count" not in metadata:
+            self.hybrid_pair_count = int(sum(1 for value in self.pair_is_complex if bool(value)))
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
         return True
@@ -287,6 +313,11 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             return False
         if not callable(resume_enabled) or not bool(resume_enabled()):
             return False
+        # The legal hybrid schedule is only known after materializing the real
+        # transform diagonals, so speculative shell-only resume must not decide
+        # that adjacent blocks can be packed as complex inputs.
+        self._save_resume_precreated_groups_by_pair = {}
+        return False
         try:
             slots = int(scheme.params.get_slots())
             rows = int(math.ceil(int(getattr(self.module, "fhe_output_shape").numel()) / int(slots)))
@@ -352,6 +383,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         if self._compile_from_save_resume_group_cache(scheme):
             return
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
+        self.hybrid_group_reject_reasons = []
         prepare_started = time.perf_counter()
         diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
         keys = sorted((int(row), int(col)) for row, col in diagonals)
@@ -378,48 +413,117 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.last_runtime_timing["prepare_transforms_s"] = float(time.perf_counter() - prepare_started)
 
         compile_started = time.perf_counter()
-        precreated_groups = dict(self._save_resume_precreated_groups_by_pair)
+        precreated_groups = {}
         self._save_resume_precreated_groups_by_pair = {}
         for pair_index, left_col in enumerate(range(0, int(self.cols), 2)):
             right_col = int(left_col + 1)
             has_right = int(right_col) < int(self.cols)
-            entries: list[tuple[int, Any]] = []
-            for row in range(int(self.rows)):
-                left = transforms_by_row_col.get((int(row), int(left_col)))
-                right = transforms_by_row_col.get((int(row), int(right_col))) if has_right else None
-                if left is None and right is None:
-                    continue
-                transform = (
-                    _merge_input_pair_to_complex(
-                        left,
-                        right,
-                        name=f"{self.output_node_id}_input_pair_{int(left_col)}_{int(right_col)}_r{int(row)}",
+
+            def compile_entries(
+                entries: list[tuple[int, Any]],
+                *,
+                pair: tuple[int, int | None],
+                is_complex: bool,
+                reject_reason: str = "",
+            ) -> None:
+                if not entries:
+                    return
+                precreated = precreated_groups.get(int(pair_index)) if bool(is_complex) else None
+                if precreated is not None and bool(precreated[4]):
+                    group = precreated[0]
+                else:
+                    group = (
+                        precreated[0]
+                        if precreated is not None
+                        else UnifiedTransformGroup([transform for _row, transform in entries])
                     )
-                    if has_right
-                    else (left if left is not None else right)
-                )
-                entries.append((int(row), transform))
-            if not entries:
-                continue
-            precreated = precreated_groups.get(int(pair_index))
-            if precreated is not None and bool(precreated[4]):
-                group = precreated[0]
-            else:
-                group = (
-                    precreated[0]
-                    if precreated is not None
-                    else UnifiedTransformGroup([transform for _row, transform in entries])
-                )
-                group.transforms = [transform for _row, transform in entries]
-                group.compile_unified(scheme.backend)
-            self.groups_by_pair.append(group)
-            self.row_indices_by_pair.append(tuple(int(row) for row, _transform in entries))
-            self.input_block_pairs.append((int(left_col), int(right_col) if has_right else None))
-            self.pair_is_complex.append(bool(has_right))
-            for row, _transform in entries:
-                transforms_by_row_col.pop((int(row), int(left_col)), None)
-                if has_right:
+                    group.transforms = [transform for _row, transform in entries]
+                    group.compile_unified(scheme.backend)
+                self.groups_by_pair.append(group)
+                self.row_indices_by_pair.append(tuple(int(row) for row, _transform in entries))
+                self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
+                self.pair_is_complex.append(bool(is_complex))
+                self.hybrid_group_reject_reasons.append(str(reject_reason))
+
+            if has_right:
+                candidates: list[tuple[int, Any | None, Any | None]] = []
+                reject_reasons: list[str] = []
+                for row in range(int(self.rows)):
+                    left = transforms_by_row_col.get((int(row), int(left_col)))
+                    right = transforms_by_row_col.get((int(row), int(right_col)))
+                    if left is None and right is None:
+                        continue
+                    candidates.append((int(row), left, right))
+                    reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+                    if reason:
+                        reject_reasons.append(f"row={int(row)}:{reason}")
+                if not candidates:
+                    continue
+                if reject_reasons:
+                    reason = "; ".join(reject_reasons)
+                    self.hybrid_pair_rejected_count += 1
+                    self.hybrid_pair_reject_reasons.append(
+                        f"input_pair=({int(left_col)},{int(right_col)}):{reason}"
+                    )
+                    left_entries = [
+                        (int(row), left)
+                        for row, left, _right in candidates
+                        if left is not None
+                    ]
+                    right_entries = [
+                        (int(row), right)
+                        for row, _left, right in candidates
+                        if right is not None
+                    ]
+                    compile_entries(
+                        left_entries,
+                        pair=(int(left_col), None),
+                        is_complex=False,
+                        reject_reason=reason,
+                    )
+                    compile_entries(
+                        right_entries,
+                        pair=(int(right_col), None),
+                        is_complex=False,
+                        reject_reason=reason,
+                    )
+                else:
+                    entries = [
+                        (
+                            int(row),
+                            _merge_input_pair_to_complex(
+                                left,
+                                right,
+                                name=(
+                                    f"{self.output_node_id}_input_pair_"
+                                    f"{int(left_col)}_{int(right_col)}_r{int(row)}"
+                                ),
+                            ),
+                        )
+                        for row, left, right in candidates
+                    ]
+                    self.hybrid_pair_count += 1
+                    compile_entries(
+                        entries,
+                        pair=(int(left_col), int(right_col)),
+                        is_complex=True,
+                    )
+                for row, _left, _right in candidates:
+                    transforms_by_row_col.pop((int(row), int(left_col)), None)
                     transforms_by_row_col.pop((int(row), int(right_col)), None)
+            else:
+                entries = []
+                for row in range(int(self.rows)):
+                    transform = transforms_by_row_col.get((int(row), int(left_col)))
+                    if transform is not None:
+                        entries.append((int(row), transform))
+                compile_entries(
+                    entries,
+                    pair=(int(left_col), None),
+                    is_complex=False,
+                )
+                for row, _transform in entries:
+                    transforms_by_row_col.pop((int(row), int(left_col)), None)
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
 
@@ -497,6 +601,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.row_indices_by_pair = []
         self.input_block_pairs = []
         self.pair_is_complex = []
+        self.hybrid_group_reject_reasons = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
         self._bias_plaintext_cache = {}
 
 

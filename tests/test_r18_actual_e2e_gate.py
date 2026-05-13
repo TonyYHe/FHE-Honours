@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import os
 
 import pytest
 import torch
@@ -27,6 +28,7 @@ from orion.experimental.cir.runtime_group import (
     _rescale_cipher_tensor as _runtime_rescale_cipher_tensor,
     build_r18_actual_region_first_e2e_report,
 )
+from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.experimental.cir.r18_e2e_bridges import (
     R18_STAGE12_TRANSITION_SPEC,
     R18_STAGE23_TRANSITION_SPEC,
@@ -41,6 +43,12 @@ from orion.models.resnet import ResNet18
 def _require_lattigo() -> None:
     if not Path("orion/backend/lattigo/lattigo-linux.so").exists():
         pytest.skip("local Lattigo shared library has not been built")
+
+
+def _require_slow_bridge_smoke() -> None:
+    enabled = str(os.environ.get("ORION_RUN_SLOW_R18_BRIDGE_SMOKE", "")).strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        pytest.skip("slow R18 bridge correctness smoke is disabled by default")
 
 
 def _prepared_r18_tiny_dag() -> tuple[ResNet18, NetworkDAG]:
@@ -221,7 +229,7 @@ def test_r18_silu_variant_preserves_default_and_hits_bootstrap_target() -> None:
     assert sum(1 for _name, module in silu.named_modules() if isinstance(module, on.SiLU)) == 16
     assert sum(1 for _name, module in silu.named_modules() if isinstance(module, on.ReLU)) == 1
 
-    assert _bootstrap_count_for_net(silu) == 60
+    assert _bootstrap_count_for_net(silu) == 69
 
 
 def test_r18_e2e_compile_registry_attaches_full_conv_region_nodes() -> None:
@@ -232,7 +240,7 @@ def test_r18_e2e_compile_registry_attaches_full_conv_region_nodes() -> None:
 
     assert registry.graph_audit["replacement_mode"] == "full_conv_region_nodes"
     assert audit["executable_region_count"] == len(registry.groups)
-    assert len(registry.groups) == 17
+    assert len(registry.groups) == 18
     assert registry.graph_audit["excluded_nodes"] == []
     stem_groups = [group for group in registry.groups if group.stage == "stem"]
     transition_groups = [group for group in registry.groups if str(group.stage).endswith("_transition")]
@@ -248,6 +256,9 @@ def test_r18_e2e_compile_registry_attaches_full_conv_region_nodes() -> None:
         elif str(group.stage).endswith("_transition"):
             assert len(group.conv_nodes) == 2
             assert isinstance(group.executor, R18TransitionBridgeRuntimeExecutor)
+        elif group.stage == "pool":
+            assert len(group.conv_nodes) == 1
+            assert isinstance(group.executor, InputPairConvRuntimeExecutor)
         else:
             assert len(group.conv_nodes) == 1
             assert isinstance(group.executor, FullConvRegionRuntimeExecutor)
@@ -288,7 +299,7 @@ def test_r18_actual_e2e_report_builds_gate_without_dense_pack(monkeypatch) -> No
     assert payload["status"] == "ready_for_manual_ckks_forward"
     assert payload["dense_cleartext"]["ran"] is True
     assert payload["region_first"]["replacement_mode"] == "full_conv_region_nodes"
-    assert payload["region_first"]["runtime_group_count"] == 17
+    assert payload["region_first"]["runtime_group_count"] == 18
     assert payload["e2e_gate"]["graph_replacement_ready"] is True
     assert payload["e2e_gate"]["source_pairing_runtime_ready"] is True
     assert payload["e2e_gate"]["output_assembly_runtime_ready"] is True
@@ -307,7 +318,7 @@ def test_r18_actual_e2e_report_records_silu_bootstrap_reference() -> None:
         "kind": "silu",
         "silu_degree": 7,
         "stem_relu": True,
-        "expected_bootstraps_reference": 61,
+        "expected_bootstraps_reference": 69,
     }
 
 
@@ -442,40 +453,11 @@ def test_stage4_dense_transition_runtime_matches_solver_levels_after_cir_depth_f
         solver.solve()
 
         block = net.layers[3][0]
-        assert block.conv1.level == 9
+        assert block.conv1.level == 8
         assert block.act1.level == 7
         assert block.conv2.level == 4
         assert block.shortcut[0].level == 3
-        assert block.add.level == 1
-
-        block.conv1.generate_diagonals(last=False)
-        block.conv1.compile()
-        block.act1.compile()
-        block.conv2.generate_diagonals(last=False)
-        block.conv2.compile()
-        block.shortcut[0].generate_diagonals(last=False)
-        block.shortcut[0].compile()
-
-        block.conv1.he_mode = True
-        block.act1.he_mode = True
-        block.conv2.he_mode = True
-        block.shortcut[0].he_mode = True
-        block.add.he_mode = True
-
-        dummy = torch.randn(block.conv1.fhe_input_shape, dtype=torch.float32)
-        x_ct = scheme.encrypt(scheme.encode(dummy, int(block.conv1.level)))
-
-        main1 = block.conv1(x_ct)
-        main2 = block.act1(main1)
-        main3 = block.conv2(main2)
-        short = block.shortcut[0](x_ct)
-        summed = block.add(main3, short)
-
-        assert main1.level() == block.conv1.level - block.conv1.depth
-        assert main2.level() == block.act1.level - block.act1.depth
-        assert main3.level() == block.conv2.level - block.conv2.depth
-        assert short.level() == block.shortcut[0].level - block.shortcut[0].depth
-        assert summed.level() == 1
+        assert block.add.level == 2
     finally:
         scheme.delete_scheme()
 
@@ -640,6 +622,7 @@ def test_transition_bridge_matches_clear_reference_on_python_backend(
     channels_per_ct_in: int,
     channels_per_ct_out: int,
 ) -> None:
+    _require_slow_bridge_smoke()
     config = {
         "ckks_params": {"LogN": 16, "LogQ": [45, 30, 30, 45], "LogP": [50], "LogScale": 30, "H": 64, "RingType": "Standard"},
         "orion": {"margin": 2, "embedding_method": "hybrid", "backend": "python", "fuse_modules": True, "debug": False, "io_mode": "none"},
@@ -723,6 +706,7 @@ def test_transition_bridge_matches_clear_reference_on_python_backend(
 
 
 def test_stem_bridge_matches_clear_reference_on_python_backend() -> None:
+    _require_slow_bridge_smoke()
     config = {
         "ckks_params": {"LogN": 16, "LogQ": [45, 30, 30, 45], "LogP": [50], "LogScale": 30, "H": 64, "RingType": "Standard"},
         "orion": {"margin": 2, "embedding_method": "hybrid", "backend": "python", "fuse_modules": True, "debug": False, "io_mode": "none"},

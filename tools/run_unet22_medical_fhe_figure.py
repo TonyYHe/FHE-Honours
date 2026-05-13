@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -184,6 +185,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "io_dir": None if args.io_dir is None else str(Path(args.io_dir)),
         "sample_index": int(args.sample_index),
         "sample_count": int(args.sample_count),
+        "bootstrap_margin_override": None if args.bootstrap_margin is None else float(args.bootstrap_margin),
         "out_dir": str(out_dir),
     }
     payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -271,94 +273,173 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     payload["config"] = config
     started = time.perf_counter()
-    scheme.init_scheme(config)
+    previous_bootstrap_margin = os.environ.get("ORION_BOOTSTRAP_MARGIN_OVERRIDE")
+    if args.bootstrap_margin is not None:
+        os.environ["ORION_BOOTSTRAP_MARGIN_OVERRIDE"] = str(float(args.bootstrap_margin))
     try:
-        fit_image = rendered_samples[0]["image"]
-        scheme.fit(model, fit_image)
-        input_level = scheme.compile(model)
-        model.he()
-        total_forward_s = 0.0
-        for sample in rendered_samples:
-            image = sample["image"]
-            mask = sample["mask"]
-            clear = sample["clear"]
-            actual_index = int(sample["row"]["actual_dataset_index"])
-            x_ct = scheme.encrypt(scheme.encode(image, int(input_level)))
-            forward_started = time.perf_counter()
-            out_ct = model(x_ct)
-            forward_s = float(time.perf_counter() - forward_started)
-            total_forward_s += float(forward_s)
-            decoded = out_ct.decrypt().decode().detach().cpu()
-            if torch.is_complex(decoded):
-                decoded = decoded.real
-            decoded = decoded.to(dtype=torch.float32)
-            fhe_img = _mask_image(decoded, from_logits=True)
-            fhe_path = out_dir / f"{dataset}_sample{actual_index}_fhe_pred.png"
-            fhe_img.save(fhe_path)
-            panel_path = out_dir / f"{dataset}_sample{actual_index}_ref_vs_pytorch_vs_fhe.png"
-            _save_panel(
-                panel_path,
-                [
-                    ("Input", sample["input_img"]),
-                    ("Reference", sample["mask_img"]),
-                    ("PyTorch", sample["pred_img"]),
-                    ("FHE", fhe_img),
-                ],
-            )
-            sample["row"]["fhe_decoded_shape"] = [int(v) for v in decoded.shape]
-            sample["row"]["fhe_vs_pytorch_logits"] = _metrics(clear, decoded)
-            sample["row"]["fhe_vs_reference"] = _segmentation_metrics(decoded, mask, from_logits=True)
-            sample["row"]["timing_s"] = {"he_forward": float(forward_s)}
-            sample["row"]["artifacts"]["fhe_pred"] = str(fhe_path)
-            sample["row"]["artifacts"]["panel"] = str(panel_path)
-            for tensor in (out_ct, x_ct):
-                release = getattr(tensor, "release", None)
-                if callable(release):
-                    release()
-            backend = getattr(scheme, "backend", None)
-            if backend is not None:
-                trim_runtime_memory(backend, reason=f"after_unet22_medical_sample_{actual_index}")
+        scheme.init_scheme(config)
+        try:
+            fit_image = rendered_samples[0]["image"]
             payload.update(
                 {
-                    "status": "running_fhe",
-                    "input_level": int(input_level),
-                    "timing_s": {
-                        "total_so_far": float(time.perf_counter() - started),
-                        "he_forward_total_so_far": float(total_forward_s),
-                    },
-                    "samples": [dict(item["row"]) for item in rendered_samples],
+                    "status": "fitting_ranges",
+                    "timing_s": {"total_so_far": float(time.perf_counter() - started)},
                 }
             )
             payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            print(
-                json.dumps(
-                    {
-                        "event": "sample_done",
-                        "dataset": str(dataset),
-                        "actual_dataset_index": int(actual_index),
-                        "he_forward_s": float(forward_s),
-                        "fhe_vs_reference": sample["row"]["fhe_vs_reference"],
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
+            scheme.fit(model, fit_image)
+            payload.update(
+                {
+                    "status": "compiling_network",
+                    "timing_s": {"total_so_far": float(time.perf_counter() - started)},
+                }
             )
-        payload.update(
-            {
-                "status": "ok",
-                "input_level": int(input_level),
-                "timing_s": {
-                    "total": float(time.perf_counter() - started),
-                    "he_forward_total": float(total_forward_s),
-                },
-                "samples": [dict(sample["row"]) for sample in rendered_samples],
-            }
-        )
+            payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            input_level = scheme.compile(model)
+            payload.update(
+                {
+                    "status": "compiled_network",
+                    "input_level": int(input_level),
+                    "timing_s": {"total_so_far": float(time.perf_counter() - started)},
+                }
+            )
+            payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            payload.update(
+                {
+                    "status": "materializing_he_model",
+                    "timing_s": {"total_so_far": float(time.perf_counter() - started)},
+                }
+            )
+            payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            model.he()
+            payload.update(
+                {
+                    "status": "he_model_ready",
+                    "timing_s": {"total_so_far": float(time.perf_counter() - started)},
+                }
+            )
+            payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            total_forward_s = 0.0
+            for sample in rendered_samples:
+                image = sample["image"]
+                mask = sample["mask"]
+                clear = sample["clear"]
+                actual_index = int(sample["row"]["actual_dataset_index"])
+                payload.update(
+                    {
+                        "status": "encrypting_sample",
+                        "current_sample_actual_index": int(actual_index),
+                        "timing_s": {
+                            "total_so_far": float(time.perf_counter() - started),
+                            "he_forward_total_so_far": float(total_forward_s),
+                        },
+                    }
+                )
+                payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                x_ct = scheme.encrypt(scheme.encode(image, int(input_level)))
+                payload.update(
+                    {
+                        "status": "forwarding_fhe_sample",
+                        "current_sample_actual_index": int(actual_index),
+                        "timing_s": {
+                            "total_so_far": float(time.perf_counter() - started),
+                            "he_forward_total_so_far": float(total_forward_s),
+                        },
+                    }
+                )
+                payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                forward_started = time.perf_counter()
+                out_ct = model(x_ct)
+                forward_s = float(time.perf_counter() - forward_started)
+                total_forward_s += float(forward_s)
+                payload.update(
+                    {
+                        "status": "decrypting_sample",
+                        "current_sample_actual_index": int(actual_index),
+                        "timing_s": {
+                            "total_so_far": float(time.perf_counter() - started),
+                            "he_forward_total_so_far": float(total_forward_s),
+                        },
+                    }
+                )
+                payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                decoded = out_ct.decrypt().decode().detach().cpu()
+                if torch.is_complex(decoded):
+                    decoded = decoded.real
+                decoded = decoded.to(dtype=torch.float32)
+                fhe_img = _mask_image(decoded, from_logits=True)
+                fhe_path = out_dir / f"{dataset}_sample{actual_index}_fhe_pred.png"
+                fhe_img.save(fhe_path)
+                panel_path = out_dir / f"{dataset}_sample{actual_index}_ref_vs_pytorch_vs_fhe.png"
+                _save_panel(
+                    panel_path,
+                    [
+                        ("Input", sample["input_img"]),
+                        ("Reference", sample["mask_img"]),
+                        ("PyTorch", sample["pred_img"]),
+                        ("FHE", fhe_img),
+                    ],
+                )
+                sample["row"]["fhe_decoded_shape"] = [int(v) for v in decoded.shape]
+                sample["row"]["fhe_vs_pytorch_logits"] = _metrics(clear, decoded)
+                sample["row"]["fhe_vs_reference"] = _segmentation_metrics(decoded, mask, from_logits=True)
+                sample["row"]["timing_s"] = {"he_forward": float(forward_s)}
+                sample["row"]["artifacts"]["fhe_pred"] = str(fhe_path)
+                sample["row"]["artifacts"]["panel"] = str(panel_path)
+                for tensor in (out_ct, x_ct):
+                    release = getattr(tensor, "release", None)
+                    if callable(release):
+                        release()
+                backend = getattr(scheme, "backend", None)
+                if backend is not None:
+                    trim_runtime_memory(backend, reason=f"after_unet22_medical_sample_{actual_index}")
+                payload.update(
+                    {
+                        "status": "running_fhe",
+                        "input_level": int(input_level),
+                        "timing_s": {
+                            "total_so_far": float(time.perf_counter() - started),
+                            "he_forward_total_so_far": float(total_forward_s),
+                        },
+                        "samples": [dict(item["row"]) for item in rendered_samples],
+                    }
+                )
+                payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                print(
+                    json.dumps(
+                        {
+                            "event": "sample_done",
+                            "dataset": str(dataset),
+                            "actual_dataset_index": int(actual_index),
+                            "he_forward_s": float(forward_s),
+                            "fhe_vs_reference": sample["row"]["fhe_vs_reference"],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            payload.update(
+                {
+                    "status": "ok",
+                    "input_level": int(input_level),
+                    "timing_s": {
+                        "total": float(time.perf_counter() - started),
+                        "he_forward_total": float(total_forward_s),
+                    },
+                    "samples": [dict(sample["row"]) for sample in rendered_samples],
+                }
+            )
+        finally:
+            backend = getattr(scheme, "backend", None)
+            if backend is not None:
+                trim_runtime_memory(backend, reason="after_unet22_medical_fhe_figure")
+            scheme.delete_scheme()
     finally:
-        backend = getattr(scheme, "backend", None)
-        if backend is not None:
-            trim_runtime_memory(backend, reason="after_unet22_medical_fhe_figure")
-        scheme.delete_scheme()
+        if args.bootstrap_margin is not None:
+            if previous_bootstrap_margin is None:
+                os.environ.pop("ORION_BOOTSTRAP_MARGIN_OVERRIDE", None)
+            else:
+                os.environ["ORION_BOOTSTRAP_MARGIN_OVERRIDE"] = previous_bootstrap_margin
     payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
 
@@ -378,6 +459,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider-mode", default=None)
     parser.add_argument("--io-mode", choices=("none", "save", "load"), default="none")
     parser.add_argument("--io-dir", type=Path, default=None)
+    parser.add_argument("--bootstrap-margin", type=float, default=None)
     parser.add_argument("--skip-fhe", action="store_true")
     return parser.parse_args()
 

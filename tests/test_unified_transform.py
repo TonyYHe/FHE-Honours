@@ -10,6 +10,12 @@ import torch
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core.orion import scheme
+from orion.experimental.cir.hybrid_schedule import (
+    hybrid_pair_schedule_compatible,
+    hybrid_schedule_signature,
+    mark_hybrid_schedule_padding_allowed,
+    pad_hybrid_pair_to_common_schedule,
+)
 from orion.nn import unified_transform as unified_transform_module
 from orion.nn.unified_transform import UnifiedTransformGroup, can_use_unified_bsgs
 
@@ -242,6 +248,44 @@ def _fake_transform(
             )
         ),
     )
+
+
+def test_hybrid_schedule_signature_normalizes_diagonal_keys_mod_slots() -> None:
+    transform = _fake_transform({-1: [1.0], 9: [2.0], 2: [3.0]})
+
+    signature = hybrid_schedule_signature(transform, slots=8)
+
+    assert signature.slots == 8
+    assert signature.normalized_diagonal_keys == (1, 2, 7)
+
+
+def test_hybrid_pair_schedule_compatibility_requires_matching_support() -> None:
+    left = _fake_transform({0: [1.0], 3: [2.0], 9: [3.0]})
+    same = _fake_transform({0: [4.0], 1: [5.0], 3: [6.0]})
+    different = _fake_transform({0: [1.0], 2: [2.0]})
+
+    assert hybrid_pair_schedule_compatible(left, same, slots=8) is True
+    assert hybrid_pair_schedule_compatible(left, different, slots=8) is False
+    assert hybrid_pair_schedule_compatible(left, None, slots=8) is False
+    assert hybrid_pair_schedule_compatible(None, same, slots=8) is False
+
+
+def test_hybrid_schedule_padding_is_explicit_and_family_scoped() -> None:
+    left = _fake_transform({0: torch.ones(8)})
+    right = _fake_transform({1: torch.ones(8)})
+
+    unpadded_left, unpadded_right, reason = pad_hybrid_pair_to_common_schedule(left, right, 8, name="unmarked")
+    assert reason == ""
+    assert hybrid_pair_schedule_compatible(unpadded_left, unpadded_right, slots=8) is False
+
+    mark_hybrid_schedule_padding_allowed(left, family="same_tile_family")
+    mark_hybrid_schedule_padding_allowed(right, family="same_tile_family")
+    padded_left, padded_right, reason = pad_hybrid_pair_to_common_schedule(left, right, 8, name="marked")
+
+    assert reason.startswith("schedule_padded(")
+    assert hybrid_pair_schedule_compatible(padded_left, padded_right, slots=8) is True
+    assert sorted(padded_left.diagonals[(0, 0)]) == [0, 1]
+    assert sorted(padded_right.diagonals[(0, 0)]) == [0, 1]
 
 
 def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> None:
@@ -504,7 +548,9 @@ def test_memory_bounded_load_streams_compile_to_match_saved_payload_layout(tmp_p
     ]
 
 
-def test_save_resume_reuses_complete_unified_group(tmp_path) -> None:
+def test_save_resume_reuses_complete_unified_group(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "2")
+    monkeypatch.setenv("ORION_UNIFIED_STREAM_COMPILE_BATCH_BYTES", "0")
     diags_path = tmp_path / "unified_diagonals.h5"
     save_transforms = (
         _fake_transform(

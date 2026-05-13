@@ -623,10 +623,12 @@ def _compact_stage4_source_from_regular(source: torch.Tensor) -> torch.Tensor:
 
 def _compiled_rotation_key_count(group: Any, backend: Any) -> int:
     transform_ids = getattr(group, "unified_ids", None) or ()
+    backend_module = str(type(backend).__module__)
+    identity_keys = {0, 1} if "orion.backend.lattigo" in backend_module else {0}
     keys: set[int] = set()
     for transform_id in transform_ids:
         for key in backend.GetLinearTransformRotationKeys(int(transform_id)):
-            if int(key) != 0:
+            if int(key) not in identity_keys:
                 keys.add(int(key))
     return int(len(keys))
 

@@ -17,6 +17,9 @@ class PlainTensor:
 
     def release(self):
         if 'sys' in globals() and sys.modules and self.scheme:
+            if getattr(self.scheme, "backend", None) is not self.backend:
+                self.ids = []
+                return
             try:
                 for idx in self.ids:
                     self.backend.DeletePlaintext(idx)
@@ -100,6 +103,9 @@ class CipherTensor:
 
     def release(self):
         if 'sys' in globals() and sys.modules and self.scheme:
+            if getattr(self.scheme, "backend", None) is not self.backend:
+                self.ids = []
+                return
             try:
                 for idx in self.ids:
                     self.backend.DeleteCiphertext(idx)

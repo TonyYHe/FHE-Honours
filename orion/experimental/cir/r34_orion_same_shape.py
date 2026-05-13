@@ -11,6 +11,12 @@ import torch.nn.functional as F
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core import packing
+from orion.experimental.cir.hybrid_schedule import (
+    hybrid_pair_schedule_compatible,
+    hybrid_pair_schedule_reject_reason,
+    mark_hybrid_schedule_padding_allowed,
+    pad_hybrid_pair_to_common_schedule,
+)
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 try:
@@ -1165,12 +1171,23 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
         self.target_indices_by_input_block: list[tuple[int, ...]] = []
         self.input_block_pairs: list[tuple[int, int | None]] = []
         self.complex_input_block_flags: list[bool] = []
+        self.hybrid_group_reject_reasons: list[str] = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons: list[str] = []
+        self.hybrid_pair_schedule_padded_count = 0
+        self.hybrid_pair_schedule_pad_reasons: list[str] = []
 
     def compile_cache_metadata(self) -> dict[str, Any]:
         return {
             "kind": type(self).__name__,
             "rows": int(self.rows),
             "cols": int(self.cols),
+            "hybrid_pair_count": int(self.hybrid_pair_count),
+            "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
+            "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
+            "hybrid_pair_schedule_padded_count": int(self.hybrid_pair_schedule_padded_count),
+            "hybrid_pair_schedule_pad_reasons": [str(value) for value in self.hybrid_pair_schedule_pad_reasons],
             "groups_by_input_block": [
                 {
                     "storage_key": str(getattr(group, "_storage_key", "")),
@@ -1183,6 +1200,11 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                         None if self.input_block_pairs[index][1] is None else int(self.input_block_pairs[index][1]),
                     ],
                     "complex_input_block": bool(self.complex_input_block_flags[index]),
+                    "hybrid_pair_reject_reason": (
+                        str(self.hybrid_group_reject_reasons[index])
+                        if index < len(self.hybrid_group_reject_reasons)
+                        else ""
+                    ),
                 }
                 for index, group in enumerate(self.groups_by_input_block)
             ],
@@ -1201,6 +1223,13 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
         }
         self.rows = int(metadata.get("rows", 0))
         self.cols = int(metadata.get("cols", 0))
+        self.hybrid_pair_count = int(metadata.get("hybrid_pair_count", 0))
+        self.hybrid_pair_rejected_count = int(metadata.get("hybrid_pair_rejected_count", 0))
+        self.hybrid_pair_reject_reasons = [str(value) for value in metadata.get("hybrid_pair_reject_reasons", [])]
+        self.hybrid_pair_schedule_padded_count = int(metadata.get("hybrid_pair_schedule_padded_count", 0))
+        self.hybrid_pair_schedule_pad_reasons = [
+            str(value) for value in metadata.get("hybrid_pair_schedule_pad_reasons", [])
+        ]
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
         self.bias_plaintexts = self._compile_bias_plaintexts(scheme, extra_depth=0)
         level = int(self._level(scheme))
@@ -1217,6 +1246,9 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
             self.target_indices_by_input_block.append(target_indices)
             self.input_block_pairs.append((int(pair[0]), None if len(pair) < 2 or pair[1] is None else int(pair[1])))
             self.complex_input_block_flags.append(bool(group_meta.get("complex_input_block", False)))
+            self.hybrid_group_reject_reasons.append(str(group_meta.get("hybrid_pair_reject_reason", "")))
+        if "hybrid_pair_count" not in metadata:
+            self.hybrid_pair_count = int(sum(1 for value in self.complex_input_block_flags if bool(value)))
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
         return True
@@ -1239,6 +1271,12 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
         self.rows = int(len(plan.output_regions))
         self.bias_plaintexts = self._compile_bias_plaintexts(scheme, extra_depth=0)
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
+        self.hybrid_pair_schedule_padded_count = 0
+        self.hybrid_pair_schedule_pad_reasons = []
+        self.hybrid_group_reject_reasons = []
 
         level = self._level(scheme)
         prepare_transforms_started = time.time()
@@ -1258,16 +1296,41 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
             for family in plan.family_templates
             for entry in family.template_entries
         }
+        schedule_family = f"r34_same_shape:{self.spec.family_label}:{self.spec.policy}"
+
+        def mark_schedule_padding(transform: Any | None) -> Any | None:
+            return mark_hybrid_schedule_padding_allowed(transform, family=str(schedule_family))
+
+        def compile_entries(
+            entries: list[tuple[int, Any]],
+            *,
+            pair: tuple[int, int | None],
+            is_complex: bool,
+            reject_reason: str = "",
+        ) -> None:
+            if not entries:
+                return
+            ordered = sorted(entries, key=lambda item: int(item[0]))
+            group = UnifiedTransformGroup([transform for _target_index, transform in ordered])
+            group.compile_unified(scheme.backend)
+            self.groups_by_input_block.append(group)
+            self.target_indices_by_input_block.append(tuple(int(target_index) for target_index, _transform in ordered))
+            self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
+            self.complex_input_block_flags.append(bool(is_complex))
+            self.hybrid_group_reject_reasons.append(str(reject_reason))
+
         for left_input_index in range(0, int(self.cols), 2):
             right_input_index = int(left_input_index + 1)
             has_right = int(right_input_index) < int(self.cols)
-            entries: list[tuple[int, Any]] = []
             if has_right:
+                candidates: list[tuple[int, Any | None, Any | None]] = []
+                reject_reasons: list[str] = []
+                pair_pad_reasons: list[str] = []
                 for target_index in range(int(self.rows)):
                     by_input = steps_by_target_and_input.get(int(target_index), {})
                     left_step = by_input.get(int(left_input_index))
                     right_step = by_input.get(int(right_input_index))
-                    left_transform = (
+                    left_transform = mark_schedule_padding(
                         None
                         if left_step is None
                         else _transform_from_plan_step(
@@ -1280,7 +1343,7 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                             template_by_id=template_by_id,
                         )
                     )
-                    right_transform = (
+                    right_transform = mark_schedule_padding(
                         None
                         if right_step is None
                         else _transform_from_plan_step(
@@ -1295,7 +1358,51 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                     )
                     if left_transform is None and right_transform is None:
                         continue
-                    entries.append(
+                    left_transform, right_transform, pad_reason = pad_hybrid_pair_to_common_schedule(
+                        left_transform,
+                        right_transform,
+                        int(self.slots),
+                        name=(
+                            f"{self.output_node_id}_hybrid_pair_"
+                            f"{int(left_input_index)}_{int(right_input_index)}_t{int(target_index)}"
+                        ),
+                    )
+                    if pad_reason:
+                        pair_pad_reasons.append(f"target={int(target_index)}:{pad_reason}")
+                    candidates.append((int(target_index), left_transform, right_transform))
+                    reason = hybrid_pair_schedule_reject_reason(left_transform, right_transform, int(self.slots))
+                    if reason:
+                        reject_reasons.append(f"target={int(target_index)}:{reason}")
+                if not candidates:
+                    continue
+                if reject_reasons:
+                    reason = "; ".join(reject_reasons)
+                    self.hybrid_pair_rejected_count += 1
+                    self.hybrid_pair_reject_reasons.append(
+                        f"input_pair=({int(left_input_index)},{int(right_input_index)}):{reason}"
+                    )
+                    compile_entries(
+                        [
+                            (int(target_index), left_transform)
+                            for target_index, left_transform, _right_transform in candidates
+                            if left_transform is not None
+                        ],
+                        pair=(int(left_input_index), None),
+                        is_complex=False,
+                        reject_reason=reason,
+                    )
+                    compile_entries(
+                        [
+                            (int(target_index), right_transform)
+                            for target_index, _left_transform, right_transform in candidates
+                            if right_transform is not None
+                        ],
+                        pair=(int(right_input_index), None),
+                        is_complex=False,
+                        reject_reason=reason,
+                    )
+                else:
+                    entries = [
                         (
                             int(target_index),
                             _merge_optional_dense_block_transforms_to_complex(
@@ -1308,10 +1415,22 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                                 real_lane_output_scale=0.5,
                             ),
                         )
+                        for target_index, left_transform, right_transform in candidates
+                    ]
+                    self.hybrid_pair_count += 1
+                    if pair_pad_reasons:
+                        self.hybrid_pair_schedule_padded_count += 1
+                        self.hybrid_pair_schedule_pad_reasons.append(
+                            f"input_pair=({int(left_input_index)},{int(right_input_index)}):"
+                            + "; ".join(pair_pad_reasons)
+                        )
+                    compile_entries(
+                        entries,
+                        pair=(int(left_input_index), int(right_input_index)),
+                        is_complex=True,
                     )
-                is_complex = True
-                pair = (int(left_input_index), int(right_input_index))
             else:
+                entries: list[tuple[int, Any]] = []
                 for target_index in range(int(self.rows)):
                     step = steps_by_target_and_input.get(int(target_index), {}).get(int(left_input_index))
                     transform = (
@@ -1329,16 +1448,11 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                     )
                     if transform is not None:
                         entries.append((int(target_index), transform))
-                is_complex = False
-                pair = (int(left_input_index), None)
-            if entries:
-                ordered = sorted(entries, key=lambda item: int(item[0]))
-                group = UnifiedTransformGroup([transform for _target_index, transform in ordered])
-                group.compile_unified(scheme.backend)
-                self.groups_by_input_block.append(group)
-                self.target_indices_by_input_block.append(tuple(int(target_index) for target_index, _transform in ordered))
-                self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
-                self.complex_input_block_flags.append(bool(is_complex))
+                compile_entries(
+                    entries,
+                    pair=(int(left_input_index), None),
+                    is_complex=False,
+                )
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
 
@@ -1376,6 +1490,10 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
                     torch.Size([1, int(self.slots)]),
                 )
                 partial = _rescale_cipher_tensor(partial)
+                if bool(self.complex_input_block_flags[int(block_index)]):
+                    conj = partial.conjugate(in_place=False)
+                    partial, conj = _align_ciphertexts_for_add(partial, conj)
+                    partial = partial.add(conj, in_place=True)
                 if output_blocks[int(target_index)] is None:
                     output_blocks[int(target_index)] = partial
                 else:
@@ -1385,15 +1503,10 @@ class R34InterGroupHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecut
 
         postprocess_started = time.time()
         output_ids: list[int] = []
-        needs_real_lane_extract = any(bool(value) for value in self.complex_input_block_flags)
         for block_index, block_ct in enumerate(output_blocks):
             if block_ct is None:
                 raise RuntimeError(f"missing same-shape output block {block_index} for {self.output_node_id}")
             output_blocks[int(block_index)] = None
-            if bool(needs_real_lane_extract):
-                conj = block_ct.conjugate(in_place=False)
-                block_ct, conj = _align_ciphertexts_for_add(block_ct, conj)
-                block_ct = block_ct.add(conj, in_place=True)
             block_ct = self._add_bias(block_ct, block_index=int(block_index))
             _maybe_set_default_scale(block_ct)
             output_ids.append(int(block_ct.ids[0]))
@@ -1419,6 +1532,14 @@ class R34Pack2SameShapeRuntimeExecutor:
         self.spec = spec
         self.output_node_id = str(output_node_id)
         self.group: Any | None = None
+        self.groups_by_input_block: list[Any] = []
+        self.target_indices_by_input_block: list[tuple[int, ...]] = []
+        self.input_block_pairs: list[tuple[int, int | None]] = []
+        self.complex_input_block_flags: list[bool] = []
+        self.hybrid_group_reject_reasons: list[str] = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons: list[str] = []
         self.target_indices: tuple[int, ...] = ()
         self.bias_vector: torch.Tensor | None = None
         self.bias_plaintexts: dict[int, Any | None] = {}
@@ -1512,6 +1633,29 @@ class R34Pack2SameShapeRuntimeExecutor:
             "cols": int(self.cols),
             "storage_key": "" if self.group is None else str(getattr(self.group, "_storage_key", "")),
             "target_indices": [int(value) for value in self.target_indices],
+            "hybrid_pair_count": int(self.hybrid_pair_count),
+            "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
+            "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
+            "groups_by_input_block": [
+                {
+                    "storage_key": str(getattr(group, "_storage_key", "")),
+                    "target_indices": [
+                        int(value)
+                        for value in self.target_indices_by_input_block[index]
+                    ],
+                    "input_block_pair": [
+                        int(self.input_block_pairs[index][0]),
+                        None if self.input_block_pairs[index][1] is None else int(self.input_block_pairs[index][1]),
+                    ],
+                    "complex_input_block": bool(self.complex_input_block_flags[index]),
+                    "hybrid_pair_reject_reason": (
+                        str(self.hybrid_group_reject_reasons[index])
+                        if index < len(self.hybrid_group_reject_reasons)
+                        else ""
+                    ),
+                }
+                for index, group in enumerate(self.groups_by_input_block)
+            ],
         }
 
     def _compile_from_cache_metadata(self, scheme: Any) -> bool:
@@ -1528,15 +1672,47 @@ class R34Pack2SameShapeRuntimeExecutor:
         self.rows = int(metadata.get("rows", 0))
         self.cols = int(metadata.get("cols", 2))
         self.target_indices = tuple(int(value) for value in metadata.get("target_indices", []))
+        self.hybrid_pair_count = int(metadata.get("hybrid_pair_count", 0))
+        self.hybrid_pair_rejected_count = int(metadata.get("hybrid_pair_rejected_count", 0))
+        self.hybrid_pair_reject_reasons = [str(value) for value in metadata.get("hybrid_pair_reject_reasons", [])]
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
         self.bias_plaintexts = self._compile_bias_plaintexts(scheme)
         level = int(self._level(scheme))
         compile_started = time.time()
-        self.group = UnifiedTransformGroup(
-            [_cached_transform_shell(level=int(level), scheme=scheme) for _target in self.target_indices]
-        )
-        self.group._storage_key = str(metadata["storage_key"])
-        self.group.compile_unified(scheme.backend)
+        group_rows = list(metadata.get("groups_by_input_block", []))
+        if not group_rows:
+            group_rows = [
+                {
+                    "storage_key": str(metadata["storage_key"]),
+                    "target_indices": [int(value) for value in self.target_indices],
+                    "input_block_pair": [0, 1],
+                    "complex_input_block": True,
+                    "hybrid_pair_reject_reason": "",
+                }
+            ]
+        self.groups_by_input_block = []
+        self.target_indices_by_input_block = []
+        self.input_block_pairs = []
+        self.complex_input_block_flags = []
+        self.hybrid_group_reject_reasons = []
+        for group_meta in group_rows:
+            target_indices = tuple(int(value) for value in group_meta.get("target_indices", []))
+            if not target_indices:
+                continue
+            group = UnifiedTransformGroup(
+                [_cached_transform_shell(level=int(level), scheme=scheme) for _target in target_indices]
+            )
+            group._storage_key = str(group_meta["storage_key"])
+            group.compile_unified(scheme.backend)
+            pair = list(group_meta.get("input_block_pair", []))
+            self.groups_by_input_block.append(group)
+            self.target_indices_by_input_block.append(target_indices)
+            self.input_block_pairs.append((int(pair[0]), None if len(pair) < 2 or pair[1] is None else int(pair[1])))
+            self.complex_input_block_flags.append(bool(group_meta.get("complex_input_block", False)))
+            self.hybrid_group_reject_reasons.append(str(group_meta.get("hybrid_pair_reject_reason", "")))
+        self.group = self.groups_by_input_block[0] if self.groups_by_input_block else None
+        if "hybrid_pair_count" not in metadata:
+            self.hybrid_pair_count = int(sum(1 for value in self.complex_input_block_flags if bool(value)))
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
         return True
@@ -1563,8 +1739,39 @@ class R34Pack2SameShapeRuntimeExecutor:
             complex_diag_scale=0.5,
         )
         self.target_indices = tuple(int(v) for v in assets["prototype"]["target_indices"])
+        prototype_transforms = list(assets["prototype"]["transforms"])
+        reject_reasons = [str(value) for value in assets.get("hybrid_pair_reject_reasons", ())]
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
+        self.hybrid_group_reject_reasons = []
+        self.groups_by_input_block = []
+        self.target_indices_by_input_block = []
+        self.input_block_pairs = []
+        self.complex_input_block_flags = []
+        if prototype_transforms:
+            self.hybrid_pair_count = 1
+            group_specs = [
+                ((0, 1), True, self.target_indices, prototype_transforms, "")
+            ]
+        else:
+            reason = "; ".join(reject_reasons)
+            if reject_reasons:
+                self.hybrid_pair_rejected_count = 1
+                self.hybrid_pair_reject_reasons = [f"input_pair=(0,1):{reason}"]
+            baseline_groups = dict(assets["baseline_groups"])
+            target_set: set[int] = set()
+            group_specs = []
+            for input_index in (0, 1):
+                payload = baseline_groups.get(int(input_index), {})
+                target_indices = tuple(int(value) for value in payload.get("target_indices", ()))
+                transforms = list(payload.get("transforms", ()))
+                if not transforms:
+                    continue
+                target_set.update(int(value) for value in target_indices)
+                group_specs.append(((int(input_index), None), False, target_indices, transforms, reason))
+            self.target_indices = tuple(sorted(target_set))
         self.rows = int(len(self.target_indices))
-        transforms = list(assets["prototype"]["transforms"])
         self.last_runtime_timing = {
             "prepare_plans_s": 0.0,
             "prepare_transforms_s": float(time.time() - prepare_started),
@@ -1575,8 +1782,15 @@ class R34Pack2SameShapeRuntimeExecutor:
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
         self.bias_plaintexts = self._compile_bias_plaintexts(scheme)
         compile_started = time.time()
-        self.group = UnifiedTransformGroup(transforms)
-        self.group.compile_unified(scheme.backend)
+        for pair, is_complex, target_indices, transforms, reject_reason in group_specs:
+            group = UnifiedTransformGroup(transforms)
+            group.compile_unified(scheme.backend)
+            self.groups_by_input_block.append(group)
+            self.target_indices_by_input_block.append(tuple(int(value) for value in target_indices))
+            self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
+            self.complex_input_block_flags.append(bool(is_complex))
+            self.hybrid_group_reject_reasons.append(str(reject_reason))
+        self.group = self.groups_by_input_block[0] if self.groups_by_input_block else None
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
 
@@ -1591,34 +1805,47 @@ class R34Pack2SameShapeRuntimeExecutor:
         }
         self.compile(scheme)
         ids = tuple(int(v) for v in getattr(source_ct, "ids", ()))
-        if len(ids) < 2:
-            raise RuntimeError(f"{self.output_node_id} pack2 runtime requires 2 source ciphertext blocks, got {len(ids)}")
-        imag_id = scheme.evaluator.mul_imaginary_unit(int(ids[1]), +1, False)
-        complex_id = scheme.evaluator.add_ciphertext(int(ids[0]), int(imag_id), False)
-        complex_source = CipherTensor(
-            scheme,
-            [int(complex_id)],
-            torch.Size([1, int(self.slots)]),
-            torch.Size([1, int(self.slots)]),
-        )
+        if len(ids) < int(self.cols):
+            raise RuntimeError(f"{self.output_node_id} pack2 runtime requires {self.cols} source ciphertext blocks, got {len(ids)}")
         evaluate_started = time.time()
-        assert self.group is not None
-        output_ids = self.group.evaluate_unified(int(complex_source.ids[0]), scheme.backend)
+        if not self.groups_by_input_block:
+            raise RuntimeError(f"{self.output_node_id} pack2 runtime was not compiled")
+        output_blocks: dict[int, Any] = {}
+        for group_index, group in enumerate(self.groups_by_input_block):
+            left_input_index, right_input_index = self.input_block_pairs[int(group_index)]
+            if bool(self.complex_input_block_flags[int(group_index)]):
+                if right_input_index is None:
+                    raise RuntimeError(f"{self.output_node_id} pack2 hybrid group is missing its imaginary lane")
+                imag_id = scheme.evaluator.mul_imaginary_unit(int(ids[int(right_input_index)]), +1, False)
+                input_id = scheme.evaluator.add_ciphertext(int(ids[int(left_input_index)]), int(imag_id), False)
+            else:
+                input_id = int(ids[int(left_input_index)])
+            output_ids = group.evaluate_unified(int(input_id), scheme.backend)
+            for target_index, output_id in zip(self.target_indices_by_input_block[int(group_index)], output_ids):
+                partial = CipherTensor(
+                    scheme,
+                    [int(output_id)],
+                    torch.Size([1, int(self.slots)]),
+                    torch.Size([1, int(self.slots)]),
+                )
+                partial = _rescale_cipher_tensor(partial)
+                if bool(self.complex_input_block_flags[int(group_index)]):
+                    conj = partial.conjugate(in_place=False)
+                    partial, conj = _align_ciphertexts_for_add(partial, conj)
+                    partial = partial.add(conj, in_place=True)
+                if int(target_index) in output_blocks:
+                    lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
+                    output_blocks[int(target_index)] = lhs + rhs
+                else:
+                    output_blocks[int(target_index)] = partial
         self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
 
         postprocess_started = time.time()
         row_outputs: dict[int, int] = {}
-        for target_index, output_id in zip(self.target_indices, output_ids):
-            raw = CipherTensor(
-                scheme,
-                [int(output_id)],
-                torch.Size([1, int(self.slots)]),
-                torch.Size([1, int(self.slots)]),
-            )
-            raw = _rescale_cipher_tensor(raw)
-            conj = raw.conjugate(in_place=False)
-            raw, conj = _align_ciphertexts_for_add(raw, conj)
-            real = raw.add(conj, in_place=True)
+        for target_index in self.target_indices:
+            if int(target_index) not in output_blocks:
+                raise RuntimeError(f"{self.output_node_id} missing pack2 output target {int(target_index)}")
+            real = output_blocks.pop(int(target_index))
             real = self._add_bias(real, target_index=int(target_index))
             _maybe_set_default_scale(real)
             row_outputs[int(target_index)] = int(real.ids[0])
@@ -1673,6 +1900,9 @@ def _merge_optional_dense_block_transforms_to_complex(
         raise ValueError("at least one dense block transform is required")
     anchor = left if left is not None else right
     slots = int(anchor.fhe_output_shape[-1])
+    if not hybrid_pair_schedule_compatible(left, right, int(slots)):
+        reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+        raise ValueError(f"dense-block hybrid merge requires identical schedules: {reason}")
     left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
     right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
     all_keys = sorted({int(key) for key in left_diags.keys()} | {int(key) for key in right_diags.keys()})
@@ -1889,8 +2119,8 @@ def build_r34_same_shape_pack2_prototype_assets(
     reference = F.conv2d(x.unsqueeze(0), weight, bias=None, stride=1, padding=1)[0]
 
     baseline_groups: dict[int, Any] = {}
-    prototype_transforms: list[Any] = []
-    prototype_target_indices: list[int] = []
+    paired_transforms: list[tuple[int, Any, Any]] = []
+    reject_reasons: list[str] = []
     for target_index in selected_target_blocks:
         left_transform = _build_orion_same_shape_direct_transform(
             spec=spec,
@@ -1912,15 +2142,24 @@ def build_r34_same_shape_pack2_prototype_assets(
         )
         baseline_groups.setdefault(0, []).append((int(target_index), left_transform))
         baseline_groups.setdefault(1, []).append((int(target_index), right_transform))
-        prototype_transforms.append(
-            _merge_dense_block_transforms_to_complex(
-                left_transform,
-                right_transform,
-                name=f"{spec.family_label}_pack2_proto_t{int(target_index)}",
-                real_lane_output_scale=float(complex_diag_scale),
+        paired_transforms.append((int(target_index), left_transform, right_transform))
+        reason = hybrid_pair_schedule_reject_reason(left_transform, right_transform, int(slot_count))
+        if reason:
+            reject_reasons.append(f"target={int(target_index)}:{reason}")
+
+    prototype_transforms: list[Any] = []
+    prototype_target_indices: list[int] = []
+    if not reject_reasons:
+        for target_index, left_transform, right_transform in paired_transforms:
+            prototype_transforms.append(
+                _merge_dense_block_transforms_to_complex(
+                    left_transform,
+                    right_transform,
+                    name=f"{spec.family_label}_pack2_proto_t{int(target_index)}",
+                    real_lane_output_scale=float(complex_diag_scale),
+                )
             )
-        )
-        prototype_target_indices.append(int(target_index))
+            prototype_target_indices.append(int(target_index))
 
     block0 = inputs["orion_source_block_0"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
     block1 = inputs["orion_source_block_1"].unsafe_raw_tensor_for_debug().to(dtype=torch.float32)
@@ -1940,6 +2179,7 @@ def build_r34_same_shape_pack2_prototype_assets(
             "target_indices": tuple(int(value) for value in prototype_target_indices),
             "transforms": list(prototype_transforms),
         },
+        "hybrid_pair_reject_reasons": tuple(str(value) for value in reject_reasons),
         "complex_source": complex_source,
         "notes": (
             f"family_label={spec.family_label}",

@@ -2,13 +2,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from orion.core.region_cir_replay import (
+    DEFAULT_END_TO_END_ARTIFACT,
     build_big_graph_convolution_microbench,
     write_big_graph_convolution_microbench,
 )
 
 
+def _require_end_to_end_artifact() -> None:
+    if not Path(DEFAULT_END_TO_END_ARTIFACT).exists():
+        pytest.skip(f"scripts/cir artifact is not available: {DEFAULT_END_TO_END_ARTIFACT}")
+
+
 def test_big_graph_microbench_excludes_r20_synthetic_rows() -> None:
+    _require_end_to_end_artifact()
     payload = build_big_graph_convolution_microbench()
 
     networks = {row["network"] for row in payload["rows"]}
@@ -19,6 +28,7 @@ def test_big_graph_microbench_excludes_r20_synthetic_rows() -> None:
 
 
 def test_big_graph_microbench_has_publishable_original_size_cost_rows() -> None:
+    _require_end_to_end_artifact()
     payload = build_big_graph_convolution_microbench()
     rows = {row["network"]: row for row in payload["rows"]}
 
@@ -41,6 +51,7 @@ def test_big_graph_microbench_has_publishable_original_size_cost_rows() -> None:
 
 
 def test_big_graph_microbench_does_not_promote_tiny_lattigo_to_original_size_fact(tmp_path: Path) -> None:
+    _require_end_to_end_artifact()
     payload = build_big_graph_convolution_microbench(lattigo_microbench_artifact=tmp_path / "missing_lattigo.json")
 
     assert payload["status"] == "needs_original_size_lattigo"
@@ -56,6 +67,7 @@ def test_big_graph_microbench_does_not_promote_tiny_lattigo_to_original_size_fac
 
 
 def test_big_graph_microbench_counts_original_size_lattigo_artifact(tmp_path: Path) -> None:
+    _require_end_to_end_artifact()
     lattigo_artifact = tmp_path / "orion_big_graph_lattigo_microbench.json"
     lattigo_artifact.write_text(
         """
@@ -84,6 +96,7 @@ def test_big_graph_microbench_counts_original_size_lattigo_artifact(tmp_path: Pa
 
 
 def test_big_graph_microbench_artifact_is_written(tmp_path: Path) -> None:
+    _require_end_to_end_artifact()
     out = tmp_path / "orion_big_graph_convolution_microbench.json"
 
     payload = write_big_graph_convolution_microbench(out_path=out)
