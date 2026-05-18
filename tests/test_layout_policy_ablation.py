@@ -62,7 +62,7 @@ def test_u22_64_layout_policy_planner_aligns_add_inputs() -> None:
             assert len({_layout_key(row) for row in incoming}) == 1
 
 
-def test_layout_policy_parser_marks_non_dp_u22_modes_as_planner_only() -> None:
+def test_layout_policy_parser_marks_non_dp_u22_modes_as_compile_plan_only() -> None:
     opts = _region_first_mode_options("u22_64_base32_layout_fixedmax")
     assert opts["u22_layout_policy"] == "fixed_max"
     assert opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
@@ -76,10 +76,40 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_planner_only() -> None:
     )
     audit = registry.attach_to_dag(dag)
 
-    assert audit["attached_count"] == 0
+    assert audit["attached_count"] > 0
+    assert audit["executable_region_count"] == 0
     assert audit["graph_audit"]["layout_policy"] == "fixed_max"
-    assert audit["graph_audit"]["layout_policy_runtime"] == "planner_only"
-    assert {row["reason"] for row in audit["graph_audit"]["excluded_nodes"]} == {"u22_layout_policy_planner_only"}
+    assert audit["graph_audit"]["layout_policy_runtime"] == "compile_plan_only"
+    assert audit["graph_audit"]["layout_policy_runtime_lowering"] == "layout_policy_runtime_lowering_missing"
+    assert audit["graph_audit"]["layout_policy_compile_plan_consumed"] is True
+    assert audit["graph_audit"]["layout_policy_edge_layout_count"] == 34
+    assert audit["graph_audit"]["layout_policy_compile_plan_region_count"] == audit["attached_count"]
+    assert {
+        row["reason"]
+        for row in audit["graph_audit"]["runtime_lowering_missing_nodes"]
+    } == {"layout_policy_runtime_lowering_missing"}
+    assert all(group.fallback_reason == "layout_policy_runtime_lowering_missing" for group in registry.groups)
+
+
+def test_layout_policy_dp_registry_keeps_provider_runtime_and_records_plan() -> None:
+    opts = _region_first_mode_options("u22_64_base32_layout_dp")
+    dag = build_u22_dag(network_spec("u22_64_base32"))
+    registry = U22CompileRegistry.for_dag(
+        dag,
+        allowed_nodes=opts["u22_allowed_nodes"],
+        enable_conv_kernels=bool(opts["u22_conv_kernels"]),
+        layout_policy=str(opts["u22_layout_policy"]),
+    )
+    audit = registry.attach_to_dag(dag)
+
+    assert audit["attached_count"] > 0
+    assert audit["executable_region_count"] > 0
+    assert audit["graph_audit"]["layout_policy"] == "dp"
+    assert audit["graph_audit"]["layout_policy_runtime"] == "provider_executable"
+    assert audit["graph_audit"]["layout_policy_runtime_lowering"] == "provider_executable"
+    assert audit["graph_audit"]["layout_policy_compile_plan_consumed"] is True
+    assert audit["graph_audit"]["layout_policy_edge_layout_count"] == 34
+    assert audit["graph_audit"]["layout_policy_relayout_edge_count"] == 4
 
 
 def test_runtime_anchor_timeout_is_reported_without_launching_real_e2e(tmp_path: Path) -> None:

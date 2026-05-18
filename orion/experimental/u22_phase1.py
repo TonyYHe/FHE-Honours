@@ -263,6 +263,107 @@ def _u22_pool_group(*, node: str, module: Any) -> RegionFirstRuntimeGroup:
     )
 
 
+def _normalize_u22_layout_policy(value: str) -> str:
+    normalized = str(value or "dp").strip().lower()
+    if normalized in {"fixed", "fixedmax", "fixed-max", "fixed_max"}:
+        return "fixed_max"
+    if normalized in {"eager", "greedy", "dp"}:
+        return str(normalized)
+    return "dp"
+
+
+def _layout_policy_stage_for_module(module: Any) -> str:
+    if isinstance(module, ConvTranspose2d):
+        return "layout_policy_tconv"
+    if isinstance(module, AvgPool2d):
+        return "layout_policy_pool"
+    if isinstance(module, Conv2d):
+        return "layout_policy_conv"
+    return ""
+
+
+def _layout_policy_node_plan(compile_plan: dict[str, Any], *, node: str) -> dict[str, Any]:
+    edge_layouts = [
+        dict(row)
+        for row in compile_plan.get("edge_layouts", [])
+        if str(row.get("source")) == str(node) or str(row.get("target")) == str(node)
+    ]
+    return {
+        "policy": str(compile_plan.get("policy", "")),
+        "node": str(node),
+        "runtime_lowering": "layout_policy_runtime_lowering_missing",
+        "edge_layouts": edge_layouts,
+    }
+
+
+def _layout_policy_compile_plan_groups(dag: Any, compile_plan: dict[str, Any]) -> tuple[RegionFirstRuntimeGroup, ...]:
+    policy = str(compile_plan.get("policy", ""))
+    groups: list[RegionFirstRuntimeGroup] = []
+    for node in dag.topological_sort():
+        module = dag.nodes[node].get("module")
+        stage = _layout_policy_stage_for_module(module)
+        if not stage:
+            continue
+        groups.append(
+            RegionFirstRuntimeGroup(
+                region_id=f"u22_layout_policy_{policy}_{str(node)}",
+                network="U22",
+                stage=str(stage),
+                module_prefix=str(node),
+                conv_nodes=(str(node),),
+                strategy=f"u22_layout_policy_{policy}_compile_plan",
+                materializer="layout_policy_runtime_lowering_missing",
+                depth=1,
+                solver_depth=1,
+                boundary_actions=(
+                    "layout_policy_compile_plan",
+                    f"layout_policy_{policy}",
+                    "layout_policy_runtime_lowering_missing",
+                ),
+                expected_stats={},
+                executable=False,
+                fallback_reason="layout_policy_runtime_lowering_missing",
+                output_node_ids=(str(node),),
+                executor=None,
+                plan=_layout_policy_node_plan(compile_plan, node=str(node)),
+                fused_weight_count=0,
+            )
+        )
+    return tuple(groups)
+
+
+def _layout_policy_relayout_nodes(compile_plan: dict[str, Any]) -> list[dict[str, str]]:
+    return [
+        {
+            "node": str(row.get("target", "")),
+            "edge": str(row.get("edge", "")),
+            "reason": str(row.get("reason", "")),
+        }
+        for row in compile_plan.get("relayout_edges", [])
+    ]
+
+
+def _layout_policy_audit_fields(
+    compile_plan: dict[str, Any],
+    *,
+    runtime: str,
+    runtime_lowering: str,
+) -> dict[str, Any]:
+    return {
+        "layout_policy": str(compile_plan.get("policy", "dp")),
+        "layout_policy_runtime": str(runtime),
+        "layout_policy_runtime_lowering": str(runtime_lowering),
+        "layout_policy_compile_plan_consumed": True,
+        "layout_policy_metric_source": str(compile_plan.get("metric_source", "planner_estimate")),
+        "layout_policy_summary": dict(compile_plan.get("summary", {})),
+        "layout_policy_edge_layout_count": int(compile_plan.get("edge_layout_count", 0)),
+        "layout_policy_relayout_edge_count": int(compile_plan.get("relayout_edge_count", 0)),
+        "layout_policy_relayout_nodes": _layout_policy_relayout_nodes(compile_plan),
+        "layout_policy_relayout_edges": [dict(row) for row in compile_plan.get("relayout_edges", [])],
+        "layout_policy_edge_layouts": [dict(row) for row in compile_plan.get("edge_layouts", [])],
+    }
+
+
 def _merge_optional_tconv_source_block_transforms_to_complex(
     left: Any | None,
     right: Any | None,
@@ -1345,38 +1446,44 @@ class U22CompileRegistry:
         groups: list[RegionFirstRuntimeGroup] = []
         excluded_nodes: list[dict[str, str]] = []
         allowed = None if allowed_nodes is None else {str(value) for value in allowed_nodes}
-        normalized_layout_policy = str(layout_policy or "dp").strip().lower()
-        if normalized_layout_policy in {"fixed", "fixedmax", "fixed-max"}:
-            normalized_layout_policy = "fixed_max"
+        normalized_layout_policy = _normalize_u22_layout_policy(str(layout_policy or "dp"))
+        from orion.experimental.layout_policy_ablation import build_layout_policy_compile_plan
+
+        layout_compile_plan = build_layout_policy_compile_plan(dag, policy=str(normalized_layout_policy))
         if normalized_layout_policy in {"fixed_max", "eager", "greedy"}:
-            for node in dag.topological_sort():
-                module = dag.nodes[node].get("module")
-                if isinstance(module, (Conv2d, ConvTranspose2d, AvgPool2d)):
-                    excluded_nodes.append(
-                        {
-                            "node": str(node),
-                            "reason": "u22_layout_policy_planner_only",
-                        }
-                    )
+            groups = list(_layout_policy_compile_plan_groups(dag, layout_compile_plan))
+            selected_tconv_count = int(sum(1 for group in groups if str(group.stage) == "layout_policy_tconv"))
+            selected_conv_count = int(sum(1 for group in groups if str(group.stage) == "layout_policy_conv"))
+            selected_pool_count = int(sum(1 for group in groups if str(group.stage) == "layout_policy_pool"))
+            lowering_missing_nodes = [
+                {
+                    "node": str(group.module_prefix),
+                    "reason": "layout_policy_runtime_lowering_missing",
+                }
+                for group in groups
+            ]
             return cls(
-                groups=(),
+                groups=tuple(groups),
                 graph_audit={
                     "node_count": int(len(dag.nodes)),
                     "edge_count": int(len(dag.edges)),
-                    "selected_region_count": 0,
-                    "selected_tconv_count": 0,
-                    "selected_conv_count": 0,
-                    "selected_pool_count": 0,
+                    "selected_region_count": int(len(groups)),
+                    "selected_tconv_count": int(selected_tconv_count),
+                    "selected_conv_count": int(selected_conv_count),
+                    "selected_pool_count": int(selected_pool_count),
                     "selected_generic_conv_count": 0,
+                    "layout_policy_compile_plan_region_count": int(len(groups)),
+                    "runtime_lowering_missing_nodes": lowering_missing_nodes,
                     "allowed_nodes": None if allowed_nodes is None else [str(value) for value in allowed_nodes],
                     "enable_conv_kernels": bool(enable_conv_kernels),
-                    "layout_policy": str(normalized_layout_policy),
-                    "layout_policy_runtime": "planner_only",
                     "excluded_nodes": excluded_nodes,
+                    **_layout_policy_audit_fields(
+                        layout_compile_plan,
+                        runtime="compile_plan_only",
+                        runtime_lowering="layout_policy_runtime_lowering_missing",
+                    ),
                 },
             )
-        if normalized_layout_policy not in {"", "dp"}:
-            normalized_layout_policy = "dp"
         selected_tconv_count = 0
         selected_conv_count = 0
         selected_pool_count = 0
@@ -1478,11 +1585,15 @@ class U22CompileRegistry:
                 "selected_conv_count": int(selected_conv_count),
                 "selected_pool_count": int(selected_pool_count),
                 "selected_generic_conv_count": int(selected_generic_conv_count),
+                "layout_policy_compile_plan_region_count": int(len(groups)),
                 "allowed_nodes": None if allowed_nodes is None else [str(value) for value in allowed_nodes],
                 "enable_conv_kernels": bool(enable_conv_kernels),
-                "layout_policy": str(normalized_layout_policy or "dp"),
-                "layout_policy_runtime": "provider_executable",
                 "excluded_nodes": excluded_nodes,
+                **_layout_policy_audit_fields(
+                    layout_compile_plan,
+                    runtime="provider_executable",
+                    runtime_lowering="provider_executable",
+                ),
             },
         )
 

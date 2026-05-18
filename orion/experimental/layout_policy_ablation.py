@@ -788,6 +788,40 @@ def plan_policy(dag: NetworkDAG, edges: Sequence[EdgeInfo], policy: str, *, slot
     raise AssertionError(f"unreachable policy {policy!r}")
 
 
+def build_layout_policy_compile_plan(
+    dag: NetworkDAG,
+    *,
+    policy: str = "dp",
+    slots: int = DEFAULT_SLOTS,
+) -> dict[str, Any]:
+    edges = build_edge_infos(dag, slots=int(slots))
+    plan = plan_policy(dag, edges, policy, slots=int(slots))
+    edge_layouts = [dict(row) for row in plan.edge_layouts]
+    relayout_edges = [
+        {
+            "edge": str(row["edge"]),
+            "source": str(row["source"]),
+            "target": str(row["target"]),
+            "reason": str(row.get("relayout_reason", "")),
+            "selected_layout": dict(row["selected_layout"]),
+        }
+        for row in edge_layouts
+        if bool(row.get("relayout", False))
+    ]
+    return {
+        "status": "ok",
+        "policy": str(plan.policy),
+        "policy_label": str(plan.policy_label),
+        "metric_source": str(plan.metric_source),
+        "slots": int(slots),
+        "edge_layout_count": int(len(edge_layouts)),
+        "relayout_edge_count": int(len(relayout_edges)),
+        "summary": plan.summary_row(),
+        "relayout_edges": relayout_edges,
+        "edge_layouts": edge_layouts,
+    }
+
+
 def build_planner_ablation(
     *,
     network: str = "u22_64_base32",
