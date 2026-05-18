@@ -1340,10 +1340,43 @@ class U22CompileRegistry:
         *,
         allowed_nodes: tuple[str, ...] | None = None,
         enable_conv_kernels: bool = False,
+        layout_policy: str = "dp",
     ) -> "U22CompileRegistry":
         groups: list[RegionFirstRuntimeGroup] = []
         excluded_nodes: list[dict[str, str]] = []
         allowed = None if allowed_nodes is None else {str(value) for value in allowed_nodes}
+        normalized_layout_policy = str(layout_policy or "dp").strip().lower()
+        if normalized_layout_policy in {"fixed", "fixedmax", "fixed-max"}:
+            normalized_layout_policy = "fixed_max"
+        if normalized_layout_policy in {"fixed_max", "eager", "greedy"}:
+            for node in dag.topological_sort():
+                module = dag.nodes[node].get("module")
+                if isinstance(module, (Conv2d, ConvTranspose2d, AvgPool2d)):
+                    excluded_nodes.append(
+                        {
+                            "node": str(node),
+                            "reason": "u22_layout_policy_planner_only",
+                        }
+                    )
+            return cls(
+                groups=(),
+                graph_audit={
+                    "node_count": int(len(dag.nodes)),
+                    "edge_count": int(len(dag.edges)),
+                    "selected_region_count": 0,
+                    "selected_tconv_count": 0,
+                    "selected_conv_count": 0,
+                    "selected_pool_count": 0,
+                    "selected_generic_conv_count": 0,
+                    "allowed_nodes": None if allowed_nodes is None else [str(value) for value in allowed_nodes],
+                    "enable_conv_kernels": bool(enable_conv_kernels),
+                    "layout_policy": str(normalized_layout_policy),
+                    "layout_policy_runtime": "planner_only",
+                    "excluded_nodes": excluded_nodes,
+                },
+            )
+        if normalized_layout_policy not in {"", "dp"}:
+            normalized_layout_policy = "dp"
         selected_tconv_count = 0
         selected_conv_count = 0
         selected_pool_count = 0
@@ -1447,6 +1480,8 @@ class U22CompileRegistry:
                 "selected_generic_conv_count": int(selected_generic_conv_count),
                 "allowed_nodes": None if allowed_nodes is None else [str(value) for value in allowed_nodes],
                 "enable_conv_kernels": bool(enable_conv_kernels),
+                "layout_policy": str(normalized_layout_policy or "dp"),
+                "layout_policy_runtime": "provider_executable",
                 "excluded_nodes": excluded_nodes,
             },
         )

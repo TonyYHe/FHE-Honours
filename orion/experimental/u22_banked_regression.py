@@ -40,9 +40,9 @@ U22_BANKED_REGRESSION_CASES: dict[str, U22BankedRegressionCase] = {
         case_name="u4_mini",
         dataset="imagenet",
         node_name="up4",
-        expected_rotations=15,
+        expected_rotations=19,
         expected_conjugations=0,
-        assumption="Mapped to the smallest available U22 decoder-u4 shape in this repo: UNet22(dataset='imagenet') up4.",
+        assumption="Mapped to UNet22(dataset='imagenet') up4; rotations use per-UnifiedTransformGroup shared-key union.",
     ),
     "u3_mini": U22BankedRegressionCase(
         case_name="u3_mini",
@@ -156,6 +156,44 @@ def _decode_output(module, out: CipherTensor) -> torch.Tensor:
     )[0]
 
 
+def _rotation_key_stats(groups: list[Any], backend: Any) -> dict[str, Any]:
+    group_rows: list[dict[str, Any]] = []
+    group_union_total = 0
+    transform_sum_total = 0
+    get_keys = getattr(backend, "GetLinearTransformRotationKeys")
+    for group_index, group in enumerate(groups):
+        transform_rows: list[dict[str, Any]] = []
+        union_keys: set[int] = set()
+        transform_ids = [int(value) for value in list(getattr(group, "unified_ids", []) or [])]
+        for transform_id in transform_ids:
+            keys = sorted({int(key) for key in list(get_keys(int(transform_id))) if int(key) != 0})
+            union_keys.update(int(key) for key in keys)
+            transform_sum_total += int(len(keys))
+            transform_rows.append(
+                {
+                    "transform_id": int(transform_id),
+                    "rotation_count": int(len(keys)),
+                    "rotation_keys": [int(key) for key in keys],
+                }
+            )
+        group_union_total += int(len(union_keys))
+        group_rows.append(
+            {
+                "group_index": int(group_index),
+                "unified_ids": [int(value) for value in transform_ids],
+                "union_rotation_count": int(len(union_keys)),
+                "transform_sum_rotation_count": int(sum(int(row["rotation_count"]) for row in transform_rows)),
+                "union_rotation_keys": [int(key) for key in sorted(union_keys)],
+                "transforms": transform_rows,
+            }
+        )
+    return {
+        "group_union_rotation_count": int(group_union_total),
+        "transform_sum_rotation_count": int(transform_sum_total),
+        "groups": group_rows,
+    }
+
+
 def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") -> dict[str, Any]:
     case = U22_BANKED_REGRESSION_CASES[str(case_name)]
     if str(backend) == "lattigo":
@@ -192,13 +230,8 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
         if single_group is not None:
             groups.append(single_group)
         groups.extend(list(getattr(executor, "groups", []) or []))
-        transform_ids: list[int] = []
-        for group in groups:
-            transform_ids.extend(int(value) for value in list(getattr(group, "unified_ids", []) or []))
-        observed_rotations = 0
-        for transform_id in transform_ids:
-            keys = list(getattr(scheme.backend, "GetLinearTransformRotationKeys")(int(transform_id)))
-            observed_rotations += sum(1 for key in keys if int(key) != 0)
+        rotation_key_stats = _rotation_key_stats(groups, scheme.backend)
+        observed_rotations = int(rotation_key_stats["group_union_rotation_count"])
 
         observed_conjugations = 0
         payload = {
@@ -218,6 +251,8 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
                 "rotations": int(observed_rotations),
                 "conjugations": int(observed_conjugations),
             },
+            "rotation_key_stats": rotation_key_stats,
+            "runtime_counts": dict(getattr(executor, "last_runtime_counts", {}) or {}),
             "expected": {
                 "rotations": int(case.expected_rotations),
                 "conjugations": int(case.expected_conjugations),

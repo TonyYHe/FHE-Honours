@@ -334,21 +334,48 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
     )
     u22_allowed_nodes = None
     u22_conv_kernels = bool(u22_mode_base is not None)
+    u22_layout_policy = "dp" if u22_mode_base is not None else ""
     if u22_mode_base is not None and normalized != str(u22_mode_base):
         suffix = normalized[len(str(u22_mode_base)) + 1 :]
         allowed: list[str] = []
-        for token in suffix.split("_"):
+        tokens = suffix.split("_")
+        index = 0
+        while index < len(tokens):
+            token = tokens[int(index)]
             if token == "conv":
                 u22_conv_kernels = True
+                index += 1
                 continue
             if token == "noconv":
                 u22_conv_kernels = False
+                index += 1
+                continue
+            if token == "layout" and int(index + 1) < len(tokens):
+                raw_policy = str(tokens[int(index + 1)])
+                if raw_policy == "fixed" and int(index + 2) < len(tokens) and str(tokens[int(index + 2)]) == "max":
+                    raw_policy = "fixedmax"
+                    index += 1
+                policy_aliases = {
+                    "fixed": "fixed_max",
+                    "fixedmax": "fixed_max",
+                    "eager": "eager",
+                    "greedy": "greedy",
+                    "dp": "dp",
+                }
+                if raw_policy in policy_aliases:
+                    u22_layout_policy = str(policy_aliases[raw_policy])
+                    index += 2
+                    continue
+            if token in {"fixedmax", "eager", "greedy", "dp"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
+                index += 1
                 continue
             if not token.startswith("up"):
+                index += 1
                 continue
             digits = token[2:]
             if digits and all(ch in "1234" for ch in digits):
                 allowed.extend(f"up{ch}" for ch in digits)
+            index += 1
         if allowed:
             u22_allowed_nodes = tuple(dict.fromkeys(allowed))
     if u22_mode_base in {"u22_64_base32", "u22_256_base32"} and u22_allowed_nodes is None:
@@ -381,6 +408,7 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         "is_u22_phase1": bool(u22_mode_base is not None),
         "u22_allowed_nodes": u22_allowed_nodes,
         "u22_conv_kernels": bool(u22_conv_kernels),
+        "u22_layout_policy": str(u22_layout_policy),
         "allowed_stages": (
             r18_allowed_stages
             if r18_allowed_stages is not None
@@ -728,6 +756,7 @@ class Scheme:
                     network_dag,
                     allowed_nodes=region_first_options.get("u22_allowed_nodes"),
                     enable_conv_kernels=bool(region_first_options.get("u22_conv_kernels", False)),
+                    layout_policy=str(region_first_options.get("u22_layout_policy", "dp")),
                 )
                 self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
             else:

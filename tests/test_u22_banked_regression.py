@@ -27,3 +27,6 @@ def test_u22_banked_regression_runner_executes_on_lattigo(case_name: str) -> Non
     assert payload["supports_scheme"] is True
     assert payload["parity"]["exact"] is True
     assert payload["parity"]["max_abs"] <= payload["parity"]["tolerance"]
+    assert payload["drift"] == {"rotations": 0, "conjugations": 0}
+    assert payload["observed"] == payload["expected"]
+    assert payload["rotation_key_stats"]["group_union_rotation_count"] == payload["observed"]["rotations"]
