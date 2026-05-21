@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +15,44 @@ class HybridScheduleSignature:
     selected_baby_width: int | None = None
     baby_rotations: tuple[int, ...] = ()
     giant_rotations: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class HybridPairLayoutItem:
+    left_index: int
+    right_index: int | None
+    strict_schedule_pair: bool
+    covered_output_count: int = 0
+    reject_reasons: tuple[str, ...] = ()
+    schedule_materialized: bool = False
+
+
+@dataclass(frozen=True)
+class HybridPairLayoutPlan:
+    items: tuple[HybridPairLayoutItem, ...]
+    strict_pair_count: int
+    covered_output_count: int
+    singleton_count: int
+    rejected_adjacent_pair_reasons: tuple[str, ...] = ()
+    schedule_materialized_pair_count: int = 0
+    schedule_materialized_output_count: int = 0
+
+    @property
+    def uses_shifted_boundaries(self) -> bool:
+        if not self.items:
+            return False
+        first_left = int(self.items[0].left_index)
+        for item in self.items:
+            if item.right_index is not None and (int(item.left_index) - int(first_left)) % 2 != 0:
+                return True
+        return False
+
+
+@dataclass(frozen=True)
+class HybridScheduleMaterializationResult:
+    pair_count: int
+    output_count: int
+    reasons: tuple[str, ...] = ()
 
 
 def _int_attr(value: Any, names: tuple[str, ...]) -> int | None:
@@ -112,6 +150,251 @@ def hybrid_pair_schedule_compatible(left: Any | None, right: Any | None, slots: 
     return hybrid_pair_schedule_reject_reason(left, right, int(slots)) == ""
 
 
+def hybrid_transform_sequence_pair_reject_reasons(
+    left_transforms: Sequence[Any | None],
+    right_transforms: Sequence[Any | None],
+    slots: int,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    width = max(len(left_transforms), len(right_transforms))
+    for output_index in range(int(width)):
+        left = left_transforms[int(output_index)] if int(output_index) < len(left_transforms) else None
+        right = right_transforms[int(output_index)] if int(output_index) < len(right_transforms) else None
+        if left is None and right is None:
+            continue
+        reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+        if reason:
+            reasons.append(f"output={int(output_index)}:{reason}")
+    return tuple(reasons)
+
+
+def hybrid_transform_sequence_pair_weight(
+    left_transforms: Sequence[Any | None],
+    right_transforms: Sequence[Any | None],
+) -> int:
+    width = max(len(left_transforms), len(right_transforms))
+    count = 0
+    for output_index in range(int(width)):
+        left = left_transforms[int(output_index)] if int(output_index) < len(left_transforms) else None
+        right = right_transforms[int(output_index)] if int(output_index) < len(right_transforms) else None
+        if left is not None or right is not None:
+            count += 1
+    return int(count)
+
+
+def _schedule_reject_can_be_materialized(reason: str) -> bool:
+    return bool(
+        str(reason).startswith("diagonal_key_set_mismatch(")
+        or str(reason) == "missing_left_transform"
+        or str(reason) == "missing_right_transform"
+    )
+
+
+def hybrid_transform_sequence_pair_schedule_materializable(
+    left_transforms: Sequence[Any | None],
+    right_transforms: Sequence[Any | None],
+    slots: int,
+) -> tuple[bool, tuple[str, ...], int]:
+    reasons: list[str] = []
+    materialized_outputs = 0
+    width = max(len(left_transforms), len(right_transforms))
+    for output_index in range(int(width)):
+        left = left_transforms[int(output_index)] if int(output_index) < len(left_transforms) else None
+        right = right_transforms[int(output_index)] if int(output_index) < len(right_transforms) else None
+        if left is None and right is None:
+            continue
+        reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+        if not reason:
+            continue
+        if not _schedule_reject_can_be_materialized(str(reason)):
+            reasons.append(f"output={int(output_index)}:{reason}:not_materializable")
+            continue
+        if left is not None and right is not None:
+            left_sig = hybrid_schedule_signature(left, int(slots))
+            right_sig = hybrid_schedule_signature(right, int(slots))
+            if (
+                left_sig.selected_baby_width != right_sig.selected_baby_width
+                or left_sig.baby_rotations != right_sig.baby_rotations
+                or left_sig.giant_rotations != right_sig.giant_rotations
+            ):
+                reasons.append(f"output={int(output_index)}:bsgs_schedule_metadata_mismatch:not_materializable")
+                continue
+        if not hybrid_schedule_padding_allowed(left, right):
+            reasons.append(f"output={int(output_index)}:{reason}:layout_padding_not_allowed")
+            continue
+        materialized_outputs += 1
+    return bool(materialized_outputs > 0 and not reasons), tuple(reasons), int(materialized_outputs)
+
+
+def optimize_hybrid_pair_layout(
+    transforms_by_block: Mapping[int, Sequence[Any | None]],
+    slots: int,
+    *,
+    allow_schedule_materialization: bool = False,
+) -> HybridPairLayoutPlan:
+    """Choose adjacent source-block pair boundaries that maximize strict pairs.
+
+    This is a tiny DP analogue of the paper's layout search: at each source
+    boundary, choose either a singleton block or a real/imag pair. A pair is
+    admitted only when every paired output transform already has an identical
+    schedule signature. The helper does not pad or mutate transforms.
+    """
+
+    block_indices = tuple(sorted(int(index) for index in transforms_by_block))
+    if not block_indices:
+        return HybridPairLayoutPlan((), 0, 0, 0, ())
+    expected = tuple(range(int(block_indices[0]), int(block_indices[-1]) + 1))
+    if block_indices != expected:
+        raise ValueError("hybrid pair layout optimizer requires contiguous block indices")
+
+    rejected_reasons: list[str] = []
+    pair_cache: dict[int, tuple[bool, bool, bool, int, int, tuple[str, ...]]] = {}
+    for index in block_indices[:-1]:
+        left = tuple(transforms_by_block[int(index)])
+        right = tuple(transforms_by_block[int(index + 1)])
+        reasons = hybrid_transform_sequence_pair_reject_reasons(left, right, int(slots))
+        weight = hybrid_transform_sequence_pair_weight(left, right)
+        strict_compatible = bool(weight > 0 and not reasons)
+        schedule_materializable = False
+        materialized_outputs = 0
+        materialize_reasons: tuple[str, ...] = ()
+        if not strict_compatible and bool(allow_schedule_materialization) and int(weight) > 0:
+            schedule_materializable, materialize_reasons, materialized_outputs = (
+                hybrid_transform_sequence_pair_schedule_materializable(left, right, int(slots))
+            )
+        compatible = bool(strict_compatible or schedule_materializable)
+        pair_cache[int(index)] = (
+            bool(compatible),
+            bool(strict_compatible),
+            bool(schedule_materializable),
+            int(weight),
+            int(materialized_outputs),
+            tuple(reasons if reasons else materialize_reasons),
+        )
+        if not compatible and (weight > 0 or reasons or materialize_reasons):
+            shown = materialize_reasons if materialize_reasons else reasons
+            rejected_reasons.append(f"input_pair=({int(index)},{int(index + 1)}):" + "; ".join(shown))
+
+    # dp[position] = (pair_count, covered_outputs, -materialized_outputs, -singleton_count, items)
+    dp: dict[int, tuple[int, int, int, int, tuple[HybridPairLayoutItem, ...]]] = {
+        len(block_indices): (0, 0, 0, 0, ())
+    }
+    for pos in range(len(block_indices) - 1, -1, -1):
+        left_index = int(block_indices[int(pos)])
+        next_single = dp[int(pos + 1)]
+        singleton_item = HybridPairLayoutItem(
+            left_index=int(left_index),
+            right_index=None,
+            strict_schedule_pair=False,
+            covered_output_count=0,
+        )
+        best = (
+            int(next_single[0]),
+            int(next_single[1]),
+            int(next_single[2]),
+            int(next_single[3] - 1),
+            (singleton_item,) + tuple(next_single[4]),
+        )
+        if int(pos + 1) < len(block_indices):
+            compatible, strict, materialized, weight, materialized_outputs, reasons = pair_cache.get(
+                int(left_index),
+                (False, False, False, 0, 0, ()),
+            )
+            if compatible:
+                next_pair = dp[int(pos + 2)]
+                pair_item = HybridPairLayoutItem(
+                    left_index=int(left_index),
+                    right_index=int(left_index + 1),
+                    strict_schedule_pair=bool(strict),
+                    covered_output_count=int(weight),
+                    reject_reasons=tuple(reasons),
+                    schedule_materialized=bool(materialized),
+                )
+                candidate = (
+                    int(next_pair[0] + 1),
+                    int(next_pair[1] + int(weight)),
+                    int(next_pair[2] - int(materialized_outputs)),
+                    int(next_pair[3]),
+                    (pair_item,) + tuple(next_pair[4]),
+                )
+                if candidate[:4] > best[:4]:
+                    best = candidate
+        dp[int(pos)] = best
+
+    pair_count, covered_count, materialized_output_score, singleton_score, items = dp[0]
+    materialized_pair_count = sum(
+        1
+        for item in items
+        if item.right_index is not None and bool(item.schedule_materialized)
+    )
+    return HybridPairLayoutPlan(
+        items=tuple(items),
+        strict_pair_count=int(pair_count),
+        covered_output_count=int(covered_count),
+        singleton_count=int(-singleton_score),
+        rejected_adjacent_pair_reasons=tuple(rejected_reasons),
+        schedule_materialized_pair_count=int(materialized_pair_count),
+        schedule_materialized_output_count=int(-materialized_output_score),
+    )
+
+
+def materialize_hybrid_pair_layout_schedules(
+    transforms_by_block: MutableMapping[int, list[Any | None]],
+    plan: HybridPairLayoutPlan,
+    slots: int,
+    *,
+    name_prefix: str,
+) -> HybridScheduleMaterializationResult:
+    pair_reasons: list[str] = []
+    pair_count = 0
+    output_count = 0
+    for item in plan.items:
+        if item.right_index is None or not bool(item.schedule_materialized):
+            continue
+        left_index = int(item.left_index)
+        right_index = int(item.right_index)
+        left_transforms = list(transforms_by_block[int(left_index)])
+        right_transforms = list(transforms_by_block[int(right_index)])
+        width = max(len(left_transforms), len(right_transforms))
+        if len(left_transforms) < int(width):
+            left_transforms.extend([None] * int(int(width) - len(left_transforms)))
+        if len(right_transforms) < int(width):
+            right_transforms.extend([None] * int(int(width) - len(right_transforms)))
+        reasons: list[str] = []
+        for output_index in range(int(width)):
+            left = left_transforms[int(output_index)]
+            right = right_transforms[int(output_index)]
+            if left is None and right is None:
+                continue
+            before_reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+            if not before_reason:
+                continue
+            left, right, pad_reason = pad_hybrid_pair_to_common_schedule(
+                left,
+                right,
+                int(slots),
+                name=f"{name_prefix}_src{left_index}_{right_index}_out{int(output_index)}",
+            )
+            left_transforms[int(output_index)] = left
+            right_transforms[int(output_index)] = right
+            after_reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+            if after_reason:
+                reasons.append(f"output={int(output_index)}:{after_reason}")
+            elif pad_reason:
+                output_count += 1
+                reasons.append(f"output={int(output_index)}:{pad_reason}")
+        transforms_by_block[int(left_index)] = left_transforms
+        transforms_by_block[int(right_index)] = right_transforms
+        if reasons:
+            pair_count += 1
+            pair_reasons.append(f"input_pair=({left_index},{right_index}):" + "; ".join(reasons))
+    return HybridScheduleMaterializationResult(
+        pair_count=int(pair_count),
+        output_count=int(output_count),
+        reasons=tuple(pair_reasons),
+    )
+
+
 def mark_hybrid_schedule_padding_allowed(transform: Any | None, *, family: str) -> Any | None:
     if transform is None:
         return None
@@ -178,6 +461,12 @@ def _zero_transform_like(anchor: Any, *, keys: tuple[int, ...], slots: int, name
         target_index=int(getattr(anchor, "target_index", 0)),
         input_id=str(getattr(anchor, "input_id", "hybrid_zero_schedule_pad")),
     )
+    for attr in ("selected_n1", "bsgs_n1", "N1", "n1", "baby_rotations", "baby_shifts", "giant_rotations", "giant_shifts"):
+        if hasattr(anchor, attr):
+            try:
+                setattr(transform, attr, getattr(anchor, attr))
+            except Exception:
+                pass
     family = str(getattr(anchor, "hybrid_schedule_family", ""))
     if family:
         mark_hybrid_schedule_padding_allowed(transform, family=family)

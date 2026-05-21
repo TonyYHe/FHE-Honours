@@ -216,6 +216,8 @@ class NewEvaluator:
         diagonals = linear_layer.diagonals 
         level = linear_layer.level
         bsgs_ratio = linear_layer.bsgs_ratio
+        reuse_saved_plaintexts = bool(getattr(linear_layer, "_compile_cache_reuse_saved_plaintexts", False))
+        effective_io_mode = "load" if reuse_saved_plaintexts else self.io_mode
         if self.io_mode == "save":
             linear_layer._compile_cache_diag_indices_by_block = {
                 (int(row), int(col)): tuple(sorted(int(idx) for idx in diags.keys()))
@@ -226,28 +228,34 @@ class NewEvaluator:
                 for (row, col), diags in diagonals.items()
             }
 
+        lintransf_ids = {}
+
+        def finish_compiled_batch(batch_ids) -> None:
+            for row, col, diags_idxs, lintransf_id in batch_ids:
+                lintransf_ids[(int(row), int(col))] = int(lintransf_id)
+                self.generate_rotation_keys(int(lintransf_id))
+                self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
+                if self.io_mode == "save" and not reuse_saved_plaintexts:
+                    self.save_plaintext_diagonals(
+                        layer_name, int(lintransf_id), int(row), int(col), diags_idxs
+                    )
+            if self.io_mode != "none" and not reuse_saved_plaintexts:
+                self._trim_backend_runtime_memory()
+
         batch_ids = self._generate_transforms_batch(
             diagonals,
             level=int(level),
             bsgs_ratio=float(bsgs_ratio),
+            io_mode=str(effective_io_mode),
+            on_batch_result=finish_compiled_batch,
         )
         if batch_ids is not None:
-            lintransf_ids = {}
-            for row, col, diags_idxs, lintransf_id in batch_ids:
-                lintransf_ids[(row, col)] = int(lintransf_id)
-                self.generate_rotation_keys(int(lintransf_id))
-                self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
-                if self.io_mode == "save":
-                    self.save_plaintext_diagonals(
-                        layer_name, int(lintransf_id), int(row), int(col), diags_idxs
-                    )
             if self.io_mode == "save":
                 linear_layer.diagonals = {}
                 gc.collect()
             return lintransf_ids
 
         # Generate all linear transforms block by block.
-        lintransf_ids = {}        
         for (row, col), diags in diagonals.items(): 
             diags_idxs, diags_data = [], []
             for idx, diag in diags.items(): 
@@ -255,7 +263,7 @@ class NewEvaluator:
                 diags_data.extend(diag)
 
             lintransf_id = self.backend.GenerateLinearTransform(
-                diags_idxs, diags_data, level, bsgs_ratio, self.io_mode
+                diags_idxs, diags_data, level, bsgs_ratio, effective_io_mode
             )
             lintransf_ids[(row, col)] = lintransf_id
 
@@ -263,10 +271,12 @@ class NewEvaluator:
             # this linear transform.
             self.generate_rotation_keys(lintransf_id)
             self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
-            if self.io_mode == "save":
+            if self.io_mode == "save" and not reuse_saved_plaintexts:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
+            if self.io_mode != "none" and not reuse_saved_plaintexts:
+                self._trim_backend_runtime_memory()
 
         if self.io_mode == "save":
             linear_layer.diagonals = {}
@@ -343,10 +353,66 @@ class NewEvaluator:
             requested = 4
         return max(1, min(int(item_count), int(requested)))
 
+    def _lt_compile_batch_limit(self, item_count: int, *, index_only: bool = False) -> int:
+        if item_count <= 1:
+            return 1
+        if bool(index_only):
+            raw_value = os.environ.get("ORION_DENSE_LT_INDEX_ONLY_BATCH_TRANSFORMS")
+            if raw_value is not None:
+                try:
+                    requested = int(raw_value)
+                except (TypeError, ValueError):
+                    requested = 0
+                if requested > 0:
+                    return max(1, min(int(item_count), int(requested)))
+                return int(item_count)
+            return max(1, min(int(item_count), 128))
+        for name in (
+            "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
+            "ORION_LT_COMPILE_BATCH_TRANSFORMS",
+            # Dense save/load needs the same kind of guard that provider cached
+            # load uses. Honor the existing provider knob so benchmark scripts
+            # that already set it get bounded dense compilation too.
+            "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
+            "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
+        ):
+            raw_value = os.environ.get(name)
+            if raw_value is None:
+                continue
+            try:
+                requested = int(raw_value)
+            except (TypeError, ValueError):
+                requested = 0
+            if requested > 0:
+                return max(1, min(int(item_count), int(requested)))
+            return int(item_count)
+        if self.io_mode != "none":
+            return max(1, min(int(item_count), 4))
+        return int(item_count)
+
     def _build_block_payload(self, item):
         (row, col), diags = item
         diags_idxs, diags_data = self._flatten_diagonals(diags)
         return int(row), int(col), diags_idxs, diags_data
+
+    def _compile_save_resume_enabled_for_layer(self, linear_layer) -> bool:
+        enabled = getattr(linear_layer, "_compile_save_resume_enabled", None)
+        return callable(enabled) and bool(enabled())
+
+    def _plaintext_blocks_complete(self, layer, diag_group) -> bool:
+        if "plaintexts" not in layer:
+            return False
+        plaintext_group = layer["plaintexts"]
+        for block_name in diag_group:
+            if str(block_name) not in plaintext_group:
+                return False
+            plaintext_block = plaintext_group[str(block_name)]
+            if _ENCODED_HOIST_PAYLOAD_DATASET in plaintext_block:
+                continue
+            expected_keys = {str(diag_idx) for diag_idx in diag_group[str(block_name)].keys()}
+            if not expected_keys.issubset(set(str(key) for key in plaintext_block.keys())):
+                return False
+        return True
 
     def load_transform_shell_metadata(self, layer_name: str):
         with h5py.File(self.diags_path, "r") as handle:
@@ -362,66 +428,94 @@ class NewEvaluator:
                 }
         return diagonals, int(output_rotations)
 
-    def _generate_transforms_batch(self, diagonals, *, level: int, bsgs_ratio: float):
+    def _trim_backend_runtime_memory(self) -> None:
+        trim = getattr(self.backend, "TrimRuntimeMemory", None)
+        if callable(trim):
+            trim()
+
+    def _generate_transforms_batch(
+        self,
+        diagonals,
+        *,
+        level: int,
+        bsgs_ratio: float,
+        io_mode: str,
+        on_batch_result=None,
+    ):
         generate_batch = getattr(self.backend, "GenerateLinearTransformsBatch", None)
         if not callable(generate_batch) or len(diagonals) <= 1:
             return None
 
-        started = time.perf_counter()
         items = list(diagonals.items())
-        workers = self._lt_worker_count(len(items))
-        if workers <= 1:
-            block_payloads = [self._build_block_payload(item) for item in items]
-        else:
-            futures = []
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-lt-build") as pool:
-                for index, item in enumerate(items):
-                    futures.append((index, pool.submit(self._build_block_payload, item)))
-                ordered = [None] * len(futures)
-                wait_started = time.perf_counter()
-                for index, future in futures:
-                    ordered[index] = future.result()
-                self._add_profile("wait_s", time.perf_counter() - wait_started)
-            block_payloads = list(ordered)
-        self._add_profile("diag_generate_s", time.perf_counter() - started)
-
-        num_transforms = len(block_payloads)
-        diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
-        diag_idxs_lens = (ctypes.c_int * num_transforms)()
-        diag_data_ptrs = (ctypes.POINTER(ctypes.c_float) * num_transforms)()
-        diag_data_lens = (ctypes.c_int * num_transforms)()
-        levels = (ctypes.c_int * num_transforms)(*[int(level)] * num_transforms)
-
-        owned_arrays: list[object] = [levels]
-        for index, (_row, _col, diags_idxs, _diags_data) in enumerate(block_payloads):
-            array = (ctypes.c_int * len(diags_idxs))(*diags_idxs)
-            owned_arrays.append(array)
-            diag_idxs_ptrs[index] = array
-            diag_idxs_lens[index] = len(diags_idxs)
-        for index, (_row, _col, _diags_idxs, diags_data) in enumerate(block_payloads):
-            array = (ctypes.c_float * len(diags_data))(*diags_data)
-            owned_arrays.append(array)
-            diag_data_ptrs[index] = array
-            diag_data_lens[index] = len(diags_data)
-
-        encode_started = time.perf_counter()
-        lintransf_ids = list(
-            generate_batch(
-                int(num_transforms),
-                diag_idxs_ptrs,
-                diag_idxs_lens,
-                diag_data_ptrs,
-                diag_data_lens,
-                levels,
-                float(bsgs_ratio),
-                str(self.io_mode),
-            )
+        batch_limit = self._lt_compile_batch_limit(
+            len(items),
+            index_only=(str(io_mode) == "load" and self.io_mode == "save"),
         )
-        self._add_profile("encode_s", time.perf_counter() - encode_started)
-        return [
-            (row, col, diags_idxs, int(lintransf_id))
-            for (row, col, diags_idxs, _diags_data), lintransf_id in zip(block_payloads, lintransf_ids)
-        ]
+        results = []
+        offset = 0
+        while offset < len(items):
+            batch_items = items[int(offset): int(offset + batch_limit)]
+            workers = self._lt_worker_count(len(batch_items))
+            batch_started = time.perf_counter()
+            if workers <= 1:
+                block_payloads = [self._build_block_payload(item) for item in batch_items]
+            else:
+                futures = []
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-lt-build") as pool:
+                    for index, item in enumerate(batch_items):
+                        futures.append((index, pool.submit(self._build_block_payload, item)))
+                    ordered = [None] * len(futures)
+                    wait_started = time.perf_counter()
+                    for index, future in futures:
+                        ordered[index] = future.result()
+                    self._add_profile("wait_s", time.perf_counter() - wait_started)
+                block_payloads = list(ordered)
+            self._add_profile("diag_generate_s", time.perf_counter() - batch_started)
+
+            num_transforms = len(block_payloads)
+            diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
+            diag_idxs_lens = (ctypes.c_int * num_transforms)()
+            diag_data_ptrs = (ctypes.POINTER(ctypes.c_float) * num_transforms)()
+            diag_data_lens = (ctypes.c_int * num_transforms)()
+            levels = (ctypes.c_int * num_transforms)(*[int(level)] * num_transforms)
+
+            owned_arrays: list[object] = [levels]
+            for index, (_row, _col, diags_idxs, _diags_data) in enumerate(block_payloads):
+                array = (ctypes.c_int * len(diags_idxs))(*diags_idxs)
+                owned_arrays.append(array)
+                diag_idxs_ptrs[index] = array
+                diag_idxs_lens[index] = len(diags_idxs)
+            for index, (_row, _col, _diags_idxs, diags_data) in enumerate(block_payloads):
+                array = (ctypes.c_float * len(diags_data))(*diags_data)
+                owned_arrays.append(array)
+                diag_data_ptrs[index] = array
+                diag_data_lens[index] = len(diags_data)
+
+            encode_started = time.perf_counter()
+            lintransf_ids = list(
+                generate_batch(
+                    int(num_transforms),
+                    diag_idxs_ptrs,
+                    diag_idxs_lens,
+                    diag_data_ptrs,
+                    diag_data_lens,
+                    levels,
+                    float(bsgs_ratio),
+                    str(io_mode),
+                )
+            )
+            self._add_profile("encode_s", time.perf_counter() - encode_started)
+            batch_results = [
+                (row, col, diags_idxs, int(lintransf_id))
+                for (row, col, diags_idxs, _diags_data), lintransf_id in zip(block_payloads, lintransf_ids)
+            ]
+            if callable(on_batch_result):
+                on_batch_result(batch_results)
+            results.extend(batch_results)
+            del block_payloads, owned_arrays, lintransf_ids
+            gc.collect()
+            offset += int(batch_limit)
+        return results
     
     def get_required_rotation_keys(self, transform_id):
         return self.backend.GetLinearTransformRotationKeys(transform_id)
@@ -551,13 +645,20 @@ class NewEvaluator:
             # Load the diagonals back into the correct struct
             all_diagonals = {}
             diag_group = layer["diagonals"]
+            reuse_saved_plaintexts = (
+                self.io_mode == "save"
+                and self._compile_save_resume_enabled_for_layer(linear_layer)
+                and bool(getattr(self.backend, "supports_index_only_linear_transform_load", False))
+                and self._plaintext_blocks_complete(layer, diag_group)
+            )
+            linear_layer._compile_cache_reuse_saved_plaintexts = bool(reuse_saved_plaintexts)
             for block in diag_group:
                 row, col = map(int, block.split("_")) # 0_1 -> (0,1)
                 diags = {}
                 block_group = diag_group[block]
                 for diag_idx in block_group:
                     if (
-                        self.io_mode == "load"
+                        (self.io_mode == "load" or bool(reuse_saved_plaintexts))
                         and bool(getattr(self.backend, "supports_index_only_linear_transform_load", False))
                     ):
                         # Load mode only needs diagonal indices to rebuild the
@@ -594,13 +695,15 @@ class NewEvaluator:
             (int(i), int(j), int(transform_ids[i][j]))
             for i in range(rows)
             for j in range(cols)
+            if int(transform_ids[i][j]) >= 0
         ]
-        use_dense_shared_cache = self._dense_shared_cache_enabled(rows=rows, cols=cols)
+        dense_rectangular = int(len(work_items)) == int(rows * cols)
+        use_dense_shared_cache = bool(dense_rectangular) and self._dense_shared_cache_enabled(rows=rows, cols=cols)
         linear_layer._last_dense_shared_cache_eval = {
             "enabled": bool(use_dense_shared_cache),
             "group_count": int(cols) if bool(use_dense_shared_cache) else 0,
             "group_axis": "input_column" if bool(use_dense_shared_cache) else "",
-            "transform_count": int(rows * cols),
+            "transform_count": int(len(work_items)),
             "io_mode": str(self.io_mode),
             "host_payload_cache": bool(self._dense_host_payload_cache_enabled()),
             "host_payload_cache_count": int(len(self._dense_host_plaintext_payload_cache)),
@@ -638,6 +741,8 @@ class NewEvaluator:
             ct_out = None
             for j in range(cols):
                 t_id = transform_ids[i][j]
+                if int(t_id) < 0:
+                    continue
 
                 if self.io_mode != "none":
                     current_key = self._transform_io_key(layer_name, int(i), int(j), int(t_id))
@@ -683,7 +788,7 @@ class NewEvaluator:
                 ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
 
                 # Accumulate results across a row of blocks
-                ct_out = ct if j == 0 else ct_out + ct
+                ct_out = ct if ct_out is None else ct_out + ct
                     
                 if self.io_mode != "none":
                     self.remove_rotation_keys(t_id)
@@ -696,6 +801,9 @@ class NewEvaluator:
                         raise_on_low=False,
                     )
                 work_index += 1
+
+            if ct_out is None:
+                raise ValueError(f"Linear transform row {int(i)} has no nonempty blocks")
             
             # We know the output of this accumulation will just be one ciphertext
             if skip_post_rescale:
@@ -709,7 +817,7 @@ class NewEvaluator:
 
     def _dense_shared_cache_enabled(self, *, rows: int, cols: int) -> bool:
         override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-        if override is not None and override.lower() in ("0", "false", "no", "off"):
+        if override is None or override.lower() not in ("1", "true", "yes", "on"):
             return False
         if not callable(getattr(self.backend, "EvaluateLinearTransformsWithSharedCache", None)):
             return False
@@ -788,24 +896,16 @@ class NewEvaluator:
 
         rows = max(int(row) for row, _col, _transform_id in work_items) + 1
         cols = max(int(col) for _row, col, _transform_id in work_items) + 1
-        if int(input_cols) != int(cols):
+        if int(input_cols) < int(cols):
             raise ValueError(
                 f"Linear transform block column count {cols} does not match "
                 f"input ciphertext count {int(input_cols)}"
             )
+        cols = int(input_cols)
 
         matrix = np.full((int(rows), int(cols)), -1, dtype=int)
         for row, col, transform_id in work_items:
             matrix[int(row)][int(col)] = int(transform_id)
-
-        missing = [
-            (int(row), int(col))
-            for row in range(int(rows))
-            for col in range(int(cols))
-            if int(matrix[int(row)][int(col)]) < 0
-        ]
-        if missing:
-            raise ValueError(f"Linear transform id matrix is missing blocks: {missing[:16]}")
         return int(rows), int(cols), matrix
             
     def delete_transforms(self, transform_ids: dict):

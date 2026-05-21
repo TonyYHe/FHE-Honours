@@ -1,5 +1,7 @@
 import math
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch 
 import torch.nn as nn
@@ -112,10 +114,14 @@ def construct_conv2d_toeplitz(conv_layer, weight):
 def construct_conv2d_bias(conv_layer):
     N, Co, Ho, Wo = conv_layer.output_shape 
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
+    output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
+    alpha = max(0, int(output_layout.get("alpha", 0)))
+    beta = max(0, int(output_layout.get("beta", 0)))
+    total_h = int(Ho + alpha + beta)
 
     bias = conv_layer.on_bias
-    bias = bias.repeat_interleave(Ho*Wo)
-    bias = bias.reshape(1, Co, Ho, Wo)
+    bias = bias.repeat_interleave(total_h * Wo)
+    bias = bias.reshape(1, Co, total_h, Wo)
     bias_multiplexed = multiplex(bias, conv_layer.output_gap).squeeze(0)
     
     mC, mH, mW = bias_multiplexed.shape
@@ -252,15 +258,17 @@ class _DirectDiagonalAccumulator:
         is_last_layer: bool,
         *,
         allow_hybrid: bool = True,
+        verbose: bool = True,
     ) -> None:
         self.matrix_height = int(matrix_shape[0])
         self.matrix_width = int(matrix_shape[1])
         self.num_slots = int(num_slots)
         self.num_block_rows = math.ceil(self.matrix_height / self.num_slots)
         self.num_block_cols = math.ceil(self.matrix_width / self.num_slots)
-        print(f"├── embed method: {embed_method}")
-        print(f"├── original matrix shape: {matrix_shape}")
-        print(f"├── # blocks (rows, cols) = {(self.num_block_rows, self.num_block_cols)}")
+        if bool(verbose):
+            print(f"├── embed method: {embed_method}")
+            print(f"├── original matrix shape: {matrix_shape}")
+            print(f"├── # blocks (rows, cols) = {(self.num_block_rows, self.num_block_cols)}")
 
         if (
             allow_hybrid
@@ -278,8 +286,9 @@ class _DirectDiagonalAccumulator:
             self.num_block_rows * self.block_height,
             self.num_block_cols * self.num_slots,
         )
-        print(f"├── resized matrix shape: {self.resized_shape}")
-        print(f"├── # output rotations: {self.output_rotations}")
+        if bool(verbose):
+            print(f"├── resized matrix shape: {self.resized_shape}")
+            print(f"├── # output rotations: {self.output_rotations}")
         self.diagonals_by_block: dict[tuple[int, int], dict[int, np.ndarray]] = {}
 
     def add_entries(self, rows, cols, values) -> None:
@@ -345,6 +354,79 @@ class _DirectDiagonalAccumulator:
             np.add.at(diagonal, positions[start:end].astype(np.int64), values[start:end])
             start = end
 
+    def add_constant_entries(self, rows, cols, value: float) -> None:
+        coeff = float(value)
+        if coeff == 0.0:
+            return
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        cols = np.asarray(cols, dtype=np.int64).reshape(-1)
+        if rows.size == 0:
+            return
+
+        valid = (
+            (rows >= 0)
+            & (rows < self.matrix_height)
+            & (cols >= 0)
+            & (cols < self.matrix_width)
+        )
+        if not bool(np.any(valid)):
+            return
+        rows = rows[valid]
+        cols = cols[valid]
+
+        if self.block_height == self.num_slots:
+            block_rows = rows // self.num_slots
+            local_rows = rows - block_rows * self.num_slots
+            block_cols = cols // self.num_slots
+            local_cols = cols - block_cols * self.num_slots
+            diag_idxs = (local_cols - local_rows) % self.num_slots
+            positions = local_rows
+        else:
+            block_rows = np.zeros_like(rows)
+            local_rows = rows
+            block_cols = cols // self.num_slots
+            local_cols = cols - block_cols * self.num_slots
+            diag_idxs = (local_cols - local_rows) % self.block_height
+            positions = (local_cols - diag_idxs) % self.num_slots
+
+        if rows.size <= 1:
+            bounds = np.array([int(rows.size)], dtype=np.int64)
+        else:
+            change = (
+                (block_rows[1:] != block_rows[:-1])
+                | (block_cols[1:] != block_cols[:-1])
+                | (diag_idxs[1:] != diag_idxs[:-1])
+            )
+            bounds = np.concatenate(
+                (
+                    np.flatnonzero(change).astype(np.int64) + 1,
+                    np.array([int(rows.size)], dtype=np.int64),
+                )
+            )
+
+        start = 0
+        for end_value in bounds:
+            end = int(end_value)
+            block_key = (int(block_rows[start]), int(block_cols[start]))
+            diag_idx = int(diag_idxs[start])
+            block = self.diagonals_by_block.setdefault(block_key, {})
+            diagonal = block.get(diag_idx)
+            if diagonal is None:
+                diagonal = np.zeros((self.num_slots,), dtype=np.float32)
+                block[diag_idx] = diagonal
+            diagonal[positions[start:end].astype(np.int64)] += coeff
+            start = end
+
+    def merge_from(self, other: "_DirectDiagonalAccumulator") -> None:
+        for block_key, source_block in other.diagonals_by_block.items():
+            target_block = self.diagonals_by_block.setdefault(block_key, {})
+            for diag_idx, source_diag in source_block.items():
+                target_diag = target_block.get(int(diag_idx))
+                if target_diag is None:
+                    target_block[int(diag_idx)] = source_diag
+                else:
+                    target_diag += source_diag
+
     def finish(self, start_time: float) -> tuple[dict[tuple[int, int], dict[int, list[float]]], int]:
         out: dict[tuple[int, int], dict[int, list[float]]] = {}
         total_diagonals = 0
@@ -365,6 +447,35 @@ class _DirectDiagonalAccumulator:
         return out, int(self.output_rotations)
 
 
+def _direct_pack_worker_count(item_count: int) -> int:
+    if int(item_count) <= 1:
+        return 1
+    raw = os.environ.get("ORION_PACK_CONV_WORKERS")
+    if raw is None:
+        raw = os.environ.get("ORION_DIRECT_PACK_WORKERS")
+    if raw is None:
+        return 1
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        requested = 1
+    return max(1, min(int(item_count), int(requested)))
+
+
+def _split_contiguous_ranges(item_count: int, workers: int) -> list[tuple[int, int]]:
+    item_count = int(item_count)
+    workers = max(1, min(int(item_count), int(workers)))
+    base, extra = divmod(item_count, workers)
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for worker_index in range(workers):
+        end = start + int(base) + (1 if int(worker_index) < int(extra) else 0)
+        if start < end:
+            ranges.append((int(start), int(end)))
+        start = int(end)
+    return ranges
+
+
 def _packed_flat_indices(
     channel: int,
     rows: np.ndarray,
@@ -373,11 +484,12 @@ def _packed_flat_indices(
     gap: int,
     height: int,
     width: int,
+    row_offset: int = 0,
 ) -> np.ndarray:
     gap = int(gap)
     phase = int(channel) % int(gap * gap)
     packed_channel = int(channel) // int(gap * gap)
-    packed_rows = rows.astype(np.int64) * int(gap) + int(phase // gap)
+    packed_rows = rows.astype(np.int64) * int(gap) + int(phase // gap) + int(row_offset)
     packed_cols = cols.astype(np.int64) * int(gap) + int(phase % gap)
     return (
         (int(packed_channel) * int(height) + packed_rows) * int(width)
@@ -392,9 +504,15 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
     pad_h, pad_w = [int(value) for value in conv_layer.padding]
     dil_h, dil_w = [int(value) for value in conv_layer.dilation]
     k_h, k_w = [int(value) for value in conv_layer.kernel_size]
+    input_layout = dict(getattr(conv_layer, "layout_policy_input_layout", {}) or {})
+    output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
+    input_alpha = max(0, int(input_layout.get("alpha", 0)))
+    input_beta = max(0, int(input_layout.get("beta", 0)))
+    output_alpha = max(0, int(output_layout.get("alpha", 0)))
+    output_beta = max(0, int(output_layout.get("beta", 0)))
 
     oh_grid, ow_grid = np.meshgrid(
-        np.arange(ho, dtype=np.int64),
+        np.arange(-int(output_alpha), int(ho + output_beta), dtype=np.int64),
         np.arange(wo, dtype=np.int64),
         indexing="ij",
     )
@@ -404,8 +522,8 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
             ih_grid = oh_grid * int(stride_h) - int(pad_h) + int(kh) * int(dil_h)
             iw_grid = ow_grid * int(stride_w) - int(pad_w) + int(kw) * int(dil_w)
             valid = (
-                (ih_grid >= 0)
-                & (ih_grid < int(hi))
+                (ih_grid >= -int(input_alpha))
+                & (ih_grid < int(hi + input_beta))
                 & (iw_grid >= 0)
                 & (iw_grid < int(wi))
             )
@@ -443,44 +561,74 @@ def direct_diagonalize_conv2d(
     _, on_co, on_ho, on_wo = [int(value) for value in conv_layer.fhe_output_shape]
     input_gap = int(conv_layer.input_gap)
     output_gap = int(conv_layer.output_gap)
+    input_row_offset = max(0, int(getattr(conv_layer, "layout_policy_input_row_offset", 0) or 0))
+    output_row_offset = max(0, int(getattr(conv_layer, "layout_policy_output_row_offset", 0) or 0))
     input_block_size = int(on_ci * on_hi * on_wi)
     output_block_size = int(on_co * on_ho * on_wo)
 
-    weight = weight.detach().cpu().to(dtype=torch.float32)
+    weight_np = weight.detach().cpu().to(dtype=torch.float32).numpy()
     spatial_cache = _conv2d_spatial_cache(conv_layer)
-    for oc in range(int(co)):
-        for ic in range(int(ci)):
-            for kh in range(int(weight.shape[2])):
-                for kw in range(int(weight.shape[3])):
-                    coeff = float(weight[int(oc), int(ic), int(kh), int(kw)])
-                    if coeff == 0.0:
-                        continue
-                    oh, ow, ih, iw = spatial_cache[(int(kh), int(kw))]
-                    if oh.size == 0:
-                        continue
-                    local_rows = _packed_flat_indices(
-                        int(oc),
-                        oh,
-                        ow,
-                        gap=int(output_gap),
-                        height=int(on_ho),
-                        width=int(on_wo),
-                    )
-                    local_cols = _packed_flat_indices(
-                        int(ic),
-                        ih,
-                        iw,
-                        gap=int(input_gap),
-                        height=int(on_hi),
-                        width=int(on_wi),
-                    )
-                    values = np.full((int(local_rows.size),), float(coeff), dtype=np.float32)
-                    for batch in range(int(n_batch)):
-                        accumulator.add_entries(
-                            local_rows + int(batch) * int(output_block_size),
-                            local_cols + int(batch) * int(input_block_size),
-                            values,
+
+    def fill_accumulator(
+        target: _DirectDiagonalAccumulator,
+        oc_start: int,
+        oc_end: int,
+    ) -> _DirectDiagonalAccumulator:
+        for oc in range(int(oc_start), int(oc_end)):
+            for ic in range(int(ci)):
+                for kh in range(int(weight_np.shape[2])):
+                    for kw in range(int(weight_np.shape[3])):
+                        coeff = float(weight_np[int(oc), int(ic), int(kh), int(kw)])
+                        if coeff == 0.0:
+                            continue
+                        oh, ow, ih, iw = spatial_cache[(int(kh), int(kw))]
+                        if oh.size == 0:
+                            continue
+                        local_rows = _packed_flat_indices(
+                            int(oc),
+                            oh,
+                            ow,
+                            gap=int(output_gap),
+                            height=int(on_ho),
+                            width=int(on_wo),
+                            row_offset=int(output_row_offset),
                         )
+                        local_cols = _packed_flat_indices(
+                            int(ic),
+                            ih,
+                            iw,
+                            gap=int(input_gap),
+                            height=int(on_hi),
+                            width=int(on_wi),
+                            row_offset=int(input_row_offset),
+                        )
+                        for batch in range(int(n_batch)):
+                            target.add_constant_entries(
+                                local_rows + int(batch) * int(output_block_size),
+                                local_cols + int(batch) * int(input_block_size),
+                                float(coeff),
+                            )
+        return target
+
+    workers = _direct_pack_worker_count(int(co))
+    ranges = _split_contiguous_ranges(int(co), int(workers))
+    if len(ranges) <= 1:
+        fill_accumulator(accumulator, 0, int(co))
+    else:
+        print(f"├── direct pack workers: {len(ranges)}")
+        with ThreadPoolExecutor(max_workers=len(ranges), thread_name_prefix="orion-pack-conv2d") as executor:
+            futures = []
+            for oc_start, oc_end in ranges:
+                local = _DirectDiagonalAccumulator(
+                    matrix_shape,
+                    int(num_slots),
+                    str(embed_method),
+                    bool(is_last_layer),
+                    verbose=False,
+                )
+                futures.append(executor.submit(fill_accumulator, local, int(oc_start), int(oc_end)))
+            for future in futures:
+                accumulator.merge_from(future.result())
 
     return accumulator.finish(start_time)
 
@@ -548,50 +696,76 @@ def direct_diagonalize_conv_transpose2d(
     input_block_size = int(on_ci * on_hi * on_wi)
     output_block_size = int(on_co * on_ho * on_wo)
 
-    weight = conv_layer.on_weight.detach().cpu().to(dtype=torch.float32)
+    weight_np = conv_layer.on_weight.detach().cpu().to(dtype=torch.float32).numpy()
     groups = int(conv_layer.groups)
     in_channels_per_group = int(conv_layer.in_channels // groups)
     out_channels_per_group = int(conv_layer.out_channels // groups)
     spatial_cache = _tconv2d_spatial_cache(conv_layer)
 
-    for ic in range(int(ci)):
-        group = int(ic) // int(in_channels_per_group)
-        oc_offset = int(group) * int(out_channels_per_group)
-        for oc_rel in range(int(out_channels_per_group)):
-            oc = int(oc_offset + oc_rel)
-            if int(oc) >= int(co):
-                continue
-            for kh in range(int(weight.shape[2])):
-                for kw in range(int(weight.shape[3])):
-                    coeff = float(weight[int(ic), int(oc_rel), int(kh), int(kw)])
-                    if coeff == 0.0:
-                        continue
-                    ih, iw, oh, ow = spatial_cache[(int(kh), int(kw))]
-                    if ih.size == 0:
-                        continue
-                    local_rows = _packed_flat_indices(
-                        int(oc),
-                        oh,
-                        ow,
-                        gap=int(output_gap),
-                        height=int(on_ho),
-                        width=int(on_wo),
-                    )
-                    local_cols = _packed_flat_indices(
-                        int(ic),
-                        ih,
-                        iw,
-                        gap=int(input_gap),
-                        height=int(on_hi),
-                        width=int(on_wi),
-                    )
-                    values = np.full((int(local_rows.size),), float(coeff), dtype=np.float32)
-                    for batch in range(int(n_batch)):
-                        accumulator.add_entries(
-                            local_rows + int(batch) * int(output_block_size),
-                            local_cols + int(batch) * int(input_block_size),
-                            values,
+    def fill_accumulator(
+        target: _DirectDiagonalAccumulator,
+        ic_start: int,
+        ic_end: int,
+    ) -> _DirectDiagonalAccumulator:
+        for ic in range(int(ic_start), int(ic_end)):
+            group = int(ic) // int(in_channels_per_group)
+            oc_offset = int(group) * int(out_channels_per_group)
+            for oc_rel in range(int(out_channels_per_group)):
+                oc = int(oc_offset + oc_rel)
+                if int(oc) >= int(co):
+                    continue
+                for kh in range(int(weight_np.shape[2])):
+                    for kw in range(int(weight_np.shape[3])):
+                        coeff = float(weight_np[int(ic), int(oc_rel), int(kh), int(kw)])
+                        if coeff == 0.0:
+                            continue
+                        ih, iw, oh, ow = spatial_cache[(int(kh), int(kw))]
+                        if ih.size == 0:
+                            continue
+                        local_rows = _packed_flat_indices(
+                            int(oc),
+                            oh,
+                            ow,
+                            gap=int(output_gap),
+                            height=int(on_ho),
+                            width=int(on_wo),
                         )
+                        local_cols = _packed_flat_indices(
+                            int(ic),
+                            ih,
+                            iw,
+                            gap=int(input_gap),
+                            height=int(on_hi),
+                            width=int(on_wi),
+                        )
+                        for batch in range(int(n_batch)):
+                            target.add_constant_entries(
+                                local_rows + int(batch) * int(output_block_size),
+                                local_cols + int(batch) * int(input_block_size),
+                                float(coeff),
+                            )
+        return target
+
+    workers = _direct_pack_worker_count(int(ci))
+    ranges = _split_contiguous_ranges(int(ci), int(workers))
+    if len(ranges) <= 1:
+        fill_accumulator(accumulator, 0, int(ci))
+    else:
+        print(f"├── direct pack workers: {len(ranges)}")
+        with ThreadPoolExecutor(max_workers=len(ranges), thread_name_prefix="orion-pack-tconv2d") as executor:
+            futures = []
+            for ic_start, ic_end in ranges:
+                local = _DirectDiagonalAccumulator(
+                    matrix_shape,
+                    int(num_slots),
+                    str(embed_method),
+                    bool(is_last_layer),
+                    allow_hybrid=bool(allow_hybrid),
+                    verbose=False,
+                )
+                futures.append(executor.submit(fill_accumulator, local, int(ic_start), int(ic_end)))
+            for future in futures:
+                accumulator.merge_from(future.result())
 
     return accumulator.finish(start_time)
 

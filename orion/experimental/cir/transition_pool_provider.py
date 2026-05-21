@@ -18,6 +18,7 @@ from orion.experimental.cir.runtime_group import (
 from orion.experimental.cir.hybrid_schedule import (
     hybrid_pair_schedule_compatible,
     hybrid_pair_schedule_reject_reason,
+    optimize_hybrid_pair_layout,
 )
 from orion.nn.unified_transform import UnifiedTransformGroup
 
@@ -198,9 +199,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
     kernel_kind = "input_pair_conv_shared_rotations"
     use_ct_pt_hybrid_packing = True
 
-    def __init__(self, *, module: Any, output_node_id: str) -> None:
+    def __init__(self, *, module: Any, output_node_id: str, use_ct_pt_hybrid_packing: bool = True) -> None:
         self.module = module
         self.output_node_id = str(output_node_id)
+        self.use_ct_pt_hybrid_packing = bool(use_ct_pt_hybrid_packing)
         self.output_shape = getattr(module, "output_shape")
         self.fhe_output_shape = getattr(module, "fhe_output_shape")
         self.groups_by_pair: list[Any] = []
@@ -211,6 +213,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_pair_count = 0
         self.hybrid_pair_rejected_count = 0
         self.hybrid_pair_reject_reasons: list[str] = []
+        self.hybrid_pair_layout_strategy = ""
+        self.hybrid_pair_layout_strict_pair_count = 0
+        self.hybrid_pair_layout_covered_output_count = 0
+        self.hybrid_pair_layout_reject_reasons: list[str] = []
         self.rows = 0
         self.cols = 0
         self.output_rotations = 0
@@ -251,9 +257,16 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             "rows": int(self.rows),
             "cols": int(self.cols),
             "output_rotations": int(self.output_rotations),
+            "use_ct_pt_hybrid_packing": bool(self.use_ct_pt_hybrid_packing),
             "hybrid_pair_count": int(self.hybrid_pair_count),
             "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
             "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
+            "hybrid_pair_layout_strategy": str(self.hybrid_pair_layout_strategy),
+            "hybrid_pair_layout_strict_pair_count": int(self.hybrid_pair_layout_strict_pair_count),
+            "hybrid_pair_layout_covered_output_count": int(self.hybrid_pair_layout_covered_output_count),
+            "hybrid_pair_layout_reject_reasons": [
+                str(value) for value in self.hybrid_pair_layout_reject_reasons
+            ],
             "groups": [
                 {
                     "storage_key": str(getattr(group, "_storage_key", "")),
@@ -282,9 +295,20 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.rows = int(metadata.get("rows", 0))
         self.cols = int(metadata.get("cols", 0))
         self.output_rotations = int(metadata.get("output_rotations", 0))
+        self.use_ct_pt_hybrid_packing = bool(
+            metadata.get("use_ct_pt_hybrid_packing", self.use_ct_pt_hybrid_packing)
+        )
         self.hybrid_pair_count = int(metadata.get("hybrid_pair_count", 0))
         self.hybrid_pair_rejected_count = int(metadata.get("hybrid_pair_rejected_count", 0))
         self.hybrid_pair_reject_reasons = [str(value) for value in metadata.get("hybrid_pair_reject_reasons", [])]
+        self.hybrid_pair_layout_strategy = str(metadata.get("hybrid_pair_layout_strategy", ""))
+        self.hybrid_pair_layout_strict_pair_count = int(metadata.get("hybrid_pair_layout_strict_pair_count", 0))
+        self.hybrid_pair_layout_covered_output_count = int(
+            metadata.get("hybrid_pair_layout_covered_output_count", 0)
+        )
+        self.hybrid_pair_layout_reject_reasons = [
+            str(value) for value in metadata.get("hybrid_pair_layout_reject_reasons", [])
+        ]
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
         level = int(self._level(scheme))
         compile_started = time.perf_counter()
@@ -386,6 +410,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_pair_count = 0
         self.hybrid_pair_rejected_count = 0
         self.hybrid_pair_reject_reasons = []
+        self.hybrid_pair_layout_strategy = ""
+        self.hybrid_pair_layout_strict_pair_count = 0
+        self.hybrid_pair_layout_covered_output_count = 0
+        self.hybrid_pair_layout_reject_reasons = []
         self.hybrid_group_reject_reasons = []
         prepare_started = time.perf_counter()
         diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
@@ -415,42 +443,85 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         compile_started = time.perf_counter()
         precreated_groups = {}
         self._save_resume_precreated_groups_by_pair = {}
-        for pair_index, left_col in enumerate(range(0, int(self.cols), 2)):
-            right_col = int(left_col + 1)
-            has_right = int(right_col) < int(self.cols)
+        transforms_by_col: dict[int, list[Any | None]] = {
+            int(col): [
+                transforms_by_row_col.get((int(row), int(col)))
+                for row in range(int(self.rows))
+            ]
+            for col in range(int(self.cols))
+        }
+        if bool(self.use_ct_pt_hybrid_packing):
+            layout_plan = optimize_hybrid_pair_layout(transforms_by_col, int(slots))
+            self.hybrid_pair_layout_strict_pair_count = int(layout_plan.strict_pair_count)
+            self.hybrid_pair_layout_covered_output_count = int(layout_plan.covered_output_count)
+            self.hybrid_pair_layout_reject_reasons = [
+                str(value) for value in layout_plan.rejected_adjacent_pair_reasons
+            ]
+            use_strict_layout = int(layout_plan.strict_pair_count) > 0
+        else:
+            layout_plan = None
+            use_strict_layout = False
+            self.hybrid_pair_layout_strategy = "hybrid_disabled"
+            self.hybrid_pair_layout_strict_pair_count = 0
+            self.hybrid_pair_layout_covered_output_count = 0
+            self.hybrid_pair_layout_reject_reasons = []
+        if bool(use_strict_layout):
+            assert layout_plan is not None
+            self.hybrid_pair_layout_strategy = "strict_schedule_dp"
+            layout_items = [
+                (int(item.left_index), None if item.right_index is None else int(item.right_index), True)
+                for item in layout_plan.items
+            ]
+        elif not bool(self.use_ct_pt_hybrid_packing):
+            layout_items = [(int(col), None, False) for col in range(int(self.cols))]
+        else:
+            self.hybrid_pair_layout_strategy = (
+                "adjacent_schedule_fallback"
+                if int(layout_plan.strict_pair_count) == 0
+                else "adjacent_schedule_regression_guard"
+            )
+            layout_items = []
+            for left_col in range(0, int(self.cols), 2):
+                right_col = int(left_col + 1)
+                has_right = int(right_col) < int(self.cols)
+                layout_items.append((int(left_col), int(right_col) if bool(has_right) else None, False))
 
-            def compile_entries(
-                entries: list[tuple[int, Any]],
-                *,
-                pair: tuple[int, int | None],
-                is_complex: bool,
-                reject_reason: str = "",
-            ) -> None:
-                if not entries:
-                    return
-                precreated = precreated_groups.get(int(pair_index)) if bool(is_complex) else None
-                if precreated is not None and bool(precreated[4]):
-                    group = precreated[0]
-                else:
-                    group = (
-                        precreated[0]
-                        if precreated is not None
-                        else UnifiedTransformGroup([transform for _row, transform in entries])
-                    )
-                    group.transforms = [transform for _row, transform in entries]
-                    group.compile_unified(scheme.backend)
-                self.groups_by_pair.append(group)
-                self.row_indices_by_pair.append(tuple(int(row) for row, _transform in entries))
-                self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
-                self.pair_is_complex.append(bool(is_complex))
-                self.hybrid_group_reject_reasons.append(str(reject_reason))
+        def compile_entries(
+            entries: list[tuple[int, Any]],
+            *,
+            pair: tuple[int, int | None],
+            is_complex: bool,
+            reject_reason: str = "",
+            pair_index: int = 0,
+        ) -> None:
+            if not entries:
+                return
+            precreated = precreated_groups.get(int(pair_index)) if bool(is_complex) else None
+            if precreated is not None and bool(precreated[4]):
+                group = precreated[0]
+            else:
+                group = (
+                    precreated[0]
+                    if precreated is not None
+                    else UnifiedTransformGroup([transform for _row, transform in entries])
+                )
+                group.transforms = [transform for _row, transform in entries]
+                group.compile_unified(scheme.backend)
+            self.groups_by_pair.append(group)
+            self.row_indices_by_pair.append(tuple(int(row) for row, _transform in entries))
+            self.input_block_pairs.append((int(pair[0]), None if pair[1] is None else int(pair[1])))
+            self.pair_is_complex.append(bool(is_complex))
+            self.hybrid_group_reject_reasons.append(str(reject_reason))
 
-            if has_right:
+        for pair_index, (left_col, maybe_right_col, _layout_pair_planned) in enumerate(layout_items):
+            has_right = maybe_right_col is not None
+            right_col = int(maybe_right_col) if maybe_right_col is not None else int(left_col + 1)
+            if bool(has_right):
                 candidates: list[tuple[int, Any | None, Any | None]] = []
                 reject_reasons: list[str] = []
                 for row in range(int(self.rows)):
-                    left = transforms_by_row_col.get((int(row), int(left_col)))
-                    right = transforms_by_row_col.get((int(row), int(right_col)))
+                    left = transforms_by_col[int(left_col)][int(row)]
+                    right = transforms_by_col[int(right_col)][int(row)]
                     if left is None and right is None:
                         continue
                     candidates.append((int(row), left, right))
@@ -480,12 +551,14 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                         pair=(int(left_col), None),
                         is_complex=False,
                         reject_reason=reason,
+                        pair_index=int(pair_index),
                     )
                     compile_entries(
                         right_entries,
                         pair=(int(right_col), None),
                         is_complex=False,
                         reject_reason=reason,
+                        pair_index=int(pair_index),
                     )
                 else:
                     entries = [
@@ -507,6 +580,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                         entries,
                         pair=(int(left_col), int(right_col)),
                         is_complex=True,
+                        pair_index=int(pair_index),
                     )
                 for row, _left, _right in candidates:
                     transforms_by_row_col.pop((int(row), int(left_col)), None)
@@ -514,16 +588,18 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             else:
                 entries = []
                 for row in range(int(self.rows)):
-                    transform = transforms_by_row_col.get((int(row), int(left_col)))
+                    transform = transforms_by_col[int(left_col)][int(row)]
                     if transform is not None:
                         entries.append((int(row), transform))
                 compile_entries(
                     entries,
                     pair=(int(left_col), None),
                     is_complex=False,
+                    pair_index=int(pair_index),
                 )
                 for row, _transform in entries:
                     transforms_by_row_col.pop((int(row), int(left_col)), None)
+        del transforms_by_col
         self.compile_count += 1
         self.last_runtime_timing["compile_unified_s"] = float(time.perf_counter() - compile_started)
 
@@ -605,6 +681,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_pair_count = 0
         self.hybrid_pair_rejected_count = 0
         self.hybrid_pair_reject_reasons = []
+        self.hybrid_pair_layout_strategy = ""
+        self.hybrid_pair_layout_strict_pair_count = 0
+        self.hybrid_pair_layout_covered_output_count = 0
+        self.hybrid_pair_layout_reject_reasons = []
         self._bias_plaintext_cache = {}
 
 
@@ -854,3 +934,104 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
         self.row_indices_by_input = []
         self._conv_bias_plaintext_cache = {}
         self._shortcut_bias_plaintext_cache = {}
+
+
+class BranchPairNoHybridConvRuntimeExecutor:
+    """Transition provider ablation that evaluates branches without real/imag packing."""
+
+    kernel_kind = "branch_pair_conv_no_real_imag"
+    use_ct_pt_hybrid_packing = False
+
+    def __init__(self, *, conv_module: Any, shortcut_module: Any, output_node_ids: tuple[str, str]) -> None:
+        self.conv_module = conv_module
+        self.shortcut_module = shortcut_module
+        self.output_node_ids = tuple(str(value) for value in output_node_ids)
+        self.conv_executor = InputPairConvRuntimeExecutor(
+            module=conv_module,
+            output_node_id=str(self.output_node_ids[0]),
+            use_ct_pt_hybrid_packing=False,
+        )
+        self.shortcut_executor = InputPairConvRuntimeExecutor(
+            module=shortcut_module,
+            output_node_id=str(self.output_node_ids[1]),
+            use_ct_pt_hybrid_packing=False,
+        )
+        self.assigned_level: int | None = None
+        self.assigned_depth: int | None = None
+        self.last_runtime_timing: dict[str, Any] = {}
+        self.last_runtime_io: dict[str, Any] = {}
+        self.compile_count = 0
+
+    @property
+    def rows(self) -> int:
+        return max(int(getattr(self.conv_executor, "rows", 0)), int(getattr(self.shortcut_executor, "rows", 0)))
+
+    @property
+    def cols(self) -> int:
+        return max(int(getattr(self.conv_executor, "cols", 0)), int(getattr(self.shortcut_executor, "cols", 0)))
+
+    @property
+    def groups_by_input(self) -> list[Any]:
+        return list(getattr(self.conv_executor, "groups_by_pair", [])) + list(
+            getattr(self.shortcut_executor, "groups_by_pair", [])
+        )
+
+    @property
+    def input_block_pairs(self) -> list[tuple[int, int | None]]:
+        return list(getattr(self.conv_executor, "input_block_pairs", [])) + list(
+            getattr(self.shortcut_executor, "input_block_pairs", [])
+        )
+
+    def _sync_delegate_assignment(self) -> None:
+        for executor in (self.conv_executor, self.shortcut_executor):
+            executor.assigned_level = self.assigned_level
+            executor.assigned_depth = self.assigned_depth
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        return bool(self.conv_executor.supports_scheme(scheme) and self.shortcut_executor.supports_scheme(scheme))
+
+    def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
+        payload = dict(metadata or {})
+        conv_payload = payload.get("conv")
+        shortcut_payload = payload.get("shortcut")
+        if isinstance(conv_payload, dict):
+            self.conv_executor.load_compile_cache_metadata(conv_payload)
+        if isinstance(shortcut_payload, dict):
+            self.shortcut_executor.load_compile_cache_metadata(shortcut_payload)
+
+    def compile_cache_metadata(self) -> dict[str, Any]:
+        return {
+            "kind": self.kernel_kind,
+            "use_ct_pt_hybrid_packing": False,
+            "conv": self.conv_executor.compile_cache_metadata(),
+            "shortcut": self.shortcut_executor.compile_cache_metadata(),
+            "rows": int(self.rows),
+            "cols": int(self.cols),
+        }
+
+    def compile(self, scheme: Any) -> None:
+        self._sync_delegate_assignment()
+        self.conv_executor.compile(scheme)
+        self.shortcut_executor.compile(scheme)
+        self.compile_count += 1
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        self._sync_delegate_assignment()
+        conv_outputs = dict(self.conv_executor(source_ct))
+        shortcut_outputs = dict(self.shortcut_executor(source_ct))
+        self.last_runtime_timing = {
+            "conv": dict(getattr(self.conv_executor, "last_runtime_timing", {}) or {}),
+            "shortcut": dict(getattr(self.shortcut_executor, "last_runtime_timing", {}) or {}),
+        }
+        self.last_runtime_io = {
+            "runtime_lowering": "branch_pair_conv_no_real_imag",
+            "provider_executor": type(self).__name__,
+            "conv_executor": type(self.conv_executor).__name__,
+            "shortcut_executor": type(self.shortcut_executor).__name__,
+            "use_ct_pt_hybrid_packing": False,
+        }
+        return {**conv_outputs, **shortcut_outputs}
+
+    def cleanup(self, backend: Any | None) -> None:
+        self.conv_executor.cleanup(backend)
+        self.shortcut_executor.cleanup(backend)

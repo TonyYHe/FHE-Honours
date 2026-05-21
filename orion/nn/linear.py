@@ -275,11 +275,12 @@ class Conv2d(LinearTransform):
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
             runtime.assigned_level = int(self.level)
-            runtime.assigned_depth = int(self.depth or 0)
+            runtime_depth = int(getattr(runtime, "depth", self.depth or 0) or 0)
+            runtime.assigned_depth = int(runtime_depth)
             if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_level"):
                 runtime.executor.assigned_level = int(self.level)
             if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_depth"):
-                runtime.executor.assigned_depth = int(self.depth or 0)
+                runtime.executor.assigned_depth = int(runtime_depth)
             if not bool(getattr(self, "region_first_probe_lazy_region_compile", False)):
                 runtime.compile(self.scheme)
             self.transform_ids = {}
@@ -425,11 +426,12 @@ class ConvTranspose2d(LinearTransform):
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
             runtime.assigned_level = int(self.level)
-            runtime.assigned_depth = int(self.depth or 0)
+            runtime_depth = int(getattr(runtime, "depth", self.depth or 0) or 0)
+            runtime.assigned_depth = int(runtime_depth)
             if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_level"):
                 runtime.executor.assigned_level = int(self.level)
             if getattr(runtime, "executor", None) is not None and hasattr(runtime.executor, "assigned_depth"):
-                runtime.executor.assigned_depth = int(self.depth or 0)
+                runtime.executor.assigned_depth = int(runtime_depth)
             runtime.compile(self.scheme)
             self.transform_ids = {}
             return

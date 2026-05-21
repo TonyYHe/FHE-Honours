@@ -14,6 +14,8 @@ from orion.experimental.cir.hybrid_schedule import (
     hybrid_pair_schedule_compatible,
     hybrid_schedule_signature,
     mark_hybrid_schedule_padding_allowed,
+    materialize_hybrid_pair_layout_schedules,
+    optimize_hybrid_pair_layout,
     pad_hybrid_pair_to_common_schedule,
 )
 from orion.nn import unified_transform as unified_transform_module
@@ -286,6 +288,50 @@ def test_hybrid_schedule_padding_is_explicit_and_family_scoped() -> None:
     assert hybrid_pair_schedule_compatible(padded_left, padded_right, slots=8) is True
     assert sorted(padded_left.diagonals[(0, 0)]) == [0, 1]
     assert sorted(padded_right.diagonals[(0, 0)]) == [0, 1]
+
+
+def test_hybrid_pair_layout_optimizer_shifts_boundaries_to_maximize_strict_pairs() -> None:
+    transforms_by_block = {
+        0: [_fake_transform({0: torch.ones(8)})],
+        1: [_fake_transform({1: torch.ones(8)})],
+        2: [_fake_transform({1: torch.ones(8)})],
+    }
+
+    plan = optimize_hybrid_pair_layout(transforms_by_block, slots=8)
+
+    assert [(item.left_index, item.right_index) for item in plan.items] == [(0, None), (1, 2)]
+    assert plan.strict_pair_count == 1
+    assert plan.covered_output_count == 1
+    assert plan.singleton_count == 1
+    assert plan.uses_shifted_boundaries is True
+    assert any("input_pair=(0,1)" in reason for reason in plan.rejected_adjacent_pair_reasons)
+
+
+def test_hybrid_pair_layout_materializes_planner_approved_common_schedule() -> None:
+    left = _fake_transform({0: torch.ones(8)})
+    right = _fake_transform({1: torch.ones(8)})
+    mark_hybrid_schedule_padding_allowed(left, family="global_layout")
+    mark_hybrid_schedule_padding_allowed(right, family="global_layout")
+    transforms_by_block = {0: [left], 1: [right]}
+
+    plan = optimize_hybrid_pair_layout(
+        transforms_by_block,
+        slots=8,
+        allow_schedule_materialization=True,
+    )
+    result = materialize_hybrid_pair_layout_schedules(
+        transforms_by_block,
+        plan,
+        slots=8,
+        name_prefix="global_layout_test",
+    )
+
+    assert [(item.left_index, item.right_index) for item in plan.items] == [(0, 1)]
+    assert plan.strict_pair_count == 1
+    assert plan.schedule_materialized_pair_count == 1
+    assert result.pair_count == 1
+    assert result.output_count == 1
+    assert hybrid_pair_schedule_compatible(transforms_by_block[0][0], transforms_by_block[1][0], slots=8)
 
 
 def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> None:
@@ -597,6 +643,38 @@ def test_save_resume_reuses_complete_unified_group(tmp_path, monkeypatch) -> Non
     assert resume_backend.serialized == []
     assert resume_transforms[0].diagonals == {}
     assert resume_transforms[1].diagonals == {}
+
+
+def test_save_resume_missing_unified_root_falls_back_to_compile(tmp_path) -> None:
+    diags_path = tmp_path / "unified_diagonals.h5"
+    with h5py.File(diags_path, "w") as handle:
+        handle.create_group("unrelated")
+
+    transforms = (
+        _fake_transform(
+            {0: [1.0, 0.0, 0.0, 0.0], 1: [0.0, 2.0, 0.0, 0.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+            compile_save_resume=True,
+        ),
+        _fake_transform(
+            {0: [3.0, 0.0, 0.0, 0.0], 2: [0.0, 4.0, 0.0, 0.0]},
+            io_mode="save",
+            diags_path=str(diags_path),
+            compile_save_resume=True,
+        ),
+    )
+    backend = _FakeUnifiedLoadBackend()
+    backend.memory_bounded_unified_transforms = True
+    group = UnifiedTransformGroup(transforms)
+
+    group.compile_unified(backend)
+
+    assert backend.loaded_shells == []
+    assert backend.generated
+    with h5py.File(diags_path, "r") as handle:
+        assert "__unified_transform_groups__" in handle
+        assert group._storage_key in handle["__unified_transform_groups__"]
 
 
 def test_memory_bounded_eval_schedule_can_change_without_recompile(tmp_path) -> None:

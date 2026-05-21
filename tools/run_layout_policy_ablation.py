@@ -13,13 +13,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orion.experimental.layout_policy_ablation import (
+    attach_backend_runtime_anchors,
     attach_non_ckks_simulation,
+    attach_python_runtime_anchors,
     attach_runtime_anchor,
     build_planner_ablation,
     normalize_policies,
+    run_backend_runtime_anchors,
     run_non_ckks_layout_simulation,
+    run_python_runtime_anchors,
     run_runtime_anchor,
 )
+from orion.experimental.layout_policy_ablation import PROVIDER_PRESSURE_SUMMARY_KEYS
 
 
 DEFAULT_CACHE_ROOT = Path("/run/media/anakano/7TB/haloed-cache")
@@ -32,7 +37,10 @@ SUMMARY_COLUMNS = [
     "total_ciphertext_tiles",
     "stored_slots",
     "relayout_rotation_estimate",
+    "relayout_mask_mult_estimate",
+    "relayout_depth_estimate",
     "lt_bsgs_rotation_estimate",
+    "compact_fallback_penalty_estimate",
     "bootstrap_proxy",
     "bootstrap_count",
     "he_forward_s",
@@ -45,6 +53,7 @@ SUMMARY_COLUMNS = [
     "max_abs",
     "layout_alignment_ok",
     "objective",
+    *PROVIDER_PRESSURE_SUMMARY_KEYS,
 ]
 
 
@@ -84,14 +93,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         simulation = run_non_ckks_layout_simulation(payload, seed=int(args.sim_seed))
         payload = attach_non_ckks_simulation(payload, simulation)
     if "e2e" in modes:
-        anchor = run_runtime_anchor(
-            network=str(args.network),
-            backend=str(args.backend),
-            cache_root=Path(args.cache_root),
-            compile_timeout_s=int(args.compile_timeout_s),
-            python=Path(args.python) if args.python is not None else None,
-        )
-        payload = attach_runtime_anchor(payload, anchor)
+        if str(args.backend) == "python":
+            anchors = run_python_runtime_anchors(payload, seed=int(args.sim_seed))
+            payload = attach_python_runtime_anchors(payload, anchors)
+        elif str(args.backend) == "lattigo":
+            anchors = run_backend_runtime_anchors(
+                payload,
+                backend=str(args.backend),
+                cache_root=Path(args.cache_root),
+                compile_timeout_s=int(args.compile_timeout_s),
+                python=Path(args.python) if args.python is not None else None,
+            )
+            payload = attach_backend_runtime_anchors(payload, anchors)
+        else:
+            anchor = run_runtime_anchor(
+                network=str(args.network),
+                backend=str(args.backend),
+                cache_root=Path(args.cache_root),
+                compile_timeout_s=int(args.compile_timeout_s),
+                python=Path(args.python) if args.python is not None else None,
+            )
+            payload = attach_runtime_anchor(payload, anchor)
     out_json = _write_outputs(payload, Path(args.out))
     payload["out_csv"] = str(Path(args.out))
     payload["out_json"] = str(out_json)
@@ -100,7 +122,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run U22 full-graph halo layout-policy planner ablation.")
-    parser.add_argument("--network", choices=("u22_64_base32", "u22_256_base32"), default="u22_64_base32")
+    parser.add_argument(
+        "--network",
+        choices=("u22_64_base32", "u22_128_base32", "u22_256_base32"),
+        default="u22_64_base32",
+    )
     parser.add_argument("--policies", nargs="+", default=("fixed_max", "eager", "greedy", "dp"))
     parser.add_argument("--mode", default="planner", help="Comma-separated: planner, planner,simulate, or planner,e2e.")
     parser.add_argument("--backend", choices=("lattigo", "cheddar", "python"), default="lattigo")

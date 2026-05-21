@@ -790,7 +790,10 @@ class UnifiedTransformGroup:
         # Saved plaintext payloads are tied to how the backend constructs the
         # unified transform. If save mode compiled one transform at a time,
         # load mode must do the same before reloading those payloads.
-        return self._io_mode == "load" and bool(self._diags_path)
+        if self._io_mode == "load" and bool(self._diags_path):
+            return True
+        raw = os.environ.get("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "")
+        return self._io_mode == "none" and raw.strip().lower() not in ("", "0", "false", "no", "off")
 
     def _memory_bounded_eval_enabled(self, backend) -> bool:
         return (
@@ -1266,7 +1269,14 @@ class UnifiedTransformGroup:
                 "'orion.diags_path' to be set."
             )
         handle = h5py.File(self._diags_path, mode)
-        root = handle.require_group(self._storage_root_name())
+        if str(mode) == "r":
+            try:
+                root = handle[self._storage_root_name()]
+            except KeyError:
+                handle.close()
+                raise
+        else:
+            root = handle.require_group(self._storage_root_name())
         return handle, root
 
     def _save_and_unload_plaintext_diagonals(self, backend) -> None:
@@ -1721,6 +1731,17 @@ class UnifiedTransformGroup:
         count_value = int(descriptor_count)
         if count_value <= 0:
             return ()
+        batch_limit = int(_unified_cached_load_batch_limit())
+        if batch_limit > 0 and batch_limit < count_value:
+            sizes: list[int] = []
+            offset = 0
+            while offset < count_value:
+                size = min(int(batch_limit), int(count_value - offset))
+                sizes.append(int(size))
+                offset += int(size)
+            return tuple(sizes)
+        if batch_limit >= count_value:
+            return (count_value,)
         handle, root = self._storage_group("r")
         try:
             storage = root[self._storage_key]
@@ -1732,16 +1753,7 @@ class UnifiedTransformGroup:
         finally:
             handle.close()
 
-        batch_limit = int(_unified_cached_load_batch_limit())
-        if batch_limit <= 0 or batch_limit >= count_value:
-            return (count_value,)
-        sizes: list[int] = []
-        offset = 0
-        while offset < count_value:
-            size = min(int(batch_limit), int(count_value - offset))
-            sizes.append(int(size))
-            offset += int(size)
-        return tuple(sizes)
+        return (count_value,)
 
     def _generate_unified_backend_load_batch(
         self,
