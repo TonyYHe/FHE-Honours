@@ -321,7 +321,9 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
     }
     u22_base_modes = {
         "u22_phase1",
+        "u22_64_base8",
         "u22_64_base32",
+        "u22_256_base8",
         "u22_256_base32",
     }
     u22_mode_base = next(
@@ -342,6 +344,16 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         index = 0
         while index < len(tokens):
             token = tokens[int(index)]
+            if token in {"nohybrid", "nori", "noir"}:
+                index += 1
+                continue
+            if (
+                token in {"hybrid", "ir", "ri"}
+                and int(index + 1) < len(tokens)
+                and str(tokens[int(index + 1)]) in {"0", "false", "off", "no"}
+            ):
+                index += 2
+                continue
             if token == "conv":
                 u22_conv_kernels = True
                 index += 1
@@ -378,7 +390,7 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
             index += 1
         if allowed:
             u22_allowed_nodes = tuple(dict.fromkeys(allowed))
-    if u22_mode_base in {"u22_64_base32", "u22_256_base32"} and u22_allowed_nodes is None:
+    if u22_mode_base in {"u22_64_base8", "u22_64_base32", "u22_256_base8", "u22_256_base32"} and u22_allowed_nodes is None:
         u22_allowed_nodes = ("up1", "up2", "up3", "up4")
     elif u22_mode_base is not None and u22_allowed_nodes is None:
         u22_allowed_nodes = ("up4", "up3")

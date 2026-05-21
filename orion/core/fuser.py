@@ -15,19 +15,21 @@ class Fuser:
         linear.on_bias = linear.on_bias * cheb.prescale + cheb.constant
         
         cheb.fused = True
-        cheb.depth -= 1 # The prescale no longer consumes a level
+        if cheb.prescale != 1:
+            cheb.depth -= 1 # The prescale no longer consumes a level
 
     def _fuse_bn_chebyshev(self, bn, cheb):
         if bn.affine:
             bn.on_weight = bn.on_weight * cheb.prescale
             bn.on_bias = bn.on_bias * cheb.prescale + cheb.constant
         else:
-            bn.affine = True 
+            bn.affine = True
             bn.on_weight = torch.ones(bn.num_features) * cheb.prescale
             bn.on_bias = torch.ones(bn.num_features) * cheb.constant
 
         cheb.fused = True
-        cheb.depth -= 1
+        if cheb.prescale != 1:
+            cheb.depth -= 1
 
     def _fuse_linear_bn(self, linear, bn):
         on_inv_running_std = 1 / torch.sqrt(bn.on_running_var + bn.eps) 
@@ -51,7 +53,6 @@ class Fuser:
                 parent_module = self.network_dag.nodes[parent]["module"]
                 if isinstance(parent_module, parent_class):
                     parent_modules.append(parent_module)
-            
             return parent_modules
 
         # We'll iterate over all nodes in our network to determine if the
@@ -81,5 +82,3 @@ class Fuser:
         self.fuse_linear_chebyshev()
         self.fuse_bn_chebyshev()
         self.fuse_linear_bn()
-
-            

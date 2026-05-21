@@ -2,25 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
-from orion.experimental.cir.transition_pool_provider import (
-    BranchPairConvRuntimeExecutor,
-    BranchPairNoHybridConvRuntimeExecutor,
-    InputPairConvRuntimeExecutor,
+from orion.experimental.cir.native_halo_conv2d import (
+    NativeHaloStripeNoRIConvExecutor,
+    native_halo_conv2d_spec_from_module,
 )
+from orion.experimental.cir.transition_pool_provider import BranchPairNoHybridConvRuntimeExecutor
 
 
 class HaloLocalConvRuntimeExecutor:
     """Generic halo-local Conv2d/AvgPool provider facade.
 
-    The public provider path is intentionally network-agnostic.  For the
-    existing R34 same-shape kernels we delegate to the proven tile-local
-    lowering internally, while direct Conv2d/AvgPool nodes use the shared
-    input-pair provider.  This keeps R34/U22/U256 registries from depending on
-    R34-specific executor classes.
+    The public provider path is intentionally network-agnostic, but Conv2d
+    lowering must stay in the native aligned halo no-RI family.  When an
+    explicit R34 same-shape spec is not supplied, supported Conv2d modules get
+    a generic native halo-stripe spec inferred from the module metadata.
+    Unsupported shapes fail loudly instead of falling back to the input-pair
+    provider.
     """
 
     kernel_kind = "halo_local_conv2d"
-    use_ct_pt_hybrid_packing = True
+    use_ct_pt_hybrid_packing = False
     native_halo_input_capable = True
     native_halo_output_capable = True
 
@@ -31,25 +32,33 @@ class HaloLocalConvRuntimeExecutor:
         output_node_id: str,
         same_shape_spec: Any | None = None,
         force_input_pair: bool = False,
-        use_real_imag_hybrid: bool = True,
         native_halo_input_capable: bool | None = None,
     ) -> None:
         self.module = module
         self.output_node_id = str(output_node_id)
         self.same_shape_spec = same_shape_spec
         self.force_input_pair = bool(force_input_pair)
-        self.use_ct_pt_hybrid_packing = bool(use_real_imag_hybrid)
+        self.use_ct_pt_hybrid_packing = False
         self._native_halo_input_override = (
             None if native_halo_input_capable is None else bool(native_halo_input_capable)
         )
         self.assigned_level: int | None = None
         self.assigned_depth: int | None = None
+        inferred_native_spec = (
+            None
+            if self.same_shape_spec is not None
+            else native_halo_conv2d_spec_from_module(
+                self.module,
+                output_node_id=self.output_node_id,
+            )
+        )
+        generic_native_capable = inferred_native_spec is not None
         self.native_halo_input_capable = (
-            bool(same_shape_spec is None or bool(force_input_pair))
+            bool(generic_native_capable)
             if self._native_halo_input_override is None
             else bool(self._native_halo_input_override)
         )
-        self.native_halo_output_capable = bool(same_shape_spec is None or bool(force_input_pair))
+        self.native_halo_output_capable = bool(generic_native_capable)
         self.last_runtime_io: dict[str, Any] = {}
         self._delegate: Any | None = None
 
@@ -61,46 +70,43 @@ class HaloLocalConvRuntimeExecutor:
         return self._delegate
 
     def _make_delegate(self) -> Any:
-        if self.same_shape_spec is not None and not bool(self.force_input_pair):
+        if bool(self.force_input_pair):
+            raise RuntimeError(
+                "HaloLocalConvRuntimeExecutor no longer supports input-pair fallback; "
+                "use a native aligned halo no-RI Conv spec or an explicit non-halo provider."
+            )
+        if self.same_shape_spec is not None:
             from orion.experimental.cir.r34_orion_same_shape import (
-                R34InterGroupHybridSameShapeRuntimeExecutor,
-                R34NoHybridSameShapeRuntimeExecutor,
-                R34Pack2SameShapeRuntimeExecutor,
+                NativeAlignedHaloNoRIConvExecutor,
             )
 
-            policy = str(getattr(self.same_shape_spec, "policy", ""))
-            if not bool(self.use_ct_pt_hybrid_packing):
-                delegate = R34NoHybridSameShapeRuntimeExecutor(
-                    module=self.module,
-                    spec=self.same_shape_spec,
-                    output_node_id=self.output_node_id,
+            delegate = NativeAlignedHaloNoRIConvExecutor(
+                module=self.module,
+                spec=self.same_shape_spec,
+                output_node_id=self.output_node_id,
+            )
+        else:
+            spec = native_halo_conv2d_spec_from_module(
+                self.module,
+                output_node_id=self.output_node_id,
+            )
+            if spec is None:
+                raise RuntimeError(
+                    "HaloLocalConvRuntimeExecutor requires a native halo-stripe no-RI Conv2d spec; "
+                    f"cannot infer one for {self.output_node_id!r}."
                 )
-            elif policy == "inter_group_hybrid":
-                delegate = R34InterGroupHybridSameShapeRuntimeExecutor(
-                    module=self.module,
-                    spec=self.same_shape_spec,
-                    output_node_id=self.output_node_id,
-                )
-            else:
-                delegate = R34Pack2SameShapeRuntimeExecutor(
-                    module=self.module,
-                    spec=self.same_shape_spec,
-                    output_node_id=self.output_node_id,
-                )
-            # The R34 lowerer already materializes tile-local halo sections, but
-            # it is not the row-offset native-halo path used by input-pair convs.
-            self.native_halo_input_capable = False
-            self.native_halo_output_capable = False
-            return delegate
+            delegate = NativeHaloStripeNoRIConvExecutor(
+                module=self.module,
+                spec=spec,
+                output_node_id=self.output_node_id,
+            )
         self.native_halo_input_capable = (
-            True if self._native_halo_input_override is None else bool(self._native_halo_input_override)
+            bool(getattr(delegate, "native_halo_input_capable", False))
+            if self._native_halo_input_override is None
+            else bool(self._native_halo_input_override)
         )
-        self.native_halo_output_capable = True
-        return InputPairConvRuntimeExecutor(
-            module=self.module,
-            output_node_id=self.output_node_id,
-            use_ct_pt_hybrid_packing=bool(self.use_ct_pt_hybrid_packing),
-        )
+        self.native_halo_output_capable = bool(getattr(delegate, "native_halo_output_capable", False))
+        return delegate
 
     def _sync_delegate_assignment(self) -> None:
         if self._delegate is None:
@@ -176,7 +182,7 @@ class HaloLocalBranchPairConvRuntimeExecutor:
     kernel_kind = "halo_local_branch_pair_conv2d"
     native_halo_input_capable = False
 
-    use_ct_pt_hybrid_packing = True
+    use_ct_pt_hybrid_packing = False
 
     def __init__(
         self,
@@ -184,21 +190,15 @@ class HaloLocalBranchPairConvRuntimeExecutor:
         conv_module: Any,
         shortcut_module: Any,
         output_node_ids: tuple[str, str],
-        use_real_imag_hybrid: bool = True,
     ) -> None:
         self.conv_module = conv_module
         self.shortcut_module = shortcut_module
         self.output_node_ids = tuple(str(value) for value in output_node_ids)
-        self.use_ct_pt_hybrid_packing = bool(use_real_imag_hybrid)
+        self.use_ct_pt_hybrid_packing = False
         self.assigned_level: int | None = None
         self.assigned_depth: int | None = None
         self.last_runtime_io: dict[str, Any] = {}
-        delegate_cls = (
-            BranchPairConvRuntimeExecutor
-            if bool(self.use_ct_pt_hybrid_packing)
-            else BranchPairNoHybridConvRuntimeExecutor
-        )
-        self._delegate = delegate_cls(
+        self._delegate = BranchPairNoHybridConvRuntimeExecutor(
             conv_module=conv_module,
             shortcut_module=shortcut_module,
             output_node_ids=self.output_node_ids,

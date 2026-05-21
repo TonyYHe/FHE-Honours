@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from orion.core.auto_bootstrap import BootstrapPlacer
 from orion.nn.operations import Bootstrap
 
 
@@ -36,3 +37,17 @@ def test_bootstrap_prescale_plaintexts_are_cached_per_runtime_level() -> None:
     higher_level = bootstrap._get_prescale_ptxt(2)
     assert higher_level.level == 2
     assert encoder.calls == [(1, 202, 64), (2, 303, 64)]
+
+
+def test_bootstrap_placer_uses_runtime_materialized_output_shape() -> None:
+    class _RuntimeExecutor:
+        def runtime_fhe_output_shape(self):
+            return torch.Size([1, 1, 6, 4])
+
+    module = SimpleNamespace(
+        fhe_output_shape=torch.Size([1, 1, 4, 4]),
+        region_runtime=SimpleNamespace(executor=_RuntimeExecutor()),
+    )
+    placer = BootstrapPlacer(net=SimpleNamespace(), network_dag=None)
+
+    assert tuple(int(value) for value in placer._runtime_fhe_output_shape(module)) == (1, 1, 6, 4)

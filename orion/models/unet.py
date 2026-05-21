@@ -129,11 +129,43 @@ def list_unet22_medical_specs() -> tuple[UNet22MedicalSpec, ...]:
     return tuple(_U22_MEDICAL_SPECS[name] for name in sorted(_U22_MEDICAL_SPECS))
 
 
+def _normalize_u22_activation(activation: str | None) -> str:
+    if activation is None:
+        return "none"
+    normalized = str(activation).strip().lower()
+    if normalized in {"", "none", "identity", "linear"}:
+        return "none"
+    if normalized in {"silu", "swish"}:
+        return "silu"
+    if normalized == "relu":
+        return "relu"
+    raise ValueError(f"Unsupported UNet22 activation {activation!r}")
+
+
+def _make_u22_activation(activation: str | None, *, silu_degree: int):
+    normalized = _normalize_u22_activation(activation)
+    if normalized == "none":
+        return None
+    if normalized == "silu":
+        return on.SiLU(degree=int(silu_degree))
+    if normalized == "relu":
+        return on.ReLU()
+    raise AssertionError(f"unhandled UNet22 activation {normalized!r}")
+
+
+def _apply_u22_activation(module, x):
+    if module is None:
+        return x
+    return module(x)
+
+
 def get_unet22_medical_model(
     name: str,
     *,
     base_channels: int | None = None,
     base_dim: int | None = None,
+    activation: str | None = None,
+    silu_degree: int = 31,
 ) -> "UNet22":
     spec = get_unet22_medical_spec(name)
     requested_base = base_channels if base_channels is not None else base_dim
@@ -144,6 +176,8 @@ def get_unet22_medical_model(
         in_channels=spec.in_channels,
         out_channels=spec.out_channels,
         base_channels=requested_base,
+        activation=activation,
+        silu_degree=int(silu_degree),
     )
 
 
@@ -163,6 +197,8 @@ class UNet22(on.Module):
         out_channels: int | None = None,
         base_channels: int | None = None,
         base_dim: int | None = None,
+        activation: str | None = None,
+        silu_degree: int = 31,
     ):
         super().__init__()
         dataset = _normalize_u22_dataset(dataset)
@@ -180,88 +216,136 @@ class UNet22(on.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.base_channels = base
+        self.activation = _normalize_u22_activation(activation)
+        self.silu_degree = int(silu_degree)
 
         c1 = int(base)
         c2 = int(base * 2)
         c3 = int(base * 4)
         c4 = int(base * 8)
         c5 = int(base * 16)
+        make_act = lambda: _make_u22_activation(self.activation, silu_degree=self.silu_degree)
 
         self.enc1a = on.Conv2d(in_channels, c1, kernel_size=3, padding=1, bias=True)
+        self.enc1a_act = make_act()
         self.enc1b = on.Conv2d(c1, c1, kernel_size=3, padding=1, bias=True)
+        self.enc1b_act = make_act()
         self.pool1 = on.AvgPool2d(kernel_size=2, stride=2)
 
         self.enc2a = on.Conv2d(c1, c2, kernel_size=3, padding=1, bias=True)
+        self.enc2a_act = make_act()
         self.enc2b = on.Conv2d(c2, c2, kernel_size=3, padding=1, bias=True)
+        self.enc2b_act = make_act()
         self.pool2 = on.AvgPool2d(kernel_size=2, stride=2)
 
         self.enc3a = on.Conv2d(c2, c3, kernel_size=3, padding=1, bias=True)
+        self.enc3a_act = make_act()
         self.enc3b = on.Conv2d(c3, c3, kernel_size=3, padding=1, bias=True)
+        self.enc3b_act = make_act()
         self.pool3 = on.AvgPool2d(kernel_size=2, stride=2)
 
         self.enc4a = on.Conv2d(c3, c4, kernel_size=3, padding=1, bias=True)
+        self.enc4a_act = make_act()
         self.enc4b = on.Conv2d(c4, c4, kernel_size=3, padding=1, bias=True)
+        self.enc4b_act = make_act()
         self.pool4 = on.AvgPool2d(kernel_size=2, stride=2)
 
         self.bottlenecka = on.Conv2d(c4, c5, kernel_size=3, padding=1, bias=True)
+        self.bottlenecka_act = make_act()
         self.bottleneckb = on.Conv2d(c5, c5, kernel_size=3, padding=1, bias=True)
+        self.bottleneckb_act = make_act()
 
         self.up4 = on.ConvTranspose2d(c5, c4, kernel_size=2, stride=2, bias=True)
         self.add4 = on.Add()
         self.dec4a = on.Conv2d(c4, c4, kernel_size=3, padding=1, bias=True)
+        self.dec4a_act = make_act()
         self.dec4b = on.Conv2d(c4, c4, kernel_size=3, padding=1, bias=True)
+        self.dec4b_act = make_act()
 
         self.up3 = on.ConvTranspose2d(c4, c3, kernel_size=2, stride=2, bias=True)
         self.add3 = on.Add()
         self.dec3a = on.Conv2d(c3, c3, kernel_size=3, padding=1, bias=True)
+        self.dec3a_act = make_act()
         self.dec3b = on.Conv2d(c3, c3, kernel_size=3, padding=1, bias=True)
+        self.dec3b_act = make_act()
 
         self.up2 = on.ConvTranspose2d(c3, c2, kernel_size=2, stride=2, bias=True)
         self.add2 = on.Add()
         self.dec2a = on.Conv2d(c2, c2, kernel_size=3, padding=1, bias=True)
+        self.dec2a_act = make_act()
         self.dec2b = on.Conv2d(c2, c2, kernel_size=3, padding=1, bias=True)
+        self.dec2b_act = make_act()
 
         self.up1 = on.ConvTranspose2d(c2, c1, kernel_size=2, stride=2, bias=True)
         self.add1 = on.Add()
         self.dec1a = on.Conv2d(c1, c1, kernel_size=3, padding=1, bias=True)
+        self.dec1a_act = make_act()
         self.dec1b = on.Conv2d(c1, out_channels, kernel_size=3, padding=1, bias=True)
 
     def forward(self, x):
-        skip1 = self.enc1b(self.enc1a(x))
-        skip2 = self.enc2b(self.enc2a(self.pool1(skip1)))
-        skip3 = self.enc3b(self.enc3a(self.pool2(skip2)))
-        skip4 = self.enc4b(self.enc4a(self.pool3(skip3)))
+        x = _apply_u22_activation(self.enc1a_act, self.enc1a(x))
+        skip1 = _apply_u22_activation(self.enc1b_act, self.enc1b(x))
 
-        x = self.bottleneckb(self.bottlenecka(self.pool4(skip4)))
+        x = _apply_u22_activation(self.enc2a_act, self.enc2a(self.pool1(skip1)))
+        skip2 = _apply_u22_activation(self.enc2b_act, self.enc2b(x))
 
-        x = self.dec4b(self.dec4a(self.add4(self.up4(x), skip4)))
-        x = self.dec3b(self.dec3a(self.add3(self.up3(x), skip3)))
-        x = self.dec2b(self.dec2a(self.add2(self.up2(x), skip2)))
-        x = self.dec1b(self.dec1a(self.add1(self.up1(x), skip1)))
+        x = _apply_u22_activation(self.enc3a_act, self.enc3a(self.pool2(skip2)))
+        skip3 = _apply_u22_activation(self.enc3b_act, self.enc3b(x))
+
+        x = _apply_u22_activation(self.enc4a_act, self.enc4a(self.pool3(skip3)))
+        skip4 = _apply_u22_activation(self.enc4b_act, self.enc4b(x))
+
+        x = _apply_u22_activation(self.bottlenecka_act, self.bottlenecka(self.pool4(skip4)))
+        x = _apply_u22_activation(self.bottleneckb_act, self.bottleneckb(x))
+
+        x = _apply_u22_activation(self.dec4a_act, self.dec4a(self.add4(self.up4(x), skip4)))
+        x = _apply_u22_activation(self.dec4b_act, self.dec4b(x))
+        x = _apply_u22_activation(self.dec3a_act, self.dec3a(self.add3(self.up3(x), skip3)))
+        x = _apply_u22_activation(self.dec3b_act, self.dec3b(x))
+        x = _apply_u22_activation(self.dec2a_act, self.dec2a(self.add2(self.up2(x), skip2)))
+        x = _apply_u22_activation(self.dec2b_act, self.dec2b(x))
+        x = _apply_u22_activation(self.dec1a_act, self.dec1a(self.add1(self.up1(x), skip1)))
+        x = self.dec1b(x)
         return x
 
 
 class UNet22MontgomeryLung64(UNet22):
     """UNet22(base_dim=32) for 64x64 Montgomery CXR lung segmentation."""
 
-    def __init__(self, base_channels: int | None = None, base_dim: int | None = 32):
+    def __init__(
+        self,
+        base_channels: int | None = None,
+        base_dim: int | None = 32,
+        activation: str | None = None,
+        silu_degree: int = 31,
+    ):
         super().__init__(
             dataset="montgomery_lung_64",
             in_channels=1,
             out_channels=1,
             base_channels=base_channels,
             base_dim=base_dim,
+            activation=activation,
+            silu_degree=int(silu_degree),
         )
 
 
 class UNet22KvasirPolyp256(UNet22):
     """UNet22(base_dim=32) for 256x256 Kvasir-SEG polyp segmentation."""
 
-    def __init__(self, base_channels: int | None = None, base_dim: int | None = 32):
+    def __init__(
+        self,
+        base_channels: int | None = None,
+        base_dim: int | None = 32,
+        activation: str | None = None,
+        silu_degree: int = 31,
+    ):
         super().__init__(
             dataset="kvasir_polyp_256",
             in_channels=3,
             out_channels=1,
             base_channels=base_channels,
             base_dim=base_dim,
+            activation=activation,
+            silu_degree=int(silu_degree),
         )

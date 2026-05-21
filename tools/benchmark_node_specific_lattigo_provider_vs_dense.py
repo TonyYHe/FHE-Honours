@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 from orion.backend.python.tensors import CipherTensor
 from orion.core.fuser import Fuser
 from orion.core.network_dag import NetworkDAG
-from orion.core.orion import scheme
+from orion.core.orion import _region_first_mode_options, scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import R34CompileRegistry, U22CompileRegistry
 from orion.experimental.cir.runtime_group import (
@@ -41,6 +41,11 @@ from orion.experimental.cir.runtime_group import (
     _rescale_cipher_tensor,
     transforms_from_conv_scheme_plan,
 )
+from orion.experimental.cir.halo_local_conv_provider import (
+    HaloLocalBranchPairConvRuntimeExecutor,
+    HaloLocalConvRuntimeExecutor,
+)
+from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.experimental.u22_phase1 import TconvK2S2PythonRuntimeExecutor
 from orion.models.resnet import ResNet18, ResNet34
 from orion.models.unet import UNet22, get_unet22_medical_spec
@@ -49,21 +54,96 @@ from orion.nn.module import Module
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 try:
-    from orion.experimental.cir.r34_orion_same_shape import R34OrionSameShapeRuntimeExecutor
+    from orion.experimental.cir.r34_orion_same_shape import (
+        NativeAlignedHaloNoRIConvExecutor,
+        r34_same_shape_hardcoded_relayout_plan,
+        r34_native_aligned_halo_plan,
+    )
 except ModuleNotFoundError:
-    R34OrionSameShapeRuntimeExecutor = None  # type: ignore[assignment]
+    NativeAlignedHaloNoRIConvExecutor = None  # type: ignore[assignment]
+    r34_same_shape_hardcoded_relayout_plan = None  # type: ignore[assignment]
+    r34_native_aligned_halo_plan = None  # type: ignore[assignment]
 
 
 DEFAULT_OUT = Path("/tmp/orion_node_specific_lattigo_cheddar_provider_vs_dense.json")
 DEFAULT_CSV_OUT = Path("/tmp/orion_node_specific_lattigo_cheddar_provider_vs_dense.csv")
 BACKENDS = ("lattigo", "cheddar")
-PATHS = ("dense", "provider", "provider_no_hybrid", "provider_no_family", "provider_no_tile_family_sharing")
+PATHS = (
+    "dense",
+    "provider",
+    "provider_no_hybrid",
+    "provider_no_family",
+    "provider_no_family_no_hybrid",
+    "provider_no_tile_family_sharing",
+)
+PROVIDER_PATHS = frozenset(path for path in PATHS if str(path) != "dense")
+NO_HYBRID_PATHS = frozenset(("provider_no_hybrid", "provider_no_family_no_hybrid"))
+NO_FAMILY_PATHS = frozenset(("provider_no_family", "provider_no_family_no_hybrid"))
 LOGN_OVERRIDE_ENV = "ORION_NODE_BENCH_LOGN_OVERRIDE"
 CKKS_PROFILE_ENV = "ORION_NODE_BENCH_CKKS_PROFILE"
 CLEAN_CHEDDAR_IO_ENV = "ORION_NODE_BENCH_CLEAN_CHEDDAR_IO"
 MIN_DISK_FREE_GB_ENV = "ORION_NODE_BENCH_MIN_DISK_FREE_GB"
 DISK_WATCHDOG_INTERVAL_S_ENV = "ORION_NODE_BENCH_DISK_WATCHDOG_INTERVAL_S"
+BOUNDED_LATTIGO_DENSE_ENV = "ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE"
+BOUNDED_LATTIGO_DENSE_MODE_ENV = "ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_MODE"
+BOUNDED_LATTIGO_PROVIDER_ENV = "ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER"
+BOUNDED_LATTIGO_PROVIDER_MODE_ENV = "ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_MODE"
+CLEAN_LATTIGO_DENSE_IO_ENV = "ORION_NODE_BENCH_CLEAN_LATTIGO_DENSE_IO"
+CLEAN_LATTIGO_PROVIDER_IO_ENV = "ORION_NODE_BENCH_CLEAN_LATTIGO_PROVIDER_IO"
+LATTIGO_DENSE_IO_ROOT_ENV = "ORION_LATTIGO_DENSE_IO_ROOT"
+LATTIGO_PROVIDER_IO_ROOT_ENV = "ORION_LATTIGO_PROVIDER_IO_ROOT"
+LATTIGO_BENCH_IO_MODE_ENV = "ORION_NODE_BENCH_LATTIGO_IO_MODE"
+LATTIGO_BENCH_DIAGS_PATH_ENV = "ORION_NODE_BENCH_LATTIGO_DIAGS_PATH"
+LATTIGO_BENCH_KEYS_PATH_ENV = "ORION_NODE_BENCH_LATTIGO_KEYS_PATH"
+MAX_WORKER_RSS_GB_ENV = "ORION_NODE_BENCH_MAX_WORKER_RSS_GB"
+BOUNDED_LATTIGO_DENSE_STREAMING_CHUNK_PLAINTEXTS = "256"
+BOUNDED_LATTIGO_PROVIDER_STREAMING_CHUNK_PLAINTEXTS = "512"
 _ACTIVE_CHEDDAR_BENCH_IO_DIR: Path | None = None
+
+
+def _host_mem_available_bytes() -> int | None:
+    try:
+        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _bounded_lattigo_compile_workers_default() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    target = 4
+    mem_available = _host_mem_available_bytes()
+    if mem_available is not None:
+        if mem_available < 48 * 1024**3:
+            target = 1
+        elif mem_available < 96 * 1024**3:
+            target = 2
+    return str(max(1, min(cpu_count, target)))
+
+
+def _bounded_lattigo_pack_workers_default() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    target = 8
+    mem_available = _host_mem_available_bytes()
+    if mem_available is not None:
+        if mem_available < 48 * 1024**3:
+            target = 1
+        elif mem_available < 96 * 1024**3:
+            target = 2
+    return str(max(1, min(cpu_count, target)))
+
+
+RESNET_LOGQ = (55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40)
+RESNET_LOGP = (61, 61, 61)
+RESNET_BOOT_LOGP = (61, 61, 61, 61, 61, 61, 61, 61)
+RESNET_LOGSCALE = 40
+RESNET_SECRET_H = 192
 
 PATH_DESCRIPTIONS = {
     "dense": "baseline Orion dense LinearTransform path",
@@ -75,6 +155,10 @@ PATH_DESCRIPTIONS = {
     "provider_no_family": (
         "provider ablation with BSGS preserved but UnifiedTransformGroup family sharing disabled; "
         "each compiled LinearTransform is evaluated one by one"
+    ),
+    "provider_no_family_no_hybrid": (
+        "provider ablation with halo-local LT only: BSGS preserved, UnifiedTransformGroup family "
+        "sharing disabled, and real/imag hybrid packing disabled"
     ),
     "provider_no_tile_family_sharing": (
         "U22 TConv provider ablation with halo layout, real/imag packing, and BSGS preserved, "
@@ -135,10 +219,13 @@ NETWORK_SPECS: dict[str, dict[str, Any]] = {
         "base_dim": 32,
         "input_shape": (1, 1, 64, 64),
         "logn": 16,
-        "logq": (45, 30, 30, 30, 45),
-        "logp": (50,),
+        "logq": RESNET_LOGQ,
+        "logp": RESNET_LOGP,
         "cases": U22_TCONV_CASES,
-        "coverage_note": "unique provider-supported ConvTranspose2d decoder nodes; dense-only U22 Conv2d nodes excluded",
+        "coverage_note": (
+            "node-specific rows cover unique ConvTranspose2d decoder representatives; provider DAG attach uses "
+            "the full default U22 provider mode, including Conv2d/Pool halo layout-policy kernels"
+        ),
     },
     "u22_256_base32": {
         "label": "U-Net 22 base_dim=32 256x256",
@@ -147,10 +234,13 @@ NETWORK_SPECS: dict[str, dict[str, Any]] = {
         "base_dim": 32,
         "input_shape": (1, 3, 256, 256),
         "logn": 16,
-        "logq": (45, 30, 30, 30, 45),
-        "logp": (50,),
+        "logq": RESNET_LOGQ,
+        "logp": RESNET_LOGP,
         "cases": U22_TCONV_CASES,
-        "coverage_note": "unique provider-supported ConvTranspose2d decoder nodes; dense-only U22 Conv2d nodes excluded",
+        "coverage_note": (
+            "node-specific rows cover unique ConvTranspose2d decoder representatives; provider DAG attach uses "
+            "the full default U22 provider mode, including Conv2d/Pool halo layout-policy kernels"
+        ),
     },
 }
 
@@ -158,35 +248,35 @@ NETWORK_SPECS: dict[str, dict[str, Any]] = {
 E2E_CKKS_SPECS: dict[str, dict[str, Any]] = {
     "r18_tiny": {
         "logn": 16,
-        "logq": (55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40),
-        "logp": (61, 61, 61),
-        "logscale": 40,
-        "h": 192,
-        "boot_logp": (61, 61, 61, 61, 61, 61, 61, 61),
+        "logq": RESNET_LOGQ,
+        "logp": RESNET_LOGP,
+        "logscale": RESNET_LOGSCALE,
+        "h": RESNET_SECRET_H,
+        "boot_logp": RESNET_BOOT_LOGP,
     },
     "r34_imgnet": {
         "logn": 16,
-        "logq": (55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40),
-        "logp": (61, 61, 61),
-        "logscale": 40,
-        "h": 192,
-        "boot_logp": (61, 61, 61, 61, 61, 61, 61, 61),
+        "logq": RESNET_LOGQ,
+        "logp": RESNET_LOGP,
+        "logscale": RESNET_LOGSCALE,
+        "h": RESNET_SECRET_H,
+        "boot_logp": RESNET_BOOT_LOGP,
     },
     "u22_64_base32": {
         "logn": 16,
-        "logq": (45, 30, 30, 30, 45),
-        "logp": (50,),
-        "logscale": 30,
-        "h": 64,
-        "boot_logp": (),
+        "logq": RESNET_LOGQ,
+        "logp": RESNET_LOGP,
+        "logscale": RESNET_LOGSCALE,
+        "h": RESNET_SECRET_H,
+        "boot_logp": RESNET_BOOT_LOGP,
     },
     "u22_256_base32": {
         "logn": 16,
-        "logq": (45, 30, 30, 30, 45),
-        "logp": (50,),
-        "logscale": 30,
-        "h": 64,
-        "boot_logp": (),
+        "logq": RESNET_LOGQ,
+        "logp": RESNET_LOGP,
+        "logscale": RESNET_LOGSCALE,
+        "h": RESNET_SECRET_H,
+        "boot_logp": RESNET_BOOT_LOGP,
     },
 }
 
@@ -242,9 +332,9 @@ def _kernel_ckks_spec(network: str, *, backend: str) -> dict[str, Any]:
         "logn": int(_effective_logn(str(network), base_logn=int(spec["logn"]))),
         "logq": tuple(int(v) for v in spec["logq"]),
         "logp": tuple(int(v) for v in spec["logp"]),
-        "logscale": 30,
-        "h": 64,
-        "boot_logp": (),
+        "logscale": RESNET_LOGSCALE,
+        "h": RESNET_SECRET_H,
+        "boot_logp": RESNET_BOOT_LOGP,
     }
 
 
@@ -279,6 +369,101 @@ def _truthy_env_value(value: str | None) -> bool:
 def _safe_path_fragment(value: str) -> str:
     text = str(value)
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text).strip("_") or "item"
+
+
+def _bounded_lattigo_dense_requested(*, network: str, case_name: str, path_kind: str) -> bool:
+    if str(path_kind) != "dense":
+        return False
+    raw = str(os.environ.get(BOUNDED_LATTIGO_DENSE_ENV, "auto")).strip().lower()
+    if raw in ("0", "false", "no", "off", "none", "never"):
+        return False
+    if raw in ("1", "true", "yes", "on", "all", "always"):
+        return True
+    if raw in ("", "auto"):
+        return str(network) == "r34_imgnet" and str(case_name) == "stage4_same"
+    cases = {
+        item.strip()
+        for item in raw.replace(";", ",").split(",")
+        if item.strip()
+    }
+    return str(case_name) in cases or f"{network}/{case_name}" in cases
+
+
+def _bounded_lattigo_provider_requested(*, network: str, case_name: str, path_kind: str) -> bool:
+    if str(path_kind) not in PROVIDER_PATHS:
+        return False
+    raw = str(os.environ.get(BOUNDED_LATTIGO_PROVIDER_ENV, "auto")).strip().lower()
+    if raw in ("0", "false", "no", "off", "none", "never"):
+        return False
+    if raw in ("1", "true", "yes", "on", "all", "always"):
+        return True
+    if raw in ("", "auto"):
+        return str(network) == "r34_imgnet" and str(case_name) == "stage4_same"
+    cases = {
+        item.strip()
+        for item in raw.replace(";", ",").split(",")
+        if item.strip()
+    }
+    return str(case_name) in cases or f"{network}/{case_name}" in cases
+
+
+def _bounded_lattigo_dense_mode() -> str:
+    mode = str(os.environ.get(BOUNDED_LATTIGO_DENSE_MODE_ENV, "streaming")).strip().lower()
+    if mode in ("", "save", "saved", "save-load", "save_load"):
+        return "save"
+    if mode in ("stream", "streaming", "streaming-lt", "streaming_lt"):
+        return "streaming"
+    raise ValueError(
+        f"unknown {BOUNDED_LATTIGO_DENSE_MODE_ENV}={mode!r}; expected 'save' or 'streaming'"
+    )
+
+
+def _bounded_lattigo_provider_mode() -> str:
+    mode = str(os.environ.get(BOUNDED_LATTIGO_PROVIDER_MODE_ENV, "streaming")).strip().lower()
+    if mode in ("", "stream", "streaming", "streaming-lt", "streaming_lt"):
+        return "streaming"
+    if mode in ("save", "saved", "save-load", "save_load"):
+        return "save"
+    raise ValueError(
+        f"unknown {BOUNDED_LATTIGO_PROVIDER_MODE_ENV}={mode!r}; expected 'streaming' or 'save'"
+    )
+
+
+def _clean_lattigo_dense_io_enabled(env: dict[str, str]) -> bool:
+    raw = env.get(CLEAN_LATTIGO_DENSE_IO_ENV)
+    return True if raw is None else _truthy_env_value(raw)
+
+
+def _clean_lattigo_provider_io_enabled(env: dict[str, str]) -> bool:
+    raw = env.get(CLEAN_LATTIGO_PROVIDER_IO_ENV)
+    return True if raw is None else _truthy_env_value(raw)
+
+
+def _worker_rss_limit_bytes(env: dict[str, str], *, backend: str) -> int:
+    raw = env.get(MAX_WORKER_RSS_GB_ENV)
+    if raw is None:
+        raw = "300" if str(backend) == "lattigo" else "0"
+    try:
+        gib = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    if gib <= 0:
+        return 0
+    return int(gib * (1024**3))
+
+
+def _process_rss_bytes(pid: int) -> int | None:
+    try:
+        with Path(f"/proc/{int(pid)}/status").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("VmRSS:"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def _disk_usage_payload(path: Path) -> dict[str, int | str]:
@@ -398,6 +583,39 @@ def _synchronize_backend() -> None:
         sync()
 
 
+def _reset_runtime_operation_counters() -> bool:
+    reset = getattr(getattr(scheme, "backend", None), "ResetOperationCounters", None)
+    if not callable(reset):
+        return False
+    reset()
+    return True
+
+
+def _runtime_operation_counters() -> dict[str, int] | None:
+    get_counters = getattr(getattr(scheme, "backend", None), "GetOperationCounters", None)
+    if not callable(get_counters):
+        return None
+    values = [int(value) for value in list(get_counters())]
+    if len(values) < 4:
+        return None
+    return {
+        "rotation": int(values[0]),
+        "lintrans_rotation": int(values[1]),
+        "direct_rotation": int(values[2]),
+        "conjugation": int(values[3]),
+    }
+
+
+def _mean_operation_counters(counters: list[dict[str, int]]) -> dict[str, float]:
+    if not counters:
+        return {}
+    keys = ("rotation", "lintrans_rotation", "direct_rotation", "conjugation")
+    return {
+        key: float(statistics.fmean(float(item.get(key, 0)) for item in counters))
+        for key in keys
+    }
+
+
 def _eager_materialize_dense_transforms(module: Any, *, backend: str, effective_path_kind: str) -> dict[str, Any]:
     """Move Cheddar dense LT hoist/materialization out of the first timed forward."""
 
@@ -487,6 +705,7 @@ def _build_config(network: str, *, backend: str) -> dict[str, Any]:
         if tuple(ckks_spec.get("boot_logp", ())) != ():
             config["boot_params"] = {"LogP": [int(v) for v in ckks_spec["boot_logp"]]}
         return config
+    lattigo_io_mode = str(os.environ.get(LATTIGO_BENCH_IO_MODE_ENV, "none")).strip().lower() or "none"
     config = {
         "ckks_params": {
             "LogN": int(ckks_spec["logn"]),
@@ -502,9 +721,12 @@ def _build_config(network: str, *, backend: str) -> dict[str, Any]:
             "backend": str(backend),
             "fuse_modules": True,
             "debug": False,
-            "io_mode": "none",
+            "io_mode": str(lattigo_io_mode),
         },
     }
+    if str(lattigo_io_mode) != "none":
+        config["orion"]["diags_path"] = str(os.environ.get(LATTIGO_BENCH_DIAGS_PATH_ENV, "diagonals.h5"))
+        config["orion"]["keys_path"] = str(os.environ.get(LATTIGO_BENCH_KEYS_PATH_ENV, "keys.h5"))
     if tuple(ckks_spec.get("boot_logp", ())) != ():
         config["boot_params"] = {"LogP": [int(v) for v in ckks_spec["boot_logp"]]}
     return config
@@ -622,7 +844,13 @@ def _prepare_u22_dag(network: str, *, provider: bool) -> tuple[NetworkDAG, dict[
     _init_orion_modules(net)
     attach_audit: dict[str, Any] = {}
     if bool(provider):
-        registry = U22CompileRegistry.for_dag(dag)
+        opts = _region_first_mode_options(str(network))
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=opts["u22_allowed_nodes"],
+            enable_conv_kernels=bool(opts["u22_conv_kernels"]),
+            layout_policy=str(opts["u22_layout_policy"]),
+        )
         attach_audit = registry.attach_to_dag(dag)
     _set_compile_level(dag)
     return dag, attach_audit
@@ -639,12 +867,7 @@ def _prepare_dag(network: str, *, provider: bool) -> tuple[NetworkDAG, dict[str,
 
 
 def _is_provider_path(path_kind: str) -> bool:
-    return str(path_kind) in {
-        "provider",
-        "provider_no_hybrid",
-        "provider_no_family",
-        "provider_no_tile_family_sharing",
-    }
+    return str(path_kind) in PROVIDER_PATHS
 
 
 def _dense_cols(module: Any) -> int:
@@ -965,9 +1188,19 @@ def _apply_provider_no_hybrid_ablation(network: str, module: Any) -> dict[str, A
     executor = getattr(runtime, "executor", None)
     if runtime is None or executor is None:
         return {"status": "unsupported", "reason": "no provider executor attached"}
+    wrapper_executor = executor if hasattr(executor, "base_executor") else None
+    base_executor = getattr(executor, "base_executor", executor)
+
+    def mark_no_hybrid_boundary(replacements: dict[str, str]) -> None:
+        if not hasattr(runtime, "boundary_actions"):
+            return
+        runtime.boundary_actions = tuple(
+            str(replacements.get(str(action), str(action)))
+            for action in tuple(getattr(runtime, "boundary_actions", ()) or ())
+        )
 
     original_executor = type(executor).__name__
-    if bool(getattr(executor, "requires_compact_source", False)):
+    if bool(getattr(base_executor, "requires_compact_source", False)):
         module.region_runtime = None
         module.region_first_skip_dense_pack = False
         return {
@@ -982,11 +1215,223 @@ def _apply_provider_no_hybrid_ablation(network: str, module: Any) -> dict[str, A
             ),
         }
 
-    if str(network) == "r34_imgnet" and hasattr(executor, "spec"):
-        if R34OrionSameShapeRuntimeExecutor is None:
+    if (
+        str(network) == "r34_imgnet"
+        and isinstance(base_executor, HaloLocalConvRuntimeExecutor)
+        and getattr(base_executor, "same_shape_spec", None) is not None
+        and not bool(getattr(base_executor, "force_input_pair", False))
+    ):
+        output_node_id = (
+            getattr(base_executor, "output_node_id", None)
+            or getattr(module, "region_output_id", None)
+            or getattr(module, "name", "")
+        )
+        replacement = HaloLocalConvRuntimeExecutor(
+            module=module,
+            same_shape_spec=getattr(base_executor, "same_shape_spec"),
+            output_node_id=str(output_node_id),
+        )
+        if wrapper_executor is not None:
+            wrapper_executor.base_executor = replacement
+        else:
+            runtime.executor = replacement
+        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
+        native_plan = (
+            {}
+            if r34_native_aligned_halo_plan is None
+            else r34_native_aligned_halo_plan(getattr(replacement, "same_shape_spec")).to_dict()
+        )
+        legacy_plan = (
+            {}
+            if r34_same_shape_hardcoded_relayout_plan is None
+            else r34_same_shape_hardcoded_relayout_plan(getattr(replacement, "same_shape_spec")).to_dict()
+        )
+        return {
+            "status": "ok",
+            "mode": "r34_native_aligned_halo_no_ri",
+            "original_executor": original_executor,
+            "executor": type(runtime.executor).__name__,
+            "base_executor": type(replacement).__name__,
+            "delegate_executor": type(replacement.delegate).__name__,
+            "r34_native_aligned_halo_plan": native_plan,
+            "r34_same_shape_halo_relayout_plan": native_plan,
+            "conv_lt_raw_submatrix_tasks": int(native_plan.get("submatrix_program_count", 0) or 0),
+            "conv_lt_effective_submatrix_tasks": int(native_plan.get("sharing_group_count", 0) or 0),
+            "native_c_only_rotations": int(native_plan.get("c_only_rotations", 0) or 0),
+            "native_cb_shared_rotations": int(native_plan.get("cb_shared_rotations", 0) or 0),
+            "legacy_flat_conv_lt_tasks": int(legacy_plan.get("legacy_flat_conv_lt_tasks", 0) or 0),
+            "legacy_flat_offdiag_tasks": int(legacy_plan.get("legacy_flat_offdiag_tasks", 0) or 0),
+        }
+
+    if isinstance(base_executor, HaloLocalConvRuntimeExecutor) and not bool(
+        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
+    ):
+        try:
+            delegate = base_executor.delegate
+        except RuntimeError as exc:
             return {
                 "status": "unsupported",
-                "reason": "r34_orion_same_shape helper is unavailable in this checkout",
+                "mode": "halo_local_native_aligned_halo_no_ri_required",
+                "original_executor": original_executor,
+                "executor": type(runtime.executor).__name__,
+                "base_executor": type(base_executor).__name__,
+                "reason": str(exc),
+            }
+        if type(delegate).__name__ in {"NativeAlignedHaloNoRIConvExecutor", "NativeHaloStripeNoRIConvExecutor"}:
+            native_plan = {}
+            if type(delegate).__name__ == "NativeAlignedHaloNoRIConvExecutor" and r34_native_aligned_halo_plan is not None:
+                native_plan = r34_native_aligned_halo_plan(getattr(base_executor, "same_shape_spec")).to_dict()
+            else:
+                get_metadata = getattr(delegate, "compile_cache_metadata", None)
+                if callable(get_metadata):
+                    native_plan = dict(get_metadata()).get("native_halo_conv2d_plan", {})
+            legacy_plan = {}
+            if r34_same_shape_hardcoded_relayout_plan is not None:
+                try:
+                    legacy_plan = r34_same_shape_hardcoded_relayout_plan(
+                        getattr(base_executor, "same_shape_spec")
+                    ).to_dict()
+                except Exception:
+                    legacy_plan = {}
+            return {
+                "status": "ok",
+                "mode": (
+                    "native_aligned_halo_no_ri"
+                    if type(delegate).__name__ == "NativeAlignedHaloNoRIConvExecutor"
+                    else "native_halo_stripe_no_ri"
+                ),
+                "original_executor": original_executor,
+                "executor": type(runtime.executor).__name__,
+                "base_executor": type(base_executor).__name__,
+                "delegate_executor": type(delegate).__name__,
+                "r34_native_aligned_halo_plan": native_plan,
+                "r34_same_shape_halo_relayout_plan": native_plan,
+                "conv_lt_raw_submatrix_tasks": int(native_plan.get("submatrix_program_count", 0) or 0),
+                "conv_lt_effective_submatrix_tasks": int(native_plan.get("sharing_group_count", 0) or 0),
+                "native_c_only_rotations": int(native_plan.get("c_only_rotations", 0) or 0),
+                "native_cb_shared_rotations": int(native_plan.get("cb_shared_rotations", 0) or 0),
+                "legacy_flat_conv_lt_tasks": int(legacy_plan.get("legacy_flat_conv_lt_tasks", 0) or 0),
+                "legacy_flat_offdiag_tasks": int(legacy_plan.get("legacy_flat_offdiag_tasks", 0) or 0),
+            }
+        return {
+            "status": "ok",
+            "mode": "halo_local_already_no_real_imag_packing",
+            "original_executor": original_executor,
+            "executor": type(runtime.executor).__name__,
+            "base_executor": type(base_executor).__name__,
+            "delegate_executor": type(delegate).__name__,
+        }
+
+    if isinstance(base_executor, HaloLocalConvRuntimeExecutor) and bool(
+        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
+    ):
+        same_shape_no_hybrid = bool(
+            getattr(base_executor, "same_shape_spec", None) is not None
+            and not bool(getattr(base_executor, "force_input_pair", False))
+        )
+        output_node_id = (
+            getattr(base_executor, "output_node_id", None)
+            or getattr(module, "region_output_id", None)
+            or getattr(module, "name", "")
+        )
+        replacement = HaloLocalConvRuntimeExecutor(
+            module=module,
+            same_shape_spec=getattr(base_executor, "same_shape_spec", None),
+            output_node_id=str(output_node_id),
+            native_halo_input_capable=getattr(base_executor, "native_halo_input_capable", None),
+        )
+        if wrapper_executor is not None:
+            wrapper_executor.base_executor = replacement
+        else:
+            runtime.executor = replacement
+        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
+        return {
+            "status": "ok",
+            "mode": (
+                "halo_local_same_shape_no_real_imag_packing"
+                if bool(same_shape_no_hybrid)
+                else "halo_local_input_pair_no_real_imag_packing"
+            ),
+            "original_executor": original_executor,
+            "executor": type(runtime.executor).__name__,
+            "base_executor": type(replacement).__name__,
+            "delegate_executor": type(replacement.delegate).__name__,
+        }
+
+    if isinstance(base_executor, HaloLocalBranchPairConvRuntimeExecutor) and bool(
+        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
+    ):
+        output_node_ids = tuple(str(value) for value in getattr(base_executor, "output_node_ids", ()) or ())
+        if len(output_node_ids) != 2:
+            output_node_ids = (
+                str(getattr(module, "region_output_id", None) or getattr(module, "name", "")),
+                str(getattr(module, "region_output_id", None) or getattr(module, "name", "")),
+            )
+        replacement = HaloLocalBranchPairConvRuntimeExecutor(
+            conv_module=getattr(base_executor, "conv_module"),
+            shortcut_module=getattr(base_executor, "shortcut_module"),
+            output_node_ids=(str(output_node_ids[0]), str(output_node_ids[1])),
+        )
+        if wrapper_executor is not None:
+            wrapper_executor.base_executor = replacement
+        else:
+            runtime.executor = replacement
+        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
+        mark_no_hybrid_boundary({"branch_pair_real_imag_hybrid": "branch_pair_no_real_imag"})
+        return {
+            "status": "ok",
+            "mode": "r34_halo_local_branch_pair_no_real_imag_packing",
+            "original_executor": original_executor,
+            "executor": type(runtime.executor).__name__,
+            "base_executor": type(replacement).__name__,
+            "delegate_executor": type(replacement._delegate).__name__,
+        }
+
+    if isinstance(base_executor, HaloLocalBranchPairConvRuntimeExecutor) and not bool(
+        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
+    ):
+        mark_no_hybrid_boundary({"branch_pair_real_imag_hybrid": "branch_pair_no_real_imag"})
+        return {
+            "status": "ok",
+            "mode": "r34_halo_local_branch_pair_already_no_real_imag_packing",
+            "original_executor": original_executor,
+            "executor": type(runtime.executor).__name__,
+            "base_executor": type(base_executor).__name__,
+            "delegate_executor": type(base_executor._delegate).__name__,
+        }
+
+    if isinstance(base_executor, InputPairConvRuntimeExecutor) and bool(
+        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
+    ):
+        output_node_id = (
+            getattr(base_executor, "output_node_id", None)
+            or getattr(module, "region_output_id", None)
+            or getattr(module, "name", "")
+        )
+        replacement = InputPairConvRuntimeExecutor(
+            module=module,
+            output_node_id=str(output_node_id),
+            use_ct_pt_hybrid_packing=False,
+        )
+        if wrapper_executor is not None:
+            wrapper_executor.base_executor = replacement
+        else:
+            runtime.executor = replacement
+        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
+        mark_no_hybrid_boundary({"input_pair_ctpt_hybrid": "input_pair_no_real_imag"})
+        return {
+            "status": "ok",
+            "mode": "input_pair_conv_no_real_imag_packing",
+            "original_executor": original_executor,
+            "executor": type(runtime.executor).__name__,
+            "base_executor": type(replacement).__name__,
+        }
+
+    if str(network) == "r34_imgnet" and hasattr(executor, "spec"):
+        if NativeAlignedHaloNoRIConvExecutor is None:
+            return {
+                "status": "unsupported",
+                "reason": "r34 native aligned halo no-RI helper is unavailable in this checkout",
                 "original_executor": original_executor,
             }
         output_node_id = (
@@ -994,7 +1439,7 @@ def _apply_provider_no_hybrid_ablation(network: str, module: Any) -> dict[str, A
             or getattr(module, "region_output_id", None)
             or getattr(module, "name", "")
         )
-        runtime.executor = R34OrionSameShapeRuntimeExecutor(
+        runtime.executor = NativeAlignedHaloNoRIConvExecutor(
             module=module,
             spec=getattr(executor, "spec"),
             output_node_id=str(output_node_id),
@@ -1002,7 +1447,7 @@ def _apply_provider_no_hybrid_ablation(network: str, module: Any) -> dict[str, A
         runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
         return {
             "status": "ok",
-            "mode": "r34_same_shape_orion_unified_lt_no_real_imag_packing",
+            "mode": "r34_native_aligned_halo_no_ri",
             "original_executor": original_executor,
             "executor": type(runtime.executor).__name__,
         }
@@ -1354,7 +1799,7 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
 
 def _dense_shared_cache_stats_enabled(*, rows: int, cols: int) -> bool:
     override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-    if override is not None and override.lower() in ("0", "false", "no", "off"):
+    if override is None or override.lower() not in ("1", "true", "yes", "on"):
         return False
     if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "none":
         return False
@@ -1540,7 +1985,7 @@ def _provider_rotation_stats(module: Any, *, path_kind: str = "provider") -> dic
     if groups:
         stats = _unified_group_rotation_stats(
             groups,
-            family_sharing=str(path_kind) != "provider_no_family",
+            family_sharing=str(path_kind) not in NO_FAMILY_PATHS,
         )
     elif getattr(executor, "transform_ids", None):
         stats = _executor_transform_rotation_stats(executor)
@@ -1557,7 +2002,7 @@ def _provider_rotation_stats(module: Any, *, path_kind: str = "provider") -> dic
     stats["compact_source_contract"] = bool(getattr(executor, "requires_compact_source", False))
     stats["ct_pt_hybrid_packing"] = bool(getattr(executor, "use_ct_pt_hybrid_packing", False))
     stats["tile_family_sharing"] = not bool(getattr(executor, "disable_tile_family_sharing", False))
-    stats["bsgs_family_sharing"] = str(path_kind) != "provider_no_family"
+    stats["bsgs_family_sharing"] = str(path_kind) not in NO_FAMILY_PATHS
     output_rotations = int(
         getattr(executor, "output_fold_rotations", getattr(executor, "output_rotations", 0)) or 0
     )
@@ -1764,8 +2209,8 @@ def _bench_path(
 ) -> dict[str, Any]:
     case = _case_by_name(str(network), str(case_name))
     provider = _is_provider_path(str(path_kind))
-    no_hybrid_ablation = str(path_kind) == "provider_no_hybrid"
-    no_family_ablation = str(path_kind) == "provider_no_family"
+    no_hybrid_ablation = str(path_kind) in NO_HYBRID_PATHS
+    no_family_ablation = str(path_kind) in NO_FAMILY_PATHS
     no_tile_family_ablation = str(path_kind) == "provider_no_tile_family_sharing"
     previous_no_family_env = os.environ.get("ORION_UNIFIED_LT_INDIVIDUAL_EVAL")
     previous_no_tile_family_env = os.environ.get("ORION_U22_DISABLE_TILE_FAMILY_SHARING")
@@ -1893,6 +2338,8 @@ def _bench_path(
         output_ciphertext_count: int | None = None
         warmup_times: list[float] = []
         run_times: list[float] = []
+        warmup_operation_counts: list[dict[str, int]] = []
+        run_operation_counts: list[dict[str, int]] = []
         executor_timings: list[dict[str, float]] = []
         level = len(scheme.params.get_logq()) - 1
         gen = torch.Generator().manual_seed(int(case["seed"]) + (10000 if bool(stats_as_provider) else 0))
@@ -1907,22 +2354,38 @@ def _bench_path(
             )
             memory_trace.append(_memory_event(f"after_source_{index}", module))
             memory_trace.append(_memory_event(f"before_forward_{index}", module))
+            counters_enabled = _reset_runtime_operation_counters()
             started = time.perf_counter()
             out = module(source)
             _synchronize_backend()
             elapsed = float(time.perf_counter() - started)
+            operation_counts = _runtime_operation_counters() if bool(counters_enabled) else None
             memory_trace.append(_memory_event(f"after_forward_{index}", module))
             if output_ciphertext_count is None:
                 output_ciphertext_count = int(len(getattr(out, "ids", [])))
             if int(index) < int(warmups):
                 warmup_times.append(float(elapsed))
+                if operation_counts is not None:
+                    warmup_operation_counts.append(dict(operation_counts))
             else:
                 run_times.append(float(elapsed))
+                if operation_counts is not None:
+                    run_operation_counts.append(dict(operation_counts))
                 executor = getattr(getattr(module, "region_runtime", None), "executor", None)
                 if executor is not None:
                     executor_timings.append(dict(getattr(executor, "last_runtime_timing", {})))
             del out
             del source
+
+        first_runtime_counts = dict(run_operation_counts[0]) if run_operation_counts else {}
+        runtime_operation_counts = {
+            "available": bool(run_operation_counts),
+            "source": "lattigo_runtime_operation_callbacks" if run_operation_counts else "not_available",
+            "per_warmup": [dict(item) for item in warmup_operation_counts],
+            "per_run": [dict(item) for item in run_operation_counts],
+            "first_run": dict(first_runtime_counts),
+            "mean_per_run": _mean_operation_counters(run_operation_counts),
+        }
 
         result = {
             "status": "ok",
@@ -1951,6 +2414,11 @@ def _bench_path(
             "hot_run_median_s": float(statistics.median(run_times)) if run_times else 0.0,
             "rotation_stats": rotation_stats,
             "rotation_eval_count": int(rotation_stats.get("rotation_eval_count", 0)),
+            "runtime_operation_counts": runtime_operation_counts,
+            "runtime_rotation_eval_count": int(first_runtime_counts.get("rotation", 0)),
+            "runtime_lintrans_rotation_eval_count": int(first_runtime_counts.get("lintrans_rotation", 0)),
+            "runtime_direct_rotation_eval_count": int(first_runtime_counts.get("direct_rotation", 0)),
+            "runtime_conjugation_count": int(first_runtime_counts.get("conjugation", 0)),
             "source_ciphertext_count": int(source_count),
             "output_ciphertext_count": None if output_ciphertext_count is None else int(output_ciphertext_count),
                 "module": _module_metadata(module),
@@ -1985,6 +2453,39 @@ def _bench_path(
                 "orion_io_mode": str(scheme.params.get_io_mode()),
                 "diags_path": str(scheme.params.get_diags_path()),
                 "keys_path": str(scheme.params.get_keys_path()),
+                "bounded_lattigo_dense_audit": {
+                    "enabled": _truthy_env_value(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_ACTIVE")),
+                    "mode": str(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_MODE_ACTIVE", "")),
+                    "compile_batch_transforms": str(os.environ.get("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", "")),
+                    "lt_compile_workers": str(os.environ.get("ORION_LT_COMPILE_WORKERS", "")),
+                    "lattigo_compile_workers": str(os.environ.get("ORION_LATTIGO_COMPILE_WORKERS", "")),
+                    "streaming_lt": str(os.environ.get("ORION_LATTIGO_STREAMING_LT", "")),
+                    "streaming_lt_chunk_plaintexts": str(
+                        os.environ.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
+                    ),
+                    "saved_io_prefetch_lookahead": str(os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
+                },
+                "bounded_lattigo_provider_audit": {
+                    "enabled": _truthy_env_value(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_ACTIVE")),
+                    "mode": str(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_MODE_ACTIVE", "")),
+                    "compile_workers": str(os.environ.get("ORION_UNIFIED_COMPILE_WORKERS", "")),
+                    "stream_compile_batch_transforms": str(
+                        os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "")
+                    ),
+                    "stream_compile_batch_gb": str(os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "")),
+                    "stream_load_plaintexts": str(os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
+                    "stream_load_chunk_gb": str(os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
+                    "save_encoded_plaintexts": str(os.environ.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "")),
+                    "saved_io_prefetch_lookahead": str(os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
+                    "eval_budget_bytes": str(os.environ.get("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES", "")),
+                    "lattigo_streaming_lt": str(os.environ.get("ORION_LATTIGO_STREAMING_LT", "")),
+                    "lattigo_streaming_lt_chunk_plaintexts": str(
+                        os.environ.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
+                    ),
+                    "unified_stream_compile_io_none": str(
+                        os.environ.get("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "")
+                    ),
+                },
             }
         executor = getattr(getattr(module, "region_runtime", None), "executor", None)
         if executor is not None:
@@ -2054,15 +2555,24 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
     provider_mean = float(provider["hot_run_mean_s"])
     dense_rotations = int(dense.get("rotation_eval_count", 0))
     provider_rotations = int(provider.get("rotation_eval_count", 0))
+    dense_runtime_rotations = int(dense.get("runtime_rotation_eval_count", 0) or 0)
+    provider_runtime_rotations = int(provider.get("runtime_rotation_eval_count", 0) or 0)
 
     deltas: dict[str, Any] = {
         "compile_s_provider_minus_dense": float(provider["compile_s"] - dense["compile_s"]),
         "hot_run_mean_s_provider_minus_dense": float(provider_mean - dense_mean),
         "rotation_eval_count_provider_minus_dense": int(provider_rotations - dense_rotations),
+        "runtime_rotation_eval_count_provider_minus_dense": int(
+            provider_runtime_rotations - dense_runtime_rotations
+        ),
     }
     speedups: dict[str, Any] = {
         "time_dense_over_provider": _speedup(dense_mean, provider_mean),
         "rotation_dense_over_provider": _speedup(dense_rotations, provider_rotations),
+        "runtime_rotation_dense_over_provider": _speedup(
+            dense_runtime_rotations,
+            provider_runtime_rotations,
+        ),
         "compile_dense_over_provider": _speedup(float(dense["compile_s"]), float(provider["compile_s"])),
     }
     update_payload: dict[str, Any] = {
@@ -2145,6 +2655,69 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
         )
         update_payload["provider_no_family"] = no_family
 
+    if "provider_no_family_no_hybrid" in paths:
+        only_halo_entry = dict(paths.get("provider_no_family_no_hybrid", {}))
+        if only_halo_entry.get("status") != "ok":
+            case_payload.update(update_payload)
+            case_payload["status"] = "partial"
+            return
+        only_halo = dict(only_halo_entry["result"])
+        if only_halo.get("status") != "ok":
+            case_payload.update(update_payload)
+            case_payload["provider_no_family_no_hybrid"] = only_halo
+            case_payload["status"] = "partial"
+            return
+        only_halo_mean = float(only_halo["hot_run_mean_s"])
+        only_halo_rotations = int(only_halo.get("rotation_eval_count", 0))
+        deltas.update(
+            {
+                "compile_s_provider_no_family_no_hybrid_minus_dense": float(
+                    only_halo["compile_s"] - dense["compile_s"]
+                ),
+                "hot_run_mean_s_provider_no_family_no_hybrid_minus_dense": float(
+                    only_halo_mean - dense_mean
+                ),
+                "rotation_eval_count_provider_no_family_no_hybrid_minus_dense": int(
+                    only_halo_rotations - dense_rotations
+                ),
+                "compile_s_provider_no_family_no_hybrid_minus_provider": float(
+                    only_halo["compile_s"] - provider["compile_s"]
+                ),
+                "hot_run_mean_s_provider_no_family_no_hybrid_minus_provider": float(
+                    only_halo_mean - provider_mean
+                ),
+                "rotation_eval_count_provider_no_family_no_hybrid_minus_provider": int(
+                    only_halo_rotations - provider_rotations
+                ),
+            }
+        )
+        speedups.update(
+            {
+                "time_dense_over_provider_no_family_no_hybrid": _speedup(dense_mean, only_halo_mean),
+                "rotation_dense_over_provider_no_family_no_hybrid": _speedup(
+                    dense_rotations,
+                    only_halo_rotations,
+                ),
+                "compile_dense_over_provider_no_family_no_hybrid": _speedup(
+                    float(dense["compile_s"]),
+                    float(only_halo["compile_s"]),
+                ),
+                "time_provider_no_family_no_hybrid_over_provider": _speedup(
+                    only_halo_mean,
+                    provider_mean,
+                ),
+                "rotation_provider_no_family_no_hybrid_over_provider": _speedup(
+                    only_halo_rotations,
+                    provider_rotations,
+                ),
+                "compile_provider_no_family_no_hybrid_over_provider": _speedup(
+                    float(only_halo["compile_s"]),
+                    float(provider["compile_s"]),
+                ),
+            }
+        )
+        update_payload["provider_no_family_no_hybrid"] = only_halo
+
     if "provider_no_tile_family_sharing" in paths:
         no_tile_entry = dict(paths.get("provider_no_tile_family_sharing", {}))
         if no_tile_entry.get("status") != "ok":
@@ -2225,12 +2798,20 @@ def _run_worker(
     command.extend(["--ckks-profile", str(ckks_profile)])
 
     env = os.environ.copy()
+    if str(path_kind) == "dense":
+        env.setdefault("ORION_DENSE_LT_SHARED_CACHE", "0")
     worker_cheddar_io_root: Path | None = None
+    worker_lattigo_dense_io_root: Path | None = None
+    worker_lattigo_provider_io_root: Path | None = None
     log_dir: Path | None = None
     disk_watch_path: Path | None = None
     disk_before: dict[str, int | str] | None = None
     disk_after: dict[str, int | str] | None = None
     min_disk_free_bytes = 0
+    max_worker_rss_bytes = int(_worker_rss_limit_bytes(env, backend=str(backend)))
+    peak_worker_rss_bytes = 0
+    bounded_lattigo_dense_payload: dict[str, Any] = {"enabled": False}
+    bounded_lattigo_provider_payload: dict[str, Any] = {"enabled": False}
     if str(backend) == "cheddar":
         base_io_root = Path(env.get("ORION_CHEDDAR_IO_ROOT", tempfile.gettempdir()))
         base_io_root.mkdir(parents=True, exist_ok=True)
@@ -2262,14 +2843,241 @@ def _run_worker(
                 "min_disk_free_bytes": int(min_disk_free_bytes),
             }
 
+    if str(backend) == "lattigo" and _bounded_lattigo_dense_requested(
+        network=str(network),
+        case_name=str(case_name),
+        path_kind=str(path_kind),
+    ):
+        try:
+            bounded_mode = _bounded_lattigo_dense_mode()
+        except ValueError as exc:
+            return {
+                "status": "failed",
+                "failure_kind": "bounded_lattigo_dense_config",
+                "message": str(exc),
+                "worker_wall_s": 0.0,
+                "command": command,
+            }
+        env["ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_ACTIVE"] = "1"
+        env["ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_MODE_ACTIVE"] = str(bounded_mode)
+        compile_workers = _bounded_lattigo_compile_workers_default()
+        pack_workers = _bounded_lattigo_pack_workers_default()
+        env.setdefault("ORION_PACK_CONV_WORKERS", pack_workers)
+        env.setdefault("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", compile_workers)
+        env.setdefault("ORION_LT_COMPILE_WORKERS", compile_workers)
+        env.setdefault("ORION_LATTIGO_COMPILE_WORKERS", compile_workers)
+        env.setdefault("ORION_DENSE_LT_HOST_PAYLOAD_CACHE", "0")
+        bounded_lattigo_dense_payload = {
+            "enabled": True,
+            "mode": str(bounded_mode),
+            "policy": str(env.get(BOUNDED_LATTIGO_DENSE_ENV, "auto")),
+            "compile_batch_transforms": str(env.get("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", "")),
+            "pack_conv_workers": str(env.get("ORION_PACK_CONV_WORKERS", "")),
+            "lt_compile_workers": str(env.get("ORION_LT_COMPILE_WORKERS", "")),
+            "lattigo_compile_workers": str(env.get("ORION_LATTIGO_COMPILE_WORKERS", "")),
+        }
+        if bounded_mode == "save":
+            base_io_root = Path(env.get(LATTIGO_DENSE_IO_ROOT_ENV, str(REPO_ROOT / ".tmp" / "lattigo_dense_io")))
+            base_io_root.mkdir(parents=True, exist_ok=True)
+            prefix = (
+                "worker_"
+                f"{_safe_path_fragment(network)}_"
+                f"{_safe_path_fragment(case_name)}_"
+                f"{_safe_path_fragment(path_kind)}_"
+            )
+            worker_lattigo_dense_io_root = Path(tempfile.mkdtemp(prefix=prefix, dir=str(base_io_root)))
+            env[LATTIGO_BENCH_IO_MODE_ENV] = "save"
+            env[LATTIGO_BENCH_DIAGS_PATH_ENV] = str(worker_lattigo_dense_io_root / "diagonals.h5")
+            env[LATTIGO_BENCH_KEYS_PATH_ENV] = str(worker_lattigo_dense_io_root / "keys.h5")
+            env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "0")
+            env.setdefault("ORION_DENSE_LT_SHARED_CACHE", "0")
+            disk_watch_path = worker_lattigo_dense_io_root
+            disk_before = _disk_usage_payload(base_io_root)
+            min_disk_free_bytes = int(max(0.0, float(min_disk_free_gb)) * (1024**3))
+            bounded_lattigo_dense_payload.update(
+                {
+                    "io_root": str(worker_lattigo_dense_io_root),
+                    "base_io_root": str(base_io_root),
+                    "io_mode": "save",
+                    "diags_path": str(worker_lattigo_dense_io_root / "diagonals.h5"),
+                    "keys_path": str(worker_lattigo_dense_io_root / "keys.h5"),
+                    "saved_io_prefetch_lookahead": str(env.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
+                    "dense_shared_cache": str(env.get("ORION_DENSE_LT_SHARED_CACHE", "")),
+                }
+            )
+            if min_disk_free_bytes > 0 and int(disk_before["free_bytes"]) < min_disk_free_bytes:
+                shutil.rmtree(worker_lattigo_dense_io_root, ignore_errors=True)
+                return {
+                    "status": "failed",
+                    "failure_kind": "disk_watermark",
+                    "message": (
+                        "Skipping bounded Lattigo dense worker because free disk is below "
+                        f"{float(min_disk_free_gb):.3g} GiB watermark."
+                    ),
+                    "worker_wall_s": 0.0,
+                    "command": command,
+                    "bounded_lattigo_dense": {
+                        **bounded_lattigo_dense_payload,
+                        "io_root_cleaned": True,
+                    },
+                    "disk_before": disk_before,
+                    "min_disk_free_bytes": int(min_disk_free_bytes),
+                }
+        else:
+            env.setdefault("ORION_LATTIGO_STREAMING_LT", "force")
+            env.setdefault(
+                "ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS",
+                BOUNDED_LATTIGO_DENSE_STREAMING_CHUNK_PLAINTEXTS,
+            )
+            env.setdefault("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS", "2")
+            bounded_lattigo_dense_payload.update(
+                {
+                    "io_mode": "none",
+                    "streaming_lt": str(env.get("ORION_LATTIGO_STREAMING_LT", "")),
+                    "streaming_lt_chunk_plaintexts": str(
+                        env.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
+                    ),
+                    "streaming_lt_shared_transforms": str(
+                        env.get("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS", "")
+                    ),
+                }
+            )
+
+    if str(backend) == "lattigo" and _bounded_lattigo_provider_requested(
+        network=str(network),
+        case_name=str(case_name),
+        path_kind=str(path_kind),
+    ):
+        try:
+            provider_mode = _bounded_lattigo_provider_mode()
+        except ValueError as exc:
+            return {
+                "status": "failed",
+                "failure_kind": "bounded_lattigo_provider_config",
+                "message": str(exc),
+                "worker_wall_s": 0.0,
+                "command": command,
+            }
+        base_io_root = Path(
+            env.get(
+                LATTIGO_PROVIDER_IO_ROOT_ENV,
+                env.get(LATTIGO_DENSE_IO_ROOT_ENV, str(REPO_ROOT / ".tmp" / "lattigo_provider_io")),
+            )
+        )
+        base_io_root.mkdir(parents=True, exist_ok=True)
+        prefix = (
+            "worker_"
+            f"{_safe_path_fragment(network)}_"
+            f"{_safe_path_fragment(case_name)}_"
+            f"{_safe_path_fragment(path_kind)}_"
+        )
+        worker_lattigo_provider_io_root = Path(tempfile.mkdtemp(prefix=prefix, dir=str(base_io_root)))
+        env["ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_ACTIVE"] = "1"
+        env["ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_MODE_ACTIVE"] = str(provider_mode)
+        compile_workers = _bounded_lattigo_compile_workers_default()
+        pack_workers = _bounded_lattigo_pack_workers_default()
+        env.setdefault("ORION_PACK_CONV_WORKERS", pack_workers)
+        env.setdefault("ORION_LT_COMPILE_WORKERS", compile_workers)
+        env.setdefault("ORION_UNIFIED_COMPILE_WORKERS", compile_workers)
+        env.setdefault("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", compile_workers)
+        env.setdefault("ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS", compile_workers)
+        env.setdefault("ORION_UNIFIED_LOAD_BATCH_TRANSFORMS", compile_workers)
+        env.setdefault("ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS", compile_workers)
+        env.setdefault("ORION_LATTIGO_COMPILE_WORKERS", compile_workers)
+        env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", compile_workers)
+        env.setdefault("ORION_LATTIGO_BOOTSTRAP_WORKERS", compile_workers)
+        env.setdefault("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "2")
+        env.setdefault("ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM", "1")
+        env.setdefault("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE", "1")
+        if provider_mode == "save":
+            env[LATTIGO_BENCH_IO_MODE_ENV] = "save"
+            env[LATTIGO_BENCH_DIAGS_PATH_ENV] = str(worker_lattigo_provider_io_root / "unified_diagonals.h5")
+            env[LATTIGO_BENCH_KEYS_PATH_ENV] = str(worker_lattigo_provider_io_root / "unified_keys.h5")
+            env.setdefault("ORION_UNIFIED_LT_RELEASE_INDEX_ONLY_RAW_MATRICES_AFTER_SAVE", "1")
+            env.setdefault("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "1")
+            env.setdefault("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "0.25")
+            env.setdefault("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "0")
+            env.setdefault("ORION_UNIFIED_LT_ROTKEY_RESIDENCY", "0")
+            env.setdefault("ORION_UNIFIED_LT_PLAINTEXT_RESIDENCY", "0")
+            env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "0")
+            env.setdefault("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES", str(48 * 1024**3))
+            # Lattigo's streaming LT state is useful for dense/provider
+            # io_mode=none, but save/load needs serialized plaintext payloads.
+            env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
+        else:
+            env[LATTIGO_BENCH_IO_MODE_ENV] = "none"
+            env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "1")
+            env.setdefault("ORION_LATTIGO_STREAMING_LT", "force")
+            env.setdefault(
+                "ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS",
+                BOUNDED_LATTIGO_PROVIDER_STREAMING_CHUNK_PLAINTEXTS,
+            )
+            env.setdefault("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS", "2")
+        disk_watch_path = worker_lattigo_provider_io_root
+        disk_before = _disk_usage_payload(base_io_root)
+        min_disk_free_bytes = int(max(0.0, float(min_disk_free_gb)) * (1024**3))
+        bounded_lattigo_provider_payload = {
+            "enabled": True,
+            "mode": str(provider_mode),
+            "policy": str(env.get(BOUNDED_LATTIGO_PROVIDER_ENV, "auto")),
+            "io_root": str(worker_lattigo_provider_io_root),
+            "base_io_root": str(base_io_root),
+            "io_mode": str(env.get(LATTIGO_BENCH_IO_MODE_ENV, "none")),
+            "diags_path": str(env.get(LATTIGO_BENCH_DIAGS_PATH_ENV, "")),
+            "keys_path": str(env.get(LATTIGO_BENCH_KEYS_PATH_ENV, "")),
+            "pack_conv_workers": str(env.get("ORION_PACK_CONV_WORKERS", "")),
+            "compile_workers": str(env.get("ORION_UNIFIED_COMPILE_WORKERS", "")),
+            "stream_compile_batch_transforms": str(
+                env.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "")
+            ),
+            "stream_compile_batch_gb": str(env.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "")),
+            "stream_load_plaintexts": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
+            "stream_load_chunk_gb": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
+            "save_encoded_plaintexts": str(env.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "")),
+            "saved_io_prefetch_lookahead": str(env.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
+            "eval_budget_bytes": str(env.get("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES", "")),
+            "lattigo_streaming_lt": str(env.get("ORION_LATTIGO_STREAMING_LT", "")),
+            "lattigo_streaming_lt_chunk_plaintexts": str(
+                env.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
+            ),
+            "unified_stream_compile_io_none": str(env.get("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "")),
+            "rss_limit_bytes": int(max_worker_rss_bytes),
+        }
+        if min_disk_free_bytes > 0 and int(disk_before["free_bytes"]) < min_disk_free_bytes:
+            shutil.rmtree(worker_lattigo_provider_io_root, ignore_errors=True)
+            return {
+                "status": "failed",
+                "failure_kind": "disk_watermark",
+                "message": (
+                    "Skipping bounded Lattigo provider worker because free disk is below "
+                    f"{float(min_disk_free_gb):.3g} GiB watermark."
+                ),
+                "worker_wall_s": 0.0,
+                "command": command,
+                "bounded_lattigo_provider": {
+                    **bounded_lattigo_provider_payload,
+                    "io_root_cleaned": True,
+                },
+                "disk_before": disk_before,
+                "min_disk_free_bytes": int(min_disk_free_bytes),
+            }
+
     started = time.perf_counter()
     killed_reason = ""
     killed_disk: dict[str, int | str] | None = None
+    killed_rss_bytes: int | None = None
     stdout = ""
     stderr = ""
     returncode: int | None = None
     try:
-        log_parent = worker_cheddar_io_root if worker_cheddar_io_root is not None else Path(tempfile.gettempdir())
+        if worker_cheddar_io_root is not None:
+            log_parent = worker_cheddar_io_root
+        elif worker_lattigo_dense_io_root is not None:
+            log_parent = worker_lattigo_dense_io_root
+        elif worker_lattigo_provider_io_root is not None:
+            log_parent = worker_lattigo_provider_io_root
+        else:
+            log_parent = Path(tempfile.gettempdir())
         log_dir = Path(tempfile.mkdtemp(prefix="orion_node_worker_logs_", dir=str(log_parent)))
         stdout_path = log_dir / "stdout.txt"
         stderr_path = log_dir / "stderr.txt"
@@ -2314,6 +3122,21 @@ def _run_worker(
                             process.wait()
                         returncode = process.returncode
                         break
+                if int(max_worker_rss_bytes) > 0:
+                    rss_bytes = _process_rss_bytes(int(process.pid))
+                    if rss_bytes is not None:
+                        peak_worker_rss_bytes = max(int(peak_worker_rss_bytes), int(rss_bytes))
+                        if int(rss_bytes) > int(max_worker_rss_bytes):
+                            killed_reason = "rss_watermark"
+                            killed_rss_bytes = int(rss_bytes)
+                            process.terminate()
+                            try:
+                                process.wait(timeout=15)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait()
+                            returncode = process.returncode
+                            break
                 sleep_s = min(interval, max(0.1, deadline - now))
                 try:
                     returncode = process.wait(timeout=float(sleep_s))
@@ -2331,11 +3154,21 @@ def _run_worker(
         if worker_cheddar_io_root is not None and _truthy_env_value(env.get(CLEAN_CHEDDAR_IO_ENV)):
             shutil.rmtree(worker_cheddar_io_root, ignore_errors=True)
             cleaned_io_root = True
+        cleaned_lattigo_dense_io_root = False
+        if worker_lattigo_dense_io_root is not None and _clean_lattigo_dense_io_enabled(env):
+            shutil.rmtree(worker_lattigo_dense_io_root, ignore_errors=True)
+            cleaned_lattigo_dense_io_root = True
+        cleaned_lattigo_provider_io_root = False
+        if worker_lattigo_provider_io_root is not None and _clean_lattigo_provider_io_enabled(env):
+            shutil.rmtree(worker_lattigo_provider_io_root, ignore_errors=True)
+            cleaned_lattigo_provider_io_root = True
 
     worker_wall_s = float(time.perf_counter() - started)
     common_payload: dict[str, Any] = {
         "worker_wall_s": float(worker_wall_s),
         "command": command,
+        "max_worker_rss_bytes": int(max_worker_rss_bytes),
+        "peak_worker_rss_bytes": int(peak_worker_rss_bytes),
     }
     if worker_cheddar_io_root is not None:
         common_payload.update(
@@ -2347,6 +3180,22 @@ def _run_worker(
                 "min_disk_free_bytes": int(min_disk_free_bytes),
             }
         )
+    if bool(bounded_lattigo_dense_payload.get("enabled", False)):
+        common_payload["bounded_lattigo_dense"] = {
+            **bounded_lattigo_dense_payload,
+            "io_root_cleaned": bool(cleaned_lattigo_dense_io_root),
+            "disk_before": disk_before,
+            "disk_after": disk_after,
+            "min_disk_free_bytes": int(min_disk_free_bytes),
+        }
+    if bool(bounded_lattigo_provider_payload.get("enabled", False)):
+        common_payload["bounded_lattigo_provider"] = {
+            **bounded_lattigo_provider_payload,
+            "io_root_cleaned": bool(cleaned_lattigo_provider_io_root),
+            "disk_before": disk_before,
+            "disk_after": disk_after,
+            "min_disk_free_bytes": int(min_disk_free_bytes),
+        }
     if killed_reason == "timeout":
         common_payload.update(
             {
@@ -2364,11 +3213,27 @@ def _run_worker(
                 "status": "failed",
                 "failure_kind": "disk_watermark",
                 "message": (
-                    "Terminated Cheddar worker because free disk dropped below "
+                    "Terminated worker because free disk dropped below "
                     f"{float(min_disk_free_gb):.3g} GiB watermark."
                 ),
                 "returncode": None if returncode is None else int(returncode),
                 "disk_at_termination": killed_disk,
+                "stdout_tail": stdout[-4000:],
+                "stderr_tail": stderr[-4000:],
+            }
+        )
+        return common_payload
+    if killed_reason == "rss_watermark":
+        common_payload.update(
+            {
+                "status": "failed",
+                "failure_kind": "rss_watermark",
+                "message": (
+                    "Terminated worker because RSS exceeded "
+                    f"{int(max_worker_rss_bytes)} bytes."
+                ),
+                "returncode": None if returncode is None else int(returncode),
+                "rss_at_termination_bytes": 0 if killed_rss_bytes is None else int(killed_rss_bytes),
                 "stdout_tail": stdout[-4000:],
                 "stderr_tail": stderr[-4000:],
             }
@@ -2446,6 +3311,11 @@ def _flatten_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "dense_rotations": int(dense["rotation_eval_count"]),
                 "provider_rotations": int(provider["rotation_eval_count"]),
                 "rotation_speedup_dense_over_provider": case["speedup"]["rotation_dense_over_provider"],
+                "dense_runtime_rotations": int(dense.get("runtime_rotation_eval_count", 0) or 0),
+                "provider_runtime_rotations": int(provider.get("runtime_rotation_eval_count", 0) or 0),
+                "runtime_rotation_speedup_dense_over_provider": case["speedup"].get(
+                    "runtime_rotation_dense_over_provider"
+                ),
             }
             if "provider_no_hybrid" in case:
                 no_hybrid = dict(case["provider_no_hybrid"])
@@ -2487,6 +3357,32 @@ def _flatten_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "rotation_provider_no_family_over_provider"
                         ],
                         "provider_no_family_mode": str(no_family.get("no_family_audit", {}).get("mode", "")),
+                    }
+                )
+            if "provider_no_family_no_hybrid" in case:
+                only_halo = dict(case["provider_no_family_no_hybrid"])
+                row.update(
+                    {
+                        "provider_no_family_no_hybrid_mean_s": float(only_halo["hot_run_mean_s"]),
+                        "time_speedup_dense_over_provider_no_family_no_hybrid": case["speedup"][
+                            "time_dense_over_provider_no_family_no_hybrid"
+                        ],
+                        "time_provider_no_family_no_hybrid_over_provider": case["speedup"][
+                            "time_provider_no_family_no_hybrid_over_provider"
+                        ],
+                        "provider_no_family_no_hybrid_rotations": int(only_halo["rotation_eval_count"]),
+                        "rotation_speedup_dense_over_provider_no_family_no_hybrid": case["speedup"][
+                            "rotation_dense_over_provider_no_family_no_hybrid"
+                        ],
+                        "rotation_provider_no_family_no_hybrid_over_provider": case["speedup"][
+                            "rotation_provider_no_family_no_hybrid_over_provider"
+                        ],
+                        "provider_no_family_no_hybrid_no_hybrid_mode": str(
+                            only_halo.get("no_hybrid_audit", {}).get("mode", "")
+                        ),
+                        "provider_no_family_no_hybrid_no_family_mode": str(
+                            only_halo.get("no_family_audit", {}).get("mode", "")
+                        ),
                     }
                 )
             if "provider_no_tile_family_sharing" in case:
@@ -2557,6 +3453,11 @@ CSV_COLUMNS = (
     "hot_run_median_s",
     "hot_run_s_json",
     "rotation_eval_count",
+    "runtime_rotation_eval_count",
+    "runtime_lintrans_rotation_eval_count",
+    "runtime_direct_rotation_eval_count",
+    "runtime_conjugation_count",
+    "runtime_operation_counts_json",
     "actual_rotation_callback_count",
     "reported_unique_key_union_count",
     "rotation_stats_source",
@@ -2576,6 +3477,7 @@ CSV_COLUMNS = (
     "output_ciphertext_count",
     "time_speedup_dense_over_provider",
     "rotation_speedup_dense_over_provider",
+    "runtime_rotation_speedup_dense_over_provider",
     "compile_speedup_dense_over_provider",
     "time_speedup_dense_over_provider_no_hybrid",
     "rotation_speedup_dense_over_provider_no_hybrid",
@@ -2589,6 +3491,12 @@ CSV_COLUMNS = (
     "time_provider_no_family_over_provider",
     "rotation_provider_no_family_over_provider",
     "compile_provider_no_family_over_provider",
+    "time_speedup_dense_over_provider_no_family_no_hybrid",
+    "rotation_speedup_dense_over_provider_no_family_no_hybrid",
+    "compile_speedup_dense_over_provider_no_family_no_hybrid",
+    "time_provider_no_family_no_hybrid_over_provider",
+    "rotation_provider_no_family_no_hybrid_over_provider",
+    "compile_provider_no_family_no_hybrid_over_provider",
     "time_speedup_dense_over_provider_no_tile_family_sharing",
     "rotation_speedup_dense_over_provider_no_tile_family_sharing",
     "compile_speedup_dense_over_provider_no_tile_family_sharing",
@@ -2654,6 +3562,9 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "command_json": path_entry.get("command", ""),
                     "time_speedup_dense_over_provider": speedup.get("time_dense_over_provider"),
                     "rotation_speedup_dense_over_provider": speedup.get("rotation_dense_over_provider"),
+                    "runtime_rotation_speedup_dense_over_provider": speedup.get(
+                        "runtime_rotation_dense_over_provider"
+                    ),
                     "compile_speedup_dense_over_provider": speedup.get("compile_dense_over_provider"),
                     "time_speedup_dense_over_provider_no_hybrid": speedup.get("time_dense_over_provider_no_hybrid"),
                     "rotation_speedup_dense_over_provider_no_hybrid": speedup.get("rotation_dense_over_provider_no_hybrid"),
@@ -2667,6 +3578,24 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "time_provider_no_family_over_provider": speedup.get("time_provider_no_family_over_provider"),
                     "rotation_provider_no_family_over_provider": speedup.get("rotation_provider_no_family_over_provider"),
                     "compile_provider_no_family_over_provider": speedup.get("compile_provider_no_family_over_provider"),
+                    "time_speedup_dense_over_provider_no_family_no_hybrid": speedup.get(
+                        "time_dense_over_provider_no_family_no_hybrid"
+                    ),
+                    "rotation_speedup_dense_over_provider_no_family_no_hybrid": speedup.get(
+                        "rotation_dense_over_provider_no_family_no_hybrid"
+                    ),
+                    "compile_speedup_dense_over_provider_no_family_no_hybrid": speedup.get(
+                        "compile_dense_over_provider_no_family_no_hybrid"
+                    ),
+                    "time_provider_no_family_no_hybrid_over_provider": speedup.get(
+                        "time_provider_no_family_no_hybrid_over_provider"
+                    ),
+                    "rotation_provider_no_family_no_hybrid_over_provider": speedup.get(
+                        "rotation_provider_no_family_no_hybrid_over_provider"
+                    ),
+                    "compile_provider_no_family_no_hybrid_over_provider": speedup.get(
+                        "compile_provider_no_family_no_hybrid_over_provider"
+                    ),
                     "time_speedup_dense_over_provider_no_tile_family_sharing": speedup.get(
                         "time_dense_over_provider_no_tile_family_sharing"
                     ),
@@ -2715,6 +3644,15 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "hot_run_median_s": result.get("hot_run_median_s"),
                             "hot_run_s_json": result.get("hot_run_s", ()),
                             "rotation_eval_count": result.get("rotation_eval_count"),
+                            "runtime_rotation_eval_count": result.get("runtime_rotation_eval_count"),
+                            "runtime_lintrans_rotation_eval_count": result.get(
+                                "runtime_lintrans_rotation_eval_count"
+                            ),
+                            "runtime_direct_rotation_eval_count": result.get(
+                                "runtime_direct_rotation_eval_count"
+                            ),
+                            "runtime_conjugation_count": result.get("runtime_conjugation_count"),
+                            "runtime_operation_counts_json": result.get("runtime_operation_counts", {}),
                             "actual_rotation_callback_count": rotation_stats.get("actual_rotation_callback_count"),
                             "reported_unique_key_union_count": rotation_stats.get("reported_unique_key_union_count"),
                             "rotation_stats_source": str(rotation_stats.get("source", "")),
@@ -2883,9 +3821,12 @@ def main() -> int:
             "compile_runs_per_path": 1,
             "rotation_count_note": (
                 "rotation_eval_count is the callback-equivalent BSGS rotation count after planning: "
-                "shared-cache paths count unique nonzero baby rotations per family plus nonzero giant rotations "
-                "per transform, and dense output-fold rotations are added where the runtime still uses them. "
-                "reported_unique_key_union_count is retained only as an audit field for the old proxy."
+                "the default dense path counts each Orion submatrix transform independently; shared-cache "
+                "dense evaluation is disabled unless ORION_DENSE_LT_SHARED_CACHE is explicitly enabled. "
+                "Provider shared-cache paths count unique nonzero baby rotations per family plus nonzero "
+                "giant rotations per transform, and dense output-fold rotations are added where the runtime still uses them. "
+                "runtime_rotation_eval_count is measured during the timed Lattigo forward with runtime operation "
+                "callbacks; reported_unique_key_union_count is retained only as an audit field for the old proxy."
             ),
             "paths": {path: str(PATH_DESCRIPTIONS[path]) for path in PATHS},
             "networks": [],

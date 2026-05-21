@@ -13,12 +13,21 @@ from orion.core.orion import scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import R34CompileRegistry
 from orion.experimental.cir import r34_orion_same_shape as r34_same_shape
+from orion.experimental.cir.halo_local_conv_provider import (
+    HaloLocalBranchPairConvRuntimeExecutor,
+    HaloLocalConvRuntimeExecutor,
+)
 from orion.experimental.cir.transition_pool_provider import (
     BranchPairConvRuntimeExecutor,
+    BranchPairNoHybridConvRuntimeExecutor,
     InputPairConvRuntimeExecutor,
 )
 from orion.models.resnet import ResNet34
 from orion.nn.module import Module
+
+
+def _executor_delegate(executor):
+    return getattr(executor, "delegate", getattr(executor, "_delegate", executor))
 
 
 def _require_lattigo() -> None:
@@ -175,7 +184,8 @@ def test_r34_transition_lattigo_runtime_matches_reference(conv_name: str, shortc
         conv.he_mode = True
         shortcut.he_mode = True
 
-        assert isinstance(conv.region_runtime.executor, BranchPairConvRuntimeExecutor)
+        assert isinstance(conv.region_runtime.executor, HaloLocalBranchPairConvRuntimeExecutor)
+        assert isinstance(_executor_delegate(conv.region_runtime.executor), BranchPairNoHybridConvRuntimeExecutor)
         assert conv.region_runtime.supports_scheme(scheme) is True
 
         torch.manual_seed(23)
@@ -195,10 +205,10 @@ def test_r34_transition_lattigo_runtime_matches_reference(conv_name: str, shortc
 @pytest.mark.parametrize(
     ("node_name", "executor_type"),
     (
-        ("layers_0_0_conv1", r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor),
-        ("layers_1_1_conv1", r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor),
-        ("layers_2_1_conv1", r34_same_shape.R34Pack2SameShapeRuntimeExecutor),
-        ("layers_3_1_conv1", r34_same_shape.R34Pack2SameShapeRuntimeExecutor),
+        ("layers_0_0_conv1", r34_same_shape.NativeAlignedHaloNoRIConvExecutor),
+        ("layers_1_1_conv1", r34_same_shape.NativeAlignedHaloNoRIConvExecutor),
+        ("layers_2_1_conv1", r34_same_shape.NativeAlignedHaloNoRIConvExecutor),
+        ("layers_3_1_conv1", r34_same_shape.NativeAlignedHaloNoRIConvExecutor),
     ),
 )
 def test_r34_same_shape_lattigo_runtime_matches_reference_without_dense_pack(monkeypatch, node_name: str, executor_type: type) -> None:
@@ -211,7 +221,16 @@ def test_r34_same_shape_lattigo_runtime_matches_reference_without_dense_pack(mon
     _init_lattigo_scheme()
     try:
         _dag, module = _compile_module(str(node_name))
-        assert isinstance(module.region_runtime.executor, executor_type)
+        assert isinstance(module.region_runtime.executor, HaloLocalConvRuntimeExecutor)
+        delegate = _executor_delegate(module.region_runtime.executor)
+        assert isinstance(delegate, executor_type)
+        if str(node_name) == "layers_0_0_conv1":
+            metadata = delegate.compile_cache_metadata()
+            assert metadata["native_cb_shared_rotations"] == 904
+            assert metadata["conv_lt_effective_submatrix_tasks"] == 8
+            assert metadata["same_shape_runtime_layout"] == "compact_io_native_aligned_halo_no_ri"
+            assert metadata["input_relayout"]["blocks"]
+            assert metadata["output_relayout"]["blocks"]
 
         torch.manual_seed(abs(hash(str(node_name))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)
@@ -230,7 +249,8 @@ def test_r34_single_flow_lattigo_runtime_matches_reference(node_name: str) -> No
     _init_lattigo_scheme()
     try:
         _dag, module = _compile_module(str(node_name))
-        assert isinstance(module.region_runtime.executor, InputPairConvRuntimeExecutor)
+        assert isinstance(module.region_runtime.executor, HaloLocalConvRuntimeExecutor)
+        assert isinstance(_executor_delegate(module.region_runtime.executor), InputPairConvRuntimeExecutor)
 
         torch.manual_seed(abs(hash(str(node_name))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)

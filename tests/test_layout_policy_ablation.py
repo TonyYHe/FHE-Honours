@@ -26,13 +26,16 @@ from orion.experimental.layout_policy_ablation import (
     _runtime_config,
 )
 from orion.models.resnet import BasicBlock, ResNet
+from orion.models.unet import UNet22
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
 from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.experimental.u22_phase1 import (
+    LayoutPolicyAddRuntimeExecutor,
     LayoutPolicyEncryptedModuleRuntimeExecutor,
     LayoutPolicyProviderRuntimeExecutor,
     LayoutPolicyRelayoutKernel,
     U22CompileRegistry,
+    _layout_policy_runtime_compile_plan,
     collect_layout_policy_provider_pressure,
 )
 from orion.nn.linear import Conv2d
@@ -111,14 +114,50 @@ def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
 
     fixed = _policy(payload, "fixed_max")
     eager = _policy(payload, "eager")
+    greedy = _policy(payload, "greedy")
     dp = _policy(payload, "dp")
-    assert fixed["relayouts"] <= eager["relayouts"]
-    assert eager["halo_redundancy_ratio"] <= fixed["halo_redundancy_ratio"]
-    assert dp["objective"] <= min(
-        row["objective"]
-        for row in payload["policies"]
-        if row["policy"] in {"eager", "greedy"}
+    for policy in (fixed, eager, greedy, dp):
+        assert policy["relayouts"] == 0
+        assert policy["halo_redundancy_ratio"] == 0.0
+        assert all(
+            int(row["required_layout"]["alpha"]) == 0 and int(row["required_layout"]["beta"]) == 0
+            for row in policy["edge_layouts"]
+        )
+        assert all(
+            int(row["selected_layout"]["alpha"]) == 0 and int(row["selected_layout"]["beta"]) == 0
+            for row in policy["edge_layouts"]
+        )
+
+
+def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() -> None:
+    payload = build_planner_ablation(
+        network="u22_128_base32",
+        policies=("fixed_max", "eager", "greedy", "dp"),
     )
+
+    for policy in payload["policies"]:
+        assert policy["relayouts"] == 0
+        assert policy["halo_redundancy_ratio"] == 0.0
+        assert all(
+            int(row["required_layout"]["alpha"]) == 0 and int(row["required_layout"]["beta"]) == 0
+            for row in policy["edge_layouts"]
+        )
+        assert all(
+            int(row["selected_layout"]["alpha"]) == 0 and int(row["selected_layout"]["beta"]) == 0
+            for row in policy["edge_layouts"]
+        )
+
+
+def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layouts() -> None:
+    def runtime_count(policy: str) -> tuple[int, int]:
+        plan = build_layout_policy_compile_plan(build_u22_dag(network_spec("u22_256_base32")), policy=policy)
+        runtime_plan = _layout_policy_runtime_compile_plan(plan)
+        return int(len(runtime_plan["node_layouts"])), int(runtime_plan["relayout_edge_count"])
+
+    assert runtime_count("fixed_max") == (30, 29)
+    assert runtime_count("eager") == (30, 29)
+    assert runtime_count("greedy") == (30, 5)
+    assert runtime_count("dp") == (30, 0)
 
 
 def test_u22_64_layout_policy_planner_aligns_add_inputs() -> None:
@@ -132,11 +171,11 @@ def test_u22_64_layout_policy_planner_aligns_add_inputs() -> None:
             assert len({_layout_key(row) for row in incoming}) == 1
 
 
-def test_layout_policy_dp_forbids_compact_fallback_for_halo_consuming_ops() -> None:
+def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> None:
     payload = build_planner_ablation(network="u22_256_base32", policies=("dp",))
     dp = _policy(payload, "dp")
 
-    assert int(dp["compact_fallback_penalty_estimate"]) == 0
+    assert int(dp["compact_fallback_penalty_estimate"]) > 0
     fallback = [row for row in dp["edge_layouts"] if row.get("layout_mode") == "compact_global_fallback"]
     assert fallback == []
     uncovered = [
@@ -145,7 +184,11 @@ def test_layout_policy_dp_forbids_compact_fallback_for_halo_consuming_ops() -> N
         if row["op_kind"] in {"conv2d", "avgpool2d"}
         and not _layout_covers(row["selected_layout"], row["required_layout"])
     ]
-    assert uncovered == []
+    assert uncovered
+    assert all(row["op_kind"] == "conv2d" for row in uncovered)
+    assert all(row.get("layout_mode") == "compact_align_shared" for row in uncovered)
+    assert all(not bool(row.get("relayout", False)) for row in uncovered)
+    assert all(int(row.get("compact_fallback_penalty_estimate", 0)) > 0 for row in uncovered)
 
 
 def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() -> None:
@@ -166,24 +209,19 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
     assert audit["executable_region_count"] == audit["attached_count"]
     assert audit["graph_audit"]["layout_policy"] == "eager"
     assert audit["graph_audit"]["layout_policy_runtime"] == "provider_executable_layout_policy"
-    assert audit["graph_audit"]["layout_policy_runtime_lowering"] == "provider_executable+mixed_layout_policy"
+    assert audit["graph_audit"]["layout_policy_runtime_lowering"] == "provider_executable+compact_layout"
     assert audit["graph_audit"]["layout_policy_compile_plan_consumed"] is True
     assert audit["graph_audit"]["layout_policy_edge_layout_count"] == 34
     assert audit["graph_audit"]["layout_policy_compile_plan_region_count"] == audit["attached_count"]
     assert audit["graph_audit"]["layout_policy_provider_executable_region_count"] == audit["attached_count"]
     assert audit["graph_audit"]["layout_policy_backend_executable_region_count"] == 0
-    assert audit["graph_audit"]["layout_policy_native_halo_provider_region_count"] > 0
+    assert audit["graph_audit"]["layout_policy_native_halo_provider_region_count"] == 0
     assert all(group.fallback_reason == "" for group in registry.groups)
     assert all(isinstance(group.executor, LayoutPolicyProviderRuntimeExecutor) for group in registry.groups)
     assert all(group.executor.base_executor is not None for group in registry.groups)
     assert not any(group.materializer == "backend_encrypted_module" for group in registry.groups)
     runtime_lowerings = {group.plan["runtime_lowering"] for group in registry.groups}
-    assert runtime_lowerings <= {
-        "provider_executable+compact_layout",
-        "provider_executable+native_halo_layout",
-        "provider_executable+relayout_lt",
-    }
-    assert runtime_lowerings
+    assert runtime_lowerings == {"provider_executable+compact_layout"}
     assert {
         group.plan["provider_materializer"]
         for group in registry.groups
@@ -201,7 +239,7 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
 
 
 def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None:
-    dag = build_u22_dag(network_spec("u22_64_base32"))
+    dag = build_u22_dag(network_spec("u22_256_base32"))
     registry = U22CompileRegistry.for_dag(
         dag,
         allowed_nodes=("up1", "up2", "up3", "up4"),
@@ -220,8 +258,8 @@ def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None
     assert native_groups
     assert all("relayout_kernel_depth_1" in group.boundary_actions for group in native_groups)
     assert all(group.depth >= 2 for group in native_groups)
-    assert all(group.solver_depth == 1 for group in native_groups)
-    assert all(group.effective_depth() == 1 for group in native_groups)
+    assert all(group.solver_depth == group.depth for group in native_groups)
+    assert all(group.effective_depth() == group.depth for group in native_groups)
     assert not adapter_groups
     assert {
         type(group.executor.base_executor).__name__
@@ -420,6 +458,66 @@ def test_layout_policy_relayout_kernel_counts_one_rotation_and_mask_per_halo_sid
     assert estimate["sparse_lt_count"] == 0
 
 
+def test_layout_policy_add_runtime_materializes_common_halo_join() -> None:
+    _init_python_scheme("")
+    try:
+        compact = {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1}
+        halo = {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1}
+        rows = [
+            {
+                "edge": "left->add",
+                "source": "left",
+                "target": "add",
+                "op_kind": "add",
+                "shape": [1, 1, 2, 3],
+                "source_layout": compact,
+                "selected_layout": halo,
+                "target_layout": halo,
+                "relayout": True,
+                "relayout_reason": "dp_add_input_alignment",
+                "relayout_rotation_estimate": 2,
+                "relayout_mask_mult_estimate": 2,
+                "relayout_depth_estimate": 1,
+            },
+            {
+                "edge": "right->add",
+                "source": "right",
+                "target": "add",
+                "op_kind": "add",
+                "shape": [1, 1, 2, 3],
+                "source_layout": halo,
+                "selected_layout": halo,
+                "target_layout": halo,
+                "relayout": False,
+            },
+        ]
+        runtime = LayoutPolicyAddRuntimeExecutor(
+            node="add",
+            compile_plan={"policy": "dp", "edge_layouts": rows},
+            input_sources=("left", "right"),
+        )
+        level = len(scheme.params.get_logq()) - 1
+        left = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3)
+        left_halo = torch.cat([left[:, :, :1, :], left, left[:, :, -1:, :]], dim=2)
+        right_core = torch.full((1, 1, 2, 3), 10.0, dtype=torch.float32)
+        right_halo = torch.cat([right_core[:, :, :1, :], right_core, right_core[:, :, -1:, :]], dim=2)
+        out = runtime(
+            scheme.encrypt(scheme.encode(left, level)),
+            scheme.encrypt(scheme.encode(right_halo, level)),
+        )
+        decoded = out.decrypt().decode().detach().cpu().to(dtype=torch.float32)
+
+        assert tuple(int(value) for value in decoded.shape) == (1, 1, 4, 3)
+        assert torch.equal(decoded, left_halo + right_halo)
+        assert runtime.execute_count == 1
+        assert runtime.last_runtime_io["runtime_lowering"] == "layout_policy_add_join"
+        assert runtime.last_runtime_io["relayout_kernel_count"] == 1
+        assert runtime.last_runtime_io["relayout_rotation_count"] == 2
+        assert runtime.last_runtime_io["relayout_mask_mult_count"] == 2
+    finally:
+        scheme.delete_scheme()
+
+
 def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     dag = build_u22_dag(network_spec("u22_256_base32"))
     compile_plan = build_layout_policy_compile_plan(dag, policy="dp")
@@ -429,14 +527,26 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
         for row in compile_plan["node_layouts"]
         if bool(row.get("producer_materialized_halo", False))
     ]
-    assert int(compile_plan["relayout_edge_count"]) > 0
+    compact_align_shared = [
+        row
+        for row in compile_plan["edge_layouts"]
+        if row.get("layout_mode") == "compact_align_shared"
+    ]
+    assert int(compile_plan["relayout_edge_count"]) == 0
     assert int(compile_plan["output_relayout_node_count"]) == len(producer_halo_nodes)
-    assert int(compile_plan["summary"]["relayout_depth_estimate"]) == int(compile_plan["relayout_edge_count"]) + sum(
+    assert producer_halo_nodes == []
+    assert compact_align_shared
+    assert all(int(row.get("compact_fallback_penalty_estimate", 0)) > 0 for row in compact_align_shared)
+    relayout_edge_depth = sum(
+        1
+        for row in compile_plan["relayout_edges"]
+        if int(row["selected_layout"].get("alpha", 0)) > 0 or int(row["selected_layout"].get("beta", 0)) > 0
+    )
+    assert int(compile_plan["summary"]["relayout_depth_estimate"]) == int(relayout_edge_depth) + sum(
         int(row["depth_estimate"]) for row in compile_plan["output_relayout_nodes"]
     )
     assert all(int(row["rotation_estimate"]) >= 0 for row in compile_plan["relayout_edges"])
     assert all(int(row["mask_mult_estimate"]) >= 0 for row in compile_plan["relayout_edges"])
-    assert all(int(row["relayout_rotation_estimate"]) > 0 for row in producer_halo_nodes)
     assert all("lt_one_channel_diagonal_estimate" not in row for row in compile_plan["edge_layouts"])
     assert all("lt_bsgs_group_count_estimate" in row for row in compile_plan["edge_layouts"])
     assert int(compile_plan["summary"]["relayout_rotation_estimate"]) == sum(
@@ -445,6 +555,58 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     assert int(compile_plan["summary"]["relayout_mask_mult_estimate"]) == sum(
         int(row["mask_mult_estimate"]) for row in compile_plan["relayout_edges"]
     ) + sum(int(row["mask_mult_estimate"]) for row in compile_plan["output_relayout_nodes"])
+
+
+def test_layout_policy_dp_treats_silu_as_layout_preserving() -> None:
+    torch.manual_seed(0)
+    model = UNet22(dataset="kvasir_polyp_256", base_channels=8, activation="silu", silu_degree=7)
+    traced = OrionTracer().trace_model(model)
+    StatsTracker(traced).propagate(torch.randn((1, 3, 256, 256), dtype=torch.float32))
+    dag = NetworkDAG(traced)
+    dag.build_dag()
+    for node in dag.nodes:
+        module = dag.nodes[node]["module"]
+        if module is not None and hasattr(module, "init_orion_params"):
+            module.init_orion_params()
+        if module is not None and hasattr(module, "update_params"):
+            module.update_params()
+
+    compile_plan = build_layout_policy_compile_plan(dag, policy="dp")
+    activation_rows = [row for row in compile_plan["node_layouts"] if str(row["node"]).endswith("_act")]
+
+    assert activation_rows
+    assert int(compile_plan["output_relayout_node_count"]) == 0
+    assert all(not bool(row.get("output_relayout", False)) for row in activation_rows)
+
+
+def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback() -> None:
+    dag = build_u22_dag(network_spec("u22_256_base32"))
+    compile_plan = build_layout_policy_compile_plan(dag, policy="dp")
+    node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
+    edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
+
+    up3_layout = dict(node_rows["up3"]["selected_layout"])
+    up3_add = dict(edge_rows["up3->add3"])
+    assert int(up3_layout["alpha"]) > 0 or int(up3_layout["beta"]) > 0
+    assert bool(up3_add["relayout"]) is False
+
+    up2_layout = dict(node_rows["up2"]["selected_layout"])
+    up2_add = dict(edge_rows["up2->add2"])
+    assert int(up2_layout["alpha"]) > 0 or int(up2_layout["beta"]) > 0
+    assert bool(up2_add["relayout"]) is False
+
+    add2_dec = dict(edge_rows["add2->dec2a"])
+    assert add2_dec["layout_mode"] == "compact_align_shared"
+    assert bool(add2_dec["relayout"]) is False
+    assert int(add2_dec["selected_layout"]["alpha"]) > 0
+    assert int(add2_dec["selected_layout"]["beta"]) == 0
+
+    dec1a_layout = dict(node_rows["dec1a"]["selected_layout"])
+    add1_dec = dict(edge_rows["add1->dec1a"])
+    assert int(dec1a_layout["alpha"]) == 0
+    assert int(dec1a_layout["beta"]) == 0
+    assert add1_dec["layout_mode"] == "compact_align_shared"
+    assert bool(add1_dec["relayout"]) is False
 
 
 def test_layout_policy_dp_plans_reduced_full_structure_r34_mock() -> None:
@@ -593,13 +755,21 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
                         "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
                     },
                 ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+                    },
+                ],
             },
         )
         executor.assigned_level = int(conv.level)
         executor.assigned_depth = int(conv.depth)
         x = torch.randn((1, 1, 4, 4), dtype=torch.float32)
         x_height_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
-        reference = torch.nn.functional.conv2d(x_height_halo, conv.weight, conv.bias, padding=(0, 1))
+        reference = torch.nn.functional.conv2d(x_height_halo, conv.weight, conv.bias, padding=(1, 1))
         x_ct = scheme.encrypt(scheme.encode(x, conv.level))
         out_ct = executor(x_ct)["conv"]
         decoded = out_ct.decrypt().decode().detach().cpu().to(dtype=torch.float32)
@@ -614,7 +784,11 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
         assert executor.last_runtime_io["provider_executor"] == "InputPairConvRuntimeExecutor"
         assert executor.last_runtime_io["native_halo_provider"] is True
         assert executor.last_runtime_io["relayout_kernel_count"] == 1
+        assert tuple(int(value) for value in out_ct.on_shape) == (1, 1, 6, 4)
+        assert tuple(int(value) for value in executor.runtime_fhe_output_shape()) == (1, 1, 6, 4)
         assert not hasattr(conv, "layout_policy_input_row_offset")
+        assert not hasattr(conv, "layout_policy_output_row_offset")
+        assert tuple(int(value) for value in base.fhe_output_shape) == (1, 1, 4, 4)
         metadata = executor.compile_cache_metadata()["layout_policy_wrapper"]
         assert metadata["runtime_lowering"] == "provider_executable+native_halo_layout"
         assert metadata["relayout_kernel_count"] == 1

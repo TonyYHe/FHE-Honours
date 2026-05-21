@@ -15,6 +15,7 @@ import torch
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.models.unet import UNet22
+from orion.nn.activation import Activation, Chebyshev, Quad, ReLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.pooling import AvgPool2d
 
@@ -23,12 +24,15 @@ DEFAULT_SLOTS = 32768
 RELAYOUT_ROTATION_WEIGHT = 6.0
 RELAYOUT_MASK_MULT_WEIGHT = 1.0
 LT_ROTATION_WEIGHT = 8.0
-HALO_SLOT_WEIGHT = 0.0
+HALO_SLOT_WEIGHT = 0.02
 TILE_WEIGHT = 4.0
 BOOTSTRAP_PROXY_WEIGHT = 64.0
 BOOTSTRAP_HALO_SLOT_DIVISOR = math.inf
 RELAYOUT_DEPTH_WEIGHT = 4096.0
 RELAYOUT_NODE_STACK_DEPTH_WEIGHT = 65536.0
+ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT = 0.0
+RELAYOUT_BOOTSTRAP_CT_WEIGHT = 16384.0
+DP_FRONTIER_STATE_LIMIT = 64
 POLICY_ALIASES = {
     "fixed": "fixed_max",
     "fixedmax": "fixed_max",
@@ -56,6 +60,7 @@ PROVIDER_PRESSURE_SUMMARY_KEYS = (
     "relayout_lt_region_count",
     "relayout_edge_count",
     "output_relayout_edge_count",
+    "compact_align_shared_edge_count",
     "relayout_kernel_count",
     "relayout_rotation_count",
     "relayout_mask_mult_count",
@@ -334,18 +339,30 @@ def _layout_for_shape(
     )
 
 
+def _compact_height_strip_fits_single_ct(
+    *,
+    shape: tuple[int, int, int, int],
+    gap: int,
+    slots: int,
+) -> bool:
+    _n, _channels, height, width = shape
+    physical_h = int(height) * int(gap)
+    physical_w = int(width) * int(gap)
+    return int(physical_h * physical_w) <= int(slots)
+
+
 def _consumer_requirement(module: Any | None) -> tuple[int, int, int, str, int]:
+    if isinstance(module, AvgPool2d):
+        kernel = tuple(int(value) for value in getattr(module, "kernel_size", (1, 1)))
+        stride = tuple(int(value) for value in getattr(module, "stride", (1, 1)))
+        halo = max(0, int(max(kernel) - max(stride)))
+        return int(halo), int(halo), int(stride[0]), "avgpool2d", max(0, int(kernel[0] * kernel[1] - 1))
     if isinstance(module, Conv2d) and not isinstance(module, ConvTranspose2d):
         kernel = tuple(int(value) for value in getattr(module, "kernel_size", (1, 1)))
         stride = tuple(int(value) for value in getattr(module, "stride", (1, 1)))
         pad = tuple(int(value) for value in getattr(module, "padding", (0, 0)))
         radius = max(0, max(kernel) // 2 if max(pad) > 0 else max(kernel) - 1)
         return int(radius), int(radius), int(stride[0]), "conv2d", max(0, int(kernel[0] * kernel[1] - 1))
-    if isinstance(module, AvgPool2d):
-        kernel = tuple(int(value) for value in getattr(module, "kernel_size", (1, 1)))
-        stride = tuple(int(value) for value in getattr(module, "stride", (1, 1)))
-        halo = max(0, int(max(kernel) - max(stride)))
-        return int(halo), int(halo), int(stride[0]), "avgpool2d", max(0, int(kernel[0] * kernel[1] - 1))
     if isinstance(module, ConvTranspose2d):
         kernel = tuple(int(value) for value in getattr(module, "kernel_size", (1, 1)))
         stride = tuple(int(value) for value in getattr(module, "stride", (1, 1)))
@@ -453,6 +470,13 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
         alpha, beta, stride, op_kind, lt_base = _consumer_requirement(target_module)
         output_shape, output_fhe_shape = _consumer_output_shapes(target_module, shape, fhe_shape)
         op_params = _consumer_op_params(target_module, input_shape=shape, output_shape=output_shape)
+        if (
+            str(op_kind) in {"conv2d", "avgpool2d"}
+            and (int(alpha) > 0 or int(beta) > 0)
+            and _compact_height_strip_fits_single_ct(shape=shape, gap=int(gap), slots=int(slots))
+        ):
+            alpha = 0
+            beta = 0
         compact = _layout_for_shape(shape=shape, gap=int(gap), alpha=0, beta=0, stride=1, slots=int(slots))
         requirement = _layout_for_shape(
             shape=shape,
@@ -502,6 +526,18 @@ def _same_physical_layout(left: LayoutState, right: LayoutState) -> bool:
     )
 
 
+def _layout_with_stride(layout: LayoutState, stride: int) -> LayoutState:
+    return LayoutState(
+        alpha=int(layout.alpha),
+        beta=int(layout.beta),
+        stride=max(1, int(stride)),
+        gap=int(layout.gap),
+        core_slots=int(layout.core_slots),
+        stored_slots=int(layout.stored_slots),
+        tile_count=int(layout.tile_count),
+    )
+
+
 def _side_after_downsample(side: int, *, consume: int, stride: int) -> int:
     return max(0, int(int(side) - int(consume)) // max(1, int(stride)))
 
@@ -541,12 +577,19 @@ def _edge_row(
     relayout_reason: str,
     lt_rotations: int | None = None,
     layout_mode: str = "halo_local",
+    source_layout: LayoutState | None = None,
+    compact_fallback_penalty_estimate: int = 0,
 ) -> dict[str, Any]:
     if str(layout_mode) == "compact_global_fallback":
         raise ValueError("compact global fallback is not a valid halo-local layout-policy edge")
     if lt_rotations is None:
         lt_rotations = _lt_rotations(edge, layout)
     lt_stats = _lt_rotation_stats(edge, layout)
+    relayout_estimate = _relayout_transition_estimate(
+        source_layout=source_layout,
+        target_layout=layout,
+        relayout=bool(relayout),
+    )
     return {
         "edge": edge.edge_id,
         "source": edge.source,
@@ -555,13 +598,17 @@ def _edge_row(
         "shape": [int(value) for value in edge.shape],
         "fhe_shape": [int(value) for value in edge.fhe_shape],
         "required_layout": edge.requirement.to_dict(),
+        "source_layout": {} if source_layout is None else source_layout.to_dict(),
         "selected_layout": layout.to_dict(),
+        "target_layout": layout.to_dict(),
         "relayout": bool(relayout),
         "relayout_reason": str(relayout_reason),
-        "relayout_rotation_estimate": int(_relayout_rotations((layout,)) if bool(relayout) else 0),
-        "relayout_mask_mult_estimate": int(_relayout_mask_mults((layout,)) if bool(relayout) else 0),
+        "relayout_rotation_estimate": int(relayout_estimate["rotation_count"]),
+        "relayout_mask_mult_estimate": int(relayout_estimate["mask_mult_count"]),
+        "relayout_sparse_lt_estimate": int(relayout_estimate["sparse_lt_count"]),
+        "relayout_depth_estimate": int(relayout_estimate["depth_estimate"]),
         "lt_bsgs_rotation_estimate": int(lt_rotations),
-        "compact_fallback_penalty_estimate": 0,
+        "compact_fallback_penalty_estimate": int(compact_fallback_penalty_estimate),
         "lt_bsgs_group_count_estimate": int(lt_stats["bsgs_groups"]),
         "lt_transform_count_estimate": int(lt_stats["transforms"]),
         "lt_baby_rotation_estimate": int(lt_stats["baby_rotations"]),
@@ -781,6 +828,33 @@ def _lt_rotation_stats(edge: EdgeInfo, layout: LayoutState) -> dict[str, int]:
         beta=int(layout.beta),
     )
     output_gap = _output_gap_for_edge(edge)
+    spatial_work = max(
+        int(edge.shape[2]) * int(edge.shape[3]),
+        int((edge.output_shape or edge.shape)[2]) * int((edge.output_shape or edge.shape)[3]),
+    )
+    if int(spatial_work) > 16384:
+        input_multiplier, output_multiplier = _lt_channel_multipliers(edge)
+        input_blocks = max(1, _ceil_div(int(input_phys_h) * int(input_phys_w), int(edge.slots)))
+        output_blocks = max(
+            1,
+            _ceil_div(
+                int(edge.output_fhe_shape[2]) * int(edge.output_fhe_shape[3]),
+                int(edge.slots),
+            ),
+        )
+        bsgs_groups = int(input_blocks * output_blocks)
+        one_channel_diags = max(1, int(edge.kernel_size[0]) * int(edge.kernel_size[1]) - int(str(edge.op_kind) in {"conv2d", "avgpool2d"}))
+        transforms = int(max(1, bsgs_groups) * max(1, output_multiplier))
+        rotations = int(max(1, bsgs_groups) * int(one_channel_diags) * max(1, output_multiplier))
+        return {
+            "bsgs_groups": int(bsgs_groups),
+            "transforms": int(transforms),
+            "baby_rotations": int(min(rotations, int(one_channel_diags) * max(1, output_multiplier))),
+            "giant_rotations": int(max(0, rotations - int(one_channel_diags) * max(1, output_multiplier))),
+            "input_channel_multiplier": int(input_multiplier),
+            "output_channel_multiplier": int(output_multiplier),
+            "rotations": int(rotations),
+        }
     one_channel_groups = _one_channel_lt_groups_cached(
         op_kind=str(edge.op_kind),
         input_h=int(edge.shape[2]),
@@ -852,6 +926,69 @@ def _relayout_depth_units(layouts: Iterable[LayoutState]) -> int:
     return int(sum(1 for layout in layouts if int(layout.alpha) > 0 or int(layout.beta) > 0))
 
 
+def _relayout_transition_estimate(
+    *,
+    source_layout: LayoutState | None,
+    target_layout: LayoutState,
+    relayout: bool,
+) -> dict[str, int]:
+    if not bool(relayout):
+        return {
+            "rotation_count": 0,
+            "mask_mult_count": 0,
+            "sparse_lt_count": 0,
+            "depth_estimate": 0,
+        }
+    if source_layout is None:
+        rotations = _relayout_rotations((target_layout,))
+        masks = _relayout_mask_mults((target_layout,))
+        return {
+            "rotation_count": int(rotations),
+            "mask_mult_count": int(masks),
+            "sparse_lt_count": 0,
+            "depth_estimate": int(_relayout_depth_units((target_layout,))),
+        }
+
+    source_has_halo = bool(int(source_layout.alpha) > 0 or int(source_layout.beta) > 0)
+    target_has_halo = bool(int(target_layout.alpha) > 0 or int(target_layout.beta) > 0)
+    if not source_has_halo and target_has_halo:
+        side_count = _relayout_halo_side_count(target_layout)
+        return {
+            "rotation_count": int(side_count),
+            "mask_mult_count": int(side_count),
+            "sparse_lt_count": 0,
+            "depth_estimate": 1,
+        }
+    if source_has_halo and not target_has_halo:
+        return {
+            "rotation_count": 0,
+            "mask_mult_count": int(max(1, int(source_layout.tile_count))),
+            "sparse_lt_count": 0,
+            "depth_estimate": 1,
+        }
+    if source_has_halo and target_has_halo:
+        if _same_physical_layout(source_layout, target_layout):
+            return {
+                "rotation_count": 0,
+                "mask_mult_count": 0,
+                "sparse_lt_count": 0,
+                "depth_estimate": 0,
+            }
+        side_count = _relayout_halo_side_count(target_layout)
+        return {
+            "rotation_count": int(side_count),
+            "mask_mult_count": int(side_count),
+            "sparse_lt_count": 1,
+            "depth_estimate": 1,
+        }
+    return {
+        "rotation_count": 0,
+        "mask_mult_count": int(max(1, int(target_layout.tile_count))),
+        "sparse_lt_count": 1,
+        "depth_estimate": 1,
+    }
+
+
 def _node_layout_row(
     node: str,
     layout: LayoutState,
@@ -905,6 +1042,11 @@ def _edge_linear_cost(row: dict[str, Any]) -> float:
     )
 
 
+def _layout_footprint_cost(layout: LayoutState) -> float:
+    halo_slots = max(0, int(layout.stored_slots) - int(layout.core_slots))
+    return float(halo_slots) * HALO_SLOT_WEIGHT + float(layout.tile_count) * TILE_WEIGHT
+
+
 def _relayout_linear_cost(layout: LayoutState) -> float:
     return (
         float(_relayout_rotations((layout,))) * RELAYOUT_ROTATION_WEIGHT
@@ -912,11 +1054,61 @@ def _relayout_linear_cost(layout: LayoutState) -> float:
     )
 
 
+def _relayout_bootstrap_ct_pressure(edge_rows: Iterable[dict[str, Any]]) -> int:
+    rows = [
+        row
+        for row in edge_rows
+        if bool(row.get("relayout", False)) and int(row.get("relayout_depth_estimate", 0) or 0) > 0
+    ]
+    pressure = 0
+    add_by_target: dict[str, int] = {}
+    for row in rows:
+        layout = dict(row.get("selected_layout", {}) or {})
+        depth = int(row.get("relayout_depth_estimate", 0) or 0)
+        tile_count = max(1, int(layout.get("tile_count", 1) or 1))
+        item_pressure = int(depth * tile_count)
+        if str(row.get("op_kind", "")) == "add":
+            target = str(row.get("target", ""))
+            add_by_target[target] = max(int(add_by_target.get(target, 0)), int(item_pressure))
+        else:
+            pressure += int(item_pressure)
+    return int(pressure + sum(add_by_target.values()))
+
+
 def _policy_linear_cost(edge_rows: Iterable[dict[str, Any]], relayout_layouts: Iterable[LayoutState]) -> float:
-    return float(sum(_edge_linear_cost(row) for row in edge_rows)) + float(
-        sum(_relayout_linear_cost(layout) for layout in relayout_layouts)
-    ) + float(
-        _relayout_depth_units(relayout_layouts) * RELAYOUT_DEPTH_WEIGHT
+    rows = list(edge_rows)
+    relayouts = list(relayout_layouts)
+    if rows:
+        relayout_rotation_cost = sum(
+            int(row.get("relayout_rotation_estimate", 0) or 0)
+            for row in rows
+            if bool(row.get("relayout", False))
+        )
+        relayout_mask_cost = sum(
+            int(row.get("relayout_mask_mult_estimate", 0) or 0)
+            for row in rows
+            if bool(row.get("relayout", False))
+        )
+        relayout_depth_cost = sum(
+            int(row.get("relayout_depth_estimate", 0) or 0)
+            for row in rows
+            if bool(row.get("relayout", False))
+        )
+        add_relayout_depth_cost = sum(
+            int(row.get("relayout_depth_estimate", 0) or 0)
+            for row in rows
+            if bool(row.get("relayout", False)) and str(row.get("op_kind", "")) == "add"
+        )
+        return (
+            float(sum(_edge_linear_cost(row) for row in rows))
+            + float(relayout_rotation_cost) * RELAYOUT_ROTATION_WEIGHT
+            + float(relayout_mask_cost) * RELAYOUT_MASK_MULT_WEIGHT
+            + float(relayout_depth_cost) * RELAYOUT_DEPTH_WEIGHT
+            + float(add_relayout_depth_cost) * ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT
+            + float(_relayout_bootstrap_ct_pressure(rows)) * RELAYOUT_BOOTSTRAP_CT_WEIGHT
+        )
+    return float(sum(_relayout_linear_cost(layout) for layout in relayouts)) + float(
+        _relayout_depth_units(relayouts) * RELAYOUT_DEPTH_WEIGHT
     )
 
 
@@ -931,9 +1123,24 @@ def _finalize_policy(
     stored_slots = int(sum(int(row["selected_layout"]["stored_slots"]) for row in edge_rows))
     core_slots = int(sum(int(row["selected_layout"]["core_slots"]) for row in edge_rows))
     tile_count = int(sum(int(row["selected_layout"]["tile_count"]) for row in edge_rows))
-    relayout_rotation_estimate = _relayout_rotations(relayout_layouts)
-    relayout_mask_mult_estimate = _relayout_mask_mults(relayout_layouts)
-    relayout_depth_estimate = _relayout_depth_units(relayout_layouts)
+    edge_relayout_rows = [row for row in edge_rows if bool(row.get("relayout", False))]
+    relayout_rotation_estimate = int(
+        sum(int(row.get("relayout_rotation_estimate", 0) or 0) for row in edge_relayout_rows)
+    )
+    relayout_mask_mult_estimate = int(
+        sum(int(row.get("relayout_mask_mult_estimate", 0) or 0) for row in edge_relayout_rows)
+    )
+    relayout_depth_estimate = int(
+        sum(int(row.get("relayout_depth_estimate", 0) or 0) for row in edge_relayout_rows)
+    )
+    add_relayout_depth_estimate = int(
+        sum(
+            int(row.get("relayout_depth_estimate", 0) or 0)
+            for row in edge_relayout_rows
+            if str(row.get("op_kind", "")) == "add"
+        )
+    )
+    relayout_bootstrap_ct_pressure = int(_relayout_bootstrap_ct_pressure(edge_relayout_rows))
     lt_rotation_estimate = int(sum(int(row["lt_bsgs_rotation_estimate"]) for row in edge_rows))
     compact_fallback_penalty_estimate = int(
         sum(int(row.get("compact_fallback_penalty_estimate", 0)) for row in edge_rows)
@@ -960,13 +1167,15 @@ def _finalize_policy(
         + float(halo_slots) * HALO_SLOT_WEIGHT
         + float(tile_count) * TILE_WEIGHT
         + float(relayout_depth_estimate) * RELAYOUT_DEPTH_WEIGHT
+        + float(add_relayout_depth_estimate) * ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT
+        + float(relayout_bootstrap_ct_pressure) * RELAYOUT_BOOTSTRAP_CT_WEIGHT
         + float(bootstrap_proxy) * BOOTSTRAP_PROXY_WEIGHT
     )
     return PolicyPlan(
         policy=str(policy),
         policy_label=POLICY_LABELS[str(policy)],
         metric_source="planner_estimate",
-        relayouts=int(len(relayout_layouts)),
+        relayouts=int(len(edge_relayout_rows)),
         halo_redundancy_ratio=float(redundancy),
         total_ciphertext_tiles=int(tile_count),
         stored_slots=int(stored_slots),
@@ -998,78 +1207,263 @@ def _align_add_inputs(dag: NetworkDAG, rows_by_edge: dict[str, dict[str, Any]], 
             previous = LayoutState(**rows_by_edge[edge_id]["selected_layout"])
             if _same_layout(previous, target):
                 continue
+            rows_by_edge[edge_id]["source_layout"] = previous.to_dict()
             rows_by_edge[edge_id]["selected_layout"] = target.to_dict()
+            rows_by_edge[edge_id]["target_layout"] = target.to_dict()
             rows_by_edge[edge_id]["relayout"] = True
             rows_by_edge[edge_id]["relayout_reason"] = "add_input_alignment"
+            estimate = _relayout_transition_estimate(
+                source_layout=previous,
+                target_layout=target,
+                relayout=True,
+            )
+            rows_by_edge[edge_id]["relayout_rotation_estimate"] = int(estimate["rotation_count"])
+            rows_by_edge[edge_id]["relayout_mask_mult_estimate"] = int(estimate["mask_mult_count"])
+            rows_by_edge[edge_id]["relayout_sparse_lt_estimate"] = int(estimate["sparse_lt_count"])
+            rows_by_edge[edge_id]["relayout_depth_estimate"] = int(estimate["depth_estimate"])
             rows_by_edge[edge_id]["lt_bsgs_rotation_estimate"] = int(
                 rows_by_edge[edge_id]["lt_bsgs_rotation_estimate"]
             )
             relayout_layouts.append(target)
 
 
-def _plan_fixed_max(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
-    global_alpha = max(int(edge.requirement.alpha) for edge in edges)
-    global_beta = max(int(edge.requirement.beta) for edge in edges)
-    rows: list[dict[str, Any]] = []
-    for edge in edges:
-        layout = _layout_for_shape(
-            shape=edge.shape,
-            gap=int(edge.compact.gap),
-            alpha=int(global_alpha),
-            beta=int(global_beta),
-            stride=max(1, int(edge.requirement.stride)),
+def _fixed_max_layout_for_edge(
+    edge: EdgeInfo,
+    *,
+    global_alpha: int,
+    global_beta: int,
+    slots: int,
+) -> LayoutState:
+    fixed_like = _layout_for_shape(
+        shape=edge.shape,
+        gap=int(edge.compact.gap),
+        alpha=int(global_alpha),
+        beta=int(global_beta),
+        stride=max(1, int(edge.requirement.stride)),
+        slots=int(slots),
+    )
+    return _fill_beta_to_tile_capacity(fixed_like, shape=edge.shape, slots=int(slots))
+
+
+def _choose_non_dp_input_layout(
+    policy: str,
+    edge: EdgeInfo,
+    source_layout: LayoutState,
+    *,
+    global_alpha: int,
+    global_beta: int,
+    slots: int,
+) -> tuple[LayoutState, str]:
+    if str(policy) == "fixed_max":
+        layout = _fixed_max_layout_for_edge(
+            edge,
+            global_alpha=int(global_alpha),
+            global_beta=int(global_beta),
             slots=int(slots),
         )
-        rows.append(_edge_row(edge, layout, relayout=False, relayout_reason="", lt_rotations=_lt_rotations(edge, layout)))
-    rows_by_edge = {str(row["edge"]): row for row in rows}
+        return layout, "fixed_max_restore_halo"
+    if str(policy) == "greedy" and source_layout.covers(edge.requirement):
+        return _layout_with_stride(source_layout, max(int(source_layout.stride), int(edge.requirement.stride))), ""
+    if str(policy) == "greedy":
+        return (
+            _fill_beta_to_tile_capacity(edge.requirement, shape=edge.shape, slots=int(slots)),
+            "greedy_capacity_fill_relayout",
+        )
+    return edge.requirement, "consumer_min_layout"
+
+
+def _choose_non_dp_add_layout(
+    policy: str,
+    incoming: Sequence[EdgeInfo],
+    live: dict[str, LayoutState],
+    *,
+    global_alpha: int,
+    global_beta: int,
+    slots: int,
+) -> LayoutState:
+    if not incoming:
+        raise ValueError("cannot choose Add layout without incoming edges")
+    if str(policy) == "fixed_max":
+        return _fixed_max_layout_for_edge(
+            incoming[0],
+            global_alpha=int(global_alpha),
+            global_beta=int(global_beta),
+            slots=int(slots),
+        )
+    if str(policy) == "greedy":
+        return max(
+            (live[edge.source] for edge in incoming),
+            key=lambda item: (int(item.alpha + item.beta), int(item.stored_slots), int(item.tile_count)),
+        )
+    return incoming[0].requirement
+
+
+def _source_initial_layout(
+    policy: str,
+    outgoing: Sequence[EdgeInfo],
+    *,
+    global_alpha: int,
+    global_beta: int,
+    slots: int,
+) -> LayoutState | None:
+    if not outgoing:
+        return None
+    if str(policy) == "fixed_max":
+        return _fixed_max_layout_for_edge(
+            outgoing[0],
+            global_alpha=int(global_alpha),
+            global_beta=int(global_beta),
+            slots=int(slots),
+        )
+    local_need = _max_layout(outgoing, slots=int(slots))
+    if str(policy) == "greedy":
+        return _fill_beta_to_tile_capacity(local_need, shape=outgoing[0].shape, slots=int(slots))
+    return local_need
+
+
+def _plan_non_dp_topological(
+    dag: NetworkDAG,
+    edges: Sequence[EdgeInfo],
+    *,
+    policy: str,
+    slots: int,
+) -> PolicyPlan:
+    edges_by_source: dict[str, list[EdgeInfo]] = {}
+    edges_by_target: dict[str, list[EdgeInfo]] = {}
+    for edge in edges:
+        edges_by_source.setdefault(str(edge.source), []).append(edge)
+        edges_by_target.setdefault(str(edge.target), []).append(edge)
+    topo = [str(node) for node in dag.topological_sort()]
+    topo_index = {str(node): index for index, node in enumerate(topo)}
+    last_consumer_index = {
+        str(source): max(topo_index[str(edge.target)] for edge in source_edges)
+        for source, source_edges in edges_by_source.items()
+    }
+    global_alpha = max(int(edge.requirement.alpha) for edge in edges)
+    global_beta = max(int(edge.requirement.beta) for edge in edges)
+    live: dict[str, LayoutState] = {}
+    rows: list[dict[str, Any]] = []
     relayout_layouts: list[LayoutState] = []
-    _align_add_inputs(dag, rows_by_edge, relayout_layouts, slots=int(slots))
-    return _finalize_policy(policy="fixed_max", edge_rows=list(rows_by_edge.values()), relayout_layouts=relayout_layouts)
+    node_layouts: list[dict[str, Any]] = []
+
+    for node in topo:
+        incoming = tuple(edges_by_target.get(str(node), ()))
+        outgoing = tuple(edges_by_source.get(str(node), ()))
+        module = dag.nodes[node].get("module")
+        incoming_rows: list[dict[str, Any]] = []
+
+        if incoming and type(module).__name__ == "Add":
+            target_layout = _choose_non_dp_add_layout(
+                str(policy),
+                incoming,
+                live,
+                global_alpha=int(global_alpha),
+                global_beta=int(global_beta),
+                slots=int(slots),
+            )
+            for edge in incoming:
+                source_layout = live[edge.source]
+                relayout = not _same_physical_layout(source_layout, target_layout)
+                if bool(relayout):
+                    relayout_layouts.append(target_layout)
+                incoming_rows.append(
+                    _edge_row(
+                        edge,
+                        target_layout,
+                        relayout=bool(relayout),
+                        relayout_reason=f"{policy}_add_input_alignment" if bool(relayout) else "",
+                        lt_rotations=_lt_rotations(edge, target_layout),
+                        source_layout=source_layout,
+                    )
+                )
+        else:
+            for edge in incoming:
+                source_layout = live[edge.source]
+                target_layout, reason = _choose_non_dp_input_layout(
+                    str(policy),
+                    edge,
+                    source_layout,
+                    global_alpha=int(global_alpha),
+                    global_beta=int(global_beta),
+                    slots=int(slots),
+                )
+                relayout = str(edge.source) != "x" and not _same_physical_layout(source_layout, target_layout)
+                if bool(relayout):
+                    relayout_layouts.append(target_layout)
+                incoming_rows.append(
+                    _edge_row(
+                        edge,
+                        target_layout,
+                        relayout=bool(relayout),
+                        relayout_reason=str(reason) if bool(relayout) else "",
+                        lt_rotations=_lt_rotations(edge, target_layout),
+                        source_layout=source_layout,
+                    )
+                )
+
+        rows.extend(incoming_rows)
+
+        for source in list(live):
+            if int(last_consumer_index.get(str(source), -1)) <= int(topo_index[str(node)]):
+                live.pop(str(source), None)
+
+        output_layout: LayoutState | None
+        if incoming_rows:
+            if type(module).__name__ == "Add":
+                output_layout = LayoutState(**dict(incoming_rows[0]["selected_layout"]))
+            elif outgoing:
+                candidates = _operator_output_layout_candidates(
+                    module,
+                    incoming_rows=incoming_rows,
+                    outgoing=outgoing,
+                    slots=int(slots),
+                )
+                output_layout = candidates[0] if candidates else None
+            else:
+                output_layout = None
+        else:
+            output_layout = _source_initial_layout(
+                str(policy),
+                outgoing,
+                global_alpha=int(global_alpha),
+                global_beta=int(global_beta),
+                slots=int(slots),
+            )
+
+        if output_layout is not None and outgoing:
+            live[str(node)] = output_layout
+            node_layouts.append(
+                _node_layout_row(
+                    str(node),
+                    output_layout,
+                    outgoing[0].compact,
+                    relayout=False,
+                    reason="",
+                    producer_materialized_halo=False,
+                    shape=outgoing[0].shape,
+                    fhe_shape=outgoing[0].fhe_shape,
+                )
+            )
+
+    rows.sort(key=lambda row: (topo_index.get(str(row["source"]), 10**9), topo_index.get(str(row["target"]), 10**9)))
+    return _finalize_policy(
+        policy=str(policy),
+        edge_rows=rows,
+        relayout_layouts=relayout_layouts,
+        node_layouts=node_layouts,
+    )
+
+
+def _plan_fixed_max(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="fixed_max", slots=int(slots))
 
 
 def _plan_eager(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
-    rows: list[dict[str, Any]] = []
-    relayout_layouts: list[LayoutState] = []
-    for edge in edges:
-        layout = edge.requirement
-        relayout = not _same_layout(layout, edge.compact)
-        if bool(relayout):
-            relayout_layouts.append(layout)
-        rows.append(
-            _edge_row(
-                edge,
-                layout,
-                relayout=bool(relayout),
-                relayout_reason="consumer_min_layout" if bool(relayout) else "",
-                lt_rotations=_lt_rotations(edge, layout),
-            ),
-        )
-    rows_by_edge = {str(row["edge"]): row for row in rows}
-    _align_add_inputs(dag, rows_by_edge, relayout_layouts, slots=int(slots))
-    return _finalize_policy(policy="eager", edge_rows=list(rows_by_edge.values()), relayout_layouts=relayout_layouts)
+    return _plan_non_dp_topological(dag, edges, policy="eager", slots=int(slots))
 
 
 def _plan_greedy(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
-    current_by_source: dict[str, LayoutState] = {}
-    rows: list[dict[str, Any]] = []
-    relayout_layouts: list[LayoutState] = []
-    for edge in edges:
-        current = current_by_source.get(edge.source, edge.compact)
-        if current.covers(edge.requirement):
-            layout = current
-            relayout = False
-            reason = ""
-        else:
-            layout = edge.requirement
-            current_by_source[edge.source] = layout
-            relayout = not _same_layout(layout, edge.compact)
-            reason = "greedy_local_consumer_min" if bool(relayout) else ""
-            if bool(relayout):
-                relayout_layouts.append(layout)
-        rows.append(_edge_row(edge, layout, relayout=bool(relayout), relayout_reason=reason, lt_rotations=_lt_rotations(edge, layout)))
-    rows_by_edge = {str(row["edge"]): row for row in rows}
-    _align_add_inputs(dag, rows_by_edge, relayout_layouts, slots=int(slots))
-    return _finalize_policy(policy="greedy", edge_rows=list(rows_by_edge.values()), relayout_layouts=relayout_layouts)
+    return _plan_non_dp_topological(dag, edges, policy="greedy", slots=int(slots))
 
 
 def _source_candidate_rows(edges: Sequence[EdgeInfo], layouts: Sequence[LayoutState], *, relayout_reason: str) -> tuple[list[dict[str, Any]], list[LayoutState]]:
@@ -1086,6 +1480,7 @@ def _source_candidate_rows(edges: Sequence[EdgeInfo], layouts: Sequence[LayoutSt
                 relayout=bool(relayout),
                 relayout_reason=str(relayout_reason) if bool(relayout) else "",
                 lt_rotations=_lt_rotations(edge, layout),
+                source_layout=edge.compact,
             )
         )
     return rows, relayout_layouts
@@ -1111,6 +1506,22 @@ def _frontier_live_items(live: dict[str, LayoutState]) -> tuple[tuple[str, Layou
     return tuple(sorted(((str(node), layout) for node, layout in live.items()), key=lambda item: item[0]))
 
 
+def _prune_dp_frontier(
+    states: dict[tuple[tuple[str, tuple[int, int, int, int]], ...], _FrontierState],
+) -> dict[tuple[tuple[str, tuple[int, int, int, int]], ...], _FrontierState]:
+    if len(states) <= int(DP_FRONTIER_STATE_LIMIT):
+        return states
+    ranked = sorted(
+        states.items(),
+        key=lambda item: (
+            float(item[1].score),
+            len(item[1].relayout_layouts),
+            _halo_slot_tiebreak(item[1].edge_rows),
+        ),
+    )
+    return dict(ranked[: int(DP_FRONTIER_STATE_LIMIT)])
+
+
 def _dedupe_layouts(layouts: Iterable[LayoutState]) -> tuple[LayoutState, ...]:
     deduped: dict[tuple[int, int, int, int], LayoutState] = {}
     for layout in layouts:
@@ -1119,6 +1530,8 @@ def _dedupe_layouts(layouts: Iterable[LayoutState]) -> tuple[LayoutState, ...]:
 
 
 def _fill_beta_to_tile_capacity(layout: LayoutState, *, shape: tuple[int, int, int, int], slots: int) -> LayoutState:
+    if _compact_height_strip_fits_single_ct(shape=shape, gap=int(layout.gap), slots=int(slots)):
+        return layout
     target_tiles = max(1, int(layout.tile_count))
     _n, channels, height, width = shape
     gap = max(1, int(layout.gap))
@@ -1214,12 +1627,16 @@ def _tconv_output_layout_candidates(
             _layout_for_shape(
                 shape=edge.shape,
                 gap=int(edge.compact.gap),
-                alpha=int(source_layout.alpha) * int(scale),
+                alpha=int(source_layout.alpha),
                 beta=int(source_layout.beta) * int(scale),
                 stride=max(1, int(source_layout.stride)),
                 slots=int(slots),
             )
         )
+    # ConvTranspose2d can either propagate the upsampled halo directly, or
+    # write the native compact output and let a later consumer/add join
+    # materialize halo only if it is still needed.
+    layouts.append(edge.compact)
     return _dedupe_layouts(layouts)
 
 
@@ -1238,19 +1655,19 @@ def _operator_output_layout_candidates(
         source_layout = LayoutState(**dict(row["selected_layout"]))
         if isinstance(module, ConvTranspose2d):
             scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
-            alpha = int(source_layout.alpha) * int(scale)
+            alpha = int(source_layout.alpha)
             beta = int(source_layout.beta) * int(scale)
-        elif isinstance(module, Conv2d):
-            stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
-            consume = _conv_halo_consume(module)
-            alpha = _side_after_downsample(source_layout.alpha, consume=int(consume), stride=int(stride))
-            beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
         elif isinstance(module, AvgPool2d):
             stride_pair = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
             kernel_pair = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
             stride = max(1, int(stride_pair[0]))
             consume = max(0, int(kernel_pair[0]) - int(stride_pair[0]))
-            alpha = _side_after_downsample(source_layout.alpha, consume=int(consume), stride=int(stride))
+            alpha = int(source_layout.alpha)
+            beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
+        elif isinstance(module, Conv2d):
+            stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
+            consume = _conv_halo_consume(module)
+            alpha = int(source_layout.alpha)
             beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
         else:
             alpha = int(source_layout.alpha)
@@ -1265,6 +1682,12 @@ def _operator_output_layout_candidates(
                 slots=int(slots),
             )
         )
+    if _native_operator_output_layout(module) and any(
+        int(dict(row["selected_layout"]).get("alpha", 0)) > 0
+        or int(dict(row["selected_layout"]).get("beta", 0)) > 0
+        for row in incoming_rows
+    ):
+        layouts.append(edge.compact)
     return _dedupe_layouts(layouts)
 
 
@@ -1310,6 +1733,14 @@ def _native_operator_output_layout(module: Any | None) -> bool:
     return isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d))
 
 
+def _layout_preserving_output(module: Any | None) -> bool:
+    return isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+
+
+def _direct_output_layout_without_relayout(module: Any | None) -> bool:
+    return _native_operator_output_layout(module) or _layout_preserving_output(module)
+
+
 def _incoming_relayout_candidates(
     edge: EdgeInfo,
     *,
@@ -1329,6 +1760,8 @@ def _incoming_relayout_candidates(
 def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tuple[LayoutState, ...]:
     if str(edge.op_kind) != "conv_transpose2d":
         return ()
+    if _compact_height_strip_fits_single_ct(shape=edge.shape, gap=int(edge.compact.gap), slots=int(slots)):
+        return ()
     halo = _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
@@ -1338,6 +1771,23 @@ def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tu
         slots=int(slots),
     )
     return _dedupe_layouts((halo, _fill_beta_to_tile_capacity(halo, shape=edge.shape, slots=int(slots))))
+
+
+def _compact_align_shared_allowed(edge: EdgeInfo, source_layout: LayoutState) -> bool:
+    if str(edge.op_kind) != "conv2d":
+        return False
+    if source_layout.covers(edge.requirement):
+        return False
+    if int(edge.requirement.alpha) == 0 and int(edge.requirement.beta) == 0:
+        return False
+    return int(source_layout.gap) == int(edge.requirement.gap)
+
+
+def _compact_align_shared_penalty(edge: EdgeInfo, source_layout: LayoutState) -> int:
+    source_cost = int(_lt_rotations(edge, source_layout))
+    requirement_cost = int(_lt_rotations(edge, edge.requirement))
+    halo_sides = int(_relayout_halo_side_count(edge.requirement))
+    return int(max(0, source_cost - requirement_cost) + halo_sides)
 
 
 def _incoming_non_add_options(
@@ -1350,15 +1800,20 @@ def _incoming_non_add_options(
 ) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
     options: list[tuple[list[dict[str, Any]], list[LayoutState]]] = []
     if source_layout.covers(edge.requirement):
+        selected_layout = _layout_with_stride(
+            source_layout,
+            max(int(source_layout.stride), int(edge.requirement.stride)),
+        )
         options.append(
             (
                 [
                     _edge_row(
                         edge,
-                        source_layout,
+                        selected_layout,
                         relayout=False,
                         relayout_reason="",
-                        lt_rotations=_lt_rotations(edge, source_layout),
+                        lt_rotations=_lt_rotations(edge, selected_layout),
+                        source_layout=source_layout,
                     )
                 ],
                 [],
@@ -1387,9 +1842,32 @@ def _incoming_non_add_options(
                         relayout=True,
                         relayout_reason="dp_state_consumer_relayout",
                         lt_rotations=_lt_rotations(edge, layout),
+                        source_layout=source_layout,
                     )
                 ],
                 [layout],
+            )
+        )
+    if _compact_align_shared_allowed(edge, source_layout):
+        selected_layout = _layout_with_stride(
+            source_layout,
+            max(int(source_layout.stride), int(edge.requirement.stride)),
+        )
+        options.append(
+            (
+                [
+                    _edge_row(
+                        edge,
+                        selected_layout,
+                        relayout=False,
+                        relayout_reason="",
+                        lt_rotations=_lt_rotations(edge, selected_layout),
+                        layout_mode="compact_align_shared",
+                        source_layout=source_layout,
+                        compact_fallback_penalty_estimate=_compact_align_shared_penalty(edge, selected_layout),
+                    )
+                ],
+                [],
             )
         )
     return tuple(options)
@@ -1401,14 +1879,15 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
     if incoming:
         candidates.append(incoming[0].compact)
     if source_layouts:
+        edge = incoming[0]
         candidates.append(
-            max(
-                source_layouts,
-                key=lambda layout: (
-                    int(layout.alpha + layout.beta),
-                    int(layout.stride),
-                    int(layout.stored_slots),
-                ),
+            _layout_for_shape(
+                shape=edge.shape,
+                gap=int(edge.compact.gap),
+                alpha=max(int(layout.alpha) for layout in source_layouts),
+                beta=max(int(layout.beta) for layout in source_layouts),
+                stride=max(int(layout.stride) for layout in source_layouts),
+                slots=int(edge.slots),
             )
         )
     options: list[tuple[list[dict[str, Any]], list[LayoutState]]] = []
@@ -1427,6 +1906,7 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
                     relayout=bool(relayout),
                     relayout_reason="dp_add_input_alignment" if bool(relayout) else "",
                     lt_rotations=_lt_rotations(edge, target_layout),
+                    source_layout=source_layout,
                 )
             )
         options.append((rows, relayouts))
@@ -1512,7 +1992,7 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                             and not _same_physical_layout(output_layout, compact)
                             and str(node) != "x"
                             and type(module).__name__ != "Add"
-                            and not _native_operator_output_layout(module)
+                            and not _direct_output_layout_without_relayout(module)
                         )
                         if bool(output_relayout):
                             output_relayouts.append(output_layout)
@@ -1534,14 +2014,27 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                         + list(incoming_relayouts)
                         + list(output_relayouts)
                     )
+                    incoming_relayout_depth = int(
+                        sum(
+                            int(row.get("relayout_depth_estimate", 0) or 0)
+                            for row in incoming_rows
+                            if bool(row.get("relayout", False))
+                        )
+                    )
                     local_relayout_depth = int(
-                        _relayout_depth_units(incoming_relayouts)
+                        incoming_relayout_depth
                         + _relayout_depth_units(output_relayouts)
                     )
                     local_stack_depth = max(0, int(local_relayout_depth) - 1)
+                    output_footprint_cost = (
+                        _layout_footprint_cost(output_layout)
+                        if output_layout is not None and _native_operator_output_layout(module)
+                        else 0.0
+                    )
                     candidate_score = (
                         float(state.score)
                         + _policy_linear_cost(incoming_rows, incoming_relayouts)
+                        + float(output_footprint_cost)
                         + float(sum(_relayout_linear_cost(layout) for layout in output_relayouts))
                         + float(_relayout_depth_units(output_relayouts) * RELAYOUT_DEPTH_WEIGHT)
                         + float(local_stack_depth) * RELAYOUT_NODE_STACK_DEPTH_WEIGHT
@@ -1564,7 +2057,9 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                             relayout_layouts=candidate_relayouts,
                             node_layouts=tuple(output_layout_rows),
                         )
-        states = next_states
+                        if len(next_states) > int(DP_FRONTIER_STATE_LIMIT) * 4:
+                            next_states = _prune_dp_frontier(next_states)
+        states = _prune_dp_frontier(next_states)
     if not states:
         raise RuntimeError("layout policy DP found no legal state")
     best_state = min(
@@ -1650,9 +2145,13 @@ def build_layout_policy_compile_plan(
             "source": str(row["source"]),
             "target": str(row["target"]),
             "reason": str(row.get("relayout_reason", "")),
+            "source_layout": dict(row.get("source_layout", {}) or {}),
             "selected_layout": dict(row["selected_layout"]),
-            "rotation_estimate": int(_relayout_rotations((LayoutState(**dict(row["selected_layout"])),))),
-            "mask_mult_estimate": int(_relayout_mask_mults((LayoutState(**dict(row["selected_layout"])),))),
+            "target_layout": dict(row.get("target_layout", row["selected_layout"]) or {}),
+            "rotation_estimate": int(row.get("relayout_rotation_estimate", 0) or 0),
+            "mask_mult_estimate": int(row.get("relayout_mask_mult_estimate", 0) or 0),
+            "sparse_lt_estimate": int(row.get("relayout_sparse_lt_estimate", 0) or 0),
+            "depth_estimate": int(row.get("relayout_depth_estimate", 0) or 0),
         }
         for row in edge_layouts
         if bool(row.get("relayout", False))
@@ -1680,7 +2179,7 @@ def build_layout_policy_compile_plan(
         + sum(int(row.get("mask_mult_estimate", 0)) for row in output_relayout_nodes)
     )
     summary["relayout_depth_estimate"] = int(
-        sum(1 for row in relayout_edges if int(dict(row.get("selected_layout", {})).get("alpha", 0)) > 0 or int(dict(row.get("selected_layout", {})).get("beta", 0)) > 0)
+        sum(int(row.get("depth_estimate", 0) or 0) for row in relayout_edges)
         + sum(int(row.get("depth_estimate", 0)) for row in output_relayout_nodes)
     )
     return {

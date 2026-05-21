@@ -11,7 +11,17 @@ class Add(Module):
         super().__init__()
         self.set_depth(0)
 
+    def compile(self):
+        runtime = getattr(self, "layout_policy_add_runtime", None)
+        if runtime is not None and callable(getattr(runtime, "compile", None)):
+            runtime.assigned_level = int(self.level) if self.level is not None else None
+            runtime.assigned_depth = int(self.depth or 0)
+            runtime.compile(self.scheme)
+
     def forward(self, x, y):
+        runtime = getattr(self, "layout_policy_add_runtime", None)
+        if self.he_mode and runtime is not None:
+            return runtime(x, y)
         return x + y
     
 

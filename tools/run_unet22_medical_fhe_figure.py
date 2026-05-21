@@ -23,6 +23,11 @@ from orion.models.unet import get_unet22_medical_model
 from scripts.train_unet22_medical_seg import DATASETS, build_dataset, normalize_dataset_key, split_indices
 
 
+U22_E2E_LOGQ = [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+U22_E2E_LOGP = [61, 61, 61]
+U22_E2E_BOOT_LOGP = [61, 61, 61, 61, 61, 61, 61, 61]
+
+
 def _config(
     *,
     dataset: str,
@@ -35,11 +40,14 @@ def _config(
     config: dict[str, Any] = {
         "ckks_params": {
             "LogN": int(logn),
-            "LogQ": [45, 30, 30, 30, 45],
-            "LogP": [50],
-            "LogScale": 30,
-            "H": 64,
-            "RingType": "Standard",
+            "LogQ": list(U22_E2E_LOGQ),
+            "LogP": list(U22_E2E_LOGP),
+            "LogScale": 40,
+            "H": 192,
+            "RingType": "standard",
+        },
+        "boot_params": {
+            "LogP": list(U22_E2E_BOOT_LOGP),
         },
         "orion": {
             "margin": 2,
@@ -55,6 +63,19 @@ def _config(
         config["orion"]["diags_path"] = str(Path(io_dir) / "diagonals.h5")
         config["orion"]["keys_path"] = str(Path(io_dir) / "keys.h5")
     return config
+
+
+def _provider_pressure_payload() -> dict[str, Any]:
+    registry = getattr(scheme, "region_first_registry", None)
+    if registry is None:
+        return {"summary": {}, "regions": []}
+    from orion.experimental.u22_phase1 import collect_layout_policy_provider_pressure
+
+    return collect_layout_policy_provider_pressure(
+        registry,
+        backend=getattr(scheme, "backend", None),
+        slots=int(scheme.params.get_slots()),
+    )
 
 
 def _default_checkpoint(dataset: str, *, base_dim: int) -> Path:
@@ -136,6 +157,31 @@ def _segmentation_metrics(logits_or_probs: torch.Tensor, mask: torch.Tensor, *, 
     }
 
 
+def _reset_he_operation_counters() -> bool:
+    backend = getattr(scheme, "backend", None)
+    reset = getattr(backend, "ResetOperationCounters", None)
+    if not callable(reset):
+        return False
+    reset()
+    return True
+
+
+def _he_operation_counters() -> dict[str, int] | None:
+    backend = getattr(scheme, "backend", None)
+    get_counters = getattr(backend, "GetOperationCounters", None)
+    if not callable(get_counters):
+        return None
+    values = [int(value) for value in list(get_counters())]
+    if len(values) < 4:
+        return None
+    return {
+        "rotation": int(values[0]),
+        "lintrans_rotation": int(values[1]),
+        "direct_rotation": int(values[2]),
+        "conjugation": int(values[3]),
+    }
+
+
 def _load_sample(*, dataset: str, data_root: Path, sample_index: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, int]:
     cfg = DATASETS[str(dataset)]
     ds = build_dataset(cfg, data_root, download=False, augment=None)
@@ -168,7 +214,15 @@ def _load_samples(
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     dataset = normalize_dataset_key(str(args.dataset))
-    provider_mode = str(args.provider_mode or ("u22_64_base32" if dataset == "montgomery_lung_64" else "u22_256_base32"))
+    base_suffix = f"base{int(args.base_dim)}"
+    provider_mode = str(
+        args.provider_mode
+        or (
+            f"u22_64_{base_suffix}"
+            if dataset == "montgomery_lung_64"
+            else f"u22_256_{base_suffix}"
+        )
+    )
     checkpoint = Path(args.checkpoint) if args.checkpoint is not None else _default_checkpoint(dataset, base_dim=int(args.base_dim))
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +358,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
             payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            if bool(args.compile_only):
+                payload.update(
+                    {
+                        "status": "ok_compile_only",
+                        "provider_pressure": _provider_pressure_payload(),
+                        "timing_s": {"total": float(time.perf_counter() - started)},
+                    }
+                )
+                payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                return payload
             payload.update(
                 {
                     "status": "materializing_he_model",
@@ -349,8 +413,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 payload_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
                 forward_started = time.perf_counter()
+                counters_enabled = _reset_he_operation_counters()
                 out_ct = model(x_ct)
                 forward_s = float(time.perf_counter() - forward_started)
+                operation_counts = _he_operation_counters() if bool(counters_enabled) else None
                 total_forward_s += float(forward_s)
                 payload.update(
                     {
@@ -384,6 +450,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 sample["row"]["fhe_vs_pytorch_logits"] = _metrics(clear, decoded)
                 sample["row"]["fhe_vs_reference"] = _segmentation_metrics(decoded, mask, from_logits=True)
                 sample["row"]["timing_s"] = {"he_forward": float(forward_s)}
+                if operation_counts is not None:
+                    sample["row"]["he_operation_counts"] = operation_counts
                 sample["row"]["artifacts"]["fhe_pred"] = str(fhe_path)
                 sample["row"]["artifacts"]["panel"] = str(panel_path)
                 for tensor in (out_ct, x_ct):
@@ -426,6 +494,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "total": float(time.perf_counter() - started),
                         "he_forward_total": float(total_forward_s),
                     },
+                    "provider_pressure": _provider_pressure_payload(),
                     "samples": [dict(sample["row"]) for sample in rendered_samples],
                 }
             )
@@ -461,6 +530,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--io-dir", type=Path, default=None)
     parser.add_argument("--bootstrap-margin", type=float, default=None)
     parser.add_argument("--skip-fhe", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
     return parser.parse_args()
 
 

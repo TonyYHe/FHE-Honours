@@ -8,14 +8,15 @@ import torch.nn.functional as F
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core import packing
+from orion.core.auto_bootstrap import BootstrapSolver
 from orion.core.network_dag import NetworkDAG
 from orion.core.orion import _region_first_mode_options, scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import U22CompileRegistry
 from orion.experimental.cir.hybrid_schedule import mark_hybrid_schedule_padding_allowed
-from orion.experimental.u22_phase1 import TconvK2S2PythonRuntimeExecutor
+from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor, TconvK2S2PythonRuntimeExecutor
 from orion.models.unet import UNet22
-from orion.nn.linear import ConvTranspose2d
+from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
 
 
@@ -139,7 +140,7 @@ def test_u22_registry_attaches_all_decoder_tconvs_with_experimental_kernel(datas
             assert runtime.materializer == "tconv_k2s2_gap_halving_experimental"
             assert runtime.executable is True
             assert getattr(runtime.executor, "kernel_kind", "") == "tconv_k2s2_gap_halving_experimental"
-            assert getattr(runtime.executor, "use_ct_pt_hybrid_packing", False) is True
+            assert getattr(runtime.executor, "use_ct_pt_hybrid_packing", False) is False
     finally:
         scheme.delete_scheme()
 
@@ -186,7 +187,7 @@ def test_u22_64_default_provider_mode_selects_all_decoder_tconvs_and_conv_kernel
     assert nohybrid_opts["is_u22_phase1"] is True
     assert nohybrid_opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
     assert nohybrid_opts["u22_conv_kernels"] is True
-    assert nohybrid_opts["u22_disable_real_imag_hybrid"] is True
+    assert "u22_disable_real_imag_hybrid" not in nohybrid_opts
 
     ablation_opts = _region_first_mode_options("u22_64_base32_up1234_noconv")
     assert ablation_opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
@@ -218,12 +219,12 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
         assert audit["graph_audit"]["selected_tconv_count"] == 2
         assert audit["graph_audit"]["selected_conv_count"] >= 15
         assert audit["graph_audit"]["selected_pool_count"] == 4
-        assert audit["graph_audit"]["selected_generic_conv_count"] >= 7
+        assert audit["graph_audit"]["selected_generic_conv_count"] == 3
 
-        for node_name in ("enc1b", "dec1a", "dec2b"):
+        for node_name in ("enc1a", "enc1b", "dec1a", "dec2b"):
             runtime = getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None)
             assert runtime is not None
-            assert runtime.strategy.startswith("u22_halo_local_conv_same_shape_")
+            assert runtime.strategy.startswith("u22_native_halo_stripe_no_ri_conv_same_shape")
             assert type(runtime.executor).__name__ == "LayoutPolicyProviderRuntimeExecutor"
             assert type(runtime.executor.base_executor).__name__ == "HaloLocalConvRuntimeExecutor"
             assert runtime.executor.native_halo_input is bool(runtime.plan.get("native_halo_provider", False))
@@ -281,19 +282,15 @@ def test_u22_64_base32_provider_mode_attaches_all_linear_and_pool_nodes() -> Non
         assert audit["graph_audit"]["selected_tconv_count"] == 4
         assert audit["graph_audit"]["selected_conv_count"] == 18
         assert audit["graph_audit"]["selected_pool_count"] == 4
-        assert audit["graph_audit"]["selected_generic_conv_count"] == 7
+        assert audit["graph_audit"]["selected_generic_conv_count"] == 4
         assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
-        assert dag.nodes["dec1b"]["module"].region_runtime.stage == "channel_transition"
+        assert dag.nodes["dec1b"]["module"].region_runtime.stage == "conv_same_shape"
     finally:
         scheme.delete_scheme()
 
 
-def test_u22_registry_can_disable_provider_real_imag_hybrid() -> None:
+def test_u22_registry_provider_default_is_no_hybrid() -> None:
     from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
-    from orion.experimental.cir.r34_orion_same_shape import (
-        R34NoHybridSameShapeRuntimeExecutor,
-        R34OrionSameShapeRuntimeExecutor,
-    )
 
     opts = _region_first_mode_options("u22_64_base32_ir_false")
     _init_python_scheme(logn=int(DATASET_SPECS["tiny"]["logn"]))
@@ -304,10 +301,9 @@ def test_u22_registry_can_disable_provider_real_imag_hybrid() -> None:
             allowed_nodes=opts["u22_allowed_nodes"],
             enable_conv_kernels=bool(opts["u22_conv_kernels"]),
             layout_policy=str(opts["u22_layout_policy"]),
-            use_real_imag_hybrid=not bool(opts["u22_disable_real_imag_hybrid"]),
         )
         audit = registry.attach_to_dag(dag)
-        assert audit["graph_audit"]["use_real_imag_hybrid"] is False
+        assert "use_real_imag_hybrid" not in audit["graph_audit"]
         assert audit["executable_region_count"] == 26
         attached_modules = [
             dag.nodes[str(row["node"])]["module"]
@@ -319,21 +315,13 @@ def test_u22_registry_can_disable_provider_real_imag_hybrid() -> None:
             executor = getattr(runtime, "executor", None)
             assert executor is not None
             assert getattr(executor, "use_ct_pt_hybrid_packing", False) is False
-            if (
-                isinstance(executor, HaloLocalConvRuntimeExecutor)
-                and getattr(executor, "same_shape_spec", None) is not None
-                and not bool(getattr(executor, "force_input_pair", False))
-            ):
-                delegate = executor.delegate
-                assert isinstance(delegate, R34NoHybridSameShapeRuntimeExecutor)
-                assert type(delegate) is not R34OrionSameShapeRuntimeExecutor
     finally:
         scheme.delete_scheme()
 
 
 def test_u22_256_no_hybrid_same_shape_metadata_does_not_use_r34_hardcoded_plan() -> None:
     from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
-    from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
+    from orion.experimental.cir.native_halo_conv2d import NativeHaloStripeNoRIConvExecutor
     from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
 
     opts = _region_first_mode_options("u22_256_base32_nohybrid")
@@ -345,34 +333,224 @@ def test_u22_256_no_hybrid_same_shape_metadata_does_not_use_r34_hardcoded_plan()
             allowed_nodes=opts["u22_allowed_nodes"],
             enable_conv_kernels=bool(opts["u22_conv_kernels"]),
             layout_policy=str(opts["u22_layout_policy"]),
-            use_real_imag_hybrid=not bool(opts["u22_disable_real_imag_hybrid"]),
         )
         registry.attach_to_dag(dag)
 
-        executor = dag.nodes["enc1b"]["module"].region_runtime.executor
+        executor = dag.nodes["bottlenecka"]["module"].region_runtime.executor
         assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
         assert executor.native_halo_input is True
         assert len(executor.relayout_rows) == 1
+        assert executor.relayout_rows[0]["relayout_reason"] == "dp_state_consumer_relayout"
 
         base = executor.base_executor
         assert isinstance(base, HaloLocalConvRuntimeExecutor)
         assert bool(base.use_ct_pt_hybrid_packing) is False
-        assert base.force_input_pair is True
+        assert base.force_input_pair is False
+        assert isinstance(base.delegate, NativeHaloStripeNoRIConvExecutor)
         assert base.same_shape_spec is None
-        assert isinstance(base.delegate, InputPairConvRuntimeExecutor)
+        assert base.delegate.spec.family_label.startswith("native_halo_")
+        assert base.native_halo_input_capable is True
+        assert base.native_halo_output_capable is True
+        assert base.delegate.native_halo_input_capable is True
+        assert base.delegate.native_halo_output_capable is True
 
         metadata = executor.compile_cache_metadata()
         assert metadata["layout_policy_wrapper"]["runtime_lowering"] == "provider_executable+native_halo_layout"
         assert metadata["layout_policy_wrapper"]["native_halo_provider"] is True
         assert metadata["layout_policy_wrapper"]["relayout_edge_count"] == 1
-        assert metadata["delegate_kind"] == "InputPairConvRuntimeExecutor"
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_alpha"] == 1
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_beta"] == 7
+        assert metadata["native_halo_conv2d_plan"]["spec"]["output_alpha"] == 1
+        assert metadata["native_halo_conv2d_plan"]["spec"]["output_beta"] == 6
+        assert metadata["delegate_kind"] == "NativeHaloStripeNoRIConvExecutor"
+        assert metadata["input_relayout"] == {}
+        assert metadata["output_relayout"] == {}
+        assert metadata["relayout_sparse_lt_tasks"] == 0
+
+        enc1a_executor = dag.nodes["enc1a"]["module"].region_runtime.executor
+        assert isinstance(enc1a_executor, LayoutPolicyProviderRuntimeExecutor)
+        enc1a_base = enc1a_executor.base_executor
+        assert isinstance(enc1a_base, HaloLocalConvRuntimeExecutor)
+        assert isinstance(enc1a_base.delegate, NativeHaloStripeNoRIConvExecutor)
+        enc1a_metadata = enc1a_executor.compile_cache_metadata()
+        enc1a_plan = enc1a_metadata["native_halo_conv2d_plan"]
+        assert enc1a_plan["source_channel_tile"] == 2
+        assert enc1a_plan["target_channel_tile"] == 2
+        assert enc1a_plan["input_ct_count"] == 10
+        assert enc1a_plan["output_ct_count"] == 80
+        assert enc1a_plan["submatrix_program_count"] == 160
+        assert enc1a_plan["sharing_group_count"] == 10
+        assert enc1a_plan["cb_shared_rotations"] == 302
+    finally:
+        scheme.delete_scheme()
+
+
+def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() -> None:
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+    from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
+
+    _init_python_scheme(logn=15)
+    try:
+        conv = Conv2d(1, 1, kernel_size=3, padding=1, bias=True)
+        conv.weight.data = torch.tensor(
+            [[[[0.0, 0.25, 0.0], [0.5, 1.0, -0.25], [0.0, -0.5, 0.125]]]],
+            dtype=torch.float32,
+        )
+        conv.bias.data.fill_(0.125)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 1, 4, 4))
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_toy_conv"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(2)
+
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
+            output_node_id="conv",
+            compile_plan={
+                "policy": "dp",
+                "edge_layouts": [
+                    {
+                        "edge": "x->conv",
+                        "source": "x",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "relayout": True,
+                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "output_relayout": False,
+                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+            },
+        )
+        executor.assigned_level = level
+        executor.assigned_depth = 3
+
+        x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4) / 10.0
+        out = executor(scheme.encrypt(scheme.encode(x.reshape(-1), level)))["conv"]
+        decoded = (
+            out.decrypt()
+            .decode()
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+            .reshape(-1)[:24]
+            .reshape(1, 1, 6, 4)
+        )
+        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
+        reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
+
+        metadata = executor.compile_cache_metadata()
+        assert executor.last_runtime_io["runtime_lowering"] == "provider_executable+native_halo_layout"
+        assert executor.last_runtime_io["native_halo_provider"] is True
+        assert executor.last_runtime_io["output_relayout_edge_count"] == 0
+        assert metadata["input_relayout"] == {}
+        assert metadata["output_relayout"] == {}
+        assert metadata["relayout_sparse_lt_tasks"] == 0
+        assert executor.last_runtime_io["internal_input_relayout"] is False
+        assert executor.last_runtime_io["internal_output_relayout"] is False
+        assert tuple(int(value) for value in out.on_shape) == (1, int(scheme.params.get_slots()))
+        assert float((decoded - reference).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_native_halo_provider_uses_tight_compact_output_when_output_halo_is_zero() -> None:
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+    from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
+
+    _init_python_scheme(logn=15)
+    try:
+        conv = Conv2d(1, 1, kernel_size=3, padding=1, bias=True)
+        conv.weight.data = torch.tensor(
+            [[[[0.0, 0.25, 0.0], [0.5, 1.0, -0.25], [0.0, -0.5, 0.125]]]],
+            dtype=torch.float32,
+        )
+        conv.bias.data.fill_(0.125)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 1, 4, 4))
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_compact_output_toy_conv"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(2)
+
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
+            output_node_id="conv",
+            compile_plan={
+                "policy": "dp",
+                "edge_layouts": [
+                    {
+                        "edge": "x->conv",
+                        "source": "x",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "relayout": True,
+                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "output_relayout": False,
+                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+            },
+        )
+        executor.assigned_level = level
+        executor.assigned_depth = 3
+
+        x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4) / 10.0
+        out = executor(scheme.encrypt(scheme.encode(x.reshape(-1), level)))["conv"]
+        decoded = (
+            out.decrypt()
+            .decode()
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+            .reshape(-1)[:16]
+            .reshape(1, 1, 4, 4)
+        )
+        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
+        reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)[:, :, 1:5, :]
+
+        metadata = executor.compile_cache_metadata()
+        assert tuple(int(value) for value in out.on_shape) == (1, 1, 4, 4)
+        assert executor.last_runtime_io["native_output_storage_layout"] == "tight_compact"
+        assert metadata["native_halo_conv2d_plan"]["output_storage_layout"] == "tight_compact"
+        assert int(metadata["native_halo_conv2d_plan"]["output_ct_count"]) == 1
+        assert float((decoded - reference).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()
 
 
 def test_u22_64_benchmark_no_hybrid_helper_keeps_same_shape_on_bounded_delegate() -> None:
     from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
-    from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
+    from orion.experimental.cir.native_halo_conv2d import NativeHaloStripeNoRIConvExecutor
     from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
     from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench
 
@@ -383,9 +561,8 @@ def test_u22_64_benchmark_no_hybrid_helper_keeps_same_shape_on_bounded_delegate(
         executor = module.region_runtime.executor
         assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
         assert isinstance(executor.base_executor, HaloLocalConvRuntimeExecutor)
-        assert executor.base_executor.force_input_pair is True
-        assert executor.base_executor.same_shape_spec is None
-        assert bool(executor.base_executor.use_ct_pt_hybrid_packing) is True
+        assert executor.base_executor.force_input_pair is False
+        assert bool(executor.base_executor.use_ct_pt_hybrid_packing) is False
 
         no_hybrid_audit = bench._apply_provider_no_hybrid_ablation("u22_64_base32", module)
 
@@ -394,12 +571,12 @@ def test_u22_64_benchmark_no_hybrid_helper_keeps_same_shape_on_bounded_delegate(
         base = executor.base_executor
         delegate = base.delegate
         assert no_hybrid_audit["status"] == "ok"
-        assert no_hybrid_audit["mode"] == "halo_local_input_pair_no_real_imag_packing"
+        assert no_hybrid_audit["mode"] == "native_halo_stripe_no_ri"
         assert no_hybrid_audit["executor"] == "LayoutPolicyProviderRuntimeExecutor"
         assert no_hybrid_audit["base_executor"] == "HaloLocalConvRuntimeExecutor"
-        assert no_hybrid_audit["delegate_executor"] == "InputPairConvRuntimeExecutor"
+        assert no_hybrid_audit["delegate_executor"] == "NativeHaloStripeNoRIConvExecutor"
         assert bool(base.use_ct_pt_hybrid_packing) is False
-        assert isinstance(delegate, InputPairConvRuntimeExecutor)
+        assert isinstance(delegate, NativeHaloStripeNoRIConvExecutor)
     finally:
         bench._cleanup_scheme()
 
@@ -427,13 +604,65 @@ def test_node_specific_benchmark_u22_provider_helper_uses_full_default_provider_
         assert graph["enable_conv_kernels"] is True
         assert graph["layout_policy"] == "dp"
         assert graph["layout_policy_edge_layout_count"] == 34
-        expected_halo_edges = 34
+        expected_halo_edges = {
+            "u22_64_base32": 0,
+            "u22_256_base32": 33,
+        }[str(network)]
+        expected_relayouts = {
+            "u22_64_base32": 0,
+            "u22_256_base32": 0,
+        }[str(network)]
         assert len(halo_edges) == expected_halo_edges
-        assert int(graph["layout_policy_relayout_edge_count"]) == 17
+        assert int(graph["layout_policy_relayout_edge_count"]) == expected_relayouts
         assert int(graph["layout_policy_output_relayout_node_count"]) == 0
-        assert int(graph["layout_policy_summary"]["relayout_depth_estimate"]) == 17
+        assert int(graph["layout_policy_summary"]["relayout_depth_estimate"]) == expected_relayouts
     finally:
         bench._cleanup_scheme()
+
+
+def test_u22_256_base8_provider_solver_depth_covers_native_halo_relayout() -> None:
+    _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
+    try:
+        dag = _prepared_dag(dataset="kvasir_polyp_256", base_channels=8)
+        opts = _region_first_mode_options("u22_256_base8")
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=opts["u22_allowed_nodes"],
+            enable_conv_kernels=bool(opts["u22_conv_kernels"]),
+            layout_policy=str(opts["u22_layout_policy"]),
+        )
+        registry.attach_to_dag(dag)
+
+        dag.find_residuals()
+        solver = BootstrapSolver(
+            SimpleNamespace(),
+            dag,
+            l_eff=int(len(scheme.params.get_logq()) - 1),
+        )
+        solver.solve()
+
+        mismatches = []
+        for node_name in dag.topological_sort():
+            module = dag.nodes[node_name].get("module")
+            group = getattr(module, "region_runtime", None) if module is not None else None
+            executor = getattr(group, "executor", None) if group is not None else None
+            if not isinstance(executor, LayoutPolicyProviderRuntimeExecutor):
+                continue
+            relayout_depth = (
+                (len(executor.relayout_rows) if bool(executor.native_halo_input) else 2 * len(executor.relayout_rows))
+                + len(executor.output_relayout_rows)
+            )
+            required_level = int(relayout_depth + max(0, int(group.depth) - int(relayout_depth)))
+            level = int(getattr(module, "level"))
+            if int(level) < int(required_level):
+                mismatches.append((str(node_name), int(level), int(required_level), int(group.depth)))
+
+        dec1a = dag.nodes["dec1a"]["module"]
+        assert not mismatches
+        assert int(dec1a.level) >= int(dec1a.region_runtime.depth)
+        assert int(dec1a.region_runtime.solver_depth) == int(dec1a.region_runtime.depth)
+    finally:
+        scheme.delete_scheme()
 
 
 def test_u22_256_base32_provider_mode_skips_dense_tconv_pack_for_all_decoder_nodes(monkeypatch) -> None:
@@ -554,7 +783,11 @@ def test_u22_tconv_provider_runtime_handles_multi_input_and_output_blocks_on_pyt
         module.fhe_output_shape = torch.Size((1, 6, 16, 16))
         module.set_level(len(scheme.params.get_logq()) - 1)
 
-        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="synthetic_u22_tconv")
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="synthetic_u22_tconv",
+            use_ct_pt_hybrid_packing=True,
+        )
         assert runtime.supports_scheme(scheme) is True
         no_hybrid_runtime = TconvK2S2PythonRuntimeExecutor(
             module=module,
@@ -703,7 +936,11 @@ def test_u22_tconv_hybrid_rejects_mismatched_adjacent_source_schedules() -> None
         module.fhe_output_shape = torch.Size((1, 1, 16, 16))
         module.set_level(len(scheme.params.get_logq()) - 1)
 
-        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="mismatch_tconv")
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="mismatch_tconv",
+            use_ct_pt_hybrid_packing=True,
+        )
 
         def fake_build_source_block_transforms(*, scheme, level: int, source_block: int):
             slots = int(scheme.params.get_slots())
@@ -762,7 +999,11 @@ def test_u22_tconv_global_layout_materializes_adjacent_source_schedules() -> Non
         module.fhe_output_shape = torch.Size((1, 1, 16, 16))
         module.set_level(len(scheme.params.get_logq()) - 1)
 
-        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="global_layout_tconv")
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="global_layout_tconv",
+            use_ct_pt_hybrid_packing=True,
+        )
 
         def fake_build_source_block_transforms(*, scheme, level: int, source_block: int):
             slots = int(scheme.params.get_slots())
@@ -820,7 +1061,11 @@ def test_u22_tconv_hybrid_layout_dp_shifts_pair_boundary_for_strict_schedule() -
         module.fhe_output_shape = torch.Size((1, 1, 16, 16))
         module.set_level(len(scheme.params.get_logq()) - 1)
 
-        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="layout_dp_tconv")
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="layout_dp_tconv",
+            use_ct_pt_hybrid_packing=True,
+        )
 
         def fake_build_source_block_transforms(*, scheme, level: int, source_block: int):
             slots = int(scheme.params.get_slots())
@@ -876,7 +1121,11 @@ def test_u22_tconv_provider_splits_one_plane_across_many_ciphertexts_on_python_b
         module.fhe_output_shape = torch.Size((1, 1, 16, 16))
         module.set_level(len(scheme.params.get_logq()) - 1)
 
-        runtime = TconvK2S2PythonRuntimeExecutor(module=module, output_node_id="split_plane_tconv")
+        runtime = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id="split_plane_tconv",
+            use_ct_pt_hybrid_packing=True,
+        )
         assert runtime.supports_scheme(scheme) is True
 
         torch.manual_seed(29)

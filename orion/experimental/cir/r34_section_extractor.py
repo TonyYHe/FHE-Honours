@@ -7,7 +7,7 @@ import torch
 
 from orion.backend.python.tensors import CipherTensor
 from orion.core.region_lowering import pack_chw_gap, unpack_chw_gap
-from .r34_geometry import source_h_range_for_target
+from .r34_geometry import source_group_count, source_h_range_for_target
 
 
 RING_SLOT_COUNT = 32768
@@ -43,7 +43,8 @@ class SectionExtractPlan:
 
     @property
     def active_slots(self) -> int:
-        return int(self.c) * int(self.local_h) * int(self.gap) * int(self.w) * int(self.gap)
+        groups = source_group_count(c=int(self.c), gap=int(self.gap))
+        return int(groups) * int(self.local_h) * int(self.gap) * int(self.w) * int(self.gap)
 
     @property
     def core_row_count(self) -> int:

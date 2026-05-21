@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,8 +12,13 @@ from orion.core.orion import scheme
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental.cir import r34_orion_same_shape as r34_same_shape
+from orion.experimental.cir.halo_local_conv_provider import (
+    HaloLocalBranchPairConvRuntimeExecutor,
+    HaloLocalConvRuntimeExecutor,
+)
 from orion.experimental.cir.transition_pool_provider import (
     BranchPairConvRuntimeExecutor,
+    BranchPairNoHybridConvRuntimeExecutor,
     InputPairConvRuntimeExecutor,
 )
 from orion.experimental.cir.ir import (
@@ -28,6 +34,10 @@ from orion.experimental.cir.ir import (
 from orion.experimental import R34CompileRegistry
 from orion.nn.module import Module
 from orion.models.resnet import ResNet34
+
+
+def _executor_delegate(executor):
+    return getattr(executor, "delegate", getattr(executor, "_delegate", executor))
 
 
 def _prepared_r34_imagenet_dag() -> NetworkDAG:
@@ -99,19 +109,28 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     assert getattr(stem_conv, "region_family_label") == "stem_conv"
     assert getattr(stem_conv, "region_source_group_count") == 3
     assert getattr(stem_conv, "region_kernel_policy") == "inter_group_hybrid"
-    assert isinstance(stem_conv.region_runtime.executor, InputPairConvRuntimeExecutor)
+    assert isinstance(stem_conv.region_runtime.executor, HaloLocalConvRuntimeExecutor)
+    assert type(_executor_delegate(stem_conv.region_runtime.executor)).__name__ == "NativeHaloStripeNoRIConvExecutor"
+    assert stem_conv.region_runtime.plan["runtime_lowering"] == "provider_executable+native_halo_stripe_no_ri"
+    assert stem_conv.region_runtime.plan["halo_layout_gate"]["decision"] == "skip"
+    assert stem_conv.region_runtime.plan["halo_layout_gate"]["dense_shared_rotations"] == 610
+    assert stem_conv.region_runtime.plan["halo_layout_gate"]["halo_total_shared_rotations"] == 1080
     assert stem_conv.region_runtime.executable is True
 
     assert getattr(stem_pool, "region_family_label") == "stem_pool"
     assert getattr(stem_pool, "region_source_group_count") == 16
     assert getattr(stem_pool, "region_kernel_policy") == "inter_group_hybrid"
-    assert isinstance(stem_pool.region_runtime.executor, InputPairConvRuntimeExecutor)
+    assert type(stem_pool.region_runtime.executor).__name__ == "R34DenseSingleFlowRuntimeExecutor"
+    assert stem_pool.region_runtime.plan["runtime_lowering"] == "dense_orion_pool_shared_rotations"
+    assert stem_pool.region_runtime.plan["halo_layout_gate"]["decision"] == "skip"
+    assert stem_pool.region_runtime.plan["halo_layout_gate"]["dense_shared_rotations"] == 635
+    assert stem_pool.region_runtime.plan["halo_layout_gate"]["halo_total_shared_rotations"] == 5343
     assert stem_pool.region_runtime.executable is True
 
     assert getattr(exit_pool, "region_family_label") == "global_avgpool_exit"
     assert getattr(exit_pool, "region_source_group_count") == 1
     assert getattr(exit_pool, "region_kernel_policy") == "intra_group_pack2"
-    assert isinstance(exit_pool.region_runtime.executor, InputPairConvRuntimeExecutor)
+    assert type(exit_pool.region_runtime.executor).__name__ == "R34DenseSingleFlowRuntimeExecutor"
     assert exit_pool.region_runtime.executable is True
 
     stage2_module = dag.nodes["layers_1_1_conv1"]["module"]
@@ -125,7 +144,11 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     assert getattr(stage2_module, "region_source_group_count") == 2
     assert getattr(stage2_module, "region_kernel_policy") == "inter_group_hybrid"
     assert stage2_module.region_runtime.executable is True
-    assert isinstance(stage2_module.region_runtime.executor, r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor)
+    assert isinstance(stage2_module.region_runtime.executor, HaloLocalConvRuntimeExecutor)
+    assert isinstance(
+        _executor_delegate(stage2_module.region_runtime.executor),
+        r34_same_shape.NativeAlignedHaloNoRIConvExecutor,
+    )
 
     stage4_module = dag.nodes["layers_3_2_conv2"]["module"]
     assert getattr(stage4_module, "region_runtime") is not None
@@ -158,14 +181,24 @@ def test_r34_compile_registry_attaches_layout_metadata_and_dense_fallback() -> N
     assert getattr(stage2_transition_conv, "region_source_group_count") == 4
     assert getattr(stage2_transition_conv, "region_kernel_policy") == "inter_group_hybrid"
     assert stage2_transition_conv.region_runtime.executable is True
-    assert isinstance(stage2_transition_conv.region_runtime.executor, BranchPairConvRuntimeExecutor)
+    assert isinstance(stage2_transition_conv.region_runtime.executor, HaloLocalBranchPairConvRuntimeExecutor)
+    assert isinstance(_executor_delegate(stage2_transition_conv.region_runtime.executor), BranchPairNoHybridConvRuntimeExecutor)
+    assert stage2_transition_conv.region_runtime.plan["halo_layout_gate"]["decision"] == "skip"
+    assert stage2_transition_conv.region_runtime.plan["halo_layout_gate"]["dense_shared_rotations"] == 1045
+    assert stage2_transition_conv.region_runtime.plan["halo_layout_gate"]["halo_total_shared_rotations"] == 1196
 
     stage4_transition_conv = dag.nodes["layers_3_0_conv1"]["module"]
     stage4_transition_shortcut = dag.nodes["layers_3_0_shortcut_0"]["module"]
     assert stage4_transition_conv.region_runtime is stage4_transition_shortcut.region_runtime
-    assert isinstance(stage4_transition_conv.region_runtime.executor, BranchPairConvRuntimeExecutor)
+    assert isinstance(stage4_transition_conv.region_runtime.executor, HaloLocalBranchPairConvRuntimeExecutor)
+    assert isinstance(_executor_delegate(stage4_transition_conv.region_runtime.executor), BranchPairNoHybridConvRuntimeExecutor)
     assert getattr(stage4_transition_conv, "region_source_group_count") == 1
     assert getattr(stage4_transition_conv, "region_kernel_policy") == "intra_group_pack2"
+    assert stage4_transition_conv.region_runtime.plan["halo_layout_gate"]["decision"] == "skip"
+    assert stage4_transition_conv.region_runtime.plan["halo_layout_gate"]["blocking_stages"] == (
+        "stage2_transition",
+        "stage3_transition",
+    )
     assert stage4_transition_conv.region_runtime.executable is True
 
 
@@ -193,7 +226,8 @@ def test_r34_transition_group_compiles_and_executes_one_hybrid_runtime(monkeypat
     transition_shortcut = dag.nodes[str(shortcut_node)]["module"]
     group = transition_conv.region_runtime
     executor = group.executor
-    assert isinstance(executor, BranchPairConvRuntimeExecutor)
+    assert isinstance(executor, HaloLocalBranchPairConvRuntimeExecutor)
+    assert isinstance(_executor_delegate(executor), BranchPairNoHybridConvRuntimeExecutor)
 
     def fake_pack_conv2d(module, last):
         assert last is False
@@ -262,8 +296,8 @@ def test_r34_transition_group_compiles_and_executes_one_hybrid_runtime(monkeypat
 @pytest.mark.parametrize(
     ("node_name", "executor_type"),
     (
-        ("layers_1_1_conv1", r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor),
-        ("layers_2_1_conv1", r34_same_shape.R34Pack2SameShapeRuntimeExecutor),
+        ("layers_1_1_conv1", r34_same_shape.NativeAlignedHaloNoRIConvExecutor),
+        ("layers_2_1_conv1", r34_same_shape.NativeAlignedHaloNoRIConvExecutor),
     ),
 )
 def test_r34_same_shape_group_compiles_and_executes_runtime(monkeypatch, node_name: str, executor_type: type) -> None:
@@ -281,7 +315,8 @@ def test_r34_same_shape_group_compiles_and_executes_runtime(monkeypatch, node_na
     module = dag.nodes[str(node_name)]["module"]
     group = module.region_runtime
     executor = group.executor
-    assert isinstance(executor, executor_type)
+    assert isinstance(executor, HaloLocalConvRuntimeExecutor)
+    assert isinstance(_executor_delegate(executor), executor_type)
 
     def fail_pack_conv2d(*_args, **_kwargs):
         raise AssertionError("same-shape runtime should not call pack_conv2d")
@@ -404,7 +439,7 @@ def test_r34_same_shape_group_compiles_and_executes_runtime(monkeypatch, node_na
 
     monkeypatch.setattr(packing, "pack_conv2d", fail_pack_conv2d)
     monkeypatch.setattr(packing, "construct_conv2d_bias", fake_bias)
-    monkeypatch.setattr(r34_same_shape, "build_r34_same_shape_orion_plan", fake_same_shape_plan)
+    monkeypatch.setattr(r34_same_shape, "build_r34_native_aligned_halo_no_ri_plan", fake_same_shape_plan)
 
     config = {
         "ckks_params": {"LogN": 16, "LogQ": [45, 30, 30, 45], "LogP": [50], "LogScale": 30, "H": 64, "RingType": "Standard"},
@@ -418,14 +453,10 @@ def test_r34_same_shape_group_compiles_and_executes_runtime(monkeypatch, node_na
 
         group.compile(scheme)
         assert executor.compile_count == 1
-        expected_cols = 3 if isinstance(executor, r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor) else 2
-        assert executor.cols == expected_cols
+        delegate = _executor_delegate(executor)
+        assert executor.cols == 3
         assert executor.rows == 2
-        if isinstance(executor, r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor):
-            assert executor.input_block_pairs == [(0, 1), (2, None)]
-            assert executor.complex_input_block_flags == [True, False]
-            assert executor.groups_by_input_index == {}
-            assert len(executor.groups_by_input_block) == 2
+        assert executor.groups_by_input_index
 
         ids = []
         for seed in range(executor.cols):
@@ -465,7 +496,7 @@ def test_r34_single_flow_group_compiles_and_executes_runtime(monkeypatch) -> Non
     module = dag.nodes["avgpool"]["module"]
     group = module.region_runtime
     executor = group.executor
-    assert isinstance(executor, InputPairConvRuntimeExecutor)
+    assert type(executor).__name__ == "R34DenseSingleFlowRuntimeExecutor"
 
     def fake_pack_conv2d(conv_layer, last):
         assert last is False
@@ -532,6 +563,206 @@ def test_r34_policy_matches_simple_source_group_rule() -> None:
     assert r34_same_shape.r34_same_shape_policy(c=512, gap=32) == "intra_group_pack2"
 
 
+def test_r34_hardcoded_same_shape_relayout_plan_is_halo_local_and_reduced() -> None:
+    expected = {
+        "stage1_same": (8, 8, 4, 14, 47),
+        "stage2_same": (4, 4, 2, 6, 14),
+        "stage3_same": (2, 2, 1, 2, 4),
+        "stage4_same": (3, 3, 2, 4, 4),
+    }
+
+    for family_label, (stripe_count, raw_tasks, effective_tasks, relayout_ops, legacy_tasks) in expected.items():
+        plan = r34_same_shape.r34_same_shape_hardcoded_relayout_plan(family_label=family_label)
+        payload = plan.to_dict()
+
+        assert payload["runtime_layout"] == "height_stripe_halo_local_hardcoded"
+        assert payload["conv_dependency"] == "current_ciphertext_materialized_halo_only"
+        assert payload["stripe_count"] == stripe_count
+        assert payload["raw_conv_lt_tasks"] == raw_tasks
+        assert payload["effective_conv_lt_tasks_with_hybrid"] == effective_tasks
+        assert payload["legacy_flat_conv_lt_tasks"] == legacy_tasks
+        assert payload["legacy_flat_offdiag_tasks"] > 0
+        assert payload["relayout_rotations"] == relayout_ops
+        assert payload["relayout_mask_mults"] == relayout_ops
+        assert payload["max_active_slots"] <= 32768
+        assert payload["conv_source_target_pairs"] == [[index, index] for index in range(stripe_count)]
+        assert payload["effective_conv_lt_tasks_with_hybrid"] < payload["legacy_flat_conv_lt_tasks"]
+        assert all(int(stripe["core_shift_rows"]) == 0 for stripe in payload["stripes"])
+        assert all(
+            int(stripe["relayout_rotations"])
+            == int(stripe["relayout_mask_mults"])
+            == int(stripe["halo_top"] > 0 and stripe["index"] > 0)
+            + int(stripe["halo_bottom"] > 0 and stripe["index"] + 1 < stripe_count)
+            for stripe in payload["stripes"]
+        )
+
+
+def test_r34_same_shape_groups_expose_native_aligned_halo_plan() -> None:
+    dag = _prepared_r34_imagenet_dag()
+    registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
+    registry.attach_to_dag(dag)
+
+    for node_name in ("layers_0_0_conv1", "layers_1_1_conv1", "layers_2_1_conv1", "layers_3_1_conv1"):
+        module = dag.nodes[node_name]["module"]
+        group = module.region_runtime
+        plan = dict(group.plan)
+        relayout = dict(plan["relayout_plan"])
+        executor = group.executor
+        metadata = executor.compile_cache_metadata()
+
+        assert plan["runtime_lowering"] == "provider_executable+native_aligned_halo_no_ri"
+        assert "native_aligned_halo_no_ri" in group.boundary_actions
+        assert relayout["runtime_layout"] == "native_aligned_halo_no_ri"
+        assert relayout["conv_dependency"] == "native_aligned_halo_source_tiles"
+        assert plan["conv_lt_effective_submatrix_tasks"] <= plan["conv_lt_raw_submatrix_tasks"]
+        assert plan["native_cb_shared_rotations"] <= plan["native_c_only_rotations"]
+        assert metadata["r34_same_shape_halo_relayout_plan"]["submatrix_program_count"] == relayout[
+            "submatrix_program_count"
+        ]
+        assert metadata["conv_lt_effective_submatrix_tasks"] == relayout["sharing_group_count"]
+
+
+def test_r34_native_relayout_kernel_loads_sparse_lt_manifest() -> None:
+    spec = r34_same_shape.r34_same_shape_spec_for_family_label("stage4_same")
+    native_plan = r34_same_shape.r34_native_aligned_halo_plan(spec)
+    seen: list[dict[tuple[int, int], tuple[int, ...]]] = []
+
+    class _FakeLtEvaluator:
+        def generate_transforms(self, kernel):
+            seen.append(
+                {
+                    (int(row), int(col)): tuple(sorted(int(idx) for idx in block.keys()))
+                    for (row, col), block in kernel.diagonals.items()
+                }
+            )
+            return {
+                (int(row), int(col)): int(index + 100)
+                for index, (row, col) in enumerate(sorted(kernel.diagonals))
+            }
+
+    fake_scheme = SimpleNamespace(
+        backend=SimpleNamespace(DeleteLinearTransform=lambda _transform_id: None),
+        lt_evaluator=_FakeLtEvaluator(),
+    )
+    kernel = r34_same_shape.R34NativeAlignedRelayoutKernel(
+        spec=spec,
+        native_plan=native_plan,
+        direction="compact_to_native",
+        name="stage4_test_compact_to_native",
+        output_shape=torch.Size([2, spec.slot_count]),
+        fhe_output_shape=torch.Size([2, spec.slot_count]),
+    )
+
+    kernel.compile_from_cache_metadata(
+        fake_scheme,
+        {
+            "name": "stage4_test_compact_to_native",
+            "blocks": [
+                {"row": 1, "col": 0, "diag_indices": [7, 3], "slot_count": spec.slot_count},
+                {"row": 0, "col": 0, "diag_indices": [0], "slot_count": spec.slot_count},
+            ],
+        },
+        level=2,
+    )
+
+    assert seen == [{(0, 0): (0,), (1, 0): (3, 7)}]
+    assert kernel.transform_ids == {(0, 0): 100, (1, 0): 101}
+    metadata = kernel.to_metadata()
+    assert metadata["level"] == 2
+    assert metadata["lt_tasks"] == 2
+    assert metadata["diagonal_count"] == 3
+    assert metadata["blocks"][1]["diag_indices"] == [3, 7]
+
+
+def test_r34_native_executor_loads_relayout_and_conv_manifest(monkeypatch) -> None:
+    spec = r34_same_shape.r34_same_shape_spec_for_family_label("stage4_same")
+    relayout_seen: list[tuple[str, dict[tuple[int, int], tuple[int, ...]]]] = []
+
+    class _FakeParams:
+        def get_io_mode(self):
+            return "load"
+
+        def get_logq(self):
+            return [45, 30, 30, 45]
+
+        def get_default_scale(self):
+            return 1 << 30
+
+    class _FakeLtEvaluator:
+        def generate_transforms(self, kernel):
+            relayout_seen.append(
+                (
+                    str(kernel.name),
+                    {
+                        (int(row), int(col)): tuple(sorted(int(idx) for idx in block.keys()))
+                        for (row, col), block in kernel.diagonals.items()
+                    },
+                )
+            )
+            return {
+                (int(row), int(col)): int(index + 200)
+                for index, (row, col) in enumerate(sorted(kernel.diagonals))
+            }
+
+    def _fake_compile_unified(self, _backend):
+        self._compiled_by_test = True
+
+    monkeypatch.setattr(r34_same_shape.UnifiedTransformGroup, "compile_unified", _fake_compile_unified)
+    module = SimpleNamespace(
+        on_weight=torch.zeros(spec.weight_shape, dtype=torch.float32),
+        on_bias=torch.zeros((int(spec.c),), dtype=torch.float32),
+        input_shape=torch.Size([1, int(spec.c), int(spec.h), int(spec.w)]),
+        output_shape=torch.Size([1, int(spec.c), int(spec.h), int(spec.w)]),
+        fhe_input_shape=torch.Size([1, 1, int(spec.h * spec.gap), int(spec.w * spec.gap)]),
+        fhe_output_shape=torch.Size([1, 1, int(spec.h * spec.gap), int(spec.w * spec.gap)]),
+        input_gap=int(spec.gap),
+        output_gap=int(spec.gap),
+        stride=(1, 1),
+        padding=(1, 1),
+    )
+    executor = r34_same_shape.NativeAlignedHaloNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="stage4_test",
+    )
+    executor.assigned_level = 3
+    executor.load_compile_cache_metadata(
+        {
+            "rows": 2,
+            "cols": 2,
+            "input_relayout": {
+                "name": "stage4_test_compact_to_native_halo",
+                "blocks": [{"row": 0, "col": 0, "diag_indices": [0, 1], "slot_count": spec.slot_count}],
+            },
+            "groups_by_input_index": [
+                {"input_index": 0, "storage_key": "group_10", "target_indices": [0, 1]},
+            ],
+            "output_relayout": {
+                "name": "stage4_test_native_halo_to_compact",
+                "blocks": [{"row": 0, "col": 0, "diag_indices": [2], "slot_count": spec.slot_count}],
+            },
+        }
+    )
+    fake_scheme = SimpleNamespace(
+        params=_FakeParams(),
+        backend=SimpleNamespace(DeleteLinearTransform=lambda _transform_id: None),
+        lt_evaluator=_FakeLtEvaluator(),
+        encode=lambda values, level, scale: SimpleNamespace(values=values, level=level, scale=scale),
+    )
+
+    assert executor._compile_from_cache_metadata(fake_scheme) is True
+
+    assert relayout_seen == [
+        ("stage4_test_compact_to_native_halo", {(0, 0): (0, 1)}),
+        ("stage4_test_native_halo_to_compact", {(0, 0): (2,)}),
+    ]
+    assert executor.input_relayout_kernel is not None
+    assert executor.output_relayout_kernel is not None
+    assert executor.input_relayout_kernel.transform_ids == {(0, 0): 200}
+    assert executor.output_relayout_kernel.transform_ids == {(0, 0): 200}
+    assert executor.target_indices_by_input_index == {0: (0, 1)}
+
+
 def test_r34_inter_group_policy_attaches_native_runtime_executor() -> None:
     dag = _prepared_r34_imagenet_dag()
     registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
@@ -544,5 +775,93 @@ def test_r34_inter_group_policy_attaches_native_runtime_executor() -> None:
     assert getattr(stage2_module, "region_kernel_policy") == "inter_group_hybrid"
     assert stage1_module.region_runtime.executable is True
     assert stage2_module.region_runtime.executable is True
-    assert isinstance(stage1_module.region_runtime.executor, r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor)
-    assert isinstance(stage2_module.region_runtime.executor, r34_same_shape.R34InterGroupHybridSameShapeRuntimeExecutor)
+    assert isinstance(stage1_module.region_runtime.executor, HaloLocalConvRuntimeExecutor)
+    assert isinstance(stage2_module.region_runtime.executor, HaloLocalConvRuntimeExecutor)
+    assert isinstance(
+        _executor_delegate(stage1_module.region_runtime.executor),
+        r34_same_shape.NativeAlignedHaloNoRIConvExecutor,
+    )
+    assert isinstance(
+        _executor_delegate(stage2_module.region_runtime.executor),
+        r34_same_shape.NativeAlignedHaloNoRIConvExecutor,
+    )
+
+
+def test_r34_no_hybrid_ablation_keeps_halo_local_same_shape_facade() -> None:
+    from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench
+
+    dag = _prepared_r34_imagenet_dag()
+    registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
+    registry.attach_to_dag(dag)
+
+    stem_module = dag.nodes["conv1"]["module"]
+    stem_executor = stem_module.region_runtime.executor
+    assert isinstance(stem_executor, HaloLocalConvRuntimeExecutor)
+
+    stem_audit = bench._apply_provider_no_hybrid_ablation("r34_imgnet", stem_module)
+
+    stem_executor = stem_module.region_runtime.executor
+    assert stem_audit["status"] == "ok"
+    assert stem_audit["mode"] == "native_halo_stripe_no_ri"
+    assert stem_audit["executor"] == "HaloLocalConvRuntimeExecutor"
+    assert stem_audit["delegate_executor"] == "NativeHaloStripeNoRIConvExecutor"
+    assert isinstance(stem_executor, HaloLocalConvRuntimeExecutor)
+
+    for node_name in ("layers_0_0_conv1", "layers_2_1_conv1"):
+        module = dag.nodes[node_name]["module"]
+        executor = module.region_runtime.executor
+        assert isinstance(executor, HaloLocalConvRuntimeExecutor)
+        assert bool(executor.use_ct_pt_hybrid_packing) is False
+        assert type(_executor_delegate(executor)) is not r34_same_shape.R34OrionSameShapeRuntimeExecutor
+
+        audit = bench._apply_provider_no_hybrid_ablation("r34_imgnet", module)
+
+        executor = module.region_runtime.executor
+        assert audit["status"] == "ok"
+        assert audit["mode"] == "r34_native_aligned_halo_no_ri"
+        assert audit["executor"] == "HaloLocalConvRuntimeExecutor"
+        assert audit["delegate_executor"] == "NativeAlignedHaloNoRIConvExecutor"
+        assert audit["conv_lt_effective_submatrix_tasks"] <= audit["conv_lt_raw_submatrix_tasks"]
+        assert audit["conv_lt_effective_submatrix_tasks"] < audit["legacy_flat_conv_lt_tasks"]
+        assert audit["r34_same_shape_halo_relayout_plan"]["runtime_layout"] == "native_aligned_halo_no_ri"
+        assert isinstance(executor, HaloLocalConvRuntimeExecutor)
+        assert bool(executor.use_ct_pt_hybrid_packing) is False
+        assert isinstance(_executor_delegate(executor), r34_same_shape.NativeAlignedHaloNoRIConvExecutor)
+        assert str(module.region_runtime.strategy).endswith("_no_hybrid")
+
+    transition_module = dag.nodes["layers_1_0_conv1"]["module"]
+    transition_executor = transition_module.region_runtime.executor
+    assert isinstance(transition_executor, HaloLocalBranchPairConvRuntimeExecutor)
+    assert bool(transition_executor.use_ct_pt_hybrid_packing) is False
+    assert isinstance(_executor_delegate(transition_executor), BranchPairNoHybridConvRuntimeExecutor)
+
+    transition_audit = bench._apply_provider_no_hybrid_ablation("r34_imgnet", transition_module)
+
+    transition_executor = transition_module.region_runtime.executor
+    assert transition_audit["status"] == "ok"
+    assert transition_audit["mode"] == "r34_halo_local_branch_pair_already_no_real_imag_packing"
+    assert transition_audit["executor"] == "HaloLocalBranchPairConvRuntimeExecutor"
+    assert transition_audit["delegate_executor"] == "BranchPairNoHybridConvRuntimeExecutor"
+    assert isinstance(transition_executor, HaloLocalBranchPairConvRuntimeExecutor)
+    assert bool(transition_executor.use_ct_pt_hybrid_packing) is False
+    assert isinstance(_executor_delegate(transition_executor), BranchPairNoHybridConvRuntimeExecutor)
+    assert "branch_pair_real_imag_hybrid" not in transition_module.region_runtime.boundary_actions
+    assert "branch_pair_no_real_imag" in transition_module.region_runtime.boundary_actions
+
+
+def test_r34_public_conv_provider_path_is_generic_halo_local() -> None:
+    dag = _prepared_r34_imagenet_dag()
+    registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
+    registry.attach_to_dag(dag)
+
+    public_executor_types = {
+        type(group.executor).__name__
+        for group in registry.groups
+        if group.executor is not None and group.conv_nodes
+    }
+    assert "R34InterGroupHybridSameShapeRuntimeExecutor" not in public_executor_types
+    assert "R34Pack2SameShapeRuntimeExecutor" not in public_executor_types
+    assert {
+        "HaloLocalConvRuntimeExecutor",
+        "HaloLocalBranchPairConvRuntimeExecutor",
+    }.issubset(public_executor_types)

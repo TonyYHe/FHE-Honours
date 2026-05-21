@@ -197,6 +197,8 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
     """Conv2d/AvgPool provider using input-pair packing and shared rotations."""
 
     kernel_kind = "input_pair_conv_shared_rotations"
+    native_halo_input_capable = True
+    native_halo_output_capable = True
     use_ct_pt_hybrid_packing = True
 
     def __init__(self, *, module: Any, output_node_id: str, use_ct_pt_hybrid_packing: bool = True) -> None:

@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orion.core.orion import scheme
+from orion.core import packing
 from orion.backend.python.memory_lifecycle import trim_runtime_memory
 from orion.models.resnet import ResNet18, ResNet20, ResNet34
 from orion.models.unet import UNet22
@@ -34,6 +35,61 @@ except Exception:
 
 
 DEFAULT_OUT = Path("/tmp/orion_lattigo_e2e_compare.json")
+
+
+def _layout_policy_input_layout_row() -> dict[str, Any] | None:
+    audit = dict(getattr(scheme, "region_first_attach_audit", {}) or {})
+    graph = dict(audit.get("graph_audit", {}) or {})
+    for row in graph.get("layout_policy_node_layouts", []) or []:
+        if str(dict(row).get("node", "")) != "x":
+            continue
+        layout = dict(dict(row).get("selected_layout", {}) or {})
+        if int(layout.get("alpha", 0)) <= 0 and int(layout.get("beta", 0)) <= 0:
+            return None
+        return dict(row)
+    return None
+
+
+def _layout_policy_plaintext_halo_input(x: torch.Tensor, row: dict[str, Any]) -> torch.Tensor:
+    layout = dict(row.get("selected_layout", {}) or {})
+    gap = max(1, int(layout.get("gap", 1)))
+    alpha = max(0, int(layout.get("alpha", 0)))
+    beta = max(0, int(layout.get("beta", 0)))
+    compact = packing.multiplex(x, int(gap)).detach().cpu().to(dtype=torch.float32)
+    if compact.dim() != 4:
+        raise ValueError(f"layout-policy input halo expects NCHW input, got {tuple(compact.shape)}")
+    top_rows = int(alpha * gap)
+    bottom_rows = int(beta * gap)
+    if top_rows <= 0 and bottom_rows <= 0:
+        return compact
+    halo = torch.zeros(
+        (
+            int(compact.shape[0]),
+            int(compact.shape[1]),
+            int(compact.shape[2]) + int(top_rows) + int(bottom_rows),
+            int(compact.shape[3]),
+        ),
+        dtype=torch.float32,
+    )
+    halo[:, :, int(top_rows) : int(top_rows) + int(compact.shape[2]), :] = compact
+    if top_rows > 0:
+        for h in range(int(top_rows)):
+            source_h = min(int(h), int(compact.shape[2]) - 1)
+            halo[:, :, int(h), :] = compact[:, :, int(source_h), :]
+    if bottom_rows > 0:
+        start = int(top_rows + compact.shape[2])
+        for h in range(int(bottom_rows)):
+            source_h = min(max(int(compact.shape[2]) - int(bottom_rows) + int(h), 0), int(compact.shape[2]) - 1)
+            halo[:, :, int(start + h), :] = compact[:, :, int(source_h), :]
+    return halo
+
+
+def _encrypt_model_input(x: torch.Tensor, input_level: int) -> Any:
+    row = _layout_policy_input_layout_row()
+    if row is None:
+        return scheme.encrypt(scheme.encode(x, int(input_level)))
+    halo = _layout_policy_plaintext_halo_input(x, row)
+    return scheme.encrypt(scheme.encode(halo, int(input_level)))
 
 
 def _r20_config(provider_mode: str, *, backend: str = "lattigo") -> dict[str, Any]:
@@ -139,12 +195,40 @@ def _build_r34_imgnet() -> torch.nn.Module:
     return ResNet34(dataset="imagenet")
 
 
-def _build_u22_64_base32() -> torch.nn.Module:
-    return UNet22(dataset="montgomery_lung_64", base_dim=32)
+def _build_u22_64_base32(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22(
+        dataset="montgomery_lung_64",
+        base_dim=32,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
 
 
-def _build_u22_256_base32() -> torch.nn.Module:
-    return UNet22(dataset="kvasir_polyp_256", base_dim=32)
+def _build_u22_64_base8(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22(
+        dataset="montgomery_lung_64",
+        base_dim=8,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
+def _build_u22_256_base32(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22(
+        dataset="kvasir_polyp_256",
+        base_dim=32,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
+def _build_u22_256_base8(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22(
+        dataset="kvasir_polyp_256",
+        base_dim=8,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
 
 
 NETWORKS: dict[str, dict[str, Any]] = {
@@ -188,6 +272,19 @@ NETWORKS: dict[str, dict[str, Any]] = {
         ),
         "builder": _build_u22_64_base32,
     },
+    "u22_64_base8": {
+        "label": "U22 64 base8",
+        "model": "UNet22",
+        "dataset": "montgomery_lung_64",
+        "input_shape": (1, 1, 64, 64),
+        "provider_mode": "u22_64_base8",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_64_base8,
+    },
     "u22_256_base32": {
         "label": "U22 256 base32",
         "model": "UNet22",
@@ -200,6 +297,19 @@ NETWORKS: dict[str, dict[str, Any]] = {
             backend=str(backend),
         ),
         "builder": _build_u22_256_base32,
+    },
+    "u22_256_base8": {
+        "label": "U22 256 base8",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 256, 256),
+        "provider_mode": "u22_256_base8",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base8,
     },
 }
 
@@ -239,6 +349,25 @@ def _apply_io_config(
     return config
 
 
+def _apply_ckks_preset(config: dict[str, Any], preset: str | None) -> dict[str, Any]:
+    normalized = str(preset or "network-default").strip().lower()
+    if normalized in {"", "network-default", "default"}:
+        return config
+    if normalized != "resnet":
+        raise ValueError(f"Unsupported CKKS preset {preset!r}")
+    config = dict(config)
+    config["ckks_params"] = {
+        "LogN": 16,
+        "LogQ": [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40],
+        "LogP": [61, 61, 61],
+        "LogScale": 40,
+        "H": 192,
+        "RingType": "Standard",
+    }
+    config["boot_params"] = {"LogP": [61, 61, 61, 61, 61, 61, 61, 61]}
+    return config
+
+
 def _configure_cheddar_runtime_defaults() -> dict[str, str]:
     defaults = {
         "ORION_CHEDDAR_LT_STREAMING": "auto",
@@ -247,6 +376,70 @@ def _configure_cheddar_runtime_defaults() -> dict[str, str]:
         "ORION_CHEDDAR_SHARED_CACHE_PLAN_PERSIST": "1",
         "ORION_CHEDDAR_GPU_PREFETCH": "0",
         "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
+    }
+    applied: dict[str, str] = {}
+    for name, value in defaults.items():
+        os.environ.setdefault(name, value)
+        applied[name] = str(os.environ.get(name, ""))
+    return applied
+
+
+def _host_mem_available_bytes() -> int | None:
+    try:
+        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _lattigo_compile_worker_default() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    target = 4
+    mem_available = _host_mem_available_bytes()
+    if mem_available is not None:
+        if mem_available < 48 * 1024**3:
+            target = 1
+        elif mem_available < 96 * 1024**3:
+            target = 2
+    return str(max(1, min(cpu_count, target)))
+
+
+def _lattigo_pack_worker_default() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    target = 8
+    mem_available = _host_mem_available_bytes()
+    if mem_available is not None:
+        if mem_available < 48 * 1024**3:
+            target = 1
+        elif mem_available < 96 * 1024**3:
+            target = 2
+    return str(max(1, min(cpu_count, target)))
+
+
+def _configure_lattigo_runtime_defaults() -> dict[str, str]:
+    workers = _lattigo_compile_worker_default()
+    pack_workers = _lattigo_pack_worker_default()
+    defaults = {
+        "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
+        "ORION_PACK_CONV_WORKERS": pack_workers,
+        "ORION_LT_COMPILE_WORKERS": workers,
+        "ORION_UNIFIED_COMPILE_WORKERS": workers,
+        "ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS": workers,
+        "ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS": workers,
+        "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS": workers,
+        "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS": workers,
+        "ORION_LATTIGO_COMPILE_WORKERS": workers,
+        "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": workers,
+        "ORION_LATTIGO_BOOTSTRAP_WORKERS": workers,
+        "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "2",
+        "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "1",
+        "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     }
     applied: dict[str, str] = {}
     for name, value in defaults.items():
@@ -875,6 +1068,9 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     groups = list(getattr(executor, "groups_by_input", []) or [])
     if groups:
         return _unified_group_rotation_stats(groups)
+    groups = list(getattr(executor, "groups_by_input_chunk", []) or [])
+    if groups:
+        return _unified_group_rotation_stats(groups)
     groups_by_input_index = getattr(executor, "groups_by_input_index", None) or {}
     if groups_by_input_index:
         return _unified_group_rotation_stats([group for _input_index, group in sorted(groups_by_input_index.items())])
@@ -1104,7 +1300,7 @@ def _run_forward_attempt(
             attempt,
             int(attempt_index),
             "encrypt",
-            lambda: scheme.encrypt(scheme.encode(x0, int(input_level))),
+            lambda: _encrypt_model_input(x0, int(input_level)),
             record_primary_timing=bool(record_primary),
         )
         attempt["device_memory_after_encrypt"] = _device_memory_snapshot()
@@ -1210,13 +1406,18 @@ def _run_one(
     profile_modules: bool = False,
     trace_forward_memory: bool = False,
     provider_mode_override: str | None = None,
+    provider_no_hybrid: bool = False,
     io_mode: str = "none",
     io_dir: Path | None = None,
     diags_path: Path | None = None,
     keys_path: Path | None = None,
     logn_override: int | None = None,
+    activation: str | None = None,
+    silu_degree: int = 31,
+    ckks_preset: str | None = None,
 ) -> dict[str, Any]:
     env_defaults = _configure_cheddar_runtime_defaults() if str(backend) == "cheddar" else {}
+    lattigo_env_defaults = _configure_lattigo_runtime_defaults() if str(backend) == "lattigo" else {}
     if str(backend) != "cheddar":
         os.environ.setdefault("ORION_LATTIGO_BOOTSTRAP_MANY", "0")
     if str(backend) == "cheddar" and str(io_mode).lower() in {"save", "load"}:
@@ -1226,8 +1427,18 @@ def _run_one(
         )
     spec = NETWORKS[str(network)]
     provider_mode = str(provider_mode_override or spec["provider_mode"]) if str(mode) == "provider" else ""
-    config = _apply_io_config(
+    if str(mode) == "provider" and bool(provider_no_hybrid):
+        provider_mode = (
+            str(provider_mode)
+            if "nohybrid" in str(provider_mode).lower()
+            else f"{provider_mode}_nohybrid"
+        )
+    base_config = _apply_ckks_preset(
         spec["config"](provider_mode, backend=str(backend)),
+        ckks_preset,
+    )
+    config = _apply_io_config(
+        base_config,
         backend=str(backend),
         io_mode=str(io_mode),
         io_dir=io_dir,
@@ -1245,11 +1456,17 @@ def _run_one(
         "dataset": str(spec["dataset"]),
         "mode": str(mode),
         "provider_mode": str(provider_mode),
+        "provider_no_hybrid": bool(provider_no_hybrid),
         "io_mode": str(io_mode),
         "io_dir": None if io_dir is None else str(Path(io_dir)),
         "diags_path": str(config.get("orion", {}).get("diags_path", "")),
         "keys_path": str(config.get("orion", {}).get("keys_path", "")),
         "logn_override": None if logn_override is None else int(logn_override),
+        "ckks_preset": str(ckks_preset or "network-default"),
+        "activation": {
+            "kind": str(activation) if activation is not None else None,
+            "silu_degree": int(silu_degree) if str(activation or "").lower() == "silu" else None,
+        },
         "seed": int(seed),
         "input_shape": [int(v) for v in tuple(spec["input_shape"])],
         "compile_only": bool(compile_only),
@@ -1259,6 +1476,7 @@ def _run_one(
         "trace_forward_memory": bool(trace_forward_memory),
         "bootstrap_many_enabled": os.environ.get("ORION_LATTIGO_BOOTSTRAP_MANY", "0") != "0",
         "cheddar_runtime_env": env_defaults,
+        "lattigo_runtime_env": lattigo_env_defaults,
         "config": config,
     }
     _write(payload, out_path)
@@ -1270,7 +1488,10 @@ def _run_one(
         payload["phase"] = "compile_load"
         _write(payload, out_path)
         torch.manual_seed(int(seed))
-        net = spec["builder"]()
+        if str(spec["model"]) == "UNet22":
+            net = spec["builder"](activation=activation, silu_degree=int(silu_degree))
+        else:
+            net = spec["builder"]()
         net.eval()
         x0 = torch.randn(tuple(int(v) for v in spec["input_shape"]), dtype=torch.float32)
         with torch.no_grad():
@@ -1425,6 +1646,7 @@ def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict
         "network": provider.get("network", dense.get("network")),
         "backend": provider.get("backend", dense.get("backend")),
         "label": provider.get("label", dense.get("label")),
+        "activation": provider.get("activation", dense.get("activation")),
         "dense_path": str(Path(dense_path)),
         "provider_path": str(Path(provider_path)),
         "dense": {
@@ -1522,12 +1744,27 @@ def main() -> int:
         help="Write per-module forward memory/live-ciphertext events to a JSONL sidecar.",
     )
     parser.add_argument("--provider-mode", type=str, default=None)
+    parser.add_argument(
+        "--provider-no-hybrid",
+        action="store_true",
+        help="Keep provider mode enabled but disable provider real/imag hybrid packing before compile.",
+    )
     parser.add_argument("--io-mode", choices=("none", "save", "load"), default="none")
     parser.add_argument("--io-dir", type=Path, default=None)
     parser.add_argument("--diags-path", type=Path, default=None)
     parser.add_argument("--keys-path", type=Path, default=None)
     parser.add_argument("--logn-override", type=int, default=None)
+    parser.add_argument("--activation", choices=("none", "relu", "silu"), default=None)
+    parser.add_argument("--silu-degree", type=int, default=31)
+    parser.add_argument(
+        "--ckks-preset",
+        choices=("network-default", "resnet"),
+        default="network-default",
+        help="Override the network's default CKKS/bootstrapping parameters.",
+    )
     args = parser.parse_args()
+
+    activation = None if args.activation in (None, "none") else str(args.activation)
 
     if str(args.mode) == "summarize":
         _summarize(dense_path=Path(args.dense_path), provider_path=Path(args.provider_path), out_path=Path(args.out))
@@ -1545,11 +1782,15 @@ def main() -> int:
         profile_modules=bool(args.profile_modules),
         trace_forward_memory=bool(args.trace_forward_memory),
         provider_mode_override=args.provider_mode,
+        provider_no_hybrid=bool(args.provider_no_hybrid),
         io_mode=str(args.io_mode),
         io_dir=args.io_dir,
         diags_path=args.diags_path,
         keys_path=args.keys_path,
         logn_override=args.logn_override,
+        activation=activation,
+        silu_degree=int(args.silu_degree),
+        ckks_preset=str(args.ckks_preset),
     )
     return 0
 

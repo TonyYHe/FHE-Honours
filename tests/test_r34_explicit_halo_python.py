@@ -153,6 +153,7 @@ def test_stage3_same_explicit_halo_fill_uses_expected_row_stride() -> None:
     )
     assert plan.row_stride_slots == int(plan.w) * int(plan.gap) * int(plan.gap)
     assert plan.row_stride_slots == 3584
+    assert plan.active_slots == 32256
 
 
 def test_explicit_halo_fill_uses_two_rotations_for_interior_section() -> None:

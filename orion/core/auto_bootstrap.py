@@ -308,8 +308,19 @@ class BootstrapPlacer:
         
         bootstrapper.scheme = self.net.scheme
         bootstrapper.margin = self.net.margin
-        bootstrapper.fhe_input_shape = module.fhe_output_shape
+        bootstrapper.fhe_input_shape = self._runtime_fhe_output_shape(module)
         bootstrapper.fit()
         bootstrapper.compile()
         
         return bootstrapper
+
+    def _runtime_fhe_output_shape(self, module):
+        runtime = getattr(module, "region_runtime", None)
+        executor = getattr(runtime, "executor", None) if runtime is not None else None
+        for candidate in (executor, getattr(module, "layout_policy_add_runtime", None)):
+            get_shape = getattr(candidate, "runtime_fhe_output_shape", None)
+            if callable(get_shape):
+                shape = get_shape()
+                if shape is not None:
+                    return shape
+        return module.fhe_output_shape
