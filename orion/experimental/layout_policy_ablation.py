@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -24,15 +25,26 @@ DEFAULT_SLOTS = 32768
 RELAYOUT_ROTATION_WEIGHT = 6.0
 RELAYOUT_MASK_MULT_WEIGHT = 1.0
 LT_ROTATION_WEIGHT = 8.0
+INPUT_CROSS_RECOVERY_ROTATION_MULTIPLIER = 2.0
 HALO_SLOT_WEIGHT = 0.02
 TILE_WEIGHT = 4.0
 BOOTSTRAP_PROXY_WEIGHT = 64.0
 BOOTSTRAP_HALO_SLOT_DIVISOR = math.inf
-RELAYOUT_DEPTH_WEIGHT = 4096.0
+RELAYOUT_DEPTH_WEIGHT = 33554432.0
 RELAYOUT_NODE_STACK_DEPTH_WEIGHT = 65536.0
 ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT = 0.0
 RELAYOUT_BOOTSTRAP_CT_WEIGHT = 16384.0
-DP_FRONTIER_STATE_LIMIT = 64
+DP_FRONTIER_STATE_LIMIT = 128
+LAYOUT_ESTIMATOR_COUNT_ONLY = "count_only"
+LAYOUT_ESTIMATOR_TEMPLATE = "template"
+LAYOUT_ESTIMATOR_AUTO = "auto"
+LAYOUT_ESTIMATOR_DEFAULT = os.environ.get("HALOED_LAYOUT_ESTIMATOR", LAYOUT_ESTIMATOR_COUNT_ONLY)
+LAYOUT_ESTIMATOR_AUTO_RELATIVE_WINDOW = 0.15
+LAYOUT_ESTIMATOR_AUTO_ABSOLUTE_WINDOW = 8192.0
+TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS = int(os.environ.get("HALOED_TEMPLATE_ESTIMATOR_MAX_MAPPINGS", "4000000"))
+PHYSICAL_COMPACT = "packed_compact"
+PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
+PHYSICAL_NATIVE_SOURCE_STRIPE = "native_source_stripe"
 POLICY_ALIASES = {
     "fixed": "fixed_max",
     "fixedmax": "fixed_max",
@@ -145,6 +157,64 @@ class EdgeInfo:
 
 
 @dataclass(frozen=True)
+class RotationEstimate:
+    input_cross: int
+    local_submatrix: int
+    output_materialize: int
+    bsgs_groups: int
+    transforms: int
+    baby_rotations: int
+    giant_rotations: int
+    input_channel_multiplier: int
+    output_channel_multiplier: int
+    local_programs: int
+    recovery_programs: int
+    rho_hat_per_program: int
+    unfused_rotations: int
+    same_input_fusion_savings: int
+    estimator: str = LAYOUT_ESTIMATOR_COUNT_ONLY
+
+    @property
+    def rotations(self) -> int:
+        return int(self.input_cross) + int(self.local_submatrix) + int(self.output_materialize)
+
+    def to_lt_stats(self) -> dict[str, int]:
+        return {
+            "bsgs_groups": int(self.bsgs_groups),
+            "transforms": int(self.transforms),
+            "baby_rotations": int(self.baby_rotations),
+            "giant_rotations": int(self.giant_rotations),
+            "input_channel_multiplier": int(self.input_channel_multiplier),
+            "output_channel_multiplier": int(self.output_channel_multiplier),
+            "rotations": int(self.rotations),
+            "input_cross_rotations": int(self.input_cross),
+            "local_submatrix_rotations": int(self.local_submatrix),
+            "output_materialize_rotations": int(self.output_materialize),
+            "local_programs": int(self.local_programs),
+            "recovery_programs": int(self.recovery_programs),
+            "rho_hat_per_program": int(self.rho_hat_per_program),
+            "unfused_rotations": int(self.unfused_rotations),
+            "same_input_fusion_savings": int(self.same_input_fusion_savings),
+            "estimator": str(self.estimator),
+        }
+
+
+@dataclass(frozen=True)
+class ExecutionCandidate:
+    edge: EdgeInfo
+    source_layout: LayoutState
+    target_layout: LayoutState
+    source_physical: str
+    target_physical: str | None = None
+    layout_mode: str = "halo_local"
+    relayout: bool = False
+    relayout_reason: str = ""
+    compact_fallback_penalty_estimate: int = 0
+    consumer_fused_relayout: bool = False
+    consumer_fused_rotation_estimate: int = 0
+
+
+@dataclass(frozen=True)
 class PolicyPlan:
     policy: str
     policy_label: str
@@ -156,6 +226,10 @@ class PolicyPlan:
     relayout_rotation_estimate: int
     relayout_mask_mult_estimate: int
     relayout_depth_estimate: int
+    producer_fused_materialization_count: int
+    producer_fused_rotation_estimate: int
+    consumer_fused_relayout_count: int
+    consumer_fused_rotation_estimate: int
     lt_bsgs_rotation_estimate: int
     compact_fallback_penalty_estimate: int
     bootstrap_proxy: int
@@ -181,6 +255,10 @@ class PolicyPlan:
             "relayout_rotation_estimate": int(self.relayout_rotation_estimate),
             "relayout_mask_mult_estimate": int(self.relayout_mask_mult_estimate),
             "relayout_depth_estimate": int(self.relayout_depth_estimate),
+            "producer_fused_materialization_count": int(self.producer_fused_materialization_count),
+            "producer_fused_rotation_estimate": int(self.producer_fused_rotation_estimate),
+            "consumer_fused_relayout_count": int(self.consumer_fused_relayout_count),
+            "consumer_fused_rotation_estimate": int(self.consumer_fused_rotation_estimate),
             "lt_bsgs_rotation_estimate": int(self.lt_bsgs_rotation_estimate),
             "compact_fallback_penalty_estimate": int(self.compact_fallback_penalty_estimate),
             "bootstrap_proxy": int(self.bootstrap_proxy),
@@ -336,6 +414,30 @@ def _layout_for_shape(
         core_slots=int(core_slots),
         stored_slots=int(stored_slots),
         tile_count=max(1, _ceil_div(int(stored_slots), int(slots))),
+    )
+
+
+def _fhe_shape_for_layout(
+    *,
+    shape: tuple[int, int, int, int],
+    layout: LayoutState,
+) -> tuple[int, int, int, int]:
+    n, channels, height, width = (int(value) for value in shape)
+    gap = max(1, int(layout.gap))
+    on_channels = _ceil_div(int(channels), int(gap * gap))
+    on_height = int(height * gap + (int(layout.alpha) + int(layout.beta)) * gap)
+    on_width = int(width * gap)
+    return int(n), int(on_channels), int(on_height), int(on_width)
+
+
+def _edge_with_output_layout(edge: EdgeInfo, output_layout: LayoutState) -> EdgeInfo:
+    output_shape = edge.output_shape or edge.shape
+    return replace(
+        edge,
+        output_fhe_shape=_fhe_shape_for_layout(
+            shape=output_shape,
+            layout=output_layout,
+        ),
     )
 
 
@@ -578,18 +680,39 @@ def _edge_row(
     lt_rotations: int | None = None,
     layout_mode: str = "halo_local",
     source_layout: LayoutState | None = None,
+    physical_layout: str | None = None,
     compact_fallback_penalty_estimate: int = 0,
+    consumer_fused_relayout: bool = False,
+    consumer_fused_rotation_estimate: int = 0,
+    estimator: str | None = None,
 ) -> dict[str, Any]:
     if str(layout_mode) == "compact_global_fallback":
         raise ValueError("compact global fallback is not a valid halo-local layout-policy edge")
+    lt_stats = _lt_rotation_stats(edge, layout, estimator=estimator)
     if lt_rotations is None:
-        lt_rotations = _lt_rotations(edge, layout)
-    lt_stats = _lt_rotation_stats(edge, layout)
+        lt_rotations = int(lt_stats["rotations"])
+    if physical_layout is None:
+        physical_layout = (
+            PHYSICAL_NATIVE_SOURCE_STRIPE
+            if str(layout_mode) == "native_halo_stripe"
+            else (PHYSICAL_LOGICAL_HALO if int(layout.alpha) > 0 or int(layout.beta) > 0 else PHYSICAL_COMPACT)
+        )
     relayout_estimate = _relayout_transition_estimate(
         source_layout=source_layout,
         target_layout=layout,
         relayout=bool(relayout),
     )
+    if (
+        bool(relayout)
+        and str(physical_layout) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and int(relayout_estimate["depth_estimate"]) == 0
+    ):
+        relayout_estimate = {
+            "rotation_count": int(_relayout_rotations((layout,))),
+            "mask_mult_count": 0,
+            "sparse_lt_count": int(max(1, int(layout.tile_count))),
+            "depth_estimate": 1,
+        }
     return {
         "edge": edge.edge_id,
         "source": edge.source,
@@ -613,9 +736,21 @@ def _edge_row(
         "lt_transform_count_estimate": int(lt_stats["transforms"]),
         "lt_baby_rotation_estimate": int(lt_stats["baby_rotations"]),
         "lt_giant_rotation_estimate": int(lt_stats["giant_rotations"]),
+        "lt_input_cross_rotation_estimate": int(lt_stats["input_cross_rotations"]),
+        "lt_local_submatrix_rotation_estimate": int(lt_stats["local_submatrix_rotations"]),
+        "lt_output_materialize_rotation_estimate": int(lt_stats["output_materialize_rotations"]),
+        "lt_local_program_count_estimate": int(lt_stats["local_programs"]),
+        "lt_recovery_program_count_estimate": int(lt_stats["recovery_programs"]),
+        "lt_rho_hat_per_program_estimate": int(lt_stats["rho_hat_per_program"]),
+        "lt_unfused_rotation_estimate": int(lt_stats["unfused_rotations"]),
+        "lt_same_input_fusion_savings_estimate": int(lt_stats["same_input_fusion_savings"]),
         "lt_input_channel_multiplier": int(lt_stats["input_channel_multiplier"]),
         "lt_output_channel_multiplier": int(lt_stats["output_channel_multiplier"]),
+        "lt_estimator": str(lt_stats.get("estimator", _normalize_layout_estimator(estimator))),
         "layout_mode": str(layout_mode),
+        "physical_layout": str(physical_layout),
+        "consumer_fused_relayout": bool(consumer_fused_relayout),
+        "consumer_fused_rotation_estimate": int(consumer_fused_rotation_estimate),
     }
 
 
@@ -718,6 +853,149 @@ def _one_channel_lt_groups_cached(
     )
 
 
+@lru_cache(maxsize=None)
+def _one_channel_lt_adjacency_counts_cached(
+    *,
+    op_kind: str,
+    input_h: int,
+    input_w: int,
+    output_h: int,
+    output_w: int,
+    input_phys_h: int,
+    input_phys_w: int,
+    output_phys_h: int,
+    output_phys_w: int,
+    input_gap: int,
+    output_gap: int,
+    alpha: int,
+    kernel_h: int,
+    kernel_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_h: int,
+    pad_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    slots: int,
+) -> tuple[int, ...]:
+    by_input_block: dict[int, set[int]] = {}
+
+    def add_mapping(in_h: int, in_w: int, out_h: int, out_w: int) -> None:
+        if not (0 <= int(in_h) < int(input_h) and 0 <= int(in_w) < int(input_w)):
+            return
+        if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
+            return
+        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
+        in_pw = int(in_w) * int(input_gap)
+        out_ph = int(out_h) * int(output_gap)
+        out_pw = int(out_w) * int(output_gap)
+        if not (0 <= int(in_ph) < int(input_phys_h) and 0 <= int(in_pw) < int(input_phys_w)):
+            return
+        if not (0 <= int(out_ph) < int(output_phys_h) and 0 <= int(out_pw) < int(output_phys_w)):
+            return
+        in_index = int(in_ph) * int(input_phys_w) + int(in_pw)
+        out_index = int(out_ph) * int(output_phys_w) + int(out_pw)
+        in_block, _in_slot = _one_channel_block(in_index, slots=int(slots))
+        out_block, _out_slot = _one_channel_block(out_index, slots=int(slots))
+        by_input_block.setdefault(int(in_block), set()).add(int(out_block))
+
+    if str(op_kind) in {"conv2d", "avgpool2d"}:
+        for out_h in range(int(output_h)):
+            base_h = int(out_h) * int(stride_h) - int(pad_h)
+            for out_w in range(int(output_w)):
+                base_w = int(out_w) * int(stride_w) - int(pad_w)
+                for kernel_y in range(int(kernel_h)):
+                    in_h = int(base_h) + int(kernel_y) * int(dilation_h)
+                    for kernel_x in range(int(kernel_w)):
+                        in_w = int(base_w) + int(kernel_x) * int(dilation_w)
+                        add_mapping(in_h, in_w, out_h, out_w)
+    elif str(op_kind) == "conv_transpose2d":
+        for in_h in range(int(input_h)):
+            base_h = int(in_h) * int(stride_h) - int(pad_h)
+            for in_w in range(int(input_w)):
+                base_w = int(in_w) * int(stride_w) - int(pad_w)
+                for kernel_y in range(int(kernel_h)):
+                    out_h = int(base_h) + int(kernel_y) * int(dilation_h)
+                    for kernel_x in range(int(kernel_w)):
+                        out_w = int(base_w) + int(kernel_x) * int(dilation_w)
+                        add_mapping(in_h, in_w, out_h, out_w)
+
+    return tuple(len(outputs) for _source, outputs in sorted(by_input_block.items()) if outputs)
+
+
+@lru_cache(maxsize=None)
+def _representative_shift_indices_cached(
+    *,
+    op_kind: str,
+    input_h: int,
+    input_w: int,
+    output_h: int,
+    output_w: int,
+    input_phys_h: int,
+    input_phys_w: int,
+    output_phys_h: int,
+    output_phys_w: int,
+    input_gap: int,
+    output_gap: int,
+    alpha: int,
+    kernel_h: int,
+    kernel_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_h: int,
+    pad_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    slots: int,
+) -> tuple[int, ...]:
+    samples_h = tuple(dict.fromkeys((0, max(0, int(input_h) // 2), max(0, int(input_h) - 1))))
+    samples_w = tuple(dict.fromkeys((0, max(0, int(input_w) // 2), max(0, int(input_w) - 1))))
+    out_samples_h = tuple(dict.fromkeys((0, max(0, int(output_h) // 2), max(0, int(output_h) - 1))))
+    out_samples_w = tuple(dict.fromkeys((0, max(0, int(output_w) // 2), max(0, int(output_w) - 1))))
+    shifts: set[int] = set()
+
+    def add_shift(in_h: int, in_w: int, out_h: int, out_w: int) -> None:
+        if not (0 <= int(in_h) < int(input_h) and 0 <= int(in_w) < int(input_w)):
+            return
+        if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
+            return
+        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
+        in_pw = int(in_w) * int(input_gap)
+        out_ph = int(out_h) * int(output_gap)
+        out_pw = int(out_w) * int(output_gap)
+        if not (0 <= int(in_ph) < int(input_phys_h) and 0 <= int(in_pw) < int(input_phys_w)):
+            return
+        if not (0 <= int(out_ph) < int(output_phys_h) and 0 <= int(out_pw) < int(output_phys_w)):
+            return
+        in_index = int(in_ph) * int(input_phys_w) + int(in_pw)
+        out_index = int(out_ph) * int(output_phys_w) + int(out_pw)
+        shift = int((int(in_index % int(slots)) - int(out_index % int(slots))) % int(slots))
+        if int(shift) != 0:
+            shifts.add(int(shift))
+
+    if str(op_kind) in {"conv2d", "avgpool2d"}:
+        for out_h in out_samples_h:
+            base_h = int(out_h) * int(stride_h) - int(pad_h)
+            for out_w in out_samples_w:
+                base_w = int(out_w) * int(stride_w) - int(pad_w)
+                for kernel_y in range(int(kernel_h)):
+                    in_h = int(base_h) + int(kernel_y) * int(dilation_h)
+                    for kernel_x in range(int(kernel_w)):
+                        in_w = int(base_w) + int(kernel_x) * int(dilation_w)
+                        add_shift(in_h, in_w, int(out_h), int(out_w))
+    elif str(op_kind) == "conv_transpose2d":
+        for in_h in samples_h:
+            base_h = int(in_h) * int(stride_h) - int(pad_h)
+            for in_w in samples_w:
+                base_w = int(in_w) * int(stride_w) - int(pad_w)
+                for kernel_y in range(int(kernel_h)):
+                    out_h = int(base_h) + int(kernel_y) * int(dilation_h)
+                    for kernel_x in range(int(kernel_w)):
+                        out_w = int(base_w) + int(kernel_x) * int(dilation_w)
+                        add_shift(int(in_h), int(in_w), int(out_h), int(out_w))
+    return tuple(sorted(shifts))
+
+
 def _powers_of_two_below_slots(slots: int) -> tuple[int, ...]:
     values: list[int] = []
     n1 = 1
@@ -800,27 +1078,66 @@ def _output_gap_for_edge(edge: EdgeInfo) -> int:
     return max(1, min(max(1, int(round(fhe_h / clear_h))), max(1, int(round(fhe_w / clear_w)))))
 
 
-def _lt_rotation_stats(edge: EdgeInfo, layout: LayoutState) -> dict[str, int]:
+def _normalize_layout_estimator(estimator: str | None) -> str:
+    value = str(estimator or LAYOUT_ESTIMATOR_DEFAULT).strip().lower().replace("-", "_")
+    aliases = {
+        "count": LAYOUT_ESTIMATOR_COUNT_ONLY,
+        "countonly": LAYOUT_ESTIMATOR_COUNT_ONLY,
+        "count_only": LAYOUT_ESTIMATOR_COUNT_ONLY,
+        "closed_form": LAYOUT_ESTIMATOR_COUNT_ONLY,
+        "template": LAYOUT_ESTIMATOR_TEMPLATE,
+        "template_refine": LAYOUT_ESTIMATOR_TEMPLATE,
+        "unweighted_template": LAYOUT_ESTIMATOR_TEMPLATE,
+        "auto": LAYOUT_ESTIMATOR_AUTO,
+        "auto_template": LAYOUT_ESTIMATOR_AUTO,
+    }
+    if value not in aliases:
+        raise ValueError(f"unsupported layout estimator {estimator!r}")
+    return aliases[value]
+
+
+def _bsgs_hat_from_diagonal_count(diagonal_count: int, *, slots: int) -> dict[str, int]:
+    """Count-only BSGS proxy used by the layout DP.
+
+    The planner must not construct weighted Toeplitz submatrices or exact
+    diagonal sets for every candidate layout. This proxy uses only the number of
+    nonzero diagonals and chooses a baby-step width from the same power-of-two
+    family as the descriptor tools.
+    """
+
+    diagonals = max(0, int(diagonal_count))
+    if diagonals == 0:
+        return {"rotations": 0, "baby": 0, "giant": 0, "n1": 1}
+    best: dict[str, int] | None = None
+    for n1 in _powers_of_two_below_slots(int(slots)):
+        baby = min(int(diagonals), max(1, int(n1) - 1))
+        giant = _ceil_div(int(diagonals), max(1, int(n1)))
+        rotations = int(baby + giant)
+        candidate = {"rotations": int(rotations), "baby": int(baby), "giant": int(giant), "n1": int(n1)}
+        if best is None or (int(rotations), -int(n1)) < (int(best["rotations"]), -int(best["n1"])):
+            best = candidate
+    assert best is not None
+    return dict(best)
+
+
+def _rho_hat_from_diagonal_count(diagonal_count: int, *, slots: int) -> int:
+    return int(_bsgs_hat_from_diagonal_count(int(diagonal_count), slots=int(slots))["rotations"])
+
+
+def _conv_missing_halo_rows(edge: EdgeInfo, layout: LayoutState) -> int:
+    if str(edge.op_kind) not in {"conv2d", "avgpool2d"}:
+        return 0
+    missing_top = max(0, int(edge.requirement.alpha) - int(layout.alpha))
+    missing_bottom = max(0, int(edge.requirement.beta) - int(layout.beta))
+    return int(missing_top + missing_bottom)
+
+
+def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> RotationEstimate:
     if str(edge.op_kind) in {"add", "input"}:
-        return {
-            "bsgs_groups": 0,
-            "transforms": 0,
-            "baby_rotations": 0,
-            "giant_rotations": 0,
-            "input_channel_multiplier": 0,
-            "output_channel_multiplier": 0,
-            "rotations": 0,
-        }
+        return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     if edge.output_shape is None or edge.output_fhe_shape is None:
-        return {
-            "bsgs_groups": 0,
-            "transforms": 0,
-            "baby_rotations": 0,
-            "giant_rotations": 0,
-            "input_channel_multiplier": 0,
-            "output_channel_multiplier": 0,
-            "rotations": 0,
-        }
+        return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
     input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
         clear_shape=edge.shape,
         gap=int(layout.gap),
@@ -828,34 +1145,205 @@ def _lt_rotation_stats(edge: EdgeInfo, layout: LayoutState) -> dict[str, int]:
         beta=int(layout.beta),
     )
     output_gap = _output_gap_for_edge(edge)
-    spatial_work = max(
-        int(edge.shape[2]) * int(edge.shape[3]),
-        int((edge.output_shape or edge.shape)[2]) * int((edge.output_shape or edge.shape)[3]),
+    output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
+    output_phys_w = max(1, int(edge.output_shape[3]) * int(output_gap))
+    input_multiplier, output_multiplier = _lt_channel_multipliers(edge)
+    input_blocks = max(1, _ceil_div(int(input_phys_h) * int(input_phys_w), int(edge.slots)))
+    output_blocks = max(
+        1,
+        _ceil_div(
+            int(edge.output_fhe_shape[2]) * int(edge.output_fhe_shape[3]),
+            int(edge.slots),
+        ),
     )
-    if int(spatial_work) > 16384:
-        input_multiplier, output_multiplier = _lt_channel_multipliers(edge)
-        input_blocks = max(1, _ceil_div(int(input_phys_h) * int(input_phys_w), int(edge.slots)))
-        output_blocks = max(
-            1,
-            _ceil_div(
-                int(edge.output_fhe_shape[2]) * int(edge.output_fhe_shape[3]),
-                int(edge.slots),
-            ),
+    bsgs_groups = int(input_blocks * output_blocks * max(1, int(input_multiplier)))
+    full_diags = max(
+        1,
+        int(edge.kernel_size[0]) * int(edge.kernel_size[1]) - int(str(edge.op_kind) in {"conv2d", "avgpool2d"}),
+    )
+
+    missing_rows = _conv_missing_halo_rows(edge, layout)
+    missing_diags = 0
+    if int(missing_rows) > 0:
+        missing_diags = min(
+            int(full_diags),
+            int(missing_rows) * max(1, int(edge.kernel_size[1])),
         )
-        bsgs_groups = int(input_blocks * output_blocks)
-        one_channel_diags = max(1, int(edge.kernel_size[0]) * int(edge.kernel_size[1]) - int(str(edge.op_kind) in {"conv2d", "avgpool2d"}))
-        transforms = int(max(1, bsgs_groups) * max(1, output_multiplier))
-        rotations = int(max(1, bsgs_groups) * int(one_channel_diags) * max(1, output_multiplier))
-        return {
-            "bsgs_groups": int(bsgs_groups),
-            "transforms": int(transforms),
-            "baby_rotations": int(min(rotations, int(one_channel_diags) * max(1, output_multiplier))),
-            "giant_rotations": int(max(0, rotations - int(one_channel_diags) * max(1, output_multiplier))),
-            "input_channel_multiplier": int(input_multiplier),
-            "output_channel_multiplier": int(output_multiplier),
-            "rotations": int(rotations),
-        }
-    one_channel_groups = _one_channel_lt_groups_cached(
+    # Missing halo does not remove the local stencil work. It adds boundary
+    # recovery/reassembly work on top of the local LT, which is exactly the
+    # distinction the DP needs when comparing native halo against fused
+    # cross-ciphertext handling.
+    local_diags = int(full_diags)
+
+    local_hat = _bsgs_hat_from_diagonal_count(int(local_diags), slots=int(edge.slots))
+    recovery_hat = _bsgs_hat_from_diagonal_count(int(missing_diags), slots=int(edge.slots))
+    local_rho = int(local_hat["rotations"])
+    recovery_rho = int(recovery_hat["rotations"])
+    local_baby = int(local_hat["baby"])
+    local_giant = int(local_hat["giant"])
+    recovery_baby = int(recovery_hat["baby"])
+    recovery_giant = int(recovery_hat["giant"])
+    repeated = max(1, int(output_multiplier))
+    adjacency_counts: tuple[int, ...] = ()
+    shift_indices: tuple[int, ...] = ()
+    if (
+        str(edge.op_kind) in {"conv2d", "avgpool2d", "conv_transpose2d"}
+        and _template_slot_mapping_count(edge) <= int(TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS)
+    ):
+        adjacency_counts = _one_channel_lt_adjacency_counts_cached(
+            op_kind=str(edge.op_kind),
+            input_h=int(edge.shape[2]),
+            input_w=int(edge.shape[3]),
+            output_h=int(edge.output_shape[2]),
+            output_w=int(edge.output_shape[3]),
+            input_phys_h=int(input_phys_h),
+            input_phys_w=int(input_phys_w),
+            output_phys_h=int(output_phys_h),
+            output_phys_w=int(output_phys_w),
+            input_gap=int(layout.gap),
+            output_gap=int(output_gap),
+            alpha=int(layout.alpha),
+            kernel_h=int(edge.kernel_size[0]),
+            kernel_w=int(edge.kernel_size[1]),
+            stride_h=int(edge.stride[0]),
+            stride_w=int(edge.stride[1]),
+            pad_h=int(edge.padding[0]),
+            pad_w=int(edge.padding[1]),
+            dilation_h=int(edge.dilation[0]),
+            dilation_w=int(edge.dilation[1]),
+            slots=int(edge.slots),
+        )
+        shift_indices = _representative_shift_indices_cached(
+            op_kind=str(edge.op_kind),
+            input_h=int(edge.shape[2]),
+            input_w=int(edge.shape[3]),
+            output_h=int(edge.output_shape[2]),
+            output_w=int(edge.output_shape[3]),
+            input_phys_h=int(input_phys_h),
+            input_phys_w=int(input_phys_w),
+            output_phys_h=int(output_phys_h),
+            output_phys_w=int(output_phys_w),
+            input_gap=int(layout.gap),
+            output_gap=int(output_gap),
+            alpha=int(layout.alpha),
+            kernel_h=int(edge.kernel_size[0]),
+            kernel_w=int(edge.kernel_size[1]),
+            stride_h=int(edge.stride[0]),
+            stride_w=int(edge.stride[1]),
+            pad_h=int(edge.padding[0]),
+            pad_w=int(edge.padding[1]),
+            dilation_h=int(edge.dilation[0]),
+            dilation_w=int(edge.dilation[1]),
+            slots=int(edge.slots),
+        )
+    local_programs = int(
+        (sum(int(value) for value in adjacency_counts) if adjacency_counts else int(input_blocks * output_blocks))
+        * max(1, int(input_multiplier))
+    )
+    recovery_programs = int(0 if int(missing_diags) == 0 else output_blocks * max(1, int(input_multiplier)))
+    source_group_count_one_channel = int(len(adjacency_counts) if adjacency_counts else int(input_blocks))
+    source_groups = int(source_group_count_one_channel * max(1, int(input_multiplier)))
+    recovery_transforms_per_source = int(output_blocks * int(repeated))
+    if shift_indices:
+        local_rotations_one_channel = 0
+        local_baby_one_channel = 0
+        local_giant_one_channel = 0
+        for fanout in adjacency_counts:
+            cost = _shared_bsgs_group_cost(
+                (shift_indices,),
+                slots=int(edge.slots),
+                repeated_transform_count=int(max(1, int(fanout)) * int(repeated)),
+            )
+            local_rotations_one_channel += int(cost["rotations"])
+            local_baby_one_channel += int(cost["baby_rotations"])
+            local_giant_one_channel += int(cost["giant_rotations"])
+        local_rotations = int(local_rotations_one_channel * max(1, int(input_multiplier)))
+        local_baby = int(local_baby_one_channel * max(1, int(input_multiplier)))
+        local_giant = int(local_giant_one_channel * max(1, int(input_multiplier)))
+        single_cost = _shared_bsgs_group_cost((shift_indices,), slots=int(edge.slots), repeated_transform_count=1)
+        local_rho = int(single_cost["rotations"])
+    else:
+        transforms_per_source = int(output_blocks * int(repeated))
+        local_rotations = int(
+            int(source_groups) * (int(local_baby) + int(transforms_per_source) * int(local_giant))
+        )
+    local_unfused = int(local_programs * int(local_rho) * int(repeated))
+    input_cross_rotations = int(
+        math.ceil(
+            float(source_groups)
+            * float(0 if int(recovery_programs) == 0 else int(recovery_baby) + int(recovery_transforms_per_source) * int(recovery_giant))
+            * float(INPUT_CROSS_RECOVERY_ROTATION_MULTIPLIER)
+        )
+    )
+    input_cross_unfused = int(recovery_programs * int(recovery_rho) * int(repeated))
+    total_programs = int(local_programs + recovery_programs)
+    transforms = int(total_programs * int(repeated))
+    local_baby_total = int(local_baby if shift_indices else int(source_groups) * int(local_baby))
+    input_cross_baby_total = int(
+        math.ceil(
+            float(0 if int(recovery_programs) == 0 else int(source_groups) * int(recovery_baby))
+            * float(INPUT_CROSS_RECOVERY_ROTATION_MULTIPLIER)
+        )
+    )
+    baby_rotations = int(local_baby_total + input_cross_baby_total)
+    total_rotations = int(local_rotations + input_cross_rotations)
+    giant_rotations = int(max(0, int(total_rotations) - int(baby_rotations)))
+    unfused_rotations = int(local_unfused + math.ceil(float(input_cross_unfused) * float(INPUT_CROSS_RECOVERY_ROTATION_MULTIPLIER)))
+    return RotationEstimate(
+        input_cross=int(input_cross_rotations),
+        local_submatrix=int(local_rotations),
+        output_materialize=0,
+        bsgs_groups=int(source_groups),
+        transforms=int(transforms),
+        baby_rotations=int(baby_rotations),
+        giant_rotations=int(giant_rotations),
+        input_channel_multiplier=int(input_multiplier),
+        output_channel_multiplier=int(output_multiplier),
+        local_programs=int(local_programs),
+        recovery_programs=int(recovery_programs),
+        rho_hat_per_program=int(max(int(local_rho), int(recovery_rho))),
+        unfused_rotations=int(unfused_rotations),
+        same_input_fusion_savings=int(max(0, int(unfused_rotations) - int(total_rotations))),
+        estimator=LAYOUT_ESTIMATOR_COUNT_ONLY,
+    )
+
+
+def _template_slot_mapping_count(edge: EdgeInfo) -> int:
+    if str(edge.op_kind) in {"conv2d", "avgpool2d"}:
+        output_shape = edge.output_shape or edge.shape
+        return int(output_shape[2]) * int(output_shape[3]) * int(edge.kernel_size[0]) * int(edge.kernel_size[1])
+    if str(edge.op_kind) == "conv_transpose2d":
+        return int(edge.shape[2]) * int(edge.shape[3]) * int(edge.kernel_size[0]) * int(edge.kernel_size[1])
+    return 0
+
+
+def _template_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> RotationEstimate:
+    """Cached unweighted-diagonal estimator for close-call DP candidates.
+
+    This constructs only slot-offset sets for one logical channel template. It
+    deliberately does not materialize plaintext weights or full Toeplitz
+    matrices, so it is much cheaper than the descriptor oracle but still models
+    exact BSGS baby/giant schedules for the candidate geometry.
+    """
+
+    count_only = _count_only_rotation_estimate(edge, layout)
+    if str(edge.op_kind) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
+        return count_only
+    if _template_slot_mapping_count(edge) > int(TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS):
+        return count_only
+    if edge.output_shape is None:
+        return count_only
+
+    input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
+        clear_shape=edge.shape,
+        gap=int(layout.gap),
+        alpha=int(layout.alpha),
+        beta=int(layout.beta),
+    )
+    output_gap = _output_gap_for_edge(edge)
+    output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
+    output_phys_w = max(1, int(edge.output_shape[3]) * int(output_gap))
+    groups = _one_channel_lt_groups_cached(
         op_kind=str(edge.op_kind),
         input_h=int(edge.shape[2]),
         input_w=int(edge.shape[3]),
@@ -863,8 +1351,8 @@ def _lt_rotation_stats(edge: EdgeInfo, layout: LayoutState) -> dict[str, int]:
         output_w=int(edge.output_shape[3]),
         input_phys_h=int(input_phys_h),
         input_phys_w=int(input_phys_w),
-        output_phys_h=int(edge.output_fhe_shape[2]),
-        output_phys_w=int(edge.output_fhe_shape[3]),
+        output_phys_h=int(output_phys_h),
+        output_phys_w=int(output_phys_w),
         input_gap=int(layout.gap),
         output_gap=int(output_gap),
         alpha=int(layout.alpha),
@@ -878,36 +1366,76 @@ def _lt_rotation_stats(edge: EdgeInfo, layout: LayoutState) -> dict[str, int]:
         dilation_w=int(edge.dilation[1]),
         slots=int(edge.slots),
     )
+    if not groups:
+        return count_only
+
     input_multiplier, output_multiplier = _lt_channel_multipliers(edge)
-    one_channel_bsgs_groups = 0
-    one_channel_transforms = 0
-    one_channel_baby = 0
-    one_channel_giant = 0
-    one_channel_rotations = 0
-    for group in one_channel_groups:
-        cost = _shared_bsgs_group_cost(
-            group,
+    repeated = max(1, int(output_multiplier))
+    local_rotations = 0
+    local_baby = 0
+    local_giant = 0
+    transforms = 0
+    unfused_local = 0
+    local_programs = 0
+    rho_values: list[int] = []
+    for source_group in groups:
+        source_cost = _shared_bsgs_group_cost(
+            source_group,
             slots=int(edge.slots),
-            repeated_transform_count=int(output_multiplier),
+            repeated_transform_count=int(repeated),
         )
-        one_channel_bsgs_groups += 1
-        one_channel_transforms += int(cost["transforms"])
-        one_channel_baby += int(cost["baby_rotations"])
-        one_channel_giant += int(cost["giant_rotations"])
-        one_channel_rotations += int(cost["rotations"])
-    return {
-        "bsgs_groups": int(one_channel_bsgs_groups) * int(input_multiplier),
-        "transforms": int(one_channel_transforms) * int(input_multiplier),
-        "baby_rotations": int(one_channel_baby) * int(input_multiplier),
-        "giant_rotations": int(one_channel_giant) * int(input_multiplier),
-        "input_channel_multiplier": int(input_multiplier),
-        "output_channel_multiplier": int(output_multiplier),
-        "rotations": int(one_channel_rotations) * int(input_multiplier),
-    }
+        local_rotations += int(source_cost["rotations"])
+        local_baby += int(source_cost["baby_rotations"])
+        local_giant += int(source_cost["giant_rotations"])
+        transforms += int(source_cost["transforms"])
+        local_programs += int(len(source_group))
+        for diag_set in source_group:
+            single = _shared_bsgs_group_cost(
+                (diag_set,),
+                slots=int(edge.slots),
+                repeated_transform_count=1,
+            )
+            rho_values.append(int(single["rotations"]))
+            unfused_local += int(single["rotations"]) * int(repeated)
+
+    local_rotations *= max(1, int(input_multiplier))
+    local_baby *= max(1, int(input_multiplier))
+    local_giant *= max(1, int(input_multiplier))
+    transforms *= max(1, int(input_multiplier))
+    local_programs *= max(1, int(input_multiplier))
+    unfused_local *= max(1, int(input_multiplier))
+
+    input_cross = int(count_only.input_cross)
+    total_rotations = int(local_rotations + input_cross)
+    unfused = int(unfused_local + max(0, int(count_only.unfused_rotations) - int(count_only.local_submatrix)))
+    return RotationEstimate(
+        input_cross=int(input_cross),
+        local_submatrix=int(local_rotations),
+        output_materialize=int(count_only.output_materialize),
+        bsgs_groups=int(len(groups) * max(1, int(input_multiplier))),
+        transforms=int(transforms + int(count_only.recovery_programs) * int(repeated)),
+        baby_rotations=int(local_baby),
+        giant_rotations=int(local_giant),
+        input_channel_multiplier=int(input_multiplier),
+        output_channel_multiplier=int(output_multiplier),
+        local_programs=int(local_programs),
+        recovery_programs=int(count_only.recovery_programs),
+        rho_hat_per_program=int(max(rho_values) if rho_values else count_only.rho_hat_per_program),
+        unfused_rotations=int(unfused),
+        same_input_fusion_savings=int(max(0, int(unfused) - int(total_rotations))),
+        estimator=LAYOUT_ESTIMATOR_TEMPLATE,
+    )
 
 
-def _lt_rotations(edge: EdgeInfo, layout: LayoutState) -> int:
-    return int(_lt_rotation_stats(edge, layout)["rotations"])
+def _lt_rotation_stats(edge: EdgeInfo, layout: LayoutState, *, estimator: str | None = None) -> dict[str, int]:
+    mode = _normalize_layout_estimator(estimator)
+    if mode == LAYOUT_ESTIMATOR_TEMPLATE:
+        return _template_rotation_estimate(edge, layout).to_lt_stats()
+    return _count_only_rotation_estimate(edge, layout).to_lt_stats()
+
+
+def _lt_rotations(edge: EdgeInfo, layout: LayoutState, *, estimator: str | None = None) -> int:
+    return int(_lt_rotation_stats(edge, layout, estimator=estimator)["rotations"])
 
 
 def _relayout_halo_side_count(layout: LayoutState) -> int:
@@ -997,24 +1525,82 @@ def _node_layout_row(
     relayout: bool,
     reason: str,
     producer_materialized_halo: bool = False,
+    producer_materialized_halo_reason: str | None = None,
+    producer_fused_rotation_estimate: int = 0,
+    physical_layout: str | None = None,
     shape: Sequence[int] | None = None,
     fhe_shape: Sequence[int] | None = None,
 ) -> dict[str, Any]:
+    if physical_layout is None:
+        physical_layout = PHYSICAL_LOGICAL_HALO if int(layout.alpha) > 0 or int(layout.beta) > 0 else PHYSICAL_COMPACT
     return {
         "node": str(node),
         "shape": [] if shape is None else [int(value) for value in shape],
         "fhe_shape": [] if fhe_shape is None else [int(value) for value in fhe_shape],
         "selected_layout": layout.to_dict(),
+        "physical_layout": str(physical_layout),
         "compact_layout": {} if compact is None else compact.to_dict(),
         "output_relayout": bool(relayout),
         "output_relayout_reason": str(reason) if bool(relayout) else "",
         "producer_materialized_halo": bool(producer_materialized_halo),
         "producer_materialized_halo_reason": (
-            str(reason) if bool(producer_materialized_halo) else ""
+            str(producer_materialized_halo_reason if producer_materialized_halo_reason is not None else reason)
+            if bool(producer_materialized_halo)
+            else ""
         ),
+        "producer_fused_rotation_estimate": int(producer_fused_rotation_estimate),
+        "producer_fused_depth_estimate": 0,
         "relayout_rotation_estimate": int(_relayout_rotations((layout,)) if bool(relayout) else 0),
         "relayout_mask_mult_estimate": int(_relayout_mask_mults((layout,)) if bool(relayout) else 0),
         "relayout_depth_estimate": int(_relayout_depth_units((layout,)) if bool(relayout) else 0),
+    }
+
+
+def _producer_fused_materialization_estimate(
+    module: Any | None,
+    *,
+    incoming: Sequence[EdgeInfo],
+    incoming_rows: Sequence[dict[str, Any]],
+    outgoing: Sequence[EdgeInfo],
+    output_layout: LayoutState | None,
+    slots: int,
+) -> dict[str, Any]:
+    if output_layout is None or not incoming or not incoming_rows or not outgoing:
+        return {"enabled": False, "rotation_count": 0}
+    if not _producer_fused_output_allowed(module):
+        return {"enabled": False, "rotation_count": 0}
+    if int(output_layout.alpha) == 0 and int(output_layout.beta) == 0:
+        return {"enabled": False, "rotation_count": 0}
+    semantic = _operator_semantic_output_layout(
+        module,
+        LayoutState(**dict(incoming_rows[0]["selected_layout"])),
+        outgoing[0],
+        slots=int(slots),
+    )
+    grows_halo = (
+        int(output_layout.gap) == int(semantic.gap)
+        and (
+            int(output_layout.alpha) > int(semantic.alpha)
+            or int(output_layout.beta) > int(semantic.beta)
+        )
+    )
+    if not bool(grows_halo):
+        return {"enabled": False, "rotation_count": 0}
+    fused_rotation_estimate = 0
+    compact_rotation_estimate = 0
+    output_edge_cache: dict[str, EdgeInfo] = {}
+    for edge in incoming:
+        output_edge_cache[str(edge.edge_id)] = _edge_with_output_layout(edge, output_layout)
+    for row in incoming_rows:
+        edge = next((item for item in incoming if str(item.edge_id) == str(row.get("edge", ""))), None)
+        if edge is None:
+            continue
+        input_layout = LayoutState(**dict(row["selected_layout"]))
+        compact_rotation_estimate += int(row.get("lt_bsgs_rotation_estimate", _lt_rotations(edge, input_layout)) or 0)
+        fused_rotation_estimate += _lt_rotations(output_edge_cache[str(edge.edge_id)], input_layout)
+    return {
+        "enabled": True,
+        "rotation_count": int(max(0, int(fused_rotation_estimate) - int(compact_rotation_estimate))),
     }
 
 
@@ -1133,6 +1719,22 @@ def _finalize_policy(
     relayout_depth_estimate = int(
         sum(int(row.get("relayout_depth_estimate", 0) or 0) for row in edge_relayout_rows)
     )
+    producer_fused_rows = [
+        row
+        for row in node_layouts
+        if bool(row.get("producer_materialized_halo", False))
+    ]
+    producer_fused_rotation_estimate = int(
+        sum(int(row.get("producer_fused_rotation_estimate", 0) or 0) for row in producer_fused_rows)
+    )
+    consumer_fused_rows = [
+        row
+        for row in edge_rows
+        if bool(row.get("consumer_fused_relayout", False))
+    ]
+    consumer_fused_rotation_estimate = int(
+        sum(int(row.get("consumer_fused_rotation_estimate", 0) or 0) for row in consumer_fused_rows)
+    )
     add_relayout_depth_estimate = int(
         sum(
             int(row.get("relayout_depth_estimate", 0) or 0)
@@ -1152,6 +1754,7 @@ def _finalize_policy(
                 float(relayout_rotation_estimate)
                 + float(relayout_mask_mult_estimate)
                 + float(relayout_depth_estimate) * 64.0
+                + float(producer_fused_rotation_estimate)
                 + float(lt_rotation_estimate)
                 + float(halo_slots) / BOOTSTRAP_HALO_SLOT_DIVISOR
                 + float(tile_count)
@@ -1167,6 +1770,7 @@ def _finalize_policy(
         + float(halo_slots) * HALO_SLOT_WEIGHT
         + float(tile_count) * TILE_WEIGHT
         + float(relayout_depth_estimate) * RELAYOUT_DEPTH_WEIGHT
+        + float(producer_fused_rotation_estimate) * LT_ROTATION_WEIGHT
         + float(add_relayout_depth_estimate) * ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT
         + float(relayout_bootstrap_ct_pressure) * RELAYOUT_BOOTSTRAP_CT_WEIGHT
         + float(bootstrap_proxy) * BOOTSTRAP_PROXY_WEIGHT
@@ -1182,6 +1786,10 @@ def _finalize_policy(
         relayout_rotation_estimate=int(relayout_rotation_estimate),
         relayout_mask_mult_estimate=int(relayout_mask_mult_estimate),
         relayout_depth_estimate=int(relayout_depth_estimate),
+        producer_fused_materialization_count=int(len(producer_fused_rows)),
+        producer_fused_rotation_estimate=int(producer_fused_rotation_estimate),
+        consumer_fused_relayout_count=int(len(consumer_fused_rows)),
+        consumer_fused_rotation_estimate=int(consumer_fused_rotation_estimate),
         lt_bsgs_rotation_estimate=int(lt_rotation_estimate),
         compact_fallback_penalty_estimate=int(compact_fallback_penalty_estimate),
         bootstrap_proxy=int(bootstrap_proxy),
@@ -1490,6 +2098,7 @@ def _source_candidate_rows(edges: Sequence[EdgeInfo], layouts: Sequence[LayoutSt
 class _FrontierState:
     score: float
     live_layouts: tuple[tuple[str, LayoutState], ...]
+    live_physical_layouts: tuple[tuple[str, str], ...]
     edge_rows: tuple[dict[str, Any], ...]
     relayout_layouts: tuple[LayoutState, ...]
     node_layouts: tuple[dict[str, Any], ...] = ()
@@ -1497,18 +2106,33 @@ class _FrontierState:
     def live_dict(self) -> dict[str, LayoutState]:
         return {str(node): layout for node, layout in self.live_layouts}
 
+    def physical_dict(self) -> dict[str, str]:
+        return {str(node): str(physical) for node, physical in self.live_physical_layouts}
 
-def _frontier_key(live: dict[str, LayoutState]) -> tuple[tuple[str, tuple[int, int, int, int]], ...]:
-    return tuple(sorted((str(node), layout.key()) for node, layout in live.items()))
+
+def _frontier_key(
+    live: dict[str, LayoutState],
+    physical: dict[str, str],
+) -> tuple[tuple[str, tuple[int, int, int, int], str], ...]:
+    return tuple(
+        sorted(
+            (str(node), layout.key(), str(physical.get(str(node), PHYSICAL_COMPACT)))
+            for node, layout in live.items()
+        )
+    )
 
 
 def _frontier_live_items(live: dict[str, LayoutState]) -> tuple[tuple[str, LayoutState], ...]:
     return tuple(sorted(((str(node), layout) for node, layout in live.items()), key=lambda item: item[0]))
 
 
+def _frontier_physical_items(physical: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted(((str(node), str(value)) for node, value in physical.items()), key=lambda item: item[0]))
+
+
 def _prune_dp_frontier(
-    states: dict[tuple[tuple[str, tuple[int, int, int, int]], ...], _FrontierState],
-) -> dict[tuple[tuple[str, tuple[int, int, int, int]], ...], _FrontierState]:
+    states: dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState],
+) -> dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState]:
     if len(states) <= int(DP_FRONTIER_STATE_LIMIT):
         return states
     ranked = sorted(
@@ -1609,6 +2233,63 @@ def _source_layout_candidates(edges: Sequence[EdgeInfo], *, global_alpha: int, g
     return _dedupe_layouts((edge.compact, local_need, capacity_fill, capacity_safe, fixed_like, fixed_capacity_fill))
 
 
+def _operator_semantic_output_layout(
+    module: Any | None,
+    source_layout: LayoutState,
+    edge: EdgeInfo,
+    *,
+    slots: int,
+) -> LayoutState:
+    if isinstance(module, ConvTranspose2d):
+        scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
+        alpha = int(source_layout.alpha)
+        beta = int(source_layout.beta) * int(scale)
+    elif isinstance(module, AvgPool2d):
+        stride_pair = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
+        kernel_pair = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
+        stride = max(1, int(stride_pair[0]))
+        consume = max(0, int(kernel_pair[0]) - int(stride_pair[0]))
+        alpha = int(source_layout.alpha)
+        beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
+    elif isinstance(module, Conv2d):
+        stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
+        consume = _conv_halo_consume(module)
+        alpha = int(source_layout.alpha)
+        beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
+    else:
+        alpha = int(source_layout.alpha)
+        beta = int(source_layout.beta)
+    return _layout_for_shape(
+        shape=edge.shape,
+        gap=int(edge.compact.gap),
+        alpha=int(alpha),
+        beta=int(beta),
+        stride=max(1, int(source_layout.stride)),
+        slots=int(slots),
+    )
+
+
+def _producer_fused_output_allowed(module: Any | None) -> bool:
+    return isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d))
+
+
+def _producer_fused_output_layout_candidates(
+    module: Any | None,
+    *,
+    outgoing: Sequence[EdgeInfo],
+    slots: int,
+) -> tuple[LayoutState, ...]:
+    if not outgoing or not _producer_fused_output_allowed(module):
+        return ()
+    edge = outgoing[0]
+    layouts: list[LayoutState] = []
+    local_need = _max_layout(outgoing, slots=int(slots))
+    if int(local_need.alpha) > 0 or int(local_need.beta) > 0:
+        layouts.append(local_need)
+        layouts.append(_fill_beta_to_tile_capacity(local_need, shape=edge.shape, slots=int(slots)))
+    return _dedupe_layouts(layouts)
+
+
 def _tconv_output_layout_candidates(
     module: Any | None,
     *,
@@ -1619,24 +2300,21 @@ def _tconv_output_layout_candidates(
     if not outgoing:
         return ()
     edge = outgoing[0]
-    scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
     layouts: list[LayoutState] = []
     for row in incoming_rows:
         source_layout = LayoutState(**dict(row["selected_layout"]))
         layouts.append(
-            _layout_for_shape(
-                shape=edge.shape,
-                gap=int(edge.compact.gap),
-                alpha=int(source_layout.alpha),
-                beta=int(source_layout.beta) * int(scale),
-                stride=max(1, int(source_layout.stride)),
+            _operator_semantic_output_layout(
+                module,
+                source_layout,
+                edge,
                 slots=int(slots),
             )
         )
-    # ConvTranspose2d can either propagate the upsampled halo directly, or
-    # write the native compact output and let a later consumer/add join
-    # materialize halo only if it is still needed.
+    # ConvTranspose2d can either propagate the upsampled halo directly, write
+    # compact output, or fuse a producer-side output re-layout into the same LT.
     layouts.append(edge.compact)
+    layouts.extend(_producer_fused_output_layout_candidates(module, outgoing=outgoing, slots=int(slots)))
     return _dedupe_layouts(layouts)
 
 
@@ -1653,32 +2331,11 @@ def _operator_output_layout_candidates(
     layouts: list[LayoutState] = []
     for row in incoming_rows:
         source_layout = LayoutState(**dict(row["selected_layout"]))
-        if isinstance(module, ConvTranspose2d):
-            scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
-            alpha = int(source_layout.alpha)
-            beta = int(source_layout.beta) * int(scale)
-        elif isinstance(module, AvgPool2d):
-            stride_pair = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
-            kernel_pair = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
-            stride = max(1, int(stride_pair[0]))
-            consume = max(0, int(kernel_pair[0]) - int(stride_pair[0]))
-            alpha = int(source_layout.alpha)
-            beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
-        elif isinstance(module, Conv2d):
-            stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
-            consume = _conv_halo_consume(module)
-            alpha = int(source_layout.alpha)
-            beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
-        else:
-            alpha = int(source_layout.alpha)
-            beta = int(source_layout.beta)
         layouts.append(
-            _layout_for_shape(
-                shape=edge.shape,
-                gap=int(edge.compact.gap),
-                alpha=int(alpha),
-                beta=int(beta),
-                stride=max(1, int(source_layout.stride)),
+            _operator_semantic_output_layout(
+                module,
+                source_layout,
+                edge,
                 slots=int(slots),
             )
         )
@@ -1688,6 +2345,7 @@ def _operator_output_layout_candidates(
         for row in incoming_rows
     ):
         layouts.append(edge.compact)
+    layouts.extend(_producer_fused_output_layout_candidates(module, outgoing=outgoing, slots=int(slots)))
     return _dedupe_layouts(layouts)
 
 
@@ -1727,6 +2385,23 @@ def _dp_output_layout_candidates(
         outgoing=outgoing,
         slots=int(slots),
     )
+
+
+def _output_physical_layout(
+    module: Any | None,
+    *,
+    incoming_rows: Sequence[dict[str, Any]],
+    output_layout: LayoutState,
+    producer_fused: dict[str, Any],
+) -> str:
+    if int(output_layout.alpha) == 0 and int(output_layout.beta) == 0:
+        return PHYSICAL_COMPACT
+    if bool(producer_fused.get("enabled", False)):
+        return PHYSICAL_LOGICAL_HALO
+    if isinstance(module, Conv2d) and not isinstance(module, ConvTranspose2d):
+        if any(str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE for row in incoming_rows):
+            return PHYSICAL_NATIVE_SOURCE_STRIPE
+    return PHYSICAL_LOGICAL_HALO
 
 
 def _native_operator_output_layout(module: Any | None) -> bool:
@@ -1776,11 +2451,45 @@ def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tu
 def _compact_align_shared_allowed(edge: EdgeInfo, source_layout: LayoutState) -> bool:
     if str(edge.op_kind) != "conv2d":
         return False
-    if source_layout.covers(edge.requirement):
+    if str(edge.source) == "x":
+        return False
+    return int(source_layout.gap) == int(edge.requirement.gap)
+
+
+def _conv_native_stripe_candidate_allowed(edge: EdgeInfo, source_layout: LayoutState) -> bool:
+    if str(edge.op_kind) != "conv2d":
         return False
     if int(edge.requirement.alpha) == 0 and int(edge.requirement.beta) == 0:
         return False
+    if not source_layout.covers(edge.requirement):
+        return False
     return int(source_layout.gap) == int(edge.requirement.gap)
+
+
+def _compact_halo_shared_allowed(edge: EdgeInfo, source_layout: LayoutState, source_physical: str) -> bool:
+    if str(edge.op_kind) != "conv2d":
+        return False
+    if str(edge.source) == "x":
+        return False
+    if str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE:
+        return False
+    if not source_layout.covers(edge.requirement):
+        return False
+    return int(source_layout.gap) == int(edge.requirement.gap)
+
+
+def _consumer_fused_extra_rotation(edge: EdgeInfo, fused_layout: LayoutState) -> int:
+    """Extra LT rotations paid by fusing boundary exchange into the consumer.
+
+    The row's ``lt_bsgs_rotation_estimate`` stores the actual fused LT cost.
+    This helper records only the increment relative to the native-halo
+    requirement so diagnostics can explain why a depth-free fused candidate is
+    not rotation-free.
+    """
+
+    fused = int(_lt_rotations(edge, fused_layout))
+    native = int(_lt_rotations(edge, edge.requirement))
+    return int(max(0, fused - native))
 
 
 def _compact_align_shared_penalty(edge: EdgeInfo, source_layout: LayoutState) -> int:
@@ -1790,37 +2499,80 @@ def _compact_align_shared_penalty(edge: EdgeInfo, source_layout: LayoutState) ->
     return int(max(0, source_cost - requirement_cost) + halo_sides)
 
 
-def _incoming_non_add_options(
+def _physical_for_candidate(layout: LayoutState, *, layout_mode: str, fallback: str | None = None) -> str:
+    if fallback is not None:
+        return str(fallback)
+    if str(layout_mode) == "native_halo_stripe":
+        return PHYSICAL_NATIVE_SOURCE_STRIPE
+    if int(layout.alpha) > 0 or int(layout.beta) > 0:
+        return PHYSICAL_LOGICAL_HALO
+    return PHYSICAL_COMPACT
+
+
+def enumerate_execution_candidates(
     edge: EdgeInfo,
     source_layout: LayoutState,
     *,
+    source_physical: str = PHYSICAL_COMPACT,
     global_alpha: int,
     global_beta: int,
     slots: int,
-) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
-    options: list[tuple[list[dict[str, Any]], list[LayoutState]]] = []
+) -> tuple[ExecutionCandidate, ...]:
+    """Enumerate input-layout execution choices for one non-Add edge.
+
+    This is intentionally separated from cost estimation: the enumerator only
+    describes which logical/physical layout transition is being considered.
+    ``estimate_candidate_cost`` owns the rotation, relayout, and fusion cost.
+    """
+
+    candidates: list[ExecutionCandidate] = []
     if source_layout.covers(edge.requirement):
         selected_layout = _layout_with_stride(
             source_layout,
             max(int(source_layout.stride), int(edge.requirement.stride)),
         )
-        options.append(
-            (
-                [
-                    _edge_row(
-                        edge,
-                        selected_layout,
-                        relayout=False,
-                        relayout_reason="",
-                        lt_rotations=_lt_rotations(edge, selected_layout),
+        if _conv_native_stripe_candidate_allowed(edge, source_layout):
+            native_relayout = bool(
+                str(edge.source) != "x" and str(source_physical) != PHYSICAL_NATIVE_SOURCE_STRIPE
+            )
+            candidates.append(
+                ExecutionCandidate(
+                    edge=edge,
+                    source_layout=source_layout,
+                    target_layout=selected_layout,
+                    source_physical=str(source_physical),
+                    target_physical=PHYSICAL_NATIVE_SOURCE_STRIPE,
+                    layout_mode="native_halo_stripe",
+                    relayout=bool(native_relayout),
+                    relayout_reason="dp_native_source_stripe_relayout" if bool(native_relayout) else "",
+                )
+            )
+            if _compact_halo_shared_allowed(edge, source_layout, str(source_physical)):
+                candidates.append(
+                    ExecutionCandidate(
+                        edge=edge,
                         source_layout=source_layout,
+                        target_layout=selected_layout,
+                        source_physical=str(source_physical),
+                        target_physical=PHYSICAL_LOGICAL_HALO,
+                        layout_mode="compact_halo_shared",
+                        compact_fallback_penalty_estimate=0,
+                        consumer_fused_relayout=True,
+                        consumer_fused_rotation_estimate=_consumer_fused_extra_rotation(edge, selected_layout),
                     )
-                ],
-                [],
-            ),
-        )
+                )
+        else:
+            candidates.append(
+                ExecutionCandidate(
+                    edge=edge,
+                    source_layout=source_layout,
+                    target_layout=selected_layout,
+                    source_physical=str(source_physical),
+                    target_physical=str(source_physical),
+                )
+            )
     if str(edge.source) == "x":
-        return tuple(options)
+        return tuple(candidates)
     if source_layout.covers(edge.requirement):
         relayout_candidates = _future_tconv_input_relayout_candidates(edge, slots=int(slots))
     else:
@@ -1833,19 +2585,17 @@ def _incoming_non_add_options(
     for layout in relayout_candidates:
         if source_layout.covers(layout) and _same_physical_layout(source_layout, layout):
             continue
-        options.append(
-            (
-                [
-                    _edge_row(
-                        edge,
-                        layout,
-                        relayout=True,
-                        relayout_reason="dp_state_consumer_relayout",
-                        lt_rotations=_lt_rotations(edge, layout),
-                        source_layout=source_layout,
-                    )
-                ],
-                [layout],
+        if str(edge.op_kind) == "conv2d" and _compact_align_shared_allowed(edge, source_layout):
+            continue
+        candidates.append(
+            ExecutionCandidate(
+                edge=edge,
+                source_layout=source_layout,
+                target_layout=layout,
+                source_physical=str(source_physical),
+                target_physical=_physical_for_candidate(layout, layout_mode="halo_local"),
+                relayout=True,
+                relayout_reason="dp_state_consumer_relayout",
             )
         )
     if _compact_align_shared_allowed(edge, source_layout):
@@ -1853,24 +2603,119 @@ def _incoming_non_add_options(
             source_layout,
             max(int(source_layout.stride), int(edge.requirement.stride)),
         )
-        options.append(
-            (
-                [
-                    _edge_row(
-                        edge,
-                        selected_layout,
-                        relayout=False,
-                        relayout_reason="",
-                        lt_rotations=_lt_rotations(edge, selected_layout),
-                        layout_mode="compact_align_shared",
-                        source_layout=source_layout,
-                        compact_fallback_penalty_estimate=_compact_align_shared_penalty(edge, selected_layout),
-                    )
-                ],
-                [],
+        candidates.append(
+            ExecutionCandidate(
+                edge=edge,
+                source_layout=source_layout,
+                target_layout=selected_layout,
+                source_physical=str(source_physical),
+                target_physical=(
+                    PHYSICAL_LOGICAL_HALO
+                    if int(selected_layout.alpha) > 0 or int(selected_layout.beta) > 0
+                    else PHYSICAL_COMPACT
+                ),
+                layout_mode="compact_align_shared",
+                compact_fallback_penalty_estimate=0,
+                consumer_fused_relayout=True,
+                consumer_fused_rotation_estimate=_consumer_fused_extra_rotation(edge, selected_layout),
             )
         )
-    return tuple(options)
+    return tuple(candidates)
+
+
+def estimate_candidate_cost(
+    candidate: ExecutionCandidate,
+    *,
+    estimator: str | None = None,
+) -> tuple[list[dict[str, Any]], list[LayoutState]]:
+    """Turn an execution candidate into planner rows and relayout accounting."""
+
+    target_physical = _physical_for_candidate(
+        candidate.target_layout,
+        layout_mode=str(candidate.layout_mode),
+        fallback=candidate.target_physical,
+    )
+    row = _edge_row(
+        candidate.edge,
+        candidate.target_layout,
+        relayout=bool(candidate.relayout),
+        relayout_reason=str(candidate.relayout_reason) if bool(candidate.relayout) else "",
+        layout_mode=str(candidate.layout_mode),
+        source_layout=candidate.source_layout,
+        physical_layout=str(target_physical),
+        compact_fallback_penalty_estimate=int(candidate.compact_fallback_penalty_estimate),
+        consumer_fused_relayout=bool(candidate.consumer_fused_relayout),
+        consumer_fused_rotation_estimate=int(candidate.consumer_fused_rotation_estimate),
+        estimator=estimator,
+    )
+    relayouts = [candidate.target_layout] if bool(candidate.relayout) else []
+    return [row], relayouts
+
+
+def _option_cost_for_refinement(rows: Sequence[dict[str, Any]], relayouts: Sequence[LayoutState]) -> float:
+    return float(_policy_linear_cost(rows, relayouts))
+
+
+def _candidate_needs_template_refinement(cost: float, best_cost: float) -> bool:
+    window = max(
+        float(LAYOUT_ESTIMATOR_AUTO_ABSOLUTE_WINDOW) * float(LT_ROTATION_WEIGHT),
+        abs(float(best_cost)) * float(LAYOUT_ESTIMATOR_AUTO_RELATIVE_WINDOW),
+    )
+    return float(cost) <= float(best_cost) + float(window)
+
+
+def _estimate_candidate_options(
+    candidates: Sequence[ExecutionCandidate],
+    *,
+    estimator: str | None = None,
+) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
+    mode = _normalize_layout_estimator(estimator)
+    counted = [
+        (
+            candidate,
+            *estimate_candidate_cost(candidate, estimator=LAYOUT_ESTIMATOR_COUNT_ONLY),
+        )
+        for candidate in candidates
+    ]
+    if mode == LAYOUT_ESTIMATOR_COUNT_ONLY or not counted:
+        return tuple((rows, relayouts) for _candidate, rows, relayouts in counted)
+
+    if mode == LAYOUT_ESTIMATOR_TEMPLATE:
+        return tuple(
+            estimate_candidate_cost(candidate, estimator=LAYOUT_ESTIMATOR_TEMPLATE)
+            for candidate, _rows, _relayouts in counted
+        )
+
+    costs = [_option_cost_for_refinement(rows, relayouts) for _candidate, rows, relayouts in counted]
+    best = min(costs) if costs else 0.0
+    refined: list[tuple[list[dict[str, Any]], list[LayoutState]]] = []
+    for (candidate, rows, relayouts), cost in zip(counted, costs, strict=True):
+        if _candidate_needs_template_refinement(float(cost), float(best)):
+            refined.append(estimate_candidate_cost(candidate, estimator=LAYOUT_ESTIMATOR_TEMPLATE))
+        else:
+            refined.append((rows, relayouts))
+    return tuple(refined)
+
+
+def _incoming_non_add_options(
+    edge: EdgeInfo,
+    source_layout: LayoutState,
+    *,
+    source_physical: str = PHYSICAL_COMPACT,
+    global_alpha: int,
+    global_beta: int,
+    slots: int,
+    estimator: str | None = None,
+) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
+    candidates = enumerate_execution_candidates(
+        edge,
+        source_layout,
+        source_physical=str(source_physical),
+        global_alpha=int(global_alpha),
+        global_beta=int(global_beta),
+        slots=int(slots),
+    )
+    return _estimate_candidate_options(candidates, estimator=estimator)
 
 
 def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutState]) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
@@ -1913,7 +2758,13 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
     return tuple(options)
 
 
-def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+def _plan_dp(
+    dag: NetworkDAG,
+    edges: Sequence[EdgeInfo],
+    *,
+    slots: int,
+    estimator: str | None = None,
+) -> PolicyPlan:
     edges_by_source: dict[str, list[EdgeInfo]] = {}
     edges_by_target: dict[str, list[EdgeInfo]] = {}
     for edge in edges:
@@ -1928,16 +2779,23 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
     global_alpha = max(int(edge.requirement.alpha) for edge in edges)
     global_beta = max(int(edge.requirement.beta) for edge in edges)
 
-    states: dict[tuple[tuple[str, tuple[int, int, int, int]], ...], _FrontierState] = {
-        (): _FrontierState(score=0.0, live_layouts=(), edge_rows=(), relayout_layouts=())
+    states: dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState] = {
+        (): _FrontierState(
+            score=0.0,
+            live_layouts=(),
+            live_physical_layouts=(),
+            edge_rows=(),
+            relayout_layouts=(),
+        )
     }
     for node in topo:
         incoming = tuple(edges_by_target.get(str(node), ()))
         outgoing = tuple(edges_by_source.get(str(node), ()))
         node_index = int(topo_index[str(node)])
-        next_states: dict[tuple[tuple[str, tuple[int, int, int, int]], ...], _FrontierState] = {}
+        next_states: dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState] = {}
         for state in states.values():
             live = state.live_dict()
+            live_physical = state.physical_dict()
             if any(edge.source not in live for edge in incoming):
                 continue
             if incoming and type(dag.nodes[node].get("module")).__name__ == "Add":
@@ -1948,9 +2806,11 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                     edge_options = _incoming_non_add_options(
                         edge,
                         live[edge.source],
+                        source_physical=live_physical.get(str(edge.source), PHYSICAL_COMPACT),
                         global_alpha=int(global_alpha),
                         global_beta=int(global_beta),
                         slots=int(slots),
+                        estimator=estimator,
                     )
                     combined: list[tuple[list[dict[str, Any]], list[LayoutState]]] = []
                     for prefix_rows, prefix_relayouts in incoming_options_work:
@@ -1966,9 +2826,11 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
 
             for incoming_rows, incoming_relayouts in incoming_options:
                 next_live = dict(live)
+                next_physical = dict(live_physical)
                 for source in list(next_live):
                     if int(last_consumer_index.get(str(source), -1)) <= int(node_index):
                         next_live.pop(str(source), None)
+                        next_physical.pop(str(source), None)
                 module = dag.nodes[node].get("module")
                 output_candidates = _dp_output_layout_candidates(
                     module,
@@ -1987,6 +2849,14 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                     if output_layout is not None:
                         candidate_live[str(node)] = output_layout
                         compact = outgoing[0].compact if outgoing else None
+                        producer_fused = _producer_fused_materialization_estimate(
+                            module,
+                            incoming=incoming,
+                            incoming_rows=incoming_rows,
+                            outgoing=outgoing,
+                            output_layout=output_layout,
+                            slots=int(slots),
+                        )
                         output_relayout = (
                             compact is not None
                             and not _same_physical_layout(output_layout, compact)
@@ -1996,6 +2866,24 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                         )
                         if bool(output_relayout):
                             output_relayouts.append(output_layout)
+                        output_physical = _output_physical_layout(
+                            module,
+                            incoming_rows=incoming_rows,
+                            output_layout=output_layout,
+                            producer_fused=producer_fused,
+                        )
+                        candidate_storage = dict(next_physical)
+                        candidate_storage[str(node)] = str(output_physical)
+                        logical_halo_materialized = bool(
+                            str(output_physical) == PHYSICAL_LOGICAL_HALO
+                            and _producer_fused_output_allowed(module)
+                        )
+                        materialized_halo = bool(producer_fused["enabled"]) or bool(logical_halo_materialized)
+                        materialized_reason = (
+                            "dp_producer_materialized_halo"
+                            if bool(producer_fused["enabled"])
+                            else ("dp_logical_halo_materialized_output" if bool(logical_halo_materialized) else "")
+                        )
                         output_layout_rows.append(
                             _node_layout_row(
                                 str(node),
@@ -2003,11 +2891,17 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                                 compact,
                                 relayout=bool(output_relayout),
                                 reason="dp_producer_materialized_halo" if bool(output_relayout) else "",
-                                producer_materialized_halo=bool(output_relayout),
+                                producer_materialized_halo=bool(materialized_halo),
+                                producer_materialized_halo_reason=str(materialized_reason),
+                                producer_fused_rotation_estimate=int(producer_fused["rotation_count"]),
+                                physical_layout=str(output_physical),
                                 shape=outgoing[0].shape if outgoing else None,
                                 fhe_shape=outgoing[0].fhe_shape if outgoing else None,
                             )
                         )
+                    else:
+                        producer_fused = {"enabled": False, "rotation_count": 0}
+                        candidate_storage = dict(next_physical)
                     candidate_rows = tuple(list(state.edge_rows) + list(incoming_rows))
                     candidate_relayouts = tuple(
                         list(state.relayout_layouts)
@@ -2035,11 +2929,12 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                         float(state.score)
                         + _policy_linear_cost(incoming_rows, incoming_relayouts)
                         + float(output_footprint_cost)
+                        + float(int(producer_fused["rotation_count"])) * LT_ROTATION_WEIGHT
                         + float(sum(_relayout_linear_cost(layout) for layout in output_relayouts))
                         + float(_relayout_depth_units(output_relayouts) * RELAYOUT_DEPTH_WEIGHT)
                         + float(local_stack_depth) * RELAYOUT_NODE_STACK_DEPTH_WEIGHT
                     )
-                    key = _frontier_key(candidate_live)
+                    key = _frontier_key(candidate_live, candidate_storage)
                     existing = next_states.get(key)
                     if existing is None or (
                         candidate_score,
@@ -2053,6 +2948,7 @@ def _plan_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> Polic
                         next_states[key] = _FrontierState(
                             score=float(candidate_score),
                             live_layouts=_frontier_live_items(candidate_live),
+                            live_physical_layouts=_frontier_physical_items(candidate_storage),
                             edge_rows=candidate_rows,
                             relayout_layouts=candidate_relayouts,
                             node_layouts=tuple(output_layout_rows),
@@ -2116,7 +3012,14 @@ def _plan_source_local_dp(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: 
     return _finalize_policy(policy="dp", edge_rows=list(rows_by_edge.values()), relayout_layouts=selected_relayout_layouts)
 
 
-def plan_policy(dag: NetworkDAG, edges: Sequence[EdgeInfo], policy: str, *, slots: int = DEFAULT_SLOTS) -> PolicyPlan:
+def plan_policy(
+    dag: NetworkDAG,
+    edges: Sequence[EdgeInfo],
+    policy: str,
+    *,
+    slots: int = DEFAULT_SLOTS,
+    estimator: str | None = None,
+) -> PolicyPlan:
     normalized = normalize_policy(policy)
     if normalized == "fixed_max":
         return _plan_fixed_max(dag, edges, slots=int(slots))
@@ -2125,7 +3028,7 @@ def plan_policy(dag: NetworkDAG, edges: Sequence[EdgeInfo], policy: str, *, slot
     if normalized == "greedy":
         return _plan_greedy(dag, edges, slots=int(slots))
     if normalized == "dp":
-        return _plan_dp(dag, edges, slots=int(slots))
+        return _plan_dp(dag, edges, slots=int(slots), estimator=estimator)
     raise AssertionError(f"unreachable policy {policy!r}")
 
 
@@ -2134,9 +3037,10 @@ def build_layout_policy_compile_plan(
     *,
     policy: str = "dp",
     slots: int = DEFAULT_SLOTS,
+    estimator: str | None = None,
 ) -> dict[str, Any]:
     edges = build_edge_infos(dag, slots=int(slots))
-    plan = plan_policy(dag, edges, policy, slots=int(slots))
+    plan = plan_policy(dag, edges, policy, slots=int(slots), estimator=estimator)
     edge_layouts = [dict(row) for row in plan.edge_layouts]
     node_layouts = [dict(row) for row in plan.node_layouts]
     relayout_edges = [
@@ -2188,6 +3092,7 @@ def build_layout_policy_compile_plan(
         "policy_label": str(plan.policy_label),
         "metric_source": str(plan.metric_source),
         "slots": int(slots),
+        "layout_estimator": _normalize_layout_estimator(estimator),
         "edge_layout_count": int(len(edge_layouts)),
         "relayout_edge_count": int(len(relayout_edges)),
         "output_relayout_node_count": int(len(output_relayout_nodes)),
