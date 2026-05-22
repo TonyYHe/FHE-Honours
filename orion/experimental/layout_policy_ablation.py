@@ -996,6 +996,81 @@ def _representative_shift_indices_cached(
     return tuple(sorted(shifts))
 
 
+@lru_cache(maxsize=None)
+def _sampled_source_shift_sets_cached(
+    *,
+    op_kind: str,
+    input_h: int,
+    input_w: int,
+    output_h: int,
+    output_w: int,
+    input_phys_h: int,
+    input_phys_w: int,
+    output_phys_h: int,
+    output_phys_w: int,
+    input_gap: int,
+    output_gap: int,
+    alpha: int,
+    kernel_h: int,
+    kernel_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_h: int,
+    pad_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    slots: int,
+) -> tuple[tuple[int, ...], ...]:
+    samples_h = tuple(dict.fromkeys((0, max(0, int(input_h) // 2), max(0, int(input_h) - 1))))
+    samples_w = tuple(dict.fromkeys((0, max(0, int(input_w) // 2), max(0, int(input_w) - 1))))
+    out_samples_h = tuple(dict.fromkeys((0, max(0, int(output_h) // 2), max(0, int(output_h) - 1))))
+    out_samples_w = tuple(dict.fromkeys((0, max(0, int(output_w) // 2), max(0, int(output_w) - 1))))
+    by_source: dict[int, set[int]] = {}
+
+    def add_shift(in_h: int, in_w: int, out_h: int, out_w: int) -> None:
+        if not (0 <= int(in_h) < int(input_h) and 0 <= int(in_w) < int(input_w)):
+            return
+        if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
+            return
+        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
+        in_pw = int(in_w) * int(input_gap)
+        out_ph = int(out_h) * int(output_gap)
+        out_pw = int(out_w) * int(output_gap)
+        if not (0 <= int(in_ph) < int(input_phys_h) and 0 <= int(in_pw) < int(input_phys_w)):
+            return
+        if not (0 <= int(out_ph) < int(output_phys_h) and 0 <= int(out_pw) < int(output_phys_w)):
+            return
+        in_index = int(in_ph) * int(input_phys_w) + int(in_pw)
+        out_index = int(out_ph) * int(output_phys_w) + int(out_pw)
+        source_block, in_slot = _one_channel_block(in_index, slots=int(slots))
+        _out_block, out_slot = _one_channel_block(out_index, slots=int(slots))
+        shift = int((int(in_slot) - int(out_slot)) % int(slots))
+        if int(shift) != 0:
+            by_source.setdefault(int(source_block), set()).add(int(shift))
+
+    if str(op_kind) in {"conv2d", "avgpool2d"}:
+        for out_h in out_samples_h:
+            base_h = int(out_h) * int(stride_h) - int(pad_h)
+            for out_w in out_samples_w:
+                base_w = int(out_w) * int(stride_w) - int(pad_w)
+                for kernel_y in range(int(kernel_h)):
+                    in_h = int(base_h) + int(kernel_y) * int(dilation_h)
+                    for kernel_x in range(int(kernel_w)):
+                        in_w = int(base_w) + int(kernel_x) * int(dilation_w)
+                        add_shift(in_h, in_w, int(out_h), int(out_w))
+    elif str(op_kind) == "conv_transpose2d":
+        for in_h in samples_h:
+            base_h = int(in_h) * int(stride_h) - int(pad_h)
+            for in_w in samples_w:
+                base_w = int(in_w) * int(stride_w) - int(pad_w)
+                for kernel_y in range(int(kernel_h)):
+                    out_h = int(base_h) + int(kernel_y) * int(dilation_h)
+                    for kernel_x in range(int(kernel_w)):
+                        out_w = int(base_w) + int(kernel_x) * int(dilation_w)
+                        add_shift(int(in_h), int(in_w), int(out_h), int(out_w))
+    return tuple(tuple(sorted(shifts)) for _source, shifts in sorted(by_source.items()) if shifts)
+
+
 def _powers_of_two_below_slots(slots: int) -> tuple[int, ...]:
     values: list[int] = []
     n1 = 1
@@ -1186,11 +1261,35 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
     repeated = max(1, int(output_multiplier))
     adjacency_counts: tuple[int, ...] = ()
     shift_indices: tuple[int, ...] = ()
+    sampled_source_shift_sets: tuple[tuple[int, ...], ...] = ()
     if (
         str(edge.op_kind) in {"conv2d", "avgpool2d", "conv_transpose2d"}
         and _template_slot_mapping_count(edge) <= int(TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS)
     ):
         adjacency_counts = _one_channel_lt_adjacency_counts_cached(
+            op_kind=str(edge.op_kind),
+            input_h=int(edge.shape[2]),
+            input_w=int(edge.shape[3]),
+            output_h=int(edge.output_shape[2]),
+            output_w=int(edge.output_shape[3]),
+            input_phys_h=int(input_phys_h),
+            input_phys_w=int(input_phys_w),
+            output_phys_h=int(output_phys_h),
+            output_phys_w=int(output_phys_w),
+            input_gap=int(layout.gap),
+            output_gap=int(output_gap),
+            alpha=int(layout.alpha),
+            kernel_h=int(edge.kernel_size[0]),
+            kernel_w=int(edge.kernel_size[1]),
+            stride_h=int(edge.stride[0]),
+            stride_w=int(edge.stride[1]),
+            pad_h=int(edge.padding[0]),
+            pad_w=int(edge.padding[1]),
+            dilation_h=int(edge.dilation[0]),
+            dilation_w=int(edge.dilation[1]),
+            slots=int(edge.slots),
+        )
+        sampled_source_shift_sets = _sampled_source_shift_sets_cached(
             op_kind=str(edge.op_kind),
             input_h=int(edge.shape[2]),
             input_w=int(edge.shape[3]),
@@ -1244,7 +1343,35 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
     source_group_count_one_channel = int(len(adjacency_counts) if adjacency_counts else int(input_blocks))
     source_groups = int(source_group_count_one_channel * max(1, int(input_multiplier)))
     recovery_transforms_per_source = int(output_blocks * int(repeated))
-    if shift_indices:
+    if sampled_source_shift_sets:
+        local_rotations_one_channel = 0
+        local_baby_one_channel = 0
+        local_giant_one_channel = 0
+        for source_index, fanout in enumerate(adjacency_counts):
+            diag_set = sampled_source_shift_sets[min(int(source_index), len(sampled_source_shift_sets) - 1)]
+            cost = _shared_bsgs_group_cost(
+                (diag_set,),
+                slots=int(edge.slots),
+                repeated_transform_count=int(max(1, int(fanout)) * int(repeated)),
+            )
+            local_rotations_one_channel += int(cost["rotations"])
+            local_baby_one_channel += int(cost["baby_rotations"])
+            local_giant_one_channel += int(cost["giant_rotations"])
+        local_rotations = int(local_rotations_one_channel * max(1, int(input_multiplier)))
+        local_baby = int(local_baby_one_channel * max(1, int(input_multiplier)))
+        local_giant = int(local_giant_one_channel * max(1, int(input_multiplier)))
+        local_rho = int(
+            max(
+                (
+                    _shared_bsgs_group_cost((diag_set,), slots=int(edge.slots), repeated_transform_count=1)[
+                        "rotations"
+                    ]
+                    for diag_set in sampled_source_shift_sets
+                ),
+                default=int(local_rho),
+            )
+        )
+    elif shift_indices:
         local_rotations_one_channel = 0
         local_baby_one_channel = 0
         local_giant_one_channel = 0
@@ -2300,20 +2427,9 @@ def _tconv_output_layout_candidates(
     if not outgoing:
         return ()
     edge = outgoing[0]
-    layouts: list[LayoutState] = []
-    for row in incoming_rows:
-        source_layout = LayoutState(**dict(row["selected_layout"]))
-        layouts.append(
-            _operator_semantic_output_layout(
-                module,
-                source_layout,
-                edge,
-                slots=int(slots),
-            )
-        )
-    # ConvTranspose2d can either propagate the upsampled halo directly, write
-    # compact output, or fuse a producer-side output re-layout into the same LT.
-    layouts.append(edge.compact)
+    # DP treats ConvTranspose2d as writing compact output by default. A halo
+    # output remains available only as an explicit producer-fused candidate.
+    layouts: list[LayoutState] = [edge.compact]
     layouts.extend(_producer_fused_output_layout_candidates(module, outgoing=outgoing, slots=int(slots)))
     return _dedupe_layouts(layouts)
 
