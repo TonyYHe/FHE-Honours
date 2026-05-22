@@ -231,6 +231,7 @@ class PolicyPlan:
     consumer_fused_relayout_count: int
     consumer_fused_rotation_estimate: int
     lt_bsgs_rotation_estimate: int
+    planner_rotation_cost_estimate: int
     compact_fallback_penalty_estimate: int
     bootstrap_proxy: int
     objective: float
@@ -260,6 +261,7 @@ class PolicyPlan:
             "consumer_fused_relayout_count": int(self.consumer_fused_relayout_count),
             "consumer_fused_rotation_estimate": int(self.consumer_fused_rotation_estimate),
             "lt_bsgs_rotation_estimate": int(self.lt_bsgs_rotation_estimate),
+            "planner_rotation_cost_estimate": int(self.planner_rotation_cost_estimate),
             "compact_fallback_penalty_estimate": int(self.compact_fallback_penalty_estimate),
             "bootstrap_proxy": int(self.bootstrap_proxy),
             "bootstrap_count": "" if self.bootstrap_count is None else int(self.bootstrap_count),
@@ -678,6 +680,7 @@ def _edge_row(
     relayout: bool,
     relayout_reason: str,
     lt_rotations: int | None = None,
+    planner_rotation_cost: int | None = None,
     layout_mode: str = "halo_local",
     source_layout: LayoutState | None = None,
     physical_layout: str | None = None,
@@ -691,6 +694,8 @@ def _edge_row(
     lt_stats = _lt_rotation_stats(edge, layout, estimator=estimator)
     if lt_rotations is None:
         lt_rotations = int(lt_stats["rotations"])
+    if planner_rotation_cost is None:
+        planner_rotation_cost = int(lt_rotations)
     if physical_layout is None:
         physical_layout = (
             PHYSICAL_NATIVE_SOURCE_STRIPE
@@ -731,6 +736,7 @@ def _edge_row(
         "relayout_sparse_lt_estimate": int(relayout_estimate["sparse_lt_count"]),
         "relayout_depth_estimate": int(relayout_estimate["depth_estimate"]),
         "lt_bsgs_rotation_estimate": int(lt_rotations),
+        "planner_rotation_cost_estimate": int(planner_rotation_cost),
         "compact_fallback_penalty_estimate": int(compact_fallback_penalty_estimate),
         "lt_bsgs_group_count_estimate": int(lt_stats["bsgs_groups"]),
         "lt_transform_count_estimate": int(lt_stats["transforms"]),
@@ -1748,8 +1754,9 @@ def _halo_slot_tiebreak(edge_rows: Iterable[dict[str, Any]]) -> int:
 def _edge_linear_cost(row: dict[str, Any]) -> float:
     layout = dict(row["selected_layout"])
     halo_slots = max(0, int(layout["stored_slots"]) - int(layout["core_slots"]))
+    rotation_cost = int(row.get("planner_rotation_cost_estimate", row["lt_bsgs_rotation_estimate"]) or 0)
     return (
-        float(int(row["lt_bsgs_rotation_estimate"]) + int(row.get("compact_fallback_penalty_estimate", 0))) * LT_ROTATION_WEIGHT
+        float(int(rotation_cost) + int(row.get("compact_fallback_penalty_estimate", 0))) * LT_ROTATION_WEIGHT
         + float(halo_slots) * HALO_SLOT_WEIGHT
         + float(layout["tile_count"]) * TILE_WEIGHT
     )
@@ -1871,6 +1878,9 @@ def _finalize_policy(
     )
     relayout_bootstrap_ct_pressure = int(_relayout_bootstrap_ct_pressure(edge_relayout_rows))
     lt_rotation_estimate = int(sum(int(row["lt_bsgs_rotation_estimate"]) for row in edge_rows))
+    planner_rotation_cost_estimate = int(
+        sum(int(row.get("planner_rotation_cost_estimate", row["lt_bsgs_rotation_estimate"]) or 0) for row in edge_rows)
+    )
     compact_fallback_penalty_estimate = int(
         sum(int(row.get("compact_fallback_penalty_estimate", 0)) for row in edge_rows)
     )
@@ -1882,7 +1892,7 @@ def _finalize_policy(
                 + float(relayout_mask_mult_estimate)
                 + float(relayout_depth_estimate) * 64.0
                 + float(producer_fused_rotation_estimate)
-                + float(lt_rotation_estimate)
+                + float(planner_rotation_cost_estimate)
                 + float(halo_slots) / BOOTSTRAP_HALO_SLOT_DIVISOR
                 + float(tile_count)
             )
@@ -1893,7 +1903,7 @@ def _finalize_policy(
     objective = (
         float(relayout_rotation_estimate) * RELAYOUT_ROTATION_WEIGHT
         + float(relayout_mask_mult_estimate) * RELAYOUT_MASK_MULT_WEIGHT
-        + float(lt_rotation_estimate + compact_fallback_penalty_estimate) * LT_ROTATION_WEIGHT
+        + float(planner_rotation_cost_estimate + compact_fallback_penalty_estimate) * LT_ROTATION_WEIGHT
         + float(halo_slots) * HALO_SLOT_WEIGHT
         + float(tile_count) * TILE_WEIGHT
         + float(relayout_depth_estimate) * RELAYOUT_DEPTH_WEIGHT
@@ -1918,6 +1928,7 @@ def _finalize_policy(
         consumer_fused_relayout_count=int(len(consumer_fused_rows)),
         consumer_fused_rotation_estimate=int(consumer_fused_rotation_estimate),
         lt_bsgs_rotation_estimate=int(lt_rotation_estimate),
+        planner_rotation_cost_estimate=int(planner_rotation_cost_estimate),
         compact_fallback_penalty_estimate=int(compact_fallback_penalty_estimate),
         bootstrap_proxy=int(bootstrap_proxy),
         objective=float(objective),
@@ -2427,9 +2438,21 @@ def _tconv_output_layout_candidates(
     if not outgoing:
         return ()
     edge = outgoing[0]
-    # DP treats ConvTranspose2d as writing compact output by default. A halo
-    # output remains available only as an explicit producer-fused candidate.
-    layouts: list[LayoutState] = [edge.compact]
+    layouts: list[LayoutState] = []
+    for row in incoming_rows:
+        source_layout = LayoutState(**dict(row["selected_layout"]))
+        layouts.append(
+            _operator_semantic_output_layout(
+                module,
+                source_layout,
+                edge,
+                slots=int(slots),
+            )
+        )
+    # ConvTranspose2d may naturally propagate the input halo through stride-k
+    # placement, write compact output, or explicitly materialize additional
+    # halo beyond the natural output layout.
+    layouts.append(edge.compact)
     layouts.extend(_producer_fused_output_layout_candidates(module, outgoing=outgoing, slots=int(slots)))
     return _dedupe_layouts(layouts)
 
@@ -2608,6 +2631,68 @@ def _consumer_fused_extra_rotation(edge: EdgeInfo, fused_layout: LayoutState) ->
     return int(max(0, fused - native))
 
 
+def _provider_key_rotation_proxy(edge: EdgeInfo, layout: LayoutState) -> int:
+    if str(edge.op_kind) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
+        return int(_lt_rotations(edge, layout))
+    if edge.output_shape is None:
+        return int(_lt_rotations(edge, layout))
+    if _template_slot_mapping_count(edge) > int(TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS):
+        return int(_lt_rotations(edge, layout))
+
+    input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
+        clear_shape=edge.shape,
+        gap=int(layout.gap),
+        alpha=int(layout.alpha),
+        beta=int(layout.beta),
+    )
+    output_gap = _output_gap_for_edge(edge)
+    output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
+    output_phys_w = max(1, int(edge.output_shape[3]) * int(output_gap))
+    groups = _one_channel_lt_groups_cached(
+        op_kind=str(edge.op_kind),
+        input_h=int(edge.shape[2]),
+        input_w=int(edge.shape[3]),
+        output_h=int(edge.output_shape[2]),
+        output_w=int(edge.output_shape[3]),
+        input_phys_h=int(input_phys_h),
+        input_phys_w=int(input_phys_w),
+        output_phys_h=int(output_phys_h),
+        output_phys_w=int(output_phys_w),
+        input_gap=int(layout.gap),
+        output_gap=int(output_gap),
+        alpha=int(layout.alpha),
+        kernel_h=int(edge.kernel_size[0]),
+        kernel_w=int(edge.kernel_size[1]),
+        stride_h=int(edge.stride[0]),
+        stride_w=int(edge.stride[1]),
+        pad_h=int(edge.padding[0]),
+        pad_w=int(edge.padding[1]),
+        dilation_h=int(edge.dilation[0]),
+        dilation_w=int(edge.dilation[1]),
+        slots=int(edge.slots),
+    )
+    if not groups:
+        return 0
+    input_multiplier, _output_multiplier = _lt_channel_multipliers(edge)
+    rotations = 0
+    for group in groups:
+        cost = _shared_bsgs_group_cost(
+            group,
+            slots=int(edge.slots),
+            repeated_transform_count=1,
+        )
+        rotations += int(cost["rotations"])
+    return int(rotations * max(1, int(input_multiplier)))
+
+
+def _consumer_fused_planner_rotation_cost(edge: EdgeInfo, layout: LayoutState, *, layout_mode: str) -> int:
+    if str(layout_mode) == "compact_align_shared":
+        return int(_provider_key_rotation_proxy(edge, layout))
+    if str(layout_mode) == "compact_halo_shared":
+        return int(_provider_key_rotation_proxy(edge, layout))
+    return int(_lt_rotations(edge, layout))
+
+
 def _compact_align_shared_penalty(edge: EdgeInfo, source_layout: LayoutState) -> int:
     source_cost = int(_lt_rotations(edge, source_layout))
     requirement_cost = int(_lt_rotations(edge, edge.requirement))
@@ -2674,7 +2759,7 @@ def enumerate_execution_candidates(
                         layout_mode="compact_halo_shared",
                         compact_fallback_penalty_estimate=0,
                         consumer_fused_relayout=True,
-                        consumer_fused_rotation_estimate=_consumer_fused_extra_rotation(edge, selected_layout),
+                        consumer_fused_rotation_estimate=0,
                     )
                 )
         else:
@@ -2733,7 +2818,7 @@ def enumerate_execution_candidates(
                 layout_mode="compact_align_shared",
                 compact_fallback_penalty_estimate=0,
                 consumer_fused_relayout=True,
-                consumer_fused_rotation_estimate=_consumer_fused_extra_rotation(edge, selected_layout),
+                consumer_fused_rotation_estimate=0,
             )
         )
     return tuple(candidates)
@@ -2751,6 +2836,13 @@ def estimate_candidate_cost(
         layout_mode=str(candidate.layout_mode),
         fallback=candidate.target_physical,
     )
+    planner_rotation_cost: int | None = None
+    if bool(candidate.consumer_fused_relayout):
+        planner_rotation_cost = _consumer_fused_planner_rotation_cost(
+            candidate.edge,
+            candidate.target_layout,
+            layout_mode=str(candidate.layout_mode),
+        )
     row = _edge_row(
         candidate.edge,
         candidate.target_layout,
@@ -2762,6 +2854,7 @@ def estimate_candidate_cost(
         compact_fallback_penalty_estimate=int(candidate.compact_fallback_penalty_estimate),
         consumer_fused_relayout=bool(candidate.consumer_fused_relayout),
         consumer_fused_rotation_estimate=int(candidate.consumer_fused_rotation_estimate),
+        planner_rotation_cost=planner_rotation_cost,
         estimator=estimator,
     )
     relayouts = [candidate.target_layout] if bool(candidate.relayout) else []

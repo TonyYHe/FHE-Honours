@@ -4,6 +4,7 @@ import csv
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -38,8 +39,12 @@ from orion.experimental.u22_phase1 import (
     _layout_policy_runtime_compile_plan,
     collect_layout_policy_provider_pressure,
 )
-from orion.nn.linear import Conv2d
+from orion.core.auto_bootstrap import BootstrapSolver
+from orion.nn.activation import SiLU
+from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
+from orion.nn.operations import Add
+from orion.nn.pooling import AvgPool2d
 
 
 def _policy(payload: dict, name: str) -> dict:
@@ -97,6 +102,58 @@ def _init_python_scheme(provider_mode: str) -> None:
     scheme.init_scheme(config)
     Module.set_scheme(scheme)
     Module.set_margin(scheme.params.get_margin())
+
+
+def _init_long_python_scheme(provider_mode: str = "") -> None:
+    config = _runtime_config(backend="python", provider_mode=str(provider_mode), logn=16)
+    scheme.init_scheme(config)
+    Module.set_scheme(scheme)
+    Module.set_margin(scheme.params.get_margin())
+
+
+class OneDownOneUpUNet(Module):
+    def __init__(self, *, base_channels: int = 8, activation_degree: int = 7) -> None:
+        super().__init__()
+        base = int(base_channels)
+        self.enc = Conv2d(3, base, kernel_size=3, padding=1, bias=True)
+        self.enc_act = SiLU(degree=int(activation_degree))
+        self.pool = AvgPool2d(kernel_size=2, stride=2)
+        self.mid = Conv2d(base, base * 2, kernel_size=3, padding=1, bias=True)
+        self.mid_act = SiLU(degree=int(activation_degree))
+        self.up = ConvTranspose2d(base * 2, base, kernel_size=2, stride=2, bias=True)
+        self.add = Add()
+        self.dec = Conv2d(base, base, kernel_size=3, padding=1, bias=True)
+        self.dec_act = SiLU(degree=int(activation_degree))
+        self.out = Conv2d(base, 1, kernel_size=3, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip = self.enc_act(self.enc(x))
+        x = self.mid_act(self.mid(self.pool(skip)))
+        x = self.add(self.up(x), skip)
+        x = self.dec_act(self.dec(x))
+        return self.out(x)
+
+
+def _prepared_one_down_one_up_dag(*, image_size: int = 192, base_channels: int = 8) -> NetworkDAG:
+    torch.manual_seed(0)
+    model = OneDownOneUpUNet(base_channels=int(base_channels), activation_degree=7)
+    model.eval()
+    traced = OrionTracer().trace_model(model)
+    StatsTracker(traced).propagate(
+        torch.randn((1, 3, int(image_size), int(image_size)), dtype=torch.float32)
+    )
+    dag = NetworkDAG(traced)
+    dag.build_dag()
+    Module.set_margin(2)
+    for node in dag.nodes:
+        module = dag.nodes[node]["module"]
+        if module is not None and hasattr(module, "fit"):
+            module.fit()
+        if module is not None and hasattr(module, "init_orion_params"):
+            module.init_orion_params()
+        if module is not None and hasattr(module, "update_params"):
+            module.update_params()
+    return dag
 
 
 def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
@@ -175,7 +232,7 @@ def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> 
     payload = build_planner_ablation(network="u22_256_base32", policies=("dp",))
     dp = _policy(payload, "dp")
 
-    assert int(dp["compact_fallback_penalty_estimate"]) > 0
+    assert int(dp["compact_fallback_penalty_estimate"]) == 0
     fallback = [row for row in dp["edge_layouts"] if row.get("layout_mode") == "compact_global_fallback"]
     assert fallback == []
     uncovered = [
@@ -185,10 +242,26 @@ def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> 
         and not _layout_covers(row["selected_layout"], row["required_layout"])
     ]
     assert uncovered
-    assert all(row["op_kind"] == "conv2d" for row in uncovered)
-    assert all(row.get("layout_mode") == "compact_align_shared" for row in uncovered)
-    assert all(not bool(row.get("relayout", False)) for row in uncovered)
-    assert all(int(row.get("compact_fallback_penalty_estimate", 0)) > 0 for row in uncovered)
+    assert all(
+        bool(row.get("consumer_fused_relayout", False))
+        and row.get("layout_mode") in {"compact_align_shared", "compact_halo_shared"}
+        for row in uncovered
+    )
+    shared_rows = [
+        row
+        for row in dp["edge_layouts"]
+        if row.get("layout_mode") in {"compact_align_shared", "compact_halo_shared"}
+    ]
+    assert shared_rows
+    assert int(dp["consumer_fused_relayout_count"]) == len(shared_rows)
+    assert all(not bool(row.get("relayout", False)) for row in shared_rows)
+    native_conv_halo = [
+        row
+        for row in dp["edge_layouts"]
+        if row["op_kind"] == "conv2d" and row.get("layout_mode") == "native_halo_stripe"
+    ]
+    assert native_conv_halo
+    assert all(row.get("physical_layout") == "native_source_stripe" for row in native_conv_halo)
 
 
 def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() -> None:
@@ -253,14 +326,10 @@ def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None
         if isinstance(group.executor, LayoutPolicyProviderRuntimeExecutor) and group.executor.relayout_rows
     ]
     assert relayout_groups
-    native_groups = [group for group in relayout_groups if bool(group.plan.get("native_halo_provider", False))]
-    adapter_groups = [group for group in relayout_groups if not bool(group.plan.get("native_halo_provider", False))]
-    assert native_groups
-    assert all("relayout_kernel_depth_1" in group.boundary_actions for group in native_groups)
-    assert all(group.depth >= 2 for group in native_groups)
-    assert all(group.solver_depth == group.depth for group in native_groups)
-    assert all(group.effective_depth() == group.depth for group in native_groups)
-    assert not adapter_groups
+    assert all(any(str(action).startswith("relayout_kernel_depth_") for action in group.boundary_actions) for group in relayout_groups)
+    assert all(group.depth >= 2 for group in relayout_groups)
+    assert all(group.solver_depth == group.depth for group in relayout_groups)
+    assert all(group.effective_depth() == group.depth for group in relayout_groups)
     assert {
         type(group.executor.base_executor).__name__
         for group in registry.groups
@@ -413,6 +482,37 @@ def test_layout_policy_relayout_kernel_fills_and_roundtrips_compact_halo_layout(
         scheme.delete_scheme()
 
 
+def test_layout_policy_relayout_kernel_fuses_output_affine() -> None:
+    _init_python_scheme("")
+    try:
+        edge_row = {
+            "edge": "input->conv",
+            "source": "input",
+            "target": "conv",
+            "shape": [1, 1, 2, 3],
+            "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+        }
+        x = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3)
+        level = len(scheme.params.get_logq()) - 1
+        x_ct = scheme.encrypt(scheme.encode(x, level))
+        pad = LayoutPolicyRelayoutKernel(
+            edge_row=edge_row,
+            node="conv",
+            direction="compact_to_halo",
+            index=0,
+        )
+        pad.output_scale = 0.5
+        pad.output_bias = 1.25
+        pad.compile(scheme, level=int(level))
+        halo = pad.apply(x_ct).decrypt().decode().detach().cpu().to(dtype=torch.float32)
+        expected = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2) * 0.5 + 1.25
+
+        assert tuple(int(value) for value in halo.shape) == (1, 1, 4, 3)
+        assert float((halo - expected).abs().max().item()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()
+
+
 def test_layout_policy_relayout_kernel_maps_packed_gap_halo_rows_from_neighbors() -> None:
     edge_row = {
         "edge": "input->conv",
@@ -518,6 +618,160 @@ def test_layout_policy_add_runtime_materializes_common_halo_join() -> None:
         scheme.delete_scheme()
 
 
+def test_layout_policy_add_runtime_distributes_bootstrap_affine_over_relayout_inputs() -> None:
+    _init_python_scheme("")
+    try:
+        compact = {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1}
+        halo = {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1}
+        rows = [
+            {
+                "edge": f"{source}->add",
+                "source": source,
+                "target": "add",
+                "op_kind": "add",
+                "shape": [1, 1, 2, 3],
+                "source_layout": compact,
+                "selected_layout": halo,
+                "target_layout": halo,
+                "relayout": True,
+            }
+            for source in ("left", "right")
+        ]
+        runtime = LayoutPolicyAddRuntimeExecutor(
+            node="add",
+            compile_plan={"policy": "dp", "edge_layouts": rows},
+            input_sources=("left", "right"),
+        )
+        runtime._bootstrap_prescale_fusion = {"scale": 0.5, "bias": 1.25}
+        level = len(scheme.params.get_logq()) - 1
+        left = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3)
+        right = torch.full((1, 1, 2, 3), 10.0, dtype=torch.float32)
+        left_halo = torch.cat([left[:, :, :1, :], left, left[:, :, -1:, :]], dim=2)
+        right_halo = torch.cat([right[:, :, :1, :], right, right[:, :, -1:, :]], dim=2)
+
+        out = runtime(
+            scheme.encrypt(scheme.encode(left, level)),
+            scheme.encrypt(scheme.encode(right, level)),
+        )
+        decoded = out.decrypt().decode().detach().cpu().to(dtype=torch.float32)
+        expected = (left_halo + right_halo) * 0.5 + 1.25
+
+        assert runtime.bootstrap_prescale_fusion_capable() is True
+        assert runtime.last_runtime_io["bootstrap_prescale_fused"] is True
+        assert float((decoded - expected).abs().max().item()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()
+
+
+def test_layout_policy_provider_wrapper_fuses_bootstrap_affine_into_base_attrs() -> None:
+    module = SimpleNamespace(
+        on_weight=torch.ones((2, 3, 3, 3), dtype=torch.float32),
+        on_bias=torch.tensor([1.0, 2.0], dtype=torch.float32),
+    )
+    base_executor = SimpleNamespace(module=module)
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="conv",
+        compile_plan={"policy": "dp", "edge_layouts": []},
+    )
+    executor._bootstrap_prescale_fusion = {"scale": 0.25, "bias": 1.5}
+
+    def check_attrs():
+        assert torch.equal(module.on_weight, torch.full((2, 3, 3, 3), 0.25, dtype=torch.float32))
+        assert torch.equal(module.on_bias, torch.tensor([1.75, 2.0], dtype=torch.float32))
+        return "ok"
+
+    assert executor._with_base_module_attrs(check_attrs) == "ok"
+    assert torch.equal(module.on_weight, torch.ones((2, 3, 3, 3), dtype=torch.float32))
+    assert torch.equal(module.on_bias, torch.tensor([1.0, 2.0], dtype=torch.float32))
+
+
+def test_layout_policy_provider_runtime_shape_reflects_output_relayout() -> None:
+    module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
+    base_executor = SimpleNamespace(module=module)
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="conv",
+        compile_plan={
+            "policy": "dp",
+            "edge_layouts": [],
+            "node_layouts": [
+                {
+                    "node": "conv",
+                    "shape": [1, 1, 4, 4],
+                    "fhe_shape": [1, 1, 4, 4],
+                    "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    "output_relayout": True,
+                }
+            ],
+        },
+    )
+
+    assert tuple(int(value) for value in executor.runtime_fhe_output_shape()) == (1, 1, 6, 4)
+
+
+def test_layout_policy_provider_runtime_shape_reflects_fused_output_halo_without_input_halo() -> None:
+    module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
+    base_executor = SimpleNamespace(module=module, native_halo_output_capable=True)
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="pool",
+        compile_plan={
+            "policy": "dp",
+            "edge_layouts": [],
+            "node_layouts": [
+                {
+                    "node": "pool",
+                    "shape": [1, 1, 4, 4],
+                    "fhe_shape": [1, 1, 4, 4],
+                    "selected_layout": {"alpha": 0, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    "output_relayout": False,
+                    "producer_materialized_halo": True,
+                }
+            ],
+        },
+    )
+
+    assert tuple(int(value) for value in executor.runtime_fhe_output_shape()) == (1, 1, 5, 4)
+    assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
+
+
+def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
+    _init_python_scheme("")
+    try:
+        pool = AvgPool2d(kernel_size=2, stride=2, padding=0)
+        pool.init_orion_params()
+        pool.input_shape = torch.Size((1, 1, 4, 4))
+        pool.output_shape = torch.Size((1, 1, 2, 2))
+        pool.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        pool.fhe_output_shape = torch.Size((1, 1, 3, 2))
+        pool.input_gap = 1
+        pool.output_gap = 1
+        pool.layout_policy_output_layout = {"alpha": 0, "beta": 1, "gap": 1}
+        pool.layout_policy_output_materialization = "fused_relayout"
+        pool.update_params()
+        pool.set_level(len(scheme.params.get_logq()) - 1)
+
+        executor = InputPairConvRuntimeExecutor(
+            module=pool,
+            output_node_id="pool_fused_beta",
+            use_ct_pt_hybrid_packing=False,
+        )
+        x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+        out = executor(scheme.encrypt(scheme.encode(x, pool.level)))["pool_fused_beta"]
+        decoded = out.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+        observed = decoded.to(dtype=torch.float32).flatten()[:6].reshape(1, 1, 3, 2)
+        core = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+        expected = torch.cat([core, core[:, :, -1:, :]], dim=2)
+
+        assert tuple(int(value) for value in out.on_shape) == (1, 1, 3, 2)
+        assert float((observed - expected).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
 def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     dag = build_u22_dag(network_spec("u22_256_base32"))
     compile_plan = build_layout_policy_compile_plan(dag, policy="dp")
@@ -532,16 +786,34 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
         for row in compile_plan["edge_layouts"]
         if row.get("layout_mode") == "compact_align_shared"
     ]
+    compact_halo_shared = [
+        row
+        for row in compile_plan["edge_layouts"]
+        if row.get("layout_mode") == "compact_halo_shared"
+    ]
+    native_halo_stripe = [
+        row
+        for row in compile_plan["edge_layouts"]
+        if row.get("physical_layout") == "native_source_stripe"
+    ]
     assert int(compile_plan["relayout_edge_count"]) == 0
-    assert int(compile_plan["output_relayout_node_count"]) == len(producer_halo_nodes)
-    assert producer_halo_nodes == []
+    assert int(compile_plan["output_relayout_node_count"]) == 0
+    assert producer_halo_nodes
+    assert int(compile_plan["summary"]["producer_fused_materialization_count"]) == len(producer_halo_nodes)
+    assert int(compile_plan["summary"]["producer_fused_rotation_estimate"]) >= 0
     assert compact_align_shared
-    assert all(int(row.get("compact_fallback_penalty_estimate", 0)) > 0 for row in compact_align_shared)
-    relayout_edge_depth = sum(
-        1
-        for row in compile_plan["relayout_edges"]
-        if int(row["selected_layout"].get("alpha", 0)) > 0 or int(row["selected_layout"].get("beta", 0)) > 0
+    assert compact_halo_shared
+    assert int(compile_plan["summary"]["consumer_fused_relayout_count"]) == (
+        len(compact_align_shared) + len(compact_halo_shared)
     )
+    assert int(compile_plan["summary"]["consumer_fused_rotation_estimate"]) == sum(
+        int(row.get("consumer_fused_rotation_estimate", 0) or 0)
+        for row in [*compact_align_shared, *compact_halo_shared]
+    )
+    assert all(not bool(row["relayout"]) for row in [*compact_align_shared, *compact_halo_shared])
+    assert "x->enc1a" in {row["edge"] for row in native_halo_stripe}
+    assert int(compile_plan["summary"]["compact_fallback_penalty_estimate"]) == 0
+    relayout_edge_depth = sum(int(row["depth_estimate"]) for row in compile_plan["relayout_edges"])
     assert int(compile_plan["summary"]["relayout_depth_estimate"]) == int(relayout_edge_depth) + sum(
         int(row["depth_estimate"]) for row in compile_plan["output_relayout_nodes"]
     )
@@ -585,28 +857,114 @@ def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback
     node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
     edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
 
-    up3_layout = dict(node_rows["up3"]["selected_layout"])
-    up3_add = dict(edge_rows["up3->add3"])
-    assert int(up3_layout["alpha"]) > 0 or int(up3_layout["beta"]) > 0
-    assert bool(up3_add["relayout"]) is False
-
-    up2_layout = dict(node_rows["up2"]["selected_layout"])
-    up2_add = dict(edge_rows["up2->add2"])
-    assert int(up2_layout["alpha"]) > 0 or int(up2_layout["beta"]) > 0
-    assert bool(up2_add["relayout"]) is False
-
-    add2_dec = dict(edge_rows["add2->dec2a"])
-    assert add2_dec["layout_mode"] == "compact_align_shared"
-    assert bool(add2_dec["relayout"]) is False
-    assert int(add2_dec["selected_layout"]["alpha"]) > 0
-    assert int(add2_dec["selected_layout"]["beta"]) == 0
+    for up_node, add_edge, consumer_edge in (
+        ("up3", "up3->add3", "add3->dec3a"),
+        ("up2", "up2->add2", "add2->dec2a"),
+    ):
+        up_layout = dict(node_rows[up_node]["selected_layout"])
+        up_add = dict(edge_rows[add_edge])
+        add_dec = dict(edge_rows[consumer_edge])
+        assert bool(up_add["relayout"]) is False
+        if int(up_layout["alpha"]) > 0 or int(up_layout["beta"]) > 0:
+            assert int(up_layout["alpha"]) == 1
+            assert int(up_layout["beta"]) == 0
+            assert int(up_layout["stride"]) == 2
+            assert node_rows[up_node]["producer_materialized_halo_reason"] == "dp_logical_halo_materialized_output"
+            assert int(node_rows[up_node]["producer_fused_rotation_estimate"]) == 0
+        else:
+            assert int(up_layout["alpha"]) == 0
+            assert int(up_layout["beta"]) == 0
+            assert add_dec["layout_mode"] == "compact_align_shared"
+            assert add_dec["physical_layout"] == "packed_compact"
+            assert bool(add_dec["relayout"]) is False
+            assert bool(add_dec["consumer_fused_relayout"]) is True
 
     dec1a_layout = dict(node_rows["dec1a"]["selected_layout"])
     add1_dec = dict(edge_rows["add1->dec1a"])
     assert int(dec1a_layout["alpha"]) == 0
     assert int(dec1a_layout["beta"]) == 0
     assert add1_dec["layout_mode"] == "compact_align_shared"
+    assert add1_dec["physical_layout"] == "packed_compact"
     assert bool(add1_dec["relayout"]) is False
+    assert bool(add1_dec["consumer_fused_relayout"]) is True
+
+
+def test_one_down_one_up_silu_dp_fuses_relayout_without_bootstrap_growth() -> None:
+    _init_long_python_scheme("")
+    try:
+        greedy_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+        dp_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+        greedy_plan = build_layout_policy_compile_plan(greedy_dag, policy="greedy")
+        dp_plan = build_layout_policy_compile_plan(dp_dag, policy="dp")
+
+        assert int(dp_plan["summary"]["relayout_depth_estimate"]) == 0
+        assert int(dp_plan["summary"]["relayouts"]) == 0
+        assert int(dp_plan["summary"]["consumer_fused_relayout_count"]) > 0
+        assert int(dp_plan["summary"]["total_ciphertext_tiles"]) < int(
+            greedy_plan["summary"]["total_ciphertext_tiles"]
+        )
+
+        fused_rows = [
+            row
+            for row in dp_plan["edge_layouts"]
+            if bool(row.get("consumer_fused_relayout", False))
+        ]
+        assert fused_rows
+        assert all(not bool(row.get("relayout", False)) for row in fused_rows)
+        assert sum(int(row.get("consumer_fused_rotation_estimate", 0) or 0) for row in fused_rows) == int(
+            dp_plan["summary"]["consumer_fused_rotation_estimate"]
+        )
+
+        boot_counts: dict[str, int] = {}
+        for policy, dag in (("greedy", greedy_dag), ("dp", dp_dag)):
+            registry = U22CompileRegistry.for_dag(
+                dag,
+                allowed_nodes=None,
+                enable_conv_kernels=True,
+                layout_policy=str(policy),
+            )
+            audit = registry.attach_to_dag(dag)
+            dag.find_residuals()
+            _input_level, bootstraps, _slots = BootstrapSolver(
+                SimpleNamespace(),
+                dag,
+                l_eff=int(len(scheme.params.get_logq()) - 1),
+            ).solve()
+            boot_counts[str(policy)] = int(bootstraps)
+            if str(policy) == "dp":
+                assert int(audit["graph_audit"]["layout_policy_summary"]["relayout_depth_estimate"]) == 0
+                mid_executor = dag.nodes["mid"]["module"].region_runtime.executor
+                assert isinstance(mid_executor, LayoutPolicyProviderRuntimeExecutor)
+                assert mid_executor.compact_align_shared_rows
+                assert not mid_executor.relayout_rows
+
+        assert boot_counts["dp"] <= boot_counts["greedy"]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_layout_policy_provider_keeps_native_halo_for_compact_halo_local_conv() -> None:
+    _init_long_python_scheme("")
+    try:
+        dag = _prepared_one_down_one_up_dag(image_size=128, base_channels=8)
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=None,
+            enable_conv_kernels=True,
+            layout_policy="dp",
+        )
+        registry.attach_to_dag(dag)
+
+        executor = dag.nodes["enc"]["module"].region_runtime.executor
+        assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
+        assert not executor.native_input_rows
+        assert not executor.relayout_rows
+        assert type(executor.base_executor).__name__ == "HaloLocalConvRuntimeExecutor"
+        assert type(executor.base_executor.delegate).__name__ == "NativeHaloStripeNoRIConvExecutor"
+        assert executor.compact_source_rows
+        assert executor._runtime_lowering_label() == "provider_executable+compact_layout"
+    finally:
+        scheme.delete_scheme()
 
 
 def test_layout_policy_dp_plans_reduced_full_structure_r34_mock() -> None:
@@ -766,9 +1124,9 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
             },
         )
         executor.assigned_level = int(conv.level)
-        executor.assigned_depth = int(conv.depth)
+        executor.assigned_depth = 3
         x = torch.randn((1, 1, 4, 4), dtype=torch.float32)
-        x_height_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
+        x_height_halo = torch.cat([torch.zeros_like(x[:, :, :1, :]), x, torch.zeros_like(x[:, :, -1:, :])], dim=2)
         reference = torch.nn.functional.conv2d(x_height_halo, conv.weight, conv.bias, padding=(1, 1))
         x_ct = scheme.encrypt(scheme.encode(x, conv.level))
         out_ct = executor(x_ct)["conv"]
@@ -778,21 +1136,21 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
         assert executor.compile_count == 1
         assert executor.execute_count == 1
         assert base.compile_count == 1
-        assert executor.native_halo_input is True
+        assert executor.native_halo_input is False
         assert base.assigned_depth == 1
-        assert executor.last_runtime_io["runtime_lowering"] == "provider_executable+native_halo_layout"
+        assert executor.last_runtime_io["runtime_lowering"] == "provider_executable+native_halo_output_layout"
         assert executor.last_runtime_io["provider_executor"] == "InputPairConvRuntimeExecutor"
-        assert executor.last_runtime_io["native_halo_provider"] is True
-        assert executor.last_runtime_io["relayout_kernel_count"] == 1
+        assert executor.last_runtime_io["native_halo_provider"] is False
+        assert executor.last_runtime_io["relayout_kernel_count"] == 2
         assert tuple(int(value) for value in out_ct.on_shape) == (1, 1, 6, 4)
         assert tuple(int(value) for value in executor.runtime_fhe_output_shape()) == (1, 1, 6, 4)
         assert not hasattr(conv, "layout_policy_input_row_offset")
         assert not hasattr(conv, "layout_policy_output_row_offset")
         assert tuple(int(value) for value in base.fhe_output_shape) == (1, 1, 4, 4)
         metadata = executor.compile_cache_metadata()["layout_policy_wrapper"]
-        assert metadata["runtime_lowering"] == "provider_executable+native_halo_layout"
-        assert metadata["relayout_kernel_count"] == 1
-        assert metadata["native_halo_provider"] is True
+        assert metadata["runtime_lowering"] == "provider_executable+native_halo_output_layout"
+        assert metadata["relayout_kernel_count"] == 2
+        assert metadata["native_halo_provider"] is False
         group = RegionFirstRuntimeGroup(
             region_id="layout_policy_provider_conv",
             network="U22",
@@ -801,8 +1159,8 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
             conv_nodes=("conv",),
             strategy="layout_policy_provider",
             materializer="u22_input_pair_conv_shared_rotations",
-            depth=2,
-            solver_depth=2,
+            depth=3,
+            solver_depth=3,
             boundary_actions=("layout_policy_compile_plan",),
             expected_stats={},
             executable=True,
@@ -817,10 +1175,91 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
         )
         summary = pressure["summary"]
         assert summary["provider_region_count"] == 1
-        assert summary["native_halo_provider_region_count"] == 1
-        assert summary["relayout_kernel_count"] == 1
+        assert summary["native_halo_provider_region_count"] == 0
+        assert summary["relayout_kernel_count"] == 2
         assert summary["provider_input_block_cols"] >= summary["compact_input_block_cols"]
-        assert pressure["regions"][0]["runtime_lowering"] == "provider_executable+native_halo_layout"
+        assert pressure["regions"][0]["runtime_lowering"] == "provider_executable+native_halo_output_layout"
+    finally:
+        scheme.delete_scheme()
+
+
+def test_layout_policy_provider_wrapper_runs_consumer_fused_compact_align_shared_without_relayout() -> None:
+    torch.manual_seed(0)
+    _init_python_scheme("")
+    try:
+        conv = Conv2d(1, 1, kernel_size=3, padding=1, bias=True)
+        conv.weight.data.fill_(0.125)
+        conv.bias.data.fill_(0.25)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 1, 4, 4))
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "layout_policy_provider_consumer_fused_conv"
+        conv.set_level(len(scheme.params.get_logq()) - 1)
+        conv.set_depth(1)
+        base = InputPairConvRuntimeExecutor(
+            module=conv,
+            output_node_id="conv",
+            use_ct_pt_hybrid_packing=False,
+        )
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=base,
+            output_node_id="conv",
+            compile_plan={
+                "policy": "dp",
+                "edge_layouts": [
+                    {
+                        "edge": "input->conv",
+                        "source": "input",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+                        "source_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "layout_mode": "compact_align_shared",
+                        "physical_layout": "packed_compact",
+                        "relayout": False,
+                        "consumer_fused_relayout": True,
+                        "consumer_fused_rotation_estimate": 0,
+                    },
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1},
+                        "physical_layout": "packed_compact",
+                        "output_relayout": False,
+                    },
+                ],
+            },
+        )
+        executor.assigned_level = int(conv.level)
+        executor.assigned_depth = int(conv.depth)
+        x = torch.randn((1, 1, 4, 4), dtype=torch.float32)
+        reference = torch.nn.functional.conv2d(x, conv.weight, conv.bias, padding=(1, 1))
+        x_ct = scheme.encrypt(scheme.encode(x, conv.level))
+        out_ct = executor(x_ct)["conv"]
+        decoded = out_ct.decrypt().decode().detach().cpu().to(dtype=torch.float32)
+
+        assert float((decoded - reference).abs().max().item()) <= 1.0e-4
+        assert executor.compile_count == 1
+        assert executor.execute_count == 1
+        assert base.compile_count == 1
+        assert executor.compact_align_shared_rows
+        assert not executor.relayout_rows
+        assert not executor.native_physical_relayout_rows
+        assert executor.last_runtime_io["runtime_lowering"] == "provider_executable+compact_align_shared"
+        assert executor.last_runtime_io["relayout_kernel_count"] == 0
+        assert executor.last_runtime_io["compact_align_shared_edge_count"] == 1
+        assert tuple(int(value) for value in out_ct.on_shape) == (1, 1, 4, 4)
+        assert tuple(int(value) for value in executor.runtime_fhe_output_shape()) == (1, 1, 4, 4)
     finally:
         scheme.delete_scheme()
 
