@@ -25,6 +25,7 @@ DEFAULT_SLOTS = 32768
 RELAYOUT_ROTATION_WEIGHT = 6.0
 RELAYOUT_MASK_MULT_WEIGHT = 1.0
 LT_ROTATION_WEIGHT = 8.0
+LT_TRANSFORM_ROT_EQUIV = 4.0
 INPUT_CROSS_RECOVERY_ROTATION_MULTIPLIER = 2.0
 HALO_SLOT_WEIGHT = 0.02
 TILE_WEIGHT = 4.0
@@ -1755,8 +1756,14 @@ def _edge_linear_cost(row: dict[str, Any]) -> float:
     layout = dict(row["selected_layout"])
     halo_slots = max(0, int(layout["stored_slots"]) - int(layout["core_slots"]))
     rotation_cost = int(row.get("planner_rotation_cost_estimate", row["lt_bsgs_rotation_estimate"]) or 0)
+    transform_penalty = float(row.get("lt_transform_count_estimate", 0) or 0) * float(LT_TRANSFORM_ROT_EQUIV)
     return (
-        float(int(rotation_cost) + int(row.get("compact_fallback_penalty_estimate", 0))) * LT_ROTATION_WEIGHT
+        (
+            float(rotation_cost)
+            + float(transform_penalty)
+            + float(row.get("compact_fallback_penalty_estimate", 0) or 0)
+        )
+        * LT_ROTATION_WEIGHT
         + float(halo_slots) * HALO_SLOT_WEIGHT
         + float(layout["tile_count"]) * TILE_WEIGHT
     )
