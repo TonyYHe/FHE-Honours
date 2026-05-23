@@ -379,17 +379,31 @@ class NewEvaluator:
         return 0
 
     def _flatten_diagonals(self, diags):
-        diags_idxs, diags_data = [], []
-        for idx, diag in diags.items():
-            diags_idxs.append(int(idx))
-            if isinstance(diag, torch.Tensor):
-                values = diag.detach().cpu().reshape(-1).tolist()
-            elif isinstance(diag, np.ndarray):
-                values = diag.reshape(-1).tolist()
+        diag_indices = sorted(int(idx) for idx in diags.keys())
+        chunks: list[np.ndarray] = []
+        for idx in diag_indices:
+            if int(idx) in diags:
+                diag = diags[int(idx)]
+            elif str(int(idx)) in diags:
+                diag = diags[str(int(idx))]
             else:
-                values = list(diag)
-            diags_data.extend(float(value) for value in values)
-        return diags_idxs, diags_data
+                diag = next(value for key, value in diags.items() if int(key) == int(idx))
+            if isinstance(diag, torch.Tensor):
+                values = diag.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1)
+            elif isinstance(diag, np.ndarray):
+                values = np.asarray(diag, dtype=np.float32).reshape(-1)
+            else:
+                try:
+                    values = np.asarray(diag, dtype=np.float32).reshape(-1)
+                except TypeError:
+                    values = np.asarray(list(diag), dtype=np.float32).reshape(-1)
+            chunks.append(values)
+        diag_data = (
+            np.ascontiguousarray(np.concatenate(chunks), dtype=np.float32)
+            if chunks
+            else np.zeros((0,), dtype=np.float32)
+        )
+        return np.asarray(diag_indices, dtype=np.int32), diag_data
 
     def _lt_worker_count(self, item_count: int) -> int:
         if item_count <= 1:
@@ -479,7 +493,7 @@ class NewEvaluator:
         on_batch_result=None,
     ):
         generate_batch = getattr(self.backend, "GenerateLinearTransformsBatch", None)
-        if not callable(generate_batch) or len(diagonals) <= 1:
+        if not callable(generate_batch) or len(diagonals) <= 0:
             return None
 
         items = list(diagonals.items())
@@ -516,16 +530,14 @@ class NewEvaluator:
             levels = (ctypes.c_int * num_transforms)(*[int(level)] * num_transforms)
 
             owned_arrays: list[object] = [levels]
-            for index, (_row, _col, diags_idxs, _diags_data) in enumerate(block_payloads):
-                array = (ctypes.c_int * len(diags_idxs))(*diags_idxs)
-                owned_arrays.append(array)
-                diag_idxs_ptrs[index] = array
-                diag_idxs_lens[index] = len(diags_idxs)
-            for index, (_row, _col, _diags_idxs, diags_data) in enumerate(block_payloads):
-                array = (ctypes.c_float * len(diags_data))(*diags_data)
-                owned_arrays.append(array)
-                diag_data_ptrs[index] = array
-                diag_data_lens[index] = len(diags_data)
+            for index, (_row, _col, diags_idxs, diags_data) in enumerate(block_payloads):
+                idx_array = np.ascontiguousarray(diags_idxs, dtype=np.int32)
+                data_array = np.ascontiguousarray(diags_data, dtype=np.float32)
+                owned_arrays.extend((idx_array, data_array))
+                diag_idxs_ptrs[index] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+                diag_idxs_lens[index] = int(idx_array.size)
+                diag_data_ptrs[index] = data_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                diag_data_lens[index] = int(data_array.size)
 
             encode_started = time.perf_counter()
             lintransf_ids = list(
