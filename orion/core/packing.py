@@ -427,18 +427,20 @@ class _DirectDiagonalAccumulator:
                 else:
                     target_diag += source_diag
 
-    def finish(self, start_time: float) -> tuple[dict[tuple[int, int], dict[int, list[float]]], int]:
-        out: dict[tuple[int, int], dict[int, list[float]]] = {}
+    def finish(self, start_time: float) -> tuple[dict[tuple[int, int], dict[int, np.ndarray]], int]:
+        out: dict[tuple[int, int], dict[int, np.ndarray]] = {}
         total_diagonals = 0
         for block_row in range(self.num_block_rows):
             for block_col in range(self.num_block_cols):
                 block = self.diagonals_by_block.get((int(block_row), int(block_col)), {})
                 if not block:
-                    out[(int(block_row), int(block_col))] = {0: [0.0] * self.num_slots}
+                    out[(int(block_row), int(block_col))] = {
+                        0: np.zeros((int(self.num_slots),), dtype=np.float32)
+                    }
                     continue
                 total_diagonals += len(block)
                 out[(int(block_row), int(block_col))] = {
-                    int(diag_idx): block[int(diag_idx)].tolist()
+                    int(diag_idx): np.ascontiguousarray(block[int(diag_idx)], dtype=np.float32)
                     for diag_idx in sorted(int(value) for value in block.keys())
                 }
         elapsed_time = time.time() - start_time
