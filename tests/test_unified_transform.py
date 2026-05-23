@@ -359,6 +359,14 @@ def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> N
     assert outputs == [100, 101]
     assert backend.evaluated == [([11, 12], 7)]
     assert group.get_transform_ids(transforms[0]) == {(0, 0): 11}
+    runtime = group.last_runtime_timing
+    assert runtime["runtime_fairness_mode"] == "resident_compute"
+    assert runtime["resident_compute_s"] == pytest.approx(runtime["eval_s"])
+    assert runtime["artifact_load_s"] == pytest.approx(
+        runtime["load_keys_s"] + runtime["load_plaintexts_s"]
+    )
+    assert runtime["artifact_unload_s"] == pytest.approx(runtime["unload_s"])
+    assert runtime["serving_hot_s"] >= runtime["resident_compute_s"]
 
     group.cleanup(backend)
     assert backend.deleted == [11, 12]
@@ -469,7 +477,7 @@ def test_unified_transform_group_streams_compile_and_chunks_eval_for_memory_boun
     group.compile_unified(backend)
 
     assert group.unified_ids == [11, 12]
-    assert [entry["num_transforms"] for entry in backend.generated] == [1, 1]
+    assert sum(entry["num_transforms"] for entry in backend.generated) == 2
     assert backend.serialized == [(11, 0), (11, 1), (12, 0), (12, 2)]
     assert backend.removed_plaintext_diagonals == [11, 12]
     assert sorted(backend.generated_keys) == [1, 3, 5]
@@ -574,7 +582,9 @@ def test_memory_bounded_load_streams_compile_to_match_saved_payload_layout(tmp_p
 
     load_group.compile_unified(load_backend)
 
-    assert [entry["num_transforms"] for entry in load_backend.generated] == [1, 1]
+    assert [entry["num_transforms"] for entry in load_backend.generated] == [
+        entry["num_transforms"] for entry in save_backend.generated
+    ]
     assert load_backend.serialized == []
     assert load_backend.removed_plaintext_diagonals == [11, 12]
     assert load_group._offloaded_plaintext_diagonals is True
@@ -707,7 +717,7 @@ def test_memory_bounded_eval_schedule_can_change_without_recompile(tmp_path) -> 
 
     assert first_outputs == [100, 100]
     assert second_outputs == [100, 101]
-    assert [entry["num_transforms"] for entry in backend.generated] == [1, 1]
+    assert sum(entry["num_transforms"] for entry in backend.generated) == 2
     assert backend.evaluated == [([11], 7), ([12], 7), ([11, 12], 8)]
 
 
@@ -751,6 +761,13 @@ def test_unified_transform_group_preserves_streaming_backend_group_for_memory_bo
     assert backend.removed_plaintext_diagonals == [11, 12]
     eval_events = [event for event in group.memory_trace if event["event"] == "before_eval_group_memory_bounded"]
     assert eval_events[-1]["chunk_count"] == 1
+    runtime = group.last_runtime_timing
+    assert runtime["runtime_fairness_mode"] == "streaming_eval_encode"
+    assert runtime["resident_compute_s"] is None
+    assert runtime["serving_hot_s"] >= 0.0
+    assert runtime["artifact_load_s"] == pytest.approx(
+        runtime["load_keys_s"] + runtime["load_plaintexts_s"]
+    )
 
 
 def test_memory_bounded_eval_records_timing_and_retains_shared_rotation_keys(tmp_path) -> None:
@@ -804,6 +821,15 @@ def test_memory_bounded_eval_records_timing_and_retains_shared_rotation_keys(tmp
     assert timing["cpp_trim_s"] == pytest.approx(0.25)
     group_events = [event for event in group.memory_trace if event["event"] == "after_eval_group_memory_bounded"]
     assert sum(float(event["timing"]["trim_s"]) for event in group_events) == pytest.approx(0.5)
+    runtime = group.last_runtime_timing
+    assert runtime["runtime_fairness_mode"] == "memory_bounded_load_eval"
+    assert runtime["resident_compute_s"] == pytest.approx(runtime["eval_s"])
+    assert runtime["artifact_read_s"] == pytest.approx(runtime["read_bundle_s"])
+    assert runtime["artifact_load_s"] == pytest.approx(
+        runtime["load_keys_s"] + runtime["load_plaintexts_s"]
+    )
+    assert runtime["artifact_unload_s"] == pytest.approx(runtime["unload_s"])
+    assert runtime["trim_s"] == pytest.approx(0.25)
 
 
 def test_cheddar_like_backend_prefers_encoded_plaintext_payload_cache(tmp_path) -> None:

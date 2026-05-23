@@ -30,24 +30,23 @@ from orion.backend.python.tensors import CipherTensor
 from orion.core import packing
 from orion.core.region_experiments import build_region_experiments
 from orion.core.shared_lt import PackingPlanner, RegionNode, RegionPlanner
+from orion.experimental.cir.halo_local_conv_provider import (
+    HaloLocalBranchPairConvRuntimeExecutor,
+    HaloLocalConvRuntimeExecutor,
+)
 from orion.experimental.cir.r34_orion_same_shape import (
-    R34InterGroupHybridSameShapeRuntimeExecutor,
-    R34IntraGroupPack2SameShapeRuntimeExecutor,
-    R34Pack2SameShapeRuntimeExecutor,
     R34SameShapeStageSpec,
     _maybe_set_default_scale,
     r34_same_shape_policy,
     r34_same_shape_policy_from_source_group_count,
     r34_source_group_count,
+    r34_native_aligned_halo_plan,
+    r34_same_shape_hardcoded_relayout_plan,
     r34_same_shape_spec_for_family_label,
 )
 from orion.experimental.cir.r34_inter_group_python import R34PythonTransitionFlowRuntimeExecutor
 from orion.experimental.cir.region_first_data import STAGE_MATERIALIZER_REFERENCES
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
-from orion.experimental.cir.transition_pool_provider import (
-    BranchPairConvRuntimeExecutor,
-    InputPairConvRuntimeExecutor,
-)
 from orion.nn.unified_transform import UnifiedTransformGroup
 
 
@@ -719,6 +718,75 @@ _PHASE1_KERNEL_BINDINGS: tuple[KernelBinding, ...] = (
 )
 
 
+_R34_HALO_ROTATION_GATES: dict[str, dict[str, Any]] = {
+    "stage2_transition": {
+        "candidate": "transition_main_shortcut_height_stripe_halo",
+        "decision": "skip",
+        "reason": "shared_bsgs_rotation_regression",
+        "rotation_model": "descriptor_physical_halo_shared_common_n1_plus_halo_fill",
+        "dense_tasks": 26,
+        "halo_tasks": 7,
+        "dense_shared_rotations": 1045,
+        "halo_shared_rotations": 1184,
+        "halo_fill_rotations": 12,
+        "halo_total_shared_rotations": 1196,
+    },
+    "stage3_transition": {
+        "candidate": "transition_main_shortcut_height_stripe_halo",
+        "decision": "skip",
+        "reason": "shared_bsgs_rotation_regression",
+        "rotation_model": "descriptor_physical_halo_shared_common_n1_plus_halo_fill",
+        "dense_tasks": 7,
+        "halo_tasks": 4,
+        "dense_shared_rotations": 615,
+        "halo_shared_rotations": 712,
+        "halo_fill_rotations": 6,
+        "halo_total_shared_rotations": 718,
+    },
+    "stage4_transition": {
+        "candidate": "transition_main_shortcut_height_stripe_halo",
+        "decision": "skip",
+        "reason": "transition_branch_pair_class_failed_earlier_stage_rotation_gate",
+        "rotation_model": "descriptor_physical_halo_shared_common_n1_plus_halo_fill",
+        "blocking_stages": ("stage2_transition", "stage3_transition"),
+    },
+    "stem_conv": {
+        "candidate": "stem_conv_height_stripe_halo",
+        "decision": "skip",
+        "reason": "shared_bsgs_rotation_regression",
+        "rotation_model": "descriptor_physical_halo_shared_common_n1",
+        "dense_tasks": 124,
+        "halo_tasks": 32,
+        "dense_shared_rotations": 610,
+        "halo_shared_rotations": 1080,
+        "halo_fill_rotations": 0,
+        "halo_total_shared_rotations": 1080,
+        "note": "input-side halo fill would be plaintext encode-time work, but conv rotations still regress",
+    },
+    "stem_pool": {
+        "candidate": "stem_pool_height_stripe_halo",
+        "decision": "skip",
+        "reason": "shared_bsgs_rotation_regression",
+        "rotation_model": "descriptor_physical_halo_shared_common_n1_plus_halo_fill",
+        "dense_tasks": 56,
+        "halo_tasks": 55,
+        "dense_shared_rotations": 635,
+        "halo_shared_rotations": 5235,
+        "halo_fill_rotations": 108,
+        "halo_total_shared_rotations": 5343,
+    },
+    "global_avgpool_exit": {
+        "candidate": "global_avgpool_height_stripe_halo",
+        "decision": "skip",
+        "reason": "layout_exit_plaintext_boundary_not_halo_conv_candidate",
+    },
+}
+
+
+def _r34_halo_rotation_gate(stage: str) -> dict[str, Any]:
+    return dict(_R34_HALO_ROTATION_GATES.get(str(stage), {}))
+
+
 DEFAULT_R34_PHASE1_REPORT_OUT = Path("/tmp/orion_r34_phase1_report.json")
 
 
@@ -880,8 +948,7 @@ def build_r34_phase1_transition_bridge_plan() -> dict[str, Any]:
         stride=int(conv.stride[0]),
         pad=int(conv.padding[0]),
         max_slots=32768,
-        use_real_imag_hybrid=True,
-        strategy="real_imag_hybrid_transition_branch",
+        strategy="no_real_imag_transition_branch",
     )
     binding = kernel_binding_for_family("stage3_transition")
     return {
@@ -1488,16 +1555,50 @@ def _r34_same_shape_runtime_from_modules(
     policy = str(_r34_kernel_policy_from_module(module) or spec.policy)
     if policy != str(spec.policy):
         return group
-    if str(policy) == "inter_group_hybrid":
-        executor = R34InterGroupHybridSameShapeRuntimeExecutor(module=module, spec=spec, output_node_id=str(group.conv_nodes[0]))
-    else:
-        executor = R34Pack2SameShapeRuntimeExecutor(module=module, spec=spec, output_node_id=str(group.conv_nodes[0]))
+    executor = HaloLocalConvRuntimeExecutor(
+        module=module,
+        same_shape_spec=spec,
+        output_node_id=str(group.conv_nodes[0]),
+    )
+    native_plan = r34_native_aligned_halo_plan(spec).to_dict()
     return _replace_r34_group(
         group,
+        strategy="r34_native_aligned_halo_no_ri_conv_same_shape",
+        materializer="native_aligned_halo_no_ri_conv2d",
+        depth=3,
+        boundary_actions=(
+            "halo_local_conv2d_provider",
+            "native_aligned_halo_no_ri",
+            "compact_to_native_halo_relayout",
+            "native_halo_to_compact_reassembly",
+        ),
         executable=True,
         fallback_reason="",
         fused_weight_count=1,
         executor=executor,
+        plan={
+            "runtime_lowering": "provider_executable+native_aligned_halo_no_ri",
+            "runtime_io_layout": "compact_in_compact_out",
+            "same_shape_family_label": str(spec.family_label),
+            "same_shape_policy": str(policy),
+            "native_aligned_halo_plan": native_plan,
+            "relayout_plan": native_plan,
+            "conv_lt_raw_submatrix_tasks": int(native_plan["submatrix_program_count"]),
+            "conv_lt_effective_submatrix_tasks": int(native_plan["sharing_group_count"]),
+            "native_c_only_rotations": int(native_plan["c_only_rotations"]),
+            "native_cb_shared_rotations": int(native_plan["cb_shared_rotations"]),
+            "native_shared_baby_rotations": int(native_plan["shared_baby_rotations"]),
+            "native_shared_giant_rotations": int(native_plan["shared_giant_rotations"]),
+            "legacy_flat_conv_lt_tasks": int(
+                r34_same_shape_hardcoded_relayout_plan(spec).legacy_flat_conv_lt_tasks
+            ),
+            "legacy_flat_offdiag_tasks": int(
+                r34_same_shape_hardcoded_relayout_plan(spec).legacy_flat_offdiag_tasks
+            ),
+            "relayout_rotation_count": 0,
+            "relayout_mask_mult_count": 0,
+            "relayout_sparse_lt_tasks": 0,
+        },
     )
 
 
@@ -1529,7 +1630,7 @@ def _r34_transition_runtime_from_modules(
     conv, shortcut = modules
     policy = str(_r34_kernel_policy_from_module(conv) or "")
     if str(group.stage) in {"stage2_transition", "stage3_transition", "stage4_transition"}:
-        executor = BranchPairConvRuntimeExecutor(
+        executor = HaloLocalBranchPairConvRuntimeExecutor(
             conv_module=conv,
             shortcut_module=shortcut,
             output_node_ids=group.conv_nodes,
@@ -1544,10 +1645,18 @@ def _r34_transition_runtime_from_modules(
         )
     return _replace_r34_group(
         group,
+        strategy="r34_halo_local_branch_pair_conv2d",
+        materializer="halo_local_branch_pair_conv2d",
+        boundary_actions=("branch_pair_shared_rotation_provider", "branch_pair_no_real_imag"),
         executable=True,
         fallback_reason="",
         fused_weight_count=len(modules),
         executor=executor,
+        plan={
+            "runtime_lowering": "provider_executable+branch_pair_no_real_imag",
+            "halo_layout_gate": _r34_halo_rotation_gate(str(group.stage)),
+            "conv_dependency": "current_global_ciphertext_layout",
+        },
     )
 
 
@@ -1578,20 +1687,45 @@ def _r34_direct_runtime_from_modules(
     module = modules[0]
     if not _r34_direct_module_compatible(module, contract):
         return group
-    if str(group.stage) in {"stem_conv", "stem_pool", "global_avgpool_exit"}:
-        executor = InputPairConvRuntimeExecutor(module=module, output_node_id=str(group.conv_nodes[0]))
+    if str(group.stage) == "stem_conv":
+        executor = HaloLocalConvRuntimeExecutor(
+            module=module,
+            output_node_id=str(group.conv_nodes[0]),
+        )
+        strategy = "r34_native_halo_stripe_no_ri_stem_conv"
+        materializer = "native_halo_stripe_no_ri_conv2d"
+        boundary_actions = (
+            "halo_local_conv2d_provider",
+            "native_halo_stripe_no_ri",
+            "compact_to_native_halo_relayout",
+            "native_halo_to_compact_reassembly",
+        )
+        runtime_lowering = "provider_executable+native_halo_stripe_no_ri"
     else:
         executor = R34DenseSingleFlowRuntimeExecutor(
             module=module,
             family_label=str(group.stage),
             output_node_id=str(group.conv_nodes[0]),
         )
+        strategy = "r34_dense_single_flow_pool_shared_rotations"
+        materializer = "dense_orion_single_flow"
+        boundary_actions = ("dense_orion_single_flow",)
+        runtime_lowering = "dense_orion_pool_shared_rotations"
     return _replace_r34_group(
         group,
+        strategy=str(strategy),
+        materializer=str(materializer),
+        boundary_actions=tuple(boundary_actions),
         executable=True,
         fallback_reason="",
         fused_weight_count=1,
         executor=executor,
+        plan={
+            "runtime_lowering": str(runtime_lowering),
+            "halo_layout_gate": _r34_halo_rotation_gate(str(group.stage)),
+            "native_halo_input_capable": False,
+            "conv_dependency": "current_global_ciphertext_layout",
+        },
     )
 
 

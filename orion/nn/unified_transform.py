@@ -28,35 +28,56 @@ from orion.backend.python.memory_lifecycle import (
     guard_host_memory,
     host_memory_info,
 )
+from orion.backend.python.compile_policy import (
+    auto_batch_limit,
+    auto_worker_count,
+    batch_limit_for_payloads,
+)
 
 
 _UNIFIED_GROUP_COUNTER = count(1)
 _ENCODED_HOIST_PAYLOAD_DATASET = "__encoded_hoist_payload__"
+_RUNTIME_TIMING_KEYS = (
+    "read_bundle_s",
+    "load_keys_s",
+    "load_plaintexts_s",
+    "eval_s",
+    "eval_total_s",
+    "unload_s",
+    "trim_s",
+    "cpp_plan_s",
+    "cpp_level_adjust_s",
+    "cpp_baby_step_s",
+    "cpp_giant_step_s",
+    "stream_build_map_s",
+    "stream_encode_hoist_s",
+    "stream_load_payload_s",
+    "stream_eval_s",
+    "stream_accumulate_s",
+    "cpp_push_s",
+    "cpp_trim_s",
+)
 
 
 def _unified_compile_workers(item_count: int) -> int:
-    raw = os.environ.get("ORION_UNIFIED_COMPILE_WORKERS")
-    if raw is None:
-        raw = os.environ.get("ORION_REGION_COMPILE_WORKERS", "1")
-    try:
-        requested = int(raw)
-    except (TypeError, ValueError):
-        requested = 1
-    return max(1, min(int(item_count), int(requested)))
+    return auto_worker_count(
+        int(item_count),
+        ("ORION_UNIFIED_COMPILE_WORKERS", "ORION_REGION_COMPILE_WORKERS"),
+        default_workers=1,
+        estimated_per_worker_bytes=1024**3,
+    )
 
 
 def _unified_stream_compile_batch_limit(item_count: int, workers: int) -> int:
-    raw = os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS")
-    if raw is None:
-        raw = os.environ.get("ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS")
-    if raw is None:
-        requested = int(workers)
-    else:
-        try:
-            requested = int(raw)
-        except (TypeError, ValueError):
-            requested = int(workers)
-    return max(1, min(int(item_count), int(requested)))
+    return auto_batch_limit(
+        int(item_count),
+        (
+            "ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS",
+            "ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS",
+        ),
+        default_limit=int(workers),
+        estimated_item_bytes=1024**3,
+    )
 
 
 def _unified_stream_compile_batch_bytes() -> int:
@@ -123,6 +144,21 @@ class UnifiedTransformGroup:
         self._saved_io_host_bytes_by_transform: dict[int, int] | None = None
         self._resident_plaintext_transform_ids: set[int] = set()
         self.memory_trace: list[dict[str, Any]] = []
+        self.last_runtime_timing: dict[str, Any] = self._empty_runtime_timing()
+
+    def _empty_runtime_timing(self) -> dict[str, Any]:
+        timing: dict[str, Any] = {key: 0.0 for key in _RUNTIME_TIMING_KEYS}
+        timing.update(
+            {
+                "artifact_read_s": 0.0,
+                "artifact_load_s": 0.0,
+                "artifact_unload_s": 0.0,
+                "resident_compute_s": None,
+                "serving_hot_s": 0.0,
+                "runtime_fairness_mode": "unknown",
+            }
+        )
+        return timing
 
     def _scheme_params(self):
         if not self.transforms:
@@ -508,6 +544,42 @@ class UnifiedTransformGroup:
         if not callable(uses_streaming):
             return False
         return bool(uses_streaming(int(transform_id)))
+
+    def _runtime_fairness_mode(self, backend, *, memory_bounded: bool) -> str:
+        for transform_id in self.unified_ids or ():
+            if self._transform_uses_backend_streaming(backend, int(transform_id)):
+                return "streaming_eval_encode"
+        if bool(memory_bounded):
+            return "memory_bounded_load_eval"
+        return "resident_compute"
+
+    def _publish_runtime_timing(
+        self,
+        backend,
+        timing: dict[str, float],
+        *,
+        memory_bounded: bool,
+        total_s: float,
+    ) -> dict[str, Any]:
+        payload = self._empty_runtime_timing()
+        for key, value in timing.items():
+            if key in _RUNTIME_TIMING_KEYS:
+                payload[key] = float(value)
+        mode = self._runtime_fairness_mode(backend, memory_bounded=bool(memory_bounded))
+        payload["runtime_fairness_mode"] = str(mode)
+        payload["artifact_read_s"] = float(payload.get("read_bundle_s", 0.0))
+        payload["artifact_load_s"] = float(
+            payload.get("load_keys_s", 0.0) + payload.get("load_plaintexts_s", 0.0)
+        )
+        payload["artifact_unload_s"] = float(payload.get("unload_s", 0.0))
+        payload["serving_hot_s"] = float(total_s)
+        payload["resident_compute_s"] = (
+            None
+            if mode == "streaming_eval_encode"
+            else float(payload.get("eval_s", 0.0))
+        )
+        self.last_runtime_timing = payload
+        return payload
 
     def _plaintext_load_transform_ids(
         self,
@@ -1953,10 +2025,38 @@ class UnifiedTransformGroup:
                     seconds=f"{time.perf_counter() - flatten_started:.6f}",
                 )
 
+                payload_sizes = [int(payload[0].nbytes + payload[1].nbytes) for payload in payloads]
                 queued: list[tuple[int, tuple[np.ndarray, np.ndarray, int]]] = []
                 queued_bytes = 0
-                for index, payload in zip(batch_indices, payloads):
-                    payload_bytes = int(payload[0].nbytes + payload[1].nbytes)
+                queued_count_limit = 0
+                for local_index, (index, payload) in enumerate(zip(batch_indices, payloads)):
+                    payload_bytes = int(payload_sizes[int(local_index)])
+                    if not queued:
+                        queued_count_limit = batch_limit_for_payloads(
+                            payload_sizes[int(local_index):],
+                            hard_cap=(len(payload_sizes) - int(local_index)),
+                        )
+                    if (
+                        queued
+                        and int(queued_count_limit) > 0
+                        and len(queued) >= int(queued_count_limit)
+                    ):
+                        self._compile_unified_streaming_payload_batch(
+                            backend,
+                            queued,
+                            has_complex=has_complex,
+                            save_plaintexts=save_plaintexts,
+                            load_plaintexts=load_plaintexts,
+                            storage=storage,
+                            force_compile_trim=force_compile_trim,
+                        )
+                        compiled_batch_sizes.append(int(len(queued)))
+                        queued = []
+                        queued_bytes = 0
+                        queued_count_limit = batch_limit_for_payloads(
+                            payload_sizes[int(local_index):],
+                            hard_cap=(len(payload_sizes) - int(local_index)),
+                        )
                     if (
                         queued
                         and int(batch_byte_limit) > 0
@@ -1974,6 +2074,10 @@ class UnifiedTransformGroup:
                         compiled_batch_sizes.append(int(len(queued)))
                         queued = []
                         queued_bytes = 0
+                        queued_count_limit = batch_limit_for_payloads(
+                            payload_sizes[int(local_index):],
+                            hard_cap=(len(payload_sizes) - int(local_index)),
+                        )
                     queued.append((int(index), payload))
                     queued_bytes += int(payload_bytes)
                 if queued:
@@ -2194,14 +2298,35 @@ class UnifiedTransformGroup:
             and not self._offloaded_plaintext_diagonals
             and callable(getattr(backend, "EvaluateLinearTransform", None))
         ):
+            group_started = time.perf_counter()
+            timing = self._empty_runtime_timing()
             self._record_memory_event("before_eval_single_transform", backend)
             try:
-                return [int(backend.EvaluateLinearTransform(int(self.unified_ids[0]), int(ct_input_id)))]
+                self._consume_trim_seconds(backend)
+                self._consume_shared_cache_eval_profile(backend)
+                eval_started = time.perf_counter()
+                output = [int(backend.EvaluateLinearTransform(int(self.unified_ids[0]), int(ct_input_id)))]
+                eval_total_s = float(time.perf_counter() - eval_started)
+                trim_s = self._consume_trim_seconds(backend)
+                timing["trim_s"] = float(trim_s)
+                for profile_key, profile_value in self._consume_shared_cache_eval_profile(backend).items():
+                    timing[profile_key] = float(timing.get(profile_key, 0.0) + float(profile_value))
+                timing["eval_total_s"] = float(eval_total_s)
+                timing["eval_s"] = max(0.0, float(eval_total_s) - float(trim_s))
+                return output
             finally:
-                self._record_memory_event("after_eval_single_transform", backend)
+                runtime_timing = self._publish_runtime_timing(
+                    backend,
+                    timing,
+                    memory_bounded=False,
+                    total_s=float(time.perf_counter() - group_started),
+                )
+                self._record_memory_event("after_eval_single_transform", backend, timing=runtime_timing)
         scheduler = self._shared_saved_io_scheduler()
         prefetch_key = self._saved_io_prefetch_key()
         using_shared_prefetch = False
+        group_started = time.perf_counter()
+        timing = self._empty_runtime_timing()
         if scheduler is not None:
             using_shared_prefetch = bool(
                 scheduler.fill_saved_io_prefetch_window(
@@ -2215,6 +2340,7 @@ class UnifiedTransformGroup:
             if using_shared_prefetch
             else self._io_prefetcher.consume(self._storage_key)
         )
+        read_started = time.perf_counter()
         if bundle is None and (self._should_offload_rotation_keys() or self._offloaded_plaintext_diagonals):
             self._forward_memory_guard(
                 backend,
@@ -2226,8 +2352,13 @@ class UnifiedTransformGroup:
                 prefetch=False,
                 required_keys=self._rotation_key_requests_to_load(backend, self.unified_ids, self._required_keys),
             )
+        timing["read_bundle_s"] = float(time.perf_counter() - read_started)
+        load_keys_started = time.perf_counter()
         self._load_rotation_keys(backend, bundle)
+        timing["load_keys_s"] = float(time.perf_counter() - load_keys_started)
+        load_plaintexts_started = time.perf_counter()
         self._load_plaintext_diagonals(backend, bundle)
+        timing["load_plaintexts_s"] = float(time.perf_counter() - load_plaintexts_started)
         if using_shared_prefetch:
             scheduler.fill_saved_io_prefetch_window(
                 prefetch_key,
@@ -2237,19 +2368,32 @@ class UnifiedTransformGroup:
         else:
             self._schedule_next_saved_io_prefetch(backend)
         transform_ids_array = (ctypes.c_int * len(self.unified_ids))(*[int(v) for v in self.unified_ids])
+        output_ids: list[int] | None = None
         try:
             self._record_memory_event("before_eval_group", backend)
-            return list(
+            self._consume_trim_seconds(backend)
+            self._consume_shared_cache_eval_profile(backend)
+            eval_started = time.perf_counter()
+            output_ids = list(
                 backend.EvaluateLinearTransformsWithSharedCache(
                     transform_ids_array,
                     len(self.unified_ids),
                     int(ct_input_id),
                 )
             )
+            eval_total_s = float(time.perf_counter() - eval_started)
+            trim_s = self._consume_trim_seconds(backend)
+            timing["trim_s"] = float(timing.get("trim_s", 0.0) + float(trim_s))
+            for profile_key, profile_value in self._consume_shared_cache_eval_profile(backend).items():
+                timing[profile_key] = float(timing.get(profile_key, 0.0) + float(profile_value))
+            timing["eval_total_s"] = float(eval_total_s)
+            timing["eval_s"] = max(0.0, float(eval_total_s) - float(trim_s))
         finally:
-            self._record_memory_event("after_eval_group", backend)
+            self._record_memory_event("after_eval_group", backend, timing=dict(timing))
+            unload_started = time.perf_counter()
             self._unload_plaintext_diagonals(backend)
             self._unload_rotation_keys(backend)
+            timing["unload_s"] = float(time.perf_counter() - unload_started)
             if bundle is not None:
                 bundle.clear()
             trim_event = self._forward_memory_guard(
@@ -2259,11 +2403,27 @@ class UnifiedTransformGroup:
                 force_trim=True,
                 raise_on_low=False,
             )
-            self._record_memory_event("after_eval_group_trim", backend, self.unified_ids, memory_guard=trim_event)
+            runtime_timing = self._publish_runtime_timing(
+                backend,
+                timing,
+                memory_bounded=False,
+                total_s=float(time.perf_counter() - group_started),
+            )
+            self._record_memory_event(
+                "after_eval_group_trim",
+                backend,
+                self.unified_ids,
+                memory_guard=trim_event,
+                timing=runtime_timing,
+            )
+        if output_ids is None:
+            raise RuntimeError("EvaluateLinearTransformsWithSharedCache did not return outputs")
+        return [int(value) for value in output_ids]
 
     def _evaluate_unified_memory_bounded(self, ct_input_id: int, backend) -> list[int]:
         if self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
+        group_started = time.perf_counter()
         chunks = self._memory_bounded_chunks(backend)
         stream_plaintexts = bool(self._stream_plaintext_diag_load_enabled(backend))
         output_id_by_transform: dict[int, int] = {}
@@ -2476,7 +2636,18 @@ class UnifiedTransformGroup:
                     timing=dict(chunk_timing),
                     memory_guard=trim_event,
                 )
-        self._record_memory_event("after_eval_group_memory_bounded", backend, self.unified_ids, timing=dict(group_timing))
+        runtime_timing = self._publish_runtime_timing(
+            backend,
+            group_timing,
+            memory_bounded=True,
+            total_s=float(time.perf_counter() - group_started),
+        )
+        self._record_memory_event(
+            "after_eval_group_memory_bounded",
+            backend,
+            self.unified_ids,
+            timing=runtime_timing,
+        )
         return [int(output_id_by_transform[int(transform_id)]) for transform_id in self.unified_ids]
 
     def execute(self, calling_transform, ct_input):

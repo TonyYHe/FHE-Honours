@@ -14,6 +14,7 @@ from .io_prefetch import (
     should_prefetch_saved_io,
 )
 from .memory_lifecycle import guard_host_memory
+from .compile_policy import auto_batch_limit, auto_worker_count
 from orion.backend.python.tensors import CipherTensor
 
 
@@ -61,7 +62,54 @@ class NewEvaluator:
         self._saved_io_work_order: tuple[object, ...] = ()
         self._saved_io_work_index: dict[object, int] = {}
         self._dense_host_plaintext_payload_cache: dict[int, np.ndarray] = {}
+        self.last_runtime_timing: dict[str, object] = self._empty_runtime_timing()
         self.new_evaluator()
+
+    def _empty_runtime_timing(self) -> dict[str, object]:
+        return {
+            "read_bundle_s": 0.0,
+            "load_keys_s": 0.0,
+            "load_plaintexts_s": 0.0,
+            "eval_s": 0.0,
+            "eval_total_s": 0.0,
+            "unload_s": 0.0,
+            "trim_s": 0.0,
+            "artifact_read_s": 0.0,
+            "artifact_load_s": 0.0,
+            "artifact_unload_s": 0.0,
+            "resident_compute_s": None,
+            "serving_hot_s": 0.0,
+            "runtime_fairness_mode": "unknown",
+        }
+
+    def _transform_uses_backend_streaming(self, transform_id: int) -> bool:
+        uses_streaming = getattr(self.backend, "LinearTransformUsesStreaming", None)
+        if not callable(uses_streaming):
+            return False
+        return bool(uses_streaming(int(transform_id)))
+
+    def _publish_runtime_timing(
+        self,
+        timing: dict[str, float],
+        *,
+        transform_ids: list[int],
+        total_s: float,
+    ) -> dict[str, object]:
+        payload = self._empty_runtime_timing()
+        for key, value in timing.items():
+            if key in payload:
+                payload[key] = float(value)
+        streaming = any(self._transform_uses_backend_streaming(int(transform_id)) for transform_id in transform_ids)
+        payload["runtime_fairness_mode"] = "streaming_eval_encode" if streaming else "resident_compute"
+        payload["artifact_read_s"] = float(payload.get("read_bundle_s", 0.0))
+        payload["artifact_load_s"] = float(
+            float(payload.get("load_keys_s", 0.0)) + float(payload.get("load_plaintexts_s", 0.0))
+        )
+        payload["artifact_unload_s"] = float(payload.get("unload_s", 0.0))
+        payload["serving_hot_s"] = float(total_s)
+        payload["resident_compute_s"] = None if streaming else float(payload.get("eval_s", 0.0))
+        self.last_runtime_timing = payload
+        return payload
 
     def set_compile_manifest(self, manifest) -> None:
         self.compile_manifest = manifest
@@ -346,49 +394,37 @@ class NewEvaluator:
     def _lt_worker_count(self, item_count: int) -> int:
         if item_count <= 1:
             return 1
-        raw_value = os.environ.get("ORION_LT_COMPILE_WORKERS", "")
-        try:
-            requested = int(raw_value) if raw_value else min(4, int(os.cpu_count() or 1))
-        except (TypeError, ValueError):
-            requested = 4
-        return max(1, min(int(item_count), int(requested)))
+        return auto_worker_count(
+            int(item_count),
+            ("ORION_LT_COMPILE_WORKERS",),
+            default_workers=min(4, int(os.cpu_count() or 1)),
+            estimated_per_worker_bytes=512 * 1024**2,
+        )
 
     def _lt_compile_batch_limit(self, item_count: int, *, index_only: bool = False) -> int:
         if item_count <= 1:
             return 1
         if bool(index_only):
-            raw_value = os.environ.get("ORION_DENSE_LT_INDEX_ONLY_BATCH_TRANSFORMS")
-            if raw_value is not None:
-                try:
-                    requested = int(raw_value)
-                except (TypeError, ValueError):
-                    requested = 0
-                if requested > 0:
-                    return max(1, min(int(item_count), int(requested)))
-                return int(item_count)
-            return max(1, min(int(item_count), 128))
-        for name in (
-            "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
-            "ORION_LT_COMPILE_BATCH_TRANSFORMS",
-            # Dense save/load needs the same kind of guard that provider cached
-            # load uses. Honor the existing provider knob so benchmark scripts
-            # that already set it get bounded dense compilation too.
-            "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
-            "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
-        ):
-            raw_value = os.environ.get(name)
-            if raw_value is None:
-                continue
-            try:
-                requested = int(raw_value)
-            except (TypeError, ValueError):
-                requested = 0
-            if requested > 0:
-                return max(1, min(int(item_count), int(requested)))
-            return int(item_count)
-        if self.io_mode != "none":
-            return max(1, min(int(item_count), 4))
-        return int(item_count)
+            return auto_batch_limit(
+                int(item_count),
+                ("ORION_DENSE_LT_INDEX_ONLY_BATCH_TRANSFORMS",),
+                default_limit=min(int(item_count), 128),
+                estimated_item_bytes=64 * 1024,
+            )
+        return auto_batch_limit(
+            int(item_count),
+            (
+                "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
+                "ORION_LT_COMPILE_BATCH_TRANSFORMS",
+                # Dense save/load needs the same kind of guard that provider cached
+                # load uses. Honor the existing provider knob so benchmark scripts
+                # that already set it get bounded dense compilation too.
+                "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
+                "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
+            ),
+            default_limit=(min(int(item_count), 4) if self.io_mode != "none" else int(item_count)),
+            estimated_item_bytes=(1024**3 if self.io_mode != "none" else 512 * 1024**2),
+        )
 
     def _build_block_payload(self, item):
         (row, col), diags = item
@@ -719,6 +755,16 @@ class NewEvaluator:
                 fhe_out_shape=fhe_out_shape,
                 skip_post_rescale=bool(skip_post_rescale),
             )
+        group_started = time.perf_counter()
+        runtime_timing = {
+            "read_bundle_s": 0.0,
+            "load_keys_s": 0.0,
+            "load_plaintexts_s": 0.0,
+            "eval_s": 0.0,
+            "eval_total_s": 0.0,
+            "unload_s": 0.0,
+            "trim_s": 0.0,
+        }
         prefetch_sequence, use_global_prefetch_sequence = self._transform_prefetch_sequence(
             layer_name,
             work_items,
@@ -744,6 +790,7 @@ class NewEvaluator:
                 if int(t_id) < 0:
                     continue
 
+                bundle = None
                 if self.io_mode != "none":
                     current_key = self._transform_io_key(layer_name, int(i), int(j), int(t_id))
                     self._forward_memory_guard(
@@ -755,6 +802,7 @@ class NewEvaluator:
                             int(t_id),
                         ),
                     )
+                    read_started = time.perf_counter()
                     bundle = self._transform_io_prefetcher.consume(current_key)
                     if bundle is None:
                         bundle = self._read_transform_io_bundle(
@@ -764,7 +812,11 @@ class NewEvaluator:
                             int(t_id),
                             prefetch=False,
                         )
+                    runtime_timing["read_bundle_s"] += float(time.perf_counter() - read_started)
+                    load_keys_started = time.perf_counter()
                     self.load_rotation_keys(t_id, bundle=bundle)
+                    runtime_timing["load_keys_s"] += float(time.perf_counter() - load_keys_started)
+                    load_plaintexts_started = time.perf_counter()
                     self.load_plaintext_diagonals(layer_name, i, j, t_id, bundle=bundle)
                     self.ensure_plaintext_diagonals_loaded(
                         layer_name,
@@ -773,6 +825,7 @@ class NewEvaluator:
                         t_id,
                         expected_level=int(linear_layer.level),
                     )
+                    runtime_timing["load_plaintexts_s"] += float(time.perf_counter() - load_plaintexts_started)
                     current_index = self._transform_sequence_index(
                         current_key,
                         fallback=work_index,
@@ -784,22 +837,30 @@ class NewEvaluator:
                         scratch_reserve_bytes=self._estimate_transform_scratch_reserve_bytes(t_id),
                     )
 
+                eval_started = time.perf_counter()
                 res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
+                eval_elapsed = float(time.perf_counter() - eval_started)
+                runtime_timing["eval_total_s"] += float(eval_elapsed)
+                runtime_timing["eval_s"] += float(eval_elapsed)
                 ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
 
                 # Accumulate results across a row of blocks
                 ct_out = ct if ct_out is None else ct_out + ct
                     
                 if self.io_mode != "none":
+                    unload_started = time.perf_counter()
                     self.remove_rotation_keys(t_id)
                     self.remove_plaintext_diagonals(t_id)
                     if bundle is not None:
                         bundle.clear()
+                    runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
+                    trim_started = time.perf_counter()
                     self._forward_memory_guard(
                         reason=f"after_lt_block_unload:{layer_name}:{int(i)}:{int(j)}",
                         force_trim=True,
                         raise_on_low=False,
                     )
+                    runtime_timing["trim_s"] += float(time.perf_counter() - trim_started)
                 work_index += 1
 
             if ct_out is None:
@@ -813,6 +874,12 @@ class NewEvaluator:
                 ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
                 cts_out.append(ct_out_rescaled)
 
+        timing_payload = self._publish_runtime_timing(
+            runtime_timing,
+            transform_ids=[int(transform_id) for _row, _col, transform_id in work_items],
+            total_s=float(time.perf_counter() - group_started),
+        )
+        linear_layer._last_runtime_timing = dict(timing_payload)
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
 
     def _dense_shared_cache_enabled(self, *, rows: int, cols: int) -> bool:
@@ -840,19 +907,34 @@ class NewEvaluator:
         fhe_out_shape,
         skip_post_rescale: bool,
     ):
+        group_started = time.perf_counter()
+        runtime_timing = {
+            "read_bundle_s": 0.0,
+            "load_keys_s": 0.0,
+            "load_plaintexts_s": 0.0,
+            "eval_s": 0.0,
+            "eval_total_s": 0.0,
+            "unload_s": 0.0,
+            "trim_s": 0.0,
+        }
+        all_transform_ids: list[int] = []
         cts_out = [None for _ in range(int(rows))]
         for j in range(int(cols)):
             column_ids = [int(transform_ids[i][j]) for i in range(int(rows))]
+            all_transform_ids.extend(column_ids)
             loaded_from_host_cache: list[int] = []
             if self._dense_host_payload_cache_enabled():
+                load_started = time.perf_counter()
                 for transform_id in column_ids:
                     payload = self._dense_host_plaintext_payload_cache.get(int(transform_id))
                     if payload is None:
                         continue
                     self.backend.LoadLinearTransformPlaintexts(payload, int(transform_id))
                     loaded_from_host_cache.append(int(transform_id))
+                runtime_timing["load_plaintexts_s"] += float(time.perf_counter() - load_started)
             transform_ids_array = (ctypes.c_int * len(column_ids))(*column_ids)
             try:
+                eval_started = time.perf_counter()
                 result_ids = list(
                     self.backend.EvaluateLinearTransformsWithSharedCache(
                         transform_ids_array,
@@ -860,15 +942,22 @@ class NewEvaluator:
                         int(in_ctensor.ids[j]),
                     )
                 )
+                eval_elapsed = float(time.perf_counter() - eval_started)
+                runtime_timing["eval_total_s"] += float(eval_elapsed)
+                runtime_timing["eval_s"] += float(eval_elapsed)
             finally:
+                unload_started = time.perf_counter()
                 for transform_id in loaded_from_host_cache:
                     self.backend.RemovePlaintextDiagonals(int(transform_id))
+                runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
                 if loaded_from_host_cache:
+                    trim_started = time.perf_counter()
                     self._forward_memory_guard(
                         reason="after_dense_shared_cache_unload",
                         force_trim=True,
                         raise_on_low=False,
                     )
+                    runtime_timing["trim_s"] += float(time.perf_counter() - trim_started)
             if len(result_ids) != len(column_ids):
                 raise RuntimeError(
                     "EvaluateLinearTransformsWithSharedCache returned "
@@ -887,6 +976,12 @@ class NewEvaluator:
                 ct_out.ids = []
             else:
                 output_ids.append(int(self.evaluator.rescale(ct_out.ids[0], in_place=False)))
+        timing_payload = self._publish_runtime_timing(
+            runtime_timing,
+            transform_ids=all_transform_ids,
+            total_s=float(time.perf_counter() - group_started),
+        )
+        linear_layer._last_runtime_timing = dict(timing_payload)
         return CipherTensor(self.scheme, output_ids, out_shape, fhe_out_shape)
 
     def _transform_id_matrix(self, transform_ids: dict, *, input_cols: int):

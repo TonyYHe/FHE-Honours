@@ -452,6 +452,7 @@ class PythonBackend:
         _bsgs_ratio,
         _io_mode,
     ):
+        io_mode = _io_mode.decode() if isinstance(_io_mode, bytes) else str(_io_mode)
         out: list[int] = []
         for transform_index in range(int(num_transforms)):
             diag_len = int(diag_idxs_lens[transform_index])
@@ -460,16 +461,26 @@ class PythonBackend:
                 int(diag_idxs_ptrs[transform_index][diag_index])
                 for diag_index in range(int(diag_len))
             ]
-            slots = int(data_len // max(1, diag_len)) if diag_len else int(self._num_slots)
-            diagonals: list[torch.Tensor] = []
-            cursor = 0
-            for _ in range(int(diag_len)):
-                values = [
-                    float(diag_data_ptrs[transform_index][cursor + offset])
-                    for offset in range(int(slots))
+            slots = (
+                int(self._num_slots)
+                if io_mode == "load"
+                else int(data_len // max(1, diag_len)) if diag_len else int(self._num_slots)
+            )
+            if io_mode == "load":
+                diagonals = [
+                    torch.zeros((int(slots),), dtype=torch.float32)
+                    for _diag_index in diag_indices
                 ]
-                diagonals.append(torch.tensor(values, dtype=torch.float32))
-                cursor += int(slots)
+            else:
+                diagonals: list[torch.Tensor] = []
+                cursor = 0
+                for _ in range(int(diag_len)):
+                    values = [
+                        float(diag_data_ptrs[transform_index][cursor + offset])
+                        for offset in range(int(slots))
+                    ]
+                    diagonals.append(torch.tensor(values, dtype=torch.float32))
+                    cursor += int(slots)
             out.append(
                 self._store_linear_transform(
                     diag_indices,

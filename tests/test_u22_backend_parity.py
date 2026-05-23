@@ -13,6 +13,7 @@ from orion.core.orion import scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import U22CompileRegistry
 from orion.models.unet import UNet22
+from orion.nn.linear import Conv2d
 from orion.nn.module import Module
 
 
@@ -159,3 +160,95 @@ def test_u22_decoder_tconv_python_and_lattigo_match(dataset: str, node_name: str
     assert float((python_out - python_ref).abs().max().item()) <= 1.0e-5
     assert float((lattigo_out - lattigo_ref).abs().max().item()) <= 1.0e-4
     assert float((python_out - lattigo_out).abs().max().item()) <= 1.0e-4
+
+
+def test_native_halo_conv_lattigo_matches_reference_at_level_one() -> None:
+    _require_lattigo()
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+    from orion.experimental.cir.native_halo_conv2d import native_halo_source_plaintext_blocks_from_nchw
+    from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
+
+    _init_scheme(backend="lattigo", logn=15)
+    try:
+        conv = Conv2d(1, 1, kernel_size=3, padding=1, bias=True)
+        conv.weight.data = torch.tensor(
+            [[[[0.0, 0.25, 0.0], [0.5, 1.0, -0.25], [0.0, -0.5, 0.125]]]],
+            dtype=torch.float32,
+        )
+        conv.bias.data.fill_(0.125)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 1, 4, 4))
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_level_one_toy_conv"
+        conv.set_level(1)
+        conv.set_depth(1)
+
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
+            output_node_id="conv",
+            compile_plan={
+                "policy": "dp",
+                "edge_layouts": [
+                    {
+                        "edge": "x->conv",
+                        "source": "x",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "relayout": False,
+                        "layout_mode": "native_halo_stripe",
+                        "physical_layout": "native_source_stripe",
+                        "source_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "output_relayout": False,
+                        "physical_layout": "native_source_stripe",
+                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+            },
+        )
+        executor.assigned_level = 1
+        executor.assigned_depth = 1
+
+        x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4) / 10.0
+        native_plan = executor._native_halo_plan()
+        ids = []
+        for block in native_halo_source_plaintext_blocks_from_nchw(x, native_plan):
+            block_ct = scheme.encrypt(scheme.encode(block, 1))
+            ids.append(int(block_ct.ids[0]))
+            block_ct.ids = []
+        x_ct = CipherTensor(
+            scheme,
+            ids,
+            torch.Size(tuple(int(value) for value in x.shape)),
+            torch.Size([int(len(ids)), int(scheme.params.get_slots())]),
+        )
+        out = executor(x_ct)["conv"]
+        decoded = (
+            out.decrypt()
+            .decode()
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+            .reshape(-1)[:24]
+            .reshape(1, 1, 6, 4)
+        )
+        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
+        reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
+
+        assert out.level() == 0
+        assert float((decoded - reference).abs().max().item()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()

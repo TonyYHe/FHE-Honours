@@ -9,6 +9,16 @@ from orion.nn.module import Module, timer
 from orion.nn.operations import Mult
 
 
+def _bootstrap_prescale_fusion(module):
+    fusion = getattr(module, "_bootstrap_prescale_fusion", None)
+    if not fusion:
+        return None
+    return {
+        "scale": float(dict(fusion).get("scale", 1.0)),
+        "bias": float(dict(fusion).get("bias", 0.0)),
+    }
+
+
 class Activation(Module):
     def __init__(self, coeffs):
         super().__init__()
@@ -26,7 +36,12 @@ class Activation(Module):
         self.output_scale = output_scale
 
     def compile(self):
-        self.poly = self.scheme.poly_evaluator.generate_monomial(self.coeffs)
+        coeffs = [float(value) for value in (self.coeffs or [])]
+        fusion = _bootstrap_prescale_fusion(self)
+        if fusion is not None and coeffs:
+            coeffs = [float(value) * float(fusion["scale"]) for value in coeffs]
+            coeffs[-1] = float(coeffs[-1]) + float(fusion["bias"])
+        self.poly = self.scheme.poly_evaluator.generate_monomial(coeffs)
 
     @timer
     def forward(self, x):
@@ -101,7 +116,12 @@ class Chebyshev(Module):
         self.output_scale = output_scale
 
     def compile(self):
-        self.poly = self.scheme.poly_evaluator.generate_chebyshev(self.coeffs)
+        coeffs = [float(value) for value in (self.coeffs or [])]
+        fusion = _bootstrap_prescale_fusion(self)
+        if fusion is not None and coeffs:
+            coeffs = [float(value) * float(fusion["scale"]) for value in coeffs]
+            coeffs[0] = float(coeffs[0]) + float(fusion["bias"])
+        self.poly = self.scheme.poly_evaluator.generate_chebyshev(coeffs)
 
     @timer
     def forward(self, x):  

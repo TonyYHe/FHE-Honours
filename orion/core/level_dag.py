@@ -5,6 +5,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from orion.nn.linear import LinearTransform
+from .bootstrap_fusion import bootstrap_prescale_fusion_supported
 
 class LevelDAG(nx.DiGraph):
     """
@@ -236,10 +237,12 @@ class LevelDAG(nx.DiGraph):
         
         # Case 3: Bootstrap required
         if curr_level > prev_level - prev_module.depth:
-            # Bootstrap.forward first applies its sparse prescale plaintext and
-            # rescale before calling the backend bootstrap. Reserve one level
-            # for that prescale so Lattigo does not receive a level-0 input.
-            if prev_level - prev_module.depth <= 1:
+            # Bootstrap.forward normally applies a sparse prescale plaintext
+            # before backend bootstrap, which needs one extra level. Some
+            # producers can fold that affine into their own LT/polynomial
+            # output, so those bootstraps can consume the producer at level 1.
+            min_bootstrap_input_level = 1 if bootstrap_prescale_fusion_supported(prev_module) else 2
+            if prev_level - prev_module.depth < min_bootstrap_input_level:
                 return (float("inf"), 0)
             
             # Analytical fit based on experiments. Once again could benefit

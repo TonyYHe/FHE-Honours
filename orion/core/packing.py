@@ -510,16 +510,23 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
     input_beta = max(0, int(input_layout.get("beta", 0)))
     output_alpha = max(0, int(output_layout.get("alpha", 0)))
     output_beta = max(0, int(output_layout.get("beta", 0)))
+    output_materialization = str(getattr(conv_layer, "layout_policy_output_materialization", "") or "")
+    fuse_output_relayout = output_materialization == "fused_relayout"
 
-    oh_grid, ow_grid = np.meshgrid(
+    target_oh_grid, ow_grid = np.meshgrid(
         np.arange(-int(output_alpha), int(ho + output_beta), dtype=np.int64),
         np.arange(wo, dtype=np.int64),
         indexing="ij",
     )
+    op_oh_grid = (
+        np.clip(target_oh_grid, 0, max(0, int(ho) - 1))
+        if bool(fuse_output_relayout)
+        else target_oh_grid
+    )
     cache = {}
     for kh in range(k_h):
         for kw in range(k_w):
-            ih_grid = oh_grid * int(stride_h) - int(pad_h) + int(kh) * int(dil_h)
+            ih_grid = op_oh_grid * int(stride_h) - int(pad_h) + int(kh) * int(dil_h)
             iw_grid = ow_grid * int(stride_w) - int(pad_w) + int(kw) * int(dil_w)
             valid = (
                 (ih_grid >= -int(input_alpha))
@@ -528,7 +535,7 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
                 & (iw_grid < int(wi))
             )
             cache[(int(kh), int(kw))] = (
-                oh_grid[valid].reshape(-1),
+                target_oh_grid[valid].reshape(-1),
                 ow_grid[valid].reshape(-1),
                 ih_grid[valid].reshape(-1),
                 iw_grid[valid].reshape(-1),

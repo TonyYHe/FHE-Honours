@@ -46,6 +46,8 @@ class Bootstrap(Module):
         self.prescale_ptxt = None
         self._prescale_vec = None
         self._prescale_ptxt_cache = {}
+        self.preprocess_fused = False
+        self.preprocess_fusion_kind = ""
 
     def extra_repr(self):
         l_eff = len(self.scheme.params.get_logq()) - 1
@@ -130,6 +132,8 @@ class Bootstrap(Module):
             "prescale": float(self.prescale),
             "postscale": float(self.postscale),
             "constant": float(self.constant),
+            "preprocess_fused": bool(getattr(self, "preprocess_fused", False)),
+            "preprocess_fusion_kind": str(getattr(self, "preprocess_fusion_kind", "")),
             "cipher": self._debug_cipher_stats(x),
         }
         with open(path, "a", encoding="utf-8") as handle:
@@ -141,11 +145,14 @@ class Bootstrap(Module):
             return x
         
         # Shift and scale into range [-1, 1]. Important caveat -- here we first
-        # shift, then scale. This let's us zero out unused slots and enables
-        # sparse bootstrapping (i.e., where slots < N/2).
-        if self.constant != 0:
-            x += self.constant
-        x *= self._get_prescale_ptxt(x.level())
+        # shift, then scale. This lets us zero out unused slots and enables
+        # sparse bootstrapping (i.e., where slots < N/2). Full-slot producers
+        # that can absorb this affine set preprocess_fused and arrive here
+        # already scaled, saving the plaintext-multiply level.
+        if not bool(getattr(self, "preprocess_fused", False)):
+            if self.constant != 0:
+                x += self.constant
+            x *= self._get_prescale_ptxt(x.level())
  
         slots = int(min(x.slots(), self.bootstrap_slots))
         self._write_bootstrap_debug(phase="before_bootstrap", x=x, slots=slots)

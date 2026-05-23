@@ -20,7 +20,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from orion.core.orion import scheme
 from orion.core import packing
+from orion.backend.python.tensors import CipherTensor
 from orion.backend.python.memory_lifecycle import trim_runtime_memory
+from orion.backend.python.compile_policy import auto_worker_count, policy_audit
 from orion.models.resnet import ResNet18, ResNet20, ResNet34
 from orion.models.unet import UNet22
 from orion.nn.linear import LinearTransform
@@ -74,22 +76,229 @@ def _layout_policy_plaintext_halo_input(x: torch.Tensor, row: dict[str, Any]) ->
     halo[:, :, int(top_rows) : int(top_rows) + int(compact.shape[2]), :] = compact
     if top_rows > 0:
         for h in range(int(top_rows)):
-            source_h = min(int(h), int(compact.shape[2]) - 1)
-            halo[:, :, int(h), :] = compact[:, :, int(source_h), :]
+            halo[:, :, int(h), :] = compact[:, :, 0, :]
     if bottom_rows > 0:
         start = int(top_rows + compact.shape[2])
         for h in range(int(bottom_rows)):
-            source_h = min(max(int(compact.shape[2]) - int(bottom_rows) + int(h), 0), int(compact.shape[2]) - 1)
-            halo[:, :, int(start + h), :] = compact[:, :, int(source_h), :]
+            halo[:, :, int(start + h), :] = compact[:, :, int(compact.shape[2]) - 1, :]
     return halo
 
 
-def _encrypt_model_input(x: torch.Tensor, input_level: int) -> Any:
+def _walk_executor_objects(root: Any):
+    stack = [root]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for attr in ("base_executor", "delegate", "executor"):
+            child = getattr(current, attr, None)
+            if child is not None:
+                stack.append(child)
+
+
+_RUNTIME_FAIRNESS_NUMERIC_KEYS = (
+    "resident_compute_s",
+    "serving_hot_s",
+    "artifact_read_s",
+    "artifact_load_s",
+    "artifact_unload_s",
+    "trim_s",
+    "read_bundle_s",
+    "load_keys_s",
+    "load_plaintexts_s",
+    "eval_s",
+    "eval_total_s",
+    "unload_s",
+)
+
+
+def _append_runtime_group(groups: list[Any], seen: set[int], group: Any) -> None:
+    if group is None or id(group) in seen:
+        return
+    seen.add(id(group))
+    groups.append(group)
+
+
+def _executor_unified_groups(executor: Any) -> list[Any]:
+    groups: list[Any] = []
+    seen: set[int] = set()
+    for candidate in _walk_executor_objects(executor):
+        _append_runtime_group(groups, seen, getattr(candidate, "group", None))
+        for attr in ("groups", "groups_by_input_block", "groups_by_input_chunk", "groups_by_pair"):
+            value = getattr(candidate, attr, None)
+            if isinstance(value, dict):
+                for _key, group in sorted(value.items()):
+                    _append_runtime_group(groups, seen, group)
+            else:
+                for group in list(value or []):
+                    _append_runtime_group(groups, seen, group)
+        groups_by_input_index = getattr(candidate, "groups_by_input_index", None)
+        if isinstance(groups_by_input_index, dict):
+            for _key, group in sorted(groups_by_input_index.items()):
+                _append_runtime_group(groups, seen, group)
+    return groups
+
+
+def _runtime_fairness_mode_from_env() -> str:
+    raw = os.environ.get("ORION_LATTIGO_STREAMING_LT", "")
+    if str(raw).strip().lower() in {"1", "true", "yes", "on", "force", "always"}:
+        return "streaming_eval_encode"
+    return "unknown"
+
+
+def _aggregate_runtime_fairness(timings: list[dict[str, Any]], *, serving_hot_s: float) -> dict[str, Any]:
+    payload: dict[str, Any] = {key: 0.0 for key in _RUNTIME_FAIRNESS_NUMERIC_KEYS}
+    modes: list[str] = []
+    resident_available = True
+    for timing in timings:
+        mode = str(timing.get("runtime_fairness_mode", "unknown") or "unknown")
+        modes.append(mode)
+        if mode == "streaming_eval_encode":
+            resident_available = False
+        for key in _RUNTIME_FAIRNESS_NUMERIC_KEYS:
+            value = timing.get(key)
+            if value is None:
+                if key == "resident_compute_s":
+                    resident_available = False
+                continue
+            try:
+                payload[key] = float(payload.get(key, 0.0)) + float(value)
+            except (TypeError, ValueError):
+                if key == "resident_compute_s":
+                    resident_available = False
+    if not timings:
+        mode = _runtime_fairness_mode_from_env()
+        resident_available = False
+    elif any(mode == "streaming_eval_encode" for mode in modes):
+        mode = "streaming_eval_encode"
+    elif any(mode == "memory_bounded_load_eval" for mode in modes):
+        mode = "memory_bounded_load_eval"
+    elif modes and all(mode == "resident_compute" for mode in modes):
+        mode = "resident_compute"
+    else:
+        mode = "unknown"
+        resident_available = False
+    payload["serving_hot_s"] = float(serving_hot_s)
+    if not resident_available:
+        payload["resident_compute_s"] = None
+    payload["runtime_fairness_mode"] = str(mode)
+    payload["source_count"] = int(len(timings))
+    return payload
+
+
+def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> dict[str, Any]:
+    timings: list[dict[str, Any]] = []
+    for _module_name, module in net.named_modules():
+        executor = getattr(getattr(module, "region_runtime", None), "executor", None)
+        for group in _executor_unified_groups(executor):
+            timing = getattr(group, "last_runtime_timing", None)
+            if isinstance(timing, dict):
+                timings.append(dict(timing))
+    evaluator_timing = getattr(getattr(scheme, "lt_evaluator", None), "last_runtime_timing", None)
+    if isinstance(evaluator_timing, dict) and not timings:
+        timings.append(dict(evaluator_timing))
+    return _aggregate_runtime_fairness(timings, serving_hot_s=float(serving_hot_s))
+
+
+def _model_input_native_halo_plan(net: torch.nn.Module) -> dict[str, Any] | None:
+    for module_name, module in net.named_modules():
+        runtime = getattr(module, "region_runtime", None)
+        executor = getattr(runtime, "executor", None)
+        if runtime is None or executor is None:
+            continue
+        if not bool(getattr(executor, "native_halo_input", False)):
+            continue
+        if tuple(getattr(executor, "relayout_rows", ()) or ()):
+            continue
+        native_rows = tuple(dict(row) for row in (getattr(executor, "native_input_rows", ()) or ()))
+        if not any(str(row.get("source", "")) == "x" for row in native_rows):
+            continue
+        plan_candidates: list[tuple[Any, Any]] = []
+        for candidate in _walk_executor_objects(executor):
+            plan = getattr(candidate, "native_plan", None)
+            if plan is not None and hasattr(plan, "input_ct_count") and hasattr(plan, "stripes"):
+                plan_candidates.append((candidate, plan))
+        if plan_candidates:
+            candidate, plan = next(
+                (
+                    (candidate, plan)
+                    for candidate, plan in plan_candidates
+                    if type(candidate).__name__ == "NativeHaloStripeNoRIConvExecutor"
+                ),
+                plan_candidates[-1],
+            )
+            return {
+                "node": str(getattr(runtime, "module_prefix", "") or getattr(module, "region_output_id", "") or module_name),
+                "module_path": str(module_name),
+                "plan": plan,
+                "native_rows": [dict(row) for row in native_rows],
+                "executor": type(executor).__name__,
+                "native_executor": type(candidate).__name__,
+            }
+    return None
+
+
+def _encrypt_native_halo_model_input(x: torch.Tensor, input_level: int, native_input: dict[str, Any]) -> CipherTensor:
+    from orion.experimental.cir.native_halo_conv2d import native_halo_source_plaintext_blocks_from_nchw
+
+    plan = native_input["plan"]
+    blocks = native_halo_source_plaintext_blocks_from_nchw(x, plan)
+    ids: list[int] = []
+    for block in blocks:
+        ct = scheme.encrypt(scheme.encode(block, int(input_level)))
+        ids.append(int(ct.ids[0]))
+        ct.ids = []
+    slots = int(getattr(plan.spec, "slot_count", scheme.params.get_slots()))
+    return CipherTensor(
+        scheme,
+        ids,
+        torch.Size(tuple(int(value) for value in x.shape)),
+        torch.Size([int(len(ids)), int(slots)]),
+    )
+
+
+def _encrypt_model_input(
+    x: torch.Tensor,
+    input_level: int,
+    *,
+    net: torch.nn.Module | None = None,
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    if net is not None:
+        native_input = _model_input_native_halo_plan(net)
+        if native_input is not None:
+            ct = _encrypt_native_halo_model_input(x, int(input_level), native_input)
+            if payload is not None:
+                plan = native_input["plan"]
+                payload["model_input_encoding"] = {
+                    "kind": "native_halo_plaintext_source_tiles",
+                    "node": str(native_input["node"]),
+                    "module_path": str(native_input["module_path"]),
+                    "executor": str(native_input["executor"]),
+                    "native_executor": str(native_input["native_executor"]),
+                    "input_ct_count": int(len(ct.ids)),
+                    "native_plan_input_ct_count": int(plan.input_ct_count),
+                    "stripe_count": int(len(plan.stripes)),
+                    "source_channel_group_count": int(plan.source_channel_group_count),
+                    "source_channel_tile": int(plan.source_channel_tile),
+                    "slot_count": int(plan.spec.slot_count),
+                }
+            return ct
     row = _layout_policy_input_layout_row()
     if row is None:
         return scheme.encrypt(scheme.encode(x, int(input_level)))
     halo = _layout_policy_plaintext_halo_input(x, row)
-    return scheme.encrypt(scheme.encode(halo, int(input_level)))
+    ct = scheme.encrypt(scheme.encode(halo, int(input_level)))
+    if payload is not None:
+        payload["model_input_encoding"] = {
+            "kind": "flat_halo_plaintext",
+            "input_ct_count": int(len(getattr(ct, "ids", ()) or ())),
+            "layout": dict(row.get("selected_layout", {}) or {}),
+        }
+    return ct
 
 
 def _r20_config(provider_mode: str, *, backend: str = "lattigo") -> dict[str, Any]:
@@ -298,6 +507,32 @@ NETWORKS: dict[str, dict[str, Any]] = {
         ),
         "builder": _build_u22_256_base32,
     },
+    "u22_224_base32": {
+        "label": "U22 224 base32",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "u22_256_base32",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base32,
+    },
+    "u22_192_base32": {
+        "label": "U22 192 base32",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 192, 192),
+        "provider_mode": "u22_256_base32",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base32,
+    },
     "u22_256_base8": {
         "label": "U22 256 base8",
         "model": "UNet22",
@@ -384,42 +619,35 @@ def _configure_cheddar_runtime_defaults() -> dict[str, str]:
     return applied
 
 
-def _host_mem_available_bytes() -> int | None:
-    try:
-        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.startswith("MemAvailable:"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[1]) * 1024
-    except OSError:
-        return None
-    return None
-
-
 def _lattigo_compile_worker_default() -> str:
     cpu_count = max(1, int(os.cpu_count() or 1))
-    target = 4
-    mem_available = _host_mem_available_bytes()
-    if mem_available is not None:
-        if mem_available < 48 * 1024**3:
-            target = 1
-        elif mem_available < 96 * 1024**3:
-            target = 2
-    return str(max(1, min(cpu_count, target)))
+    return str(
+        auto_worker_count(
+            cpu_count,
+            (
+                "ORION_LT_COMPILE_WORKERS",
+                "ORION_UNIFIED_COMPILE_WORKERS",
+                "ORION_LATTIGO_COMPILE_WORKERS",
+                "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
+            ),
+            default_workers=4,
+            estimated_per_worker_bytes=24 * 1024**3,
+            cpu_count=cpu_count,
+        )
+    )
 
 
 def _lattigo_pack_worker_default() -> str:
     cpu_count = max(1, int(os.cpu_count() or 1))
-    target = 8
-    mem_available = _host_mem_available_bytes()
-    if mem_available is not None:
-        if mem_available < 48 * 1024**3:
-            target = 1
-        elif mem_available < 96 * 1024**3:
-            target = 2
-    return str(max(1, min(cpu_count, target)))
+    return str(
+        auto_worker_count(
+            cpu_count,
+            ("ORION_PACK_CONV_WORKERS",),
+            default_workers=8,
+            estimated_per_worker_bytes=8 * 1024**3,
+            cpu_count=cpu_count,
+        )
+    )
 
 
 def _configure_lattigo_runtime_defaults() -> dict[str, str]:
@@ -445,6 +673,8 @@ def _configure_lattigo_runtime_defaults() -> dict[str, str]:
     for name, value in defaults.items():
         os.environ.setdefault(name, value)
         applied[name] = str(os.environ.get(name, ""))
+    applied["ORION_COMPILE_PARALLEL_POLICY"] = os.environ.get("ORION_COMPILE_PARALLEL_POLICY", "auto")
+    applied["compile_parallel_policy_audit"] = json.dumps(policy_audit(), sort_keys=True)
     return applied
 
 
@@ -1300,9 +1530,11 @@ def _run_forward_attempt(
             attempt,
             int(attempt_index),
             "encrypt",
-            lambda: _encrypt_model_input(x0, int(input_level)),
+            lambda: _encrypt_model_input(x0, int(input_level), net=net, payload=payload),
             record_primary_timing=bool(record_primary),
         )
+        attempt["model_input_encoding"] = dict(payload.get("model_input_encoding", {}) or {})
+        attempt["input_ciphertext_count"] = int(len(getattr(x0_ct, "ids", ()) or ()))
         attempt["device_memory_after_encrypt"] = _device_memory_snapshot()
         attempt["live_ciphertexts_after_encrypt"] = _live_ciphertext_snapshot()
         _write(payload, out_path)
@@ -1328,6 +1560,27 @@ def _run_forward_attempt(
                 remove_profile()
         attempt["device_memory_after_he_forward"] = _device_memory_snapshot()
         attempt["live_ciphertexts_after_he_forward"] = _live_ciphertext_snapshot()
+        runtime_fairness = _collect_runtime_fairness(
+            net,
+            serving_hot_s=float(attempt.get("timing_s", {}).get("he_forward", 0.0)),
+        )
+        attempt["runtime_fairness_timing"] = dict(runtime_fairness)
+        attempt["resident_compute_s"] = runtime_fairness.get("resident_compute_s")
+        attempt["serving_hot_s"] = runtime_fairness.get("serving_hot_s")
+        attempt["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
+        attempt["artifact_load_s"] = runtime_fairness.get("artifact_load_s")
+        attempt["artifact_unload_s"] = runtime_fairness.get("artifact_unload_s")
+        attempt["trim_s"] = runtime_fairness.get("trim_s")
+        attempt["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
+        if bool(record_primary):
+            payload["runtime_fairness_timing_after_forward"] = dict(runtime_fairness)
+            payload["resident_compute_s"] = runtime_fairness.get("resident_compute_s")
+            payload["serving_hot_s"] = runtime_fairness.get("serving_hot_s")
+            payload["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
+            payload["artifact_load_s"] = runtime_fairness.get("artifact_load_s")
+            payload["artifact_unload_s"] = runtime_fairness.get("artifact_unload_s")
+            payload["trim_s"] = runtime_fairness.get("trim_s")
+            payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         _write(payload, out_path)
         decoded = _attempt_timed(
             payload,
@@ -1572,6 +1825,15 @@ def _run_one(
                 for key in ("encrypt", "he_forward", "decrypt_decode")
             }
             payload["measured_forward_mean_timing_s"] = dict(payload["forward_mean_timing_s"])
+            runtime_fairness = _mean_runtime_fairness(measured_attempts)
+            payload["measured_runtime_fairness_timing"] = dict(runtime_fairness)
+            payload["resident_compute_s"] = runtime_fairness.get("resident_compute_s")
+            payload["serving_hot_s"] = runtime_fairness.get("serving_hot_s")
+            payload["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
+            payload["artifact_load_s"] = runtime_fairness.get("artifact_load_s")
+            payload["artifact_unload_s"] = runtime_fairness.get("artifact_unload_s")
+            payload["trim_s"] = runtime_fairness.get("trim_s")
+            payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         payload["status"] = "ok"
         payload["step"] = "done"
         payload["phase"] = "done"
@@ -1607,6 +1869,32 @@ def _artifact_runtime(payload: dict[str, Any]) -> float | None:
     return float(sum(float(value) for value in values))
 
 
+def _mean_runtime_fairness(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    if not attempts:
+        return _aggregate_runtime_fairness([], serving_hot_s=0.0)
+    timings = [dict(attempt.get("runtime_fairness_timing", {}) or {}) for attempt in attempts]
+    result: dict[str, Any] = {}
+    for key in _RUNTIME_FAIRNESS_NUMERIC_KEYS:
+        values = [timing.get(key) for timing in timings if timing.get(key) is not None]
+        result[key] = (
+            float(sum(float(value) for value in values) / max(1, len(values)))
+            if values
+            else None
+        )
+    modes = [str(timing.get("runtime_fairness_mode", "unknown") or "unknown") for timing in timings]
+    if any(mode == "streaming_eval_encode" for mode in modes):
+        mode = "streaming_eval_encode"
+    elif any(mode == "memory_bounded_load_eval" for mode in modes):
+        mode = "memory_bounded_load_eval"
+    elif modes and all(mode == "resident_compute" for mode in modes):
+        mode = "resident_compute"
+    else:
+        mode = "unknown"
+    result["runtime_fairness_mode"] = str(mode)
+    result["source_count"] = int(sum(int(timing.get("source_count", 0) or 0) for timing in timings))
+    return result
+
+
 def _he_forward_runtime(payload: dict[str, Any]) -> float:
     timing = (
         payload.get("measured_forward_mean_timing_s")
@@ -1614,6 +1902,45 @@ def _he_forward_runtime(payload: dict[str, Any]) -> float:
         or payload.get("timing_s", {})
     )
     return float(timing.get("he_forward", math.nan))
+
+
+def _runtime_fairness_value(payload: dict[str, Any], key: str) -> float | None:
+    value = payload.get(key)
+    if value is None:
+        timing = (
+            payload.get("measured_runtime_fairness_timing")
+            or payload.get("runtime_fairness_timing_after_forward")
+            or payload.get("runtime_fairness_timing")
+            or {}
+        )
+        if isinstance(timing, dict):
+            value = timing.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _runtime_fairness_mode(payload: dict[str, Any]) -> str:
+    mode = payload.get("runtime_fairness_mode")
+    if mode is None:
+        timing = (
+            payload.get("measured_runtime_fairness_timing")
+            or payload.get("runtime_fairness_timing_after_forward")
+            or payload.get("runtime_fairness_timing")
+            or {}
+        )
+        if isinstance(timing, dict):
+            mode = timing.get("runtime_fairness_mode")
+    return str(mode or "unknown")
+
+
+def _ratio_or_none(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or float(denominator) == 0.0:
+        return None
+    return float(float(numerator) / float(denominator))
 
 
 def _rotation_total(payload: dict[str, Any]) -> int | None:
@@ -1641,6 +1968,24 @@ def _profile_category_seconds(payload: dict[str, Any]) -> dict[str, float]:
 def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict[str, Any]:
     dense = json.loads(Path(dense_path).read_text(encoding="utf-8"))
     provider = json.loads(Path(provider_path).read_text(encoding="utf-8"))
+    dense_runtime_fairness = {
+        "resident_compute_s": _runtime_fairness_value(dense, "resident_compute_s"),
+        "serving_hot_s": _runtime_fairness_value(dense, "serving_hot_s"),
+        "artifact_read_s": _runtime_fairness_value(dense, "artifact_read_s"),
+        "artifact_load_s": _runtime_fairness_value(dense, "artifact_load_s"),
+        "artifact_unload_s": _runtime_fairness_value(dense, "artifact_unload_s"),
+        "trim_s": _runtime_fairness_value(dense, "trim_s"),
+        "runtime_fairness_mode": _runtime_fairness_mode(dense),
+    }
+    provider_runtime_fairness = {
+        "resident_compute_s": _runtime_fairness_value(provider, "resident_compute_s"),
+        "serving_hot_s": _runtime_fairness_value(provider, "serving_hot_s"),
+        "artifact_read_s": _runtime_fairness_value(provider, "artifact_read_s"),
+        "artifact_load_s": _runtime_fairness_value(provider, "artifact_load_s"),
+        "artifact_unload_s": _runtime_fairness_value(provider, "artifact_unload_s"),
+        "trim_s": _runtime_fairness_value(provider, "trim_s"),
+        "runtime_fairness_mode": _runtime_fairness_mode(provider),
+    }
     payload: dict[str, Any] = {
         "status": "ok" if dense.get("status") == "ok" and provider.get("status") == "ok" else "partial",
         "network": provider.get("network", dense.get("network")),
@@ -1661,6 +2006,11 @@ def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict
             "rotation_eval_count_estimate": _rotation_total(dense),
             "bootstrap_count": _bootstrap_count(dense),
             "profile_category_s": _profile_category_seconds(dense),
+            "runtime_fairness_timing": dense.get("measured_runtime_fairness_timing")
+            or dense.get("runtime_fairness_timing_after_forward")
+            or dense.get("runtime_fairness_timing")
+            or {},
+            **dense_runtime_fairness,
         },
         "provider": {
             "status": provider.get("status"),
@@ -1675,6 +2025,11 @@ def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict
             "bootstrap_count": _bootstrap_count(provider),
             "profile_category_s": _profile_category_seconds(provider),
             "attach_audit": provider.get("attach_audit", {}),
+            "runtime_fairness_timing": provider.get("measured_runtime_fairness_timing")
+            or provider.get("runtime_fairness_timing_after_forward")
+            or provider.get("runtime_fairness_timing")
+            or {},
+            **provider_runtime_fairness,
         },
     }
     if dense.get("status") == "ok" and provider.get("status") == "ok":
@@ -1690,15 +2045,19 @@ def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict
         provider_compile = float(provider.get("timing_s", {}).get("compile", math.nan))
         dense_runtime = _artifact_runtime(dense)
         provider_runtime = _artifact_runtime(provider)
+        dense_resident = dense_runtime_fairness["resident_compute_s"]
+        provider_resident = provider_runtime_fairness["resident_compute_s"]
+        dense_serving = dense_runtime_fairness["serving_hot_s"]
+        provider_serving = provider_runtime_fairness["serving_hot_s"]
         payload["ratios"] = {
             "he_forward_dense_over_provider": (
                 float(dense_he / provider_he) if provider_he and math.isfinite(provider_he) else None
             ),
-            "runtime_dense_over_provider": (
-                float(dense_runtime / provider_runtime)
-                if provider_runtime and dense_runtime is not None and math.isfinite(float(provider_runtime))
-                else None
-            ),
+            "runtime_dense_over_provider": _ratio_or_none(dense_resident, provider_resident),
+            "resident_compute_dense_over_provider": _ratio_or_none(dense_resident, provider_resident),
+            "serving_hot_dense_over_provider": _ratio_or_none(dense_serving, provider_serving),
+            "artifact_runtime_dense_over_provider": _ratio_or_none(dense_runtime, provider_runtime),
+            "runtime_speedup_metric": "resident_compute_s",
             "compile_dense_over_provider": (
                 float(dense_compile / provider_compile)
                 if provider_compile and math.isfinite(provider_compile)

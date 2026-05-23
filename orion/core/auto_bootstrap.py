@@ -1,8 +1,12 @@
-import math
 import networkx as nx
 import matplotlib.pyplot as plt
 
 from .level_dag import LevelDAG
+from .bootstrap_fusion import (
+    install_bootstrap_prescale_fusion,
+    module_bootstrap_slots,
+    runtime_fhe_output_shape,
+)
 from orion.nn.operations import Bootstrap
 
 
@@ -229,13 +233,7 @@ class BootstrapSolver:
         # output of this node will be bootstrapped. Therefore it must be an
         # Orion module, and so a module attribute exists.
         module = self.network_dag.nodes[node]["module"]
-        max_slots = module.scheme.params.get_slots()
-        
-        elements = module.fhe_output_shape.numel()
-        curr_slots = 2 ** math.ceil(math.log2(elements))
-        slots = int(min(max_slots, curr_slots)) # sparse bootstrapping
-        
-        return slots
+        return int(module_bootstrap_slots(module))
     
     def plot_shortest_path(self, save_path="", figsize=(10,10)):
         """Plot the network digraph. For the best visualization, please install
@@ -311,16 +309,9 @@ class BootstrapPlacer:
         bootstrapper.fhe_input_shape = self._runtime_fhe_output_shape(module)
         bootstrapper.fit()
         bootstrapper.compile()
+        install_bootstrap_prescale_fusion(module, bootstrapper)
         
         return bootstrapper
 
     def _runtime_fhe_output_shape(self, module):
-        runtime = getattr(module, "region_runtime", None)
-        executor = getattr(runtime, "executor", None) if runtime is not None else None
-        for candidate in (executor, getattr(module, "layout_policy_add_runtime", None)):
-            get_shape = getattr(candidate, "runtime_fhe_output_shape", None)
-            if callable(get_shape):
-                shape = get_shape()
-                if shape is not None:
-                    return shape
-        return module.fhe_output_shape
+        return runtime_fhe_output_shape(module)

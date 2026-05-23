@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orion.backend.python.tensors import CipherTensor
+from orion.backend.python.compile_policy import auto_worker_count, policy_audit
 from orion.core.fuser import Fuser
 from orion.core.network_dag import NetworkDAG
 from orion.core.orion import _region_first_mode_options, scheme
@@ -101,42 +102,35 @@ BOUNDED_LATTIGO_PROVIDER_STREAMING_CHUNK_PLAINTEXTS = "512"
 _ACTIVE_CHEDDAR_BENCH_IO_DIR: Path | None = None
 
 
-def _host_mem_available_bytes() -> int | None:
-    try:
-        with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.startswith("MemAvailable:"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    return int(parts[1]) * 1024
-    except OSError:
-        return None
-    return None
-
-
 def _bounded_lattigo_compile_workers_default() -> str:
     cpu_count = max(1, int(os.cpu_count() or 1))
-    target = 4
-    mem_available = _host_mem_available_bytes()
-    if mem_available is not None:
-        if mem_available < 48 * 1024**3:
-            target = 1
-        elif mem_available < 96 * 1024**3:
-            target = 2
-    return str(max(1, min(cpu_count, target)))
+    return str(
+        auto_worker_count(
+            cpu_count,
+            (
+                "ORION_LT_COMPILE_WORKERS",
+                "ORION_UNIFIED_COMPILE_WORKERS",
+                "ORION_LATTIGO_COMPILE_WORKERS",
+                "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
+            ),
+            default_workers=4,
+            estimated_per_worker_bytes=24 * 1024**3,
+            cpu_count=cpu_count,
+        )
+    )
 
 
 def _bounded_lattigo_pack_workers_default() -> str:
     cpu_count = max(1, int(os.cpu_count() or 1))
-    target = 8
-    mem_available = _host_mem_available_bytes()
-    if mem_available is not None:
-        if mem_available < 48 * 1024**3:
-            target = 1
-        elif mem_available < 96 * 1024**3:
-            target = 2
-    return str(max(1, min(cpu_count, target)))
+    return str(
+        auto_worker_count(
+            cpu_count,
+            ("ORION_PACK_CONV_WORKERS",),
+            default_workers=8,
+            estimated_per_worker_bytes=8 * 1024**3,
+            cpu_count=cpu_count,
+        )
+    )
 
 
 RESNET_LOGQ = (55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40)
@@ -1822,7 +1816,7 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
     groups: list[Any] = []
     seen: set[int] = set()
     _append_group(groups, seen, getattr(executor, "group", None))
-    for attr in ("groups", "groups_by_input_block"):
+    for attr in ("groups", "groups_by_input_block", "groups_by_input_chunk", "groups_by_pair"):
         value = getattr(executor, attr, None)
         if isinstance(value, dict):
             for _key, group in sorted(value.items()):
@@ -1835,6 +1829,106 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
         for _key, group in sorted(groups_by_input_index.items()):
             _append_group(groups, seen, group)
     return groups
+
+
+_RUNTIME_FAIRNESS_NUMERIC_KEYS = (
+    "resident_compute_s",
+    "serving_hot_s",
+    "artifact_read_s",
+    "artifact_load_s",
+    "artifact_unload_s",
+    "trim_s",
+    "read_bundle_s",
+    "load_keys_s",
+    "load_plaintexts_s",
+    "eval_s",
+    "eval_total_s",
+    "unload_s",
+)
+
+
+def _runtime_fairness_mode_from_env() -> str:
+    raw = os.environ.get("ORION_LATTIGO_STREAMING_LT", "")
+    if str(raw).strip().lower() in {"1", "true", "yes", "on", "force", "always"}:
+        return "streaming_eval_encode"
+    return "unknown"
+
+
+def _aggregate_runtime_fairness_timings(timings: list[dict[str, Any]], *, serving_hot_s: float) -> dict[str, Any]:
+    payload: dict[str, Any] = {key: 0.0 for key in _RUNTIME_FAIRNESS_NUMERIC_KEYS}
+    modes: list[str] = []
+    resident_available = True
+    for timing in timings:
+        mode = str(timing.get("runtime_fairness_mode", "unknown") or "unknown")
+        modes.append(mode)
+        if mode == "streaming_eval_encode":
+            resident_available = False
+        for key in _RUNTIME_FAIRNESS_NUMERIC_KEYS:
+            value = timing.get(key)
+            if value is None:
+                if key == "resident_compute_s":
+                    resident_available = False
+                continue
+            try:
+                payload[key] = float(payload.get(key, 0.0)) + float(value)
+            except (TypeError, ValueError):
+                if key == "resident_compute_s":
+                    resident_available = False
+    if not timings:
+        mode = _runtime_fairness_mode_from_env()
+        resident_available = False
+    elif any(mode == "streaming_eval_encode" for mode in modes):
+        mode = "streaming_eval_encode"
+    elif any(mode == "memory_bounded_load_eval" for mode in modes):
+        mode = "memory_bounded_load_eval"
+    elif modes and all(mode == "resident_compute" for mode in modes):
+        mode = "resident_compute"
+    else:
+        mode = "unknown"
+        resident_available = False
+    payload["serving_hot_s"] = float(serving_hot_s)
+    if not resident_available:
+        payload["resident_compute_s"] = None
+    payload["runtime_fairness_mode"] = str(mode)
+    payload["source_count"] = int(len(timings))
+    return payload
+
+
+def _runtime_fairness_for_module(module: Any, *, serving_hot_s: float) -> dict[str, Any]:
+    timings: list[dict[str, Any]] = []
+    layer_timing = getattr(module, "_last_runtime_timing", None)
+    if isinstance(layer_timing, dict):
+        timings.append(dict(layer_timing))
+    evaluator_timing = getattr(getattr(scheme, "lt_evaluator", None), "last_runtime_timing", None)
+    if isinstance(evaluator_timing, dict) and not timings:
+        timings.append(dict(evaluator_timing))
+    executor = getattr(getattr(module, "region_runtime", None), "executor", None)
+    for group in _executor_unified_groups(executor):
+        timing = getattr(group, "last_runtime_timing", None)
+        if isinstance(timing, dict):
+            timings.append(dict(timing))
+    return _aggregate_runtime_fairness_timings(timings, serving_hot_s=float(serving_hot_s))
+
+
+def _mean_runtime_fairness(timings: list[dict[str, Any]]) -> dict[str, Any]:
+    if not timings:
+        return _aggregate_runtime_fairness_timings([], serving_hot_s=0.0)
+    result: dict[str, Any] = {}
+    for key in _RUNTIME_FAIRNESS_NUMERIC_KEYS:
+        values = [item.get(key) for item in timings if item.get(key) is not None]
+        result[key] = _fmean([float(value) for value in values]) if values else None
+    modes = [str(item.get("runtime_fairness_mode", "unknown") or "unknown") for item in timings]
+    if any(mode == "streaming_eval_encode" for mode in modes):
+        mode = "streaming_eval_encode"
+    elif any(mode == "memory_bounded_load_eval" for mode in modes):
+        mode = "memory_bounded_load_eval"
+    elif modes and all(mode == "resident_compute" for mode in modes):
+        mode = "resident_compute"
+    else:
+        mode = "unknown"
+    result["runtime_fairness_mode"] = str(mode)
+    result["source_count"] = int(sum(int(item.get("source_count", 0) or 0) for item in timings))
+    return result
 
 
 def _unified_group_rotation_stats(groups: list[Any], *, family_sharing: bool = True) -> dict[str, Any]:
@@ -2341,6 +2435,8 @@ def _bench_path(
         warmup_operation_counts: list[dict[str, int]] = []
         run_operation_counts: list[dict[str, int]] = []
         executor_timings: list[dict[str, float]] = []
+        warmup_runtime_fairness: list[dict[str, Any]] = []
+        run_runtime_fairness: list[dict[str, Any]] = []
         level = len(scheme.params.get_logq()) - 1
         gen = torch.Generator().manual_seed(int(case["seed"]) + (10000 if bool(stats_as_provider) else 0))
         for index in range(int(warmups) + int(repeats)):
@@ -2359,16 +2455,19 @@ def _bench_path(
             out = module(source)
             _synchronize_backend()
             elapsed = float(time.perf_counter() - started)
+            runtime_fairness = _runtime_fairness_for_module(module, serving_hot_s=float(elapsed))
             operation_counts = _runtime_operation_counters() if bool(counters_enabled) else None
             memory_trace.append(_memory_event(f"after_forward_{index}", module))
             if output_ciphertext_count is None:
                 output_ciphertext_count = int(len(getattr(out, "ids", [])))
             if int(index) < int(warmups):
                 warmup_times.append(float(elapsed))
+                warmup_runtime_fairness.append(dict(runtime_fairness))
                 if operation_counts is not None:
                     warmup_operation_counts.append(dict(operation_counts))
             else:
                 run_times.append(float(elapsed))
+                run_runtime_fairness.append(dict(runtime_fairness))
                 if operation_counts is not None:
                     run_operation_counts.append(dict(operation_counts))
                 executor = getattr(getattr(module, "region_runtime", None), "executor", None)
@@ -2386,6 +2485,7 @@ def _bench_path(
             "first_run": dict(first_runtime_counts),
             "mean_per_run": _mean_operation_counters(run_operation_counts),
         }
+        runtime_fairness_timing = _mean_runtime_fairness(run_runtime_fairness)
 
         result = {
             "status": "ok",
@@ -2412,6 +2512,16 @@ def _bench_path(
             "hot_run_mean_s": _fmean(run_times),
             "hot_run_stdev_s": _stdev(run_times),
             "hot_run_median_s": float(statistics.median(run_times)) if run_times else 0.0,
+            "serving_hot_s": runtime_fairness_timing.get("serving_hot_s"),
+            "resident_compute_s": runtime_fairness_timing.get("resident_compute_s"),
+            "artifact_read_s": runtime_fairness_timing.get("artifact_read_s"),
+            "artifact_load_s": runtime_fairness_timing.get("artifact_load_s"),
+            "artifact_unload_s": runtime_fairness_timing.get("artifact_unload_s"),
+            "trim_s": runtime_fairness_timing.get("trim_s"),
+            "runtime_fairness_mode": str(runtime_fairness_timing.get("runtime_fairness_mode", "unknown")),
+            "runtime_fairness_timing": dict(runtime_fairness_timing),
+            "runtime_fairness_per_warmup": [dict(item) for item in warmup_runtime_fairness],
+            "runtime_fairness_per_run": [dict(item) for item in run_runtime_fairness],
             "rotation_stats": rotation_stats,
             "rotation_eval_count": int(rotation_stats.get("rotation_eval_count", 0)),
             "runtime_operation_counts": runtime_operation_counts,
@@ -2421,72 +2531,72 @@ def _bench_path(
             "runtime_conjugation_count": int(first_runtime_counts.get("conjugation", 0)),
             "source_ciphertext_count": int(source_count),
             "output_ciphertext_count": None if output_ciphertext_count is None else int(output_ciphertext_count),
-                "module": _module_metadata(module),
-                "attach_audit": dict(attach_audit) if bool(provider) else {},
-                "provider_fallback_audit": dict(provider_fallback_audit),
-                "no_hybrid_audit": dict(no_hybrid_audit),
-                "no_family_audit": {
-                    "enabled": bool(no_family_ablation),
-                    "env": "ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1" if bool(no_family_ablation) else "",
-                    "mode": (
-                        "unified_lt_individual_eval_no_family_sharing_bsgs_preserved"
-                        if bool(no_family_ablation)
-                        else ""
-                    ),
-                },
-                "no_tile_family_audit": {
-                    "enabled": bool(no_tile_family_ablation),
-                    "env": (
-                        "ORION_U22_DISABLE_TILE_FAMILY_SHARING=1"
-                        if bool(no_tile_family_ablation)
-                        else ""
-                    ),
-                    "mode": (
-                        "u22_tconv_independent_tile_bsgs_no_family_cache"
-                        if bool(no_tile_family_ablation)
-                        else ""
-                    ),
-                },
-                "effective_backend_path": "dense" if bool(uses_dense_baseline) else str(path_kind),
-                "memory_trace": memory_trace,
-                "unified_group_memory_trace": _unified_group_memory_traces(module),
-                "orion_io_mode": str(scheme.params.get_io_mode()),
-                "diags_path": str(scheme.params.get_diags_path()),
-                "keys_path": str(scheme.params.get_keys_path()),
-                "bounded_lattigo_dense_audit": {
-                    "enabled": _truthy_env_value(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_ACTIVE")),
-                    "mode": str(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_MODE_ACTIVE", "")),
-                    "compile_batch_transforms": str(os.environ.get("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", "")),
-                    "lt_compile_workers": str(os.environ.get("ORION_LT_COMPILE_WORKERS", "")),
-                    "lattigo_compile_workers": str(os.environ.get("ORION_LATTIGO_COMPILE_WORKERS", "")),
-                    "streaming_lt": str(os.environ.get("ORION_LATTIGO_STREAMING_LT", "")),
-                    "streaming_lt_chunk_plaintexts": str(
-                        os.environ.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
-                    ),
-                    "saved_io_prefetch_lookahead": str(os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
-                },
-                "bounded_lattigo_provider_audit": {
-                    "enabled": _truthy_env_value(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_ACTIVE")),
-                    "mode": str(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_MODE_ACTIVE", "")),
-                    "compile_workers": str(os.environ.get("ORION_UNIFIED_COMPILE_WORKERS", "")),
-                    "stream_compile_batch_transforms": str(
-                        os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "")
-                    ),
-                    "stream_compile_batch_gb": str(os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "")),
-                    "stream_load_plaintexts": str(os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
-                    "stream_load_chunk_gb": str(os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
-                    "save_encoded_plaintexts": str(os.environ.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "")),
-                    "saved_io_prefetch_lookahead": str(os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
-                    "eval_budget_bytes": str(os.environ.get("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES", "")),
-                    "lattigo_streaming_lt": str(os.environ.get("ORION_LATTIGO_STREAMING_LT", "")),
-                    "lattigo_streaming_lt_chunk_plaintexts": str(
-                        os.environ.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
-                    ),
-                    "unified_stream_compile_io_none": str(
-                        os.environ.get("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "")
-                    ),
-                },
-            }
+            "module": _module_metadata(module),
+            "attach_audit": dict(attach_audit) if bool(provider) else {},
+            "provider_fallback_audit": dict(provider_fallback_audit),
+            "no_hybrid_audit": dict(no_hybrid_audit),
+            "no_family_audit": {
+                "enabled": bool(no_family_ablation),
+                "env": "ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1" if bool(no_family_ablation) else "",
+                "mode": (
+                    "unified_lt_individual_eval_no_family_sharing_bsgs_preserved"
+                    if bool(no_family_ablation)
+                    else ""
+                ),
+            },
+            "no_tile_family_audit": {
+                "enabled": bool(no_tile_family_ablation),
+                "env": (
+                    "ORION_U22_DISABLE_TILE_FAMILY_SHARING=1"
+                    if bool(no_tile_family_ablation)
+                    else ""
+                ),
+                "mode": (
+                    "u22_tconv_independent_tile_bsgs_no_family_cache"
+                    if bool(no_tile_family_ablation)
+                    else ""
+                ),
+            },
+            "effective_backend_path": "dense" if bool(uses_dense_baseline) else str(path_kind),
+            "memory_trace": memory_trace,
+            "unified_group_memory_trace": _unified_group_memory_traces(module),
+            "orion_io_mode": str(scheme.params.get_io_mode()),
+            "diags_path": str(scheme.params.get_diags_path()),
+            "keys_path": str(scheme.params.get_keys_path()),
+            "bounded_lattigo_dense_audit": {
+                "enabled": _truthy_env_value(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_ACTIVE")),
+                "mode": str(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_MODE_ACTIVE", "")),
+                "compile_batch_transforms": str(os.environ.get("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", "")),
+                "lt_compile_workers": str(os.environ.get("ORION_LT_COMPILE_WORKERS", "")),
+                "lattigo_compile_workers": str(os.environ.get("ORION_LATTIGO_COMPILE_WORKERS", "")),
+                "streaming_lt": str(os.environ.get("ORION_LATTIGO_STREAMING_LT", "")),
+                "streaming_lt_chunk_plaintexts": str(
+                    os.environ.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
+                ),
+                "saved_io_prefetch_lookahead": str(os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
+            },
+            "bounded_lattigo_provider_audit": {
+                "enabled": _truthy_env_value(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_ACTIVE")),
+                "mode": str(os.environ.get("ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_MODE_ACTIVE", "")),
+                "compile_workers": str(os.environ.get("ORION_UNIFIED_COMPILE_WORKERS", "")),
+                "stream_compile_batch_transforms": str(
+                    os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "")
+                ),
+                "stream_compile_batch_gb": str(os.environ.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "")),
+                "stream_load_plaintexts": str(os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
+                "stream_load_chunk_gb": str(os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
+                "save_encoded_plaintexts": str(os.environ.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "")),
+                "saved_io_prefetch_lookahead": str(os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
+                "eval_budget_bytes": str(os.environ.get("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES", "")),
+                "lattigo_streaming_lt": str(os.environ.get("ORION_LATTIGO_STREAMING_LT", "")),
+                "lattigo_streaming_lt_chunk_plaintexts": str(
+                    os.environ.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
+                ),
+                "unified_stream_compile_io_none": str(
+                    os.environ.get("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "")
+                ),
+            },
+        }
         executor = getattr(getattr(module, "region_runtime", None), "executor", None)
         if executor is not None:
             result["executor"] = type(executor).__name__
@@ -2537,6 +2647,22 @@ def _speedup(numerator: float | int, denominator: float | int) -> float | None:
     return float(float(numerator) / denominator)
 
 
+def _resident_runtime_value(result: dict[str, Any]) -> float | None:
+    value = result.get("resident_compute_s")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _speedup_or_none(left: float | None, right: float | None) -> float | None:
+    if left is None or right is None:
+        return None
+    return _speedup(float(left), float(right))
+
+
 def _summarize_case(case_payload: dict[str, Any]) -> None:
     paths = dict(case_payload.get("paths", {}))
     dense_entry = dict(paths.get("dense", {}))
@@ -2553,6 +2679,8 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
         return
     dense_mean = float(dense["hot_run_mean_s"])
     provider_mean = float(provider["hot_run_mean_s"])
+    dense_resident = _resident_runtime_value(dense)
+    provider_resident = _resident_runtime_value(provider)
     dense_rotations = int(dense.get("rotation_eval_count", 0))
     provider_rotations = int(provider.get("rotation_eval_count", 0))
     dense_runtime_rotations = int(dense.get("runtime_rotation_eval_count", 0) or 0)
@@ -2561,13 +2689,21 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
     deltas: dict[str, Any] = {
         "compile_s_provider_minus_dense": float(provider["compile_s"] - dense["compile_s"]),
         "hot_run_mean_s_provider_minus_dense": float(provider_mean - dense_mean),
+        "resident_compute_s_provider_minus_dense": (
+            None
+            if dense_resident is None or provider_resident is None
+            else float(provider_resident - dense_resident)
+        ),
         "rotation_eval_count_provider_minus_dense": int(provider_rotations - dense_rotations),
         "runtime_rotation_eval_count_provider_minus_dense": int(
             provider_runtime_rotations - dense_runtime_rotations
         ),
     }
     speedups: dict[str, Any] = {
-        "time_dense_over_provider": _speedup(dense_mean, provider_mean),
+        "time_dense_over_provider": _speedup_or_none(dense_resident, provider_resident),
+        "resident_compute_dense_over_provider": _speedup_or_none(dense_resident, provider_resident),
+        "serving_hot_dense_over_provider": _speedup(dense_mean, provider_mean),
+        "time_speedup_metric": "resident_compute_s",
         "rotation_dense_over_provider": _speedup(dense_rotations, provider_rotations),
         "runtime_rotation_dense_over_provider": _speedup(
             dense_runtime_rotations,
@@ -2596,23 +2732,41 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
             case_payload["status"] = "partial"
             return
         no_hybrid_mean = float(no_hybrid["hot_run_mean_s"])
+        no_hybrid_resident = _resident_runtime_value(no_hybrid)
         no_hybrid_rotations = int(no_hybrid.get("rotation_eval_count", 0))
         deltas.update(
             {
                 "compile_s_provider_no_hybrid_minus_dense": float(no_hybrid["compile_s"] - dense["compile_s"]),
                 "hot_run_mean_s_provider_no_hybrid_minus_dense": float(no_hybrid_mean - dense_mean),
+                "resident_compute_s_provider_no_hybrid_minus_dense": (
+                    None
+                    if dense_resident is None or no_hybrid_resident is None
+                    else float(no_hybrid_resident - dense_resident)
+                ),
                 "rotation_eval_count_provider_no_hybrid_minus_dense": int(no_hybrid_rotations - dense_rotations),
                 "compile_s_provider_no_hybrid_minus_provider": float(no_hybrid["compile_s"] - provider["compile_s"]),
                 "hot_run_mean_s_provider_no_hybrid_minus_provider": float(no_hybrid_mean - provider_mean),
+                "resident_compute_s_provider_no_hybrid_minus_provider": (
+                    None
+                    if provider_resident is None or no_hybrid_resident is None
+                    else float(no_hybrid_resident - provider_resident)
+                ),
                 "rotation_eval_count_provider_no_hybrid_minus_provider": int(no_hybrid_rotations - provider_rotations),
             }
         )
         speedups.update(
             {
-                "time_dense_over_provider_no_hybrid": _speedup(dense_mean, no_hybrid_mean),
+                "time_dense_over_provider_no_hybrid": _speedup_or_none(dense_resident, no_hybrid_resident),
+                "resident_compute_dense_over_provider_no_hybrid": _speedup_or_none(dense_resident, no_hybrid_resident),
+                "serving_hot_dense_over_provider_no_hybrid": _speedup(dense_mean, no_hybrid_mean),
                 "rotation_dense_over_provider_no_hybrid": _speedup(dense_rotations, no_hybrid_rotations),
                 "compile_dense_over_provider_no_hybrid": _speedup(float(dense["compile_s"]), float(no_hybrid["compile_s"])),
-                "time_provider_no_hybrid_over_provider": _speedup(no_hybrid_mean, provider_mean),
+                "time_provider_no_hybrid_over_provider": _speedup_or_none(no_hybrid_resident, provider_resident),
+                "resident_compute_provider_no_hybrid_over_provider": _speedup_or_none(
+                    no_hybrid_resident,
+                    provider_resident,
+                ),
+                "serving_hot_provider_no_hybrid_over_provider": _speedup(no_hybrid_mean, provider_mean),
                 "rotation_provider_no_hybrid_over_provider": _speedup(no_hybrid_rotations, provider_rotations),
                 "compile_provider_no_hybrid_over_provider": _speedup(float(no_hybrid["compile_s"]), float(provider["compile_s"])),
             }
@@ -2632,23 +2786,41 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
             case_payload["status"] = "partial"
             return
         no_family_mean = float(no_family["hot_run_mean_s"])
+        no_family_resident = _resident_runtime_value(no_family)
         no_family_rotations = int(no_family.get("rotation_eval_count", 0))
         deltas.update(
             {
                 "compile_s_provider_no_family_minus_dense": float(no_family["compile_s"] - dense["compile_s"]),
                 "hot_run_mean_s_provider_no_family_minus_dense": float(no_family_mean - dense_mean),
+                "resident_compute_s_provider_no_family_minus_dense": (
+                    None
+                    if dense_resident is None or no_family_resident is None
+                    else float(no_family_resident - dense_resident)
+                ),
                 "rotation_eval_count_provider_no_family_minus_dense": int(no_family_rotations - dense_rotations),
                 "compile_s_provider_no_family_minus_provider": float(no_family["compile_s"] - provider["compile_s"]),
                 "hot_run_mean_s_provider_no_family_minus_provider": float(no_family_mean - provider_mean),
+                "resident_compute_s_provider_no_family_minus_provider": (
+                    None
+                    if provider_resident is None or no_family_resident is None
+                    else float(no_family_resident - provider_resident)
+                ),
                 "rotation_eval_count_provider_no_family_minus_provider": int(no_family_rotations - provider_rotations),
             }
         )
         speedups.update(
             {
-                "time_dense_over_provider_no_family": _speedup(dense_mean, no_family_mean),
+                "time_dense_over_provider_no_family": _speedup_or_none(dense_resident, no_family_resident),
+                "resident_compute_dense_over_provider_no_family": _speedup_or_none(dense_resident, no_family_resident),
+                "serving_hot_dense_over_provider_no_family": _speedup(dense_mean, no_family_mean),
                 "rotation_dense_over_provider_no_family": _speedup(dense_rotations, no_family_rotations),
                 "compile_dense_over_provider_no_family": _speedup(float(dense["compile_s"]), float(no_family["compile_s"])),
-                "time_provider_no_family_over_provider": _speedup(no_family_mean, provider_mean),
+                "time_provider_no_family_over_provider": _speedup_or_none(no_family_resident, provider_resident),
+                "resident_compute_provider_no_family_over_provider": _speedup_or_none(
+                    no_family_resident,
+                    provider_resident,
+                ),
+                "serving_hot_provider_no_family_over_provider": _speedup(no_family_mean, provider_mean),
                 "rotation_provider_no_family_over_provider": _speedup(no_family_rotations, provider_rotations),
                 "compile_provider_no_family_over_provider": _speedup(float(no_family["compile_s"]), float(provider["compile_s"])),
             }
@@ -2668,6 +2840,7 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
             case_payload["status"] = "partial"
             return
         only_halo_mean = float(only_halo["hot_run_mean_s"])
+        only_halo_resident = _resident_runtime_value(only_halo)
         only_halo_rotations = int(only_halo.get("rotation_eval_count", 0))
         deltas.update(
             {
@@ -2676,6 +2849,11 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
                 ),
                 "hot_run_mean_s_provider_no_family_no_hybrid_minus_dense": float(
                     only_halo_mean - dense_mean
+                ),
+                "resident_compute_s_provider_no_family_no_hybrid_minus_dense": (
+                    None
+                    if dense_resident is None or only_halo_resident is None
+                    else float(only_halo_resident - dense_resident)
                 ),
                 "rotation_eval_count_provider_no_family_no_hybrid_minus_dense": int(
                     only_halo_rotations - dense_rotations
@@ -2686,6 +2864,11 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
                 "hot_run_mean_s_provider_no_family_no_hybrid_minus_provider": float(
                     only_halo_mean - provider_mean
                 ),
+                "resident_compute_s_provider_no_family_no_hybrid_minus_provider": (
+                    None
+                    if provider_resident is None or only_halo_resident is None
+                    else float(only_halo_resident - provider_resident)
+                ),
                 "rotation_eval_count_provider_no_family_no_hybrid_minus_provider": int(
                     only_halo_rotations - provider_rotations
                 ),
@@ -2693,7 +2876,12 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
         )
         speedups.update(
             {
-                "time_dense_over_provider_no_family_no_hybrid": _speedup(dense_mean, only_halo_mean),
+                "time_dense_over_provider_no_family_no_hybrid": _speedup_or_none(dense_resident, only_halo_resident),
+                "resident_compute_dense_over_provider_no_family_no_hybrid": _speedup_or_none(
+                    dense_resident,
+                    only_halo_resident,
+                ),
+                "serving_hot_dense_over_provider_no_family_no_hybrid": _speedup(dense_mean, only_halo_mean),
                 "rotation_dense_over_provider_no_family_no_hybrid": _speedup(
                     dense_rotations,
                     only_halo_rotations,
@@ -2702,10 +2890,15 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
                     float(dense["compile_s"]),
                     float(only_halo["compile_s"]),
                 ),
-                "time_provider_no_family_no_hybrid_over_provider": _speedup(
-                    only_halo_mean,
-                    provider_mean,
+                "time_provider_no_family_no_hybrid_over_provider": _speedup_or_none(
+                    only_halo_resident,
+                    provider_resident,
                 ),
+                "resident_compute_provider_no_family_no_hybrid_over_provider": _speedup_or_none(
+                    only_halo_resident,
+                    provider_resident,
+                ),
+                "serving_hot_provider_no_family_no_hybrid_over_provider": _speedup(only_halo_mean, provider_mean),
                 "rotation_provider_no_family_no_hybrid_over_provider": _speedup(
                     only_halo_rotations,
                     provider_rotations,
@@ -2731,26 +2924,50 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
             case_payload["status"] = "partial"
             return
         no_tile_mean = float(no_tile["hot_run_mean_s"])
+        no_tile_resident = _resident_runtime_value(no_tile)
         no_tile_rotations = int(no_tile.get("rotation_eval_count", 0))
         deltas.update(
             {
                 "compile_s_provider_no_tile_family_sharing_minus_dense": float(no_tile["compile_s"] - dense["compile_s"]),
                 "hot_run_mean_s_provider_no_tile_family_sharing_minus_dense": float(no_tile_mean - dense_mean),
+                "resident_compute_s_provider_no_tile_family_sharing_minus_dense": (
+                    None
+                    if dense_resident is None or no_tile_resident is None
+                    else float(no_tile_resident - dense_resident)
+                ),
                 "rotation_eval_count_provider_no_tile_family_sharing_minus_dense": int(no_tile_rotations - dense_rotations),
                 "compile_s_provider_no_tile_family_sharing_minus_provider": float(no_tile["compile_s"] - provider["compile_s"]),
                 "hot_run_mean_s_provider_no_tile_family_sharing_minus_provider": float(no_tile_mean - provider_mean),
+                "resident_compute_s_provider_no_tile_family_sharing_minus_provider": (
+                    None
+                    if provider_resident is None or no_tile_resident is None
+                    else float(no_tile_resident - provider_resident)
+                ),
                 "rotation_eval_count_provider_no_tile_family_sharing_minus_provider": int(no_tile_rotations - provider_rotations),
             }
         )
         speedups.update(
             {
-                "time_dense_over_provider_no_tile_family_sharing": _speedup(dense_mean, no_tile_mean),
+                "time_dense_over_provider_no_tile_family_sharing": _speedup_or_none(dense_resident, no_tile_resident),
+                "resident_compute_dense_over_provider_no_tile_family_sharing": _speedup_or_none(
+                    dense_resident,
+                    no_tile_resident,
+                ),
+                "serving_hot_dense_over_provider_no_tile_family_sharing": _speedup(dense_mean, no_tile_mean),
                 "rotation_dense_over_provider_no_tile_family_sharing": _speedup(dense_rotations, no_tile_rotations),
                 "compile_dense_over_provider_no_tile_family_sharing": _speedup(
                     float(dense["compile_s"]),
                     float(no_tile["compile_s"]),
                 ),
-                "time_provider_no_tile_family_sharing_over_provider": _speedup(no_tile_mean, provider_mean),
+                "time_provider_no_tile_family_sharing_over_provider": _speedup_or_none(
+                    no_tile_resident,
+                    provider_resident,
+                ),
+                "resident_compute_provider_no_tile_family_sharing_over_provider": _speedup_or_none(
+                    no_tile_resident,
+                    provider_resident,
+                ),
+                "serving_hot_provider_no_tile_family_sharing_over_provider": _speedup(no_tile_mean, provider_mean),
                 "rotation_provider_no_tile_family_sharing_over_provider": _speedup(no_tile_rotations, provider_rotations),
                 "compile_provider_no_tile_family_sharing_over_provider": _speedup(
                     float(no_tile["compile_s"]),
@@ -2871,6 +3088,8 @@ def _run_worker(
             "enabled": True,
             "mode": str(bounded_mode),
             "policy": str(env.get(BOUNDED_LATTIGO_DENSE_ENV, "auto")),
+            "compile_parallel_policy": str(env.get("ORION_COMPILE_PARALLEL_POLICY", "auto")),
+            "compile_parallel_policy_audit": policy_audit(),
             "compile_batch_transforms": str(env.get("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", "")),
             "pack_conv_workers": str(env.get("ORION_PACK_CONV_WORKERS", "")),
             "lt_compile_workers": str(env.get("ORION_LT_COMPILE_WORKERS", "")),
@@ -3020,6 +3239,8 @@ def _run_worker(
             "enabled": True,
             "mode": str(provider_mode),
             "policy": str(env.get(BOUNDED_LATTIGO_PROVIDER_ENV, "auto")),
+            "compile_parallel_policy": str(env.get("ORION_COMPILE_PARALLEL_POLICY", "auto")),
+            "compile_parallel_policy_audit": policy_audit(),
             "io_root": str(worker_lattigo_provider_io_root),
             "base_io_root": str(base_io_root),
             "io_mode": str(env.get(LATTIGO_BENCH_IO_MODE_ENV, "none")),
@@ -3307,7 +3528,15 @@ def _flatten_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "op": str(case["op"]),
                 "dense_mean_s": float(dense["hot_run_mean_s"]),
                 "provider_mean_s": float(provider["hot_run_mean_s"]),
+                "dense_resident_compute_s": dense.get("resident_compute_s"),
+                "provider_resident_compute_s": provider.get("resident_compute_s"),
+                "dense_runtime_fairness_mode": dense.get("runtime_fairness_mode"),
+                "provider_runtime_fairness_mode": provider.get("runtime_fairness_mode"),
                 "time_speedup_dense_over_provider": case["speedup"]["time_dense_over_provider"],
+                "serving_hot_speedup_dense_over_provider": case["speedup"].get("serving_hot_dense_over_provider"),
+                "resident_compute_speedup_dense_over_provider": case["speedup"].get(
+                    "resident_compute_dense_over_provider"
+                ),
                 "dense_rotations": int(dense["rotation_eval_count"]),
                 "provider_rotations": int(provider["rotation_eval_count"]),
                 "rotation_speedup_dense_over_provider": case["speedup"]["rotation_dense_over_provider"],
@@ -3452,6 +3681,14 @@ CSV_COLUMNS = (
     "hot_run_stdev_s",
     "hot_run_median_s",
     "hot_run_s_json",
+    "serving_hot_s",
+    "resident_compute_s",
+    "artifact_read_s",
+    "artifact_load_s",
+    "artifact_unload_s",
+    "trim_s",
+    "runtime_fairness_mode",
+    "runtime_fairness_timing_json",
     "rotation_eval_count",
     "runtime_rotation_eval_count",
     "runtime_lintrans_rotation_eval_count",
@@ -3476,6 +3713,8 @@ CSV_COLUMNS = (
     "source_ciphertext_count",
     "output_ciphertext_count",
     "time_speedup_dense_over_provider",
+    "serving_hot_speedup_dense_over_provider",
+    "resident_compute_speedup_dense_over_provider",
     "rotation_speedup_dense_over_provider",
     "runtime_rotation_speedup_dense_over_provider",
     "compile_speedup_dense_over_provider",
@@ -3561,6 +3800,10 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "worker_wall_s": path_entry.get("worker_wall_s", ""),
                     "command_json": path_entry.get("command", ""),
                     "time_speedup_dense_over_provider": speedup.get("time_dense_over_provider"),
+                    "serving_hot_speedup_dense_over_provider": speedup.get("serving_hot_dense_over_provider"),
+                    "resident_compute_speedup_dense_over_provider": speedup.get(
+                        "resident_compute_dense_over_provider"
+                    ),
                     "rotation_speedup_dense_over_provider": speedup.get("rotation_dense_over_provider"),
                     "runtime_rotation_speedup_dense_over_provider": speedup.get(
                         "runtime_rotation_dense_over_provider"
@@ -3643,6 +3886,14 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "hot_run_stdev_s": result.get("hot_run_stdev_s"),
                             "hot_run_median_s": result.get("hot_run_median_s"),
                             "hot_run_s_json": result.get("hot_run_s", ()),
+                            "serving_hot_s": result.get("serving_hot_s"),
+                            "resident_compute_s": result.get("resident_compute_s"),
+                            "artifact_read_s": result.get("artifact_read_s"),
+                            "artifact_load_s": result.get("artifact_load_s"),
+                            "artifact_unload_s": result.get("artifact_unload_s"),
+                            "trim_s": result.get("trim_s"),
+                            "runtime_fairness_mode": result.get("runtime_fairness_mode"),
+                            "runtime_fairness_timing_json": result.get("runtime_fairness_timing", {}),
                             "rotation_eval_count": result.get("rotation_eval_count"),
                             "runtime_rotation_eval_count": result.get("runtime_rotation_eval_count"),
                             "runtime_lintrans_rotation_eval_count": result.get(

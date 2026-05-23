@@ -236,6 +236,22 @@ class LattigoLibrary:
                 restype=ArrayResultUInt64,
             )
 
+        reset_operation_counters = getattr(self.lib, "ResetOperationCounters", None)
+        if reset_operation_counters is not None:
+            self.ResetOperationCounters = LattigoFunction(
+                reset_operation_counters,
+                argtypes=[],
+                restype=None,
+            )
+
+        operation_counters = getattr(self.lib, "GetOperationCounters", None)
+        if operation_counters is not None:
+            self.GetOperationCounters = LattigoFunction(
+                operation_counters,
+                argtypes=[],
+                restype=ArrayResultUInt64,
+            )
+
         self.FreeCArray = LattigoFunction(
             self.lib.FreeCArray,
             argtypes=[ctypes.c_void_p],

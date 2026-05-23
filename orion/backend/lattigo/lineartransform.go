@@ -2,6 +2,7 @@ package main
 
 import (
 	"C"
+	"fmt"
 	"math"
 	"os"
 	"runtime"
@@ -17,6 +18,7 @@ import (
 	"github.com/realqhc/lattigo/v6/ring"
 	"github.com/realqhc/lattigo/v6/ring/ringqp"
 	"github.com/realqhc/lattigo/v6/schemes/ckks"
+	"github.com/realqhc/lattigo/v6/utils"
 )
 
 var ltHeap = NewHeapAllocator()
@@ -41,6 +43,29 @@ func ltCompileWorkerCount(n int) int {
 	}
 	workers := runtime.GOMAXPROCS(0)
 	if raw := os.Getenv("ORION_LATTIGO_COMPILE_WORKERS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			workers = parsed
+		}
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	return workers
+}
+
+func ltDiagonalEncodeWorkerCount(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if raw := os.Getenv("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			workers = parsed
+		}
+	} else if raw := os.Getenv("ORION_LATTIGO_COMPILE_WORKERS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			workers = parsed
 		}
@@ -319,7 +344,7 @@ func (state *lattigoStreamingLTState) encodeChunk(keys []int) lintrans.LinearTra
 	}
 	chunk := state.shell
 	chunk.Vec = vec
-	if err := lintrans.Encode(scheme.Encoder, state.chunkDiagonals(keys), chunk); err != nil {
+	if err := encodeSingleCKKSTransformDiagonalsParallel(state.chunkDiagonals(keys), chunk); err != nil {
 		panic(err)
 	}
 	return chunk
@@ -492,16 +517,64 @@ func buildFloatDiagonalsFromC(
 	return diagonals
 }
 
-func encodeFloatTransformsParallel(
-	diagonalsList []lintrans.Diagonals[float64],
-	transforms []lintrans.LinearTransformation,
+type diagonalEncodeJob struct {
+	key int
+	rot int
+	vec ringqp.Poly
+}
+
+type diagonalEncodeBatchJob struct {
+	transform int
+	key       int
+	rot       int
+	vec       ringqp.Poly
+}
+
+func encodeSingleCKKSTransformDiagonalsParallel[T ckks.Float](
+	diagonals lintrans.Diagonals[T],
+	transform lintrans.LinearTransformation,
 ) error {
-	n := len(transforms)
-	if n == 0 {
-		return nil
+	commonTransform := commonlintrans.LinearTransformation(transform)
+	commonDiagonals := commonlintrans.Diagonals[T](diagonals)
+	rows := 1 << commonTransform.LogDimensions.Rows
+	cols := 1 << commonTransform.LogDimensions.Cols
+
+	jobs := make([]diagonalEncodeJob, 0, len(commonDiagonals))
+	if commonTransform.N1 == 0 {
+		for _, diagKey := range commonDiagonals.DiagonalsIndexList() {
+			vecKey := diagKey
+			if vecKey < 0 {
+				vecKey += cols
+			}
+			vec, ok := commonTransform.Vec[vecKey]
+			if !ok {
+				return fmt.Errorf("cannot Encode: error encoding on LinearTransformation: plaintext diagonal [%d] does not exist", vecKey)
+			}
+			jobs = append(jobs, diagonalEncodeJob{key: diagKey, rot: 0, vec: vec})
+		}
+	} else {
+		index, _, _ := commonTransform.BSGSIndex()
+		for j := range index {
+			rot := -j & (cols - 1)
+			for _, i := range index[j] {
+				diagKey := i + j
+				vec, ok := commonTransform.Vec[diagKey]
+				if !ok {
+					return fmt.Errorf("cannot Encode: error encoding on LinearTransformation BSGS: input does not match the same non-zero diagonals")
+				}
+				jobs = append(jobs, diagonalEncodeJob{key: diagKey, rot: rot, vec: vec})
+			}
+		}
 	}
-	workers := ltCompileWorkerCount(n)
-	jobs := make(chan int, n)
+
+	workers := ltDiagonalEncodeWorkerCount(len(jobs))
+	if workers <= 1 {
+		return lintrans.Encode(ckks.NewEncoder(*scheme.Params), diagonals, transform)
+	}
+
+	metaData := *commonTransform.MetaData
+	metaData.Scale = commonTransform.Scale
+	jobCh := make(chan diagonalEncodeJob, len(jobs))
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
@@ -511,8 +584,26 @@ func encodeFloatTransformsParallel(
 		go func() {
 			defer wg.Done()
 			encoder := ckks.NewEncoder(*scheme.Params)
-			for idx := range jobs {
-				if err := lintrans.Encode(encoder, diagonalsList[idx], transforms[idx]); err != nil {
+			workerMetaData := metaData
+			buf := make([]T, rows*cols)
+			for job := range jobCh {
+				values, err := commonDiagonals.At(job.key, cols)
+				if err != nil {
+					once.Do(func() {
+						firstErr = fmt.Errorf("cannot Encode: %w", err)
+					})
+					continue
+				}
+				embedValues := values
+				if job.rot != 0 {
+					for row := 0; row < rows; row++ {
+						start := row * cols
+						end := start + cols
+						utils.RotateSliceAllocFree(values[start:end], job.rot, buf[start:end])
+					}
+					embedValues = buf
+				}
+				if err := encoder.Embed(embedValues, &workerMetaData, job.vec); err != nil {
 					once.Do(func() {
 						firstErr = err
 					})
@@ -520,12 +611,147 @@ func encodeFloatTransformsParallel(
 			}
 		}()
 	}
-	for i := 0; i < n; i++ {
-		jobs <- i
+
+	for _, job := range jobs {
+		jobCh <- job
 	}
-	close(jobs)
+	close(jobCh)
 	wg.Wait()
 	return firstErr
+}
+
+func encodeCKKSTransformsDiagonalsParallel[T ckks.Float](
+	diagonalsList []lintrans.Diagonals[T],
+	transforms []lintrans.LinearTransformation,
+) error {
+	n := len(transforms)
+	if n == 0 {
+		return nil
+	}
+	if n == 1 {
+		return encodeSingleCKKSTransformDiagonalsParallel(diagonalsList[0], transforms[0])
+	}
+	commonTransforms := make([]commonlintrans.LinearTransformation, n)
+	commonDiagonals := make([]commonlintrans.Diagonals[T], n)
+	rowsByTransform := make([]int, n)
+	colsByTransform := make([]int, n)
+	jobs := make([]diagonalEncodeBatchJob, 0)
+	maxValuesLen := 0
+	for transformIndex := 0; transformIndex < n; transformIndex++ {
+		commonTransform := commonlintrans.LinearTransformation(transforms[transformIndex])
+		commonDiagonal := commonlintrans.Diagonals[T](diagonalsList[transformIndex])
+		commonTransforms[transformIndex] = commonTransform
+		commonDiagonals[transformIndex] = commonDiagonal
+		rows := 1 << commonTransform.LogDimensions.Rows
+		cols := 1 << commonTransform.LogDimensions.Cols
+		rowsByTransform[transformIndex] = rows
+		colsByTransform[transformIndex] = cols
+		if rows*cols > maxValuesLen {
+			maxValuesLen = rows * cols
+		}
+		if commonTransform.N1 == 0 {
+			for _, diagKey := range commonDiagonal.DiagonalsIndexList() {
+				vecKey := diagKey
+				if vecKey < 0 {
+					vecKey += cols
+				}
+				vec, ok := commonTransform.Vec[vecKey]
+				if !ok {
+					return fmt.Errorf("cannot Encode: error encoding on LinearTransformation: plaintext diagonal [%d] does not exist", vecKey)
+				}
+				jobs = append(jobs, diagonalEncodeBatchJob{
+					transform: transformIndex,
+					key:       diagKey,
+					rot:       0,
+					vec:       vec,
+				})
+			}
+		} else {
+			index, _, _ := commonTransform.BSGSIndex()
+			for j := range index {
+				rot := -j & (cols - 1)
+				for _, i := range index[j] {
+					diagKey := i + j
+					vec, ok := commonTransform.Vec[diagKey]
+					if !ok {
+						return fmt.Errorf("cannot Encode: error encoding on LinearTransformation BSGS: input does not match the same non-zero diagonals")
+					}
+					jobs = append(jobs, diagonalEncodeBatchJob{
+						transform: transformIndex,
+						key:       diagKey,
+						rot:       rot,
+						vec:       vec,
+					})
+				}
+			}
+		}
+	}
+
+	workers := ltDiagonalEncodeWorkerCount(len(jobs))
+	if workers <= 1 {
+		for idx := 0; idx < n; idx++ {
+			if err := encodeSingleCKKSTransformDiagonalsParallel(diagonalsList[idx], transforms[idx]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	jobCh := make(chan diagonalEncodeBatchJob, len(jobs))
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			encoder := ckks.NewEncoder(*scheme.Params)
+			buf := make([]T, maxValuesLen)
+			for job := range jobCh {
+				transformIndex := int(job.transform)
+				commonTransform := commonTransforms[transformIndex]
+				rows := rowsByTransform[transformIndex]
+				cols := colsByTransform[transformIndex]
+				values, err := commonDiagonals[transformIndex].At(job.key, cols)
+				if err != nil {
+					once.Do(func() {
+						firstErr = fmt.Errorf("cannot Encode: %w", err)
+					})
+					continue
+				}
+				embedValues := values
+				if job.rot != 0 {
+					for row := 0; row < rows; row++ {
+						start := row * cols
+						end := start + cols
+						utils.RotateSliceAllocFree(values[start:end], job.rot, buf[start:end])
+					}
+					embedValues = buf[:rows*cols]
+				}
+				workerMetaData := *commonTransform.MetaData
+				workerMetaData.Scale = commonTransform.Scale
+				if err := encoder.Embed(embedValues, &workerMetaData, job.vec); err != nil {
+					once.Do(func() {
+						firstErr = err
+					})
+				}
+			}
+		}()
+	}
+	for _, job := range jobs {
+		jobCh <- job
+	}
+	close(jobCh)
+	wg.Wait()
+	return firstErr
+}
+
+func encodeFloatTransformsParallel(
+	diagonalsList []lintrans.Diagonals[float64],
+	transforms []lintrans.LinearTransformation,
+) error {
+	return encodeCKKSTransformsDiagonalsParallel(diagonalsList, transforms)
 }
 
 func encodeUnifiedFloatTransformsParallel(
@@ -539,36 +765,7 @@ func encodeUnifiedComplexTransformsParallel(
 	diagonalsList []lintrans.Diagonals[complex128],
 	transforms []lintrans.LinearTransformation,
 ) error {
-	n := len(transforms)
-	if n == 0 {
-		return nil
-	}
-	workers := ltCompileWorkerCount(n)
-	jobs := make(chan int, n)
-	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
-
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			encoder := ckks.NewEncoder(*scheme.Params)
-			for idx := range jobs {
-				if err := lintrans.Encode(encoder, diagonalsList[idx], transforms[idx]); err != nil {
-					once.Do(func() {
-						firstErr = err
-					})
-				}
-			}
-		}()
-	}
-	for i := 0; i < n; i++ {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
-	return firstErr
+	return encodeCKKSTransformsDiagonalsParallel(diagonalsList, transforms)
 }
 
 func optimalUnifiedBSGSLogRatio(params []lintrans.Parameters) int {

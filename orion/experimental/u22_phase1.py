@@ -19,6 +19,7 @@ from orion.experimental.cir.hybrid_schedule import (
 )
 from orion.experimental.cir.lattigo_block import _idx_chw_gap_tensor
 from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+from orion.experimental.cir.native_halo_conv2d import NativeHaloRelayoutKernel
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
 from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.nn.linear import Conv2d, ConvTranspose2d
@@ -307,6 +308,8 @@ def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node:
     for row in compile_plan.get("edge_layouts", []):
         if str(row.get("target")) != str(node) or not bool(row.get("relayout", False)):
             continue
+        if str(row.get("physical_layout", "")) == "native_source_stripe":
+            continue
         layout = dict(row.get("selected_layout", {}))
         if (
             str(row.get("op_kind", "")) != "add"
@@ -327,6 +330,8 @@ def _layout_policy_incoming_native_rows(compile_plan: dict[str, Any], *, node: s
     for row in compile_plan.get("edge_layouts", []):
         if str(row.get("target")) != str(node):
             continue
+        if str(row.get("physical_layout", "")) != "native_source_stripe":
+            continue
         if str(row.get("op_kind", "conv2d")) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
             continue
         layout = dict(row.get("selected_layout", {}))
@@ -345,9 +350,28 @@ def _layout_policy_incoming_compact_align_shared_rows(
     for row in compile_plan.get("edge_layouts", []):
         if str(row.get("target")) != str(node):
             continue
-        if str(row.get("layout_mode", "")) != "compact_align_shared":
+        if str(row.get("layout_mode", "")) not in {"compact_align_shared", "compact_halo_shared"}:
             continue
         if bool(row.get("relayout", False)):
+            continue
+        rows.append(dict(row))
+    return tuple(rows)
+
+
+def _layout_policy_incoming_compact_source_rows(
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+) -> tuple[dict[str, Any], ...]:
+    rows = []
+    for row in compile_plan.get("edge_layouts", []):
+        if str(row.get("target")) != str(node):
+            continue
+        if bool(row.get("relayout", False)):
+            continue
+        if str(row.get("op_kind", "conv2d")) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
+            continue
+        if str(row.get("physical_layout", "")) not in {"packed_compact", "logical_halo_compact"}:
             continue
         rows.append(dict(row))
     return tuple(rows)
@@ -452,6 +476,170 @@ def _layout_policy_native_halo_input_supported(base_executor: Any, relayout_rows
     return int(layout.get("gap", getattr(module, "input_gap", 1))) == int(getattr(module, "input_gap", 1))
 
 
+def _layout_policy_native_module_attrs(
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    base_executor: Any,
+    native_input_rows: tuple[dict[str, Any], ...],
+    compact_input_rows: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
+    attrs: dict[str, Any] = {}
+    input_rows = tuple(native_input_rows) if native_input_rows else tuple(compact_input_rows)
+    if input_rows:
+        row = dict(input_rows[0])
+        layout = dict(row.get("selected_layout", {}))
+        required_layout = dict(row.get("required_layout", layout) or layout)
+        gap = max(1, int(layout.get("gap", 1)))
+        alpha = max(0, int(layout.get("alpha", 0)))
+        attrs.update(
+            {
+                "fhe_input_shape": _layout_policy_halo_on_shape(row),
+                "layout_policy_input_row_offset": int(alpha * gap),
+                "layout_policy_input_layout": dict(layout),
+                "layout_policy_required_input_layout": dict(required_layout),
+                "layout_policy_input_physical_layout": str(row.get("physical_layout", "")),
+            }
+        )
+    if bool(getattr(base_executor, "native_halo_output_capable", False)):
+        output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
+        if output_row is not None:
+            output_layout = dict(output_row.get("selected_layout", {}))
+            output_gap = max(1, int(output_layout.get("gap", 1)))
+            output_alpha = max(0, int(output_layout.get("alpha", 0)))
+            attrs.update(
+                {
+                    "fhe_output_shape": _layout_policy_halo_on_shape(output_row),
+                    "layout_policy_output_row_offset": int(output_alpha * output_gap),
+                    "layout_policy_output_layout": dict(output_layout),
+                }
+            )
+            if bool(output_row.get("producer_materialized_halo", False)) or str(
+                output_row.get("physical_layout", "")
+            ) == "logical_halo_compact":
+                attrs["layout_policy_output_materialization"] = "fused_relayout"
+    return attrs
+
+
+def _layout_policy_with_base_executor_attrs(base_executor: Any, attrs: dict[str, Any], callback: Any) -> Any:
+    module = getattr(base_executor, "module", None)
+    if not attrs or module is None:
+        return callback()
+    saved = {name: getattr(module, name, _MISSING) for name in attrs}
+    base_saved = {
+        name: getattr(base_executor, name, _MISSING)
+        for name in attrs
+        if hasattr(base_executor, name)
+    }
+    try:
+        for name, value in attrs.items():
+            setattr(module, name, value)
+            if name in base_saved:
+                setattr(base_executor, name, value)
+        return callback()
+    finally:
+        for name, value in saved.items():
+            if value is _MISSING:
+                try:
+                    delattr(module, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(module, name, value)
+        for name, value in base_saved.items():
+            if value is _MISSING:
+                try:
+                    delattr(base_executor, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(base_executor, name, value)
+
+
+def _layout_policy_native_halo_plan(
+    base_executor: Any,
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    native_input_rows: tuple[dict[str, Any], ...],
+) -> Any | None:
+    attrs = _layout_policy_native_module_attrs(
+        compile_plan,
+        node=str(node),
+        base_executor=base_executor,
+        native_input_rows=native_input_rows,
+    )
+
+    def _read_plan() -> Any | None:
+        delegate = getattr(base_executor, "delegate", base_executor)
+        refresh = getattr(delegate, "_refresh_runtime_plan", None)
+        if callable(refresh):
+            refresh()
+        return getattr(delegate, "native_plan", None)
+
+    return _layout_policy_with_base_executor_attrs(base_executor, attrs, _read_plan)
+
+
+def _layout_policy_native_input_ct_count(
+    base_executor: Any,
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    native_input_rows: tuple[dict[str, Any], ...],
+) -> int:
+    plan = _layout_policy_native_halo_plan(
+        base_executor,
+        compile_plan,
+        node=str(node),
+        native_input_rows=native_input_rows,
+    )
+    try:
+        return int(getattr(plan, "input_ct_count"))
+    except Exception:
+        return 0
+
+
+def _layout_policy_native_physical_relayout_rows(
+    base_executor: Any,
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    native_input_rows: tuple[dict[str, Any], ...],
+    relayout_rows: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    if not _layout_policy_native_halo_input_supported(base_executor, native_input_rows):
+        return ()
+    if len(native_input_rows) != 1:
+        return ()
+    row = dict(native_input_rows[0])
+    if str(row.get("source", "")) == "x" and not relayout_rows:
+        return ()
+    source_node = str(row.get("source", ""))
+    native_count = _layout_policy_native_input_ct_count(
+        base_executor,
+        compile_plan,
+        node=str(node),
+        native_input_rows=native_input_rows,
+    )
+    native_source_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+    if (
+        source_node
+        and int(native_count) > 0
+        and int(native_source_counts.get(source_node, -1)) == int(native_count)
+        and not relayout_rows
+    ):
+        return ()
+    layout = dict(row.get("selected_layout", {}))
+    logical_count = max(1, int(layout.get("tile_count", 1) or 1))
+    if relayout_rows or int(native_count) > 0:
+        updated = dict(row)
+        updated["relayout_reason"] = "native_halo_physical_source_stripe_relayout"
+        updated["logical_tile_count"] = int(logical_count)
+        updated["native_input_ct_count"] = int(native_count)
+        return (updated,)
+    return ()
+
+
 def _flat_nchw_index(n: int, c: int, h: int, w: int, shape: torch.Size) -> int:
     return int(((int(n) * int(shape[1]) + int(c)) * int(shape[2]) + int(h)) * int(shape[3]) + int(w))
 
@@ -486,6 +674,9 @@ class LayoutPolicyRelayoutKernel:
         self.output_on_shape = self.fhe_output_shape
         self.level: int | None = None
         self.bsgs_ratio = 2.0
+        self.output_scale = 1.0
+        self.output_bias = 0.0
+        self._bias_ptxt_cache: dict[tuple[int, int], Any] = {}
         self.name = (
             f"layout_policy_relayout_{self.node}_{self.index}_"
             f"{self.direction}_{str(self.edge_row.get('source', 'src'))}_to_{str(self.edge_row.get('target', 'dst'))}"
@@ -613,7 +804,7 @@ class LayoutPolicyRelayoutKernel:
             if diag is None:
                 diag = torch.zeros((int(slots),), dtype=torch.float32)
                 block[int(diag_index)] = diag
-            diag[int(output_local)] = 1.0
+            diag[int(output_local)] = float(self.output_scale)
         self.level = int(level)
         self.diagonals = diagonals
         self.transform_ids = {
@@ -621,10 +812,29 @@ class LayoutPolicyRelayoutKernel:
             for (row, col), transform_id in scheme.lt_evaluator.generate_transforms(self).items()
         }
 
+    def _bias_plaintext(self, output_ct: Any) -> Any | None:
+        bias = float(getattr(self, "output_bias", 0.0) or 0.0)
+        if float(bias) == 0.0:
+            return None
+        level = int(output_ct.level())
+        scale = max(1, int(output_ct.scale()))
+        key = (int(level), int(scale))
+        cached = self._bias_ptxt_cache.get(key)
+        if cached is not None:
+            return cached
+        values = torch.full(tuple(int(value) for value in self.fhe_output_shape), float(bias), dtype=torch.float32)
+        ptxt = output_ct.scheme.encode(values, level=int(level), scale=int(scale))
+        self._bias_ptxt_cache[key] = ptxt
+        return ptxt
+
     def apply(self, source_ct: Any) -> Any:
         if not self.transform_ids:
             raise RuntimeError(f"layout-policy relayout kernel {self.name} has not been compiled")
-        return source_ct.scheme.lt_evaluator.evaluate_transforms(self, source_ct)
+        out = source_ct.scheme.lt_evaluator.evaluate_transforms(self, source_ct)
+        bias_ptxt = self._bias_plaintext(out)
+        if bias_ptxt is not None:
+            out = _add_plaintext_for_add(out, bias_ptxt)
+        return out
 
     def cleanup(self, backend: Any | None) -> None:
         delete = getattr(backend, "DeleteLinearTransform", None)
@@ -636,6 +846,11 @@ class LayoutPolicyRelayoutKernel:
                     pass
         self.transform_ids = {}
         self.diagonals = {}
+        for ptxt in self._bias_ptxt_cache.values():
+            release = getattr(ptxt, "release", None)
+            if callable(release):
+                release()
+        self._bias_ptxt_cache = {}
 
 
 class LayoutPolicyEncryptedModuleRuntimeExecutor:
@@ -851,6 +1066,10 @@ class LayoutPolicyProviderRuntimeExecutor:
         self.execute_count = 0
         self.relayout_rows = _layout_policy_incoming_relayout_rows(self.compile_plan, node=self.output_node_id)
         self.native_input_rows = _layout_policy_incoming_native_rows(self.compile_plan, node=self.output_node_id)
+        self.compact_source_rows = _layout_policy_incoming_compact_source_rows(
+            self.compile_plan,
+            node=self.output_node_id,
+        )
         self.compact_align_shared_rows = _layout_policy_incoming_compact_align_shared_rows(
             self.compile_plan,
             node=self.output_node_id,
@@ -859,6 +1078,14 @@ class LayoutPolicyProviderRuntimeExecutor:
         self.relayout_kernels: list[LayoutPolicyRelayoutKernel] = []
         self.output_relayout_kernels: list[LayoutPolicyRelayoutKernel] = []
         self.native_halo_input = _layout_policy_native_halo_input_supported(self.base_executor, self.native_input_rows)
+        self.native_physical_relayout_rows = _layout_policy_native_physical_relayout_rows(
+            self.base_executor,
+            self.compile_plan,
+            node=self.output_node_id,
+            native_input_rows=self.native_input_rows,
+            relayout_rows=self.relayout_rows,
+        )
+        self.native_physical_relayout_kernel: NativeHaloRelayoutKernel | None = None
         self.last_runtime_timing: dict[str, float] = {"relayout_s": 0.0}
         self.last_runtime_io: dict[str, Any] = {}
         self._compiled = False
@@ -873,7 +1100,7 @@ class LayoutPolicyProviderRuntimeExecutor:
         base_supports = getattr(self.base_executor, "supports_scheme", lambda _scheme: True)
         if not bool(base_supports(scheme)):
             return False
-        if not self.relayout_rows and not self.output_relayout_rows:
+        if not self.relayout_rows and not self.output_relayout_rows and not self.native_physical_relayout_rows:
             return True
         if bool(self.native_halo_input):
             backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
@@ -887,43 +1114,57 @@ class LayoutPolicyProviderRuntimeExecutor:
     def _runtime_lowering_label(self) -> str:
         if bool(self.native_halo_input):
             return "provider_executable+native_halo_layout"
+        if _layout_policy_native_output_row(self.compile_plan, node=self.output_node_id) is not None:
+            return "provider_executable+native_halo_output_layout"
         if self.compact_align_shared_rows:
             return "provider_executable+compact_align_shared"
         if not self.relayout_rows and not self.output_relayout_rows:
             return "provider_executable+compact_layout"
         return "provider_executable+relayout_lt"
 
+    def _bootstrap_prescale_fusion_spec(self) -> dict[str, float] | None:
+        fusion = self.__dict__.get("_bootstrap_prescale_fusion", None)
+        if not fusion:
+            return None
+        return {
+            "scale": float(dict(fusion).get("scale", 1.0)),
+            "bias": float(dict(fusion).get("bias", 0.0)),
+        }
+
+    def bootstrap_prescale_fusion_capable(self) -> bool:
+        if self.output_relayout_rows:
+            return True
+        module = getattr(self.base_executor, "module", None)
+        return bool(module is not None and hasattr(module, "on_weight") and hasattr(module, "on_bias"))
+
     def _native_halo_module_attrs(self) -> dict[str, Any]:
-        attrs: dict[str, Any] = {}
-        if bool(self.native_halo_input) and self.native_input_rows:
-            row = dict(self.native_input_rows[0])
-            layout = dict(row.get("selected_layout", {}))
-            gap = max(1, int(layout.get("gap", 1)))
-            alpha = max(0, int(layout.get("alpha", 0)))
-            attrs.update(
-                {
-                    "fhe_input_shape": _layout_policy_halo_on_shape(row),
-                    "layout_policy_input_row_offset": int(alpha * gap),
-                    "layout_policy_input_layout": dict(layout),
-                }
-            )
-        if bool(getattr(self.base_executor, "native_halo_output_capable", False)):
-            output_row = _layout_policy_native_output_row(self.compile_plan, node=self.output_node_id)
-            if output_row is not None:
-                output_layout = dict(output_row.get("selected_layout", {}))
-                output_gap = max(1, int(output_layout.get("gap", 1)))
-                output_alpha = max(0, int(output_layout.get("alpha", 0)))
-                attrs.update(
-                    {
-                        "fhe_output_shape": _layout_policy_halo_on_shape(output_row),
-                        "layout_policy_output_row_offset": int(output_alpha * output_gap),
-                        "layout_policy_output_layout": dict(output_layout),
-                    }
-                )
-        return attrs
+        return _layout_policy_native_module_attrs(
+            self.compile_plan,
+            node=self.output_node_id,
+            base_executor=self.base_executor,
+            native_input_rows=self.native_input_rows,
+            compact_input_rows=tuple([*self.compact_source_rows, *self.compact_align_shared_rows]),
+        )
+
+    def _bootstrap_prescale_module_attrs(self) -> dict[str, Any]:
+        fusion = self._bootstrap_prescale_fusion_spec()
+        if fusion is None or self.output_relayout_rows:
+            return {}
+        module = getattr(self.base_executor, "module", None)
+        if module is None or not hasattr(module, "on_weight") or not hasattr(module, "on_bias"):
+            return {}
+        scale = float(fusion["scale"])
+        bias = float(fusion["bias"])
+        return {
+            "on_weight": getattr(module, "on_weight") * float(scale),
+            "on_bias": getattr(module, "on_bias") * float(scale) + float(bias),
+        }
 
     def _with_base_module_attrs(self, callback: Any) -> Any:
-        attrs = self._native_halo_module_attrs()
+        attrs = {
+            **self._native_halo_module_attrs(),
+            **self._bootstrap_prescale_module_attrs(),
+        }
         module = getattr(self.base_executor, "module", None)
         if not attrs or module is None:
             return callback()
@@ -963,15 +1204,30 @@ class LayoutPolicyProviderRuntimeExecutor:
             return
         self._with_base_module_attrs(lambda: compile_base(scheme))
 
+    def _native_halo_plan(self) -> Any:
+        plan = _layout_policy_native_halo_plan(
+            self.base_executor,
+            self.compile_plan,
+            node=self.output_node_id,
+            native_input_rows=self.native_input_rows,
+        )
+        if plan is None:
+            raise RuntimeError(f"{self.output_node_id} has no native halo plan for physical relayout")
+        return plan
+
     def runtime_fhe_output_shape(self) -> Any:
+        if self.output_relayout_rows:
+            row = dict(self.output_relayout_rows[-1])
+            layout = dict(row.get("target_layout", row.get("selected_layout", {})) or {})
+            return _layout_policy_on_shape(row, layout)
+        attrs = self._native_halo_module_attrs()
+        if "fhe_output_shape" in attrs:
+            return attrs["fhe_output_shape"]
         if bool(self.native_halo_input) and bool(getattr(self.base_executor, "native_halo_output_capable", False)):
             get_native_shape = getattr(self.base_executor, "runtime_native_fhe_output_shape", None)
             if callable(get_native_shape):
                 return self._with_base_module_attrs(lambda: get_native_shape())
         module = getattr(self.base_executor, "module", None)
-        attrs = self._native_halo_module_attrs()
-        if "fhe_output_shape" in attrs:
-            return attrs["fhe_output_shape"]
         if module is not None:
             return getattr(module, "fhe_output_shape", None)
         return getattr(self.base_executor, "fhe_output_shape", None)
@@ -982,7 +1238,11 @@ class LayoutPolicyProviderRuntimeExecutor:
         if not self.supports_scheme(scheme):
             raise RuntimeError("layout-policy provider executor received an unsupported backend")
         current_level = int(self.assigned_level) if self.assigned_level is not None else int(len(scheme.params.get_logq()) - 1)
-        input_relayout_depth = int(len(self.relayout_rows) if bool(self.native_halo_input) else 2 * len(self.relayout_rows))
+        native_physical_relayout_depth = int(len(self.native_physical_relayout_rows))
+        input_relayout_depth = int(
+            (len(self.relayout_rows) if bool(self.native_halo_input) else 2 * len(self.relayout_rows))
+            + int(native_physical_relayout_depth)
+        )
         output_relayout_depth = int(len(self.output_relayout_rows))
         relayout_depth = int(input_relayout_depth + output_relayout_depth)
         if self.assigned_depth is not None:
@@ -998,6 +1258,7 @@ class LayoutPolicyProviderRuntimeExecutor:
             )
         self.relayout_kernels = []
         self.output_relayout_kernels = []
+        self.native_physical_relayout_kernel = None
         for row_index, row in enumerate(self.relayout_rows):
             pad_kernel = LayoutPolicyRelayoutKernel(
                 edge_row=row,
@@ -1019,6 +1280,20 @@ class LayoutPolicyProviderRuntimeExecutor:
             trim_kernel.compile(scheme, level=int(current_level))
             self.relayout_kernels.append(trim_kernel)
             current_level = max(0, int(current_level - 1))
+        if self.native_physical_relayout_rows:
+            native_plan = self._native_halo_plan()
+            slots = int(scheme.params.get_slots())
+            native_kernel = NativeHaloRelayoutKernel(
+                plan=native_plan,
+                direction="compact_to_native",
+                name=f"layout_policy_native_physical_relayout_{self.output_node_id}",
+                output_shape=torch.Size([int(native_plan.input_ct_count), int(slots)]),
+                fhe_output_shape=torch.Size([int(native_plan.input_ct_count), int(slots)]),
+                source_layout=dict(self.native_physical_relayout_rows[0].get("source_layout", {}) or {}),
+            )
+            native_kernel.compile(scheme, level=int(current_level))
+            self.native_physical_relayout_kernel = native_kernel
+            current_level = max(0, int(current_level - 1))
         if hasattr(self.base_executor, "assigned_level"):
             self.base_executor.assigned_level = int(current_level)
         if hasattr(self.base_executor, "assigned_depth"):
@@ -1032,6 +1307,10 @@ class LayoutPolicyProviderRuntimeExecutor:
                 direction="compact_to_halo",
                 index=int(1000 + row_index),
             )
+            fusion = self._bootstrap_prescale_fusion_spec()
+            if fusion is not None and int(row_index) == int(len(self.output_relayout_rows) - 1):
+                post_kernel.output_scale = float(fusion["scale"])
+                post_kernel.output_bias = float(fusion["bias"])
             post_kernel.compile(scheme, level=int(post_level))
             self.output_relayout_kernels.append(post_kernel)
             post_level = max(0, int(post_level - 1))
@@ -1050,6 +1329,11 @@ class LayoutPolicyProviderRuntimeExecutor:
         for kernel in self.relayout_kernels:
             working_ct = kernel.apply(working_ct)
             temp_cts.append(working_ct)
+        native_physical_relayout_applied = False
+        if self.native_physical_relayout_kernel is not None:
+            working_ct = self.native_physical_relayout_kernel.apply(working_ct)
+            temp_cts.append(working_ct)
+            native_physical_relayout_applied = True
         relayout_s = float(time.time() - relayout_started)
         try:
             outputs = dict(self._with_base_module_attrs(lambda: self.base_executor(working_ct)))
@@ -1071,7 +1355,11 @@ class LayoutPolicyProviderRuntimeExecutor:
             base_timing = dict(getattr(self.base_executor, "last_runtime_timing", {}) or {})
             base_io = dict(getattr(self.base_executor, "last_runtime_io", {}) or {})
             relayout_ops = _layout_policy_relayout_operation_totals(
-                [*self.relayout_kernels, *self.output_relayout_kernels]
+                [
+                    *self.relayout_kernels,
+                    *([self.native_physical_relayout_kernel] if self.native_physical_relayout_kernel is not None else []),
+                    *self.output_relayout_kernels,
+                ]
             )
             self.last_runtime_timing = {
                 **base_timing,
@@ -1084,14 +1372,25 @@ class LayoutPolicyProviderRuntimeExecutor:
                 "backend": self._backend_name(scheme),
                 "provider_executor": type(self.base_executor).__name__,
                 "native_halo_provider": bool(self.native_halo_input),
-                "relayout_kernel": bool(self.relayout_kernels or self.output_relayout_kernels),
-                "relayout_kernel_count": int(len(self.relayout_kernels) + len(self.output_relayout_kernels)),
+                "relayout_kernel": bool(
+                    self.relayout_kernels
+                    or self.native_physical_relayout_kernel is not None
+                    or self.output_relayout_kernels
+                ),
+                "relayout_kernel_count": int(
+                    len(self.relayout_kernels)
+                    + int(self.native_physical_relayout_kernel is not None)
+                    + len(self.output_relayout_kernels)
+                ),
                 "relayout_edge_count": int(len(self.relayout_rows)),
+                "native_physical_relayout_edge_count": int(len(self.native_physical_relayout_rows)),
+                "native_physical_relayout_applied": bool(native_physical_relayout_applied),
                 "compact_align_shared_edge_count": int(len(self.compact_align_shared_rows)),
                 "output_relayout_edge_count": int(len(self.output_relayout_rows)),
                 "relayout_rotation_count": int(relayout_ops["rotation_count"]),
                 "relayout_mask_mult_count": int(relayout_ops["mask_mult_count"]),
                 "relayout_sparse_lt_count": int(relayout_ops["sparse_lt_count"]),
+                "bootstrap_prescale_fused": bool(self._bootstrap_prescale_fusion_spec() is not None),
             }
             return outputs
         finally:
@@ -1104,8 +1403,11 @@ class LayoutPolicyProviderRuntimeExecutor:
         target_backend = backend if backend is not None else self._compiled_backend
         for kernel in [*self.relayout_kernels, *self.output_relayout_kernels]:
             kernel.cleanup(target_backend)
+        if self.native_physical_relayout_kernel is not None:
+            self.native_physical_relayout_kernel.cleanup(target_backend)
         self.relayout_kernels = []
         self.output_relayout_kernels = []
+        self.native_physical_relayout_kernel = None
         cleanup_base = getattr(self.base_executor, "cleanup", None)
         if callable(cleanup_base) and target_backend is not None:
             cleanup_base(target_backend)
@@ -1125,22 +1427,49 @@ class LayoutPolicyProviderRuntimeExecutor:
         metadata["layout_policy_wrapper"] = {
             "policy": str(self.compile_plan.get("policy", "")),
             "relayout_edge_count": int(len(self.relayout_rows)),
+            "native_physical_relayout_edge_count": int(len(self.native_physical_relayout_rows)),
             "compact_align_shared_edge_count": int(len(self.compact_align_shared_rows)),
             "output_relayout_edge_count": int(len(self.output_relayout_rows)),
             "relayout_kernel_count": int(
                 (len(self.relayout_rows) if bool(self.native_halo_input) else 2 * len(self.relayout_rows))
+                + len(self.native_physical_relayout_rows)
                 + len(self.output_relayout_rows)
             ),
             "relayout_rotation_count": int(
-                _layout_policy_relayout_operation_totals([*self.relayout_kernels, *self.output_relayout_kernels])["rotation_count"]
+                _layout_policy_relayout_operation_totals(
+                    [
+                        *self.relayout_kernels,
+                        *(
+                            [self.native_physical_relayout_kernel]
+                            if self.native_physical_relayout_kernel is not None
+                            else []
+                        ),
+                        *self.output_relayout_kernels,
+                    ]
+                )["rotation_count"]
             ),
             "relayout_mask_mult_count": int(
-                _layout_policy_relayout_operation_totals([*self.relayout_kernels, *self.output_relayout_kernels])["mask_mult_count"]
+                _layout_policy_relayout_operation_totals(
+                    [
+                        *self.relayout_kernels,
+                        *(
+                            [self.native_physical_relayout_kernel]
+                            if self.native_physical_relayout_kernel is not None
+                            else []
+                        ),
+                        *self.output_relayout_kernels,
+                    ]
+                )["mask_mult_count"]
             ),
             "base_executor": type(self.base_executor).__name__,
             "runtime_lowering": self._runtime_lowering_label(),
             "native_halo_provider": bool(self.native_halo_input),
+            "bootstrap_prescale_fused": bool(self._bootstrap_prescale_fusion_spec() is not None),
         }
+        if self.native_physical_relayout_kernel is not None:
+            metadata["layout_policy_wrapper"]["native_physical_input_relayout"] = (
+                self.native_physical_relayout_kernel.to_metadata()
+            )
         return metadata
 
 
@@ -1221,12 +1550,41 @@ class LayoutPolicyAddRuntimeExecutor:
     def _backend_name(self, scheme: Any | None) -> str:
         return str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
 
+    def _bootstrap_prescale_fusion_spec(self) -> dict[str, float] | None:
+        fusion = self.__dict__.get("_bootstrap_prescale_fusion", None)
+        if not fusion:
+            return None
+        return {
+            "scale": float(dict(fusion).get("scale", 1.0)),
+            "bias": float(dict(fusion).get("bias", 0.0)),
+        }
+
+    def bootstrap_prescale_fusion_capable(self) -> bool:
+        return bool(self.input_rows and all(bool(row.get("relayout", False)) for row in self.input_rows))
+
     def runtime_fhe_output_shape(self) -> Any:
         if not self.input_rows:
             return None
         row = dict(self.input_rows[0])
         layout = dict(row.get("target_layout", row.get("selected_layout", {})) or {})
         return _layout_policy_on_shape(row, layout)
+
+    def _bias_plaintext(self, output_ct: Any) -> Any | None:
+        fusion = self._bootstrap_prescale_fusion_spec()
+        if fusion is None:
+            return None
+        bias = float(fusion["bias"])
+        if float(bias) == 0.0:
+            return None
+        shape = self.runtime_fhe_output_shape()
+        if shape is None:
+            return None
+        values = torch.full(tuple(int(value) for value in shape), float(bias), dtype=torch.float32)
+        return output_ct.scheme.encode(
+            values,
+            level=int(output_ct.level()),
+            scale=max(1, int(output_ct.scale())),
+        )
 
     def compile(self, scheme: Any) -> None:
         if self._compiled:
@@ -1244,6 +1602,9 @@ class LayoutPolicyAddRuntimeExecutor:
                 direction=_layout_policy_relayout_direction(row),
                 index=int(index),
             )
+            fusion = self._bootstrap_prescale_fusion_spec()
+            if fusion is not None and self.bootstrap_prescale_fusion_capable():
+                kernel.output_scale = float(fusion["scale"])
             kernel.compile(scheme, level=int(current_level))
             self.relayout_kernels[int(index)] = kernel
         self.compile_count += 1
@@ -1273,6 +1634,13 @@ class LayoutPolicyAddRuntimeExecutor:
         add_started = time.time()
         lhs, rhs = _align_ciphertexts_for_add(working[0], working[1])
         out = lhs + rhs
+        if self.bootstrap_prescale_fusion_capable():
+            bias_ptxt = self._bias_plaintext(out)
+            if bias_ptxt is not None:
+                out = _add_plaintext_for_add(out, bias_ptxt)
+                release = getattr(bias_ptxt, "release", None)
+                if callable(release):
+                    release()
         add_s = float(time.time() - add_started)
         for temp in temp_cts:
             release = getattr(temp, "release", None)
@@ -1295,6 +1663,9 @@ class LayoutPolicyAddRuntimeExecutor:
             "relayout_sparse_lt_count": int(relayout_ops["sparse_lt_count"]),
             "input_ciphertext_counts": [int(len(getattr(value, "ids", ())) or 0) for value in inputs],
             "output_ciphertext_count": int(len(getattr(out, "ids", ())) or 0),
+            "bootstrap_prescale_fused": bool(
+                self._bootstrap_prescale_fusion_spec() is not None and self.bootstrap_prescale_fusion_capable()
+            ),
         }
         return out
 
@@ -1366,8 +1737,18 @@ def _layout_policy_provider_plan(group: RegionFirstRuntimeGroup, compile_plan: d
     )
     output_relayout_rows = _layout_policy_output_relayout_rows(compile_plan, node=str(group.module_prefix))
     native_halo = _layout_policy_native_halo_input_supported(group.executor, native_rows)
+    native_output_row = _layout_policy_native_output_row(compile_plan, node=str(group.module_prefix))
+    native_physical_relayout_rows = _layout_policy_native_physical_relayout_rows(
+        group.executor,
+        compile_plan,
+        node=str(group.module_prefix),
+        native_input_rows=native_rows,
+        relayout_rows=relayout_rows,
+    )
     if bool(native_halo):
         plan["runtime_lowering"] = "provider_executable+native_halo_layout"
+    elif native_output_row is not None:
+        plan["runtime_lowering"] = "provider_executable+native_halo_output_layout"
     elif compact_align_shared_rows:
         plan["runtime_lowering"] = "provider_executable+compact_align_shared"
     elif not relayout_rows and not output_relayout_rows:
@@ -1375,7 +1756,9 @@ def _layout_policy_provider_plan(group: RegionFirstRuntimeGroup, compile_plan: d
     else:
         plan["runtime_lowering"] = "provider_executable+relayout_lt"
     plan["native_halo_provider"] = bool(native_halo)
+    plan["native_halo_output_provider"] = bool(native_output_row is not None)
     plan["relayout_edge_count"] = int(len(relayout_rows))
+    plan["native_physical_relayout_edge_count"] = int(len(native_physical_relayout_rows))
     plan["compact_align_shared_edge_count"] = int(len(compact_align_shared_rows))
     plan["output_relayout_edge_count"] = int(len(output_relayout_rows))
     plan["provider_stage"] = str(group.stage)
@@ -1389,23 +1772,33 @@ def _layout_policy_wrap_provider_group(
     *,
     compile_plan: dict[str, Any],
 ) -> RegionFirstRuntimeGroup:
+    base_executor = group.executor
+    plan_group = group
     relayout_rows = _layout_policy_incoming_relayout_rows(compile_plan, node=str(group.module_prefix))
     native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(group.module_prefix))
     output_relayout_rows = _layout_policy_output_relayout_rows(compile_plan, node=str(group.module_prefix))
-    native_halo = _layout_policy_native_halo_input_supported(group.executor, native_rows)
+    native_halo = _layout_policy_native_halo_input_supported(base_executor, native_rows)
+    native_physical_relayout_rows = _layout_policy_native_physical_relayout_rows(
+        base_executor,
+        compile_plan,
+        node=str(group.module_prefix),
+        native_input_rows=native_rows,
+        relayout_rows=relayout_rows,
+    )
     relayout_depth = int(
         (len(relayout_rows) if bool(native_halo) else 2 * len(relayout_rows))
+        + len(native_physical_relayout_rows)
         + len(output_relayout_rows)
     )
     policy = str(compile_plan.get("policy", ""))
     base_depth = int(group.effective_depth())
     executor = (
         LayoutPolicyProviderRuntimeExecutor(
-            base_executor=group.executor,
+            base_executor=base_executor,
             output_node_id=str(group.module_prefix),
             compile_plan=compile_plan,
         )
-        if group.executor is not None
+        if base_executor is not None
         else None
     )
     return replace(
@@ -1422,9 +1815,45 @@ def _layout_policy_wrap_provider_group(
             f"relayout_kernel_depth_{int(relayout_depth)}",
         ),
         executor=executor,
-        plan=_layout_policy_provider_plan(group, compile_plan),
+        plan=_layout_policy_provider_plan(plan_group, compile_plan),
         compiled=False,
     )
+
+
+def _layout_policy_with_native_physical_output_counts(
+    compile_plan: dict[str, Any],
+    groups: tuple[RegionFirstRuntimeGroup, ...],
+) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for group in groups:
+        executor = getattr(group, "executor", None)
+        if executor is None or not bool(getattr(executor, "native_halo_output_capable", False)):
+            continue
+        node = str(getattr(group, "module_prefix", ""))
+        native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
+        if not _layout_policy_native_halo_input_supported(executor, native_rows):
+            continue
+        plan = _layout_policy_native_halo_plan(
+            executor,
+            compile_plan,
+            node=str(node),
+            native_input_rows=native_rows,
+        )
+        if plan is None:
+            continue
+        spec = getattr(plan, "spec", None)
+        output_has_halo = bool(
+            int(getattr(spec, "output_alpha", 0) or 0) > 0
+            or int(getattr(spec, "output_beta", 0) or 0) > 0
+        )
+        if not bool(output_has_halo):
+            continue
+        counts[str(node)] = int(getattr(plan, "output_ct_count", 0) or 0)
+    if not counts:
+        return dict(compile_plan)
+    updated = dict(compile_plan)
+    updated["_native_physical_output_ct_counts"] = dict(counts)
+    return updated
 
 
 def _layout_policy_block_count_from_shape(shape: Any, *, slots: int) -> int:
@@ -1621,6 +2050,11 @@ def _layout_policy_region_pressure_row(group: RegionFirstRuntimeGroup, *, backen
     relayout_ops = _layout_policy_relayout_operation_totals(
         [
             *(getattr(executor, "relayout_kernels", []) or []),
+            *(
+                [getattr(executor, "native_physical_relayout_kernel")]
+                if getattr(executor, "native_physical_relayout_kernel", None) is not None
+                else []
+            ),
             *(getattr(executor, "output_relayout_kernels", []) or []),
         ]
     )
@@ -1636,10 +2070,14 @@ def _layout_policy_region_pressure_row(group: RegionFirstRuntimeGroup, *, backen
         "runtime_lowering": runtime_lowering,
         "native_halo_provider": bool(getattr(executor, "native_halo_input", False)),
         "relayout_edge_count": int(len(relayout_rows)),
+        "native_physical_relayout_edge_count": int(
+            len(getattr(executor, "native_physical_relayout_rows", ()) or ())
+        ),
         "compact_align_shared_edge_count": int(len(compact_align_shared_rows)),
         "output_relayout_edge_count": int(len(output_relayout_rows)),
         "relayout_kernel_count": int(
             len(getattr(executor, "relayout_kernels", []) or [])
+            + int(getattr(executor, "native_physical_relayout_kernel", None) is not None)
             + len(getattr(executor, "output_relayout_kernels", []) or [])
         ),
         "relayout_rotation_count": int(relayout_ops["rotation_count"]),
@@ -1688,6 +2126,7 @@ def collect_layout_policy_provider_pressure(registry: Any, *, backend: Any | Non
             sum(1 for row in regions if str(row.get("runtime_lowering")) == "provider_executable+relayout_lt")
         ),
         "relayout_edge_count": total("relayout_edge_count"),
+        "native_physical_relayout_edge_count": total("native_physical_relayout_edge_count"),
         "compact_align_shared_edge_count": total("compact_align_shared_edge_count"),
         "output_relayout_edge_count": total("output_relayout_edge_count"),
         "relayout_kernel_count": total("relayout_kernel_count"),
@@ -2656,6 +3095,8 @@ class TconvK2S2PythonRuntimeExecutor:
         input_beta = max(0, int(input_layout.get("beta", 0)))
         output_alpha = max(0, int(output_layout.get("alpha", 0)))
         output_beta = max(0, int(output_layout.get("beta", 0)))
+        output_materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
+        fused_output_relayout = output_materialization == "fused_relayout"
         input_physical_h = int(getattr(self.module, "fhe_input_shape")[2])
         output_total_h = int(h_out + output_alpha + output_beta)
 
@@ -2681,8 +3122,6 @@ class TconvK2S2PythonRuntimeExecutor:
             source_grid = source_local.unsqueeze(1)
             for kh in range(2):
                 oh = ih * 2 + int(kh)
-                oh_total = oh + int(output_alpha)
-                oh_grid = oh_total.unsqueeze(1).expand_as(oc_grid)
                 for kw in range(2):
                     ow = iw * 2 + int(kw)
                     coeff = weight[
@@ -2695,48 +3134,79 @@ class TconvK2S2PythonRuntimeExecutor:
                     if not bool(torch.any(nonzero).item()):
                         continue
                     ow_grid = ow.unsqueeze(1).expand_as(oc_grid)
-                    out_slot = _idx_chw_gap_tensor(
-                        oc_grid,
-                        oh_grid,
-                        ow_grid,
-                        h=int(output_total_h),
-                        w=int(w_out),
-                        gap=int(output_gap),
-                    )
-                    output_block = torch.div(out_slot, int(slots), rounding_mode="floor")
-                    output_local = torch.remainder(out_slot, int(slots))
-                    if int(self.output_fold_rotations) > 0 and int(self.output_block_count) == 1:
-                        diag_idx = torch.remainder(
-                            source_grid - output_local,
-                            int(self.output_fold_block_height),
-                        )
-                        output_positions = torch.remainder(source_grid - diag_idx, int(slots))
+                    target_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+                    if bool(fused_output_relayout):
+                        core_valid = (oh >= 0) & (oh < int(h_out))
+                        target_rows.append((oh + int(output_alpha), core_valid))
+                        top_valid = core_valid & (oh == 0)
+                        for top_row in range(int(output_alpha)):
+                            target_rows.append(
+                                (
+                                    torch.full_like(oh, int(top_row)),
+                                    top_valid,
+                                )
+                            )
+                        bottom_valid = core_valid & (oh == int(h_out) - 1)
+                        for bottom_row in range(int(output_beta)):
+                            target_rows.append(
+                                (
+                                    torch.full_like(oh, int(output_alpha + h_out + bottom_row)),
+                                    bottom_valid,
+                                )
+                            )
                     else:
-                        diag_idx = torch.remainder(source_grid - output_local, int(slots))
-                        output_positions = output_local
-                    valid = (
-                        nonzero
-                        & (oh_grid >= 0)
-                        & (oh_grid < int(output_total_h))
-                        & (output_block >= 0)
-                        & (output_block < int(self.output_block_count))
-                    )
-                    if not bool(torch.any(valid).item()):
-                        continue
-                    flat_blocks = output_block[valid].to(dtype=torch.int64)
-                    flat_diags = diag_idx[valid].to(dtype=torch.int64)
-                    flat_locals = output_positions[valid].to(dtype=torch.int64)
-                    flat_values = coeff[valid].to(dtype=torch.float32)
-                    for block in torch.unique(flat_blocks).tolist():
-                        block_value = int(block)
-                        block_mask = flat_blocks == int(block_value)
-                        diagonal_parts[int(block_value)].append(
+                        oh_total = oh + int(output_alpha)
+                        target_rows.append(
                             (
-                                flat_diags[block_mask].clone(),
-                                flat_locals[block_mask].clone(),
-                                flat_values[block_mask].clone(),
+                                oh_total,
+                                (oh_total >= 0) & (oh_total < int(output_total_h)),
                             )
                         )
+                    for target_h, row_valid in target_rows:
+                        oh_grid = target_h.unsqueeze(1).expand_as(oc_grid)
+                        out_slot = _idx_chw_gap_tensor(
+                            oc_grid,
+                            oh_grid,
+                            ow_grid,
+                            h=int(output_total_h),
+                            w=int(w_out),
+                            gap=int(output_gap),
+                        )
+                        output_block = torch.div(out_slot, int(slots), rounding_mode="floor")
+                        output_local = torch.remainder(out_slot, int(slots))
+                        if int(self.output_fold_rotations) > 0 and int(self.output_block_count) == 1:
+                            diag_idx = torch.remainder(
+                                source_grid - output_local,
+                                int(self.output_fold_block_height),
+                            )
+                            output_positions = torch.remainder(source_grid - diag_idx, int(slots))
+                        else:
+                            diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                            output_positions = output_local
+                        valid = (
+                            nonzero
+                            & row_valid.unsqueeze(1)
+                            & (ow_grid >= 0)
+                            & (ow_grid < int(w_out))
+                            & (output_block >= 0)
+                            & (output_block < int(self.output_block_count))
+                        )
+                        if not bool(torch.any(valid).item()):
+                            continue
+                        flat_blocks = output_block[valid].to(dtype=torch.int64)
+                        flat_diags = diag_idx[valid].to(dtype=torch.int64)
+                        flat_locals = output_positions[valid].to(dtype=torch.int64)
+                        flat_values = coeff[valid].to(dtype=torch.float32)
+                        for block in torch.unique(flat_blocks).tolist():
+                            block_value = int(block)
+                            block_mask = flat_blocks == int(block_value)
+                            diagonal_parts[int(block_value)].append(
+                                (
+                                    flat_diags[block_mask].clone(),
+                                    flat_locals[block_mask].clone(),
+                                    flat_values[block_mask].clone(),
+                                )
+                            )
 
         block_transforms: list[Any | None] = []
         empty_transform_count = 0
@@ -3022,6 +3492,10 @@ class U22CompileRegistry:
                 enable_conv_kernels=enable_conv_kernels,
                 layout_policy="dp",
                 _wrap_layout_policy=False,
+            )
+            executable_layout_plan = _layout_policy_with_native_physical_output_counts(
+                executable_layout_plan,
+                tuple(provider_registry.groups),
             )
             groups = [
                 _layout_policy_wrap_provider_group(group, compile_plan=executable_layout_plan)

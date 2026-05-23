@@ -2492,8 +2492,8 @@ class NativeAlignedHaloNoRIConvExecutor(R34OrionSameShapeRuntimeExecutor):
         self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
 
         input_level = int(self._level(scheme))
-        conv_level = max(0, int(input_level - 1))
-        conv_output_level = max(0, int(conv_level - 1))
+        conv_level = int(input_level)
+        conv_output_level = max(0, int(input_level - 1))
         self.bias_plaintexts = self._compile_bias_plaintexts_at_level(scheme, level=int(conv_output_level))
 
         compile_started = time.time()
@@ -2675,8 +2675,8 @@ class NativeAlignedHaloNoRIConvExecutor(R34OrionSameShapeRuntimeExecutor):
         self.cols = int(self.native_plan.input_ct_count)
 
         input_level = int(self._level(scheme))
-        conv_level = max(0, int(input_level - 1))
-        conv_output_level = max(0, int(conv_level - 1))
+        conv_level = int(input_level)
+        conv_output_level = max(0, int(input_level - 1))
         self.bias_plaintexts = self._compile_bias_plaintexts_at_level(scheme, level=int(conv_output_level))
 
         compile_started = time.time()

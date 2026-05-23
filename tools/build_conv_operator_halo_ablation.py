@@ -99,7 +99,9 @@ def _valid_positions(
     kw: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     source_h_start = int(stripe["source_h_start"])
-    local_h = int(stripe["source_h_end"]) - int(stripe["source_h_start"])
+    source_storage_h = int(stripe["source_h_end"]) - int(stripe["source_h_start"])
+    target_storage_h = int(stripe.get("target_storage_rows", source_storage_h))
+    target_local_h_start = int(stripe.get("target_local_h_start", int(stripe["target_h_start"]) - source_h_start))
     source_local_hs: list[int] = []
     source_ws: list[int] = []
     target_local_hs: list[int] = []
@@ -109,12 +111,12 @@ def _valid_positions(
         if int(in_h) < 0 or int(in_h) >= int(case.h_in):
             continue
         source_local_h = int(in_h) - int(source_h_start)
-        target_local_h = int(out_h) - int(source_h_start)
+        target_local_h = int(target_local_h_start) + int(out_h) - int(stripe["target_h_start"])
         if (
             int(source_local_h) < 0
-            or int(source_local_h) >= int(local_h)
+            or int(source_local_h) >= int(source_storage_h)
             or int(target_local_h) < 0
-            or int(target_local_h) >= int(local_h)
+            or int(target_local_h) >= int(target_storage_h)
         ):
             continue
         for out_w in range(int(case.w_out)):
@@ -143,16 +145,17 @@ def _flat_halo_ablation(
     sharing_groups: list[list[dict[str, Any]]] = []
     stripe_rows: list[dict[str, Any]] = []
     for stripe_index, stripe in enumerate(stripes):
-        local_h = int(stripe["source_h_end"]) - int(stripe["source_h_start"])
+        source_storage_h = int(stripe["source_h_end"]) - int(stripe["source_h_start"])
+        target_storage_h = int(stripe.get("target_storage_rows", source_storage_h))
         source_bases, source_phase_h, source_phase_w, source_packed_w, source_group_block = _channel_bases(
             channel_count=int(case.c_in),
-            height=int(local_h),
+            height=int(source_storage_h),
             width=int(case.w_in),
             gap=int(case.gap_in),
         )
         target_bases, target_phase_h, target_phase_w, target_packed_w, target_group_block = _channel_bases(
             channel_count=int(case.c_out),
-            height=int(local_h),
+            height=int(target_storage_h),
             width=int(case.w_out),
             gap=int(case.gap_out),
         )
@@ -235,7 +238,22 @@ def _flat_halo_ablation(
                 "source_h_end": int(stripe["source_h_end"]),
                 "target_h_start": int(stripe["target_h_start"]),
                 "target_h_end": int(stripe["target_h_end"]),
-                "local_h": int(local_h),
+                "source_storage_h": int(source_storage_h),
+                "target_storage_h": int(target_storage_h),
+                "target_local_h_start": int(
+                    stripe.get(
+                        "target_local_h_start",
+                        int(stripe["target_h_start"]) - int(stripe["source_h_start"]),
+                    )
+                ),
+                "target_local_h_end": int(
+                    stripe.get(
+                        "target_local_h_end",
+                        int(stripe.get("target_local_h_start", int(stripe["target_h_start"]) - int(stripe["source_h_start"])))
+                        + int(stripe["target_h_end"])
+                        - int(stripe["target_h_start"]),
+                    )
+                ),
                 "source_block_count": int(source_block_count),
                 "target_block_count": int(target_block_count),
                 "rotation_diag_count_matrix": matrix,

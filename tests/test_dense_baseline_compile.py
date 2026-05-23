@@ -222,6 +222,91 @@ def test_dense_compile_batches_independent_transforms_without_unified_api() -> N
     assert profile["encode_s"] >= 0.0
 
 
+def test_dense_compile_batches_are_memory_bounded(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.batch_sizes = []
+            self.next_id = 200
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            self.batch_sizes.append(int(num_transforms))
+            ids = list(range(self.next_id, self.next_id + int(num_transforms)))
+            self.next_id += int(num_transforms)
+            return ids
+
+        def GenerateLinearTransformsUnified(self, *_args):
+            raise AssertionError("dense baseline must not use unified transforms")
+
+        def GetLinearTransformRotationKeys(self, _transform_id):
+            return []
+
+    monkeypatch.setenv("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", "2")
+    backend = Backend()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    layer = SimpleNamespace(
+        name="bounded",
+        diagonals={
+            (0, index): {index: [float(index), 0.0, 0.0, 0.0]}
+            for index in range(5)
+        },
+        level=2,
+        bsgs_ratio=2,
+    )
+
+    transform_ids = evaluator.generate_transforms(layer)
+
+    assert backend.batch_sizes == [2, 2, 1]
+    assert transform_ids == {
+        (0, 0): 200,
+        (0, 1): 201,
+        (0, 2): 202,
+        (0, 3): 203,
+        (0, 4): 204,
+    }
+
+
+def test_dense_save_load_compile_defaults_to_provider_sized_batches(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_COMPILE_PARALLEL_POLICY", "manual")
+    for name in (
+        "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
+        "ORION_LT_COMPILE_BATCH_TRANSFORMS",
+        "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
+        "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    evaluator = object.__new__(NewEvaluator)
+    evaluator.io_mode = "save"
+
+    assert evaluator._lt_compile_batch_limit(9) == 4
+
+
+def test_dense_shared_cache_is_opt_in(monkeypatch) -> None:
+    class Backend:
+        def EvaluateLinearTransformsWithSharedCache(self):
+            raise AssertionError("only presence is checked")
+
+    evaluator = object.__new__(NewEvaluator)
+    evaluator.backend = Backend()
+    evaluator.io_mode = "none"
+
+    monkeypatch.delenv("ORION_DENSE_LT_SHARED_CACHE", raising=False)
+    assert evaluator._dense_shared_cache_enabled(rows=2, cols=2) is False
+
+    monkeypatch.setenv("ORION_DENSE_LT_SHARED_CACHE", "0")
+    assert evaluator._dense_shared_cache_enabled(rows=2, cols=2) is False
+
+    monkeypatch.setenv("ORION_DENSE_LT_SHARED_CACHE", "1")
+    assert evaluator._dense_shared_cache_enabled(rows=2, cols=2) is True
+
+
 def test_transform_metadata_validation_ignores_rotation_request_order() -> None:
     params = SimpleNamespace(
         get_logscale=lambda: 35,

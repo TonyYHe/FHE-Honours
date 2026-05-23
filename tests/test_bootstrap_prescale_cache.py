@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from orion.core.auto_bootstrap import BootstrapPlacer
+from orion.nn.activation import Chebyshev
 from orion.nn.operations import Bootstrap
 
 
@@ -51,3 +52,86 @@ def test_bootstrap_placer_uses_runtime_materialized_output_shape() -> None:
     placer = BootstrapPlacer(net=SimpleNamespace(), network_dag=None)
 
     assert tuple(int(value) for value in placer._runtime_fhe_output_shape(module)) == (1, 1, 6, 4)
+
+
+def test_bootstrap_placer_marks_full_slot_prescale_fusion() -> None:
+    class _Params:
+        def get_slots(self):
+            return 64
+
+    class _RuntimeExecutor:
+        def runtime_fhe_output_shape(self):
+            return torch.Size([1, 64])
+
+        def bootstrap_prescale_fusion_capable(self):
+            return True
+
+    encoder = _DummyEncoder()
+    scheme = SimpleNamespace(encoder=encoder, params=_Params())
+    module = SimpleNamespace(
+        level=3,
+        depth=1,
+        output_min=torch.tensor(-4.0),
+        output_max=torch.tensor(4.0),
+        fhe_output_shape=torch.Size([1, 64]),
+        scheme=scheme,
+        region_runtime=SimpleNamespace(executor=_RuntimeExecutor()),
+    )
+    placer = BootstrapPlacer(net=SimpleNamespace(scheme=scheme, margin=1.0), network_dag=None)
+
+    bootstrap = placer._create_bootstrapper(module)
+
+    assert bootstrap.preprocess_fused is True
+    assert module._bootstrap_prescale_fusion["scale"] == bootstrap.prescale
+    assert module._bootstrap_prescale_fusion["bias"] == bootstrap.prescale * bootstrap.constant
+
+
+def test_bootstrap_placer_keeps_sparse_prescale_in_bootstrap() -> None:
+    class _Params:
+        def get_slots(self):
+            return 64
+
+    class _RuntimeExecutor:
+        def runtime_fhe_output_shape(self):
+            return torch.Size([1, 16])
+
+        def bootstrap_prescale_fusion_capable(self):
+            return True
+
+    encoder = _DummyEncoder()
+    scheme = SimpleNamespace(encoder=encoder, params=_Params())
+    module = SimpleNamespace(
+        level=3,
+        depth=1,
+        output_min=torch.tensor(-4.0),
+        output_max=torch.tensor(4.0),
+        fhe_output_shape=torch.Size([1, 16]),
+        scheme=scheme,
+        region_runtime=SimpleNamespace(executor=_RuntimeExecutor()),
+    )
+    placer = BootstrapPlacer(net=SimpleNamespace(scheme=scheme, margin=1.0), network_dag=None)
+
+    bootstrap = placer._create_bootstrapper(module)
+
+    assert bootstrap.preprocess_fused is False
+    assert not hasattr(module, "_bootstrap_prescale_fusion")
+
+
+def test_chebyshev_compile_fuses_bootstrap_output_affine() -> None:
+    class _PolyEvaluator:
+        def __init__(self) -> None:
+            self.coeffs = None
+
+        def generate_chebyshev(self, coeffs):
+            self.coeffs = list(coeffs)
+            return list(coeffs)
+
+    evaluator = _PolyEvaluator()
+    activation = Chebyshev(degree=1, fn=lambda x: x)
+    activation.coeffs = [2.0, 3.0]
+    activation.scheme = SimpleNamespace(poly_evaluator=evaluator)
+    activation._bootstrap_prescale_fusion = {"scale": 0.5, "bias": 1.25}
+
+    activation.compile()
+
+    assert evaluator.coeffs == [2.25, 1.5]

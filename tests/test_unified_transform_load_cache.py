@@ -222,3 +222,30 @@ def test_unified_transform_load_mode_uses_legacy_batch_override(tmp_path, monkey
 
     assert load_backend.unified_load_calls == [((0, 1),), ((0, 2),)]
     assert load_group.evaluate_unified(7, load_backend) == [100, 101]
+
+
+def test_unified_transform_load_mode_env_batch_overrides_saved_streaming_batches(tmp_path, monkeypatch) -> None:
+    diags_path = tmp_path / "unified_diagonals.h5"
+    keys_path = tmp_path / "unified_keys.h5"
+    save_group = UnifiedTransformGroup(
+        _transforms(io_mode="save", diags_path=str(diags_path), keys_path=str(keys_path))
+    )
+    save_group.compile_unified(_Backend())
+    with h5py.File(diags_path, "a") as handle:
+        storage = handle["__unified_transform_groups__"][save_group._storage_key]
+        storage.attrs["compile_mode"] = "streaming"
+        storage.attrs["compile_batch_sizes"] = np.asarray([1, 1], dtype=np.int32)
+    monkeypatch.setenv("ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS", "2")
+
+    load_backend = _Backend()
+    load_backend._next_transform_id = 0
+    load_backend.rotation_keys = {0: [1, 3], 1: [1, 5]}
+    load_group = UnifiedTransformGroup(
+        _transforms(io_mode="load", diags_path=str(diags_path), keys_path=str(keys_path))
+    )
+    load_group._storage_key = save_group._storage_key
+
+    load_group.compile_unified(load_backend)
+
+    assert load_backend.unified_load_calls == [((0, 1), (0, 2))]
+    assert load_group.evaluate_unified(7, load_backend) == [100, 101]
