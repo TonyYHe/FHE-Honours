@@ -986,15 +986,21 @@ def _build_conv_transform(
     target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
     source_count = int(source_end - source_start)
     target_count = int(target_end - target_start)
-    source_slots = _slot_indices(int(source_count), int(stripe.source_h), int(spec.w_in), int(spec.gap_in))
-    target_slots = (
-        None
-        if bool(compact_output)
-        else _slot_indices(int(target_count), int(stripe.target_h), int(spec.w_out), int(spec.gap_out))
-    )
-    target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
     key_parts: list[torch.Tensor] = []
     value_parts: list[torch.Tensor] = []
+    source_channels = torch.arange(int(source_count), dtype=torch.int64)
+    target_channels = (
+        torch.arange(int(target_start), int(target_end), dtype=torch.int64)
+        if bool(compact_output)
+        else torch.arange(int(target_count), dtype=torch.int64)
+    )
+    out_h_values = torch.arange(
+        int(stripe.target_h_start),
+        int(stripe.target_h_end),
+        dtype=torch.int64,
+    )
+    out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
+    max_pair_count = int(_native_halo_build_pair_chunk_limit())
     for kh in range(int(spec.kernel)):
         for kw in range(int(spec.kernel)):
             coeff = weight[
@@ -1006,64 +1012,112 @@ def _build_conv_transform(
             if not bool(torch.any(coeff != 0).item()):
                 continue
             coeff_by_source_target = coeff.t().contiguous()
-            for out_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
-                op_out_h = (
-                    _materialized_output_source_h(
-                        int(out_h),
-                        h_out=int(spec.h_out),
-                        output_alpha=int(spec.output_alpha),
-                        output_beta=int(spec.output_beta),
-                    )
-                    if bool(compact_output)
-                    else int(out_h)
+            coeff_nonzero = torch.abs(coeff_by_source_target) > 0
+            if not bool(coeff_nonzero.any().item()):
+                continue
+
+            op_out_h_values = (
+                _materialized_output_source_h(
+                    out_h_values,
+                    h_out=int(spec.h_out),
+                    output_alpha=int(spec.output_alpha),
+                    output_beta=int(spec.output_beta),
                 )
-                in_h = int(op_out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
-                if int(in_h) < int(spec.input_h_min) or int(in_h) >= int(spec.input_h_max):
-                    continue
-                source_local_h = int(in_h) - int(stripe.source_h_start)
-                target_local_h = int(out_h) - int(stripe.target_h_start)
-                if int(source_local_h) < 0 or int(source_local_h) >= int(stripe.source_h):
-                    continue
-                if int(target_local_h) < 0 or int(target_local_h) >= int(stripe.target_h):
-                    continue
-                for out_w in range(int(spec.w_out)):
-                    in_w = int(out_w) * int(spec.stride) - int(spec.pad) + int(kw) * int(spec.dilation)
-                    if int(in_w) < 0 or int(in_w) >= int(spec.w_in):
+                if bool(compact_output)
+                else out_h_values
+            )
+            in_h_values = (
+                op_out_h_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kh) * int(spec.dilation)
+            )
+            source_local_h_values = in_h_values - int(stripe.source_h_start)
+            target_local_h_values = out_h_values - int(stripe.target_h_start)
+            valid_h = (
+                (in_h_values >= int(spec.input_h_min))
+                & (in_h_values < int(spec.input_h_max))
+                & (source_local_h_values >= 0)
+                & (source_local_h_values < int(stripe.source_h))
+                & (target_local_h_values >= 0)
+                & (target_local_h_values < int(stripe.target_h))
+            )
+            if not bool(valid_h.any().item()):
+                continue
+            in_w_values = (
+                out_w_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kw) * int(spec.dilation)
+            )
+            valid_w = (in_w_values >= 0) & (in_w_values < int(spec.w_in))
+            if not bool(valid_w.any().item()):
+                continue
+
+            valid_source_h = source_local_h_values[valid_h]
+            valid_target_h = target_local_h_values[valid_h]
+            valid_out_h = out_h_values[valid_h]
+            valid_source_w = in_w_values[valid_w]
+            valid_out_w = out_w_values[valid_w]
+            source_h_grid, source_w_grid = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
+            target_h_grid, target_w_grid = torch.meshgrid(valid_target_h, valid_out_w, indexing="ij")
+            out_h_grid, out_w_grid = torch.meshgrid(valid_out_h, valid_out_w, indexing="ij")
+            source_h_flat = source_h_grid.reshape(-1)
+            source_w_flat = source_w_grid.reshape(-1)
+            target_h_flat = target_h_grid.reshape(-1)
+            target_w_flat = target_w_grid.reshape(-1)
+            out_h_flat = out_h_grid.reshape(-1)
+            out_w_flat = out_w_grid.reshape(-1)
+            if int(source_h_flat.numel()) == 0:
+                continue
+
+            channel_pair_count = max(1, int(source_count) * int(target_count))
+            position_chunk = max(1, int(max_pair_count // channel_pair_count))
+            for start in range(0, int(source_h_flat.numel()), int(position_chunk)):
+                end = min(int(source_h_flat.numel()), int(start) + int(position_chunk))
+                source_vec = _idx_chw_gap_channel_positions(
+                    source_channels,
+                    h=source_h_flat[int(start): int(end)],
+                    w=source_w_flat[int(start): int(end)],
+                    height=int(stripe.source_h),
+                    width=int(spec.w_in),
+                    gap=int(spec.gap_in),
+                )
+                if bool(compact_output):
+                    compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+                    target_index = _idx_chw_gap_channel_positions(
+                        target_channels,
+                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_alpha)),
+                        w=out_w_flat[int(start): int(end)],
+                        height=int(compact_output_h),
+                        width=int(spec.w_out),
+                        gap=int(spec.gap_out),
+                    )
+                    target_block_mask = (
+                        torch.div(target_index, int(slots), rounding_mode="floor")
+                        == int(compact_target_block)
+                    )
+                    if not bool(target_block_mask.any().item()):
                         continue
-                    source_vec = source_slots[:, int(source_local_h), int(in_w)]
-                    if bool(compact_output):
-                        compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
-                        compact_h = int(out_h) + max(0, int(spec.output_alpha))
-                        compact_slots = torch.tensor(
-                            [
-                                _idx_chw_gap(
-                                    int(channel),
-                                    int(compact_h),
-                                    int(out_w),
-                                    int(compact_output_h),
-                                    int(spec.w_out),
-                                    int(spec.gap_out),
-                                )
-                                for channel in target_channels.tolist()
-                            ],
-                            dtype=torch.int64,
-                        )
-                        target_block_mask = (
-                            torch.div(compact_slots, int(slots), rounding_mode="floor")
-                            == int(compact_target_block)
-                        )
-                        if not bool(target_block_mask.any().item()):
-                            continue
-                        target_vec = torch.remainder(compact_slots[target_block_mask], int(slots))
-                        coeff_values = coeff_by_source_target[:, target_block_mask].reshape(-1).to(dtype=torch.float32)
-                    else:
-                        assert target_slots is not None
-                        target_vec = target_slots[:, int(target_local_h), int(out_w)]
-                        coeff_values = coeff_by_source_target.reshape(-1).to(dtype=torch.float32)
-                    diag_index = (source_vec[:, None] - target_vec[None, :]).remainder(int(slots))
-                    output_slot = target_vec[None, :].expand_as(diag_index)
-                    key_parts.append((diag_index.reshape(-1) * int(slots) + output_slot.reshape(-1)).to(dtype=torch.int64))
-                    value_parts.append(coeff_values)
+                    target_vec = torch.remainder(target_index, int(slots))
+                else:
+                    target_vec = _idx_chw_gap_channel_positions(
+                        target_channels,
+                        h=target_h_flat[int(start): int(end)],
+                        w=target_w_flat[int(start): int(end)],
+                        height=int(stripe.target_h),
+                        width=int(spec.w_out),
+                        gap=int(spec.gap_out),
+                    )
+                    target_block_mask = torch.ones_like(target_vec, dtype=torch.bool)
+
+                pair_mask = coeff_nonzero[:, :, None] & target_block_mask[None, :, :]
+                if not bool(pair_mask.any().item()):
+                    continue
+                diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
+                output_slot = target_vec[None, :, :].expand_as(diag_index)
+                flat_keys = (diag_index * int(slots) + output_slot).to(dtype=torch.int64)
+                flat_values = coeff_by_source_target[:, :, None].expand_as(diag_index).to(dtype=torch.float32)
+                key_parts.append(flat_keys[pair_mask])
+                value_parts.append(flat_values[pair_mask])
     if not key_parts:
         return None
     keys, values = _coalesce_native_rows(torch.cat(key_parts), torch.cat(value_parts))
@@ -1130,11 +1184,18 @@ def _build_conv_transforms_for_compact_output(
     if source_count <= 0 or target_count <= 0:
         return []
 
-    source_slots = _slot_indices(int(source_count), int(stripe.source_h), int(spec.w_in), int(spec.gap_in))
     target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
     compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
     key_parts_by_block: dict[int, list[torch.Tensor]] = {}
     value_parts_by_block: dict[int, list[torch.Tensor]] = {}
+    source_channels = torch.arange(int(source_count), dtype=torch.int64)
+    out_h_values = torch.arange(
+        int(stripe.target_h_start),
+        int(stripe.target_h_end),
+        dtype=torch.int64,
+    )
+    out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
+    max_pair_count = int(_native_halo_build_pair_chunk_limit())
 
     for kh in range(int(spec.kernel)):
         for kw in range(int(spec.kernel)):
@@ -1147,54 +1208,86 @@ def _build_conv_transforms_for_compact_output(
             if not bool(torch.any(coeff != 0).item()):
                 continue
             coeff_by_source_target = coeff.t().contiguous()
-            for out_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
-                op_out_h = _materialized_output_source_h(
-                    int(out_h),
-                    h_out=int(spec.h_out),
-                    output_alpha=int(spec.output_alpha),
-                    output_beta=int(spec.output_beta),
+            coeff_nonzero = torch.abs(coeff_by_source_target) > 0
+            if not bool(coeff_nonzero.any().item()):
+                continue
+
+            op_out_h_values = _materialized_output_source_h(
+                out_h_values,
+                h_out=int(spec.h_out),
+                output_alpha=int(spec.output_alpha),
+                output_beta=int(spec.output_beta),
+            )
+            in_h_values = (
+                op_out_h_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kh) * int(spec.dilation)
+            )
+            source_local_h_values = in_h_values - int(stripe.source_h_start)
+            valid_h = (
+                (in_h_values >= int(spec.input_h_min))
+                & (in_h_values < int(spec.input_h_max))
+                & (source_local_h_values >= 0)
+                & (source_local_h_values < int(stripe.source_h))
+            )
+            if not bool(valid_h.any().item()):
+                continue
+            in_w_values = (
+                out_w_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kw) * int(spec.dilation)
+            )
+            valid_w = (in_w_values >= 0) & (in_w_values < int(spec.w_in))
+            if not bool(valid_w.any().item()):
+                continue
+
+            valid_source_h = source_local_h_values[valid_h]
+            valid_out_h = out_h_values[valid_h]
+            valid_source_w = in_w_values[valid_w]
+            valid_out_w = out_w_values[valid_w]
+            source_h_grid, source_w_grid = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
+            out_h_grid, out_w_grid = torch.meshgrid(valid_out_h, valid_out_w, indexing="ij")
+            source_h_flat = source_h_grid.reshape(-1)
+            source_w_flat = source_w_grid.reshape(-1)
+            out_h_flat = out_h_grid.reshape(-1)
+            out_w_flat = out_w_grid.reshape(-1)
+            if int(source_h_flat.numel()) == 0:
+                continue
+
+            channel_pair_count = max(1, int(source_count) * int(target_count))
+            position_chunk = max(1, int(max_pair_count // channel_pair_count))
+            for start in range(0, int(source_h_flat.numel()), int(position_chunk)):
+                end = min(int(source_h_flat.numel()), int(start) + int(position_chunk))
+                source_vec = _idx_chw_gap_channel_positions(
+                    source_channels,
+                    h=source_h_flat[int(start): int(end)],
+                    w=source_w_flat[int(start): int(end)],
+                    height=int(stripe.source_h),
+                    width=int(spec.w_in),
+                    gap=int(spec.gap_in),
                 )
-                in_h = int(op_out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
-                if int(in_h) < int(spec.input_h_min) or int(in_h) >= int(spec.input_h_max):
-                    continue
-                source_local_h = int(in_h) - int(stripe.source_h_start)
-                if int(source_local_h) < 0 or int(source_local_h) >= int(stripe.source_h):
-                    continue
-                compact_h = int(out_h) + max(0, int(spec.output_alpha))
-                for out_w in range(int(spec.w_out)):
-                    in_w = int(out_w) * int(spec.stride) - int(spec.pad) + int(kw) * int(spec.dilation)
-                    if int(in_w) < 0 or int(in_w) >= int(spec.w_in):
+                compact_slots = _idx_chw_gap_channel_positions(
+                    target_channels,
+                    h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_alpha)),
+                    w=out_w_flat[int(start): int(end)],
+                    height=int(compact_output_h),
+                    width=int(spec.w_out),
+                    gap=int(spec.gap_out),
+                )
+                target_blocks = torch.div(compact_slots, int(slots), rounding_mode="floor")
+                target_slots = torch.remainder(compact_slots, int(slots))
+                diag_index = (source_vec[:, None, :] - target_slots[None, :, :]).remainder(int(slots))
+                output_slot = target_slots[None, :, :].expand_as(diag_index)
+                flat_keys = (diag_index * int(slots) + output_slot).to(dtype=torch.int64)
+                flat_values = coeff_by_source_target[:, :, None].expand_as(diag_index).to(dtype=torch.float32)
+                for target_block in torch.unique(target_blocks).tolist():
+                    block = int(target_block)
+                    block_mask = target_blocks == int(block)
+                    pair_mask = coeff_nonzero[:, :, None] & block_mask[None, :, :]
+                    if not bool(pair_mask.any().item()):
                         continue
-                    source_vec = source_slots[:, int(source_local_h), int(in_w)]
-                    compact_slots = torch.tensor(
-                        [
-                            _idx_chw_gap(
-                                int(channel),
-                                int(compact_h),
-                                int(out_w),
-                                int(compact_output_h),
-                                int(spec.w_out),
-                                int(spec.gap_out),
-                            )
-                            for channel in target_channels.tolist()
-                        ],
-                        dtype=torch.int64,
-                    )
-                    target_blocks = torch.div(compact_slots, int(slots), rounding_mode="floor")
-                    target_slots = torch.remainder(compact_slots, int(slots))
-                    for target_block in torch.unique(target_blocks).tolist():
-                        block = int(target_block)
-                        mask = target_blocks == int(block)
-                        if not bool(mask.any().item()):
-                            continue
-                        target_vec = target_slots[mask]
-                        coeff_values = coeff_by_source_target[:, mask].reshape(-1).to(dtype=torch.float32)
-                        diag_index = (source_vec[:, None] - target_vec[None, :]).remainder(int(slots))
-                        output_slot = target_vec[None, :].expand_as(diag_index)
-                        key_parts_by_block.setdefault(int(block), []).append(
-                            (diag_index.reshape(-1) * int(slots) + output_slot.reshape(-1)).to(dtype=torch.int64)
-                        )
-                        value_parts_by_block.setdefault(int(block), []).append(coeff_values)
+                    key_parts_by_block.setdefault(int(block), []).append(flat_keys[pair_mask])
+                    value_parts_by_block.setdefault(int(block), []).append(flat_values[pair_mask])
 
     transforms: list[tuple[int, Any]] = []
     source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
