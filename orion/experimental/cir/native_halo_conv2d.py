@@ -1108,6 +1108,140 @@ def _build_conv_transform(
     )
 
 
+def _build_conv_transforms_for_compact_output(
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    stripe: NativeHaloStripe,
+    source_group: int,
+    target_group: int,
+    level: int,
+    scheme: Any,
+    group_n1: int,
+) -> list[tuple[int, Any]]:
+    slots = int(spec.slot_count)
+    source_start = int(source_group) * int(plan.source_channel_tile)
+    source_end = min(int(spec.c_in), int(source_start) + int(plan.source_channel_tile))
+    target_start = int(target_group) * int(plan.target_channel_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
+    source_count = int(source_end - source_start)
+    target_count = int(target_end - target_start)
+    if source_count <= 0 or target_count <= 0:
+        return []
+
+    source_slots = _slot_indices(int(source_count), int(stripe.source_h), int(spec.w_in), int(spec.gap_in))
+    target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
+    compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+    key_parts_by_block: dict[int, list[torch.Tensor]] = {}
+    value_parts_by_block: dict[int, list[torch.Tensor]] = {}
+
+    for kh in range(int(spec.kernel)):
+        for kw in range(int(spec.kernel)):
+            coeff = weight[
+                int(target_start): int(target_end),
+                int(source_start): int(source_end),
+                int(kh),
+                int(kw),
+            ].to(dtype=torch.float32)
+            if not bool(torch.any(coeff != 0).item()):
+                continue
+            coeff_by_source_target = coeff.t().contiguous()
+            for out_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
+                op_out_h = _materialized_output_source_h(
+                    int(out_h),
+                    h_out=int(spec.h_out),
+                    output_alpha=int(spec.output_alpha),
+                    output_beta=int(spec.output_beta),
+                )
+                in_h = int(op_out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
+                if int(in_h) < int(spec.input_h_min) or int(in_h) >= int(spec.input_h_max):
+                    continue
+                source_local_h = int(in_h) - int(stripe.source_h_start)
+                if int(source_local_h) < 0 or int(source_local_h) >= int(stripe.source_h):
+                    continue
+                compact_h = int(out_h) + max(0, int(spec.output_alpha))
+                for out_w in range(int(spec.w_out)):
+                    in_w = int(out_w) * int(spec.stride) - int(spec.pad) + int(kw) * int(spec.dilation)
+                    if int(in_w) < 0 or int(in_w) >= int(spec.w_in):
+                        continue
+                    source_vec = source_slots[:, int(source_local_h), int(in_w)]
+                    compact_slots = torch.tensor(
+                        [
+                            _idx_chw_gap(
+                                int(channel),
+                                int(compact_h),
+                                int(out_w),
+                                int(compact_output_h),
+                                int(spec.w_out),
+                                int(spec.gap_out),
+                            )
+                            for channel in target_channels.tolist()
+                        ],
+                        dtype=torch.int64,
+                    )
+                    target_blocks = torch.div(compact_slots, int(slots), rounding_mode="floor")
+                    target_slots = torch.remainder(compact_slots, int(slots))
+                    for target_block in torch.unique(target_blocks).tolist():
+                        block = int(target_block)
+                        mask = target_blocks == int(block)
+                        if not bool(mask.any().item()):
+                            continue
+                        target_vec = target_slots[mask]
+                        coeff_values = coeff_by_source_target[:, mask].reshape(-1).to(dtype=torch.float32)
+                        diag_index = (source_vec[:, None] - target_vec[None, :]).remainder(int(slots))
+                        output_slot = target_vec[None, :].expand_as(diag_index)
+                        key_parts_by_block.setdefault(int(block), []).append(
+                            (diag_index.reshape(-1) * int(slots) + output_slot.reshape(-1)).to(dtype=torch.int64)
+                        )
+                        value_parts_by_block.setdefault(int(block), []).append(coeff_values)
+
+    transforms: list[tuple[int, Any]] = []
+    source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
+    for target_block in sorted(key_parts_by_block):
+        key_parts = key_parts_by_block[int(target_block)]
+        value_parts = value_parts_by_block.get(int(target_block), [])
+        if not key_parts or not value_parts:
+            continue
+        keys, values = _coalesce_native_rows(torch.cat(key_parts), torch.cat(value_parts))
+        if int(keys.numel()) == 0:
+            continue
+        diag_indices = torch.div(keys, int(slots), rounding_mode="floor").to(dtype=torch.int64)
+        output_slots = torch.remainder(keys, int(slots)).to(dtype=torch.int64)
+        diag_tensors: dict[int, torch.Tensor] = {}
+        unique, counts = torch.unique_consecutive(diag_indices, return_counts=True)
+        start = 0
+        for diag_value, count_value in zip(unique.tolist(), counts.tolist()):
+            end = int(start + int(count_value))
+            diag = torch.zeros((int(slots),), dtype=torch.float32)
+            diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
+            diag_tensors[int(diag_value)] = diag
+            start = int(end)
+        if not diag_tensors:
+            continue
+        baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_tensors), slots=int(slots), n1=int(group_n1))
+        transform = SimpleNamespace(
+            name=(
+                f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+                f"_tgt{int(target_group)}_compact{int(target_block)}"
+            ),
+            diagonals={(0, 0): {int(index): diag for index, diag in sorted(diag_tensors.items())}},
+            level=int(level),
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, int(slots)]),
+            output_shape=torch.Size([1, int(slots)]),
+            target_index=int(target_block),
+            input_id=f"native_source_tile_{int(source_index)}",
+            selected_n1=int(group_n1),
+            baby_shifts=tuple(sorted(int(value) for value in baby)),
+            giant_shifts=tuple(sorted(int(value) for value in giant)),
+            rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+            rotation_cost_owner=bool(int(target_group) == 0 and int(target_block) == 0),
+        )
+        transforms.append((int(target_block), transform))
+    return transforms
+
+
 def _compact_source_index(
     spec: NativeHaloConv2DSpec,
     source_layout: dict[str, Any],
@@ -1835,10 +1969,9 @@ class NativeHaloStripeNoRIConvExecutor:
                     ordered: list[tuple[int, Any]] = []
                     group_n1 = int(self.native_plan.group_n1s[int(group_index)])
                     for target_group in range(int(self.native_plan.target_channel_group_count)):
-                        target_blocks = range(int(self.rows)) if bool(compact_output) else (None,)
-                        for target_block in target_blocks:
+                        if bool(compact_output):
                             build_started = time.time()
-                            transform = _build_conv_transform(
+                            transforms = _build_conv_transforms_for_compact_output(
                                 spec=self.native_plan.spec,
                                 plan=self.native_plan,
                                 weight=weight,
@@ -1848,17 +1981,38 @@ class NativeHaloStripeNoRIConvExecutor:
                                 level=int(conv_level),
                                 scheme=scheme,
                                 group_n1=int(group_n1),
-                                compact_target_block=target_block,
                             )
                             self.last_runtime_timing["build_transform_s"] = float(
                                 self.last_runtime_timing.get("build_transform_s", 0.0)
                             ) + float(time.time() - build_started)
-                            if transform is None:
-                                continue
-                            self.last_runtime_timing["built_transform_count"] = float(
-                                self.last_runtime_timing.get("built_transform_count", 0.0)
-                            ) + 1.0
-                            ordered.append((int(transform.target_index), transform))
+                            for target_index, transform in transforms:
+                                self.last_runtime_timing["built_transform_count"] = float(
+                                    self.last_runtime_timing.get("built_transform_count", 0.0)
+                                ) + 1.0
+                                ordered.append((int(target_index), transform))
+                            continue
+                        build_started = time.time()
+                        transform = _build_conv_transform(
+                            spec=self.native_plan.spec,
+                            plan=self.native_plan,
+                            weight=weight,
+                            stripe=stripe,
+                            source_group=int(source_group),
+                            target_group=int(target_group),
+                            level=int(conv_level),
+                            scheme=scheme,
+                            group_n1=int(group_n1),
+                            compact_target_block=None,
+                        )
+                        self.last_runtime_timing["build_transform_s"] = float(
+                            self.last_runtime_timing.get("build_transform_s", 0.0)
+                        ) + float(time.time() - build_started)
+                        if transform is None:
+                            continue
+                        self.last_runtime_timing["built_transform_count"] = float(
+                            self.last_runtime_timing.get("built_transform_count", 0.0)
+                        ) + 1.0
+                        ordered.append((int(transform.target_index), transform))
                     input_index = int(stripe.index) * int(self.native_plan.source_channel_group_count) + int(source_group)
                     if ordered:
                         ordered.sort(key=lambda item: int(item[0]))
