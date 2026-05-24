@@ -65,6 +65,23 @@ def _activation_fusion_capable(module: Any) -> bool:
     )
 
 
+def _relu_parent(module: Any) -> Any | None:
+    parent_ref = getattr(module, "_relu_parent_ref", None)
+    if not callable(parent_ref):
+        return None
+    return parent_ref()
+
+
+def _relu_output_fusion_capable(module: Any) -> bool:
+    if type(module).__name__ != "Mult":
+        return False
+    if str(getattr(module, "_relu_role", "")) != "output":
+        return False
+    parent = _relu_parent(module)
+    sign = getattr(parent, "sign", None)
+    return bool(type(parent).__name__ == "ReLU" and getattr(sign, "acts", None))
+
+
 def _runtime_fusion_capable(module: Any) -> bool:
     runtime = getattr(module, "region_runtime", None)
     executor = getattr(runtime, "executor", None) if runtime is not None else None
@@ -96,6 +113,7 @@ def bootstrap_prescale_fusion_supported(module: Any) -> bool:
         return False
     return bool(
         _activation_fusion_capable(module)
+        or _relu_output_fusion_capable(module)
         or _runtime_fusion_capable(module)
         or _add_fusion_capable(module)
     )
@@ -114,13 +132,19 @@ def install_bootstrap_prescale_fusion(module: Any, bootstrapper: Any) -> bool:
     if not bootstrap_prescale_fusion_supported(module):
         return False
     affine = bootstrap_prescale_affine(bootstrapper)
-    setattr(module, "_bootstrap_prescale_fusion", dict(affine))
-    for candidate in (
-        getattr(getattr(module, "region_runtime", None), "executor", None),
-        getattr(module, "layout_policy_add_runtime", None),
-    ):
-        if candidate is not None:
-            setattr(candidate, "_bootstrap_prescale_fusion", dict(affine))
+    if _relu_output_fusion_capable(module):
+        parent = _relu_parent(module)
+        last_sign_act = getattr(parent.sign, "acts")[-1]
+        setattr(last_sign_act, "_bootstrap_output_scale_fusion", float(affine["scale"]))
+        setattr(module, "_bootstrap_output_bias_fusion", float(affine["bias"]))
+    else:
+        setattr(module, "_bootstrap_prescale_fusion", dict(affine))
+        for candidate in (
+            getattr(getattr(module, "region_runtime", None), "executor", None),
+            getattr(module, "layout_policy_add_runtime", None),
+        ):
+            if candidate is not None:
+                setattr(candidate, "_bootstrap_prescale_fusion", dict(affine))
     setattr(bootstrapper, "preprocess_fused", True)
     setattr(bootstrapper, "preprocess_fusion_kind", "producer_affine")
     return True

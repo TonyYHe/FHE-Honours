@@ -1,4 +1,5 @@
-import math 
+import math
+import weakref
 
 import torch
 import torch.nn as nn
@@ -117,6 +118,9 @@ class Chebyshev(Module):
 
     def compile(self):
         coeffs = [float(value) for value in (self.coeffs or [])]
+        output_scale_fusion = getattr(self, "_bootstrap_output_scale_fusion", None)
+        if output_scale_fusion is not None and coeffs:
+            coeffs = [float(value) * float(output_scale_fusion) for value in coeffs]
         fusion = _bootstrap_prescale_fusion(self)
         if fusion is not None and coeffs:
             coeffs = [float(value) * float(fusion["scale"]) for value in coeffs]
@@ -284,6 +288,10 @@ class ReLU(Module):
         self.sign = _Sign(degrees, prec, logalpha, logerr)
         self.mult1 = Mult()
         self.mult2 = Mult()
+        self.mult1._relu_parent_ref = weakref.ref(self)
+        self.mult1._relu_role = "sign_prescale"
+        self.mult2._relu_parent_ref = weakref.ref(self)
+        self.mult2._relu_role = "output"
 
         self.prescale = 1 
         self.postscale = 1
@@ -295,16 +303,17 @@ class ReLU(Module):
         self.input_min = self.mult1.input_min 
         self.input_max = self.mult1.input_max
 
+        self.prescale = 1
+        self.postscale = 1
         absmax = max(abs(self.input_min), abs(self.input_max)) * self.margin
         if absmax > 1:
             self.postscale = int(math.ceil(absmax))
             self.prescale = 1 / self.postscale
+        self.mult1.set_depth(0 if self.prescale == 1 else 1)
     
     @timer
     def forward(self, x):
         if self.he_mode and bool(getattr(self, "region_first_probe_activation_bypass", False)):
             return x
-        x = self.mult1(x, self.prescale)
-        x = self.mult2(x, self.sign(x))
-        x *= self.postscale # integer mult, no level consumed
-        return x
+        sign_input = self.mult1(x, self.prescale)
+        return self.mult2(x, self.sign(sign_input))

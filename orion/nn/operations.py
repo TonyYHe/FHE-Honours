@@ -31,7 +31,12 @@ class Mult(Module):
         self.set_depth(1)
 
     def forward(self, x, y):
-        return x * y
+        out = x * y
+        if self.he_mode:
+            bias = float(getattr(self, "_bootstrap_output_bias_fusion", 0.0) or 0.0)
+            if bias != 0.0:
+                out += bias
+        return out
     
 
 class Bootstrap(Module):

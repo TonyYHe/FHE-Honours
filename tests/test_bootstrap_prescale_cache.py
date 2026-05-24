@@ -168,3 +168,23 @@ def test_chebyshev_compile_fuses_bootstrap_output_affine() -> None:
     activation.compile()
 
     assert evaluator.coeffs == [2.25, 1.5]
+
+
+def test_chebyshev_compile_fuses_bootstrap_output_scale() -> None:
+    class _PolyEvaluator:
+        def __init__(self) -> None:
+            self.coeffs = None
+
+        def generate_chebyshev(self, coeffs):
+            self.coeffs = list(coeffs)
+            return list(coeffs)
+
+    evaluator = _PolyEvaluator()
+    activation = Chebyshev(degree=1, fn=lambda x: x)
+    activation.coeffs = [2.0, 3.0]
+    activation.scheme = SimpleNamespace(poly_evaluator=evaluator)
+    activation._bootstrap_output_scale_fusion = 0.25
+
+    activation.compile()
+
+    assert evaluator.coeffs == [0.5, 0.75]
