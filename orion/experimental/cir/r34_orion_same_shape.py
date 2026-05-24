@@ -21,6 +21,17 @@ from orion.experimental.cir.hybrid_schedule import (
 )
 from orion.nn.unified_transform import UnifiedTransformGroup
 
+
+def _unified_output_fusion_enabled() -> bool:
+    return os.environ.get("ORION_UNIFIED_LT_OUTPUT_FUSION", "1").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 try:
     from orion.experimental.cir.runtime_group import (
         _add_plaintext_for_add,
@@ -2383,6 +2394,7 @@ class R34OrionSameShapeRuntimeExecutor:
             raise RuntimeError(f"{self.output_node_id} requires {self.cols} source ciphertext blocks, got {len(ids)}")
 
         output_blocks: list[Any | None] = [None for _ in range(int(self.rows))]
+        fuse_output_rescale = bool(_unified_output_fusion_enabled())
         evaluate_started = time.time()
         for input_index, group in sorted(self.groups_by_input_index.items()):
             if int(input_index) >= len(ids):
@@ -2395,7 +2407,8 @@ class R34OrionSameShapeRuntimeExecutor:
                     torch.Size([1, int(self.slots)]),
                     torch.Size([1, int(self.slots)]),
                 )
-                partial = _rescale_cipher_tensor(partial)
+                if not fuse_output_rescale:
+                    partial = _rescale_cipher_tensor(partial)
                 if output_blocks[int(target_index)] is None:
                     output_blocks[int(target_index)] = partial
                 else:
@@ -2408,6 +2421,8 @@ class R34OrionSameShapeRuntimeExecutor:
         for block_index, block_ct in enumerate(output_blocks):
             if block_ct is None:
                 raise RuntimeError(f"missing same-shape output block {block_index} for {self.output_node_id}")
+            if fuse_output_rescale:
+                block_ct = _rescale_cipher_tensor(block_ct)
             block_ct = self._add_bias(block_ct, block_index=int(block_index))
             block_ct.set_scale(int(scheme.params.get_default_scale()))
             output_ids.append(int(block_ct.ids[0]))
@@ -2761,6 +2776,7 @@ class NativeAlignedHaloNoRIConvExecutor(R34OrionSameShapeRuntimeExecutor):
             )
 
         output_blocks: list[Any | None] = [None for _ in range(int(self.rows))]
+        fuse_output_rescale = bool(_unified_output_fusion_enabled())
         evaluate_started = time.time()
         for input_index, group in sorted(self.groups_by_input_index.items()):
             if int(input_index) >= len(ids):
@@ -2773,7 +2789,8 @@ class NativeAlignedHaloNoRIConvExecutor(R34OrionSameShapeRuntimeExecutor):
                     torch.Size([1, int(self.slots)]),
                     torch.Size([1, int(self.slots)]),
                 )
-                partial = _rescale_cipher_tensor(partial)
+                if not fuse_output_rescale:
+                    partial = _rescale_cipher_tensor(partial)
                 if output_blocks[int(target_index)] is None:
                     output_blocks[int(target_index)] = partial
                 else:
@@ -2786,6 +2803,8 @@ class NativeAlignedHaloNoRIConvExecutor(R34OrionSameShapeRuntimeExecutor):
         for block_index, block_ct in enumerate(output_blocks):
             if block_ct is None:
                 raise RuntimeError(f"missing native aligned halo output block {block_index} for {self.output_node_id}")
+            if fuse_output_rescale:
+                block_ct = _rescale_cipher_tensor(block_ct)
             block_ct = self._add_bias(block_ct, block_index=int(block_index))
             block_ct.set_scale(int(scheme.params.get_default_scale()))
             output_ids.append(int(block_ct.ids[0]))
@@ -3377,6 +3396,7 @@ class R34NoHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecutor):
             raise RuntimeError(f"{self.output_node_id} requires {self.cols} source ciphertext blocks, got {len(ids)}")
 
         output_blocks: list[Any | None] = [None for _ in range(int(self.rows))]
+        fuse_output_rescale = bool(_unified_output_fusion_enabled())
         evaluate_started = time.time()
         for chunk_index, group in enumerate(self.groups_by_input_chunk):
             input_index = int(self.input_index_by_chunk[int(chunk_index)])
@@ -3393,7 +3413,8 @@ class R34NoHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecutor):
                     torch.Size([1, int(self.slots)]),
                     torch.Size([1, int(self.slots)]),
                 )
-                partial = _rescale_cipher_tensor(partial)
+                if not fuse_output_rescale:
+                    partial = _rescale_cipher_tensor(partial)
                 if output_blocks[int(target_index)] is None:
                     output_blocks[int(target_index)] = partial
                 else:
@@ -3406,6 +3427,8 @@ class R34NoHybridSameShapeRuntimeExecutor(R34OrionSameShapeRuntimeExecutor):
         for block_index, block_ct in enumerate(output_blocks):
             if block_ct is None:
                 raise RuntimeError(f"missing same-shape output block {block_index} for {self.output_node_id}")
+            if fuse_output_rescale:
+                block_ct = _rescale_cipher_tensor(block_ct)
             block_ct = self._add_bias(block_ct, block_index=int(block_index))
             block_ct.set_scale(int(scheme.params.get_default_scale()))
             output_ids.append(int(block_ct.ids[0]))

@@ -35,6 +35,17 @@ def _env_truthy(name: str) -> bool:
     raw = os.environ.get(str(name), "")
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _unified_output_fusion_enabled() -> bool:
+    return os.environ.get("ORION_UNIFIED_LT_OUTPUT_FUSION", "1").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 try:
     from orion.experimental.cir.runtime_group import _add_plaintext_for_add, _align_ciphertexts_for_add, _rescale_cipher_tensor
 except ImportError:
@@ -3550,10 +3561,14 @@ class TconvK2S2PythonRuntimeExecutor:
                 if owned:
                     self.last_runtime_counts["projection_count"] += 1
                     self.last_runtime_counts["conjugate_count"] += 1
-                real_input_ids[int(block_index)] = int(real_id)
-                owned_temp_ids.extend(int(value) for value in owned)
+            real_input_ids[int(block_index)] = int(real_id)
+            owned_temp_ids.extend(int(value) for value in owned)
             return int(real_input_ids[int(block_index)])
 
+        fuse_output_rescale = bool(_unified_output_fusion_enabled()) and not any(
+            bool(value) for value in self.complex_input_block_flags
+        )
+        self.last_runtime_counts["output_rescale_fusion"] = int(fuse_output_rescale)
         for input_unit, group in enumerate(self.groups):
             left_block, right_block = self.input_block_pairs[int(input_unit)]
             if bool(self.complex_input_block_flags[int(input_unit)]):
@@ -3583,10 +3598,11 @@ class TconvK2S2PythonRuntimeExecutor:
                     torch.Size([1, int(scheme.params.get_slots())]),
                     torch.Size([1, int(scheme.params.get_slots())]),
                 )
-                rescale_started = time.time()
-                block_ct = _rescale_cipher_tensor(block_ct)
-                self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
-                self.last_runtime_counts["rescale_count"] += 1
+                if not fuse_output_rescale:
+                    rescale_started = time.time()
+                    block_ct = _rescale_cipher_tensor(block_ct)
+                    self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                    self.last_runtime_counts["rescale_count"] += 1
                 if bool(self.complex_input_block_flags[int(input_unit)]):
                     real_extract_started = time.time()
                     conj = block_ct.conjugate(in_place=False)
@@ -3608,6 +3624,11 @@ class TconvK2S2PythonRuntimeExecutor:
         for output_block, block_ct in enumerate(accumulated):
             if block_ct is None:
                 raise RuntimeError(f"U22 experimental tconv kernel missing output block {output_block}")
+            if fuse_output_rescale:
+                rescale_started = time.time()
+                block_ct = _rescale_cipher_tensor(block_ct)
+                self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                self.last_runtime_counts["rescale_count"] += 1
             block_ct = self._apply_output_fold_rotations(block_ct)
             final_ids.append(int(block_ct.ids[0]))
             block_ct.ids = []

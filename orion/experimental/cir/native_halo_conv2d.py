@@ -20,6 +20,7 @@ from .r34_orion_same_shape import (
     _idx_chw_gap,
     _native_best_common_bsgs,
     _rescale_cipher_tensor,
+    _unified_output_fusion_enabled,
 )
 
 
@@ -1904,6 +1905,7 @@ class NativeHaloStripeNoRIConvExecutor:
         partial_count = 0
         rescale_count = 0
         accumulate_count = 0
+        fuse_output_rescale = bool(_unified_output_fusion_enabled())
         evaluate_started = time.time()
         for input_index, group in sorted(self.groups_by_input_index.items()):
             group_started = time.time()
@@ -1920,10 +1922,11 @@ class NativeHaloStripeNoRIConvExecutor:
                 )
                 self.last_runtime_timing["partial_wrap_s"] += float(time.time() - wrap_started)
                 partial_count += 1
-                rescale_started = time.time()
-                partial = _rescale_cipher_tensor(partial)
-                self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
-                rescale_count += 1
+                if not fuse_output_rescale:
+                    rescale_started = time.time()
+                    partial = _rescale_cipher_tensor(partial)
+                    self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                    rescale_count += 1
                 if output_blocks[int(target_index)] is None:
                     output_blocks[int(target_index)] = partial
                 else:
@@ -1932,12 +1935,21 @@ class NativeHaloStripeNoRIConvExecutor:
                     output_blocks[int(target_index)] = lhs + rhs
                     self.last_runtime_timing["partial_accumulate_s"] += float(time.time() - accumulate_started)
                     accumulate_count += 1
+        if fuse_output_rescale:
+            for block_index, block_ct in enumerate(output_blocks):
+                if block_ct is None:
+                    continue
+                rescale_started = time.time()
+                output_blocks[int(block_index)] = _rescale_cipher_tensor(block_ct)
+                self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                rescale_count += 1
         self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
         self.last_runtime_counts = {
             "group_count": int(evaluated_group_count),
             "partial_count": int(partial_count),
             "partial_rescale_count": int(rescale_count),
             "partial_accumulate_count": int(accumulate_count),
+            "output_rescale_fusion": int(fuse_output_rescale),
             "target_count": int(self.rows),
         }
 
