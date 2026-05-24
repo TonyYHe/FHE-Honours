@@ -25,16 +25,10 @@ DEFAULT_SLOTS = 32768
 RELAYOUT_ROTATION_WEIGHT = 6.0
 RELAYOUT_MASK_MULT_WEIGHT = 1.0
 LT_ROTATION_WEIGHT = 8.0
-LT_TRANSFORM_ROT_EQUIV = 4.0
+SUBMATRIX_EVAL_ROT_EQUIV = 4.0
 INPUT_CROSS_RECOVERY_ROTATION_MULTIPLIER = 2.0
-HALO_SLOT_WEIGHT = 0.02
-TILE_WEIGHT = 4.0
-BOOTSTRAP_PROXY_WEIGHT = 64.0
-BOOTSTRAP_HALO_SLOT_DIVISOR = math.inf
 RELAYOUT_DEPTH_WEIGHT = 33554432.0
-RELAYOUT_NODE_STACK_DEPTH_WEIGHT = 65536.0
 ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT = 0.0
-RELAYOUT_BOOTSTRAP_CT_WEIGHT = 16384.0
 DP_FRONTIER_STATE_LIMIT = 128
 LAYOUT_ESTIMATOR_COUNT_ONLY = "count_only"
 LAYOUT_ESTIMATOR_TEMPLATE = "template"
@@ -1970,16 +1964,9 @@ def _halo_slots_for_rows(edge_rows: Iterable[dict[str, Any]]) -> int:
     )
 
 
-def _halo_slot_tiebreak(edge_rows: Iterable[dict[str, Any]]) -> int:
-    halo_slots = _halo_slots_for_rows(edge_rows)
-    return int(halo_slots) if float(HALO_SLOT_WEIGHT) > 0.0 else -int(halo_slots)
-
-
 def _edge_linear_cost(row: dict[str, Any]) -> float:
-    layout = dict(row["selected_layout"])
-    halo_slots = max(0, int(layout["stored_slots"]) - int(layout["core_slots"]))
     rotation_cost = int(row.get("planner_rotation_cost_estimate", row["lt_bsgs_rotation_estimate"]) or 0)
-    transform_penalty = float(row.get("lt_transform_count_estimate", 0) or 0) * float(LT_TRANSFORM_ROT_EQUIV)
+    transform_penalty = float(row.get("lt_transform_count_estimate", 0) or 0) * float(SUBMATRIX_EVAL_ROT_EQUIV)
     return (
         (
             float(rotation_cost)
@@ -1987,14 +1974,7 @@ def _edge_linear_cost(row: dict[str, Any]) -> float:
             + float(row.get("compact_fallback_penalty_estimate", 0) or 0)
         )
         * LT_ROTATION_WEIGHT
-        + float(halo_slots) * HALO_SLOT_WEIGHT
-        + float(layout["tile_count"]) * TILE_WEIGHT
     )
-
-
-def _layout_footprint_cost(layout: LayoutState) -> float:
-    halo_slots = max(0, int(layout.stored_slots) - int(layout.core_slots))
-    return float(halo_slots) * HALO_SLOT_WEIGHT + float(layout.tile_count) * TILE_WEIGHT
 
 
 def _relayout_linear_cost(layout: LayoutState) -> float:
@@ -2002,27 +1982,6 @@ def _relayout_linear_cost(layout: LayoutState) -> float:
         float(_relayout_rotations((layout,))) * RELAYOUT_ROTATION_WEIGHT
         + float(_relayout_mask_mults((layout,))) * RELAYOUT_MASK_MULT_WEIGHT
     )
-
-
-def _relayout_bootstrap_ct_pressure(edge_rows: Iterable[dict[str, Any]]) -> int:
-    rows = [
-        row
-        for row in edge_rows
-        if bool(row.get("relayout", False)) and int(row.get("relayout_depth_estimate", 0) or 0) > 0
-    ]
-    pressure = 0
-    add_by_target: dict[str, int] = {}
-    for row in rows:
-        layout = dict(row.get("selected_layout", {}) or {})
-        depth = int(row.get("relayout_depth_estimate", 0) or 0)
-        tile_count = max(1, int(layout.get("tile_count", 1) or 1))
-        item_pressure = int(depth * tile_count)
-        if str(row.get("op_kind", "")) == "add":
-            target = str(row.get("target", ""))
-            add_by_target[target] = max(int(add_by_target.get(target, 0)), int(item_pressure))
-        else:
-            pressure += int(item_pressure)
-    return int(pressure + sum(add_by_target.values()))
 
 
 def _policy_linear_cost(edge_rows: Iterable[dict[str, Any]], relayout_layouts: Iterable[LayoutState]) -> float:
@@ -2055,7 +2014,6 @@ def _policy_linear_cost(edge_rows: Iterable[dict[str, Any]], relayout_layouts: I
             + float(relayout_mask_cost) * RELAYOUT_MASK_MULT_WEIGHT
             + float(relayout_depth_cost) * RELAYOUT_DEPTH_WEIGHT
             + float(add_relayout_depth_cost) * ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT
-            + float(_relayout_bootstrap_ct_pressure(rows)) * RELAYOUT_BOOTSTRAP_CT_WEIGHT
         )
     return float(sum(_relayout_linear_cost(layout) for layout in relayouts)) + float(
         _relayout_depth_units(relayouts) * RELAYOUT_DEPTH_WEIGHT
@@ -2106,7 +2064,6 @@ def _finalize_policy(
             if str(row.get("op_kind", "")) == "add"
         )
     )
-    relayout_bootstrap_ct_pressure = int(_relayout_bootstrap_ct_pressure(edge_relayout_rows))
     lt_rotation_estimate = int(sum(int(row["lt_bsgs_rotation_estimate"]) for row in edge_rows))
     unfused_lt_rotation_estimate = int(
         sum(int(row.get("lt_unfused_rotation_estimate", row["lt_bsgs_rotation_estimate"]) or 0) for row in edge_rows)
@@ -2127,32 +2084,15 @@ def _finalize_policy(
         sum(int(row.get("compact_fallback_penalty_estimate", 0)) for row in edge_rows)
     )
     halo_slots = int(stored_slots - core_slots)
-    bootstrap_proxy = int(
-        math.ceil(
-            (
-                float(relayout_rotation_estimate)
-                + float(relayout_mask_mult_estimate)
-                + float(relayout_depth_estimate) * 64.0
-                + float(producer_fused_rotation_estimate)
-                + float(planner_rotation_cost_estimate)
-                + float(halo_slots) / BOOTSTRAP_HALO_SLOT_DIVISOR
-                + float(tile_count)
-            )
-            / 64.0
-        )
-    )
+    bootstrap_proxy = 0
     redundancy = 0.0 if int(core_slots) == 0 else float(stored_slots - core_slots) / float(core_slots)
     objective = (
         float(relayout_rotation_estimate) * RELAYOUT_ROTATION_WEIGHT
         + float(relayout_mask_mult_estimate) * RELAYOUT_MASK_MULT_WEIGHT
         + float(planner_rotation_cost_estimate + compact_fallback_penalty_estimate) * LT_ROTATION_WEIGHT
-        + float(halo_slots) * HALO_SLOT_WEIGHT
-        + float(tile_count) * TILE_WEIGHT
         + float(relayout_depth_estimate) * RELAYOUT_DEPTH_WEIGHT
         + float(producer_fused_rotation_estimate) * LT_ROTATION_WEIGHT
         + float(add_relayout_depth_estimate) * ADD_RELAYOUT_BOOTSTRAP_DEPTH_WEIGHT
-        + float(relayout_bootstrap_ct_pressure) * RELAYOUT_BOOTSTRAP_CT_WEIGHT
-        + float(bootstrap_proxy) * BOOTSTRAP_PROXY_WEIGHT
     )
     return PolicyPlan(
         policy=str(policy),
@@ -2857,7 +2797,6 @@ def _prune_dp_frontier(
         key=lambda item: (
             float(item[1].score),
             len(item[1].relayout_layouts),
-            _halo_slot_tiebreak(item[1].edge_rows),
         ),
     )
     return dict(ranked[: int(DP_FRONTIER_STATE_LIMIT)])
@@ -3713,42 +3652,21 @@ def _plan_dp(
                         + list(incoming_relayouts)
                         + list(output_relayouts)
                     )
-                    incoming_relayout_depth = int(
-                        sum(
-                            int(row.get("relayout_depth_estimate", 0) or 0)
-                            for row in incoming_rows
-                            if bool(row.get("relayout", False))
-                        )
-                    )
-                    local_relayout_depth = int(
-                        incoming_relayout_depth
-                        + _relayout_depth_units(output_relayouts)
-                    )
-                    local_stack_depth = max(0, int(local_relayout_depth) - 1)
-                    output_footprint_cost = (
-                        _layout_footprint_cost(output_layout)
-                        if output_layout is not None and _native_operator_output_layout(module)
-                        else 0.0
-                    )
                     candidate_score = (
                         float(state.score)
                         + _policy_linear_cost(incoming_rows, incoming_relayouts)
-                        + float(output_footprint_cost)
                         + float(int(producer_fused["rotation_count"])) * LT_ROTATION_WEIGHT
                         + float(sum(_relayout_linear_cost(layout) for layout in output_relayouts))
                         + float(_relayout_depth_units(output_relayouts) * RELAYOUT_DEPTH_WEIGHT)
-                        + float(local_stack_depth) * RELAYOUT_NODE_STACK_DEPTH_WEIGHT
                     )
                     key = _frontier_key(candidate_live, candidate_storage)
                     existing = next_states.get(key)
                     if existing is None or (
                         candidate_score,
                         len(candidate_relayouts),
-                        _halo_slot_tiebreak(candidate_rows),
                     ) < (
                         float(existing.score),
                         len(existing.relayout_layouts),
-                        _halo_slot_tiebreak(existing.edge_rows),
                     ):
                         next_states[key] = _FrontierState(
                             score=float(candidate_score),
@@ -3768,7 +3686,6 @@ def _plan_dp(
         key=lambda state: (
             float(state.score),
             len(state.relayout_layouts),
-            _halo_slot_tiebreak(state.edge_rows),
         ),
     )
     rows = [{**dict(row), "dp_state_planned": True} for row in best_state.edge_rows]
