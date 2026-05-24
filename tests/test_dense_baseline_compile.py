@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import h5py
+import numpy as np
 import pytest
 import torch
 
@@ -286,6 +287,141 @@ def test_dense_save_load_compile_defaults_to_provider_sized_batches(monkeypatch)
     evaluator.io_mode = "save"
 
     assert evaluator._lt_compile_batch_limit(9) == 4
+
+
+class _FakeSerializedDenseBackend:
+    load_plaintext_diagonals_requires_payload = True
+
+    def __init__(self) -> None:
+        self.serialized = []
+        self.freed = 0
+        self.removed = []
+        self.loaded_batches = []
+        self.loaded_diagonals = []
+
+    def SerializeDiagonal(self, transform_id, diag_idx):
+        self.serialized.append((int(transform_id), int(diag_idx)))
+        return np.asarray([int(transform_id), int(diag_idx), int(diag_idx) + 1], dtype=np.uint8), object()
+
+    def FreeCArray(self, _ptr) -> None:
+        self.freed += 1
+
+    def RemovePlaintextDiagonals(self, transform_id) -> None:
+        self.removed.append(int(transform_id))
+
+    def LoadPlaintextDiagonalsBatch(self, payload, offsets, lengths, diag_indices, transform_id) -> None:
+        payload_arr = np.asarray(payload, dtype=np.uint8).reshape(-1)
+        self.loaded_batches.append(
+            {
+                "transform_id": int(transform_id),
+                "diag_indices": [int(value) for value in diag_indices],
+                "segments": [
+                    payload_arr[int(offset): int(offset) + int(length)].tolist()
+                    for offset, length in zip(offsets, lengths)
+                ],
+            }
+        )
+
+    def LoadPlaintextDiagonal(self, payload, transform_id, diag_idx) -> None:
+        self.loaded_diagonals.append(
+            (int(transform_id), int(diag_idx), np.asarray(payload, dtype=np.uint8).reshape(-1).tolist())
+        )
+
+
+def _dense_cache_evaluator(tmp_path, backend) -> NewEvaluator:
+    evaluator = object.__new__(NewEvaluator)
+    evaluator.backend = backend
+    evaluator.diags_path = str(tmp_path / "diags.h5")
+    evaluator.keys_path = ""
+    evaluator.io_mode = "save"
+    evaluator.compile_load_profile = {}
+    evaluator._transform_io_size_cache = {}
+    evaluator._transform_device_size_cache = {}
+    return evaluator
+
+
+def test_dense_plaintext_cache_saves_coarse_payload_and_loads_batch(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ORION_DENSE_LT_COARSE_ARTIFACT_IO", raising=False)
+    backend = _FakeSerializedDenseBackend()
+    evaluator = _dense_cache_evaluator(tmp_path, backend)
+
+    evaluator.save_plaintext_diagonals("cached", 77, 0, 1, [5, 3])
+
+    assert backend.serialized == [(77, 5), (77, 3)]
+    assert backend.freed == 2
+    assert backend.removed == [77]
+    with h5py.File(tmp_path / "diags.h5", "r") as handle:
+        block = handle["cached"]["plaintexts"]["0_1"]
+        assert block["diag_indices"][:].tolist() == [5, 3]
+        assert block["diag_offsets"][:].tolist() == [0, 3]
+        assert block["diag_lengths"][:].tolist() == [3, 3]
+        assert block["diag_payload"][:].tolist() == [77, 5, 6, 77, 3, 4]
+        assert "5" not in block and "3" not in block
+
+    bundle = evaluator._read_transform_io_bundle("cached", 0, 1, 88, prefetch=False)
+    evaluator.load_plaintext_diagonals("cached", 0, 1, 88, bundle=bundle)
+
+    assert backend.loaded_batches[-1] == {
+        "transform_id": 88,
+        "diag_indices": [5, 3],
+        "segments": [[77, 5, 6], [77, 3, 4]],
+    }
+
+
+def test_dense_coarse_payload_streams_when_chunk_limit_is_small(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ORION_DENSE_LT_COARSE_LOAD_CHUNK_BYTES", "4")
+    backend = _FakeSerializedDenseBackend()
+    evaluator = _dense_cache_evaluator(tmp_path, backend)
+    evaluator.save_plaintext_diagonals("cached", 77, 0, 1, [5, 3])
+
+    bundle = evaluator._read_transform_io_bundle("cached", 0, 1, 88, prefetch=False)
+    assert bundle["coarse_stream_plaintexts"] is True
+
+    evaluator.load_plaintext_diagonals("cached", 0, 1, 88, bundle=bundle)
+
+    assert backend.loaded_batches[-2:] == [
+        {"transform_id": 88, "diag_indices": [5], "segments": [[77, 5, 6]]},
+        {"transform_id": 88, "diag_indices": [3], "segments": [[77, 3, 4]]},
+    ]
+
+
+def test_dense_plaintext_cache_reads_legacy_fine_diagonal_payloads(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ORION_DENSE_LT_COARSE_ARTIFACT_IO", "0")
+    backend = _FakeSerializedDenseBackend()
+    evaluator = _dense_cache_evaluator(tmp_path, backend)
+    with h5py.File(tmp_path / "diags.h5", "w") as handle:
+        block = handle.create_group("cached").create_group("plaintexts").create_group("0_1")
+        block.create_dataset("5", data=np.asarray([5, 50], dtype=np.uint8))
+        block.create_dataset("3", data=np.asarray([3, 30], dtype=np.uint8))
+
+    bundle = evaluator._read_transform_io_bundle("cached", 0, 1, 88, prefetch=False)
+    evaluator.load_plaintext_diagonals("cached", 0, 1, 88, bundle=bundle)
+
+    assert backend.loaded_batches[-1] == {
+        "transform_id": 88,
+        "diag_indices": [3, 5],
+        "segments": [[3, 30], [5, 50]],
+    }
+
+
+def test_dense_legacy_fine_payload_streams_when_chunk_limit_is_small(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("ORION_DENSE_LT_COARSE_LOAD_CHUNK_BYTES", "3")
+    backend = _FakeSerializedDenseBackend()
+    evaluator = _dense_cache_evaluator(tmp_path, backend)
+    with h5py.File(tmp_path / "diags.h5", "w") as handle:
+        block = handle.create_group("cached").create_group("plaintexts").create_group("0_1")
+        block.create_dataset("5", data=np.asarray([5, 50], dtype=np.uint8))
+        block.create_dataset("3", data=np.asarray([3, 30], dtype=np.uint8))
+
+    bundle = evaluator._read_transform_io_bundle("cached", 0, 1, 88, prefetch=False)
+    assert bundle["fine_stream_plaintexts"] is True
+
+    evaluator.load_plaintext_diagonals("cached", 0, 1, 88, bundle=bundle)
+
+    assert backend.loaded_batches[-2:] == [
+        {"transform_id": 88, "diag_indices": [3], "segments": [[3, 30]]},
+        {"transform_id": 88, "diag_indices": [5], "segments": [[5, 50]]},
+    ]
 
 
 def test_dense_shared_cache_is_opt_in(monkeypatch) -> None:

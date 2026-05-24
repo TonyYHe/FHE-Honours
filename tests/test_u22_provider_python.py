@@ -467,7 +467,7 @@ def test_native_physical_relayout_honors_source_layout_offsets() -> None:
             ({"alpha": 0, "beta": 0, "gap": 1, "tile_count": 1}, x),
             (
                 {"alpha": 1, "beta": 1, "gap": 1, "tile_count": 1},
-                torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2),
+                torch.cat([torch.zeros_like(x[:, :, :1, :]), x, torch.zeros_like(x[:, :, -1:, :])], dim=2),
             ),
         ):
             kernel = NativeHaloRelayoutKernel(
@@ -516,13 +516,148 @@ def test_u22_256_base8_routes_flat_halo_producers_to_native_compact_source() -> 
         row = enc2a.compact_align_shared_rows[0]
         assert row["source"] == "pool1"
         assert row["target"] == "enc2a"
-        assert row["layout_mode"] == "compact_align_shared"
-        assert row["physical_layout"] == "packed_compact"
+        assert row["layout_mode"] == "compact_halo_shared"
+        assert row["physical_layout"] == "logical_halo_compact"
         assert bool(row["consumer_fused_relayout"]) is True
         assert isinstance(enc2a.base_executor, HaloLocalConvRuntimeExecutor)
         assert isinstance(enc2a.base_executor.delegate, NativeHaloStripeNoRIConvExecutor)
         assert enc2a.compact_source_rows
 
+    finally:
+        scheme.delete_scheme()
+
+
+def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+
+    _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
+    try:
+        torch.manual_seed(0)
+        model = UNet22(
+            dataset="kvasir_polyp_256",
+            base_channels=8,
+            activation="silu",
+            silu_degree=7,
+        )
+        traced = OrionTracer().trace_model(model)
+        StatsTracker(traced).propagate(torch.randn((1, 3, 224, 224), dtype=torch.float32))
+        dag = NetworkDAG(traced)
+        dag.build_dag()
+        for node in dag.nodes:
+            module = dag.nodes[node]["module"]
+            if module is not None and hasattr(module, "init_orion_params"):
+                module.init_orion_params()
+            if module is not None and hasattr(module, "update_params"):
+                module.update_params()
+
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=None,
+            enable_conv_kernels=True,
+            layout_policy="fixed_max_fused",
+        )
+        assert registry.graph_audit["layout_policy_provider_fallback_nodes"] == []
+        registry.attach_to_dag(dag)
+
+        enc1a = dag.nodes["enc1a"]["module"].region_runtime.executor
+        assert isinstance(enc1a, LayoutPolicyProviderRuntimeExecutor)
+        enc1a.assigned_level = len(scheme.params.get_logq()) - 1
+        enc1a.assigned_depth = 1
+        enc1a.compile(scheme)
+        assert enc1a.base_executor.delegate.native_plan.spec.input_beta == 1
+
+        executor = dag.nodes["enc3a"]["module"].region_runtime.executor
+        assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
+        assert isinstance(executor.base_executor, HaloLocalConvRuntimeExecutor)
+        assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
+        assert executor.compact_source_rows
+        assert not executor.native_input_rows
+        assert executor.output_relayout_rows == ()
+        assert executor.native_physical_relayout_rows == ()
+        assert executor.compile_plan["policy"] == "fixed_max_fused"
+        assert executor.base_executor.native_halo_output_capable
+
+        executor.assigned_level = len(scheme.params.get_logq()) - 1
+        executor.assigned_depth = 1
+        executor.compile(scheme)
+        assert executor.base_executor.rows > 0
+        assert executor.base_executor.cols > 0
+        assert executor.base_executor.delegate.native_plan.spec.input_beta == 16
+
+        enc4a = dag.nodes["enc4a"]["module"].region_runtime.executor
+        assert isinstance(enc4a, LayoutPolicyProviderRuntimeExecutor)
+        assert isinstance(enc4a.base_executor, HaloLocalConvRuntimeExecutor)
+        assert enc4a._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_224_silu7_layout_policies_validate_native_provider_plans() -> None:
+    _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
+    try:
+        torch.manual_seed(0)
+        model = UNet22(
+            dataset="kvasir_polyp_256",
+            base_channels=8,
+            activation="silu",
+            silu_degree=7,
+        )
+        traced = OrionTracer().trace_model(model)
+        StatsTracker(traced).propagate(torch.randn((1, 3, 224, 224), dtype=torch.float32))
+        dag = NetworkDAG(traced)
+        dag.build_dag()
+        for node in dag.nodes:
+            module = dag.nodes[node]["module"]
+            if module is not None and hasattr(module, "init_orion_params"):
+                module.init_orion_params()
+            if module is not None and hasattr(module, "update_params"):
+                module.update_params()
+
+        for policy in ("fixed_max_fused", "eager_fused", "greedy_fused", "dp"):
+            registry = U22CompileRegistry.for_dag(
+                dag,
+                allowed_nodes=None,
+                enable_conv_kernels=True,
+                layout_policy=policy,
+            )
+            assert registry.graph_audit["layout_policy_provider_fallback_nodes"] == []
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_224_silu7_dp_preserves_native_physical_layout_across_activation() -> None:
+    from orion.experimental.layout_policy_ablation import build_layout_policy_compile_plan
+
+    _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
+    try:
+        torch.manual_seed(0)
+        model = UNet22(
+            dataset="kvasir_polyp_256",
+            base_channels=8,
+            activation="silu",
+            silu_degree=7,
+        )
+        traced = OrionTracer().trace_model(model)
+        StatsTracker(traced).propagate(torch.randn((1, 3, 224, 224), dtype=torch.float32))
+        dag = NetworkDAG(traced)
+        dag.build_dag()
+        for node in dag.nodes:
+            module = dag.nodes[node]["module"]
+            if module is not None and hasattr(module, "init_orion_params"):
+                module.init_orion_params()
+            if module is not None and hasattr(module, "update_params"):
+                module.update_params()
+
+        plan = build_layout_policy_compile_plan(dag, policy="dp")
+        edges = {str(row["edge"]): dict(row) for row in plan["edge_layouts"]}
+        nodes = {str(row["node"]): dict(row) for row in plan["node_layouts"]}
+
+        assert edges["x->enc1a"]["physical_layout"] == "native_source_stripe"
+        assert edges["enc1a->enc1a_act"]["physical_layout"] == "native_source_stripe"
+        assert nodes["enc1a_act"]["physical_layout"] == "native_source_stripe"
+        assert edges["enc1a_act->enc1b"]["layout_mode"] == "native_halo_stripe"
+        assert edges["enc1a_act->enc1b"]["physical_layout"] == "native_source_stripe"
+        assert edges["enc1a_act->enc1b"]["relayout"] is False
     finally:
         scheme.delete_scheme()
 
@@ -610,8 +745,12 @@ def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() ->
             .reshape(-1)[:24]
             .reshape(1, 1, 6, 4)
         )
-        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
-        reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
+        reference = F.conv2d(
+            x,
+            conv.on_weight.detach(),
+            conv.on_bias.detach(),
+            padding=(2, 1),
+        )
 
         metadata = executor.compile_cache_metadata()
         assert executor.last_runtime_io["runtime_lowering"] == "provider_executable+native_halo_layout"
@@ -622,6 +761,15 @@ def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() ->
         assert metadata["relayout_sparse_lt_tasks"] == 0
         assert executor.last_runtime_io["internal_input_relayout"] is False
         assert executor.last_runtime_io["internal_output_relayout"] is False
+        timing = executor.last_runtime_timing
+        assert timing["group_eval_s"] >= 0.0
+        assert timing["partial_wrap_s"] >= 0.0
+        assert timing["partial_rescale_s"] >= 0.0
+        assert timing["partial_accumulate_s"] >= 0.0
+        counts = executor.last_runtime_counts
+        assert counts["partial_count"] == counts["partial_rescale_count"]
+        assert counts["partial_accumulate_count"] >= 0
+        assert counts["target_count"] >= 1
         assert tuple(int(value) for value in out.on_shape) == (1, int(scheme.params.get_slots()))
         assert float((decoded - reference).abs().max().item()) <= 1.0e-5
     finally:
@@ -711,8 +859,7 @@ def test_native_halo_provider_uses_tight_compact_output_when_output_halo_is_zero
             .reshape(-1)[:16]
             .reshape(1, 1, 4, 4)
         )
-        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
-        reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)[:, :, 1:5, :]
+        reference = F.conv2d(x, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
 
         metadata = executor.compile_cache_metadata()
         assert tuple(int(value) for value in out.on_shape) == (1, 1, 4, 4)
@@ -793,8 +940,7 @@ def test_native_halo_provider_accepts_compact_source_layout_without_input_pair_f
             .reshape(-1)[:32]
             .reshape(1, 2, 4, 4)
         )
-        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
-        reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)[:, :, 1:5, :]
+        reference = F.conv2d(x, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
         metadata = executor.compile_cache_metadata()
 
         assert isinstance(executor.base_executor, HaloLocalConvRuntimeExecutor)
@@ -807,6 +953,170 @@ def test_native_halo_provider_accepts_compact_source_layout_without_input_pair_f
         assert executor.last_runtime_io["internal_input_relayout"] is False
         assert metadata["input_physical_layout"] == "packed_compact"
         assert metadata["runtime_input_ct_count"] == 1
+        assert float((decoded - reference).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_native_halo_provider_uses_physical_compact_layout_for_raw_input_source() -> None:
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+    from orion.experimental.cir.native_halo_conv2d import NativeHaloStripeNoRIConvExecutor
+
+    _init_python_scheme(logn=15)
+    try:
+        conv = Conv2d(2, 2, kernel_size=3, padding=1, bias=True)
+        conv.weight.data = torch.arange(36, dtype=torch.float32).reshape(2, 2, 3, 3) / 50.0 - 0.2
+        conv.bias.data = torch.tensor([0.25, -0.125], dtype=torch.float32)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 2, 4, 4))
+        conv.output_shape = torch.Size((1, 2, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 2, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 2, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_raw_input_compact_source_toy_conv"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(2)
+
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
+            output_node_id="conv",
+            compile_plan={
+                "policy": "fixed_max_fused",
+                "edge_layouts": [
+                    {
+                        "edge": "x->conv",
+                        "source": "x",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 2, 4, 4],
+                        "fhe_shape": [1, 2, 4, 4],
+                        "relayout": False,
+                        "layout_mode": "halo_local",
+                        "physical_layout": "packed_compact",
+                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"alpha": 1, "beta": 3, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 2, 4, 4],
+                        "fhe_shape": [1, 2, 4, 4],
+                        "output_relayout": False,
+                        "physical_layout": "packed_compact",
+                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+            },
+        )
+        executor.assigned_level = level
+        executor.assigned_depth = 2
+
+        x = torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 4) / 10.0
+        out = executor(scheme.encrypt(scheme.encode(x, level)))["conv"]
+        decoded = (
+            out.decrypt()
+            .decode()
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+            .reshape(-1)[:32]
+            .reshape(1, 2, 4, 4)
+        )
+        reference = F.conv2d(x, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
+        metadata = executor.compile_cache_metadata()
+
+        assert isinstance(executor.base_executor.delegate, NativeHaloStripeNoRIConvExecutor)
+        assert executor.last_runtime_io["input_physical_layout"] == "packed_compact"
+        assert metadata["compact_source_layout"]["alpha"] == 0
+        assert metadata["compact_source_layout"]["beta"] == 0
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_alpha"] == 1
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_beta"] == 1
+        assert float((decoded - reference).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None:
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+
+    _init_python_scheme(logn=15)
+    try:
+        conv = Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
+        conv.weight.data = torch.tensor(
+            [[[[0.25, -0.5, 0.75], [1.0, 0.5, -0.25], [0.125, -0.375, 0.625]]]],
+            dtype=torch.float32,
+        )
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 1, 4, 4))
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_global_padding_halo_toy_conv"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(2)
+
+        halo_layout = {"alpha": 1, "beta": 2, "stride": 1, "gap": 1, "tile_count": 1}
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
+            output_node_id="conv",
+            compile_plan={
+                "policy": "fixed_max_fused",
+                "edge_layouts": [
+                    {
+                        "edge": "prev->conv",
+                        "source": "prev",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 7, 4],
+                        "relayout": False,
+                        "layout_mode": "halo_local",
+                        "physical_layout": "logical_halo_compact",
+                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": dict(halo_layout),
+                        "selected_layout": dict(halo_layout),
+                    }
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "output_relayout": False,
+                        "physical_layout": "packed_compact",
+                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+            },
+        )
+        executor.assigned_level = level
+        executor.assigned_depth = 2
+
+        x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4) / 10.0
+        physical = torch.full((1, 1, 7, 4), 100.0, dtype=torch.float32)
+        physical[:, :, 1:5, :] = x
+        out = executor(scheme.encrypt(scheme.encode(physical, level)))["conv"]
+        decoded = (
+            out.decrypt()
+            .decode()
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+            .reshape(-1)[:16]
+            .reshape(1, 1, 4, 4)
+        )
+        reference = F.conv2d(x, conv.on_weight.detach(), None, padding=1)
+        metadata = executor.compile_cache_metadata()
+
+        assert metadata["compact_source_layout"]["alpha"] == 1
+        assert metadata["compact_source_layout"]["beta"] == 2
         assert float((decoded - reference).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()

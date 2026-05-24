@@ -520,19 +520,23 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
         np.arange(wo, dtype=np.int64),
         indexing="ij",
     )
-    op_oh_grid = (
-        np.clip(target_oh_grid, 0, max(0, int(ho) - 1))
-        if bool(fuse_output_relayout)
-        else target_oh_grid
-    )
+    if bool(fuse_output_relayout):
+        op_oh_grid = target_oh_grid.copy()
+        top = op_oh_grid < 0
+        bottom = op_oh_grid >= int(ho)
+        op_oh_grid[top] = op_oh_grid[top] + int(output_alpha)
+        op_oh_grid[bottom] = op_oh_grid[bottom] - int(output_beta)
+        op_oh_grid = np.clip(op_oh_grid, 0, max(0, int(ho) - 1))
+    else:
+        op_oh_grid = target_oh_grid
     cache = {}
     for kh in range(k_h):
         for kw in range(k_w):
             ih_grid = op_oh_grid * int(stride_h) - int(pad_h) + int(kh) * int(dil_h)
             iw_grid = ow_grid * int(stride_w) - int(pad_w) + int(kw) * int(dil_w)
             valid = (
-                (ih_grid >= -int(input_alpha))
-                & (ih_grid < int(hi + input_beta))
+                (ih_grid >= 0)
+                & (ih_grid < int(hi))
                 & (iw_grid >= 0)
                 & (iw_grid < int(wi))
             )
@@ -551,6 +555,8 @@ def direct_diagonalize_conv2d(
     num_slots: int,
     embed_method: str,
     is_last_layer: bool,
+    *,
+    allow_hybrid: bool = True,
 ):
     start_time = time.time()
     matrix_shape = (
@@ -562,6 +568,7 @@ def direct_diagonalize_conv2d(
         int(num_slots),
         str(embed_method),
         bool(is_last_layer),
+        allow_hybrid=bool(allow_hybrid),
     )
 
     n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
@@ -633,6 +640,7 @@ def direct_diagonalize_conv2d(
                     int(num_slots),
                     str(embed_method),
                     bool(is_last_layer),
+                    allow_hybrid=bool(allow_hybrid),
                     verbose=False,
                 )
                 futures.append(executor.submit(fill_accumulator, local, int(oc_start), int(oc_end)))

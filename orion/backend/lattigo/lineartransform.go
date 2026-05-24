@@ -23,6 +23,25 @@ import (
 
 var ltHeap = NewHeapAllocator()
 
+var (
+	ltPredecodeMu             sync.Mutex
+	ltPredecodedRotationKeys  = make(map[uint64]*rlwe.GaloisKey)
+	ltPredecodedPlaintextVecs = make(map[int]map[int]ringqp.Poly)
+)
+
+func clearPredecodedLinearTransformArtifacts() {
+	ltPredecodeMu.Lock()
+	defer ltPredecodeMu.Unlock()
+	ltPredecodedRotationKeys = make(map[uint64]*rlwe.GaloisKey)
+	ltPredecodedPlaintextVecs = make(map[int]map[int]ringqp.Poly)
+}
+
+func deletePredecodedPlaintextDiagonals(transformID int) {
+	ltPredecodeMu.Lock()
+	defer ltPredecodeMu.Unlock()
+	delete(ltPredecodedPlaintextVecs, transformID)
+}
+
 type lattigoStreamingLTState struct {
 	shell           lintrans.LinearTransformation
 	slots           int
@@ -922,6 +941,7 @@ func validateLinearTransformPlaintextLevels(transformID int, transform lintrans.
 //export DeleteLinearTransform
 func DeleteLinearTransform(id C.int) {
 	deleteStreamingLTState(int(id))
+	deletePredecodedPlaintextDiagonals(int(id))
 	ltHeap.Delete(int(id))
 }
 
@@ -1187,6 +1207,53 @@ func LoadRotationKey(
 	scheme.EvalKeys.GaloisKeys[uint64(galEl)] = &rotKey
 }
 
+//export PredecodeRotationKey
+func PredecodeRotationKey(
+	dataPtr *C.uchar, lenData C.ulong,
+	galEl C.ulong,
+) {
+	rotKeySerial := CArrayToByteSlice(unsafe.Pointer(dataPtr), uint64(lenData))
+
+	var rotKey rlwe.GaloisKey
+	if err := rotKey.UnmarshalBinary(rotKeySerial); err != nil {
+		panic(err)
+	}
+
+	ltPredecodeMu.Lock()
+	ltPredecodedRotationKeys[uint64(galEl)] = &rotKey
+	ltPredecodeMu.Unlock()
+}
+
+//export InstallPredecodedRotationKey
+func InstallPredecodedRotationKey(galEl C.ulong) C.int {
+	key := uint64(galEl)
+	ltPredecodeMu.Lock()
+	rotKey, ok := ltPredecodedRotationKeys[key]
+	if ok {
+		delete(ltPredecodedRotationKeys, key)
+	}
+	ltPredecodeMu.Unlock()
+
+	if !ok || rotKey == nil {
+		return C.int(0)
+	}
+	if scheme.EvalKeys == nil {
+		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
+	}
+	if scheme.EvalKeys.GaloisKeys == nil {
+		scheme.EvalKeys.GaloisKeys = make(map[uint64]*rlwe.GaloisKey)
+	}
+	scheme.EvalKeys.GaloisKeys[key] = rotKey
+	return C.int(1)
+}
+
+//export RemovePredecodedRotationKeys
+func RemovePredecodedRotationKeys() {
+	ltPredecodeMu.Lock()
+	ltPredecodedRotationKeys = make(map[uint64]*rlwe.GaloisKey)
+	ltPredecodeMu.Unlock()
+}
+
 //export SerializeDiagonal
 func SerializeDiagonal(transformID, diagIdx C.int) (*C.char, C.ulong) {
 	transform := RetrieveLinearTransform(int(transformID))
@@ -1252,6 +1319,77 @@ func LoadPlaintextDiagonalsBatch(
 		}
 		transform.Vec[int(diagIdxs[i])] = poly
 	}
+}
+
+//export PredecodePlaintextDiagonalsBatch
+func PredecodePlaintextDiagonalsBatch(
+	dataPtr *C.uchar, lenData C.ulong,
+	offsetsPtr *C.ulonglong, offsetsLen C.int,
+	lengthsPtr *C.ulonglong, lengthsLen C.int,
+	diagIdxsPtr *C.int, diagIdxsLen C.int,
+	transformID C.int,
+) {
+	if int(offsetsLen) != int(lengthsLen) || int(offsetsLen) != int(diagIdxsLen) {
+		panic("PredecodePlaintextDiagonalsBatch received mismatched batch array lengths")
+	}
+
+	payload := CArrayToByteSlice(unsafe.Pointer(dataPtr), uint64(lenData))
+	offsets := unsafe.Slice(offsetsPtr, int(offsetsLen))
+	lengths := unsafe.Slice(lengthsPtr, int(lengthsLen))
+	diagIdxs := unsafe.Slice(diagIdxsPtr, int(diagIdxsLen))
+
+	decoded := make(map[int]ringqp.Poly, int(diagIdxsLen))
+	for i := range diagIdxs {
+		start := uint64(offsets[i])
+		end := start + uint64(lengths[i])
+		if end > uint64(len(payload)) {
+			panic("PredecodePlaintextDiagonalsBatch slice exceeds payload bounds")
+		}
+
+		var poly ringqp.Poly
+		if err := poly.UnmarshalBinary(payload[start:end]); err != nil {
+			panic(err)
+		}
+		decoded[int(diagIdxs[i])] = poly
+	}
+
+	ltPredecodeMu.Lock()
+	existing := ltPredecodedPlaintextVecs[int(transformID)]
+	if existing == nil {
+		existing = make(map[int]ringqp.Poly, len(decoded))
+		ltPredecodedPlaintextVecs[int(transformID)] = existing
+	}
+	for diagIdx, poly := range decoded {
+		existing[diagIdx] = poly
+	}
+	ltPredecodeMu.Unlock()
+}
+
+//export InstallPredecodedPlaintextDiagonals
+func InstallPredecodedPlaintextDiagonals(transformID C.int) C.int {
+	id := int(transformID)
+	ltPredecodeMu.Lock()
+	decoded, ok := ltPredecodedPlaintextVecs[id]
+	if ok {
+		delete(ltPredecodedPlaintextVecs, id)
+	}
+	ltPredecodeMu.Unlock()
+
+	if !ok {
+		return C.int(0)
+	}
+	transform := RetrieveLinearTransform(id)
+	count := 0
+	for diagIdx, poly := range decoded {
+		transform.Vec[diagIdx] = poly
+		count++
+	}
+	return C.int(count)
+}
+
+//export RemovePredecodedPlaintextDiagonals
+func RemovePredecodedPlaintextDiagonals(transformID C.int) {
+	deletePredecodedPlaintextDiagonals(int(transformID))
 }
 
 //export RemovePlaintextDiagonals

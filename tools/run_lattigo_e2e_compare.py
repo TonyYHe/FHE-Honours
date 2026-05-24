@@ -24,7 +24,8 @@ from orion.backend.python.tensors import CipherTensor
 from orion.backend.python.memory_lifecycle import trim_runtime_memory
 from orion.backend.python.compile_policy import auto_worker_count, policy_audit
 from orion.models.resnet import ResNet18, ResNet20, ResNet34
-from orion.models.unet import UNet22
+from orion.models.unet import UNet22, UNet22Encoder
+from orion.models.vgg import VGG
 from orion.nn.linear import LinearTransform
 from orion.nn.module import Module
 from orion.nn.operations import Bootstrap
@@ -392,16 +393,52 @@ def _u22_config(*, logn: int, provider_mode: str, backend: str = "lattigo") -> d
     }
 
 
-def _build_r18_tiny() -> torch.nn.Module:
-    return ResNet18(dataset="tiny")
+def _activation_or_relu(activation: str | None) -> str:
+    return str(activation or "relu").lower()
 
 
-def _build_r20_cifar10() -> torch.nn.Module:
+def _stem_relu_for_activation(activation: str | None) -> bool:
+    return _activation_or_relu(activation) == "relu"
+
+
+def _build_r18_tiny(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return ResNet18(
+        dataset="tiny",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=_stem_relu_for_activation(activation),
+    )
+
+
+def _build_r20_cifar10(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
     return ResNet20(dataset="cifar10")
 
 
-def _build_r34_imgnet() -> torch.nn.Module:
-    return ResNet34(dataset="imagenet")
+def _build_r18_imgnet(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return ResNet18(
+        dataset="imagenet",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=_stem_relu_for_activation(activation),
+    )
+
+
+def _build_r34_imgnet(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return ResNet34(
+        dataset="imagenet",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=_stem_relu_for_activation(activation),
+    )
+
+
+def _build_vgg16_imgnet(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return VGG(
+        "VGG16",
+        dataset="imagenet",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+    )
 
 
 def _build_u22_64_base32(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
@@ -440,6 +477,24 @@ def _build_u22_256_base8(*, activation: str | None = None, silu_degree: int = 31
     )
 
 
+def _build_u22_256_base8_encoder(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22Encoder(
+        dataset="kvasir_polyp_256",
+        base_dim=8,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
+def _build_u22_256_base64_encoder(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22Encoder(
+        dataset="kvasir_polyp_256",
+        base_dim=64,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
 NETWORKS: dict[str, dict[str, Any]] = {
     "resnet20_cifar10": {
         "label": "ResNet20 CIFAR10",
@@ -458,6 +513,24 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "provider_mode": "r18_tiny_e2e",
         "config": _r18_config,
         "builder": _build_r18_tiny,
+    },
+    "vgg16_imgnet": {
+        "label": "VGG16 ImageNet",
+        "model": "VGG16",
+        "dataset": "imagenet",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "vgg_imgnet_layout_dp",
+        "config": _r34_config,
+        "builder": _build_vgg16_imgnet,
+    },
+    "r18_imgnet": {
+        "label": "R18 ImageNet",
+        "model": "ResNet18",
+        "dataset": "imagenet",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "r18_imgnet_layout_dp",
+        "config": _r34_config,
+        "builder": _build_r18_imgnet,
     },
     "r34_imgnet": {
         "label": "R34 ImageNet",
@@ -545,6 +618,65 @@ NETWORKS: dict[str, dict[str, Any]] = {
             backend=str(backend),
         ),
         "builder": _build_u22_256_base8,
+    },
+    "u22_256_base8_encoder": {
+        "label": "U22 256 base8 encoder",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 256, 256),
+        "provider_mode": "u22_256_base8",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base8_encoder,
+        "scope": "encoder",
+    },
+    "u22_192_base64_encoder": {
+        "label": "U22 192 base64 encoder",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 192, 192),
+        "provider_mode": "u22_256_base32",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base64_encoder,
+        "scope": "encoder",
+        "base_dim": 64,
+    },
+    "u22_224_base64_encoder": {
+        "label": "U22 224 base64 encoder",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "u22_256_base32",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base64_encoder,
+        "scope": "encoder",
+        "base_dim": 64,
+    },
+    "u22_256_base64_encoder": {
+        "label": "U22 256 base64 encoder",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 256, 256),
+        "provider_mode": "u22_256_base32",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_256_base64_encoder,
+        "scope": "encoder",
+        "base_dim": 64,
     },
 }
 
@@ -1707,6 +1839,7 @@ def _run_one(
         "label": str(spec["label"]),
         "model": str(spec["model"]),
         "dataset": str(spec["dataset"]),
+        "network_scope": str(spec.get("scope", "full")),
         "mode": str(mode),
         "provider_mode": str(provider_mode),
         "provider_no_hybrid": bool(provider_no_hybrid),
@@ -1741,10 +1874,7 @@ def _run_one(
         payload["phase"] = "compile_load"
         _write(payload, out_path)
         torch.manual_seed(int(seed))
-        if str(spec["model"]) == "UNet22":
-            net = spec["builder"](activation=activation, silu_degree=int(silu_degree))
-        else:
-            net = spec["builder"]()
+        net = spec["builder"](activation=activation, silu_degree=int(silu_degree))
         net.eval()
         x0 = torch.randn(tuple(int(v) for v in spec["input_shape"]), dtype=torch.float32)
         with torch.no_grad():

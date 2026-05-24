@@ -309,6 +309,78 @@ class UNet22(on.Module):
         return x
 
 
+class UNet22Encoder(on.Module):
+    """Encoder-only UNet22 prefix ending at enc4b."""
+
+    def __init__(
+        self,
+        dataset: str = "kvasir_polyp_256",
+        in_channels: int | None = None,
+        base_channels: int | None = None,
+        base_dim: int | None = None,
+        activation: str | None = None,
+        silu_degree: int = 31,
+    ):
+        super().__init__()
+        dataset = _normalize_u22_dataset(dataset)
+        if base_channels is not None and base_dim is not None and int(base_channels) != int(base_dim):
+            raise ValueError(
+                f"Received conflicting UNet22 base sizes: "
+                f"base_channels={base_channels} and base_dim={base_dim}."
+            )
+        requested_base = base_channels if base_channels is not None else base_dim
+        base = int(requested_base if requested_base is not None else _u22_default_base_channels(dataset))
+        default_in_channels, _default_out_channels = _u22_default_channels(dataset)
+        in_channels = int(default_in_channels if in_channels is None else in_channels)
+        self.dataset = dataset
+        self.in_channels = in_channels
+        self.base_channels = base
+        self.activation = _normalize_u22_activation(activation)
+        self.silu_degree = int(silu_degree)
+
+        c1 = int(base)
+        c2 = int(base * 2)
+        c3 = int(base * 4)
+        c4 = int(base * 8)
+        make_act = lambda: _make_u22_activation(self.activation, silu_degree=self.silu_degree)
+
+        self.enc1a = on.Conv2d(in_channels, c1, kernel_size=3, padding=1, bias=True)
+        self.enc1a_act = make_act()
+        self.enc1b = on.Conv2d(c1, c1, kernel_size=3, padding=1, bias=True)
+        self.enc1b_act = make_act()
+        self.pool1 = on.AvgPool2d(kernel_size=2, stride=2)
+
+        self.enc2a = on.Conv2d(c1, c2, kernel_size=3, padding=1, bias=True)
+        self.enc2a_act = make_act()
+        self.enc2b = on.Conv2d(c2, c2, kernel_size=3, padding=1, bias=True)
+        self.enc2b_act = make_act()
+        self.pool2 = on.AvgPool2d(kernel_size=2, stride=2)
+
+        self.enc3a = on.Conv2d(c2, c3, kernel_size=3, padding=1, bias=True)
+        self.enc3a_act = make_act()
+        self.enc3b = on.Conv2d(c3, c3, kernel_size=3, padding=1, bias=True)
+        self.enc3b_act = make_act()
+        self.pool3 = on.AvgPool2d(kernel_size=2, stride=2)
+
+        self.enc4a = on.Conv2d(c3, c4, kernel_size=3, padding=1, bias=True)
+        self.enc4a_act = make_act()
+        self.enc4b = on.Conv2d(c4, c4, kernel_size=3, padding=1, bias=True)
+        self.enc4b_act = make_act()
+
+    def forward(self, x):
+        x = _apply_u22_activation(self.enc1a_act, self.enc1a(x))
+        skip1 = _apply_u22_activation(self.enc1b_act, self.enc1b(x))
+
+        x = _apply_u22_activation(self.enc2a_act, self.enc2a(self.pool1(skip1)))
+        skip2 = _apply_u22_activation(self.enc2b_act, self.enc2b(x))
+
+        x = _apply_u22_activation(self.enc3a_act, self.enc3a(self.pool2(skip2)))
+        skip3 = _apply_u22_activation(self.enc3b_act, self.enc3b(x))
+
+        x = _apply_u22_activation(self.enc4a_act, self.enc4a(self.pool3(skip3)))
+        return _apply_u22_activation(self.enc4b_act, self.enc4b(x))
+
+
 class UNet22MontgomeryLung64(UNet22):
     """UNet22(base_dim=32) for 64x64 Montgomery CXR lung segmentation."""
 

@@ -72,6 +72,19 @@ def test_lt_evaluator_registers_global_saved_io_work_order() -> None:
     assert evaluator._saved_io_work_index[("second", 0, 0, 21)] == 2
 
 
+def test_lt_evaluator_saved_io_prefetch_default_lookahead_is_one(monkeypatch) -> None:
+    evaluator = NewEvaluator.__new__(NewEvaluator)
+
+    monkeypatch.delenv("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", raising=False)
+    assert evaluator._read_transform_io_lookahead() == 1
+
+    monkeypatch.setenv("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "not-an-int")
+    assert evaluator._read_transform_io_lookahead() == 1
+
+    monkeypatch.setenv("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "0")
+    assert evaluator._read_transform_io_lookahead() == 0
+
+
 def test_lt_evaluator_rebuilds_transform_matrix_from_numeric_block_keys() -> None:
     evaluator = NewEvaluator.__new__(NewEvaluator)
     transform_ids = {}

@@ -86,6 +86,39 @@ def test_bootstrap_placer_marks_full_slot_prescale_fusion() -> None:
     assert module._bootstrap_prescale_fusion["bias"] == bootstrap.prescale * bootstrap.constant
 
 
+def test_bootstrap_placer_respects_prescale_fusion_disable_env(monkeypatch) -> None:
+    class _Params:
+        def get_slots(self):
+            return 64
+
+    class _RuntimeExecutor:
+        def runtime_fhe_output_shape(self):
+            return torch.Size([1, 64])
+
+        def bootstrap_prescale_fusion_capable(self):
+            return True
+
+    monkeypatch.setenv("ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION", "1")
+
+    encoder = _DummyEncoder()
+    scheme = SimpleNamespace(encoder=encoder, params=_Params())
+    module = SimpleNamespace(
+        level=3,
+        depth=1,
+        output_min=torch.tensor(-4.0),
+        output_max=torch.tensor(4.0),
+        fhe_output_shape=torch.Size([1, 64]),
+        scheme=scheme,
+        region_runtime=SimpleNamespace(executor=_RuntimeExecutor()),
+    )
+    placer = BootstrapPlacer(net=SimpleNamespace(scheme=scheme, margin=1.0), network_dag=None)
+
+    bootstrap = placer._create_bootstrapper(module)
+
+    assert bootstrap.preprocess_fused is False
+    assert not hasattr(module, "_bootstrap_prescale_fusion")
+
+
 def test_bootstrap_placer_keeps_sparse_prescale_in_bootstrap() -> None:
     class _Params:
         def get_slots(self):

@@ -152,6 +152,7 @@ func DeleteScheme() {
 	DeleteRotationKeys()
 	DeleteBootstrappers()
 	DeleteMinimaxSignMap()
+	clearPredecodedLinearTransformArtifacts()
 
 	ltHeap.Reset()
 	polyHeap.Reset()

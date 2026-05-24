@@ -132,6 +132,18 @@ class PythonBackend:
             return tensor
         return tensor.to(dtype=torch.float32)
 
+    def _float_ptr_tensor(self, ptr, length: int) -> torch.Tensor:
+        length = int(length)
+        if length <= 0:
+            return torch.zeros((0,), dtype=torch.float32)
+        return torch.from_numpy(np.ctypeslib.as_array(ptr, shape=(length,)))
+
+    def _double_ptr_tensor(self, ptr, length: int) -> torch.Tensor:
+        length = int(length)
+        if length <= 0:
+            return torch.zeros((0,), dtype=torch.float64)
+        return torch.from_numpy(np.ctypeslib.as_array(ptr, shape=(length,)))
+
     def _decode_complex_list(self, values: torch.Tensor) -> list[float]:
         tensor = self._clone_values(values).reshape(-1)
         out: list[float] = []
@@ -472,15 +484,9 @@ class PythonBackend:
                     for _diag_index in diag_indices
                 ]
             else:
-                diagonals: list[torch.Tensor] = []
-                cursor = 0
-                for _ in range(int(diag_len)):
-                    values = [
-                        float(diag_data_ptrs[transform_index][cursor + offset])
-                        for offset in range(int(slots))
-                    ]
-                    diagonals.append(torch.tensor(values, dtype=torch.float32))
-                    cursor += int(slots)
+                data = self._float_ptr_tensor(diag_data_ptrs[transform_index], int(data_len))
+                matrix = data[: int(diag_len) * int(slots)].reshape(int(diag_len), int(slots))
+                diagonals = [matrix[index] for index in range(int(diag_len))]
             out.append(
                 self._store_linear_transform(
                     diag_indices,
@@ -499,12 +505,9 @@ class PythonBackend:
             data_len = int(diag_data_lens[transform_index])
             diag_indices = [int(diag_idxs_ptrs[transform_index][diag_index]) for diag_index in range(int(diag_len))]
             slots = int(data_len // max(1, diag_len)) if diag_len else int(self._num_slots)
-            diagonals: list[torch.Tensor] = []
-            cursor = 0
-            for _ in range(int(diag_len)):
-                values = [float(diag_data_ptrs[transform_index][cursor + offset]) for offset in range(int(slots))]
-                diagonals.append(torch.tensor(values, dtype=torch.float32))
-                cursor += int(slots)
+            data = self._float_ptr_tensor(diag_data_ptrs[transform_index], int(data_len))
+            matrix = data[: int(diag_len) * int(slots)].reshape(int(diag_len), int(slots))
+            diagonals = [matrix[index] for index in range(int(diag_len))]
             out.append(self._store_linear_transform(diag_indices, diagonals, int(levels_array[transform_index]), int(slots)))
         return out
 
@@ -516,16 +519,10 @@ class PythonBackend:
             data_len = int(diag_data_lens[transform_index])
             diag_indices = [int(diag_idxs_ptrs[transform_index][diag_index]) for diag_index in range(int(diag_len))]
             slots = int(data_len // max(1, 2 * diag_len)) if diag_len else int(self._num_slots)
-            diagonals: list[torch.Tensor] = []
-            cursor = 0
-            for _ in range(int(diag_len)):
-                values: list[complex] = []
-                for offset in range(int(slots)):
-                    real = float(diag_data_ptrs[transform_index][cursor + 2 * offset])
-                    imag = float(diag_data_ptrs[transform_index][cursor + 2 * offset + 1])
-                    values.append(complex(real, imag))
-                diagonals.append(torch.tensor(values, dtype=torch.complex64))
-                cursor += int(2 * slots)
+            data = self._double_ptr_tensor(diag_data_ptrs[transform_index], int(data_len))
+            pairs = data[: int(diag_len) * int(slots) * 2].reshape(int(diag_len), int(slots), 2)
+            matrix = torch.complex(pairs[:, :, 0].to(dtype=torch.float32), pairs[:, :, 1].to(dtype=torch.float32))
+            diagonals = [matrix[index] for index in range(int(diag_len))]
             out.append(self._store_linear_transform(diag_indices, diagonals, int(levels_array[transform_index]), int(slots)))
         return out
 

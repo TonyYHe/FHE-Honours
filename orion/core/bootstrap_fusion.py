@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
+
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
+
+
+def bootstrap_prescale_fusion_disabled() -> bool:
+    value = os.environ.get("ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION", "0")
+    return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
 def runtime_fhe_output_shape(module: Any) -> torch.Size | Any:
@@ -82,6 +90,8 @@ def bootstrap_prescale_fusion_supported(module: Any) -> bool:
     slots, while the full-slot U22 cases can fold the affine into producers.
     """
 
+    if bootstrap_prescale_fusion_disabled():
+        return False
     if module is None or not module_uses_full_bootstrap_slots(module):
         return False
     return bool(

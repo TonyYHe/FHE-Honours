@@ -124,6 +124,14 @@ class LattigoLibrary:
         self.lib = self._load_library()
         self.load_plaintext_diagonals_requires_payload = True
         self.saved_io_prefetch_requires_device_memory = False
+        self.saved_io_host_predecode_enabled = _read_env_bool(
+            (
+                "ORION_SAVED_IO_HOST_PREDECODE",
+                "ORION_LATTIGO_SAVED_IO_HOST_PREDECODE",
+            ),
+            True,
+        )
+        self.saved_io_host_predecode_supported = False
         self.supports_index_only_linear_transform_load = True
         self.memory_bounded_unified_transforms = _read_env_bool(
             (
@@ -908,6 +916,33 @@ class LattigoLibrary:
             restype=None
         )
 
+        predecode_rotation_key = getattr(self.lib, "PredecodeRotationKey", None)
+        install_predecoded_rotation_key = getattr(self.lib, "InstallPredecodedRotationKey", None)
+        remove_predecoded_rotation_keys = getattr(self.lib, "RemovePredecodedRotationKeys", None)
+        if (
+            predecode_rotation_key is not None
+            and install_predecoded_rotation_key is not None
+            and remove_predecoded_rotation_keys is not None
+        ):
+            self.PredecodeRotationKey = LattigoFunction(
+                predecode_rotation_key,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong,
+                    ctypes.c_ulong,
+                ],
+                restype=None,
+            )
+            self.InstallPredecodedRotationKey = LattigoFunction(
+                install_predecoded_rotation_key,
+                argtypes=[ctypes.c_ulong],
+                restype=ctypes.c_int,
+            )
+            self.RemovePredecodedRotationKeys = LattigoFunction(
+                remove_predecoded_rotation_keys,
+                argtypes=[],
+                restype=None,
+            )
+
         self.SerializeDiagonal = LattigoFunction(
             self.lib.SerializeDiagonal,
             argtypes=[
@@ -937,6 +972,41 @@ class LattigoLibrary:
                 ctypes.c_int,
             ],
             restype=None
+        )
+
+        predecode_plaintexts = getattr(self.lib, "PredecodePlaintextDiagonalsBatch", None)
+        install_predecoded_plaintexts = getattr(self.lib, "InstallPredecodedPlaintextDiagonals", None)
+        remove_predecoded_plaintexts = getattr(self.lib, "RemovePredecodedPlaintextDiagonals", None)
+        if (
+            predecode_plaintexts is not None
+            and install_predecoded_plaintexts is not None
+            and remove_predecoded_plaintexts is not None
+        ):
+            self.PredecodePlaintextDiagonalsBatch = LattigoFunction(
+                predecode_plaintexts,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong,
+                    ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                    ctypes.c_int,
+                ],
+                restype=None,
+            )
+            self.InstallPredecodedPlaintextDiagonals = LattigoFunction(
+                install_predecoded_plaintexts,
+                argtypes=[ctypes.c_int],
+                restype=ctypes.c_int,
+            )
+            self.RemovePredecodedPlaintextDiagonals = LattigoFunction(
+                remove_predecoded_plaintexts,
+                argtypes=[ctypes.c_int],
+                restype=None,
+            )
+
+        self.saved_io_host_predecode_supported = bool(
+            callable(getattr(self, "PredecodeRotationKey", None))
+            or callable(getattr(self, "PredecodePlaintextDiagonalsBatch", None))
         )
 
         self.RemovePlaintextDiagonals = LattigoFunction(

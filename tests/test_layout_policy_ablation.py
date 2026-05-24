@@ -943,6 +943,60 @@ def test_one_down_one_up_silu_dp_fuses_relayout_without_bootstrap_growth() -> No
         scheme.delete_scheme()
 
 
+def test_one_down_one_up_fused_non_dp_policies_remove_adjacent_relayout_depth() -> None:
+    fixed_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+    fixed_fused_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+    eager_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+    eager_fused_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+    greedy_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+    greedy_fused_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+
+    fixed = build_layout_policy_compile_plan(fixed_dag, policy="fixed_max")
+    fixed_fused = build_layout_policy_compile_plan(fixed_fused_dag, policy="fixed_max_fused")
+    eager = build_layout_policy_compile_plan(eager_dag, policy="eager")
+    eager_fused = build_layout_policy_compile_plan(eager_fused_dag, policy="eager_fused")
+    greedy = build_layout_policy_compile_plan(greedy_dag, policy="greedy")
+    greedy_fused = build_layout_policy_compile_plan(greedy_fused_dag, policy="greedy_fused")
+
+    assert int(fixed["summary"]["relayout_depth_estimate"]) > 0
+    assert int(eager["summary"]["relayout_depth_estimate"]) > 0
+    assert int(greedy["summary"]["relayout_depth_estimate"]) > 0
+    assert int(fixed_fused["summary"]["relayout_depth_estimate"]) == 0
+    assert int(eager_fused["summary"]["relayout_depth_estimate"]) == 0
+    assert int(greedy_fused["summary"]["relayout_depth_estimate"]) == 0
+    assert int(fixed_fused["summary"]["relayouts"]) == 0
+    assert int(eager_fused["summary"]["relayouts"]) == 0
+    assert int(greedy_fused["summary"]["relayouts"]) == 0
+    assert int(eager_fused["summary"]["consumer_fused_relayout_count"]) > 0
+    assert any(
+        "producer_fused" in str(row.get("producer_materialized_halo_reason", ""))
+        for row in fixed_fused["node_layouts"]
+    )
+
+
+def test_orion_dense_policy_simulates_no_halo_compact_baseline() -> None:
+    dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
+    plan = build_layout_policy_compile_plan(dag, policy="orion_dense")
+
+    assert int(plan["summary"]["relayouts"]) == 0
+    assert int(plan["summary"]["relayout_depth_estimate"]) == 0
+    assert int(plan["summary"]["consumer_fused_relayout_count"]) == 0
+    assert int(plan["summary"]["producer_fused_materialization_count"]) == 0
+    assert all(
+        int(row["selected_layout"]["alpha"]) == 0
+        and int(row["selected_layout"]["beta"]) == 0
+        and row["physical_layout"] == "packed_compact"
+        and row["layout_mode"] == "orion_dense"
+        for row in plan["edge_layouts"]
+    )
+    assert all(
+        int(row["selected_layout"]["alpha"]) == 0
+        and int(row["selected_layout"]["beta"]) == 0
+        and row["physical_layout"] == "packed_compact"
+        for row in plan["node_layouts"]
+    )
+
+
 def test_layout_policy_provider_keeps_native_halo_for_compact_halo_local_conv() -> None:
     _init_long_python_scheme("")
     try:

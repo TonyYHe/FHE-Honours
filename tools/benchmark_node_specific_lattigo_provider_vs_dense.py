@@ -3108,7 +3108,7 @@ def _run_worker(
             env[LATTIGO_BENCH_IO_MODE_ENV] = "save"
             env[LATTIGO_BENCH_DIAGS_PATH_ENV] = str(worker_lattigo_dense_io_root / "diagonals.h5")
             env[LATTIGO_BENCH_KEYS_PATH_ENV] = str(worker_lattigo_dense_io_root / "keys.h5")
-            env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "0")
+            env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "1")
             env.setdefault("ORION_DENSE_LT_SHARED_CACHE", "0")
             disk_watch_path = worker_lattigo_dense_io_root
             disk_before = _disk_usage_payload(base_io_root)
@@ -3218,7 +3218,7 @@ def _run_worker(
             env.setdefault("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "0")
             env.setdefault("ORION_UNIFIED_LT_ROTKEY_RESIDENCY", "0")
             env.setdefault("ORION_UNIFIED_LT_PLAINTEXT_RESIDENCY", "0")
-            env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "0")
+            env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "1")
             env.setdefault("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES", str(48 * 1024**3))
             # Lattigo's streaming LT state is useful for dense/provider
             # io_mode=none, but save/load needs serialized plaintext payloads.

@@ -172,9 +172,19 @@ def ResNet18(dataset='imagenet', activation="relu", silu_degree=127, stem_relu=T
         stem_relu=stem_relu,
     )
 
-def ResNet34(dataset='imagenet'):
+def ResNet34(dataset='imagenet', activation="relu", silu_degree=127, stem_relu=True):
     conv1_params, num_classes = get_resnet_config(dataset)
-    return ResNet(dataset, BasicBlock, [3,4,6,3], [64,128,256,512], conv1_params, num_classes)
+    return ResNet(
+        dataset,
+        BasicBlock,
+        [3,4,6,3],
+        [64,128,256,512],
+        conv1_params,
+        num_classes,
+        activation=activation,
+        silu_degree=silu_degree,
+        stem_relu=stem_relu,
+    )
 
 def ResNet50(dataset='imagenet'):
     conv1_params, num_classes = get_resnet_config(dataset)

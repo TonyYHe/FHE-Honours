@@ -85,6 +85,86 @@ def _slot_indices(channel_count: int, height: int, width: int, gap: int) -> torc
     return out
 
 
+def _idx_chw_gap_channels(
+    channels: torch.Tensor,
+    *,
+    h: int,
+    w: int,
+    height: int,
+    width: int,
+    gap: int,
+) -> torch.Tensor:
+    g = max(1, int(gap))
+    phases = int(g * g)
+    packed_w = int(width) * int(g)
+    group_block = int(height) * int(g) * int(packed_w)
+    values = channels.to(dtype=torch.int64)
+    group = torch.div(values, int(phases), rounding_mode="floor")
+    phase = torch.remainder(values, int(phases))
+    phase_h = torch.div(phase, int(g), rounding_mode="floor")
+    phase_w = torch.remainder(phase, int(g))
+    return (
+        group * int(group_block)
+        + (int(h) * int(g) + phase_h) * int(packed_w)
+        + int(w) * int(g)
+        + phase_w
+    ).to(dtype=torch.int64)
+
+
+def _idx_chw_gap_channel_positions(
+    channels: torch.Tensor,
+    *,
+    h: torch.Tensor,
+    w: torch.Tensor,
+    height: int,
+    width: int,
+    gap: int,
+) -> torch.Tensor:
+    g = max(1, int(gap))
+    phases = int(g * g)
+    packed_w = int(width) * int(g)
+    group_block = int(height) * int(g) * int(packed_w)
+    values = channels.to(dtype=torch.int64)[:, None]
+    h_values = h.to(dtype=torch.int64)[None, :]
+    w_values = w.to(dtype=torch.int64)[None, :]
+    group = torch.div(values, int(phases), rounding_mode="floor")
+    phase = torch.remainder(values, int(phases))
+    phase_h = torch.div(phase, int(g), rounding_mode="floor")
+    phase_w = torch.remainder(phase, int(g))
+    return (
+        group * int(group_block)
+        + (h_values * int(g) + phase_h) * int(packed_w)
+        + w_values * int(g)
+        + phase_w
+    ).to(dtype=torch.int64)
+
+
+def _native_halo_build_pair_chunk_limit() -> int:
+    raw = __import__("os").environ.get("ORION_NATIVE_HALO_BUILD_PAIR_CHUNK")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 8_000_000
+
+
+def _materialized_output_source_h(output_h: torch.Tensor | int, *, h_out: int, output_alpha: int, output_beta: int):
+    if isinstance(output_h, torch.Tensor):
+        values = output_h.clone().to(dtype=torch.int64)
+        top = values < 0
+        bottom = values >= int(h_out)
+        values[top] = values[top] + int(output_alpha)
+        values[bottom] = values[bottom] - int(output_beta)
+        return values.clamp(0, max(0, int(h_out) - 1))
+    value = int(output_h)
+    if int(value) < 0:
+        value += int(output_alpha)
+    elif int(value) >= int(h_out):
+        value -= int(output_beta)
+    return min(max(int(value), 0), max(0, int(h_out) - 1))
+
+
 def _heuristic_channel_tile(channel_count: int, gap: int) -> int:
     """Deterministic native-stripe channel tile.
 
@@ -670,7 +750,8 @@ def native_halo_source_plaintext_blocks_from_nchw(
             for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
                 for local_h in range(int(stripe.source_h)):
                     global_h = int(stripe.source_h_start) + int(local_h)
-                    source_h = min(max(int(global_h), 0), int(spec.h_in) - 1)
+                    if int(global_h) < 0 or int(global_h) >= int(spec.h_in):
+                        continue
                     for w_index in range(int(spec.w_in)):
                         slot = _idx_chw_gap(
                             int(local_channel),
@@ -680,7 +761,7 @@ def native_halo_source_plaintext_blocks_from_nchw(
                             int(spec.w_in),
                             int(spec.gap_in),
                         )
-                        block[int(slot)] = src[int(channel), int(source_h), int(w_index)]
+                        block[int(slot)] = src[int(channel), int(global_h), int(w_index)]
             blocks.append(block)
     if len(blocks) != int(plan.input_ct_count):
         raise RuntimeError(
@@ -715,19 +796,22 @@ class NativeHaloRelayoutKernel:
         self.diagonals: dict[tuple[int, int], dict[int, torch.Tensor]] = {}
         self.transform_ids: dict[tuple[int, int], int] = {}
 
-    def _compact_input_index(self, *, channel: int, h: int, w: int) -> int:
+    def _compact_input_index(self, *, channel: int, h: int, w: int) -> int | None:
         source_alpha = max(0, int(self.source_layout.get("alpha", self.spec.input_alpha) or 0))
         source_beta = max(0, int(self.source_layout.get("beta", self.spec.input_beta) or 0))
         if int(h) < 0:
-            source_h = int(h) + int(source_alpha) if int(source_alpha) > 0 else 0
+            if int(h) < -int(source_alpha):
+                return None
+            source_h = int(h) + int(source_alpha)
         elif int(h) >= int(self.spec.h_in):
-            if int(source_beta) > 0:
-                source_h = int(source_alpha) + int(h)
-            else:
-                source_h = int(source_alpha) + int(self.spec.h_in) - 1
+            if int(h) >= int(self.spec.h_in) + int(source_beta):
+                return None
+            source_h = int(source_alpha) + int(h)
         else:
             source_h = int(source_alpha) + int(h)
-        source_h = min(max(int(source_h), 0), int(self.spec.h_in) + int(source_alpha) + int(source_beta) - 1)
+        source_height = int(self.spec.h_in) + int(source_alpha) + int(source_beta)
+        if int(source_h) < 0 or int(source_h) >= int(source_height):
+            return None
         return _idx_chw_gap(
             int(channel),
             int(source_h),
@@ -778,8 +862,15 @@ class NativeHaloRelayoutKernel:
                     for global_h in range(int(stripe.source_h_start), int(stripe.source_h_end)):
                         local_h = int(global_h) - int(stripe.source_h_start)
                         for w_index in range(int(self.spec.w_in)):
+                            source_index = self._compact_input_index(
+                                channel=int(channel),
+                                h=int(global_h),
+                                w=int(w_index),
+                            )
+                            if source_index is None:
+                                continue
                             yield (
-                                self._compact_input_index(channel=int(channel), h=int(global_h), w=int(w_index)),
+                                int(source_index),
                                 self._native_source_index(
                                     stripe=stripe,
                                     group=int(group),
@@ -915,7 +1006,17 @@ def _build_conv_transform(
                 continue
             coeff_by_source_target = coeff.t().contiguous()
             for out_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
-                in_h = int(out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
+                op_out_h = (
+                    _materialized_output_source_h(
+                        int(out_h),
+                        h_out=int(spec.h_out),
+                        output_alpha=int(spec.output_alpha),
+                        output_beta=int(spec.output_beta),
+                    )
+                    if bool(compact_output)
+                    else int(out_h)
+                )
+                in_h = int(op_out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
                 if int(in_h) < int(spec.input_h_min) or int(in_h) >= int(spec.input_h_max):
                     continue
                 source_local_h = int(in_h) - int(stripe.source_h_start)
@@ -930,13 +1031,15 @@ def _build_conv_transform(
                         continue
                     source_vec = source_slots[:, int(source_local_h), int(in_w)]
                     if bool(compact_output):
+                        compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+                        compact_h = int(out_h) + max(0, int(spec.output_alpha))
                         compact_slots = torch.tensor(
                             [
                                 _idx_chw_gap(
                                     int(channel),
-                                    int(out_h),
+                                    int(compact_h),
                                     int(out_w),
-                                    int(spec.h_out),
+                                    int(compact_output_h),
                                     int(spec.w_out),
                                     int(spec.gap_out),
                                 )
@@ -1011,18 +1114,23 @@ def _compact_source_index(
     channel: int,
     h: int,
     w: int,
-) -> int:
+) -> int | None:
     source_alpha = max(0, int(source_layout.get("alpha", spec.input_alpha) or 0))
     source_beta = max(0, int(source_layout.get("beta", spec.input_beta) or 0))
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     if int(h) < 0:
-        source_h = int(h) + int(source_alpha) if int(source_alpha) > 0 else 0
+        if int(h) < -int(source_alpha):
+            return None
+        source_h = int(h) + int(source_alpha)
     elif int(h) >= int(spec.h_in):
-        source_h = int(source_alpha) + int(h) if int(source_beta) > 0 else int(source_alpha) + int(spec.h_in) - 1
+        if int(h) >= int(spec.h_in) + int(source_beta):
+            return None
+        source_h = int(source_alpha) + int(h)
     else:
         source_h = int(source_alpha) + int(h)
     source_height = int(spec.h_in) + int(source_alpha) + int(source_beta)
-    source_h = min(max(int(source_h), 0), int(source_height) - 1)
+    if int(source_h) < 0 or int(source_h) >= int(source_height):
+        return None
     return _idx_chw_gap(
         int(channel),
         int(source_h),
@@ -1057,65 +1165,137 @@ def _build_compact_source_conv_transform(
         if bool(compact_output)
         else _slot_indices(int(target_count), int(stripe.target_h), int(spec.w_out), int(spec.gap_out))
     )
+    source_channels = torch.arange(int(spec.c_in), dtype=torch.int64)
+    target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
+    source_alpha = max(0, int(source_layout.get("alpha", spec.input_alpha) or 0))
+    source_beta = max(0, int(source_layout.get("beta", spec.input_beta) or 0))
+    source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
+    source_height = int(spec.h_in) + int(source_alpha) + int(source_beta)
     key_parts: list[torch.Tensor] = []
     value_parts: list[torch.Tensor] = []
+    out_h_values = torch.arange(
+        int(stripe.target_h_start),
+        int(stripe.target_h_end),
+        dtype=torch.int64,
+    )
+    out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
+    max_pair_count = int(_native_halo_build_pair_chunk_limit())
     for kh in range(int(spec.kernel)):
         for kw in range(int(spec.kernel)):
             coeff = weight[int(target_start): int(target_end), :, int(kh), int(kw)].to(dtype=torch.float32)
             if not bool(torch.any(coeff != 0).item()):
                 continue
-            for out_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
-                in_h = int(out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
-                if int(in_h) < int(spec.input_h_min) or int(in_h) >= int(spec.input_h_max):
+            op_out_h_values = (
+                _materialized_output_source_h(
+                    out_h_values,
+                    h_out=int(spec.h_out),
+                    output_alpha=int(spec.output_alpha),
+                    output_beta=int(spec.output_beta),
+                )
+                if bool(compact_output)
+                else out_h_values
+            )
+            in_h_values = (
+                op_out_h_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kh) * int(spec.dilation)
+            )
+            valid_h = (
+                (in_h_values >= 0)
+                & (in_h_values < int(spec.h_in))
+            )
+            if not bool(valid_h.any().item()):
+                continue
+            in_w_values = (
+                out_w_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kw) * int(spec.dilation)
+            )
+            valid_w = (in_w_values >= 0) & (in_w_values < int(spec.w_in))
+            if not bool(valid_w.any().item()):
+                continue
+
+            valid_out_h = out_h_values[valid_h]
+            valid_source_h = int(source_alpha) + in_h_values[valid_h]
+            valid_out_w = out_w_values[valid_w]
+            valid_source_w = in_w_values[valid_w]
+            grid_h, grid_w = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
+            out_grid_h, out_grid_w = torch.meshgrid(valid_out_h, valid_out_w, indexing="ij")
+            source_h_flat = grid_h.reshape(-1)
+            source_w_flat = grid_w.reshape(-1)
+            out_h_flat = out_grid_h.reshape(-1)
+            out_w_flat = out_grid_w.reshape(-1)
+            if int(source_h_flat.numel()) == 0:
+                continue
+
+            coeff_by_source_target = coeff.t().contiguous()
+            coeff_nonzero = torch.abs(coeff_by_source_target) > 0
+            if not bool(coeff_nonzero.any().item()):
+                continue
+            channel_pair_count = max(1, int(source_channels.numel()) * int(target_count))
+            position_chunk = max(1, int(max_pair_count // channel_pair_count))
+
+            for start in range(0, int(source_h_flat.numel()), int(position_chunk)):
+                end = min(int(source_h_flat.numel()), int(start) + int(position_chunk))
+                source_index = _idx_chw_gap_channel_positions(
+                    source_channels,
+                    h=source_h_flat[int(start): int(end)],
+                    w=source_w_flat[int(start): int(end)],
+                    height=int(source_height),
+                    width=int(spec.w_in),
+                    gap=int(source_gap),
+                )
+                source_block_mask = (
+                    torch.div(source_index, int(slots), rounding_mode="floor")
+                    == int(source_block)
+                )
+                if not bool(source_block_mask.any().item()):
                     continue
-                target_local_h = int(out_h) - int(stripe.target_h_start)
-                if int(target_local_h) < 0 or int(target_local_h) >= int(stripe.target_h):
+                source_vec = torch.remainder(source_index, int(slots))
+
+                if bool(compact_output):
+                    compact_output_h = (
+                        int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+                    )
+                    target_index = _idx_chw_gap_channel_positions(
+                        target_channels,
+                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_alpha)),
+                        w=out_w_flat[int(start): int(end)],
+                        height=int(compact_output_h),
+                        width=int(spec.w_out),
+                        gap=int(spec.gap_out),
+                    )
+                    target_block_mask = (
+                        torch.div(target_index, int(slots), rounding_mode="floor")
+                        == int(compact_target_block)
+                    )
+                    target_vec = torch.remainder(target_index, int(slots))
+                else:
+                    assert target_slots is not None
+                    target_local_h = out_h_flat[int(start): int(end)] - int(stripe.target_h_start)
+                    target_vec = _idx_chw_gap_channel_positions(
+                        torch.arange(int(target_count), dtype=torch.int64),
+                        h=target_local_h,
+                        w=out_w_flat[int(start): int(end)],
+                        height=int(stripe.target_h),
+                        width=int(spec.w_out),
+                        gap=int(spec.gap_out),
+                    )
+                    target_block_mask = torch.ones_like(target_vec, dtype=torch.bool)
+
+                pair_mask = (
+                    source_block_mask[:, None, :]
+                    & target_block_mask[None, :, :]
+                    & coeff_nonzero[:, :, None]
+                )
+                if not bool(pair_mask.any().item()):
                     continue
-                for out_w in range(int(spec.w_out)):
-                    in_w = int(out_w) * int(spec.stride) - int(spec.pad) + int(kw) * int(spec.dilation)
-                    if int(in_w) < 0 or int(in_w) >= int(spec.w_in):
-                        continue
-                    for local_target, target_channel in enumerate(range(int(target_start), int(target_end))):
-                        if bool(compact_output):
-                            target_index = _idx_chw_gap(
-                                int(target_channel),
-                                int(out_h),
-                                int(out_w),
-                                int(spec.h_out),
-                                int(spec.w_out),
-                                int(spec.gap_out),
-                            )
-                            if int(target_index // int(slots)) != int(compact_target_block):
-                                continue
-                            target_local = int(target_index % int(slots))
-                        else:
-                            assert target_slots is not None
-                            target_local = int(target_slots[int(local_target), int(target_local_h), int(out_w)])
-                        source_locals: list[int] = []
-                        coeff_values: list[float] = []
-                        for source_channel in range(int(spec.c_in)):
-                            value = float(coeff[int(local_target), int(source_channel)].item())
-                            if float(value) == 0.0:
-                                continue
-                            source_index = _compact_source_index(
-                                spec,
-                                source_layout,
-                                channel=int(source_channel),
-                                h=int(in_h),
-                                w=int(in_w),
-                            )
-                            if int(source_index // int(slots)) != int(source_block):
-                                continue
-                            source_locals.append(int(source_index % int(slots)))
-                            coeff_values.append(float(value))
-                        if not source_locals:
-                            continue
-                        source_vec = torch.tensor(source_locals, dtype=torch.int64)
-                        target_vec = torch.full((int(len(source_locals)),), int(target_local), dtype=torch.int64)
-                        diag_index = (source_vec - target_vec).remainder(int(slots))
-                        output_slot = target_vec
-                        key_parts.append((diag_index * int(slots) + output_slot).to(dtype=torch.int64))
-                        value_parts.append(torch.tensor(coeff_values, dtype=torch.float32))
+                diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
+                output_slot = target_vec[None, :, :].expand_as(diag_index)
+                flat_keys = (diag_index * int(slots) + output_slot).to(dtype=torch.int64)
+                flat_values = coeff_by_source_target[:, :, None].expand_as(diag_index).to(dtype=torch.float32)
+                key_parts.append(flat_keys[pair_mask])
+                value_parts.append(flat_values[pair_mask])
     if not key_parts:
         return None
     keys, values = _coalesce_native_rows(torch.cat(key_parts), torch.cat(value_parts))
@@ -1205,11 +1385,21 @@ class NativeHaloStripeNoRIConvExecutor:
             "prepare_plans_s": 0.0,
             "prepare_transforms_s": 0.0,
             "compile_unified_s": 0.0,
+            "build_transform_s": 0.0,
+            "retune_bsgs_s": 0.0,
+            "group_compile_s": 0.0,
+            "built_transform_count": 0.0,
+            "compiled_group_count": 0.0,
             "evaluate_unified_s": 0.0,
+            "group_eval_s": 0.0,
+            "partial_wrap_s": 0.0,
+            "partial_rescale_s": 0.0,
+            "partial_accumulate_s": 0.0,
             "postprocess_s": 0.0,
             "input_relayout_s": 0.0,
             "output_relayout_s": 0.0,
         }
+        self.last_runtime_counts: dict[str, int] = {}
         self._compile_cache_metadata: dict[str, Any] = {}
 
     def supports_scheme(self, scheme: Any | None) -> bool:
@@ -1219,7 +1409,13 @@ class NativeHaloStripeNoRIConvExecutor:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
 
     def _uses_tight_compact_output(self) -> bool:
-        return not _spec_has_output_halo(self.native_plan.spec)
+        materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
+        return bool(str(materialization) == "fused_relayout" or not _spec_has_output_halo(self.native_plan.spec))
+
+    def _compact_output_storage_layout(self) -> str:
+        if _spec_has_output_halo(self.native_plan.spec):
+            return "logical_halo_compact"
+        return "tight_compact"
 
     def _input_physical_layout(self) -> str:
         value = str(getattr(self.module, "layout_policy_input_physical_layout", "") or "")
@@ -1248,6 +1444,17 @@ class NativeHaloStripeNoRIConvExecutor:
             int(spec.slot_count),
         )
 
+    def _compact_output_ct_count(self) -> int:
+        spec = self.native_plan.spec
+        height = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+        return _compact_ct_count(
+            int(spec.c_out),
+            int(height),
+            int(spec.w_out),
+            int(spec.gap_out),
+            int(spec.slot_count),
+        )
+
     def runtime_native_fhe_output_shape(self) -> torch.Size:
         if self._uses_tight_compact_output():
             if self.fhe_output_shape is not None:
@@ -1258,7 +1465,22 @@ class NativeHaloStripeNoRIConvExecutor:
         input_layout = dict(getattr(self.module, "layout_policy_input_layout", {}) or {})
         required_input_layout = dict(getattr(self.module, "layout_policy_required_input_layout", {}) or {})
         if self._uses_compact_source_input() and required_input_layout:
-            input_layout = required_input_layout
+            trust_selected_layout = bool(
+                getattr(self.module, "layout_policy_trust_selected_compact_input_layout", False)
+            )
+            selected_alpha = max(0, int(input_layout.get("alpha", 0) or 0))
+            selected_beta = max(0, int(input_layout.get("beta", 0) or 0))
+            required_alpha = max(0, int(required_input_layout.get("alpha", 0) or 0))
+            required_beta = max(0, int(required_input_layout.get("beta", 0) or 0))
+            selected_gap = max(1, int(input_layout.get("gap", self.spec.gap_in) or 1))
+            required_gap = max(1, int(required_input_layout.get("gap", self.spec.gap_in) or 1))
+            if (
+                not bool(trust_selected_layout)
+                or int(selected_gap) != int(required_gap)
+                or int(selected_alpha) < int(required_alpha)
+                or int(selected_beta) < int(required_beta)
+            ):
+                input_layout = required_input_layout
         output_layout = dict(getattr(self.module, "layout_policy_output_layout", {}) or {})
         return replace(
             self.spec,
@@ -1274,7 +1496,11 @@ class NativeHaloStripeNoRIConvExecutor:
         if bool(changed):
             self.native_plan = native_halo_conv2d_plan(runtime_spec)
         self.slots = int(self.native_plan.spec.slot_count)
-        self.rows = int(self.native_plan.output_ct_count)
+        self.rows = int(
+            self._compact_output_ct_count()
+            if self._uses_tight_compact_output()
+            else self.native_plan.output_ct_count
+        )
         self.cols = int(self._compact_source_ct_count() if self._uses_compact_source_input() else self.native_plan.input_ct_count)
         self.output_shape = getattr(self.module, "output_shape", self.output_shape)
         self.fhe_output_shape = getattr(self.module, "fhe_output_shape", self.fhe_output_shape)
@@ -1329,23 +1555,23 @@ class NativeHaloStripeNoRIConvExecutor:
         start = int(block_index) * int(self.slots)
         stop = int(start) + int(self.slots)
         out = torch.zeros((int(self.slots),), dtype=torch.float32)
-        for channel in range(int(spec.c_out)):
-            bias_value = float(self.bias_vector[int(channel)])
-            if bias_value == 0.0:
-                continue
-            for out_h in range(int(spec.h_out)):
-                for out_w in range(int(spec.w_out)):
-                    flat_index = _idx_chw_gap(
-                        int(channel),
-                        int(out_h),
-                        int(out_w),
-                        int(spec.h_out),
-                        int(spec.w_out),
-                        int(spec.gap_out),
-                    )
-                    if int(flat_index) < int(start) or int(flat_index) >= int(stop):
-                        continue
-                    out[int(flat_index) - int(start)] = float(bias_value)
+        compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+        out_h = torch.arange(int(compact_output_h), dtype=torch.int64).repeat_interleave(int(spec.w_out))
+        out_w = torch.arange(int(spec.w_out), dtype=torch.int64).repeat(int(compact_output_h))
+        channels = torch.arange(int(spec.c_out), dtype=torch.int64)
+        flat_index = _idx_chw_gap_channel_positions(
+            channels,
+            h=out_h,
+            w=out_w,
+            height=int(compact_output_h),
+            width=int(spec.w_out),
+            gap=int(spec.gap_out),
+        )
+        mask = (flat_index >= int(start)) & (flat_index < int(stop))
+        if bool(mask.any().item()):
+            positions = (flat_index[mask] - int(start)).to(dtype=torch.int64)
+            values = self.bias_vector.detach().to(dtype=torch.float32)[:, None].expand_as(flat_index)[mask]
+            out.index_copy_(0, positions, values)
         return out
 
     def _compile_bias_plaintexts_at_level(self, scheme: Any, *, level: int) -> tuple[Any | None, ...]:
@@ -1360,6 +1586,94 @@ class NativeHaloStripeNoRIConvExecutor:
                 self._bias_plaintext_cache[(int(block_index), int(level))] = ptxt
             plaintexts.append(ptxt)
         return tuple(plaintexts)
+
+    def _compile_compact_source_layout_diagonals(
+        self,
+        scheme: Any,
+        *,
+        level: int,
+    ) -> None:
+        from orion.core import packing
+
+        build_started = time.time()
+        weight = getattr(self.module, "on_weight").detach()
+        if int(getattr(self.module, "groups", 1) or 1) > 1:
+            weight = packing.resolve_grouped_conv(self.module)
+        diagonals, output_rotations = packing.direct_diagonalize_conv2d(
+            self.module,
+            weight,
+            int(self.slots),
+            str(scheme.params.get_embedding_method()),
+            False,
+            allow_hybrid=False,
+        )
+        self.last_runtime_timing["build_transform_s"] = float(
+            self.last_runtime_timing.get("build_transform_s", 0.0)
+        ) + float(time.time() - build_started)
+        if int(output_rotations) != 0:
+            raise RuntimeError("compact-source provider diagonal generator does not support hybrid output rotations")
+
+        ordered_by_source: dict[int, list[tuple[int, Any]]] = {}
+        for (target_index, source_index), diag_map in sorted(dict(diagonals).items()):
+            if int(source_index) < 0 or int(source_index) >= int(self.cols):
+                continue
+            if int(target_index) < 0 or int(target_index) >= int(self.rows):
+                continue
+            diag_tensors = {int(index): value for index, value in dict(diag_map or {}).items()}
+            if not diag_tensors:
+                continue
+            baby, giant = _bsgs_rotation_sets(
+                set(int(value) for value in diag_tensors),
+                slots=int(self.slots),
+                n1=1,
+            )
+            transform = SimpleNamespace(
+                name=(
+                    f"native_halo_{self.native_plan.spec.family_label}"
+                    f"_compact_dense_src{int(source_index)}_tgt{int(target_index)}"
+                ),
+                diagonals={(0, 0): {int(index): value for index, value in sorted(diag_tensors.items())}},
+                level=int(level),
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, int(self.slots)]),
+                output_shape=torch.Size([1, int(self.slots)]),
+                target_index=int(target_index),
+                input_id=f"compact_source_block_{int(source_index)}",
+                selected_n1=1,
+                baby_shifts=tuple(sorted(int(value) for value in baby)),
+                giant_shifts=tuple(sorted(int(value) for value in giant)),
+                rotation_group_id=f"native_halo:{self.native_plan.spec.family_label}:compact_dense_src{int(source_index)}",
+                rotation_cost_owner=bool(int(target_index) == 0),
+            )
+            ordered_by_source.setdefault(int(source_index), []).append((int(target_index), transform))
+            self.last_runtime_timing["built_transform_count"] = float(
+                self.last_runtime_timing.get("built_transform_count", 0.0)
+            ) + 1.0
+
+        if not ordered_by_source:
+            raise RuntimeError("compact-source provider diagonal generator produced no transforms")
+
+        for source_index, ordered in sorted(ordered_by_source.items()):
+            ordered.sort(key=lambda item: int(item[0]))
+            transforms = [transform for _target_index, transform in ordered]
+            retune_started = time.time()
+            _retune_transform_group_bsgs(transforms, slots=int(self.slots))
+            self.last_runtime_timing["retune_bsgs_s"] = float(
+                self.last_runtime_timing.get("retune_bsgs_s", 0.0)
+            ) + float(time.time() - retune_started)
+            group = UnifiedTransformGroup(transforms)
+            group_compile_started = time.time()
+            group.compile_unified(scheme.backend)
+            self.last_runtime_timing["group_compile_s"] = float(
+                self.last_runtime_timing.get("group_compile_s", 0.0)
+            ) + float(time.time() - group_compile_started)
+            self.last_runtime_timing["compiled_group_count"] = float(
+                self.last_runtime_timing.get("compiled_group_count", 0.0)
+            ) + 1.0
+            self.groups_by_input_index[int(source_index)] = group
+            self.target_indices_by_input_index[int(source_index)] = tuple(
+                int(target_index) for target_index, _transform in ordered
+            )
 
     def _add_bias(self, ct: Any, *, block_index: int) -> Any:
         if self.bias_vector is None:
@@ -1389,11 +1703,15 @@ class NativeHaloStripeNoRIConvExecutor:
             "native_halo_conv2d_plan": self.native_plan.to_dict(),
             "input_physical_layout": self._input_physical_layout(),
             "runtime_input_ct_count": int(self.cols),
+            "runtime_output_ct_count": int(self.rows),
             "compact_source_layout": dict(self._compact_source_layout()) if self._uses_compact_source_input() else {},
             "conv_lt_raw_submatrix_tasks": int(self.native_plan.submatrix_program_count),
             "conv_lt_effective_submatrix_tasks": int(self.native_plan.sharing_group_count),
             "input_relayout": {},
             "output_relayout": {},
+            "runtime_output_storage_layout": self._compact_output_storage_layout()
+            if self._uses_tight_compact_output()
+            else "native_halo_stripe",
             "relayout_sparse_lt_tasks": 0,
             "native_c_only_rotations": int(self.native_plan.c_only_rotations),
             "native_cb_shared_rotations": int(self.native_plan.cb_shared_rotations),
@@ -1426,11 +1744,21 @@ class NativeHaloStripeNoRIConvExecutor:
             "prepare_plans_s": float(time.time() - prepare_started),
             "prepare_transforms_s": 0.0,
             "compile_unified_s": 0.0,
+            "build_transform_s": 0.0,
+            "retune_bsgs_s": 0.0,
+            "group_compile_s": 0.0,
+            "built_transform_count": 0.0,
+            "compiled_group_count": 0.0,
             "evaluate_unified_s": 0.0,
+            "group_eval_s": 0.0,
+            "partial_wrap_s": 0.0,
+            "partial_rescale_s": 0.0,
+            "partial_accumulate_s": 0.0,
             "postprocess_s": 0.0,
             "input_relayout_s": 0.0,
             "output_relayout_s": 0.0,
         }
+        self.last_runtime_counts = {}
         module_bias = getattr(self.module, "on_bias", None)
         self.bias_vector = None if module_bias is None else module_bias.detach().to(dtype=torch.float32)
         weight = getattr(self.module, "on_weight").detach().to(dtype=torch.float32)
@@ -1445,12 +1773,18 @@ class NativeHaloStripeNoRIConvExecutor:
         compact_source = self._uses_compact_source_input()
         compact_source_layout = self._compact_source_layout()
         if bool(compact_source):
+            if bool(compact_output):
+                self._compile_compact_source_layout_diagonals(scheme, level=int(conv_level))
+                self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - compile_started)
+                self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+                return
             for source_block in range(int(self.cols)):
                 ordered: list[tuple[int, Any]] = []
                 for stripe in self.native_plan.stripes:
                     for target_group in range(int(self.native_plan.target_channel_group_count)):
                         target_blocks = range(int(self.rows)) if bool(compact_output) else (None,)
                         for target_block in target_blocks:
+                            build_started = time.time()
                             transform = _build_compact_source_conv_transform(
                                 spec=self.native_plan.spec,
                                 plan=self.native_plan,
@@ -1464,15 +1798,32 @@ class NativeHaloStripeNoRIConvExecutor:
                                 group_n1=1,
                                 compact_target_block=target_block,
                             )
+                            self.last_runtime_timing["build_transform_s"] = float(
+                                self.last_runtime_timing.get("build_transform_s", 0.0)
+                            ) + float(time.time() - build_started)
                             if transform is None:
                                 continue
+                            self.last_runtime_timing["built_transform_count"] = float(
+                                self.last_runtime_timing.get("built_transform_count", 0.0)
+                            ) + 1.0
                             ordered.append((int(transform.target_index), transform))
                 if ordered:
                     ordered.sort(key=lambda item: int(item[0]))
                     transforms = [transform for _target_index, transform in ordered]
+                    retune_started = time.time()
                     _retune_transform_group_bsgs(transforms, slots=int(self.slots))
+                    self.last_runtime_timing["retune_bsgs_s"] = float(
+                        self.last_runtime_timing.get("retune_bsgs_s", 0.0)
+                    ) + float(time.time() - retune_started)
                     group = UnifiedTransformGroup(transforms)
+                    group_compile_started = time.time()
                     group.compile_unified(scheme.backend)
+                    self.last_runtime_timing["group_compile_s"] = float(
+                        self.last_runtime_timing.get("group_compile_s", 0.0)
+                    ) + float(time.time() - group_compile_started)
+                    self.last_runtime_timing["compiled_group_count"] = float(
+                        self.last_runtime_timing.get("compiled_group_count", 0.0)
+                    ) + 1.0
                     self.groups_by_input_index[int(source_block)] = group
                     self.target_indices_by_input_index[int(source_block)] = tuple(
                         int(target_index) for target_index, _transform in ordered
@@ -1485,6 +1836,7 @@ class NativeHaloStripeNoRIConvExecutor:
                     for target_group in range(int(self.native_plan.target_channel_group_count)):
                         target_blocks = range(int(self.rows)) if bool(compact_output) else (None,)
                         for target_block in target_blocks:
+                            build_started = time.time()
                             transform = _build_conv_transform(
                                 spec=self.native_plan.spec,
                                 plan=self.native_plan,
@@ -1497,14 +1849,27 @@ class NativeHaloStripeNoRIConvExecutor:
                                 group_n1=int(group_n1),
                                 compact_target_block=target_block,
                             )
+                            self.last_runtime_timing["build_transform_s"] = float(
+                                self.last_runtime_timing.get("build_transform_s", 0.0)
+                            ) + float(time.time() - build_started)
                             if transform is None:
                                 continue
+                            self.last_runtime_timing["built_transform_count"] = float(
+                                self.last_runtime_timing.get("built_transform_count", 0.0)
+                            ) + 1.0
                             ordered.append((int(transform.target_index), transform))
                     input_index = int(stripe.index) * int(self.native_plan.source_channel_group_count) + int(source_group)
                     if ordered:
                         ordered.sort(key=lambda item: int(item[0]))
                         group = UnifiedTransformGroup([transform for _target_index, transform in ordered])
+                        group_compile_started = time.time()
                         group.compile_unified(scheme.backend)
+                        self.last_runtime_timing["group_compile_s"] = float(
+                            self.last_runtime_timing.get("group_compile_s", 0.0)
+                        ) + float(time.time() - group_compile_started)
+                        self.last_runtime_timing["compiled_group_count"] = float(
+                            self.last_runtime_timing.get("compiled_group_count", 0.0)
+                        ) + 1.0
                         self.groups_by_input_index[int(input_index)] = group
                         self.target_indices_by_input_index[int(input_index)] = tuple(
                             int(target_index) for target_index, _transform in ordered
@@ -1521,6 +1886,11 @@ class NativeHaloStripeNoRIConvExecutor:
         self.compile(scheme)
         self.last_runtime_timing["input_relayout_s"] = 0.0
         self.last_runtime_timing["output_relayout_s"] = 0.0
+        self.last_runtime_timing["evaluate_unified_s"] = 0.0
+        self.last_runtime_timing["group_eval_s"] = 0.0
+        self.last_runtime_timing["partial_wrap_s"] = 0.0
+        self.last_runtime_timing["partial_rescale_s"] = 0.0
+        self.last_runtime_timing["partial_accumulate_s"] = 0.0
         ids = tuple(int(value) for value in getattr(source_ct, "ids", ()))
         if len(ids) < int(self.cols):
             source_kind = "compact source blocks" if self._uses_compact_source_input() else "native source tiles"
@@ -1530,23 +1900,46 @@ class NativeHaloStripeNoRIConvExecutor:
             )
 
         output_blocks: list[Any | None] = [None for _ in range(int(self.rows))]
+        evaluated_group_count = 0
+        partial_count = 0
+        rescale_count = 0
+        accumulate_count = 0
         evaluate_started = time.time()
         for input_index, group in sorted(self.groups_by_input_index.items()):
+            group_started = time.time()
             output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
+            self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
+            evaluated_group_count += 1
             for target_index, output_id in zip(self.target_indices_by_input_index[int(input_index)], output_ids):
+                wrap_started = time.time()
                 partial = CipherTensor(
                     scheme,
                     [int(output_id)],
                     torch.Size([1, int(self.slots)]),
                     torch.Size([1, int(self.slots)]),
                 )
+                self.last_runtime_timing["partial_wrap_s"] += float(time.time() - wrap_started)
+                partial_count += 1
+                rescale_started = time.time()
                 partial = _rescale_cipher_tensor(partial)
+                self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                rescale_count += 1
                 if output_blocks[int(target_index)] is None:
                     output_blocks[int(target_index)] = partial
                 else:
+                    accumulate_started = time.time()
                     lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
                     output_blocks[int(target_index)] = lhs + rhs
+                    self.last_runtime_timing["partial_accumulate_s"] += float(time.time() - accumulate_started)
+                    accumulate_count += 1
         self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
+        self.last_runtime_counts = {
+            "group_count": int(evaluated_group_count),
+            "partial_count": int(partial_count),
+            "partial_rescale_count": int(rescale_count),
+            "partial_accumulate_count": int(accumulate_count),
+            "target_count": int(self.rows),
+        }
 
         postprocess_started = time.time()
         output_ids: list[int] = []
@@ -1566,7 +1959,7 @@ class NativeHaloStripeNoRIConvExecutor:
         self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
         self.last_runtime_io = {
             "runtime_lowering": (
-                "native_halo_stripe_no_ri+tight_compact_output"
+                f"native_halo_stripe_no_ri+{self._compact_output_storage_layout()}_output"
                 if self._uses_tight_compact_output()
                 else "native_halo_stripe_no_ri"
             ),
@@ -1578,7 +1971,9 @@ class NativeHaloStripeNoRIConvExecutor:
             "runtime_input_ct_count": int(self.cols),
             "native_input_ct_count": int(self.native_plan.input_ct_count),
             "native_output_ct_count": int(self.rows),
-            "native_output_storage_layout": "tight_compact" if self._uses_tight_compact_output() else "native_halo_stripe",
+            "native_output_storage_layout": self._compact_output_storage_layout()
+            if self._uses_tight_compact_output()
+            else "native_halo_stripe",
             "internal_input_relayout": False,
             "internal_output_relayout": False,
         }

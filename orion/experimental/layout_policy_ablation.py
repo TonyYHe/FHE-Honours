@@ -51,20 +51,46 @@ POLICY_ALIASES = {
     "fixedmax": "fixed_max",
     "fixed-max": "fixed_max",
     "fixed_max": "fixed_max",
+    "fixed_fused": "fixed_max_fused",
+    "fixed-fused": "fixed_max_fused",
+    "fixedmax_fused": "fixed_max_fused",
+    "fixedmax-fused": "fixed_max_fused",
+    "fixed_max_fused": "fixed_max_fused",
+    "fixed-max-fused": "fixed_max_fused",
     "eager": "eager",
     "eager_relayout": "eager",
     "eager-relayout": "eager",
+    "eager_fused": "eager_fused",
+    "eager-fused": "eager_fused",
+    "eager_relayout_fused": "eager_fused",
+    "eager-relayout-fused": "eager_fused",
     "greedy": "greedy",
     "greedy_local": "greedy",
     "greedy-local": "greedy",
+    "greedy_fused": "greedy_fused",
+    "greedy-fused": "greedy_fused",
+    "greedy_local_fused": "greedy_fused",
+    "greedy-local-fused": "greedy_fused",
+    "orion": "orion_dense",
+    "dense": "orion_dense",
+    "orion_dense": "orion_dense",
+    "orion-dense": "orion_dense",
+    "oriondense": "orion_dense",
+    "no_halo": "orion_dense",
+    "no-halo": "orion_dense",
+    "nohalo": "orion_dense",
     "dp": "dp",
     "dp_global": "dp",
     "dp-global": "dp",
 }
 POLICY_LABELS = {
     "fixed_max": "Fixed-Max-Halo",
+    "fixed_max_fused": "Fixed-Max-Halo+Fusion",
     "eager": "Eager-Re-Layout",
+    "eager_fused": "Eager-Re-Layout+Fusion",
     "greedy": "Greedy-Local",
+    "greedy_fused": "Greedy-Local+Fusion",
+    "orion_dense": "Orion-Dense-No-Halo",
     "dp": "DP-Global",
 }
 PROVIDER_PRESSURE_SUMMARY_KEYS = (
@@ -173,6 +199,7 @@ class RotationEstimate:
     rho_hat_per_program: int
     unfused_rotations: int
     same_input_fusion_savings: int
+    ct_pt_mults: int
     estimator: str = LAYOUT_ESTIMATOR_COUNT_ONLY
 
     @property
@@ -196,6 +223,7 @@ class RotationEstimate:
             "rho_hat_per_program": int(self.rho_hat_per_program),
             "unfused_rotations": int(self.unfused_rotations),
             "same_input_fusion_savings": int(self.same_input_fusion_savings),
+            "ct_pt_mults": int(self.ct_pt_mults),
             "estimator": str(self.estimator),
         }
 
@@ -233,6 +261,9 @@ class PolicyPlan:
     consumer_fused_rotation_estimate: int
     lt_bsgs_rotation_estimate: int
     planner_rotation_cost_estimate: int
+    reported_rotation_estimate: int
+    lt_ct_pt_mult_estimate: int
+    ct_pt_mult_estimate: int
     compact_fallback_penalty_estimate: int
     bootstrap_proxy: int
     objective: float
@@ -263,6 +294,9 @@ class PolicyPlan:
             "consumer_fused_rotation_estimate": int(self.consumer_fused_rotation_estimate),
             "lt_bsgs_rotation_estimate": int(self.lt_bsgs_rotation_estimate),
             "planner_rotation_cost_estimate": int(self.planner_rotation_cost_estimate),
+            "reported_rotation_estimate": int(self.reported_rotation_estimate),
+            "lt_ct_pt_mult_estimate": int(self.lt_ct_pt_mult_estimate),
+            "ct_pt_mult_estimate": int(self.ct_pt_mult_estimate),
             "compact_fallback_penalty_estimate": int(self.compact_fallback_penalty_estimate),
             "bootstrap_proxy": int(self.bootstrap_proxy),
             "bootstrap_count": "" if self.bootstrap_count is None else int(self.bootstrap_count),
@@ -697,6 +731,9 @@ def _edge_row(
         lt_rotations = int(lt_stats["rotations"])
     if planner_rotation_cost is None:
         planner_rotation_cost = int(lt_rotations)
+    lt_ct_pt_mults = int(lt_stats["ct_pt_mults"])
+    if bool(consumer_fused_relayout):
+        lt_ct_pt_mults = max(int(lt_ct_pt_mults), int(_lt_ct_pt_mults(edge, edge.requirement)))
     if physical_layout is None:
         physical_layout = (
             PHYSICAL_NATIVE_SOURCE_STRIPE
@@ -738,6 +775,7 @@ def _edge_row(
         "relayout_depth_estimate": int(relayout_estimate["depth_estimate"]),
         "lt_bsgs_rotation_estimate": int(lt_rotations),
         "planner_rotation_cost_estimate": int(planner_rotation_cost),
+        "lt_ct_pt_mult_estimate": int(lt_ct_pt_mults),
         "compact_fallback_penalty_estimate": int(compact_fallback_penalty_estimate),
         "lt_bsgs_group_count_estimate": int(lt_stats["bsgs_groups"]),
         "lt_transform_count_estimate": int(lt_stats["transforms"]),
@@ -778,6 +816,101 @@ def _one_channel_block(slot_index: int, *, slots: int) -> tuple[int, int]:
     return int(slot_index) // int(slots), int(slot_index) % int(slots)
 
 
+def _one_channel_lt_mapping_tensors(
+    *,
+    op_kind: str,
+    input_h: int,
+    input_w: int,
+    output_h: int,
+    output_w: int,
+    input_phys_h: int,
+    input_phys_w: int,
+    output_phys_h: int,
+    output_phys_w: int,
+    input_gap: int,
+    output_gap: int,
+    alpha: int,
+    kernel_h: int,
+    kernel_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_h: int,
+    pad_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    slots: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if str(op_kind) in {"conv2d", "avgpool2d"}:
+        out_h, out_w, kernel_y, kernel_x = torch.meshgrid(
+            torch.arange(int(output_h), dtype=torch.int64),
+            torch.arange(int(output_w), dtype=torch.int64),
+            torch.arange(int(kernel_h), dtype=torch.int64),
+            torch.arange(int(kernel_w), dtype=torch.int64),
+            indexing="ij",
+        )
+        in_h = out_h * int(stride_h) - int(pad_h) + kernel_y * int(dilation_h)
+        in_w = out_w * int(stride_w) - int(pad_w) + kernel_x * int(dilation_w)
+    elif str(op_kind) == "conv_transpose2d":
+        in_h, in_w, kernel_y, kernel_x = torch.meshgrid(
+            torch.arange(int(input_h), dtype=torch.int64),
+            torch.arange(int(input_w), dtype=torch.int64),
+            torch.arange(int(kernel_h), dtype=torch.int64),
+            torch.arange(int(kernel_w), dtype=torch.int64),
+            indexing="ij",
+        )
+        out_h = in_h * int(stride_h) - int(pad_h) + kernel_y * int(dilation_h)
+        out_w = in_w * int(stride_w) - int(pad_w) + kernel_x * int(dilation_w)
+    else:
+        empty = torch.empty((0,), dtype=torch.int64)
+        return empty, empty, empty
+
+    in_h = in_h.reshape(-1)
+    in_w = in_w.reshape(-1)
+    out_h = out_h.reshape(-1)
+    out_w = out_w.reshape(-1)
+    valid = (
+        (in_h >= 0)
+        & (in_h < int(input_h))
+        & (in_w >= 0)
+        & (in_w < int(input_w))
+        & (out_h >= 0)
+        & (out_h < int(output_h))
+        & (out_w >= 0)
+        & (out_w < int(output_w))
+    )
+    if not bool(valid.any().item()):
+        empty = torch.empty((0,), dtype=torch.int64)
+        return empty, empty, empty
+
+    in_ph = (in_h[valid] + int(alpha)) * int(input_gap)
+    in_pw = in_w[valid] * int(input_gap)
+    out_ph = out_h[valid] * int(output_gap)
+    out_pw = out_w[valid] * int(output_gap)
+    physical_valid = (
+        (in_ph >= 0)
+        & (in_ph < int(input_phys_h))
+        & (in_pw >= 0)
+        & (in_pw < int(input_phys_w))
+        & (out_ph >= 0)
+        & (out_ph < int(output_phys_h))
+        & (out_pw >= 0)
+        & (out_pw < int(output_phys_w))
+    )
+    if not bool(physical_valid.any().item()):
+        empty = torch.empty((0,), dtype=torch.int64)
+        return empty, empty, empty
+
+    in_index = in_ph[physical_valid] * int(input_phys_w) + in_pw[physical_valid]
+    out_index = out_ph[physical_valid] * int(output_phys_w) + out_pw[physical_valid]
+    in_block = torch.div(in_index, int(slots), rounding_mode="floor").to(dtype=torch.int64)
+    out_block = torch.div(out_index, int(slots), rounding_mode="floor").to(dtype=torch.int64)
+    diagonal = torch.remainder(
+        torch.remainder(in_index, int(slots)) - torch.remainder(out_index, int(slots)),
+        int(slots),
+    )
+    return in_block, out_block, diagonal.to(dtype=torch.int64)
+
+
 @lru_cache(maxsize=None)
 def _one_channel_lt_groups_cached(
     *,
@@ -803,51 +936,43 @@ def _one_channel_lt_groups_cached(
     dilation_w: int,
     slots: int,
 ) -> tuple[tuple[tuple[int, ...], ...], ...]:
-    by_input_block: dict[int, dict[int, set[int]]] = {}
+    in_block, out_block, diagonal = _one_channel_lt_mapping_tensors(
+        op_kind=str(op_kind),
+        input_h=int(input_h),
+        input_w=int(input_w),
+        output_h=int(output_h),
+        output_w=int(output_w),
+        input_phys_h=int(input_phys_h),
+        input_phys_w=int(input_phys_w),
+        output_phys_h=int(output_phys_h),
+        output_phys_w=int(output_phys_w),
+        input_gap=int(input_gap),
+        output_gap=int(output_gap),
+        alpha=int(alpha),
+        kernel_h=int(kernel_h),
+        kernel_w=int(kernel_w),
+        stride_h=int(stride_h),
+        stride_w=int(stride_w),
+        pad_h=int(pad_h),
+        pad_w=int(pad_w),
+        dilation_h=int(dilation_h),
+        dilation_w=int(dilation_w),
+        slots=int(slots),
+    )
+    nonzero = diagonal != 0
+    if not bool(nonzero.any().item()):
+        return ()
 
-    def add_mapping(in_h: int, in_w: int, out_h: int, out_w: int) -> None:
-        if not (0 <= int(in_h) < int(input_h) and 0 <= int(in_w) < int(input_w)):
-            return
-        if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
-            return
-        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
-        in_pw = int(in_w) * int(input_gap)
-        out_ph = int(out_h) * int(output_gap)
-        out_pw = int(out_w) * int(output_gap)
-        if not (0 <= int(in_ph) < int(input_phys_h) and 0 <= int(in_pw) < int(input_phys_w)):
-            return
-        if not (0 <= int(out_ph) < int(output_phys_h) and 0 <= int(out_pw) < int(output_phys_w)):
-            return
-        in_index = int(in_ph) * int(input_phys_w) + int(in_pw)
-        out_index = int(out_ph) * int(output_phys_w) + int(out_pw)
-        in_block, in_slot = _one_channel_block(in_index, slots=int(slots))
-        out_block, out_slot = _one_channel_block(out_index, slots=int(slots))
-        diagonal = (int(in_slot) - int(out_slot)) % int(slots)
-        if int(diagonal) == 0:
-            return
-        output_groups = by_input_block.setdefault(int(in_block), {})
-        output_groups.setdefault(int(out_block), set()).add(int(diagonal))
-
-    if str(op_kind) in {"conv2d", "avgpool2d"}:
-        for out_h in range(int(output_h)):
-            base_h = int(out_h) * int(stride_h) - int(pad_h)
-            for out_w in range(int(output_w)):
-                base_w = int(out_w) * int(stride_w) - int(pad_w)
-                for kernel_y in range(int(kernel_h)):
-                    in_h = int(base_h) + int(kernel_y) * int(dilation_h)
-                    for kernel_x in range(int(kernel_w)):
-                        in_w = int(base_w) + int(kernel_x) * int(dilation_w)
-                        add_mapping(in_h, in_w, out_h, out_w)
-    elif str(op_kind) == "conv_transpose2d":
-        for in_h in range(int(input_h)):
-            base_h = int(in_h) * int(stride_h) - int(pad_h)
-            for in_w in range(int(input_w)):
-                base_w = int(in_w) * int(stride_w) - int(pad_w)
-                for kernel_y in range(int(kernel_h)):
-                    out_h = int(base_h) + int(kernel_y) * int(dilation_h)
-                    for kernel_x in range(int(kernel_w)):
-                        out_w = int(base_w) + int(kernel_x) * int(dilation_w)
-                        add_mapping(in_h, in_w, out_h, out_w)
+    output_block_count = max(1, _ceil_div(int(output_phys_h) * int(output_phys_w), int(slots)))
+    keys = (
+        (in_block[nonzero] * int(output_block_count) + out_block[nonzero]) * int(slots)
+        + diagonal[nonzero]
+    )
+    by_input_block: dict[int, dict[int, list[int]]] = {}
+    for key in torch.unique(keys).tolist():
+        pair, diag = divmod(int(key), int(slots))
+        source, target = divmod(int(pair), int(output_block_count))
+        by_input_block.setdefault(int(source), {}).setdefault(int(target), []).append(int(diag))
 
     return tuple(
         tuple(
@@ -858,6 +983,65 @@ def _one_channel_lt_groups_cached(
         for _input_block, output_groups in sorted(by_input_block.items())
         if output_groups
     )
+
+
+@lru_cache(maxsize=None)
+def _one_channel_lt_ct_pt_mult_count_cached(
+    *,
+    op_kind: str,
+    input_h: int,
+    input_w: int,
+    output_h: int,
+    output_w: int,
+    input_phys_h: int,
+    input_phys_w: int,
+    output_phys_h: int,
+    output_phys_w: int,
+    input_gap: int,
+    output_gap: int,
+    alpha: int,
+    kernel_h: int,
+    kernel_w: int,
+    stride_h: int,
+    stride_w: int,
+    pad_h: int,
+    pad_w: int,
+    dilation_h: int,
+    dilation_w: int,
+    slots: int,
+) -> int:
+    in_block, out_block, diagonal = _one_channel_lt_mapping_tensors(
+        op_kind=str(op_kind),
+        input_h=int(input_h),
+        input_w=int(input_w),
+        output_h=int(output_h),
+        output_w=int(output_w),
+        input_phys_h=int(input_phys_h),
+        input_phys_w=int(input_phys_w),
+        output_phys_h=int(output_phys_h),
+        output_phys_w=int(output_phys_w),
+        input_gap=int(input_gap),
+        output_gap=int(output_gap),
+        alpha=int(alpha),
+        kernel_h=int(kernel_h),
+        kernel_w=int(kernel_w),
+        stride_h=int(stride_h),
+        stride_w=int(stride_w),
+        pad_h=int(pad_h),
+        pad_w=int(pad_w),
+        dilation_h=int(dilation_h),
+        dilation_w=int(dilation_w),
+        slots=int(slots),
+    )
+    if int(diagonal.numel()) == 0:
+        return 0
+
+    output_block_count = max(1, _ceil_div(int(output_phys_h) * int(output_phys_w), int(slots)))
+    keys = (
+        (in_block * int(output_block_count) + out_block) * int(slots)
+        + diagonal
+    )
+    return int(torch.unique(keys).numel())
 
 
 @lru_cache(maxsize=None)
@@ -885,49 +1069,36 @@ def _one_channel_lt_adjacency_counts_cached(
     dilation_w: int,
     slots: int,
 ) -> tuple[int, ...]:
-    by_input_block: dict[int, set[int]] = {}
-
-    def add_mapping(in_h: int, in_w: int, out_h: int, out_w: int) -> None:
-        if not (0 <= int(in_h) < int(input_h) and 0 <= int(in_w) < int(input_w)):
-            return
-        if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
-            return
-        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
-        in_pw = int(in_w) * int(input_gap)
-        out_ph = int(out_h) * int(output_gap)
-        out_pw = int(out_w) * int(output_gap)
-        if not (0 <= int(in_ph) < int(input_phys_h) and 0 <= int(in_pw) < int(input_phys_w)):
-            return
-        if not (0 <= int(out_ph) < int(output_phys_h) and 0 <= int(out_pw) < int(output_phys_w)):
-            return
-        in_index = int(in_ph) * int(input_phys_w) + int(in_pw)
-        out_index = int(out_ph) * int(output_phys_w) + int(out_pw)
-        in_block, _in_slot = _one_channel_block(in_index, slots=int(slots))
-        out_block, _out_slot = _one_channel_block(out_index, slots=int(slots))
-        by_input_block.setdefault(int(in_block), set()).add(int(out_block))
-
-    if str(op_kind) in {"conv2d", "avgpool2d"}:
-        for out_h in range(int(output_h)):
-            base_h = int(out_h) * int(stride_h) - int(pad_h)
-            for out_w in range(int(output_w)):
-                base_w = int(out_w) * int(stride_w) - int(pad_w)
-                for kernel_y in range(int(kernel_h)):
-                    in_h = int(base_h) + int(kernel_y) * int(dilation_h)
-                    for kernel_x in range(int(kernel_w)):
-                        in_w = int(base_w) + int(kernel_x) * int(dilation_w)
-                        add_mapping(in_h, in_w, out_h, out_w)
-    elif str(op_kind) == "conv_transpose2d":
-        for in_h in range(int(input_h)):
-            base_h = int(in_h) * int(stride_h) - int(pad_h)
-            for in_w in range(int(input_w)):
-                base_w = int(in_w) * int(stride_w) - int(pad_w)
-                for kernel_y in range(int(kernel_h)):
-                    out_h = int(base_h) + int(kernel_y) * int(dilation_h)
-                    for kernel_x in range(int(kernel_w)):
-                        out_w = int(base_w) + int(kernel_x) * int(dilation_w)
-                        add_mapping(in_h, in_w, out_h, out_w)
-
-    return tuple(len(outputs) for _source, outputs in sorted(by_input_block.items()) if outputs)
+    in_block, out_block, _diagonal = _one_channel_lt_mapping_tensors(
+        op_kind=str(op_kind),
+        input_h=int(input_h),
+        input_w=int(input_w),
+        output_h=int(output_h),
+        output_w=int(output_w),
+        input_phys_h=int(input_phys_h),
+        input_phys_w=int(input_phys_w),
+        output_phys_h=int(output_phys_h),
+        output_phys_w=int(output_phys_w),
+        input_gap=int(input_gap),
+        output_gap=int(output_gap),
+        alpha=int(alpha),
+        kernel_h=int(kernel_h),
+        kernel_w=int(kernel_w),
+        stride_h=int(stride_h),
+        stride_w=int(stride_w),
+        pad_h=int(pad_h),
+        pad_w=int(pad_w),
+        dilation_h=int(dilation_h),
+        dilation_w=int(dilation_w),
+        slots=int(slots),
+    )
+    if int(in_block.numel()) == 0:
+        return ()
+    output_block_count = max(1, _ceil_div(int(output_phys_h) * int(output_phys_w), int(slots)))
+    pair_keys = torch.unique(in_block * int(output_block_count) + out_block)
+    source_blocks = torch.div(pair_keys, int(output_block_count), rounding_mode="floor")
+    _sources, counts = torch.unique_consecutive(source_blocks, return_counts=True)
+    return tuple(int(value) for value in counts.tolist())
 
 
 @lru_cache(maxsize=None)
@@ -1214,11 +1385,61 @@ def _conv_missing_halo_rows(edge: EdgeInfo, layout: LayoutState) -> int:
     return int(missing_top + missing_bottom)
 
 
+def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
+    if str(edge.op_kind) in {"add", "input"}:
+        return 0
+    if edge.output_shape is None or edge.output_fhe_shape is None:
+        return 0
+
+    input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
+        clear_shape=edge.shape,
+        gap=int(layout.gap),
+        alpha=int(layout.alpha),
+        beta=int(layout.beta),
+    )
+    output_gap = _output_gap_for_edge(edge)
+    output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
+    output_phys_w = max(1, int(edge.output_shape[3]) * int(output_gap))
+    input_multiplier, output_multiplier = _lt_channel_multipliers(edge)
+    full_diags = max(1, int(edge.kernel_size[0]) * int(edge.kernel_size[1]))
+
+    if _template_slot_mapping_count(edge) <= int(TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS):
+        one_channel = _one_channel_lt_ct_pt_mult_count_cached(
+            op_kind=str(edge.op_kind),
+            input_h=int(edge.shape[2]),
+            input_w=int(edge.shape[3]),
+            output_h=int(edge.output_shape[2]),
+            output_w=int(edge.output_shape[3]),
+            input_phys_h=int(input_phys_h),
+            input_phys_w=int(input_phys_w),
+            output_phys_h=int(output_phys_h),
+            output_phys_w=int(output_phys_w),
+            input_gap=int(layout.gap),
+            output_gap=int(output_gap),
+            alpha=int(layout.alpha),
+            kernel_h=int(edge.kernel_size[0]),
+            kernel_w=int(edge.kernel_size[1]),
+            stride_h=int(edge.stride[0]),
+            stride_w=int(edge.stride[1]),
+            pad_h=int(edge.padding[0]),
+            pad_w=int(edge.padding[1]),
+            dilation_h=int(edge.dilation[0]),
+            dilation_w=int(edge.dilation[1]),
+            slots=int(edge.slots),
+        )
+    else:
+        input_blocks = max(1, _ceil_div(int(input_phys_h) * int(input_phys_w), int(edge.slots)))
+        output_blocks = max(1, _ceil_div(int(output_phys_h) * int(output_phys_w), int(edge.slots)))
+        one_channel = int(input_blocks * output_blocks * int(full_diags))
+
+    return int(int(one_channel) * max(1, int(input_multiplier)) * max(1, int(output_multiplier)))
+
+
 def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> RotationEstimate:
     if str(edge.op_kind) in {"add", "input"}:
-        return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     if edge.output_shape is None or edge.output_fhe_shape is None:
-        return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
     input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
         clear_shape=edge.shape,
@@ -1438,6 +1659,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
         rho_hat_per_program=int(max(int(local_rho), int(recovery_rho))),
         unfused_rotations=int(unfused_rotations),
         same_input_fusion_savings=int(max(0, int(unfused_rotations) - int(total_rotations))),
+        ct_pt_mults=int(_lt_ct_pt_mults(edge, layout)),
         estimator=LAYOUT_ESTIMATOR_COUNT_ONLY,
     )
 
@@ -1557,6 +1779,7 @@ def _template_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotation
         rho_hat_per_program=int(max(rho_values) if rho_values else count_only.rho_hat_per_program),
         unfused_rotations=int(unfused),
         same_input_fusion_savings=int(max(0, int(unfused) - int(total_rotations))),
+        ct_pt_mults=int(_lt_ct_pt_mults(edge, layout)),
         estimator=LAYOUT_ESTIMATOR_TEMPLATE,
     )
 
@@ -1885,9 +2108,21 @@ def _finalize_policy(
     )
     relayout_bootstrap_ct_pressure = int(_relayout_bootstrap_ct_pressure(edge_relayout_rows))
     lt_rotation_estimate = int(sum(int(row["lt_bsgs_rotation_estimate"]) for row in edge_rows))
+    unfused_lt_rotation_estimate = int(
+        sum(int(row.get("lt_unfused_rotation_estimate", row["lt_bsgs_rotation_estimate"]) or 0) for row in edge_rows)
+    )
     planner_rotation_cost_estimate = int(
         sum(int(row.get("planner_rotation_cost_estimate", row["lt_bsgs_rotation_estimate"]) or 0) for row in edge_rows)
     )
+    reported_rotation_estimate = (
+        int(unfused_lt_rotation_estimate)
+        if str(policy) == "orion_dense"
+        else int(planner_rotation_cost_estimate + relayout_rotation_estimate + producer_fused_rotation_estimate)
+    )
+    lt_ct_pt_mult_estimate = int(
+        sum(int(row.get("lt_ct_pt_mult_estimate", 0) or 0) for row in edge_rows)
+    )
+    ct_pt_mult_estimate = int(lt_ct_pt_mult_estimate + relayout_mask_mult_estimate)
     compact_fallback_penalty_estimate = int(
         sum(int(row.get("compact_fallback_penalty_estimate", 0)) for row in edge_rows)
     )
@@ -1936,6 +2171,9 @@ def _finalize_policy(
         consumer_fused_rotation_estimate=int(consumer_fused_rotation_estimate),
         lt_bsgs_rotation_estimate=int(lt_rotation_estimate),
         planner_rotation_cost_estimate=int(planner_rotation_cost_estimate),
+        reported_rotation_estimate=int(reported_rotation_estimate),
+        lt_ct_pt_mult_estimate=int(lt_ct_pt_mult_estimate),
+        ct_pt_mult_estimate=int(ct_pt_mult_estimate),
         compact_fallback_penalty_estimate=int(compact_fallback_penalty_estimate),
         bootstrap_proxy=int(bootstrap_proxy),
         objective=float(objective),
@@ -2074,6 +2312,166 @@ def _source_initial_layout(
     return local_need
 
 
+def _no_halo_layout_for_edge(edge: EdgeInfo, *, slots: int) -> LayoutState:
+    return _layout_for_shape(
+        shape=edge.shape,
+        gap=int(edge.compact.gap),
+        alpha=0,
+        beta=0,
+        stride=max(1, int(edge.requirement.stride)),
+        slots=int(slots),
+    )
+
+
+def _no_halo_layout_from_semantic(
+    semantic: LayoutState,
+    *,
+    edge: EdgeInfo,
+    slots: int,
+) -> LayoutState:
+    return _layout_for_shape(
+        shape=edge.shape,
+        gap=int(semantic.gap),
+        alpha=0,
+        beta=0,
+        stride=max(1, int(semantic.stride)),
+        slots=int(slots),
+    )
+
+
+def _base_non_dp_policy(policy: str) -> str:
+    normalized = str(policy)
+    if normalized == "fixed_max_fused":
+        return "fixed_max"
+    if normalized == "eager_fused":
+        return "eager"
+    if normalized == "greedy_fused":
+        return "greedy"
+    return normalized
+
+
+def _non_dp_policy_uses_fusion(policy: str) -> bool:
+    return str(policy) in {"fixed_max_fused", "eager_fused", "greedy_fused"}
+
+
+def _layout_has_halo(layout: LayoutState) -> bool:
+    return bool(int(layout.alpha) > 0 or int(layout.beta) > 0)
+
+
+def _non_dp_consumer_fused_row(
+    policy: str,
+    edge: EdgeInfo,
+    *,
+    source_layout: LayoutState,
+    source_physical: str,
+) -> dict[str, Any] | None:
+    selected_layout = _layout_with_stride(
+        source_layout,
+        max(int(source_layout.stride), int(edge.requirement.stride)),
+    )
+    if (
+        source_layout.covers(edge.requirement)
+        and str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and _conv_native_stripe_candidate_allowed(edge, source_layout)
+    ):
+        return _edge_row(
+            edge,
+            selected_layout,
+            relayout=False,
+            relayout_reason="",
+            layout_mode="native_halo_stripe",
+            source_layout=source_layout,
+            physical_layout=PHYSICAL_NATIVE_SOURCE_STRIPE,
+            planner_rotation_cost=_consumer_fused_planner_rotation_cost(
+                edge,
+                selected_layout,
+                layout_mode="native_halo_stripe",
+            ),
+        )
+    if not _compact_align_shared_allowed(edge, source_layout, str(source_physical)):
+        return None
+    if source_layout.covers(edge.requirement):
+        if not _compact_halo_shared_allowed(edge, source_layout, str(source_physical)):
+            return None
+        layout_mode = "compact_halo_shared"
+    else:
+        layout_mode = "compact_align_shared"
+    physical_layout = PHYSICAL_LOGICAL_HALO if _layout_has_halo(selected_layout) else PHYSICAL_COMPACT
+    return _edge_row(
+        edge,
+        selected_layout,
+        relayout=False,
+        relayout_reason="",
+        layout_mode=str(layout_mode),
+        source_layout=source_layout,
+        physical_layout=str(physical_layout),
+        consumer_fused_relayout=True,
+        consumer_fused_rotation_estimate=0,
+        planner_rotation_cost=_consumer_fused_planner_rotation_cost(
+            edge,
+            selected_layout,
+            layout_mode=str(layout_mode),
+        ),
+    )
+
+
+def _non_dp_producer_fused_output_preference(
+    policy: str,
+    module: Any | None,
+    *,
+    incoming_rows: Sequence[dict[str, Any]],
+    outgoing: Sequence[EdgeInfo],
+    live: dict[str, LayoutState],
+    edges_by_target: dict[str, list[EdgeInfo]],
+    global_alpha: int,
+    global_beta: int,
+    slots: int,
+) -> tuple[LayoutState, str] | None:
+    if not incoming_rows or len(outgoing) != 1:
+        return None
+    if not _producer_fused_output_allowed(module):
+        return None
+    edge = outgoing[0]
+    semantic = _operator_semantic_output_layout(
+        module,
+        LayoutState(**dict(incoming_rows[0]["selected_layout"])),
+        edge,
+        slots=int(slots),
+    )
+    if str(edge.op_kind) == "add":
+        add_incoming = tuple(edges_by_target.get(str(edge.target), ()))
+        if not add_incoming:
+            return None
+        temp_live = dict(live)
+        temp_live[str(edge.source)] = semantic
+        if any(str(item.source) not in temp_live for item in add_incoming):
+            return None
+        target_layout = _choose_non_dp_add_layout(
+            _base_non_dp_policy(policy),
+            add_incoming,
+            temp_live,
+            global_alpha=int(global_alpha),
+            global_beta=int(global_beta),
+            slots=int(slots),
+        )
+        reason = "add_input_alignment"
+    else:
+        target_layout, reason = _choose_non_dp_input_layout(
+            _base_non_dp_policy(policy),
+            edge,
+            semantic,
+            global_alpha=int(global_alpha),
+            global_beta=int(global_beta),
+            slots=int(slots),
+        )
+    if int(target_layout.gap) != int(edge.compact.gap):
+        return None
+    if _same_physical_layout(semantic, target_layout):
+        return None
+    reason_token = str(reason or "next_consumer_layout")
+    return target_layout, f"{policy}_producer_fused_{reason_token}"
+
+
 def _plan_non_dp_topological(
     dag: NetworkDAG,
     edges: Sequence[EdgeInfo],
@@ -2094,7 +2492,10 @@ def _plan_non_dp_topological(
     }
     global_alpha = max(int(edge.requirement.alpha) for edge in edges)
     global_beta = max(int(edge.requirement.beta) for edge in edges)
+    base_policy = _base_non_dp_policy(str(policy))
+    fuse_local_relayouts = _non_dp_policy_uses_fusion(str(policy))
     live: dict[str, LayoutState] = {}
+    live_physical: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
     relayout_layouts: list[LayoutState] = []
     node_layouts: list[dict[str, Any]] = []
@@ -2107,7 +2508,7 @@ def _plan_non_dp_topological(
 
         if incoming and type(module).__name__ == "Add":
             target_layout = _choose_non_dp_add_layout(
-                str(policy),
+                str(base_policy),
                 incoming,
                 live,
                 global_alpha=int(global_alpha),
@@ -2132,8 +2533,9 @@ def _plan_non_dp_topological(
         else:
             for edge in incoming:
                 source_layout = live[edge.source]
+                source_physical = live_physical.get(str(edge.source), PHYSICAL_COMPACT)
                 target_layout, reason = _choose_non_dp_input_layout(
-                    str(policy),
+                    str(base_policy),
                     edge,
                     source_layout,
                     global_alpha=int(global_alpha),
@@ -2141,17 +2543,30 @@ def _plan_non_dp_topological(
                     slots=int(slots),
                 )
                 relayout = str(edge.source) != "x" and not _same_physical_layout(source_layout, target_layout)
-                if bool(relayout):
-                    relayout_layouts.append(target_layout)
-                incoming_rows.append(
-                    _edge_row(
+                fused_row = (
+                    _non_dp_consumer_fused_row(
+                        str(policy),
                         edge,
-                        target_layout,
-                        relayout=bool(relayout),
-                        relayout_reason=str(reason) if bool(relayout) else "",
-                        lt_rotations=_lt_rotations(edge, target_layout),
                         source_layout=source_layout,
+                        source_physical=str(source_physical),
                     )
+                    if bool(relayout) and bool(fuse_local_relayouts)
+                    else None
+                )
+                if fused_row is not None:
+                    incoming_rows.append(fused_row)
+                else:
+                    if bool(relayout):
+                        relayout_layouts.append(target_layout)
+                    incoming_rows.append(
+                        _edge_row(
+                            edge,
+                            target_layout,
+                            relayout=bool(relayout),
+                            relayout_reason=str(reason) if bool(relayout) else "",
+                            lt_rotations=_lt_rotations(edge, target_layout),
+                            source_layout=source_layout,
+                        )
                 )
 
         rows.extend(incoming_rows)
@@ -2159,11 +2574,17 @@ def _plan_non_dp_topological(
         for source in list(live):
             if int(last_consumer_index.get(str(source), -1)) <= int(topo_index[str(node)]):
                 live.pop(str(source), None)
+                live_physical.pop(str(source), None)
 
         output_layout: LayoutState | None
+        output_physical = PHYSICAL_COMPACT
+        producer_fused = {"enabled": False, "rotation_count": 0}
+        producer_materialized_halo = False
+        producer_materialized_halo_reason = ""
         if incoming_rows:
             if type(module).__name__ == "Add":
                 output_layout = LayoutState(**dict(incoming_rows[0]["selected_layout"]))
+                output_physical = str(incoming_rows[0].get("physical_layout", PHYSICAL_COMPACT))
             elif outgoing:
                 candidates = _operator_output_layout_candidates(
                     module,
@@ -2172,19 +2593,68 @@ def _plan_non_dp_topological(
                     slots=int(slots),
                 )
                 output_layout = candidates[0] if candidates else None
+                fused_output = (
+                    _non_dp_producer_fused_output_preference(
+                        str(policy),
+                        module,
+                        incoming_rows=incoming_rows,
+                        outgoing=outgoing,
+                        live=live,
+                        edges_by_target=edges_by_target,
+                        global_alpha=int(global_alpha),
+                        global_beta=int(global_beta),
+                        slots=int(slots),
+                    )
+                    if bool(fuse_local_relayouts)
+                    else None
+                )
+                if fused_output is not None:
+                    output_layout, producer_materialized_halo_reason = fused_output
+                if output_layout is not None:
+                    producer_fused = _producer_fused_materialization_estimate(
+                        module,
+                        incoming=incoming,
+                        incoming_rows=incoming_rows,
+                        outgoing=outgoing,
+                        output_layout=output_layout,
+                        slots=int(slots),
+                    )
+                    output_physical = _output_physical_layout(
+                        module,
+                        incoming_rows=incoming_rows,
+                        output_layout=output_layout,
+                        producer_fused=producer_fused,
+                    )
+                    logical_halo_materialized = bool(
+                        str(output_physical) == PHYSICAL_LOGICAL_HALO
+                        and _producer_fused_output_allowed(module)
+                    )
+                    producer_materialized_halo = bool(producer_fused["enabled"]) or bool(logical_halo_materialized)
+                    if not producer_materialized_halo_reason:
+                        producer_materialized_halo_reason = (
+                            f"{policy}_producer_materialized_halo"
+                            if bool(producer_fused["enabled"])
+                            else (
+                                f"{policy}_logical_halo_materialized_output"
+                                if bool(logical_halo_materialized)
+                                else ""
+                            )
+                        )
             else:
                 output_layout = None
         else:
             output_layout = _source_initial_layout(
-                str(policy),
+                str(base_policy),
                 outgoing,
                 global_alpha=int(global_alpha),
                 global_beta=int(global_beta),
                 slots=int(slots),
             )
+            output_physical = PHYSICAL_LOGICAL_HALO if output_layout is not None and _layout_has_halo(output_layout) else PHYSICAL_COMPACT
 
         if output_layout is not None and outgoing:
             live[str(node)] = output_layout
+            live_physical[str(node)] = str(output_physical)
             node_layouts.append(
                 _node_layout_row(
                     str(node),
@@ -2192,7 +2662,10 @@ def _plan_non_dp_topological(
                     outgoing[0].compact,
                     relayout=False,
                     reason="",
-                    producer_materialized_halo=False,
+                    producer_materialized_halo=bool(producer_materialized_halo),
+                    producer_materialized_halo_reason=str(producer_materialized_halo_reason),
+                    producer_fused_rotation_estimate=int(producer_fused["rotation_count"]),
+                    physical_layout=str(output_physical),
                     shape=outgoing[0].shape,
                     fhe_shape=outgoing[0].fhe_shape,
                 )
@@ -2211,12 +2684,111 @@ def _plan_fixed_max(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -
     return _plan_non_dp_topological(dag, edges, policy="fixed_max", slots=int(slots))
 
 
+def _plan_fixed_max_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="fixed_max_fused", slots=int(slots))
+
+
 def _plan_eager(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
     return _plan_non_dp_topological(dag, edges, policy="eager", slots=int(slots))
 
 
+def _plan_eager_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="eager_fused", slots=int(slots))
+
+
 def _plan_greedy(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
     return _plan_non_dp_topological(dag, edges, policy="greedy", slots=int(slots))
+
+
+def _plan_greedy_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="greedy_fused", slots=int(slots))
+
+
+def _plan_orion_dense(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    edges_by_source: dict[str, list[EdgeInfo]] = {}
+    edges_by_target: dict[str, list[EdgeInfo]] = {}
+    for edge in edges:
+        edges_by_source.setdefault(str(edge.source), []).append(edge)
+        edges_by_target.setdefault(str(edge.target), []).append(edge)
+    topo = [str(node) for node in dag.topological_sort()]
+    topo_index = {str(node): index for index, node in enumerate(topo)}
+    last_consumer_index = {
+        str(source): max(topo_index[str(edge.target)] for edge in source_edges)
+        for source, source_edges in edges_by_source.items()
+    }
+    live: dict[str, LayoutState] = {}
+    rows: list[dict[str, Any]] = []
+    node_layouts: list[dict[str, Any]] = []
+
+    for node in topo:
+        incoming = tuple(edges_by_target.get(str(node), ()))
+        outgoing = tuple(edges_by_source.get(str(node), ()))
+        module = dag.nodes[node].get("module")
+        incoming_rows: list[dict[str, Any]] = []
+        for edge in incoming:
+            source_layout = live.get(str(edge.source), _no_halo_layout_for_edge(edge, slots=int(slots)))
+            target_layout = _no_halo_layout_for_edge(edge, slots=int(slots))
+            incoming_rows.append(
+                _edge_row(
+                    edge,
+                    target_layout,
+                    relayout=False,
+                    relayout_reason="",
+                    layout_mode="orion_dense",
+                    source_layout=source_layout,
+                    physical_layout=PHYSICAL_COMPACT,
+                )
+            )
+        rows.extend(incoming_rows)
+
+        for source in list(live):
+            if int(last_consumer_index.get(str(source), -1)) <= int(topo_index[str(node)]):
+                live.pop(str(source), None)
+
+        output_layout: LayoutState | None = None
+        if incoming_rows and outgoing:
+            if type(module).__name__ == "Add":
+                output_layout = _no_halo_layout_for_edge(outgoing[0], slots=int(slots))
+            else:
+                semantic = _operator_semantic_output_layout(
+                    module,
+                    LayoutState(**dict(incoming_rows[0]["selected_layout"])),
+                    outgoing[0],
+                    slots=int(slots),
+                )
+                output_layout = _no_halo_layout_from_semantic(
+                    semantic,
+                    edge=outgoing[0],
+                    slots=int(slots),
+                )
+        elif outgoing:
+            output_layout = _no_halo_layout_for_edge(outgoing[0], slots=int(slots))
+
+        if output_layout is not None and outgoing:
+            live[str(node)] = output_layout
+            node_layouts.append(
+                _node_layout_row(
+                    str(node),
+                    output_layout,
+                    outgoing[0].compact,
+                    relayout=False,
+                    reason="",
+                    producer_materialized_halo=False,
+                    producer_materialized_halo_reason="",
+                    producer_fused_rotation_estimate=0,
+                    physical_layout=PHYSICAL_COMPACT,
+                    shape=outgoing[0].shape,
+                    fhe_shape=outgoing[0].fhe_shape,
+                )
+            )
+
+    rows.sort(key=lambda row: (topo_index.get(str(row["source"]), 10**9), topo_index.get(str(row["target"]), 10**9)))
+    return _finalize_policy(
+        policy="orion_dense",
+        edge_rows=rows,
+        relayout_layouts=[],
+        node_layouts=node_layouts,
+    )
 
 
 def _source_candidate_rows(edges: Sequence[EdgeInfo], layouts: Sequence[LayoutState], *, relayout_reason: str) -> tuple[list[dict[str, Any]], list[LayoutState]]:
@@ -2540,6 +3112,13 @@ def _output_physical_layout(
     output_layout: LayoutState,
     producer_fused: dict[str, Any],
 ) -> str:
+    if _layout_preserving_output(module) and incoming_rows:
+        physicals = {
+            str(row.get("physical_layout", PHYSICAL_COMPACT) or PHYSICAL_COMPACT)
+            for row in incoming_rows
+        }
+        if len(physicals) == 1:
+            return next(iter(physicals))
     if int(output_layout.alpha) == 0 and int(output_layout.beta) == 0:
         return PHYSICAL_COMPACT
     if bool(producer_fused.get("enabled", False)):
@@ -2594,10 +3173,16 @@ def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tu
     return _dedupe_layouts((halo, _fill_beta_to_tile_capacity(halo, shape=edge.shape, slots=int(slots))))
 
 
-def _compact_align_shared_allowed(edge: EdgeInfo, source_layout: LayoutState) -> bool:
+def _compact_align_shared_allowed(
+    edge: EdgeInfo,
+    source_layout: LayoutState,
+    source_physical: str = PHYSICAL_COMPACT,
+) -> bool:
     if str(edge.op_kind) != "conv2d":
         return False
     if str(edge.source) == "x":
+        return False
+    if str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE:
         return False
     return int(source_layout.gap) == int(edge.requirement.gap)
 
@@ -2793,7 +3378,11 @@ def enumerate_execution_candidates(
     for layout in relayout_candidates:
         if source_layout.covers(layout) and _same_physical_layout(source_layout, layout):
             continue
-        if str(edge.op_kind) == "conv2d" and _compact_align_shared_allowed(edge, source_layout):
+        if str(edge.op_kind) == "conv2d" and _compact_align_shared_allowed(
+            edge,
+            source_layout,
+            str(source_physical),
+        ):
             continue
         candidates.append(
             ExecutionCandidate(
@@ -2806,7 +3395,7 @@ def enumerate_execution_candidates(
                 relayout_reason="dp_state_consumer_relayout",
             )
         )
-    if _compact_align_shared_allowed(edge, source_layout):
+    if _compact_align_shared_allowed(edge, source_layout, str(source_physical)):
         selected_layout = _layout_with_stride(
             source_layout,
             max(int(source_layout.stride), int(edge.requirement.stride)),
@@ -3239,10 +3828,18 @@ def plan_policy(
     normalized = normalize_policy(policy)
     if normalized == "fixed_max":
         return _plan_fixed_max(dag, edges, slots=int(slots))
+    if normalized == "fixed_max_fused":
+        return _plan_fixed_max_fused(dag, edges, slots=int(slots))
     if normalized == "eager":
         return _plan_eager(dag, edges, slots=int(slots))
+    if normalized == "eager_fused":
+        return _plan_eager_fused(dag, edges, slots=int(slots))
     if normalized == "greedy":
         return _plan_greedy(dag, edges, slots=int(slots))
+    if normalized == "greedy_fused":
+        return _plan_greedy_fused(dag, edges, slots=int(slots))
+    if normalized == "orion_dense":
+        return _plan_orion_dense(dag, edges, slots=int(slots))
     if normalized == "dp":
         return _plan_dp(dag, edges, slots=int(slots), estimator=estimator)
     raise AssertionError(f"unreachable policy {policy!r}")
@@ -3468,7 +4065,12 @@ def _provider_mode_for_policy(spec: NetworkSpec, policy: str) -> str:
     normalized = normalize_policy(policy)
     if normalized == "dp":
         return str(spec.provider_mode)
-    suffix = "fixedmax" if normalized == "fixed_max" else str(normalized)
+    suffixes = {
+        "fixed_max": "fixedmax",
+        "fixed_max_fused": "fixedmax_fused",
+        "orion_dense": "oriondense",
+    }
+    suffix = suffixes.get(str(normalized), str(normalized))
     return f"{spec.provider_mode}_layout_{suffix}"
 
 

@@ -334,9 +334,15 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         ),
         None,
     )
+    layout_policy_generic_modes = {
+        "generic_layout_dp",
+        "vgg_imgnet_layout_dp",
+        "r18_imgnet_layout_dp",
+    }
+    is_layout_policy_generic = normalized in layout_policy_generic_modes
     u22_allowed_nodes = None
-    u22_conv_kernels = bool(u22_mode_base is not None)
-    u22_layout_policy = "dp" if u22_mode_base is not None else ""
+    u22_conv_kernels = bool(u22_mode_base is not None or is_layout_policy_generic)
+    u22_layout_policy = "dp" if bool(u22_mode_base is not None or is_layout_policy_generic) else ""
     if u22_mode_base is not None and normalized != str(u22_mode_base):
         suffix = normalized[len(str(u22_mode_base)) + 1 :]
         allowed: list[str] = []
@@ -367,18 +373,31 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                 if raw_policy == "fixed" and int(index + 2) < len(tokens) and str(tokens[int(index + 2)]) == "max":
                     raw_policy = "fixedmax"
                     index += 1
+                if int(index + 2) < len(tokens) and str(tokens[int(index + 2)]) == "fused":
+                    raw_policy = f"{raw_policy}_fused"
+                    index += 1
                 policy_aliases = {
                     "fixed": "fixed_max",
                     "fixedmax": "fixed_max",
+                    "fixed_fused": "fixed_max_fused",
+                    "fixedmax_fused": "fixed_max_fused",
                     "eager": "eager",
+                    "eager_fused": "eager_fused",
                     "greedy": "greedy",
+                    "greedy_fused": "greedy_fused",
+                    "orion": "orion_dense",
+                    "dense": "orion_dense",
+                    "oriondense": "orion_dense",
+                    "orion_dense": "orion_dense",
+                    "nohalo": "orion_dense",
+                    "no_halo": "orion_dense",
                     "dp": "dp",
                 }
                 if raw_policy in policy_aliases:
                     u22_layout_policy = str(policy_aliases[raw_policy])
                     index += 2
                     continue
-            if token in {"fixedmax", "eager", "greedy", "dp"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
+            if token in {"fixedmax", "eager", "greedy", "dp", "fused"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
                 index += 1
                 continue
             if not token.startswith("up"):
@@ -394,7 +413,13 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         u22_allowed_nodes = ("up1", "up2", "up3", "up4")
     elif u22_mode_base is not None and u22_allowed_nodes is None:
         u22_allowed_nodes = ("up4", "up3")
-    is_enabled = normalized in r18_modes or r18_allowed_stages is not None or normalized == "r34_imgnet_phase1" or u22_mode_base is not None
+    is_enabled = (
+        normalized in r18_modes
+        or r18_allowed_stages is not None
+        or normalized == "r34_imgnet_phase1"
+        or u22_mode_base is not None
+        or bool(is_layout_policy_generic)
+    )
     is_r18 = normalized in r18_modes or r18_allowed_stages is not None
     is_probe_dense_bypass = r18_probe_stage_allowed_stages is not None or normalized in {
         "r18_tiny_e2e_probe",
@@ -418,6 +443,7 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
         "is_r18": bool(is_r18),
         "is_r34_phase1": bool(normalized == "r34_imgnet_phase1"),
         "is_u22_phase1": bool(u22_mode_base is not None),
+        "is_layout_policy_generic": bool(is_layout_policy_generic),
         "u22_allowed_nodes": u22_allowed_nodes,
         "u22_conv_kernels": bool(u22_conv_kernels),
         "u22_layout_policy": str(u22_layout_policy),
@@ -761,7 +787,7 @@ class Scheme:
 
                 self.region_first_registry = R34CompileRegistry.for_r34_imgnet_phase1(network_dag)
                 self.region_first_attach_audit = self.region_first_registry.attach_to_dag(network_dag)
-            elif bool(region_first_options["is_u22_phase1"]):
+            elif bool(region_first_options["is_u22_phase1"]) or bool(region_first_options["is_layout_policy_generic"]):
                 from orion.experimental.u22_phase1 import U22CompileRegistry
 
                 self.region_first_registry = U22CompileRegistry.for_dag(

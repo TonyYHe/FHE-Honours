@@ -13,12 +13,26 @@ from .io_prefetch import (
     estimate_linear_transform_device_bytes,
     should_prefetch_saved_io,
 )
-from .memory_lifecycle import guard_host_memory
+from .memory_lifecycle import guard_host_memory, host_memory_info
 from .compile_policy import auto_batch_limit, auto_worker_count
 from orion.backend.python.tensors import CipherTensor
 
 
 _ENCODED_HOIST_PAYLOAD_DATASET = "__encoded_hoist_payload__"
+_DENSE_DIAG_INDICES_DATASET = "diag_indices"
+_DENSE_DIAG_OFFSETS_DATASET = "diag_offsets"
+_DENSE_DIAG_LENGTHS_DATASET = "diag_lengths"
+_DENSE_DIAG_PAYLOAD_DATASET = "diag_payload"
+_DENSE_COARSE_DIAG_DATASETS = {
+    _DENSE_DIAG_INDICES_DATASET,
+    _DENSE_DIAG_OFFSETS_DATASET,
+    _DENSE_DIAG_LENGTHS_DATASET,
+    _DENSE_DIAG_PAYLOAD_DATASET,
+}
+_DENSE_RESERVED_PLAINTEXT_DATASETS = _DENSE_COARSE_DIAG_DATASETS | {
+    _ENCODED_HOIST_PAYLOAD_DATASET,
+}
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
 
 
 _COMPILE_PROFILE_KEYS = (
@@ -150,11 +164,11 @@ class NewEvaluator:
         self.backend.NewLinearTransformEvaluator()
 
     def _read_transform_io_lookahead(self) -> int:
-        raw_value = os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "2")
+        raw_value = os.environ.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "1")
         try:
             return max(0, int(raw_value))
         except (TypeError, ValueError):
-            return 2
+            return 1
 
     def register_saved_io_schedule(self, linear_layers) -> None:
         work_order: list[tuple[str, int, int, int]] = []
@@ -458,6 +472,14 @@ class NewEvaluator:
                 return False
             plaintext_block = plaintext_group[str(block_name)]
             if _ENCODED_HOIST_PAYLOAD_DATASET in plaintext_block:
+                continue
+            if self._dense_block_has_coarse_payload(plaintext_block):
+                expected_keys = {
+                    int(diag_idx)
+                    for diag_idx in diag_group[str(block_name)].keys()
+                }
+                if set(self._dense_block_diag_indices(plaintext_block)) != expected_keys:
+                    return False
                 continue
             expected_keys = {str(diag_idx) for diag_idx in diag_group[str(block_name)].keys()}
             if not expected_keys.issubset(set(str(key) for key in plaintext_block.keys())):
@@ -1124,6 +1146,16 @@ class NewEvaluator:
                         self.backend.RemovePlaintextDiagonals(int(lintransf_id))
                     return
 
+                if self._dense_coarse_artifact_io_enabled():
+                    self._write_dense_coarse_payload(
+                        block_group,
+                        int(lintransf_id),
+                        diag_idxs,
+                        payload_required=self._plaintext_payload_required(),
+                    )
+                    self.backend.RemovePlaintextDiagonals(int(lintransf_id))
+                    return
+
                 if not self._plaintext_payload_required():
                     for diag_idx in diag_idxs:
                         block_group.create_dataset(str(int(diag_idx)), data=np.zeros((0,), dtype=np.uint8))
@@ -1148,12 +1180,429 @@ class NewEvaluator:
             getattr(self.backend, "LoadLinearTransformPlaintexts", None)
         )
 
+    def _dense_coarse_artifact_io_enabled(self) -> bool:
+        raw_value = os.environ.get("ORION_DENSE_LT_COARSE_ARTIFACT_IO", "1")
+        return raw_value.strip().lower() not in _FALSE_ENV_VALUES
+
+    def _dense_coarse_save_chunk_bytes(self) -> int:
+        raw_value = os.environ.get("ORION_DENSE_LT_COARSE_SAVE_CHUNK_BYTES")
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                pass
+        raw_mib = os.environ.get("ORION_DENSE_LT_COARSE_SAVE_CHUNK_MB")
+        if raw_mib:
+            try:
+                return max(1, int(float(raw_mib) * 1024**2))
+            except ValueError:
+                pass
+        return 1024**2
+
+    def _dense_coarse_load_chunk_bytes(self) -> int:
+        raw_value = os.environ.get("ORION_DENSE_LT_COARSE_LOAD_CHUNK_BYTES")
+        if raw_value:
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                pass
+        raw_gib = os.environ.get("ORION_DENSE_LT_COARSE_LOAD_CHUNK_GB")
+        if raw_gib:
+            try:
+                return max(1, int(float(raw_gib) * 1024**3))
+            except ValueError:
+                pass
+        raw_unified = os.environ.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_BYTES")
+        if raw_unified:
+            try:
+                return max(1, int(raw_unified))
+            except ValueError:
+                pass
+        return 512 * 1024**2
+
+    def _dense_coarse_resident_fraction_limit(self) -> float:
+        raw_value = os.environ.get("ORION_DENSE_LT_COARSE_LOAD_MAX_RESIDENT_FRACTION", "0.25")
+        try:
+            return min(1.0, max(0.01, float(raw_value)))
+        except ValueError:
+            return 0.25
+
+    def _dense_coarse_safe_load_chunk_bytes(self) -> int:
+        chunk_limit = int(self._dense_coarse_load_chunk_bytes())
+        info = host_memory_info()
+        if info is None:
+            return int(chunk_limit)
+        available = int(info.get("available_bytes", 0))
+        if available <= 0:
+            return int(chunk_limit)
+        resident_limit = int(available * self._dense_coarse_resident_fraction_limit())
+        return max(1, min(int(chunk_limit), int(resident_limit)))
+
+    def _dense_block_has_coarse_payload(self, block) -> bool:
+        return all(name in block for name in _DENSE_COARSE_DIAG_DATASETS)
+
+    def _dense_block_diag_indices(self, block) -> tuple[int, ...]:
+        if _DENSE_DIAG_INDICES_DATASET in block:
+            return tuple(int(value) for value in np.asarray(block[_DENSE_DIAG_INDICES_DATASET][:]).reshape(-1))
+        return tuple(
+            sorted(
+                int(name)
+                for name in block.keys()
+                if str(name) not in _DENSE_RESERVED_PLAINTEXT_DATASETS
+            )
+        )
+
+    def _dense_block_dataset_bytes(self, dataset) -> int:
+        return int(dataset.size) * int(dataset.dtype.itemsize)
+
+    def _dense_coarse_block_bytes(self, block) -> int:
+        return sum(
+            self._dense_block_dataset_bytes(block[name])
+            for name in _DENSE_COARSE_DIAG_DATASETS
+            if name in block
+        )
+
+    def _dense_fine_block_bytes(self, block) -> int:
+        return sum(
+            self._dense_block_dataset_bytes(block[str(diag_idx)])
+            for diag_idx in self._dense_block_diag_indices(block)
+            if str(diag_idx) in block
+        )
+
+    def _dense_coarse_payload_should_stream(self, payload_bytes: int, *, reason: str) -> bool:
+        if int(payload_bytes) <= 0:
+            return False
+        if int(payload_bytes) > int(self._dense_coarse_safe_load_chunk_bytes()):
+            return True
+        guard = self._forward_memory_guard(
+            reason=str(reason),
+            needed_bytes=int(payload_bytes),
+            raise_on_low=False,
+        )
+        after = guard.get("after") or guard.get("before")
+        if after is None:
+            return False
+        available = int(after.get("available_bytes", 0))
+        min_available = int(guard.get("min_available_bytes", 0))
+        if bool(min_available > 0 and available - int(payload_bytes) < min_available):
+            return True
+        return bool(
+            available > 0
+            and int(payload_bytes) > int(available * self._dense_coarse_resident_fraction_limit())
+        )
+
+    def _write_dense_coarse_payload(
+        self,
+        block_group,
+        lintransf_id: int,
+        diag_idxs,
+        *,
+        payload_required: bool,
+    ) -> None:
+        diag_indices = tuple(int(diag_idx) for diag_idx in diag_idxs)
+        offsets: list[int] = []
+        lengths: list[int] = []
+        cursor = 0
+        payload_ds = block_group.create_dataset(
+            _DENSE_DIAG_PAYLOAD_DATASET,
+            shape=(0,),
+            maxshape=(None,),
+            chunks=(int(self._dense_coarse_save_chunk_bytes()),),
+            dtype=np.uint8,
+        )
+        if bool(payload_required):
+            for diag_idx in diag_indices:
+                diag_serial, diag_ptr = self.backend.SerializeDiagonal(
+                    int(lintransf_id),
+                    int(diag_idx),
+                )
+                try:
+                    serial_arr = np.asarray(diag_serial, dtype=np.uint8).reshape(-1)
+                    length = int(serial_arr.size)
+                    offsets.append(int(cursor))
+                    lengths.append(int(length))
+                    if length:
+                        next_cursor = int(cursor + length)
+                        payload_ds.resize((next_cursor,))
+                        payload_ds[int(cursor):next_cursor] = serial_arr
+                        cursor = int(next_cursor)
+                finally:
+                    self.backend.FreeCArray(diag_ptr)
+        block_group.create_dataset(
+            _DENSE_DIAG_INDICES_DATASET,
+            data=np.asarray(diag_indices, dtype=np.int32),
+        )
+        block_group.create_dataset(
+            _DENSE_DIAG_OFFSETS_DATASET,
+            data=np.asarray(offsets, dtype=np.uint64),
+        )
+        block_group.create_dataset(
+            _DENSE_DIAG_LENGTHS_DATASET,
+            data=np.asarray(lengths, dtype=np.uint64),
+        )
+
+    def _load_dense_coarse_plaintexts_from_block(
+        self,
+        block,
+        transform_id: int,
+        *,
+        selected_diag_indices=None,
+    ) -> list[int]:
+        load_batch = getattr(self.backend, "LoadPlaintextDiagonalsBatch", None)
+        if not callable(load_batch):
+            raise RuntimeError("dense coarse plaintext cache requires LoadPlaintextDiagonalsBatch")
+
+        diag_indices = [int(value) for value in np.asarray(block[_DENSE_DIAG_INDICES_DATASET][:]).reshape(-1)]
+        offsets = [int(value) for value in np.asarray(block[_DENSE_DIAG_OFFSETS_DATASET][:]).reshape(-1)]
+        lengths = [int(value) for value in np.asarray(block[_DENSE_DIAG_LENGTHS_DATASET][:]).reshape(-1)]
+        if selected_diag_indices is not None:
+            selected = {int(value) for value in selected_diag_indices}
+        else:
+            selected = None
+
+        if not self._plaintext_payload_required():
+            selected_indices = [
+                int(diag_idx)
+                for diag_idx in diag_indices
+                if selected is None or int(diag_idx) in selected
+            ]
+            if selected_indices:
+                load_batch(
+                    np.zeros((0,), dtype=np.uint8),
+                    [],
+                    [],
+                    selected_indices,
+                    int(transform_id),
+                )
+            return selected_indices
+
+        payload_ds = block[_DENSE_DIAG_PAYLOAD_DATASET]
+        if len(diag_indices) != len(offsets) or len(diag_indices) != len(lengths):
+            raise RuntimeError("Malformed dense coarse plaintext cache: metadata lengths differ")
+        chunk_limit = int(self._dense_coarse_safe_load_chunk_bytes())
+        reloaded: list[int] = []
+        index = 0
+        while index < len(diag_indices):
+            if selected is not None and int(diag_indices[index]) not in selected:
+                index += 1
+                continue
+            start = int(offsets[index])
+            end = int(start + lengths[index])
+            next_index = int(index + 1)
+            included = [int(index)]
+            while next_index < len(diag_indices):
+                if selected is not None and int(diag_indices[next_index]) not in selected:
+                    break
+                candidate_end = int(offsets[next_index] + lengths[next_index])
+                if candidate_end - start > chunk_limit:
+                    break
+                end = int(candidate_end)
+                included.append(int(next_index))
+                next_index += 1
+            self._forward_memory_guard(
+                reason=f"before_dense_coarse_plaintext_stream_load:{int(transform_id)}:{int(index)}",
+                needed_bytes=int(end - start),
+                raise_on_low=True,
+            )
+            payload = np.asarray(payload_ds[start:end], dtype=np.uint8).reshape(-1)
+            load_batch(
+                payload,
+                [int(offsets[i] - start) for i in included],
+                [int(lengths[i]) for i in included],
+                [int(diag_indices[i]) for i in included],
+                int(transform_id),
+            )
+            reloaded.extend(int(diag_indices[i]) for i in included)
+            del payload
+            index = int(next_index)
+        return reloaded
+
+    def _load_dense_coarse_plaintexts_from_disk(
+        self,
+        layer_name,
+        row,
+        col,
+        transform_id,
+        *,
+        selected_diag_indices=None,
+    ) -> list[int]:
+        with h5py.File(self.diags_path, "r") as f:
+            block = f[str(layer_name)]["plaintexts"][f"{int(row)}_{int(col)}"]
+            return self._load_dense_coarse_plaintexts_from_block(
+                block,
+                int(transform_id),
+                selected_diag_indices=selected_diag_indices,
+            )
+
+    def _load_dense_fine_plaintexts_from_block(
+        self,
+        block,
+        transform_id: int,
+        *,
+        selected_diag_indices=None,
+    ) -> list[int]:
+        diag_indices = list(self._dense_block_diag_indices(block))
+        if selected_diag_indices is not None:
+            selected = {int(value) for value in selected_diag_indices}
+            diag_indices = [int(value) for value in diag_indices if int(value) in selected]
+        if not diag_indices:
+            return []
+
+        load_batch = getattr(self.backend, "LoadPlaintextDiagonalsBatch", None)
+        if not callable(load_batch):
+            reloaded = []
+            for diag_idx in diag_indices:
+                dataset = block[str(int(diag_idx))]
+                needed_bytes = self._dense_block_dataset_bytes(dataset)
+                self._forward_memory_guard(
+                    reason=f"before_dense_fine_plaintext_load:{int(transform_id)}:{int(diag_idx)}",
+                    needed_bytes=int(needed_bytes),
+                    raise_on_low=True,
+                )
+                serial_diag = dataset[()]
+                self.backend.LoadPlaintextDiagonal(serial_diag, int(transform_id), int(diag_idx))
+                reloaded.append(int(diag_idx))
+            return reloaded
+
+        if not self._plaintext_payload_required():
+            load_batch(
+                np.zeros((0,), dtype=np.uint8),
+                [],
+                [],
+                [int(value) for value in diag_indices],
+                int(transform_id),
+            )
+            return [int(value) for value in diag_indices]
+
+        chunk_limit = int(self._dense_coarse_safe_load_chunk_bytes())
+        reloaded: list[int] = []
+        payload_chunks = []
+        offsets = []
+        lengths = []
+        batch_diag_indices = []
+        cursor = 0
+
+        def flush() -> None:
+            nonlocal payload_chunks, offsets, lengths, batch_diag_indices, cursor
+            if not batch_diag_indices:
+                return
+            needed_bytes = int(cursor)
+            self._forward_memory_guard(
+                reason=f"before_dense_fine_plaintext_batch_load:{int(transform_id)}:{len(reloaded)}",
+                needed_bytes=needed_bytes,
+                raise_on_low=True,
+            )
+            payload = (
+                np.concatenate(payload_chunks)
+                if payload_chunks
+                else np.zeros((0,), dtype=np.uint8)
+            )
+            load_batch(
+                payload,
+                list(offsets),
+                list(lengths),
+                list(batch_diag_indices),
+                int(transform_id),
+            )
+            reloaded.extend(int(value) for value in batch_diag_indices)
+            payload_chunks = []
+            offsets = []
+            lengths = []
+            batch_diag_indices = []
+            cursor = 0
+
+        for diag_idx in diag_indices:
+            dataset = block[str(int(diag_idx))]
+            diag_bytes = self._dense_block_dataset_bytes(dataset)
+            if batch_diag_indices and cursor + int(diag_bytes) > chunk_limit:
+                flush()
+            self._forward_memory_guard(
+                reason=f"before_dense_fine_plaintext_read:{int(transform_id)}:{int(diag_idx)}",
+                needed_bytes=int(diag_bytes),
+                raise_on_low=True,
+            )
+            serial_diag = np.asarray(dataset[()], dtype=np.uint8).reshape(-1).copy()
+            offsets.append(int(cursor))
+            lengths.append(int(serial_diag.size))
+            payload_chunks.append(serial_diag)
+            batch_diag_indices.append(int(diag_idx))
+            cursor += int(serial_diag.size)
+        flush()
+        return reloaded
+
+    def _load_dense_fine_plaintexts_from_disk(
+        self,
+        layer_name,
+        row,
+        col,
+        transform_id,
+        *,
+        selected_diag_indices=None,
+    ) -> list[int]:
+        with h5py.File(self.diags_path, "r") as f:
+            block = f[str(layer_name)]["plaintexts"][f"{int(row)}_{int(col)}"]
+            return self._load_dense_fine_plaintexts_from_block(
+                block,
+                int(transform_id),
+                selected_diag_indices=selected_diag_indices,
+            )
+
     def _device_transform_prefetch_supported(self) -> bool:
         if not bool(getattr(self.backend, "saved_io_device_prefetch_enabled", False)):
             return False
         return self._encoded_plaintext_payload_supported() and callable(
             getattr(self.backend, "LoadLinearTransformRotationKey", None)
         )
+
+    def _host_predecode_saved_io_enabled(self) -> bool:
+        if not bool(getattr(self.backend, "saved_io_host_predecode_enabled", False)):
+            return False
+        if not bool(getattr(self.backend, "saved_io_host_predecode_supported", False)):
+            return False
+        return bool(
+            callable(getattr(self.backend, "PredecodeRotationKey", None))
+            or callable(getattr(self.backend, "PredecodePlaintextDiagonalsBatch", None))
+        )
+
+    def _predecode_transform_io_bundle_on_host(self, bundle, transform_id: int) -> None:
+        if bundle is None or not self._host_predecode_saved_io_enabled():
+            return
+        if callable(getattr(self.backend, "LoadLinearTransformRotationKey", None)):
+            return
+
+        predecode_key = getattr(self.backend, "PredecodeRotationKey", None)
+        if callable(predecode_key) and bundle.get("rotation_keys"):
+            predecoded_keys = []
+            for key_value, serial_key in bundle.get("rotation_keys", ()):
+                predecode_key(serial_key, int(key_value))
+                predecoded_keys.append(int(key_value))
+            bundle["rotation_keys"] = ()
+            bundle["rotation_keys_predecoded_on_host"] = tuple(predecoded_keys)
+
+        predecode_plaintexts = getattr(self.backend, "PredecodePlaintextDiagonalsBatch", None)
+        if not callable(predecode_plaintexts):
+            return
+        if bundle.get("encoded_plaintext_payload") is not None:
+            return
+        if bundle.get("coarse_stream_plaintexts") or bundle.get("fine_stream_plaintexts"):
+            return
+        lengths = tuple(int(value) for value in bundle.get("lengths", ()))
+        offsets = tuple(int(value) for value in bundle.get("offsets", ()))
+        diag_indices = tuple(int(value) for value in bundle.get("diag_indices", ()))
+        payload = bundle.get("payload")
+        if payload is None or not lengths or len(lengths) != len(diag_indices):
+            return
+        predecode_plaintexts(
+            payload,
+            list(offsets),
+            list(lengths),
+            list(diag_indices),
+            int(transform_id),
+        )
+        bundle["payload"] = np.zeros((0,), dtype=np.uint8)
+        bundle["offsets"] = ()
+        bundle["lengths"] = ()
+        bundle["plaintexts_predecoded_on_host"] = True
 
     def _transform_io_key(self, layer_name, row, col, transform_id):
         return (str(layer_name), int(row), int(col), int(transform_id))
@@ -1287,8 +1736,12 @@ class NewEvaluator:
                 if _ENCODED_HOIST_PAYLOAD_DATASET in block:
                     dataset = block[_ENCODED_HOIST_PAYLOAD_DATASET]
                     total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
+                elif self._dense_block_has_coarse_payload(block):
+                    total_bytes += self._dense_coarse_block_bytes(block)
                 else:
                     for diag_idx in block:
+                        if str(diag_idx) in _DENSE_RESERVED_PLAINTEXT_DATASETS:
+                            continue
                         dataset = block[diag_idx]
                         total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
         elif self.diags_path and self._encoded_plaintext_payload_supported():
@@ -1297,6 +1750,8 @@ class NewEvaluator:
                 if _ENCODED_HOIST_PAYLOAD_DATASET in block:
                     dataset = block[_ENCODED_HOIST_PAYLOAD_DATASET]
                     total_bytes += int(dataset.size) * int(dataset.dtype.itemsize)
+                elif self._dense_block_has_coarse_payload(block):
+                    total_bytes += self._dense_coarse_block_bytes(block)
 
         self._transform_io_size_cache[cache_key] = int(total_bytes)
         return int(total_bytes)
@@ -1360,11 +1815,34 @@ class NewEvaluator:
                     dtype=np.uint8,
                 ).reshape(-1).copy()
                 return bundle
+            if self._dense_block_has_coarse_payload(block):
+                bundle["diag_indices"] = self._dense_block_diag_indices(block)
+                bundle["offsets"] = tuple(
+                    int(value)
+                    for value in np.asarray(block[_DENSE_DIAG_OFFSETS_DATASET][:]).reshape(-1)
+                )
+                bundle["lengths"] = tuple(
+                    int(value)
+                    for value in np.asarray(block[_DENSE_DIAG_LENGTHS_DATASET][:]).reshape(-1)
+                )
+                payload_ds = block[_DENSE_DIAG_PAYLOAD_DATASET]
+                payload_bytes = self._dense_block_dataset_bytes(payload_ds)
+                if self._dense_coarse_payload_should_stream(
+                    payload_bytes,
+                    reason=f"before_dense_coarse_artifact_read:{layer_name}:{int(row)}:{int(col)}",
+                ):
+                    bundle["coarse_stream_plaintexts"] = True
+                    bundle["layer_name"] = str(layer_name)
+                    bundle["row"] = int(row)
+                    bundle["col"] = int(col)
+                    return bundle
+                bundle["payload"] = np.asarray(payload_ds[:], dtype=np.uint8).reshape(-1).copy()
+                return bundle
 
         if not self._plaintext_payload_required():
             with h5py.File(self.diags_path, "r") as f:
                 block = f[layer_name]["plaintexts"][f"{row}_{col}"]
-                bundle["diag_indices"] = tuple(sorted(int(diag_idx) for diag_idx in block.keys()))
+                bundle["diag_indices"] = self._dense_block_diag_indices(block)
             return bundle
 
         payload_chunks = []
@@ -1374,7 +1852,18 @@ class NewEvaluator:
         cursor = 0
         with h5py.File(self.diags_path, "r") as f:
             block = f[layer_name]["plaintexts"][f"{row}_{col}"]
-            diag_indices = sorted(int(diag_idx) for diag_idx in block.keys())
+            diag_indices = self._dense_block_diag_indices(block)
+            fine_payload_bytes = self._dense_fine_block_bytes(block)
+            if self._dense_coarse_payload_should_stream(
+                fine_payload_bytes,
+                reason=f"before_dense_fine_artifact_read:{layer_name}:{int(row)}:{int(col)}",
+            ):
+                bundle["diag_indices"] = tuple(int(value) for value in diag_indices)
+                bundle["fine_stream_plaintexts"] = True
+                bundle["layer_name"] = str(layer_name)
+                bundle["row"] = int(row)
+                bundle["col"] = int(col)
+                return bundle
             for diag_idx in diag_indices:
                 serial_diag = np.asarray(block[str(diag_idx)][()], dtype=np.uint8).reshape(-1).copy()
                 plaintexts.append((int(diag_idx), serial_diag))
@@ -1435,6 +1924,7 @@ class NewEvaluator:
                 transform_id,
                 prefetch=False,
             )
+            self._predecode_transform_io_bundle_on_host(bundle, int(transform_id))
             if bundle is None or not self._device_transform_prefetch_supported():
                 return bundle
             load_transform_key = self.backend.LoadLinearTransformRotationKey
@@ -1464,6 +1954,16 @@ class NewEvaluator:
         if bundle is not None:
             if bundle.get("plaintexts_prefetched_to_device"):
                 return
+            if bundle.get("plaintexts_predecoded_on_host"):
+                install_predecoded = getattr(self.backend, "InstallPredecodedPlaintextDiagonals", None)
+                if not callable(install_predecoded):
+                    raise RuntimeError("backend is missing InstallPredecodedPlaintextDiagonals")
+                installed = int(install_predecoded(int(transform_id)))
+                if installed <= 0:
+                    raise RuntimeError(
+                        f"missing predecoded plaintext diagonals for transform_id={int(transform_id)}"
+                    )
+                return
             encoded_payload = bundle.get("encoded_plaintext_payload")
             if encoded_payload is not None:
                 self.backend.LoadLinearTransformPlaintexts(
@@ -1471,6 +1971,24 @@ class NewEvaluator:
                     int(transform_id),
                 )
                 bundle["encoded_plaintext_payload"] = None
+                return
+            if bundle.get("coarse_stream_plaintexts"):
+                self._load_dense_coarse_plaintexts_from_disk(
+                    bundle.get("layer_name", layer_name),
+                    int(bundle.get("row", row)),
+                    int(bundle.get("col", col)),
+                    int(transform_id),
+                )
+                bundle["coarse_stream_plaintexts"] = False
+                return
+            if bundle.get("fine_stream_plaintexts"):
+                self._load_dense_fine_plaintexts_from_disk(
+                    bundle.get("layer_name", layer_name),
+                    int(bundle.get("row", row)),
+                    int(bundle.get("col", col)),
+                    int(transform_id),
+                )
+                bundle["fine_stream_plaintexts"] = False
                 return
             diag_indices = list(bundle.get("diag_indices", ()))
             if hasattr(self.backend, "LoadPlaintextDiagonalsBatch"):
@@ -1509,8 +2027,14 @@ class NewEvaluator:
                 )
                 del payload
                 return
+            if self._dense_block_has_coarse_payload(block):
+                self._load_dense_coarse_plaintexts_from_block(
+                    block,
+                    int(transform_id),
+                )
+                return
             if not self._plaintext_payload_required() and hasattr(self.backend, "LoadPlaintextDiagonalsBatch"):
-                diag_indices = sorted(int(diag_idx) for diag_idx in block.keys())
+                diag_indices = self._dense_block_diag_indices(block)
                 self.backend.LoadPlaintextDiagonalsBatch(
                     np.zeros((0,), dtype=np.uint8),
                     [],
@@ -1519,12 +2043,7 @@ class NewEvaluator:
                     int(transform_id),
                 )
                 return
-
-            for diag_idx in block:
-                serial_diag = block[diag_idx][()]
-            self.backend.LoadPlaintextDiagonal(
-                serial_diag, transform_id, int(diag_idx)
-            )
+            self._load_dense_fine_plaintexts_from_block(block, int(transform_id))
 
     def ensure_plaintext_diagonals_loaded(self, layer_name, row, col, transform_id, expected_level=None):
         get_empty_keys = getattr(self.backend, "GetLinearTransformEmptyPlaintextKeys", None)
@@ -1578,13 +2097,17 @@ class NewEvaluator:
         reloaded = []
         with h5py.File(self.diags_path, "r") as f:
             block = f[str(layer_name)]["plaintexts"][f"{int(row)}_{int(col)}"]
-            for diag_idx in diag_indices:
-                key = str(int(diag_idx))
-                if key not in block:
-                    continue
-                serial_diag = block[key][()]
-                self.backend.LoadPlaintextDiagonal(serial_diag, int(transform_id), int(diag_idx))
-                reloaded.append(int(diag_idx))
+            if self._dense_block_has_coarse_payload(block):
+                return self._load_dense_coarse_plaintexts_from_block(
+                    block,
+                    int(transform_id),
+                    selected_diag_indices=diag_indices,
+                )
+            return self._load_dense_fine_plaintexts_from_block(
+                block,
+                int(transform_id),
+                selected_diag_indices=diag_indices,
+            )
         return reloaded
     
     def load_rotation_keys(self, transform_id, bundle=None):
@@ -1592,6 +2115,14 @@ class NewEvaluator:
         if bundle is not None:
             if bundle.get("rotation_keys_prefetched_to_device"):
                 return
+            predecoded_keys = {int(key) for key in bundle.get("rotation_keys_predecoded_on_host", ())}
+            install_predecoded_key = getattr(self.backend, "InstallPredecodedRotationKey", None)
+            if predecoded_keys and callable(install_predecoded_key):
+                for key_value in sorted(predecoded_keys):
+                    install_predecoded_key(int(key_value))
+                bundle["rotation_keys_predecoded_on_host"] = ()
+                if not bundle.get("rotation_keys"):
+                    return
             for key_value, serial_key in bundle.get("rotation_keys", ()):
                 if callable(load_transform_key):
                     load_transform_key(serial_key, int(key_value), int(transform_id))

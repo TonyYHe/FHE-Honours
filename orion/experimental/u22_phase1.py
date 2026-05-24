@@ -255,6 +255,14 @@ def _normalize_u22_layout_policy(value: str) -> str:
     normalized = str(value or "dp").strip().lower()
     if normalized in {"fixed", "fixedmax", "fixed-max", "fixed_max"}:
         return "fixed_max"
+    if normalized in {"fixed_fused", "fixed-fused", "fixedmax_fused", "fixedmax-fused", "fixed_max_fused", "fixed-max-fused"}:
+        return "fixed_max_fused"
+    if normalized in {"eager_fused", "eager-fused", "eager_relayout_fused", "eager-relayout-fused"}:
+        return "eager_fused"
+    if normalized in {"greedy_fused", "greedy-fused", "greedy_local_fused", "greedy-local-fused"}:
+        return "greedy_fused"
+    if normalized in {"orion", "dense", "orion_dense", "orion-dense", "oriondense", "no_halo", "no-halo", "nohalo"}:
+        return "orion_dense"
     if normalized in {"eager", "greedy", "dp"}:
         return str(normalized)
     return "dp"
@@ -419,6 +427,56 @@ def _layout_policy_output_relayout_rows(compile_plan: dict[str, Any], *, node: s
     return tuple(rows)
 
 
+def _layout_policy_backend_producer_output_rows(compile_plan: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    rows: list[dict[str, Any]] = []
+    for row in compile_plan.get("node_layouts", []):
+        layout = dict(row.get("selected_layout", {}) or {})
+        if not _layout_policy_has_halo(layout):
+            continue
+        shape = [int(value) for value in row.get("shape", [])]
+        if len(shape) != 4:
+            continue
+        rows.append(dict(row))
+    return tuple(rows)
+
+
+def _layout_policy_attach_backend_producer_outputs(
+    dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    provider_nodes: set[str],
+) -> list[dict[str, Any]]:
+    attached: list[dict[str, Any]] = []
+    for row in _layout_policy_backend_producer_output_rows(compile_plan):
+        node = str(row.get("node", ""))
+        if not node or node in provider_nodes or node not in dag.nodes:
+            continue
+        module = dag.nodes[node].get("module")
+        if not isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d)):
+            continue
+        layout = dict(row.get("selected_layout", {}) or {})
+        gap = max(1, int(layout.get("gap", getattr(module, "output_gap", 1) or 1)))
+        alpha = max(0, int(layout.get("alpha", 0)))
+        output_shape = _layout_policy_on_shape(row, layout)
+        previous_shape = tuple(int(value) for value in getattr(module, "fhe_output_shape", torch.Size()))
+        module.fhe_output_shape = output_shape
+        module.layout_policy_output_layout = dict(layout)
+        module.layout_policy_output_row_offset = int(alpha * gap)
+        module.layout_policy_output_materialization = "fused_relayout"
+        attached.append(
+            {
+                "node": str(node),
+                "physical_layout": str(row.get("physical_layout", "")),
+                "previous_fhe_output_shape": [int(value) for value in previous_shape],
+                "fhe_output_shape": [int(value) for value in output_shape],
+                "alpha": int(alpha),
+                "beta": int(layout.get("beta", 0)),
+                "tile_count": int(layout.get("tile_count", 0) or 0),
+            }
+        )
+    return attached
+
+
 def _layout_policy_input_pair_native_halo_enabled() -> bool:
     return str(os.environ.get("ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO", "1")).strip().lower() not in {
         "",
@@ -452,6 +510,15 @@ def _layout_policy_on_shape(edge_row: dict[str, Any], layout: dict[str, Any]) ->
             int(width * gap),
         )
     )
+
+
+def _layout_policy_zero_halo_layout(layout: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(layout)
+    updated["alpha"] = 0
+    updated["beta"] = 0
+    if "core_slots" in updated:
+        updated["stored_slots"] = int(updated.get("core_slots", 0) or 0)
+    return updated
 
 
 def _layout_policy_halo_on_shape(edge_row: dict[str, Any]) -> torch.Size:
@@ -490,15 +557,26 @@ def _layout_policy_native_module_attrs(
         row = dict(input_rows[0])
         layout = dict(row.get("selected_layout", {}))
         required_layout = dict(row.get("required_layout", layout) or layout)
+        trust_selected_compact_layout = bool(
+            compact_input_rows and not native_input_rows and str(row.get("source", "")) != "x"
+        )
+        physical_input_layout = dict(layout)
+        if compact_input_rows and not native_input_rows and not bool(trust_selected_compact_layout):
+            physical_input_layout = dict(row.get("source_layout", {}) or {})
+            if not physical_input_layout or str(row.get("source", "")) == "x":
+                physical_input_layout = _layout_policy_zero_halo_layout(layout)
         gap = max(1, int(layout.get("gap", 1)))
-        alpha = max(0, int(layout.get("alpha", 0)))
+        physical_gap = max(1, int(physical_input_layout.get("gap", gap)))
+        alpha = max(0, int(physical_input_layout.get("alpha", 0)))
         attrs.update(
             {
-                "fhe_input_shape": _layout_policy_halo_on_shape(row),
-                "layout_policy_input_row_offset": int(alpha * gap),
-                "layout_policy_input_layout": dict(layout),
+                "fhe_input_shape": _layout_policy_on_shape(row, physical_input_layout),
+                "layout_policy_input_row_offset": int(alpha * physical_gap),
+                "layout_policy_input_layout": dict(physical_input_layout),
+                "layout_policy_selected_input_layout": dict(layout),
                 "layout_policy_required_input_layout": dict(required_layout),
                 "layout_policy_input_physical_layout": str(row.get("physical_layout", "")),
+                "layout_policy_trust_selected_compact_input_layout": bool(trust_selected_compact_layout),
             }
         )
     if bool(getattr(base_executor, "native_halo_output_capable", False)):
@@ -562,12 +640,14 @@ def _layout_policy_native_halo_plan(
     *,
     node: str,
     native_input_rows: tuple[dict[str, Any], ...],
+    compact_input_rows: tuple[dict[str, Any], ...] = (),
 ) -> Any | None:
     attrs = _layout_policy_native_module_attrs(
         compile_plan,
         node=str(node),
         base_executor=base_executor,
         native_input_rows=native_input_rows,
+        compact_input_rows=compact_input_rows,
     )
 
     def _read_plan() -> Any | None:
@@ -580,6 +660,78 @@ def _layout_policy_native_halo_plan(
     return _layout_policy_with_base_executor_attrs(base_executor, attrs, _read_plan)
 
 
+def _layout_policy_native_halo_plan_or_none(
+    base_executor: Any,
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    native_input_rows: tuple[dict[str, Any], ...],
+    compact_input_rows: tuple[dict[str, Any], ...] = (),
+) -> Any | None:
+    try:
+        return _layout_policy_native_halo_plan(
+            base_executor,
+            compile_plan,
+            node=str(node),
+            native_input_rows=native_input_rows,
+            compact_input_rows=compact_input_rows,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "native halo" in message and "does not fit" in message:
+            return None
+        raise
+
+
+def _layout_policy_compact_input_rows_for_node(
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        [
+            *_layout_policy_incoming_compact_source_rows(compile_plan, node=str(node)),
+            *_layout_policy_incoming_compact_align_shared_rows(compile_plan, node=str(node)),
+        ]
+    )
+
+
+def _layout_policy_validate_native_provider_plans(
+    compile_plan: dict[str, Any],
+    groups: tuple[RegionFirstRuntimeGroup, ...],
+) -> dict[str, Any]:
+    """Fail fast if a planner emits a native-provider layout that cannot compile."""
+
+    for group in groups:
+        node = str(getattr(group, "module_prefix", ""))
+        executor = getattr(group, "executor", None)
+        if not isinstance(executor, HaloLocalConvRuntimeExecutor):
+            continue
+        native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
+        compact_input_rows = _layout_policy_compact_input_rows_for_node(compile_plan, node=str(node))
+        output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
+        if not native_rows and not compact_input_rows and output_row is None:
+            continue
+        try:
+            _layout_policy_native_halo_plan(
+                executor,
+                compile_plan,
+                node=str(node),
+                native_input_rows=native_rows,
+                compact_input_rows=compact_input_rows,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "native halo" in message and "does not fit" in message:
+                policy = str(compile_plan.get("policy", ""))
+                raise RuntimeError(
+                    "layout policy generated a non-executable native halo plan "
+                    f"for policy={policy!r}, node={str(node)!r}: {message}"
+                ) from exc
+            raise
+    return dict(compile_plan)
+
+
 def _layout_policy_native_input_ct_count(
     base_executor: Any,
     compile_plan: dict[str, Any],
@@ -587,7 +739,7 @@ def _layout_policy_native_input_ct_count(
     node: str,
     native_input_rows: tuple[dict[str, Any], ...],
 ) -> int:
-    plan = _layout_policy_native_halo_plan(
+    plan = _layout_policy_native_halo_plan_or_none(
         base_executor,
         compile_plan,
         node=str(node),
@@ -1727,7 +1879,10 @@ def _layout_policy_compile_plan_groups(dag: Any, compile_plan: dict[str, Any]) -
     return tuple(groups)
 
 
-def _layout_policy_provider_plan(group: RegionFirstRuntimeGroup, compile_plan: dict[str, Any]) -> dict[str, Any]:
+def _layout_policy_provider_plan(
+    group: RegionFirstRuntimeGroup,
+    compile_plan: dict[str, Any],
+) -> dict[str, Any]:
     plan = _layout_policy_node_plan(compile_plan, node=str(group.module_prefix))
     relayout_rows = _layout_policy_incoming_relayout_rows(compile_plan, node=str(group.module_prefix))
     native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(group.module_prefix))
@@ -1773,7 +1928,7 @@ def _layout_policy_wrap_provider_group(
     compile_plan: dict[str, Any],
 ) -> RegionFirstRuntimeGroup:
     base_executor = group.executor
-    plan_group = group
+    plan_group = replace(group, executor=base_executor)
     relayout_rows = _layout_policy_incoming_relayout_rows(compile_plan, node=str(group.module_prefix))
     native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(group.module_prefix))
     output_relayout_rows = _layout_policy_output_relayout_rows(compile_plan, node=str(group.module_prefix))
@@ -1831,13 +1986,19 @@ def _layout_policy_with_native_physical_output_counts(
             continue
         node = str(getattr(group, "module_prefix", ""))
         native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
-        if not _layout_policy_native_halo_input_supported(executor, native_rows):
+        compact_input_rows = _layout_policy_compact_input_rows_for_node(compile_plan, node=str(node))
+        if (
+            not _layout_policy_native_halo_input_supported(executor, native_rows)
+            and not compact_input_rows
+            and _layout_policy_native_output_row(compile_plan, node=str(node)) is None
+        ):
             continue
         plan = _layout_policy_native_halo_plan(
             executor,
             compile_plan,
             node=str(node),
             native_input_rows=native_rows,
+            compact_input_rows=compact_input_rows,
         )
         if plan is None:
             continue
@@ -2193,6 +2354,9 @@ def _layout_policy_audit_fields(
         "layout_policy_relayout_nodes": _layout_policy_relayout_nodes(compile_plan),
         "layout_policy_relayout_edges": [dict(row) for row in compile_plan.get("relayout_edges", [])],
         "layout_policy_output_relayout_nodes": [dict(row) for row in compile_plan.get("output_relayout_nodes", [])],
+        "layout_policy_provider_fallback_nodes": [
+            dict(row) for row in compile_plan.get("provider_fallback_nodes", [])
+        ],
         "layout_policy_edge_layouts": [dict(row) for row in compile_plan.get("edge_layouts", [])],
         "layout_policy_node_layouts": [dict(row) for row in compile_plan.get("node_layouts", [])],
     }
@@ -3484,7 +3648,8 @@ class U22CompileRegistry:
         if (
             bool(_wrap_layout_policy)
             and bool(enable_conv_kernels)
-            and normalized_layout_policy in {"fixed_max", "eager", "greedy", "dp"}
+            and normalized_layout_policy
+            in {"fixed_max", "fixed_max_fused", "eager", "eager_fused", "greedy", "greedy_fused", "orion_dense", "dp"}
         ):
             provider_registry = cls.for_dag(
                 dag,
@@ -3492,6 +3657,10 @@ class U22CompileRegistry:
                 enable_conv_kernels=enable_conv_kernels,
                 layout_policy="dp",
                 _wrap_layout_policy=False,
+            )
+            executable_layout_plan = _layout_policy_validate_native_provider_plans(
+                executable_layout_plan,
+                tuple(provider_registry.groups),
             )
             executable_layout_plan = _layout_policy_with_native_physical_output_counts(
                 executable_layout_plan,
@@ -3680,6 +3849,7 @@ class U22CompileRegistry:
 
     def attach_to_dag(self, dag) -> dict[str, Any]:
         attached: list[dict[str, Any]] = []
+        provider_nodes: set[str] = set()
         for group in self.groups:
             for node in group.conv_nodes:
                 if node not in dag.nodes:
@@ -3690,6 +3860,8 @@ class U22CompileRegistry:
                 module.region_runtime = group
                 module.region_output_id = str(node)
                 module.region_first_skip_dense_pack = bool(group.executable)
+                if bool(group.executable):
+                    provider_nodes.add(str(node))
                 if bool(group.executable) and hasattr(module, "set_depth"):
                     module.set_depth(int(group.effective_depth()))
                 attached.append(
@@ -3707,7 +3879,13 @@ class U22CompileRegistry:
                 compile_plan = dict(plan)
                 break
         add_attached: list[dict[str, Any]] = []
+        backend_producer_attached: list[dict[str, Any]] = []
         if compile_plan is not None:
+            backend_producer_attached = _layout_policy_attach_backend_producer_outputs(
+                dag,
+                compile_plan,
+                provider_nodes=provider_nodes,
+            )
             for node in dag.topological_sort():
                 module = dag.nodes[node].get("module")
                 if type(module).__name__ != "Add":
@@ -3752,6 +3930,8 @@ class U22CompileRegistry:
         return {
             "attached_count": int(len(attached)),
             "attached": attached,
+            "layout_policy_backend_producer_output_count": int(len(backend_producer_attached)),
+            "layout_policy_backend_producer_outputs": backend_producer_attached,
             "layout_policy_add_runtime_count": int(len(add_attached)),
             "layout_policy_add_runtimes": add_attached,
             "executable_region_count": int(sum(1 for group in self.groups if bool(group.executable))),
