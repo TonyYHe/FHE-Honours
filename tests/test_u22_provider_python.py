@@ -1208,39 +1208,6 @@ def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None
         scheme.delete_scheme()
 
 
-def test_u22_64_benchmark_no_hybrid_helper_keeps_same_shape_on_bounded_delegate() -> None:
-    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
-    from orion.experimental.cir.native_halo_conv2d import NativeHaloStripeNoRIConvExecutor
-    from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
-    from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench
-
-    bench._init_scheme("u22_64_base32", backend="python")
-    try:
-        dag, _audit = bench._prepare_dag("u22_64_base32", provider=True)
-        module = dag.nodes["enc1b"]["module"]
-        executor = module.region_runtime.executor
-        assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
-        assert isinstance(executor.base_executor, HaloLocalConvRuntimeExecutor)
-        assert executor.base_executor.force_input_pair is False
-        assert bool(executor.base_executor.use_ct_pt_hybrid_packing) is False
-
-        no_hybrid_audit = bench._apply_provider_no_hybrid_ablation("u22_64_base32", module)
-
-        executor = module.region_runtime.executor
-        assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
-        base = executor.base_executor
-        delegate = base.delegate
-        assert no_hybrid_audit["status"] == "ok"
-        assert no_hybrid_audit["mode"] == "native_halo_stripe_no_ri"
-        assert no_hybrid_audit["executor"] == "LayoutPolicyProviderRuntimeExecutor"
-        assert no_hybrid_audit["base_executor"] == "HaloLocalConvRuntimeExecutor"
-        assert no_hybrid_audit["delegate_executor"] == "NativeHaloStripeNoRIConvExecutor"
-        assert bool(base.use_ct_pt_hybrid_packing) is False
-        assert isinstance(delegate, NativeHaloStripeNoRIConvExecutor)
-    finally:
-        bench._cleanup_scheme()
-
-
 @pytest.mark.parametrize("network", ("u22_64_base32", "u22_256_base32"))
 def test_node_specific_benchmark_u22_provider_helper_uses_full_default_provider_mode(network: str) -> None:
     from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench

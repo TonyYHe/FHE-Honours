@@ -16,7 +16,6 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -34,36 +33,15 @@ from orion.core.orion import _region_first_mode_options, scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import R34CompileRegistry, U22CompileRegistry
 from orion.experimental.cir.runtime_group import (
-    FullConvRegionRuntimeExecutor,
     RegionFirstCompileRegistry,
-    _add_plaintext_for_add,
-    _align_ciphertexts_for_add,
-    _encode_plaintext_for_add,
-    _rescale_cipher_tensor,
-    transforms_from_conv_scheme_plan,
 )
-from orion.experimental.cir.halo_local_conv_provider import (
-    HaloLocalBranchPairConvRuntimeExecutor,
-    HaloLocalConvRuntimeExecutor,
-)
+from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
 from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
-from orion.experimental.u22_phase1 import TconvK2S2PythonRuntimeExecutor
 from orion.models.resnet import ResNet18, ResNet34
 from orion.models.unet import UNet22, get_unet22_medical_spec
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
 from orion.nn.unified_transform import UnifiedTransformGroup
-
-try:
-    from orion.experimental.cir.r34_orion_same_shape import (
-        NativeAlignedHaloNoRIConvExecutor,
-        r34_same_shape_hardcoded_relayout_plan,
-        r34_native_aligned_halo_plan,
-    )
-except ModuleNotFoundError:
-    NativeAlignedHaloNoRIConvExecutor = None  # type: ignore[assignment]
-    r34_same_shape_hardcoded_relayout_plan = None  # type: ignore[assignment]
-    r34_native_aligned_halo_plan = None  # type: ignore[assignment]
 
 
 DEFAULT_OUT = Path("/tmp/orion_node_specific_lattigo_cheddar_provider_vs_dense.json")
@@ -72,14 +50,11 @@ BACKENDS = ("lattigo", "cheddar")
 PATHS = (
     "dense",
     "provider",
-    "provider_no_hybrid",
     "provider_no_family",
-    "provider_no_family_no_hybrid",
     "provider_no_tile_family_sharing",
 )
 PROVIDER_PATHS = frozenset(path for path in PATHS if str(path) != "dense")
-NO_HYBRID_PATHS = frozenset(("provider_no_hybrid", "provider_no_family_no_hybrid"))
-NO_FAMILY_PATHS = frozenset(("provider_no_family", "provider_no_family_no_hybrid"))
+NO_FAMILY_PATHS = frozenset(("provider_no_family",))
 LOGN_OVERRIDE_ENV = "ORION_NODE_BENCH_LOGN_OVERRIDE"
 CKKS_PROFILE_ENV = "ORION_NODE_BENCH_CKKS_PROFILE"
 CLEAN_CHEDDAR_IO_ENV = "ORION_NODE_BENCH_CLEAN_CHEDDAR_IO"
@@ -142,17 +117,9 @@ RESNET_SECRET_H = 192
 PATH_DESCRIPTIONS = {
     "dense": "baseline Orion dense LinearTransform path",
     "provider": "optimized provider path with backend UnifiedTransformGroup and any hybrid packing enabled",
-    "provider_no_hybrid": (
-        "provider ablation with real/imag hybrid packing disabled while preserving "
-        "channelwise split and cross-channel rotation sharing via UnifiedTransformGroup"
-    ),
     "provider_no_family": (
         "provider ablation with BSGS preserved but UnifiedTransformGroup family sharing disabled; "
         "each compiled LinearTransform is evaluated one by one"
-    ),
-    "provider_no_family_no_hybrid": (
-        "provider ablation with halo-local LT only: BSGS preserved, UnifiedTransformGroup family "
-        "sharing disabled, and real/imag hybrid packing disabled"
     ),
     "provider_no_tile_family_sharing": (
         "U22 TConv provider ablation with halo layout, real/imag packing, and BSGS preserved, "
@@ -936,553 +903,6 @@ def _make_source(module: Any, *, count: int, gen: torch.Generator, level: int, p
             source.stage4_compact_source = True
             source.is_region_first_compact_source = True
     return source
-
-
-def _split_transform_for_no_hybrid_lane(transform: Any, *, lane: str) -> Any | None:
-    split_diags: dict[int, torch.Tensor] = {}
-    for _block_key, block_diags in getattr(transform, "diagonals", {}).items():
-        for diag_idx, diag_values in dict(block_diags).items():
-            values = diag_values.detach().clone().reshape(-1) if isinstance(diag_values, torch.Tensor) else torch.as_tensor(list(diag_values))
-            if str(lane) == "real":
-                split = values.real.to(dtype=torch.float32) if torch.is_complex(values) else values.to(dtype=torch.float32)
-            elif str(lane) == "imag_source":
-                split = -values.imag.to(dtype=torch.float32) if torch.is_complex(values) else torch.zeros_like(values, dtype=torch.float32)
-            else:
-                raise ValueError(f"unknown no-hybrid lane {lane!r}")
-            if bool(torch.any(split != 0).item()):
-                split_diags[int(diag_idx)] = split
-    if not split_diags:
-        return None
-    return SimpleNamespace(
-        name=f"{getattr(transform, 'name', 'provider_transform')}_{str(lane)}_no_hybrid",
-        diagonals={(0, 0): split_diags},
-        level=int(getattr(transform, "level")),
-        scheme=getattr(transform, "scheme"),
-        fhe_output_shape=getattr(transform, "fhe_output_shape"),
-        output_shape=getattr(transform, "output_shape"),
-        target_index=int(getattr(transform, "target_index", 0)),
-        input_id=str(getattr(transform, "input_id", "")),
-    )
-
-
-class ProviderNoHybridFullConvRuntimeExecutor:
-    """A timing ablation for R18 full-conv providers with real/imag packing disabled.
-
-    The source/channel split and backend UnifiedTransformGroup stay intact. For
-    each original complex source pair, this evaluates the real-lane transform on
-    the left source and the negated imaginary-lane transform on the right source:
-    Re((A + iB) * (x + iy)) = A*x - B*y.
-    """
-
-    no_hybrid_ablation = True
-
-    def __init__(self, base_executor: FullConvRegionRuntimeExecutor) -> None:
-        self.base_executor = base_executor
-        self.plans = tuple(getattr(base_executor, "plans", ()) or ())
-        self.output_node_id = str(getattr(base_executor, "output_node_id"))
-        self.output_shape = getattr(base_executor, "output_shape")
-        self.fhe_output_shape = getattr(base_executor, "fhe_output_shape")
-        self.bias_vector = getattr(base_executor, "bias_vector", None)
-        self.bias_plaintexts: tuple[Any | None, ...] = ()
-        self._bias_plaintext_cache: dict[tuple[int, int], Any] = {}
-        self.assigned_level: int | None = getattr(base_executor, "assigned_level", None)
-        self.assigned_depth: int | None = getattr(base_executor, "assigned_depth", None)
-        self.compile_count = 0
-        self.block_evaluate_count = 0
-        self.cols = 0
-        self.rows = 0
-        self.groups: list[Any] = []
-        self._plan_lane_groups: list[tuple[Any | None, tuple[int, ...], Any | None, tuple[int, ...]]] = []
-        self.last_runtime_timing: dict[str, float] = {
-            "prepare_plans_s": 0.0,
-            "prepare_transforms_s": 0.0,
-            "compile_unified_s": 0.0,
-            "evaluate_unified_s": 0.0,
-            "postprocess_s": 0.0,
-        }
-
-    def supports_scheme(self, scheme_value: Any | None) -> bool:
-        return scheme_value is not None
-
-    def _ensure_plans(self) -> None:
-        if self.plans:
-            return
-        self.base_executor._ensure_plans()
-        self.plans = tuple(getattr(self.base_executor, "plans", ()) or ())
-
-    @property
-    def bank_count(self) -> int:
-        self._ensure_plans()
-        if not self.plans:
-            return 0
-        return len(self.plans[0].linear_transform_steps[0].shared_output_banks)
-
-    def _level(self, scheme_value: Any) -> int:
-        return int(self.assigned_level) if self.assigned_level is not None else len(scheme_value.params.get_logq()) - 1
-
-    def _output_level(self, scheme_value: Any) -> int:
-        return max(0, int(self._level(scheme_value)) - 1)
-
-    def _compile_lane_group(self, transforms: list[Any], *, lane: str, backend: Any) -> tuple[Any | None, tuple[int, ...]]:
-        lane_transforms: list[Any] = []
-        bank_indices: list[int] = []
-        for bank_index, transform in enumerate(transforms):
-            split_transform = _split_transform_for_no_hybrid_lane(transform, lane=str(lane))
-            if split_transform is None:
-                continue
-            lane_transforms.append(split_transform)
-            bank_indices.append(int(bank_index))
-        if not lane_transforms:
-            return None, ()
-        group = UnifiedTransformGroup(lane_transforms)
-        group.compile_unified(backend)
-        self.groups.append(group)
-        return group, tuple(int(index) for index in bank_indices)
-
-    def compile(self, scheme_value: Any) -> None:
-        if self._plan_lane_groups:
-            return
-        self.last_runtime_timing = {
-            "prepare_plans_s": 0.0,
-            "prepare_transforms_s": 0.0,
-            "compile_unified_s": 0.0,
-            "evaluate_unified_s": 0.0,
-            "postprocess_s": 0.0,
-        }
-        prepare_plans_started = time.time()
-        self._ensure_plans()
-        self.last_runtime_timing["prepare_plans_s"] = float(time.time() - prepare_plans_started)
-        self.rows = int(self.bank_count)
-        self.cols = int(len(self.plans) * 2)
-        level = self._level(scheme_value)
-
-        prepare_transforms_started = time.time()
-        transforms_by_plan = [
-            transforms_from_conv_scheme_plan(
-                plan,
-                level=int(level),
-                scheme=scheme_value,
-                bank_count=int(self.bank_count),
-            )[0]
-            for plan in self.plans
-        ]
-        self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - prepare_transforms_started)
-
-        compile_started = time.time()
-        for transforms in transforms_by_plan:
-            real_group, real_indices = self._compile_lane_group(transforms, lane="real", backend=scheme_value.backend)
-            imag_group, imag_indices = self._compile_lane_group(transforms, lane="imag_source", backend=scheme_value.backend)
-            self._plan_lane_groups.append((real_group, real_indices, imag_group, imag_indices))
-        self.bias_plaintexts = self._compile_bias_plaintexts(scheme_value)
-        self.compile_count += 1
-        self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
-
-    def _bias_chunk(self, *, bank_index: int, slots: int) -> torch.Tensor | None:
-        if self.bias_vector is None:
-            return None
-        start = int(bank_index * slots)
-        end = min(int(start + slots), int(self.bias_vector.numel()))
-        chunk = torch.zeros((slots,), dtype=torch.float32)
-        if end > start:
-            chunk[: int(end - start)] = self.bias_vector[int(start) : int(end)]
-        return chunk
-
-    def _compile_bias_plaintexts(self, scheme_value: Any) -> tuple[Any | None, ...]:
-        if self.bias_vector is None:
-            return ()
-        level = self._output_level(scheme_value)
-        scale = int(scheme_value.params.get_default_scale())
-        slots = int(scheme_value.params.get_slots())
-        plaintexts: list[Any | None] = []
-        for bank_index in range(int(self.rows)):
-            chunk = self._bias_chunk(bank_index=int(bank_index), slots=int(slots))
-            ptxt = None if chunk is None else scheme_value.encode(chunk, level=int(level), scale=int(scale))
-            if ptxt is not None:
-                self._bias_plaintext_cache[(int(bank_index), int(level))] = ptxt
-            plaintexts.append(ptxt)
-        return tuple(plaintexts)
-
-    def _add_bias(self, ct: Any, *, bank_index: int) -> Any:
-        if self.bias_vector is None:
-            return ct
-        bias_pt = self.bias_plaintexts[int(bank_index)] if int(bank_index) < len(self.bias_plaintexts) else None
-        if bias_pt is None or int(bias_pt.level()) != int(ct.level()):
-            bias_pt = self._bias_plaintext_cache.get((int(bank_index), int(ct.level())))
-        if bias_pt is None or int(bias_pt.level()) != int(ct.level()):
-            chunk = self._bias_chunk(bank_index=int(bank_index), slots=int(ct.slots()))
-            if chunk is None:
-                return ct
-            bias_pt = _encode_plaintext_for_add(ct, chunk)
-            self._bias_plaintext_cache[(int(bank_index), int(ct.level()))] = bias_pt
-        return _add_plaintext_for_add(ct, bias_pt)
-
-    def __call__(self, source_ct: Any) -> dict[str, Any]:
-        scheme_value = source_ct.scheme
-        self.last_runtime_timing = {
-            "prepare_plans_s": 0.0,
-            "prepare_transforms_s": 0.0,
-            "compile_unified_s": 0.0,
-            "evaluate_unified_s": 0.0,
-            "postprocess_s": 0.0,
-        }
-        self.compile(scheme_value)
-        ids = tuple(int(value) for value in getattr(source_ct, "ids", ()))
-        if len(ids) < int(self.cols):
-            raise RuntimeError(f"{self.output_node_id} no-hybrid provider requires {self.cols} source ids, got {len(ids)}")
-
-        outputs: list[Any | None] = [None for _ in range(int(self.rows))]
-        evaluate_started = time.time()
-        for plan_index, (real_group, real_indices, imag_group, imag_indices) in enumerate(self._plan_lane_groups):
-            lane_payloads = (
-                (real_group, real_indices, int(ids[int(plan_index) * 2])),
-                (imag_group, imag_indices, int(ids[int(plan_index) * 2 + 1])),
-            )
-            for group, bank_indices, source_id in lane_payloads:
-                if group is None:
-                    continue
-                output_ids = group.evaluate_unified(int(source_id), scheme_value.backend)
-                self.block_evaluate_count += 1
-                for bank_index, output_id in zip(bank_indices, output_ids):
-                    partial = CipherTensor(
-                        scheme_value,
-                        [int(output_id)],
-                        torch.Size([1, int(self.plans[0].ring_slot_count)]),
-                        torch.Size([1, int(self.plans[0].ring_slot_count)]),
-                    )
-                    if outputs[int(bank_index)] is None:
-                        outputs[int(bank_index)] = partial
-                    else:
-                        lhs, rhs = _align_ciphertexts_for_add(outputs[int(bank_index)], partial)
-                        outputs[int(bank_index)] = lhs + rhs
-        self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
-
-        real_ids: list[int] = []
-        postprocess_started = time.time()
-        for bank_index, ct in enumerate(outputs):
-            if ct is None:
-                raise RuntimeError(f"missing no-hybrid provider output bank {bank_index}")
-            ct = _rescale_cipher_tensor(ct)
-            ct = self._add_bias(ct, bank_index=int(bank_index))
-            ct.set_scale(int(scheme_value.params.get_default_scale()))
-            real_ids.append(int(ct.ids[0]))
-            ct.ids = []
-        self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
-        return {
-            self.output_node_id: CipherTensor(
-                scheme_value,
-                real_ids,
-                self.output_shape,
-                self.fhe_output_shape,
-            )
-        }
-
-
-def _apply_provider_no_hybrid_ablation(network: str, module: Any) -> dict[str, Any]:
-    runtime = getattr(module, "region_runtime", None)
-    executor = getattr(runtime, "executor", None)
-    if runtime is None or executor is None:
-        return {"status": "unsupported", "reason": "no provider executor attached"}
-    wrapper_executor = executor if hasattr(executor, "base_executor") else None
-    base_executor = getattr(executor, "base_executor", executor)
-
-    def mark_no_hybrid_boundary(replacements: dict[str, str]) -> None:
-        if not hasattr(runtime, "boundary_actions"):
-            return
-        runtime.boundary_actions = tuple(
-            str(replacements.get(str(action), str(action)))
-            for action in tuple(getattr(runtime, "boundary_actions", ()) or ())
-        )
-
-    original_executor = type(executor).__name__
-    if bool(getattr(base_executor, "requires_compact_source", False)):
-        module.region_runtime = None
-        module.region_first_skip_dense_pack = False
-        return {
-            "status": "ok",
-            "mode": "dense_orion_no_lane_split_baseline_for_compact_source",
-            "original_executor": original_executor,
-            "executor": "dense_orion",
-            "uses_dense_baseline": True,
-            "reason": (
-                "compact-source providers have one source and one LT; disabling hybrid packing "
-                "must not split real/imag lanes because that changes the kernel into two LT evaluations"
-            ),
-        }
-
-    if (
-        str(network) == "r34_imgnet"
-        and isinstance(base_executor, HaloLocalConvRuntimeExecutor)
-        and getattr(base_executor, "same_shape_spec", None) is not None
-        and not bool(getattr(base_executor, "force_input_pair", False))
-    ):
-        output_node_id = (
-            getattr(base_executor, "output_node_id", None)
-            or getattr(module, "region_output_id", None)
-            or getattr(module, "name", "")
-        )
-        replacement = HaloLocalConvRuntimeExecutor(
-            module=module,
-            same_shape_spec=getattr(base_executor, "same_shape_spec"),
-            output_node_id=str(output_node_id),
-        )
-        if wrapper_executor is not None:
-            wrapper_executor.base_executor = replacement
-        else:
-            runtime.executor = replacement
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        native_plan = (
-            {}
-            if r34_native_aligned_halo_plan is None
-            else r34_native_aligned_halo_plan(getattr(replacement, "same_shape_spec")).to_dict()
-        )
-        legacy_plan = (
-            {}
-            if r34_same_shape_hardcoded_relayout_plan is None
-            else r34_same_shape_hardcoded_relayout_plan(getattr(replacement, "same_shape_spec")).to_dict()
-        )
-        return {
-            "status": "ok",
-            "mode": "r34_native_aligned_halo_no_ri",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-            "base_executor": type(replacement).__name__,
-            "delegate_executor": type(replacement.delegate).__name__,
-            "r34_native_aligned_halo_plan": native_plan,
-            "r34_same_shape_halo_relayout_plan": native_plan,
-            "conv_lt_raw_submatrix_tasks": int(native_plan.get("submatrix_program_count", 0) or 0),
-            "conv_lt_effective_submatrix_tasks": int(native_plan.get("sharing_group_count", 0) or 0),
-            "native_c_only_rotations": int(native_plan.get("c_only_rotations", 0) or 0),
-            "native_cb_shared_rotations": int(native_plan.get("cb_shared_rotations", 0) or 0),
-            "legacy_flat_conv_lt_tasks": int(legacy_plan.get("legacy_flat_conv_lt_tasks", 0) or 0),
-            "legacy_flat_offdiag_tasks": int(legacy_plan.get("legacy_flat_offdiag_tasks", 0) or 0),
-        }
-
-    if isinstance(base_executor, HaloLocalConvRuntimeExecutor) and not bool(
-        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
-    ):
-        try:
-            delegate = base_executor.delegate
-        except RuntimeError as exc:
-            return {
-                "status": "unsupported",
-                "mode": "halo_local_native_aligned_halo_no_ri_required",
-                "original_executor": original_executor,
-                "executor": type(runtime.executor).__name__,
-                "base_executor": type(base_executor).__name__,
-                "reason": str(exc),
-            }
-        if type(delegate).__name__ in {"NativeAlignedHaloNoRIConvExecutor", "NativeHaloStripeNoRIConvExecutor"}:
-            native_plan = {}
-            if type(delegate).__name__ == "NativeAlignedHaloNoRIConvExecutor" and r34_native_aligned_halo_plan is not None:
-                native_plan = r34_native_aligned_halo_plan(getattr(base_executor, "same_shape_spec")).to_dict()
-            else:
-                get_metadata = getattr(delegate, "compile_cache_metadata", None)
-                if callable(get_metadata):
-                    native_plan = dict(get_metadata()).get("native_halo_conv2d_plan", {})
-            legacy_plan = {}
-            if r34_same_shape_hardcoded_relayout_plan is not None:
-                try:
-                    legacy_plan = r34_same_shape_hardcoded_relayout_plan(
-                        getattr(base_executor, "same_shape_spec")
-                    ).to_dict()
-                except Exception:
-                    legacy_plan = {}
-            return {
-                "status": "ok",
-                "mode": (
-                    "native_aligned_halo_no_ri"
-                    if type(delegate).__name__ == "NativeAlignedHaloNoRIConvExecutor"
-                    else "native_halo_stripe_no_ri"
-                ),
-                "original_executor": original_executor,
-                "executor": type(runtime.executor).__name__,
-                "base_executor": type(base_executor).__name__,
-                "delegate_executor": type(delegate).__name__,
-                "r34_native_aligned_halo_plan": native_plan,
-                "r34_same_shape_halo_relayout_plan": native_plan,
-                "conv_lt_raw_submatrix_tasks": int(native_plan.get("submatrix_program_count", 0) or 0),
-                "conv_lt_effective_submatrix_tasks": int(native_plan.get("sharing_group_count", 0) or 0),
-                "native_c_only_rotations": int(native_plan.get("c_only_rotations", 0) or 0),
-                "native_cb_shared_rotations": int(native_plan.get("cb_shared_rotations", 0) or 0),
-                "legacy_flat_conv_lt_tasks": int(legacy_plan.get("legacy_flat_conv_lt_tasks", 0) or 0),
-                "legacy_flat_offdiag_tasks": int(legacy_plan.get("legacy_flat_offdiag_tasks", 0) or 0),
-            }
-        return {
-            "status": "ok",
-            "mode": "halo_local_already_no_real_imag_packing",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-            "base_executor": type(base_executor).__name__,
-            "delegate_executor": type(delegate).__name__,
-        }
-
-    if isinstance(base_executor, HaloLocalConvRuntimeExecutor) and bool(
-        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
-    ):
-        same_shape_no_hybrid = bool(
-            getattr(base_executor, "same_shape_spec", None) is not None
-            and not bool(getattr(base_executor, "force_input_pair", False))
-        )
-        output_node_id = (
-            getattr(base_executor, "output_node_id", None)
-            or getattr(module, "region_output_id", None)
-            or getattr(module, "name", "")
-        )
-        replacement = HaloLocalConvRuntimeExecutor(
-            module=module,
-            same_shape_spec=getattr(base_executor, "same_shape_spec", None),
-            output_node_id=str(output_node_id),
-            native_halo_input_capable=getattr(base_executor, "native_halo_input_capable", None),
-        )
-        if wrapper_executor is not None:
-            wrapper_executor.base_executor = replacement
-        else:
-            runtime.executor = replacement
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        return {
-            "status": "ok",
-            "mode": (
-                "halo_local_same_shape_no_real_imag_packing"
-                if bool(same_shape_no_hybrid)
-                else "halo_local_input_pair_no_real_imag_packing"
-            ),
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-            "base_executor": type(replacement).__name__,
-            "delegate_executor": type(replacement.delegate).__name__,
-        }
-
-    if isinstance(base_executor, HaloLocalBranchPairConvRuntimeExecutor) and bool(
-        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
-    ):
-        output_node_ids = tuple(str(value) for value in getattr(base_executor, "output_node_ids", ()) or ())
-        if len(output_node_ids) != 2:
-            output_node_ids = (
-                str(getattr(module, "region_output_id", None) or getattr(module, "name", "")),
-                str(getattr(module, "region_output_id", None) or getattr(module, "name", "")),
-            )
-        replacement = HaloLocalBranchPairConvRuntimeExecutor(
-            conv_module=getattr(base_executor, "conv_module"),
-            shortcut_module=getattr(base_executor, "shortcut_module"),
-            output_node_ids=(str(output_node_ids[0]), str(output_node_ids[1])),
-        )
-        if wrapper_executor is not None:
-            wrapper_executor.base_executor = replacement
-        else:
-            runtime.executor = replacement
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        mark_no_hybrid_boundary({"branch_pair_real_imag_hybrid": "branch_pair_no_real_imag"})
-        return {
-            "status": "ok",
-            "mode": "r34_halo_local_branch_pair_no_real_imag_packing",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-            "base_executor": type(replacement).__name__,
-            "delegate_executor": type(replacement._delegate).__name__,
-        }
-
-    if isinstance(base_executor, HaloLocalBranchPairConvRuntimeExecutor) and not bool(
-        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
-    ):
-        mark_no_hybrid_boundary({"branch_pair_real_imag_hybrid": "branch_pair_no_real_imag"})
-        return {
-            "status": "ok",
-            "mode": "r34_halo_local_branch_pair_already_no_real_imag_packing",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-            "base_executor": type(base_executor).__name__,
-            "delegate_executor": type(base_executor._delegate).__name__,
-        }
-
-    if isinstance(base_executor, InputPairConvRuntimeExecutor) and bool(
-        getattr(base_executor, "use_ct_pt_hybrid_packing", False)
-    ):
-        output_node_id = (
-            getattr(base_executor, "output_node_id", None)
-            or getattr(module, "region_output_id", None)
-            or getattr(module, "name", "")
-        )
-        replacement = InputPairConvRuntimeExecutor(
-            module=module,
-            output_node_id=str(output_node_id),
-            use_ct_pt_hybrid_packing=False,
-        )
-        if wrapper_executor is not None:
-            wrapper_executor.base_executor = replacement
-        else:
-            runtime.executor = replacement
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        mark_no_hybrid_boundary({"input_pair_ctpt_hybrid": "input_pair_no_real_imag"})
-        return {
-            "status": "ok",
-            "mode": "input_pair_conv_no_real_imag_packing",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-            "base_executor": type(replacement).__name__,
-        }
-
-    if str(network) == "r34_imgnet" and hasattr(executor, "spec"):
-        if NativeAlignedHaloNoRIConvExecutor is None:
-            return {
-                "status": "unsupported",
-                "reason": "r34 native aligned halo no-RI helper is unavailable in this checkout",
-                "original_executor": original_executor,
-            }
-        output_node_id = (
-            getattr(executor, "output_node_id", None)
-            or getattr(module, "region_output_id", None)
-            or getattr(module, "name", "")
-        )
-        runtime.executor = NativeAlignedHaloNoRIConvExecutor(
-            module=module,
-            spec=getattr(executor, "spec"),
-            output_node_id=str(output_node_id),
-        )
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        return {
-            "status": "ok",
-            "mode": "r34_native_aligned_halo_no_ri",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-        }
-
-    if isinstance(executor, FullConvRegionRuntimeExecutor):
-        runtime.executor = ProviderNoHybridFullConvRuntimeExecutor(executor)
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        return {
-            "status": "ok",
-            "mode": "r18_full_conv_unified_lt_no_real_imag_packing",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-        }
-
-    if isinstance(executor, TconvK2S2PythonRuntimeExecutor) and bool(
-        getattr(executor, "use_ct_pt_hybrid_packing", False)
-    ):
-        output_node_id = (
-            getattr(executor, "output_node_id", None)
-            or getattr(module, "region_output_id", None)
-            or getattr(module, "name", "")
-        )
-        runtime.executor = TconvK2S2PythonRuntimeExecutor(
-            module=module,
-            output_node_id=str(output_node_id),
-            use_ct_pt_hybrid_packing=False,
-        )
-        runtime.strategy = f"{getattr(runtime, 'strategy', 'provider')}_no_hybrid"
-        return {
-            "status": "ok",
-            "mode": "u22_tconv_unified_lt_no_ct_pt_hybrid_packing",
-            "original_executor": original_executor,
-            "executor": type(runtime.executor).__name__,
-        }
-
-    return {
-        "status": "ok",
-        "mode": "provider_already_no_real_imag_hybrid_packing",
-        "original_executor": original_executor,
-        "executor": original_executor,
-    }
 
 
 def _rotation_keys(transform_id: int) -> list[int]:
@@ -2303,7 +1723,6 @@ def _bench_path(
 ) -> dict[str, Any]:
     case = _case_by_name(str(network), str(case_name))
     provider = _is_provider_path(str(path_kind))
-    no_hybrid_ablation = str(path_kind) in NO_HYBRID_PATHS
     no_family_ablation = str(path_kind) in NO_FAMILY_PATHS
     no_tile_family_ablation = str(path_kind) == "provider_no_tile_family_sharing"
     previous_no_family_env = os.environ.get("ORION_UNIFIED_LT_INDIVIDUAL_EVAL")
@@ -2327,29 +1746,19 @@ def _bench_path(
             raise KeyError(f"node {node_name!r} not found in {network}")
         module = dag.nodes[node_name]["module"]
         runtime = getattr(module, "region_runtime", None)
-        provider_fallback_audit: dict[str, Any] = {}
         if bool(provider):
             if runtime is None:
-                dense_fallback_reason = str(getattr(module, "region_first_dense_fallback_reason", "") or "")
-                if dense_fallback_reason:
-                    provider_fallback_audit = {
-                        "status": "ok",
-                        "mode": "dense_fallback",
-                        "uses_dense_baseline": True,
-                        "reason": dense_fallback_reason,
-                    }
-                else:
-                    return {
-                        "status": "unsupported",
-                        "backend": str(backend),
-                        "path": str(path_kind),
-                        "network": str(network),
-                        "case": str(case_name),
-                        "node": node_name,
-                        "reason": "no provider runtime attached",
-                        "attach_audit": dict(attach_audit),
-                        "module": _module_metadata(module),
-                    }
+                return {
+                    "status": "unsupported",
+                    "backend": str(backend),
+                    "path": str(path_kind),
+                    "network": str(network),
+                    "case": str(case_name),
+                    "node": node_name,
+                    "reason": "no provider runtime attached",
+                    "attach_audit": dict(attach_audit),
+                    "module": _module_metadata(module),
+                }
             if runtime is not None and not bool(getattr(runtime, "supports_scheme", lambda _scheme: True)(scheme)):
                 return {
                     "status": "unsupported",
@@ -2363,42 +1772,8 @@ def _bench_path(
                     "module": _module_metadata(module),
                 }
 
-        no_hybrid_audit: dict[str, Any] = {}
-        if bool(no_hybrid_ablation) and not bool(provider_fallback_audit.get("uses_dense_baseline", False)):
-            no_hybrid_audit = _apply_provider_no_hybrid_ablation(str(network), module)
-            if str(no_hybrid_audit.get("status")) != "ok":
-                return {
-                    "status": "unsupported",
-                    "backend": str(backend),
-                    "path": str(path_kind),
-                    "network": str(network),
-                    "case": str(case_name),
-                    "node": node_name,
-                    "reason": str(no_hybrid_audit.get("reason", "provider_no_hybrid_not_available")),
-                    "attach_audit": dict(attach_audit),
-                    "no_hybrid_audit": dict(no_hybrid_audit),
-                    "module": _module_metadata(module),
-                }
-            runtime = getattr(module, "region_runtime", None)
-            if runtime is not None and not bool(getattr(runtime, "supports_scheme", lambda _scheme: True)(scheme)):
-                return {
-                    "status": "unsupported",
-                    "backend": str(backend),
-                    "path": str(path_kind),
-                    "network": str(network),
-                    "case": str(case_name),
-                    "node": node_name,
-                    "reason": f"provider_no_hybrid runtime does not support active {backend} scheme",
-                    "attach_audit": dict(attach_audit),
-                    "no_hybrid_audit": dict(no_hybrid_audit),
-                    "module": _module_metadata(module),
-                }
-        uses_dense_baseline = bool(
-            no_hybrid_audit.get("uses_dense_baseline", False)
-            or provider_fallback_audit.get("uses_dense_baseline", False)
-        )
-        stats_as_provider = bool(provider and not uses_dense_baseline)
-        source_path_kind = "dense" if bool(uses_dense_baseline) else str(path_kind)
+        stats_as_provider = bool(provider)
+        source_path_kind = str(path_kind)
         memory_trace: list[dict[str, Any]] = [_memory_event("before_generate_diagonals", module)]
 
         generate_started = time.perf_counter()
@@ -2498,7 +1873,7 @@ def _bench_path(
             "op": str(case["op"]),
             "stage": str(case["stage"]),
             "multiplicity": int(case["multiplicity"]),
-            "reason": str(provider_fallback_audit.get("reason", "")),
+            "reason": "",
             "compile_once": True,
             "compile_s": float(generate_diagonals_s + compile_backend_s),
             "generate_diagonals_s": float(generate_diagonals_s),
@@ -2533,8 +1908,6 @@ def _bench_path(
             "output_ciphertext_count": None if output_ciphertext_count is None else int(output_ciphertext_count),
             "module": _module_metadata(module),
             "attach_audit": dict(attach_audit) if bool(provider) else {},
-            "provider_fallback_audit": dict(provider_fallback_audit),
-            "no_hybrid_audit": dict(no_hybrid_audit),
             "no_family_audit": {
                 "enabled": bool(no_family_ablation),
                 "env": "ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1" if bool(no_family_ablation) else "",
@@ -2557,7 +1930,7 @@ def _bench_path(
                     else ""
                 ),
             },
-            "effective_backend_path": "dense" if bool(uses_dense_baseline) else str(path_kind),
+            "effective_backend_path": str(path_kind),
             "memory_trace": memory_trace,
             "unified_group_memory_trace": _unified_group_memory_traces(module),
             "orion_io_mode": str(scheme.params.get_io_mode()),
@@ -2719,60 +2092,6 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
         "speedup": speedups,
     }
 
-    if "provider_no_hybrid" in paths:
-        no_hybrid_entry = dict(paths.get("provider_no_hybrid", {}))
-        if no_hybrid_entry.get("status") != "ok":
-            case_payload.update(update_payload)
-            case_payload["status"] = "partial"
-            return
-        no_hybrid = dict(no_hybrid_entry["result"])
-        if no_hybrid.get("status") != "ok":
-            case_payload.update(update_payload)
-            case_payload["provider_no_hybrid"] = no_hybrid
-            case_payload["status"] = "partial"
-            return
-        no_hybrid_mean = float(no_hybrid["hot_run_mean_s"])
-        no_hybrid_resident = _resident_runtime_value(no_hybrid)
-        no_hybrid_rotations = int(no_hybrid.get("rotation_eval_count", 0))
-        deltas.update(
-            {
-                "compile_s_provider_no_hybrid_minus_dense": float(no_hybrid["compile_s"] - dense["compile_s"]),
-                "hot_run_mean_s_provider_no_hybrid_minus_dense": float(no_hybrid_mean - dense_mean),
-                "resident_compute_s_provider_no_hybrid_minus_dense": (
-                    None
-                    if dense_resident is None or no_hybrid_resident is None
-                    else float(no_hybrid_resident - dense_resident)
-                ),
-                "rotation_eval_count_provider_no_hybrid_minus_dense": int(no_hybrid_rotations - dense_rotations),
-                "compile_s_provider_no_hybrid_minus_provider": float(no_hybrid["compile_s"] - provider["compile_s"]),
-                "hot_run_mean_s_provider_no_hybrid_minus_provider": float(no_hybrid_mean - provider_mean),
-                "resident_compute_s_provider_no_hybrid_minus_provider": (
-                    None
-                    if provider_resident is None or no_hybrid_resident is None
-                    else float(no_hybrid_resident - provider_resident)
-                ),
-                "rotation_eval_count_provider_no_hybrid_minus_provider": int(no_hybrid_rotations - provider_rotations),
-            }
-        )
-        speedups.update(
-            {
-                "time_dense_over_provider_no_hybrid": _speedup_or_none(dense_resident, no_hybrid_resident),
-                "resident_compute_dense_over_provider_no_hybrid": _speedup_or_none(dense_resident, no_hybrid_resident),
-                "serving_hot_dense_over_provider_no_hybrid": _speedup(dense_mean, no_hybrid_mean),
-                "rotation_dense_over_provider_no_hybrid": _speedup(dense_rotations, no_hybrid_rotations),
-                "compile_dense_over_provider_no_hybrid": _speedup(float(dense["compile_s"]), float(no_hybrid["compile_s"])),
-                "time_provider_no_hybrid_over_provider": _speedup_or_none(no_hybrid_resident, provider_resident),
-                "resident_compute_provider_no_hybrid_over_provider": _speedup_or_none(
-                    no_hybrid_resident,
-                    provider_resident,
-                ),
-                "serving_hot_provider_no_hybrid_over_provider": _speedup(no_hybrid_mean, provider_mean),
-                "rotation_provider_no_hybrid_over_provider": _speedup(no_hybrid_rotations, provider_rotations),
-                "compile_provider_no_hybrid_over_provider": _speedup(float(no_hybrid["compile_s"]), float(provider["compile_s"])),
-            }
-        )
-        update_payload["provider_no_hybrid"] = no_hybrid
-
     if "provider_no_family" in paths:
         no_family_entry = dict(paths.get("provider_no_family", {}))
         if no_family_entry.get("status") != "ok":
@@ -2826,90 +2145,6 @@ def _summarize_case(case_payload: dict[str, Any]) -> None:
             }
         )
         update_payload["provider_no_family"] = no_family
-
-    if "provider_no_family_no_hybrid" in paths:
-        only_halo_entry = dict(paths.get("provider_no_family_no_hybrid", {}))
-        if only_halo_entry.get("status") != "ok":
-            case_payload.update(update_payload)
-            case_payload["status"] = "partial"
-            return
-        only_halo = dict(only_halo_entry["result"])
-        if only_halo.get("status") != "ok":
-            case_payload.update(update_payload)
-            case_payload["provider_no_family_no_hybrid"] = only_halo
-            case_payload["status"] = "partial"
-            return
-        only_halo_mean = float(only_halo["hot_run_mean_s"])
-        only_halo_resident = _resident_runtime_value(only_halo)
-        only_halo_rotations = int(only_halo.get("rotation_eval_count", 0))
-        deltas.update(
-            {
-                "compile_s_provider_no_family_no_hybrid_minus_dense": float(
-                    only_halo["compile_s"] - dense["compile_s"]
-                ),
-                "hot_run_mean_s_provider_no_family_no_hybrid_minus_dense": float(
-                    only_halo_mean - dense_mean
-                ),
-                "resident_compute_s_provider_no_family_no_hybrid_minus_dense": (
-                    None
-                    if dense_resident is None or only_halo_resident is None
-                    else float(only_halo_resident - dense_resident)
-                ),
-                "rotation_eval_count_provider_no_family_no_hybrid_minus_dense": int(
-                    only_halo_rotations - dense_rotations
-                ),
-                "compile_s_provider_no_family_no_hybrid_minus_provider": float(
-                    only_halo["compile_s"] - provider["compile_s"]
-                ),
-                "hot_run_mean_s_provider_no_family_no_hybrid_minus_provider": float(
-                    only_halo_mean - provider_mean
-                ),
-                "resident_compute_s_provider_no_family_no_hybrid_minus_provider": (
-                    None
-                    if provider_resident is None or only_halo_resident is None
-                    else float(only_halo_resident - provider_resident)
-                ),
-                "rotation_eval_count_provider_no_family_no_hybrid_minus_provider": int(
-                    only_halo_rotations - provider_rotations
-                ),
-            }
-        )
-        speedups.update(
-            {
-                "time_dense_over_provider_no_family_no_hybrid": _speedup_or_none(dense_resident, only_halo_resident),
-                "resident_compute_dense_over_provider_no_family_no_hybrid": _speedup_or_none(
-                    dense_resident,
-                    only_halo_resident,
-                ),
-                "serving_hot_dense_over_provider_no_family_no_hybrid": _speedup(dense_mean, only_halo_mean),
-                "rotation_dense_over_provider_no_family_no_hybrid": _speedup(
-                    dense_rotations,
-                    only_halo_rotations,
-                ),
-                "compile_dense_over_provider_no_family_no_hybrid": _speedup(
-                    float(dense["compile_s"]),
-                    float(only_halo["compile_s"]),
-                ),
-                "time_provider_no_family_no_hybrid_over_provider": _speedup_or_none(
-                    only_halo_resident,
-                    provider_resident,
-                ),
-                "resident_compute_provider_no_family_no_hybrid_over_provider": _speedup_or_none(
-                    only_halo_resident,
-                    provider_resident,
-                ),
-                "serving_hot_provider_no_family_no_hybrid_over_provider": _speedup(only_halo_mean, provider_mean),
-                "rotation_provider_no_family_no_hybrid_over_provider": _speedup(
-                    only_halo_rotations,
-                    provider_rotations,
-                ),
-                "compile_provider_no_family_no_hybrid_over_provider": _speedup(
-                    float(only_halo["compile_s"]),
-                    float(provider["compile_s"]),
-                ),
-            }
-        )
-        update_payload["provider_no_family_no_hybrid"] = only_halo
 
     if "provider_no_tile_family_sharing" in paths:
         no_tile_entry = dict(paths.get("provider_no_tile_family_sharing", {}))
@@ -3546,27 +2781,6 @@ def _flatten_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "runtime_rotation_dense_over_provider"
                 ),
             }
-            if "provider_no_hybrid" in case:
-                no_hybrid = dict(case["provider_no_hybrid"])
-                row.update(
-                    {
-                        "provider_no_hybrid_mean_s": float(no_hybrid["hot_run_mean_s"]),
-                        "time_speedup_dense_over_provider_no_hybrid": case["speedup"][
-                            "time_dense_over_provider_no_hybrid"
-                        ],
-                        "time_provider_no_hybrid_over_provider": case["speedup"][
-                            "time_provider_no_hybrid_over_provider"
-                        ],
-                        "provider_no_hybrid_rotations": int(no_hybrid["rotation_eval_count"]),
-                        "rotation_speedup_dense_over_provider_no_hybrid": case["speedup"][
-                            "rotation_dense_over_provider_no_hybrid"
-                        ],
-                        "rotation_provider_no_hybrid_over_provider": case["speedup"][
-                            "rotation_provider_no_hybrid_over_provider"
-                        ],
-                        "provider_no_hybrid_mode": str(no_hybrid.get("no_hybrid_audit", {}).get("mode", "")),
-                    }
-                )
             if "provider_no_family" in case:
                 no_family = dict(case["provider_no_family"])
                 row.update(
@@ -3586,32 +2800,6 @@ def _flatten_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "rotation_provider_no_family_over_provider"
                         ],
                         "provider_no_family_mode": str(no_family.get("no_family_audit", {}).get("mode", "")),
-                    }
-                )
-            if "provider_no_family_no_hybrid" in case:
-                only_halo = dict(case["provider_no_family_no_hybrid"])
-                row.update(
-                    {
-                        "provider_no_family_no_hybrid_mean_s": float(only_halo["hot_run_mean_s"]),
-                        "time_speedup_dense_over_provider_no_family_no_hybrid": case["speedup"][
-                            "time_dense_over_provider_no_family_no_hybrid"
-                        ],
-                        "time_provider_no_family_no_hybrid_over_provider": case["speedup"][
-                            "time_provider_no_family_no_hybrid_over_provider"
-                        ],
-                        "provider_no_family_no_hybrid_rotations": int(only_halo["rotation_eval_count"]),
-                        "rotation_speedup_dense_over_provider_no_family_no_hybrid": case["speedup"][
-                            "rotation_dense_over_provider_no_family_no_hybrid"
-                        ],
-                        "rotation_provider_no_family_no_hybrid_over_provider": case["speedup"][
-                            "rotation_provider_no_family_no_hybrid_over_provider"
-                        ],
-                        "provider_no_family_no_hybrid_no_hybrid_mode": str(
-                            only_halo.get("no_hybrid_audit", {}).get("mode", "")
-                        ),
-                        "provider_no_family_no_hybrid_no_family_mode": str(
-                            only_halo.get("no_family_audit", {}).get("mode", "")
-                        ),
                     }
                 )
             if "provider_no_tile_family_sharing" in case:
@@ -3666,7 +2854,6 @@ CSV_COLUMNS = (
     "reason",
     "effective_backend_path",
     "executor",
-    "no_hybrid_mode",
     "no_family_mode",
     "no_tile_family_mode",
     "compile_once",
@@ -3718,24 +2905,12 @@ CSV_COLUMNS = (
     "rotation_speedup_dense_over_provider",
     "runtime_rotation_speedup_dense_over_provider",
     "compile_speedup_dense_over_provider",
-    "time_speedup_dense_over_provider_no_hybrid",
-    "rotation_speedup_dense_over_provider_no_hybrid",
-    "compile_speedup_dense_over_provider_no_hybrid",
-    "time_provider_no_hybrid_over_provider",
-    "rotation_provider_no_hybrid_over_provider",
-    "compile_provider_no_hybrid_over_provider",
     "time_speedup_dense_over_provider_no_family",
     "rotation_speedup_dense_over_provider_no_family",
     "compile_speedup_dense_over_provider_no_family",
     "time_provider_no_family_over_provider",
     "rotation_provider_no_family_over_provider",
     "compile_provider_no_family_over_provider",
-    "time_speedup_dense_over_provider_no_family_no_hybrid",
-    "rotation_speedup_dense_over_provider_no_family_no_hybrid",
-    "compile_speedup_dense_over_provider_no_family_no_hybrid",
-    "time_provider_no_family_no_hybrid_over_provider",
-    "rotation_provider_no_family_no_hybrid_over_provider",
-    "compile_provider_no_family_no_hybrid_over_provider",
     "time_speedup_dense_over_provider_no_tile_family_sharing",
     "rotation_speedup_dense_over_provider_no_tile_family_sharing",
     "compile_speedup_dense_over_provider_no_tile_family_sharing",
@@ -3809,36 +2984,12 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "runtime_rotation_dense_over_provider"
                     ),
                     "compile_speedup_dense_over_provider": speedup.get("compile_dense_over_provider"),
-                    "time_speedup_dense_over_provider_no_hybrid": speedup.get("time_dense_over_provider_no_hybrid"),
-                    "rotation_speedup_dense_over_provider_no_hybrid": speedup.get("rotation_dense_over_provider_no_hybrid"),
-                    "compile_speedup_dense_over_provider_no_hybrid": speedup.get("compile_dense_over_provider_no_hybrid"),
-                    "time_provider_no_hybrid_over_provider": speedup.get("time_provider_no_hybrid_over_provider"),
-                    "rotation_provider_no_hybrid_over_provider": speedup.get("rotation_provider_no_hybrid_over_provider"),
-                    "compile_provider_no_hybrid_over_provider": speedup.get("compile_provider_no_hybrid_over_provider"),
                     "time_speedup_dense_over_provider_no_family": speedup.get("time_dense_over_provider_no_family"),
                     "rotation_speedup_dense_over_provider_no_family": speedup.get("rotation_dense_over_provider_no_family"),
                     "compile_speedup_dense_over_provider_no_family": speedup.get("compile_dense_over_provider_no_family"),
                     "time_provider_no_family_over_provider": speedup.get("time_provider_no_family_over_provider"),
                     "rotation_provider_no_family_over_provider": speedup.get("rotation_provider_no_family_over_provider"),
                     "compile_provider_no_family_over_provider": speedup.get("compile_provider_no_family_over_provider"),
-                    "time_speedup_dense_over_provider_no_family_no_hybrid": speedup.get(
-                        "time_dense_over_provider_no_family_no_hybrid"
-                    ),
-                    "rotation_speedup_dense_over_provider_no_family_no_hybrid": speedup.get(
-                        "rotation_dense_over_provider_no_family_no_hybrid"
-                    ),
-                    "compile_speedup_dense_over_provider_no_family_no_hybrid": speedup.get(
-                        "compile_dense_over_provider_no_family_no_hybrid"
-                    ),
-                    "time_provider_no_family_no_hybrid_over_provider": speedup.get(
-                        "time_provider_no_family_no_hybrid_over_provider"
-                    ),
-                    "rotation_provider_no_family_no_hybrid_over_provider": speedup.get(
-                        "rotation_provider_no_family_no_hybrid_over_provider"
-                    ),
-                    "compile_provider_no_family_no_hybrid_over_provider": speedup.get(
-                        "compile_provider_no_family_no_hybrid_over_provider"
-                    ),
                     "time_speedup_dense_over_provider_no_tile_family_sharing": speedup.get(
                         "time_dense_over_provider_no_tile_family_sharing"
                     ),
@@ -3862,7 +3013,6 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 if result:
                     rotation_stats = dict(result.get("rotation_stats", {}) or {})
                     module = dict(result.get("module", {}) or {})
-                    no_hybrid_audit = dict(result.get("no_hybrid_audit", {}) or {})
                     no_family_audit = dict(result.get("no_family_audit", {}) or {})
                     no_tile_family_audit = dict(result.get("no_tile_family_audit", {}) or {})
                     row.update(
@@ -3871,7 +3021,6 @@ def _flatten_csv_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "reason": str(result.get("reason", path_entry.get("reason", ""))),
                             "effective_backend_path": str(result.get("effective_backend_path", "")),
                             "executor": str(result.get("executor", rotation_stats.get("executor", ""))),
-                            "no_hybrid_mode": str(no_hybrid_audit.get("mode", "")),
                             "no_family_mode": str(no_family_audit.get("mode", "")),
                             "no_tile_family_mode": str(no_tile_family_audit.get("mode", "")),
                             "compile_once": result.get("compile_once", ""),
@@ -3962,7 +3111,7 @@ def _worker_main(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Node-specific multi-backend dense/provider/provider-no-hybrid benchmark for unique optimized "
+            "Node-specific multi-backend dense/provider benchmark for unique optimized "
             "CONV/TCONV nodes in R18 Tiny, R34 ImageNet, and U22 base_dim=32."
         )
     )

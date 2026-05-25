@@ -787,68 +787,6 @@ def test_r34_inter_group_policy_attaches_native_runtime_executor() -> None:
     )
 
 
-def test_r34_no_hybrid_ablation_keeps_halo_local_same_shape_facade() -> None:
-    from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench
-
-    dag = _prepared_r34_imagenet_dag()
-    registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)
-    registry.attach_to_dag(dag)
-
-    stem_module = dag.nodes["conv1"]["module"]
-    stem_executor = stem_module.region_runtime.executor
-    assert isinstance(stem_executor, HaloLocalConvRuntimeExecutor)
-
-    stem_audit = bench._apply_provider_no_hybrid_ablation("r34_imgnet", stem_module)
-
-    stem_executor = stem_module.region_runtime.executor
-    assert stem_audit["status"] == "ok"
-    assert stem_audit["mode"] == "native_halo_stripe_no_ri"
-    assert stem_audit["executor"] == "HaloLocalConvRuntimeExecutor"
-    assert stem_audit["delegate_executor"] == "NativeHaloStripeNoRIConvExecutor"
-    assert isinstance(stem_executor, HaloLocalConvRuntimeExecutor)
-
-    for node_name in ("layers_0_0_conv1", "layers_2_1_conv1"):
-        module = dag.nodes[node_name]["module"]
-        executor = module.region_runtime.executor
-        assert isinstance(executor, HaloLocalConvRuntimeExecutor)
-        assert bool(executor.use_ct_pt_hybrid_packing) is False
-        assert type(_executor_delegate(executor)) is not r34_same_shape.R34OrionSameShapeRuntimeExecutor
-
-        audit = bench._apply_provider_no_hybrid_ablation("r34_imgnet", module)
-
-        executor = module.region_runtime.executor
-        assert audit["status"] == "ok"
-        assert audit["mode"] == "r34_native_aligned_halo_no_ri"
-        assert audit["executor"] == "HaloLocalConvRuntimeExecutor"
-        assert audit["delegate_executor"] == "NativeAlignedHaloNoRIConvExecutor"
-        assert audit["conv_lt_effective_submatrix_tasks"] <= audit["conv_lt_raw_submatrix_tasks"]
-        assert audit["conv_lt_effective_submatrix_tasks"] < audit["legacy_flat_conv_lt_tasks"]
-        assert audit["r34_same_shape_halo_relayout_plan"]["runtime_layout"] == "native_aligned_halo_no_ri"
-        assert isinstance(executor, HaloLocalConvRuntimeExecutor)
-        assert bool(executor.use_ct_pt_hybrid_packing) is False
-        assert isinstance(_executor_delegate(executor), r34_same_shape.NativeAlignedHaloNoRIConvExecutor)
-        assert str(module.region_runtime.strategy).endswith("_no_hybrid")
-
-    transition_module = dag.nodes["layers_1_0_conv1"]["module"]
-    transition_executor = transition_module.region_runtime.executor
-    assert isinstance(transition_executor, HaloLocalBranchPairConvRuntimeExecutor)
-    assert bool(transition_executor.use_ct_pt_hybrid_packing) is False
-    assert isinstance(_executor_delegate(transition_executor), BranchPairNoHybridConvRuntimeExecutor)
-
-    transition_audit = bench._apply_provider_no_hybrid_ablation("r34_imgnet", transition_module)
-
-    transition_executor = transition_module.region_runtime.executor
-    assert transition_audit["status"] == "ok"
-    assert transition_audit["mode"] == "r34_halo_local_branch_pair_already_no_real_imag_packing"
-    assert transition_audit["executor"] == "HaloLocalBranchPairConvRuntimeExecutor"
-    assert transition_audit["delegate_executor"] == "BranchPairNoHybridConvRuntimeExecutor"
-    assert isinstance(transition_executor, HaloLocalBranchPairConvRuntimeExecutor)
-    assert bool(transition_executor.use_ct_pt_hybrid_packing) is False
-    assert isinstance(_executor_delegate(transition_executor), BranchPairNoHybridConvRuntimeExecutor)
-    assert "branch_pair_real_imag_hybrid" not in transition_module.region_runtime.boundary_actions
-    assert "branch_pair_no_real_imag" in transition_module.region_runtime.boundary_actions
-
-
 def test_r34_public_conv_provider_path_is_generic_halo_local() -> None:
     dag = _prepared_r34_imagenet_dag()
     registry = R34CompileRegistry.for_r34_imgnet_phase1(dag)

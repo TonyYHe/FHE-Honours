@@ -1093,47 +1093,6 @@ def test_input_pair_no_hybrid_compiles_singleton_source_blocks(monkeypatch) -> N
         scheme.delete_scheme()
 
 
-def test_provider_no_hybrid_ablation_rebuilds_direct_input_pair_executor() -> None:
-    from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench
-
-    conv = Conv2d(1, 1, kernel_size=1, bias=True)
-    conv.init_orion_params()
-    conv.input_shape = torch.Size((1, 1, 1, 2))
-    conv.output_shape = torch.Size((1, 1, 1, 1))
-    conv.fhe_input_shape = torch.Size((1, 1, 1, 2))
-    conv.fhe_output_shape = torch.Size((1, 1, 1, 1))
-    conv.input_gap = 1
-    conv.output_gap = 1
-    conv.name = "direct_input_pair_ablation_probe"
-    conv.region_output_id = "probe"
-    conv.region_runtime = RegionFirstRuntimeGroup(
-        region_id="direct_input_pair_ablation_probe",
-        network="U22",
-        stage="single_block_conv",
-        module_prefix="probe",
-        conv_nodes=("probe",),
-        strategy="u22_input_pair_conv_shared_rotations",
-        materializer="u22_input_pair_conv_shared_rotations",
-        depth=1,
-        boundary_actions=("input_pair_ctpt_hybrid", "shared_block_rotation_cache"),
-        executable=True,
-        fallback_reason="",
-        output_node_ids=("probe",),
-        executor=InputPairConvRuntimeExecutor(module=conv, output_node_id="probe"),
-        fused_weight_count=1,
-        expected_stats={},
-    )
-
-    audit = bench._apply_provider_no_hybrid_ablation("u22_64_base32", conv)
-
-    assert audit["status"] == "ok"
-    assert audit["mode"] == "input_pair_conv_no_real_imag_packing"
-    assert audit["executor"] == "InputPairConvRuntimeExecutor"
-    assert bool(conv.region_runtime.executor.use_ct_pt_hybrid_packing) is False
-    assert "input_pair_ctpt_hybrid" not in conv.region_runtime.boundary_actions
-    assert "input_pair_no_real_imag" in conv.region_runtime.boundary_actions
-
-
 def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout() -> None:
     torch.manual_seed(0)
     _init_python_scheme("")

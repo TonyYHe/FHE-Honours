@@ -1992,7 +1992,6 @@ def _run_one(
     profile_lt: bool = False,
     trace_forward_memory: bool = False,
     provider_mode_override: str | None = None,
-    provider_no_hybrid: bool = False,
     io_mode: str = "none",
     io_dir: Path | None = None,
     diags_path: Path | None = None,
@@ -2013,12 +2012,6 @@ def _run_one(
         )
     spec = NETWORKS[str(network)]
     provider_mode = str(provider_mode_override or spec["provider_mode"]) if str(mode) == "provider" else ""
-    if str(mode) == "provider" and bool(provider_no_hybrid):
-        provider_mode = (
-            str(provider_mode)
-            if "nohybrid" in str(provider_mode).lower()
-            else f"{provider_mode}_nohybrid"
-        )
     base_config = _apply_ckks_preset(
         spec["config"](provider_mode, backend=str(backend)),
         ckks_preset,
@@ -2043,7 +2036,6 @@ def _run_one(
         "network_scope": str(spec.get("scope", "full")),
         "mode": str(mode),
         "provider_mode": str(provider_mode),
-        "provider_no_hybrid": bool(provider_no_hybrid),
         "io_mode": str(io_mode),
         "io_dir": None if io_dir is None else str(Path(io_dir)),
         "diags_path": str(config.get("orion", {}).get("diags_path", "")),
@@ -2441,11 +2433,6 @@ def main() -> int:
         help="Write per-module forward memory/live-ciphertext events to a JSONL sidecar.",
     )
     parser.add_argument("--provider-mode", type=str, default=None)
-    parser.add_argument(
-        "--provider-no-hybrid",
-        action="store_true",
-        help="Keep provider mode enabled but disable provider real/imag hybrid packing before compile.",
-    )
     parser.add_argument("--io-mode", choices=("none", "save", "load"), default="none")
     parser.add_argument("--io-dir", type=Path, default=None)
     parser.add_argument("--diags-path", type=Path, default=None)
@@ -2480,7 +2467,6 @@ def main() -> int:
         profile_lt=bool(args.profile_lt),
         trace_forward_memory=bool(args.trace_forward_memory),
         provider_mode_override=args.provider_mode,
-        provider_no_hybrid=bool(args.provider_no_hybrid),
         io_mode=str(args.io_mode),
         io_dir=args.io_dir,
         diags_path=args.diags_path,
