@@ -736,7 +736,7 @@ def test_layout_policy_provider_runtime_shape_reflects_fused_output_halo_without
     assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
 
 
-def test_input_pair_pool_provider_fuses_output_bottom_beta_relayout() -> None:
+def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
     _init_python_scheme("")
     try:
         pool = AvgPool2d(kernel_size=2, stride=2, padding=0)

@@ -245,7 +245,8 @@ def test_native_halo_conv_lattigo_matches_reference_at_level_one() -> None:
             .reshape(-1)[:24]
             .reshape(1, 1, 6, 4)
         )
-        x_halo = torch.cat([x[:, :, :1, :], x, x[:, :, -1:, :]], dim=2)
+        halo_row = torch.zeros_like(x[:, :, :1, :])
+        x_halo = torch.cat([halo_row, x, halo_row], dim=2)
         reference = F.conv2d(x_halo, conv.on_weight.detach(), conv.on_bias.detach(), padding=1)
 
         assert out.level() == 0

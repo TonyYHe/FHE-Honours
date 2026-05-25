@@ -1036,11 +1036,96 @@ def test_native_halo_provider_uses_physical_compact_layout_for_raw_input_source(
         assert executor.last_runtime_io["input_physical_layout"] == "packed_compact"
         assert metadata["compact_source_layout"]["top_beta"] == 0
         assert metadata["compact_source_layout"]["bottom_beta"] == 0
-        assert metadata["native_halo_conv2d_plan"]["spec"]["input_top_beta"] == 1
-        assert metadata["native_halo_conv2d_plan"]["spec"]["input_bottom_beta"] == 1
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_top_beta"] == 0
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_bottom_beta"] == 0
         assert float((decoded - reference).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()
+
+
+def test_native_halo_executor_loads_cached_manifest_groups(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((2, 2, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 2, 4, 4]),
+        output_shape=torch.Size([1, 2, 4, 4]),
+        fhe_input_shape=torch.Size([1, 2, 4, 4]),
+        fhe_output_shape=torch.Size([1, 2, 4, 4]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={},
+        layout_policy_output_layout={},
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="test_cached_native_halo",
+        c_in=2,
+        h_in=4,
+        w_in=4,
+        c_out=2,
+        h_out=4,
+        w_out=4,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=16,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    executor.assigned_level = 3
+    executor.load_compile_cache_metadata(
+        {
+            "rows": 2,
+            "cols": 2,
+            "groups_by_input_index": [
+                {"input_index": 0, "storage_key": "group_10", "target_indices": [0, 1]},
+                {"input_index": 1, "storage_key": "group_11", "target_indices": [1]},
+            ],
+        }
+    )
+
+    calls: list[tuple[str, int]] = []
+
+    def _fake_compile_unified(self, _backend):
+        calls.append((str(self._storage_key), int(len(self.transforms))))
+        self.unified_ids = [int(1000 + len(calls) * 10 + index) for index in range(len(self.transforms))]
+        self.is_compiled = True
+
+    def _unexpected_rebuild(*_args, **_kwargs):
+        raise AssertionError("load-mode native halo compile should use cached transform shells")
+
+    monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _fake_compile_unified)
+    monkeypatch.setattr(native_halo_conv2d, "_build_compact_source_conv_transform", _unexpected_rebuild)
+    monkeypatch.setattr(native_halo_conv2d, "_build_conv_transform", _unexpected_rebuild)
+    monkeypatch.setattr(native_halo_conv2d, "_build_conv_transforms_for_compact_output", _unexpected_rebuild)
+
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_io_mode=lambda: "load",
+            get_logq=lambda: [45, 30, 30, 45],
+            get_default_scale=lambda: 1 << 30,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    executor.compile(fake_scheme)
+
+    assert calls == [("group_10", 2), ("group_11", 1)]
+    assert sorted(executor.groups_by_input_index) == [0, 1]
+    assert executor.target_indices_by_input_index[0] == (0, 1)
+    assert executor.target_indices_by_input_index[1] == (1,)
+    assert executor.last_runtime_timing["built_transform_count"] == 0.0
+    assert executor.last_runtime_timing["compiled_group_count"] == 2.0
 
 
 def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None:
