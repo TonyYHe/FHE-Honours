@@ -1678,3 +1678,88 @@ func EvaluateLinearTransformsWithSharedCache(
 	}
 	return SliceToCArray(outIDs, convertIntToCInt)
 }
+
+//export EvaluateLinearTransformSourcesWithSharedCacheAdd
+func EvaluateLinearTransformSourcesWithSharedCacheAdd(
+	ctxtIDs *C.int,
+	numSources C.int,
+	transformIDs *C.int,
+	targetIDs *C.int,
+	groupOffsets *C.int,
+	numPartials C.int,
+	numTargets C.int,
+) (*C.int, C.ulong) {
+	sourceCount := int(numSources)
+	partialCount := int(numPartials)
+	targetCount := int(numTargets)
+	if sourceCount <= 0 {
+		panic(fmt.Errorf("EvaluateLinearTransformSourcesWithSharedCacheAdd requires at least one source"))
+	}
+	if partialCount <= 0 {
+		panic(fmt.Errorf("EvaluateLinearTransformSourcesWithSharedCacheAdd requires at least one transform"))
+	}
+	if targetCount <= 0 {
+		panic(fmt.Errorf("EvaluateLinearTransformSourcesWithSharedCacheAdd requires at least one target"))
+	}
+
+	ctxtIDsSlice := CArrayToSlice(ctxtIDs, numSources, convertCIntToInt)
+	transformIDsSlice := CArrayToSlice(transformIDs, numPartials, convertCIntToInt)
+	targetIDsSlice := CArrayToSlice(targetIDs, numPartials, convertCIntToInt)
+	offsetsSlice := CArrayToSlice(groupOffsets, C.int(sourceCount+1), convertCIntToInt)
+	if len(offsetsSlice) != sourceCount+1 {
+		panic(fmt.Errorf("groupOffsets length mismatch"))
+	}
+	if offsetsSlice[0] != 0 || offsetsSlice[sourceCount] != partialCount {
+		panic(fmt.Errorf("invalid group offsets: first=%d last=%d partials=%d", offsetsSlice[0], offsetsSlice[sourceCount], partialCount))
+	}
+
+	ctIns := make([]*rlwe.Ciphertext, sourceCount)
+	transformGroups := make([][]lintrans.LinearTransformation, sourceCount)
+	targetGroups := make([][]int, sourceCount)
+	for sourceIndex := 0; sourceIndex < sourceCount; sourceIndex++ {
+		start := offsetsSlice[sourceIndex]
+		end := offsetsSlice[sourceIndex+1]
+		if start < 0 || end < start || end > partialCount {
+			panic(fmt.Errorf("invalid group offset range for source %d: [%d,%d)", sourceIndex, start, end))
+		}
+		ctIns[sourceIndex] = RetrieveCiphertext(ctxtIDsSlice[sourceIndex])
+		groupLen := end - start
+		transformGroups[sourceIndex] = make([]lintrans.LinearTransformation, groupLen)
+		targetGroups[sourceIndex] = make([]int, groupLen)
+		for localIndex := 0; localIndex < groupLen; localIndex++ {
+			partialIndex := start + localIndex
+			transformID := transformIDsSlice[partialIndex]
+			transform := RetrieveLinearTransform(transformID)
+			if hasStreamingLTState(transformID) {
+				panic(fmt.Errorf("target-sum reduction does not support streaming linear transform %d", transformID))
+			}
+			ensureLinearTransformRotationKeys(transform)
+			validateLinearTransformPlaintextLevels(transformID, transform)
+			transformGroups[sourceIndex][localIndex] = transform
+			targetGroups[sourceIndex][localIndex] = targetIDsSlice[partialIndex]
+		}
+	}
+
+	scheme.LinEvaluator = lintrans.NewEvaluator(
+		scheme.Evaluator.WithKey(scheme.EvalKeys),
+	)
+
+	outputs := make([]*rlwe.Ciphertext, targetCount)
+	for i := range outputs {
+		outputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, scheme.Params.MaxLevel())
+	}
+	if err := scheme.LinEvaluator.EvaluateManySourcesWithSharedCacheAdd(
+		ctIns,
+		transformGroups,
+		targetGroups,
+		outputs,
+	); err != nil {
+		panic(err)
+	}
+
+	outIDs := make([]int, targetCount)
+	for i, ct := range outputs {
+		outIDs[i] = PushCiphertext(ct)
+	}
+	return SliceToCArray(outIDs, convertIntToCInt)
+}

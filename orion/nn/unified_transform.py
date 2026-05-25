@@ -2510,12 +2510,149 @@ class UnifiedTransformGroup:
             raise ValueError("Transform not found in unified group") from exc
         return {(0, 0): int(self.unified_ids[index])}
 
+    @staticmethod
+    def evaluate_sources_with_target_sum(
+        groups: Iterable["UnifiedTransformGroup"],
+        ct_input_ids: Iterable[int],
+        target_indices_by_group: Iterable[Iterable[int]],
+        target_count: int,
+        backend,
+    ) -> list[int] | None:
+        evaluate = getattr(backend, "EvaluateLinearTransformSourcesWithSharedCacheAdd", None)
+        if not callable(evaluate):
+            return None
+
+        group_list = list(groups)
+        source_ids = [int(value) for value in ct_input_ids]
+        target_groups = [tuple(int(value) for value in targets) for targets in target_indices_by_group]
+        target_count = int(target_count)
+        if (
+            target_count <= 0
+            or not group_list
+            or len(group_list) != len(source_ids)
+            or len(group_list) != len(target_groups)
+        ):
+            return None
+
+        transform_ids: list[int] = []
+        target_ids: list[int] = []
+        group_offsets: list[int] = [0]
+        target_signatures: dict[int, tuple[int | None, int | None, int | None]] = {}
+        get_level = getattr(backend, "GetCiphertextLevel", None)
+        get_scale = getattr(backend, "GetCiphertextScale", None)
+        get_slots = getattr(backend, "GetCiphertextSlots", None)
+
+        def read_int(reader, value: int) -> int | None:
+            if not callable(reader):
+                return None
+            try:
+                return int(reader(int(value)))
+            except Exception:
+                return None
+
+        for source_index, (group, ct_id, targets) in enumerate(zip(group_list, source_ids, target_groups)):
+            if not group.is_compiled or group.unified_ids is None:
+                return None
+            if group._should_offload_rotation_keys() or group._offloaded_plaintext_diagonals:
+                return None
+            if group._memory_bounded_eval_enabled(backend) and len(group._memory_bounded_chunks(backend)) > 1:
+                return None
+            ids = [int(value) for value in group.unified_ids]
+            if len(ids) != len(targets) or len(group.transforms) < len(ids):
+                return None
+
+            source_level = read_int(get_level, int(ct_id))
+            source_scale = read_int(get_scale, int(ct_id))
+            source_slots = read_int(get_slots, int(ct_id))
+            for local_index, (transform_id, target_index) in enumerate(zip(ids, targets)):
+                target_index = int(target_index)
+                if target_index < 0 or target_index >= target_count:
+                    return None
+                transform_level = getattr(group.transforms[int(local_index)], "level", None)
+                output_level = None
+                if source_level is not None and transform_level is not None:
+                    output_level = min(int(source_level), int(transform_level))
+                signature = (output_level, source_scale, source_slots)
+                previous = target_signatures.get(target_index)
+                if previous is not None and previous != signature:
+                    return None
+                target_signatures[target_index] = signature
+                transform_ids.append(int(transform_id))
+                target_ids.append(int(target_index))
+            group_offsets.append(len(transform_ids))
+
+        if not transform_ids or len(target_signatures) != target_count:
+            return None
+
+        source_array = (ctypes.c_int * len(source_ids))(*source_ids)
+        transform_array = (ctypes.c_int * len(transform_ids))(*transform_ids)
+        target_array = (ctypes.c_int * len(target_ids))(*target_ids)
+        offsets_array = (ctypes.c_int * len(group_offsets))(*group_offsets)
+
+        primary_group = group_list[0]
+        group_started = time.perf_counter()
+        timing = primary_group._empty_runtime_timing()
+        primary_group._record_memory_event(
+            "before_eval_sources_target_sum",
+            backend,
+            transform_ids,
+            source_count=int(len(source_ids)),
+            partial_count=int(len(transform_ids)),
+            target_count=int(target_count),
+        )
+        output_ids: list[int] | None = None
+        try:
+            primary_group._consume_trim_seconds(backend)
+            primary_group._consume_shared_cache_eval_profile(backend)
+            eval_started = time.perf_counter()
+            output_ids = list(
+                evaluate(
+                    source_array,
+                    len(source_ids),
+                    transform_array,
+                    target_array,
+                    offsets_array,
+                    len(transform_ids),
+                    target_count,
+                )
+            )
+            eval_total_s = float(time.perf_counter() - eval_started)
+            trim_s = primary_group._consume_trim_seconds(backend)
+            timing["trim_s"] = float(trim_s)
+            for profile_key, profile_value in primary_group._consume_shared_cache_eval_profile(backend).items():
+                timing[profile_key] = float(timing.get(profile_key, 0.0) + float(profile_value))
+            timing["eval_total_s"] = float(eval_total_s)
+            timing["eval_s"] = max(0.0, float(eval_total_s) - float(trim_s))
+        finally:
+            runtime_timing = primary_group._publish_runtime_timing(
+                backend,
+                timing,
+                memory_bounded=False,
+                total_s=float(time.perf_counter() - group_started),
+            )
+            primary_group._record_memory_event(
+                "after_eval_sources_target_sum",
+                backend,
+                transform_ids,
+                timing=runtime_timing,
+                source_count=int(len(source_ids)),
+                partial_count=int(len(transform_ids)),
+                target_count=int(target_count),
+            )
+            for group in group_list[1:]:
+                group.last_runtime_timing = group._empty_runtime_timing()
+                group.last_runtime_timing["runtime_fairness_mode"] = "resident_compute"
+                group.last_runtime_timing["resident_compute_s"] = 0.0
+        if output_ids is None:
+            raise RuntimeError("EvaluateLinearTransformSourcesWithSharedCacheAdd did not return outputs")
+        return [int(value) for value in output_ids]
+
     def evaluate_unified(self, ct_input_id: int, backend) -> list[int]:
         if not self.is_compiled or self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
         if self._memory_bounded_eval_enabled(backend):
             chunks = self._memory_bounded_chunks(backend)
-            if len(chunks) > 1:
+            if chunks:
                 return self._evaluate_unified_memory_bounded(int(ct_input_id), backend)
         if (
             len(self.unified_ids) == 1

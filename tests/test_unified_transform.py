@@ -35,6 +35,10 @@ class _FakeBackend:
         self.removed_transform_keys = []
         self.rotation_keys = {11: [1, 3], 12: [1, 5]}
         self.generated_keys = []
+        self.source_target_sum_evaluated = []
+        self.ct_levels = {}
+        self.ct_scales = {}
+        self.ct_slots = {}
         self.next_transform_id = 11
         self.streaming_transform_ids = set()
 
@@ -65,6 +69,35 @@ class _FakeBackend:
         ids = [int(transform_ids_array[i]) for i in range(int(num_transforms))]
         self.evaluated.append((ids, int(ct_input_id)))
         return [100 + i for i in range(int(num_transforms))]
+
+    def EvaluateLinearTransformSourcesWithSharedCacheAdd(
+        self,
+        ctxt_ids_array,
+        num_sources,
+        transform_ids_array,
+        target_ids_array,
+        group_offsets_array,
+        num_partials,
+        num_targets,
+    ):
+        record = {
+            "ctxt_ids": [int(ctxt_ids_array[i]) for i in range(int(num_sources))],
+            "transform_ids": [int(transform_ids_array[i]) for i in range(int(num_partials))],
+            "target_ids": [int(target_ids_array[i]) for i in range(int(num_partials))],
+            "group_offsets": [int(group_offsets_array[i]) for i in range(int(num_sources) + 1)],
+            "target_count": int(num_targets),
+        }
+        self.source_target_sum_evaluated.append(record)
+        return [200 + i for i in range(int(num_targets))]
+
+    def GetCiphertextLevel(self, ciphertext_id):
+        return int(self.ct_levels.get(int(ciphertext_id), 2))
+
+    def GetCiphertextScale(self, ciphertext_id):
+        return int(self.ct_scales.get(int(ciphertext_id), 1 << 30))
+
+    def GetCiphertextSlots(self, ciphertext_id):
+        return int(self.ct_slots.get(int(ciphertext_id), 8))
 
     def SerializeDiagonal(self, transform_id, diag_idx):
         self.serialized.append((int(transform_id), int(diag_idx)))
@@ -371,6 +404,57 @@ def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> N
     group.cleanup(backend)
     assert backend.deleted == [11, 12]
     assert group.is_compiled is False
+
+
+def test_unified_transform_sources_target_sum_uses_compatible_targets() -> None:
+    backend = _FakeBackend()
+    group_a = UnifiedTransformGroup((_fake_transform({0: [1.0]}, level=2), _fake_transform({0: [2.0]}, level=2)))
+    group_b = UnifiedTransformGroup((_fake_transform({0: [3.0]}, level=2), _fake_transform({0: [4.0]}, level=2)))
+    group_a.is_compiled = True
+    group_a.unified_ids = [11, 12]
+    group_b.is_compiled = True
+    group_b.unified_ids = [21, 22]
+
+    outputs = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+        [group_a, group_b],
+        [7, 8],
+        [(0, 1), (0, 1)],
+        2,
+        backend,
+    )
+
+    assert outputs == [200, 201]
+    assert backend.source_target_sum_evaluated == [
+        {
+            "ctxt_ids": [7, 8],
+            "transform_ids": [11, 12, 21, 22],
+            "target_ids": [0, 1, 0, 1],
+            "group_offsets": [0, 2, 4],
+            "target_count": 2,
+        }
+    ]
+
+
+def test_unified_transform_sources_target_sum_rejects_mismatched_target_level() -> None:
+    backend = _FakeBackend()
+    backend.ct_levels[8] = 1
+    group_a = UnifiedTransformGroup((_fake_transform({0: [1.0]}, level=2),))
+    group_b = UnifiedTransformGroup((_fake_transform({0: [3.0]}, level=2),))
+    group_a.is_compiled = True
+    group_a.unified_ids = [11]
+    group_b.is_compiled = True
+    group_b.unified_ids = [21]
+
+    outputs = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+        [group_a, group_b],
+        [7, 8],
+        [(0,), (0,)],
+        1,
+        backend,
+    )
+
+    assert outputs is None
+    assert backend.source_target_sum_evaluated == []
 
 
 def test_unified_transform_group_requires_diagonals() -> None:
@@ -1133,6 +1217,78 @@ def test_unified_transform_group_runs_on_lattigo_backend() -> None:
         assert len(decoded) == 2
         assert float((decoded[0][:8] - x[:8]).abs().max()) <= 1.0e-4
         assert float((decoded[1][:8] - 2.0 * x[:8]).abs().max()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()
+
+
+def test_unified_transform_sources_target_sum_runs_on_lattigo_backend() -> None:
+    shared_library = Path("orion/backend/lattigo/lattigo-linux.so")
+    if not shared_library.exists():
+        pytest.skip("local Lattigo shared library has not been built")
+
+    config = {
+        "ckks_params": {
+            "LogN": 12,
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+
+        def transform(name: str, multiplier: float):
+            return SimpleNamespace(
+                name=name,
+                diagonals={(0, 0): {0: [float(multiplier)] * slots}},
+                level=level,
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, slots]),
+                output_shape=torch.Size([1, slots]),
+            )
+
+        group_a = UnifiedTransformGroup([transform("a_to_0", 1.0), transform("a_to_1", 2.0)])
+        group_b = UnifiedTransformGroup([transform("b_to_0", 3.0), transform("b_to_1", 4.0)])
+        group_a.compile_unified(scheme.backend)
+        group_b.compile_unified(scheme.backend)
+
+        x = torch.zeros(slots, dtype=torch.float32)
+        y = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        y[:8] = torch.linspace(0.2, 0.9, 8)
+        ct_x = scheme.encrypt(scheme.encode(x, level))
+        ct_y = scheme.encrypt(scheme.encode(y, level))
+
+        output_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+            [group_a, group_b],
+            [int(ct_x.ids[0]), int(ct_y.ids[0])],
+            [(0, 1), (0, 1)],
+            2,
+            scheme.backend,
+        )
+
+        assert output_ids is not None
+        decoded = []
+        for output_id in output_ids:
+            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, slots]), torch.Size([1, slots]))
+            values = out_ct.decrypt().decode().reshape(-1)
+            decoded.append(values.real if torch.is_complex(values) else values)
+
+        assert len(decoded) == 2
+        assert float((decoded[0][:8] - (x[:8] + 3.0 * y[:8])).abs().max()) <= 1.0e-3
+        assert float((decoded[1][:8] - (2.0 * x[:8] + 4.0 * y[:8])).abs().max()) <= 1.0e-3
     finally:
         scheme.delete_scheme()
 

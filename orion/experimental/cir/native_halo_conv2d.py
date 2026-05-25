@@ -2212,35 +2212,72 @@ class NativeHaloStripeNoRIConvExecutor:
         rescale_count = 0
         accumulate_count = 0
         fuse_output_rescale = bool(_unified_output_fusion_enabled())
+        sorted_groups = sorted(self.groups_by_input_index.items())
+        target_sum_output_ids: list[int] | None = None
         evaluate_started = time.time()
-        for input_index, group in sorted(self.groups_by_input_index.items()):
+        if fuse_output_rescale and sorted_groups:
             group_started = time.time()
-            output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
-            self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
-            evaluated_group_count += 1
-            for target_index, output_id in zip(self.target_indices_by_input_index[int(input_index)], output_ids):
+            target_sum_output_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+                [group for _input_index, group in sorted_groups],
+                [int(ids[int(input_index)]) for input_index, _group in sorted_groups],
+                [
+                    self.target_indices_by_input_index[int(input_index)]
+                    for input_index, _group in sorted_groups
+                ],
+                int(self.rows),
+                scheme.backend,
+            )
+            if target_sum_output_ids is not None:
+                self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
+        if target_sum_output_ids is not None:
+            if len(target_sum_output_ids) != int(self.rows):
+                raise RuntimeError(
+                    f"{self.output_node_id} target-sum reduction returned {len(target_sum_output_ids)} "
+                    f"outputs for {self.rows} targets"
+                )
+            evaluated_group_count = int(len(sorted_groups))
+            partial_count = int(
+                sum(len(self.target_indices_by_input_index[int(input_index)]) for input_index, _group in sorted_groups)
+            )
+            accumulate_count = max(0, int(partial_count) - int(len(target_sum_output_ids)))
+            for target_index, output_id in enumerate(target_sum_output_ids):
                 wrap_started = time.time()
-                partial = CipherTensor(
+                output_blocks[int(target_index)] = CipherTensor(
                     scheme,
                     [int(output_id)],
                     torch.Size([1, int(self.slots)]),
                     torch.Size([1, int(self.slots)]),
                 )
                 self.last_runtime_timing["partial_wrap_s"] += float(time.time() - wrap_started)
-                partial_count += 1
-                if not fuse_output_rescale:
-                    rescale_started = time.time()
-                    partial = _rescale_cipher_tensor(partial)
-                    self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
-                    rescale_count += 1
-                if output_blocks[int(target_index)] is None:
-                    output_blocks[int(target_index)] = partial
-                else:
-                    accumulate_started = time.time()
-                    lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
-                    output_blocks[int(target_index)] = lhs + rhs
-                    self.last_runtime_timing["partial_accumulate_s"] += float(time.time() - accumulate_started)
-                    accumulate_count += 1
+        else:
+            for input_index, group in sorted_groups:
+                group_started = time.time()
+                output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
+                self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
+                evaluated_group_count += 1
+                for target_index, output_id in zip(self.target_indices_by_input_index[int(input_index)], output_ids):
+                    wrap_started = time.time()
+                    partial = CipherTensor(
+                        scheme,
+                        [int(output_id)],
+                        torch.Size([1, int(self.slots)]),
+                        torch.Size([1, int(self.slots)]),
+                    )
+                    self.last_runtime_timing["partial_wrap_s"] += float(time.time() - wrap_started)
+                    partial_count += 1
+                    if not fuse_output_rescale:
+                        rescale_started = time.time()
+                        partial = _rescale_cipher_tensor(partial)
+                        self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                        rescale_count += 1
+                    if output_blocks[int(target_index)] is None:
+                        output_blocks[int(target_index)] = partial
+                    else:
+                        accumulate_started = time.time()
+                        lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
+                        output_blocks[int(target_index)] = lhs + rhs
+                        self.last_runtime_timing["partial_accumulate_s"] += float(time.time() - accumulate_started)
+                        accumulate_count += 1
         if fuse_output_rescale:
             for block_index, block_ct in enumerate(output_blocks):
                 if block_ct is None:
@@ -2255,7 +2292,6 @@ class NativeHaloStripeNoRIConvExecutor:
             "partial_count": int(partial_count),
             "partial_rescale_count": int(rescale_count),
             "partial_accumulate_count": int(accumulate_count),
-            "output_rescale_fusion": int(fuse_output_rescale),
             "target_count": int(self.rows),
         }
 

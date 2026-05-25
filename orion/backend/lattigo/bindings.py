@@ -901,6 +901,22 @@ class LattigoLibrary:
             restype=ArrayResultInt
         )
 
+        evaluate_sources_add = getattr(self.lib, "EvaluateLinearTransformSourcesWithSharedCacheAdd", None)
+        if evaluate_sources_add is not None:
+            self.EvaluateLinearTransformSourcesWithSharedCacheAdd = LattigoFunction(
+                evaluate_sources_add,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_int),  # ctxtIDs
+                    ctypes.c_int,  # numSources
+                    ctypes.POINTER(ctypes.c_int),  # transformIDs
+                    ctypes.POINTER(ctypes.c_int),  # targetIDs
+                    ctypes.POINTER(ctypes.c_int),  # groupOffsets
+                    ctypes.c_int,  # numPartials
+                    ctypes.c_int,  # numTargets
+                ],
+                restype=ArrayResultInt
+            )
+
         enable_profile = getattr(self.lib, "EnableLinearTransformEvaluationProfile", None)
         reset_profile = getattr(self.lib, "ResetLinearTransformEvaluationProfile", None)
         get_profile = getattr(self.lib, "GetLinearTransformEvaluationProfileCounters", None)

@@ -3594,57 +3594,86 @@ class TconvK2S2PythonRuntimeExecutor:
         fuse_output_rescale = bool(_unified_output_fusion_enabled()) and not any(
             bool(value) for value in self.complex_input_block_flags
         )
-        self.last_runtime_counts["output_rescale_fusion"] = int(fuse_output_rescale)
-        for input_unit, group in enumerate(self.groups):
-            left_block, right_block = self.input_block_pairs[int(input_unit)]
-            if bool(self.complex_input_block_flags[int(input_unit)]):
-                if right_block is None:
-                    raise RuntimeError("U22 CT-PT hybrid input block pair is missing its imaginary lane")
-                left_id = source_id_for_complex_block(int(left_block))
-                right_id = source_id_for_complex_block(int(right_block))
-                input_pack_started = time.time()
-                imag_id = int(scheme.evaluator.mul_imaginary_unit(int(right_id), +1, False))
-                input_id = int(scheme.evaluator.add_ciphertext(int(left_id), int(imag_id), False))
-                self.last_runtime_timing["input_pack_s"] += float(time.time() - input_pack_started)
-                self.last_runtime_counts["input_pack_count"] += 1
-                owned_temp_ids.extend([int(imag_id), int(input_id)])
-            else:
-                input_id = int(ids[int(left_block)])
+        target_sum_output_ids: list[int] | None = None
+        if fuse_output_rescale:
             evaluate_started = time.time()
-            output_ids = group.evaluate_unified(int(input_id), scheme.backend)
-            self.last_runtime_timing["evaluate_unified_s"] += float(time.time() - evaluate_started)
-            self.last_runtime_counts["evaluate_count"] += 1
-            self.block_evaluate_count += 1
-            for output_block, output_id in zip(self.target_indices_by_input_unit[int(input_unit)], output_ids):
-                from orion.backend.python.tensors import CipherTensor
+            target_sum_output_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+                self.groups,
+                [int(ids[int(pair[0])]) for pair in self.input_block_pairs],
+                self.target_indices_by_input_unit,
+                int(self.output_block_count),
+                scheme.backend,
+            )
+            if target_sum_output_ids is not None:
+                self.last_runtime_timing["evaluate_unified_s"] += float(time.time() - evaluate_started)
+                self.last_runtime_counts["evaluate_count"] += int(len(self.groups))
+                self.block_evaluate_count += int(len(self.groups))
+        if target_sum_output_ids is not None:
+            if len(target_sum_output_ids) != int(self.output_block_count):
+                raise RuntimeError(
+                    f"U22 experimental tconv target-sum reduction returned {len(target_sum_output_ids)} "
+                    f"outputs for {self.output_block_count} targets"
+                )
+            from orion.backend.python.tensors import CipherTensor
 
-                block_ct = CipherTensor(
+            for output_block, output_id in enumerate(target_sum_output_ids):
+                accumulated[int(output_block)] = CipherTensor(
                     scheme,
                     [int(output_id)],
                     torch.Size([1, int(scheme.params.get_slots())]),
                     torch.Size([1, int(scheme.params.get_slots())]),
                 )
-                if not fuse_output_rescale:
-                    rescale_started = time.time()
-                    block_ct = _rescale_cipher_tensor(block_ct)
-                    self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
-                    self.last_runtime_counts["rescale_count"] += 1
+        else:
+            for input_unit, group in enumerate(self.groups):
+                left_block, right_block = self.input_block_pairs[int(input_unit)]
                 if bool(self.complex_input_block_flags[int(input_unit)]):
-                    real_extract_started = time.time()
-                    conj = block_ct.conjugate(in_place=False)
-                    block_ct, conj = _align_ciphertexts_for_add(block_ct, conj)
-                    block_ct = block_ct + conj
-                    self.last_runtime_timing["real_extract_s"] += float(time.time() - real_extract_started)
-                    self.last_runtime_counts["conjugate_count"] += 1
-                    self.last_runtime_counts["real_extract_count"] += 1
-                if accumulated[int(output_block)] is None:
-                    accumulated[int(output_block)] = block_ct
+                    if right_block is None:
+                        raise RuntimeError("U22 CT-PT hybrid input block pair is missing its imaginary lane")
+                    left_id = source_id_for_complex_block(int(left_block))
+                    right_id = source_id_for_complex_block(int(right_block))
+                    input_pack_started = time.time()
+                    imag_id = int(scheme.evaluator.mul_imaginary_unit(int(right_id), +1, False))
+                    input_id = int(scheme.evaluator.add_ciphertext(int(left_id), int(imag_id), False))
+                    self.last_runtime_timing["input_pack_s"] += float(time.time() - input_pack_started)
+                    self.last_runtime_counts["input_pack_count"] += 1
+                    owned_temp_ids.extend([int(imag_id), int(input_id)])
                 else:
-                    accumulate_started = time.time()
-                    lhs, rhs = _align_ciphertexts_for_add(accumulated[int(output_block)], block_ct)
-                    accumulated[int(output_block)] = lhs + rhs
-                    self.last_runtime_timing["accumulate_s"] += float(time.time() - accumulate_started)
-                    self.last_runtime_counts["accumulate_add_count"] += 1
+                    input_id = int(ids[int(left_block)])
+                evaluate_started = time.time()
+                output_ids = group.evaluate_unified(int(input_id), scheme.backend)
+                self.last_runtime_timing["evaluate_unified_s"] += float(time.time() - evaluate_started)
+                self.last_runtime_counts["evaluate_count"] += 1
+                self.block_evaluate_count += 1
+                for output_block, output_id in zip(self.target_indices_by_input_unit[int(input_unit)], output_ids):
+                    from orion.backend.python.tensors import CipherTensor
+
+                    block_ct = CipherTensor(
+                        scheme,
+                        [int(output_id)],
+                        torch.Size([1, int(scheme.params.get_slots())]),
+                        torch.Size([1, int(scheme.params.get_slots())]),
+                    )
+                    if not fuse_output_rescale:
+                        rescale_started = time.time()
+                        block_ct = _rescale_cipher_tensor(block_ct)
+                        self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
+                        self.last_runtime_counts["rescale_count"] += 1
+                    if bool(self.complex_input_block_flags[int(input_unit)]):
+                        real_extract_started = time.time()
+                        conj = block_ct.conjugate(in_place=False)
+                        block_ct, conj = _align_ciphertexts_for_add(block_ct, conj)
+                        block_ct = block_ct + conj
+                        self.last_runtime_timing["real_extract_s"] += float(time.time() - real_extract_started)
+                        self.last_runtime_counts["conjugate_count"] += 1
+                        self.last_runtime_counts["real_extract_count"] += 1
+                    if accumulated[int(output_block)] is None:
+                        accumulated[int(output_block)] = block_ct
+                    else:
+                        accumulate_started = time.time()
+                        lhs, rhs = _align_ciphertexts_for_add(accumulated[int(output_block)], block_ct)
+                        accumulated[int(output_block)] = lhs + rhs
+                        self.last_runtime_timing["accumulate_s"] += float(time.time() - accumulate_started)
+                        self.last_runtime_counts["accumulate_add_count"] += 1
         postprocess_started = time.time()
         final_ids: list[int] = []
         for output_block, block_ct in enumerate(accumulated):
