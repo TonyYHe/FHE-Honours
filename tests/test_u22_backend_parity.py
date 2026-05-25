@@ -203,8 +203,8 @@ def test_native_halo_conv_lattigo_matches_reference_at_level_one() -> None:
                         "relayout": False,
                         "layout_mode": "native_halo_stripe",
                         "physical_layout": "native_source_stripe",
-                        "source_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
                 "node_layouts": [
@@ -214,7 +214,7 @@ def test_native_halo_conv_lattigo_matches_reference_at_level_one() -> None:
                         "fhe_shape": [1, 1, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "native_source_stripe",
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
             },

@@ -361,8 +361,8 @@ def test_u22_256_no_hybrid_same_shape_metadata_does_not_use_r34_hardcoded_plan()
         assert metadata["layout_policy_wrapper"]["native_halo_provider"] is True
         assert metadata["layout_policy_wrapper"]["relayout_edge_count"] == 0
         assert metadata["layout_policy_wrapper"]["native_physical_relayout_edge_count"] == 0
-        assert metadata["native_halo_conv2d_plan"]["spec"]["input_alpha"] == 1
-        assert metadata["native_halo_conv2d_plan"]["spec"]["input_beta"] >= 0
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_top_beta"] == 1
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_bottom_beta"] >= 0
         assert metadata["native_halo_conv2d_plan"]["output_storage_layout"] in {
             "native_halo_stripe",
             "tight_compact",
@@ -455,8 +455,8 @@ def test_native_physical_relayout_honors_source_layout_offsets() -> None:
             stride=1,
             pad=1,
             slot_count=int(scheme.params.get_slots()),
-            input_alpha=1,
-            input_beta=1,
+            input_top_beta=1,
+            input_bottom_beta=1,
         )
         plan = native_halo_conv2d_plan(spec)
         level = len(scheme.params.get_logq()) - 1
@@ -464,9 +464,9 @@ def test_native_physical_relayout_honors_source_layout_offsets() -> None:
         expected = torch.cat(native_halo_source_plaintext_blocks_from_nchw(x, plan)).to(dtype=torch.float32)
 
         for source_layout, source_tensor in (
-            ({"alpha": 0, "beta": 0, "gap": 1, "tile_count": 1}, x),
+            ({"top_beta": 0, "bottom_beta": 0, "gap": 1, "tile_count": 1}, x),
             (
-                {"alpha": 1, "beta": 1, "gap": 1, "tile_count": 1},
+                {"top_beta": 1, "bottom_beta": 1, "gap": 1, "tile_count": 1},
                 torch.cat([torch.zeros_like(x[:, :, :1, :]), x, torch.zeros_like(x[:, :, -1:, :])], dim=2),
             ),
         ):
@@ -564,7 +564,7 @@ def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
         enc1a.assigned_level = len(scheme.params.get_logq()) - 1
         enc1a.assigned_depth = 1
         enc1a.compile(scheme)
-        assert enc1a.base_executor.delegate.native_plan.spec.input_beta == 1
+        assert enc1a.base_executor.delegate.native_plan.spec.input_bottom_beta == 1
 
         executor = dag.nodes["enc3a"]["module"].region_runtime.executor
         assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
@@ -582,7 +582,7 @@ def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
         executor.compile(scheme)
         assert executor.base_executor.rows > 0
         assert executor.base_executor.cols > 0
-        assert executor.base_executor.delegate.native_plan.spec.input_beta == 16
+        assert executor.base_executor.delegate.native_plan.spec.input_bottom_beta == 16
 
         enc4a = dag.nodes["enc4a"]["module"].region_runtime.executor
         assert isinstance(enc4a, LayoutPolicyProviderRuntimeExecutor)
@@ -703,8 +703,8 @@ def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() ->
                         "relayout": False,
                         "layout_mode": "native_halo_stripe",
                         "physical_layout": "native_source_stripe",
-                        "source_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
                 "node_layouts": [
@@ -714,7 +714,7 @@ def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() ->
                         "fhe_shape": [1, 1, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "native_source_stripe",
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
             },
@@ -820,8 +820,8 @@ def test_native_halo_provider_uses_tight_compact_output_when_output_halo_is_zero
                         "relayout": False,
                         "layout_mode": "native_halo_stripe",
                         "physical_layout": "native_source_stripe",
-                        "source_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
                 "node_layouts": [
@@ -831,7 +831,7 @@ def test_native_halo_provider_uses_tight_compact_output_when_output_halo_is_zero
                         "fhe_shape": [1, 1, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "packed_compact",
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
             },
@@ -912,9 +912,9 @@ def test_native_halo_provider_accepts_compact_source_layout_without_input_pair_f
                         "relayout": False,
                         "layout_mode": "halo_local",
                         "physical_layout": "packed_compact",
-                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
-                        "source_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "required_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
                 "node_layouts": [
@@ -924,7 +924,7 @@ def test_native_halo_provider_accepts_compact_source_layout_without_input_pair_f
                         "fhe_shape": [1, 2, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "packed_compact",
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
             },
@@ -998,9 +998,9 @@ def test_native_halo_provider_uses_physical_compact_layout_for_raw_input_source(
                         "relayout": False,
                         "layout_mode": "halo_local",
                         "physical_layout": "packed_compact",
-                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
-                        "source_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
-                        "selected_layout": {"alpha": 1, "beta": 3, "stride": 1, "gap": 1, "tile_count": 1},
+                        "required_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "source_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 3, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
                 "node_layouts": [
@@ -1010,7 +1010,7 @@ def test_native_halo_provider_uses_physical_compact_layout_for_raw_input_source(
                         "fhe_shape": [1, 2, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "packed_compact",
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
             },
@@ -1034,10 +1034,10 @@ def test_native_halo_provider_uses_physical_compact_layout_for_raw_input_source(
 
         assert isinstance(executor.base_executor.delegate, NativeHaloStripeNoRIConvExecutor)
         assert executor.last_runtime_io["input_physical_layout"] == "packed_compact"
-        assert metadata["compact_source_layout"]["alpha"] == 0
-        assert metadata["compact_source_layout"]["beta"] == 0
-        assert metadata["native_halo_conv2d_plan"]["spec"]["input_alpha"] == 1
-        assert metadata["native_halo_conv2d_plan"]["spec"]["input_beta"] == 1
+        assert metadata["compact_source_layout"]["top_beta"] == 0
+        assert metadata["compact_source_layout"]["bottom_beta"] == 0
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_top_beta"] == 1
+        assert metadata["native_halo_conv2d_plan"]["spec"]["input_bottom_beta"] == 1
         assert float((decoded - reference).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()
@@ -1065,7 +1065,7 @@ def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None
         conv.set_level(level)
         conv.set_depth(2)
 
-        halo_layout = {"alpha": 1, "beta": 2, "stride": 1, "gap": 1, "tile_count": 1}
+        halo_layout = {"top_beta": 1, "bottom_beta": 2, "stride": 1, "gap": 1, "tile_count": 1}
         executor = LayoutPolicyProviderRuntimeExecutor(
             base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
             output_node_id="conv",
@@ -1082,7 +1082,7 @@ def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None
                         "relayout": False,
                         "layout_mode": "halo_local",
                         "physical_layout": "logical_halo_compact",
-                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "required_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                         "source_layout": dict(halo_layout),
                         "selected_layout": dict(halo_layout),
                     }
@@ -1094,7 +1094,7 @@ def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None
                         "fhe_shape": [1, 1, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "packed_compact",
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
             },
@@ -1118,8 +1118,8 @@ def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None
         reference = F.conv2d(x, conv.on_weight.detach(), None, padding=1)
         metadata = executor.compile_cache_metadata()
 
-        assert metadata["compact_source_layout"]["alpha"] == 1
-        assert metadata["compact_source_layout"]["beta"] == 2
+        assert metadata["compact_source_layout"]["top_beta"] == 1
+        assert metadata["compact_source_layout"]["bottom_beta"] == 2
         assert float((decoded - reference).abs().max().item()) <= 1.0e-5
     finally:
         scheme.delete_scheme()
@@ -1169,8 +1169,8 @@ def test_node_specific_benchmark_u22_provider_helper_uses_full_default_provider_
         halo_edges = [
             row
             for row in graph["layout_policy_edge_layouts"]
-            if int(dict(row.get("selected_layout", {})).get("alpha", 0)) > 0
-            or int(dict(row.get("selected_layout", {})).get("beta", 0)) > 0
+            if int(dict(row.get("selected_layout", {})).get("top_beta", 0)) > 0
+            or int(dict(row.get("selected_layout", {})).get("bottom_beta", 0)) > 0
         ]
 
         assert audit["attached_count"] == 26
@@ -1337,7 +1337,7 @@ def test_u22_decoder_tconv_provider_supports_actual_base64_tiny_at_logn16() -> N
         scheme.delete_scheme()
 
 
-def test_u22_tconv_provider_fuses_output_beta_relayout_on_python_backend() -> None:
+def test_u22_tconv_provider_fuses_output_bottom_beta_relayout_on_python_backend() -> None:
     _init_python_scheme(logn=8)
     try:
         module = ConvTranspose2d(
@@ -1360,16 +1360,16 @@ def test_u22_tconv_provider_fuses_output_beta_relayout_on_python_backend() -> No
         module.output_gap = 1
         module.fhe_input_shape = torch.Size((1, 1, 4, 4))
         module.fhe_output_shape = torch.Size((1, 1, 5, 4))
-        module.layout_policy_output_layout = {"alpha": 0, "beta": 1, "gap": 1}
+        module.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 1, "gap": 1}
         module.layout_policy_output_materialization = "fused_relayout"
         module.set_level(len(scheme.params.get_logq()) - 1)
 
         runtime = TconvK2S2PythonRuntimeExecutor(
             module=module,
-            output_node_id="synthetic_tconv_fused_output_beta",
+            output_node_id="synthetic_tconv_fused_output_bottom_beta",
         )
         x = torch.arange(1, 5, dtype=torch.float32).reshape(1, 2, 2)
-        out = runtime(_encode_input(module, x))["synthetic_tconv_fused_output_beta"]
+        out = runtime(_encode_input(module, x))["synthetic_tconv_fused_output_bottom_beta"]
         decoded = out.decrypt().decode().detach().cpu()
         if torch.is_complex(decoded):
             decoded = decoded.real

@@ -67,14 +67,14 @@ def test_layout_policy_runtime_config_uses_resnet_e2e_logq_budget() -> None:
 
 def _layout_key(row: dict) -> tuple[int, int, int, int]:
     layout = row["selected_layout"]
-    return int(layout["alpha"]), int(layout["beta"]), int(layout["stride"]), int(layout["gap"])
+    return int(layout["top_beta"]), int(layout["bottom_beta"]), int(layout["stride"]), int(layout["gap"])
 
 
 def _layout_covers(selected: dict, required: dict) -> bool:
     return (
         int(selected["gap"]) == int(required["gap"])
-        and int(selected["alpha"]) >= int(required["alpha"])
-        and int(selected["beta"]) >= int(required["beta"])
+        and int(selected["top_beta"]) >= int(required["top_beta"])
+        and int(selected["bottom_beta"]) >= int(required["bottom_beta"])
         and int(selected["stride"]) >= int(required["stride"])
     )
 
@@ -177,11 +177,11 @@ def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
         assert policy["relayouts"] == 0
         assert policy["halo_redundancy_ratio"] == 0.0
         assert all(
-            int(row["required_layout"]["alpha"]) == 0 and int(row["required_layout"]["beta"]) == 0
+            int(row["required_layout"]["top_beta"]) == 0 and int(row["required_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
         assert all(
-            int(row["selected_layout"]["alpha"]) == 0 and int(row["selected_layout"]["beta"]) == 0
+            int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
 
@@ -196,11 +196,11 @@ def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() ->
         assert policy["relayouts"] == 0
         assert policy["halo_redundancy_ratio"] == 0.0
         assert all(
-            int(row["required_layout"]["alpha"]) == 0 and int(row["required_layout"]["beta"]) == 0
+            int(row["required_layout"]["top_beta"]) == 0 and int(row["required_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
         assert all(
-            int(row["selected_layout"]["alpha"]) == 0 and int(row["selected_layout"]["beta"]) == 0
+            int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
 
@@ -395,7 +395,7 @@ def test_non_dp_layout_policy_executor_uses_encrypted_module_backend() -> None:
                         "target": "conv",
                         "shape": [1, 1, 4, 4],
                         "relayout": True,
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1},
                     },
                 ],
             },
@@ -448,7 +448,7 @@ def test_layout_policy_relayout_kernel_fills_and_roundtrips_compact_halo_layout(
             "source": "input",
             "target": "conv",
             "shape": [1, 1, 2, 3],
-            "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+            "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1},
         }
         x = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3)
         level = len(scheme.params.get_logq()) - 1
@@ -490,7 +490,7 @@ def test_layout_policy_relayout_kernel_fuses_output_affine() -> None:
             "source": "input",
             "target": "conv",
             "shape": [1, 1, 2, 3],
-            "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+            "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1},
         }
         x = torch.arange(6, dtype=torch.float32).reshape(1, 1, 2, 3)
         level = len(scheme.params.get_logq()) - 1
@@ -519,7 +519,7 @@ def test_layout_policy_relayout_kernel_maps_packed_gap_halo_rows_from_neighbors(
         "source": "input",
         "target": "conv",
         "shape": [1, 4, 3, 2],
-        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 2},
+        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 2},
     }
     kernel = LayoutPolicyRelayoutKernel(
         edge_row=edge_row,
@@ -547,7 +547,7 @@ def test_layout_policy_relayout_kernel_counts_one_rotation_and_mask_per_halo_sid
         "source": "input",
         "target": "conv",
         "shape": [1, 1, 4, 4],
-        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
     }
     pad = LayoutPolicyRelayoutKernel(edge_row=edge_row, node="conv", direction="compact_to_halo", index=0)
     estimate = pad.operation_estimate()
@@ -561,8 +561,8 @@ def test_layout_policy_relayout_kernel_counts_one_rotation_and_mask_per_halo_sid
 def test_layout_policy_add_runtime_materializes_common_halo_join() -> None:
     _init_python_scheme("")
     try:
-        compact = {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1}
-        halo = {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1}
+        compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1}
+        halo = {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1}
         rows = [
             {
                 "edge": "left->add",
@@ -621,8 +621,8 @@ def test_layout_policy_add_runtime_materializes_common_halo_join() -> None:
 def test_layout_policy_add_runtime_distributes_bootstrap_affine_over_relayout_inputs() -> None:
     _init_python_scheme("")
     try:
-        compact = {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1}
-        halo = {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1}
+        compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1}
+        halo = {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1}
         rows = [
             {
                 "edge": f"{source}->add",
@@ -700,7 +700,7 @@ def test_layout_policy_provider_runtime_shape_reflects_output_relayout() -> None
                     "node": "conv",
                     "shape": [1, 1, 4, 4],
                     "fhe_shape": [1, 1, 4, 4],
-                    "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     "output_relayout": True,
                 }
             ],
@@ -724,7 +724,7 @@ def test_layout_policy_provider_runtime_shape_reflects_fused_output_halo_without
                     "node": "pool",
                     "shape": [1, 1, 4, 4],
                     "fhe_shape": [1, 1, 4, 4],
-                    "selected_layout": {"alpha": 0, "beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    "selected_layout": {"top_beta": 0, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     "output_relayout": False,
                     "producer_materialized_halo": True,
                 }
@@ -736,7 +736,7 @@ def test_layout_policy_provider_runtime_shape_reflects_fused_output_halo_without
     assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
 
 
-def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
+def test_input_pair_pool_provider_fuses_output_bottom_beta_relayout() -> None:
     _init_python_scheme("")
     try:
         pool = AvgPool2d(kernel_size=2, stride=2, padding=0)
@@ -747,7 +747,7 @@ def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
         pool.fhe_output_shape = torch.Size((1, 1, 3, 2))
         pool.input_gap = 1
         pool.output_gap = 1
-        pool.layout_policy_output_layout = {"alpha": 0, "beta": 1, "gap": 1}
+        pool.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 1, "gap": 1}
         pool.layout_policy_output_materialization = "fused_relayout"
         pool.update_params()
         pool.set_level(len(scheme.params.get_logq()) - 1)
@@ -865,15 +865,15 @@ def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback
         up_add = dict(edge_rows[add_edge])
         add_dec = dict(edge_rows[consumer_edge])
         assert bool(up_add["relayout"]) is False
-        if int(up_layout["alpha"]) > 0 or int(up_layout["beta"]) > 0:
-            assert int(up_layout["alpha"]) == 1
-            assert int(up_layout["beta"]) == 0
+        if int(up_layout["top_beta"]) > 0 or int(up_layout["bottom_beta"]) > 0:
+            assert int(up_layout["top_beta"]) == 1
+            assert int(up_layout["bottom_beta"]) == 0
             assert int(up_layout["stride"]) == 2
             assert node_rows[up_node]["producer_materialized_halo_reason"] == "dp_logical_halo_materialized_output"
             assert int(node_rows[up_node]["producer_fused_rotation_estimate"]) == 0
         else:
-            assert int(up_layout["alpha"]) == 0
-            assert int(up_layout["beta"]) == 0
+            assert int(up_layout["top_beta"]) == 0
+            assert int(up_layout["bottom_beta"]) == 0
             assert add_dec["layout_mode"] == "compact_align_shared"
             assert add_dec["physical_layout"] == "packed_compact"
             assert bool(add_dec["relayout"]) is False
@@ -881,8 +881,8 @@ def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback
 
     dec1a_layout = dict(node_rows["dec1a"]["selected_layout"])
     add1_dec = dict(edge_rows["add1->dec1a"])
-    assert int(dec1a_layout["alpha"]) == 0
-    assert int(dec1a_layout["beta"]) == 0
+    assert int(dec1a_layout["top_beta"]) == 0
+    assert int(dec1a_layout["bottom_beta"]) == 0
     assert add1_dec["layout_mode"] == "compact_align_shared"
     assert add1_dec["physical_layout"] == "packed_compact"
     assert bool(add1_dec["relayout"]) is False
@@ -983,15 +983,15 @@ def test_orion_dense_policy_simulates_no_halo_compact_baseline() -> None:
     assert int(plan["summary"]["consumer_fused_relayout_count"]) == 0
     assert int(plan["summary"]["producer_fused_materialization_count"]) == 0
     assert all(
-        int(row["selected_layout"]["alpha"]) == 0
-        and int(row["selected_layout"]["beta"]) == 0
+        int(row["selected_layout"]["top_beta"]) == 0
+        and int(row["selected_layout"]["bottom_beta"]) == 0
         and row["physical_layout"] == "packed_compact"
         and row["layout_mode"] == "orion_dense"
         for row in plan["edge_layouts"]
     )
     assert all(
-        int(row["selected_layout"]["alpha"]) == 0
-        and int(row["selected_layout"]["beta"]) == 0
+        int(row["selected_layout"]["top_beta"]) == 0
+        and int(row["selected_layout"]["bottom_beta"]) == 0
         and row["physical_layout"] == "packed_compact"
         for row in plan["node_layouts"]
     )
@@ -1164,7 +1164,7 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
                         "target": "conv",
                         "shape": [1, 1, 4, 4],
                         "relayout": True,
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1},
                     },
                 ],
                 "node_layouts": [
@@ -1172,7 +1172,7 @@ def test_layout_policy_provider_wrapper_runs_input_pair_provider_after_relayout(
                         "node": "conv",
                         "shape": [1, 1, 4, 4],
                         "fhe_shape": [1, 1, 4, 4],
-                        "selected_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1},
                     },
                 ],
             },
@@ -1272,9 +1272,9 @@ def test_layout_policy_provider_wrapper_runs_consumer_fused_compact_align_shared
                         "op_kind": "conv2d",
                         "shape": [1, 1, 4, 4],
                         "fhe_shape": [1, 1, 4, 4],
-                        "required_layout": {"alpha": 1, "beta": 1, "stride": 1, "gap": 1},
-                        "source_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "required_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1},
+                        "source_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "tile_count": 1},
                         "layout_mode": "compact_align_shared",
                         "physical_layout": "packed_compact",
                         "relayout": False,
@@ -1287,7 +1287,7 @@ def test_layout_policy_provider_wrapper_runs_consumer_fused_compact_align_shared
                         "node": "conv",
                         "shape": [1, 1, 4, 4],
                         "fhe_shape": [1, 1, 4, 4],
-                        "selected_layout": {"alpha": 0, "beta": 0, "stride": 1, "gap": 1},
+                        "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1},
                         "physical_layout": "packed_compact",
                         "output_relayout": False,
                     },

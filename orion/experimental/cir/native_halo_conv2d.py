@@ -60,8 +60,16 @@ def _compact_ct_count(channel_count: int, height: int, width: int, gap: int, slo
     return max(1, _ceil_div(int(active_slots), int(slots)))
 
 
+def _layout_top_beta(layout: dict[str, Any], *, default: int = 0) -> int:
+    return max(0, int(layout.get("top_beta", layout.get("alpha", int(default))) or 0))
+
+
+def _layout_bottom_beta(layout: dict[str, Any], *, default: int = 0) -> int:
+    return max(0, int(layout.get("bottom_beta", layout.get("beta", int(default))) or 0))
+
+
 def _spec_has_output_halo(spec: NativeHaloConv2DSpec) -> bool:
-    return bool(int(spec.output_alpha) > 0 or int(spec.output_beta) > 0)
+    return bool(int(spec.output_top_beta) > 0 or int(spec.output_bottom_beta) > 0)
 
 
 def _slot_indices(channel_count: int, height: int, width: int, gap: int) -> torch.Tensor:
@@ -150,19 +158,19 @@ def _native_halo_build_pair_chunk_limit() -> int:
     return 8_000_000
 
 
-def _materialized_output_source_h(output_h: torch.Tensor | int, *, h_out: int, output_alpha: int, output_beta: int):
+def _materialized_output_source_h(output_h: torch.Tensor | int, *, h_out: int, output_top_beta: int, output_bottom_beta: int):
     if isinstance(output_h, torch.Tensor):
         values = output_h.clone().to(dtype=torch.int64)
         top = values < 0
         bottom = values >= int(h_out)
-        values[top] = values[top] + int(output_alpha)
-        values[bottom] = values[bottom] - int(output_beta)
+        values[top] = values[top] + int(output_top_beta)
+        values[bottom] = values[bottom] - int(output_bottom_beta)
         return values.clamp(0, max(0, int(h_out) - 1))
     value = int(output_h)
     if int(value) < 0:
-        value += int(output_alpha)
+        value += int(output_top_beta)
     elif int(value) >= int(h_out):
-        value -= int(output_beta)
+        value -= int(output_bottom_beta)
     return min(max(int(value), 0), max(0, int(h_out) - 1))
 
 
@@ -243,26 +251,26 @@ class NativeHaloConv2DSpec:
     dilation: int = 1
     groups: int = 1
     slot_count: int = RING_SLOT_COUNT
-    input_alpha: int = 0
-    input_beta: int = 0
-    output_alpha: int = 0
-    output_beta: int = 0
+    input_top_beta: int = 0
+    input_bottom_beta: int = 0
+    output_top_beta: int = 0
+    output_bottom_beta: int = 0
 
     @property
     def input_h_min(self) -> int:
-        return -max(0, int(self.input_alpha))
+        return -max(0, int(self.input_top_beta))
 
     @property
     def input_h_max(self) -> int:
-        return int(self.h_in) + max(0, int(self.input_beta))
+        return int(self.h_in) + max(0, int(self.input_bottom_beta))
 
     @property
     def output_h_min(self) -> int:
-        return -max(0, int(self.output_alpha))
+        return -max(0, int(self.output_top_beta))
 
     @property
     def output_h_max(self) -> int:
-        return int(self.h_out) + max(0, int(self.output_beta))
+        return int(self.h_out) + max(0, int(self.output_bottom_beta))
 
     @property
     def weight_shape(self) -> tuple[int, int, int, int]:
@@ -290,10 +298,10 @@ class NativeHaloConv2DSpec:
             "dilation": int(self.dilation),
             "groups": int(self.groups),
             "slot_count": int(self.slot_count),
-            "input_alpha": int(self.input_alpha),
-            "input_beta": int(self.input_beta),
-            "output_alpha": int(self.output_alpha),
-            "output_beta": int(self.output_beta),
+            "input_top_beta": int(self.input_top_beta),
+            "input_bottom_beta": int(self.input_bottom_beta),
+            "output_top_beta": int(self.output_top_beta),
+            "output_bottom_beta": int(self.output_bottom_beta),
         }
 
 
@@ -473,10 +481,10 @@ def native_halo_conv2d_spec_from_module(module: Any, *, output_node_id: str) -> 
         dilation=int(dilation[0]),
         groups=int(groups),
         slot_count=int(slot_count),
-        input_alpha=max(0, int(input_layout.get("alpha", 0) or 0)),
-        input_beta=max(0, int(input_layout.get("beta", 0) or 0)),
-        output_alpha=max(0, int(output_layout.get("alpha", 0) or 0)),
-        output_beta=max(0, int(output_layout.get("beta", 0) or 0)),
+        input_top_beta=_layout_top_beta(input_layout),
+        input_bottom_beta=_layout_bottom_beta(input_layout),
+        output_top_beta=_layout_top_beta(output_layout),
+        output_bottom_beta=_layout_bottom_beta(output_layout),
     )
 
 
@@ -798,26 +806,26 @@ class NativeHaloRelayoutKernel:
         self.transform_ids: dict[tuple[int, int], int] = {}
 
     def _compact_input_index(self, *, channel: int, h: int, w: int) -> int | None:
-        source_alpha = max(0, int(self.source_layout.get("alpha", self.spec.input_alpha) or 0))
-        source_beta = max(0, int(self.source_layout.get("beta", self.spec.input_beta) or 0))
+        source_top_beta = _layout_top_beta(self.source_layout, default=self.spec.input_top_beta)
+        source_bottom_beta = _layout_bottom_beta(self.source_layout, default=self.spec.input_bottom_beta)
         if int(h) < 0:
-            if int(h) < -int(source_alpha):
+            if int(h) < -int(source_top_beta):
                 return None
-            source_h = int(h) + int(source_alpha)
+            source_h = int(h) + int(source_top_beta)
         elif int(h) >= int(self.spec.h_in):
-            if int(h) >= int(self.spec.h_in) + int(source_beta):
+            if int(h) >= int(self.spec.h_in) + int(source_bottom_beta):
                 return None
-            source_h = int(source_alpha) + int(h)
+            source_h = int(source_top_beta) + int(h)
         else:
-            source_h = int(source_alpha) + int(h)
-        source_height = int(self.spec.h_in) + int(source_alpha) + int(source_beta)
+            source_h = int(source_top_beta) + int(h)
+        source_height = int(self.spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
         if int(source_h) < 0 or int(source_h) >= int(source_height):
             return None
         return _idx_chw_gap(
             int(channel),
             int(source_h),
             int(w),
-            int(self.spec.h_in) + int(source_alpha) + int(source_beta),
+            int(self.spec.h_in) + int(source_top_beta) + int(source_bottom_beta),
             int(self.spec.w_in),
             int(self.spec.gap_in),
         )
@@ -825,9 +833,9 @@ class NativeHaloRelayoutKernel:
     def _compact_output_index(self, *, channel: int, h: int, w: int) -> int:
         return _idx_chw_gap(
             int(channel),
-            int(h) + max(0, int(self.spec.output_alpha)),
+            int(h) + max(0, int(self.spec.output_top_beta)),
             int(w),
-            int(self.spec.h_out) + max(0, int(self.spec.output_alpha)) + max(0, int(self.spec.output_beta)),
+            int(self.spec.h_out) + max(0, int(self.spec.output_top_beta)) + max(0, int(self.spec.output_bottom_beta)),
             int(self.spec.w_out),
             int(self.spec.gap_out),
         )
@@ -1020,8 +1028,8 @@ def _build_conv_transform(
                 _materialized_output_source_h(
                     out_h_values,
                     h_out=int(spec.h_out),
-                    output_alpha=int(spec.output_alpha),
-                    output_beta=int(spec.output_beta),
+                    output_top_beta=int(spec.output_top_beta),
+                    output_bottom_beta=int(spec.output_bottom_beta),
                 )
                 if bool(compact_output)
                 else out_h_values
@@ -1082,10 +1090,10 @@ def _build_conv_transform(
                     gap=int(spec.gap_in),
                 )
                 if bool(compact_output):
-                    compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+                    compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
                     target_index = _idx_chw_gap_channel_positions(
                         target_channels,
-                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_alpha)),
+                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
                         w=out_w_flat[int(start): int(end)],
                         height=int(compact_output_h),
                         width=int(spec.w_out),
@@ -1185,7 +1193,7 @@ def _build_conv_transforms_for_compact_output(
         return []
 
     target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
-    compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+    compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
     key_parts_by_block: dict[int, list[torch.Tensor]] = {}
     value_parts_by_block: dict[int, list[torch.Tensor]] = {}
     source_channels = torch.arange(int(source_count), dtype=torch.int64)
@@ -1215,8 +1223,8 @@ def _build_conv_transforms_for_compact_output(
             op_out_h_values = _materialized_output_source_h(
                 out_h_values,
                 h_out=int(spec.h_out),
-                output_alpha=int(spec.output_alpha),
-                output_beta=int(spec.output_beta),
+                output_top_beta=int(spec.output_top_beta),
+                output_bottom_beta=int(spec.output_bottom_beta),
             )
             in_h_values = (
                 op_out_h_values * int(spec.stride)
@@ -1268,7 +1276,7 @@ def _build_conv_transforms_for_compact_output(
                 )
                 compact_slots = _idx_chw_gap_channel_positions(
                     target_channels,
-                    h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_alpha)),
+                    h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
                     w=out_w_flat[int(start): int(end)],
                     height=int(compact_output_h),
                     width=int(spec.w_out),
@@ -1343,20 +1351,20 @@ def _compact_source_index(
     h: int,
     w: int,
 ) -> int | None:
-    source_alpha = max(0, int(source_layout.get("alpha", spec.input_alpha) or 0))
-    source_beta = max(0, int(source_layout.get("beta", spec.input_beta) or 0))
+    source_top_beta = max(0, int(_layout_top_beta(source_layout, default=spec.input_top_beta) or 0))
+    source_bottom_beta = max(0, int(_layout_bottom_beta(source_layout, default=spec.input_bottom_beta) or 0))
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     if int(h) < 0:
-        if int(h) < -int(source_alpha):
+        if int(h) < -int(source_top_beta):
             return None
-        source_h = int(h) + int(source_alpha)
+        source_h = int(h) + int(source_top_beta)
     elif int(h) >= int(spec.h_in):
-        if int(h) >= int(spec.h_in) + int(source_beta):
+        if int(h) >= int(spec.h_in) + int(source_bottom_beta):
             return None
-        source_h = int(source_alpha) + int(h)
+        source_h = int(source_top_beta) + int(h)
     else:
-        source_h = int(source_alpha) + int(h)
-    source_height = int(spec.h_in) + int(source_alpha) + int(source_beta)
+        source_h = int(source_top_beta) + int(h)
+    source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
     if int(source_h) < 0 or int(source_h) >= int(source_height):
         return None
     return _idx_chw_gap(
@@ -1395,10 +1403,10 @@ def _build_compact_source_conv_transform(
     )
     source_channels = torch.arange(int(spec.c_in), dtype=torch.int64)
     target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
-    source_alpha = max(0, int(source_layout.get("alpha", spec.input_alpha) or 0))
-    source_beta = max(0, int(source_layout.get("beta", spec.input_beta) or 0))
+    source_top_beta = max(0, int(_layout_top_beta(source_layout, default=spec.input_top_beta) or 0))
+    source_bottom_beta = max(0, int(_layout_bottom_beta(source_layout, default=spec.input_bottom_beta) or 0))
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
-    source_height = int(spec.h_in) + int(source_alpha) + int(source_beta)
+    source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
     key_parts: list[torch.Tensor] = []
     value_parts: list[torch.Tensor] = []
     out_h_values = torch.arange(
@@ -1417,8 +1425,8 @@ def _build_compact_source_conv_transform(
                 _materialized_output_source_h(
                     out_h_values,
                     h_out=int(spec.h_out),
-                    output_alpha=int(spec.output_alpha),
-                    output_beta=int(spec.output_beta),
+                    output_top_beta=int(spec.output_top_beta),
+                    output_bottom_beta=int(spec.output_bottom_beta),
                 )
                 if bool(compact_output)
                 else out_h_values
@@ -1444,7 +1452,7 @@ def _build_compact_source_conv_transform(
                 continue
 
             valid_out_h = out_h_values[valid_h]
-            valid_source_h = int(source_alpha) + in_h_values[valid_h]
+            valid_source_h = int(source_top_beta) + in_h_values[valid_h]
             valid_out_w = out_w_values[valid_w]
             valid_source_w = in_w_values[valid_w]
             grid_h, grid_w = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
@@ -1483,11 +1491,11 @@ def _build_compact_source_conv_transform(
 
                 if bool(compact_output):
                     compact_output_h = (
-                        int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+                        int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
                     )
                     target_index = _idx_chw_gap_channel_positions(
                         target_channels,
-                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_alpha)),
+                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
                         w=out_w_flat[int(start): int(end)],
                         height=int(compact_output_h),
                         width=int(spec.w_out),
@@ -1655,15 +1663,15 @@ class NativeHaloStripeNoRIConvExecutor:
     def _compact_source_layout(self) -> dict[str, int]:
         layout = dict(getattr(self.module, "layout_policy_input_layout", {}) or {})
         return {
-            "alpha": max(0, int(layout.get("alpha", 0) or 0)),
-            "beta": max(0, int(layout.get("beta", 0) or 0)),
+            "top_beta": _layout_top_beta(layout),
+            "bottom_beta": _layout_bottom_beta(layout),
             "gap": max(1, int(layout.get("gap", self.native_plan.spec.gap_in) or 1)),
         }
 
     def _compact_source_ct_count(self) -> int:
         spec = self.native_plan.spec
         layout = self._compact_source_layout()
-        height = int(spec.h_in) + int(layout["alpha"]) + int(layout["beta"])
+        height = int(spec.h_in) + int(layout["top_beta"]) + int(layout["bottom_beta"])
         return _compact_ct_count(
             int(spec.c_in),
             int(height),
@@ -1674,7 +1682,7 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def _compact_output_ct_count(self) -> int:
         spec = self.native_plan.spec
-        height = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+        height = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
         return _compact_ct_count(
             int(spec.c_out),
             int(height),
@@ -1696,26 +1704,26 @@ class NativeHaloStripeNoRIConvExecutor:
             trust_selected_layout = bool(
                 getattr(self.module, "layout_policy_trust_selected_compact_input_layout", False)
             )
-            selected_alpha = max(0, int(input_layout.get("alpha", 0) or 0))
-            selected_beta = max(0, int(input_layout.get("beta", 0) or 0))
-            required_alpha = max(0, int(required_input_layout.get("alpha", 0) or 0))
-            required_beta = max(0, int(required_input_layout.get("beta", 0) or 0))
+            selected_top_beta = _layout_top_beta(input_layout)
+            selected_bottom_beta = _layout_bottom_beta(input_layout)
+            required_top_beta = _layout_top_beta(required_input_layout)
+            required_bottom_beta = _layout_bottom_beta(required_input_layout)
             selected_gap = max(1, int(input_layout.get("gap", self.spec.gap_in) or 1))
             required_gap = max(1, int(required_input_layout.get("gap", self.spec.gap_in) or 1))
             if (
                 not bool(trust_selected_layout)
                 or int(selected_gap) != int(required_gap)
-                or int(selected_alpha) < int(required_alpha)
-                or int(selected_beta) < int(required_beta)
+                or int(selected_top_beta) < int(required_top_beta)
+                or int(selected_bottom_beta) < int(required_bottom_beta)
             ):
                 input_layout = required_input_layout
         output_layout = dict(getattr(self.module, "layout_policy_output_layout", {}) or {})
         return replace(
             self.spec,
-            input_alpha=max(0, int(input_layout.get("alpha", 0) or 0)),
-            input_beta=max(0, int(input_layout.get("beta", 0) or 0)),
-            output_alpha=max(0, int(output_layout.get("alpha", 0) or 0)),
-            output_beta=max(0, int(output_layout.get("beta", 0) or 0)),
+            input_top_beta=_layout_top_beta(input_layout),
+            input_bottom_beta=_layout_bottom_beta(input_layout),
+            output_top_beta=_layout_top_beta(output_layout),
+            output_bottom_beta=_layout_bottom_beta(output_layout),
         )
 
     def _refresh_runtime_plan(self) -> bool:
@@ -1783,7 +1791,7 @@ class NativeHaloStripeNoRIConvExecutor:
         start = int(block_index) * int(self.slots)
         stop = int(start) + int(self.slots)
         out = torch.zeros((int(self.slots),), dtype=torch.float32)
-        compact_output_h = int(spec.h_out) + max(0, int(spec.output_alpha)) + max(0, int(spec.output_beta))
+        compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
         out_h = torch.arange(int(compact_output_h), dtype=torch.int64).repeat_interleave(int(spec.w_out))
         out_w = torch.arange(int(spec.w_out), dtype=torch.int64).repeat(int(compact_output_h))
         channels = torch.arange(int(spec.c_out), dtype=torch.int64)

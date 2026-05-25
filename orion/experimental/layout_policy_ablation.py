@@ -124,8 +124,8 @@ class NetworkSpec:
 
 @dataclass(frozen=True)
 class LayoutState:
-    alpha: int
-    beta: int
+    top_beta: int
+    bottom_beta: int
     stride: int
     gap: int
     core_slots: int
@@ -137,13 +137,13 @@ class LayoutState:
         return max(0, int(self.stored_slots) - int(self.core_slots))
 
     def key(self) -> tuple[int, int, int, int]:
-        return int(self.alpha), int(self.beta), int(self.stride), int(self.gap)
+        return int(self.top_beta), int(self.bottom_beta), int(self.stride), int(self.gap)
 
     def covers(self, other: "LayoutState") -> bool:
         return (
             int(self.gap) == int(other.gap)
-            and int(self.alpha) >= int(other.alpha)
-            and int(self.beta) >= int(other.beta)
+            and int(self.top_beta) >= int(other.top_beta)
+            and int(self.bottom_beta) >= int(other.bottom_beta)
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -426,8 +426,8 @@ def _layout_for_shape(
     *,
     shape: tuple[int, int, int, int],
     gap: int,
-    alpha: int,
-    beta: int,
+    top_beta: int,
+    bottom_beta: int,
     stride: int,
     slots: int,
 ) -> LayoutState:
@@ -435,11 +435,11 @@ def _layout_for_shape(
     phase = max(1, int(gap) * int(gap))
     channel_groups = _ceil_div(int(channels), int(phase))
     core_slots = int(channel_groups * int(height) * int(gap) * int(width) * int(gap))
-    stored_h = int(height) * int(gap) + int(alpha + beta) * int(gap)
+    stored_h = int(height) * int(gap) + int(top_beta + bottom_beta) * int(gap)
     stored_slots = int(channel_groups * int(stored_h) * int(width) * int(gap))
     return LayoutState(
-        alpha=int(alpha),
-        beta=int(beta),
+        top_beta=int(top_beta),
+        bottom_beta=int(bottom_beta),
         stride=int(stride),
         gap=int(gap),
         core_slots=int(core_slots),
@@ -456,7 +456,7 @@ def _fhe_shape_for_layout(
     n, channels, height, width = (int(value) for value in shape)
     gap = max(1, int(layout.gap))
     on_channels = _ceil_div(int(channels), int(gap * gap))
-    on_height = int(height * gap + (int(layout.alpha) + int(layout.beta)) * gap)
+    on_height = int(height * gap + (int(layout.top_beta) + int(layout.bottom_beta)) * gap)
     on_width = int(width * gap)
     return int(n), int(on_channels), int(on_height), int(on_width)
 
@@ -600,22 +600,22 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
     for source, target in dag.edges:
         target_module = dag.nodes[target].get("module")
         shape, fhe_shape, gap = _edge_shapes(dag, str(source), str(target))
-        alpha, beta, stride, op_kind, lt_base = _consumer_requirement(target_module)
+        top_beta, bottom_beta, stride, op_kind, lt_base = _consumer_requirement(target_module)
         output_shape, output_fhe_shape = _consumer_output_shapes(target_module, shape, fhe_shape)
         op_params = _consumer_op_params(target_module, input_shape=shape, output_shape=output_shape)
         if (
             str(op_kind) in {"conv2d", "avgpool2d"}
-            and (int(alpha) > 0 or int(beta) > 0)
+            and (int(top_beta) > 0 or int(bottom_beta) > 0)
             and _compact_height_strip_fits_single_ct(shape=shape, gap=int(gap), slots=int(slots))
         ):
-            alpha = 0
-            beta = 0
-        compact = _layout_for_shape(shape=shape, gap=int(gap), alpha=0, beta=0, stride=1, slots=int(slots))
+            top_beta = 0
+            bottom_beta = 0
+        compact = _layout_for_shape(shape=shape, gap=int(gap), top_beta=0, bottom_beta=0, stride=1, slots=int(slots))
         requirement = _layout_for_shape(
             shape=shape,
             gap=int(gap),
-            alpha=int(alpha),
-            beta=int(beta),
+            top_beta=int(top_beta),
+            bottom_beta=int(bottom_beta),
             stride=int(stride),
             slots=int(slots),
         )
@@ -652,8 +652,8 @@ def _same_layout(left: LayoutState, right: LayoutState) -> bool:
 
 def _same_physical_layout(left: LayoutState, right: LayoutState) -> bool:
     return (
-        int(left.alpha) == int(right.alpha)
-        and int(left.beta) == int(right.beta)
+        int(left.top_beta) == int(right.top_beta)
+        and int(left.bottom_beta) == int(right.bottom_beta)
         and int(left.gap) == int(right.gap)
         and int(left.tile_count) == int(right.tile_count)
     )
@@ -661,8 +661,8 @@ def _same_physical_layout(left: LayoutState, right: LayoutState) -> bool:
 
 def _layout_with_stride(layout: LayoutState, stride: int) -> LayoutState:
     return LayoutState(
-        alpha=int(layout.alpha),
-        beta=int(layout.beta),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
         stride=max(1, int(stride)),
         gap=int(layout.gap),
         core_slots=int(layout.core_slots),
@@ -689,14 +689,14 @@ def _max_layout(edges: Sequence[EdgeInfo], *, slots: int) -> LayoutState:
     if not edges:
         raise ValueError("cannot build max layout for empty edge set")
     edge = edges[0]
-    alpha = max(int(item.requirement.alpha) for item in edges)
-    beta = max(int(item.requirement.beta) for item in edges)
+    top_beta = max(int(item.requirement.top_beta) for item in edges)
+    bottom_beta = max(int(item.requirement.bottom_beta) for item in edges)
     stride = max(int(item.requirement.stride) for item in edges)
     return _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=int(alpha),
-        beta=int(beta),
+        top_beta=int(top_beta),
+        bottom_beta=int(bottom_beta),
         stride=int(stride),
         slots=int(slots),
     )
@@ -732,7 +732,7 @@ def _edge_row(
         physical_layout = (
             PHYSICAL_NATIVE_SOURCE_STRIPE
             if str(layout_mode) == "native_halo_stripe"
-            else (PHYSICAL_LOGICAL_HALO if int(layout.alpha) > 0 or int(layout.beta) > 0 else PHYSICAL_COMPACT)
+            else (PHYSICAL_LOGICAL_HALO if int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0 else PHYSICAL_COMPACT)
         )
     relayout_estimate = _relayout_transition_estimate(
         source_layout=source_layout,
@@ -797,11 +797,11 @@ def _layout_one_channel_physical_shape(
     *,
     clear_shape: tuple[int, int, int, int],
     gap: int,
-    alpha: int,
-    beta: int,
+    top_beta: int,
+    bottom_beta: int,
 ) -> tuple[int, int]:
     _n, _c, height, width = clear_shape
-    physical_h = int(height) * int(gap) + int(alpha + beta) * int(gap)
+    physical_h = int(height) * int(gap) + int(top_beta + bottom_beta) * int(gap)
     physical_w = int(width) * int(gap)
     return max(1, int(physical_h)), max(1, int(physical_w))
 
@@ -823,7 +823,7 @@ def _one_channel_lt_mapping_tensors(
     output_phys_w: int,
     input_gap: int,
     output_gap: int,
-    alpha: int,
+    top_beta: int,
     kernel_h: int,
     kernel_w: int,
     stride_h: int,
@@ -876,7 +876,7 @@ def _one_channel_lt_mapping_tensors(
         empty = torch.empty((0,), dtype=torch.int64)
         return empty, empty, empty
 
-    in_ph = (in_h[valid] + int(alpha)) * int(input_gap)
+    in_ph = (in_h[valid] + int(top_beta)) * int(input_gap)
     in_pw = in_w[valid] * int(input_gap)
     out_ph = out_h[valid] * int(output_gap)
     out_pw = out_w[valid] * int(output_gap)
@@ -919,7 +919,7 @@ def _one_channel_lt_groups_cached(
     output_phys_w: int,
     input_gap: int,
     output_gap: int,
-    alpha: int,
+    top_beta: int,
     kernel_h: int,
     kernel_w: int,
     stride_h: int,
@@ -942,7 +942,7 @@ def _one_channel_lt_groups_cached(
         output_phys_w=int(output_phys_w),
         input_gap=int(input_gap),
         output_gap=int(output_gap),
-        alpha=int(alpha),
+        top_beta=int(top_beta),
         kernel_h=int(kernel_h),
         kernel_w=int(kernel_w),
         stride_h=int(stride_h),
@@ -993,7 +993,7 @@ def _one_channel_lt_ct_pt_mult_count_cached(
     output_phys_w: int,
     input_gap: int,
     output_gap: int,
-    alpha: int,
+    top_beta: int,
     kernel_h: int,
     kernel_w: int,
     stride_h: int,
@@ -1016,7 +1016,7 @@ def _one_channel_lt_ct_pt_mult_count_cached(
         output_phys_w=int(output_phys_w),
         input_gap=int(input_gap),
         output_gap=int(output_gap),
-        alpha=int(alpha),
+        top_beta=int(top_beta),
         kernel_h=int(kernel_h),
         kernel_w=int(kernel_w),
         stride_h=int(stride_h),
@@ -1052,7 +1052,7 @@ def _one_channel_lt_adjacency_counts_cached(
     output_phys_w: int,
     input_gap: int,
     output_gap: int,
-    alpha: int,
+    top_beta: int,
     kernel_h: int,
     kernel_w: int,
     stride_h: int,
@@ -1075,7 +1075,7 @@ def _one_channel_lt_adjacency_counts_cached(
         output_phys_w=int(output_phys_w),
         input_gap=int(input_gap),
         output_gap=int(output_gap),
-        alpha=int(alpha),
+        top_beta=int(top_beta),
         kernel_h=int(kernel_h),
         kernel_w=int(kernel_w),
         stride_h=int(stride_h),
@@ -1109,7 +1109,7 @@ def _representative_shift_indices_cached(
     output_phys_w: int,
     input_gap: int,
     output_gap: int,
-    alpha: int,
+    top_beta: int,
     kernel_h: int,
     kernel_w: int,
     stride_h: int,
@@ -1131,7 +1131,7 @@ def _representative_shift_indices_cached(
             return
         if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
             return
-        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
+        in_ph = (int(in_h) + int(top_beta)) * int(input_gap)
         in_pw = int(in_w) * int(input_gap)
         out_ph = int(out_h) * int(output_gap)
         out_pw = int(out_w) * int(output_gap)
@@ -1182,7 +1182,7 @@ def _sampled_source_shift_sets_cached(
     output_phys_w: int,
     input_gap: int,
     output_gap: int,
-    alpha: int,
+    top_beta: int,
     kernel_h: int,
     kernel_w: int,
     stride_h: int,
@@ -1204,7 +1204,7 @@ def _sampled_source_shift_sets_cached(
             return
         if not (0 <= int(out_h) < int(output_h) and 0 <= int(out_w) < int(output_w)):
             return
-        in_ph = (int(in_h) + int(alpha)) * int(input_gap)
+        in_ph = (int(in_h) + int(top_beta)) * int(input_gap)
         in_pw = int(in_w) * int(input_gap)
         out_ph = int(out_h) * int(output_gap)
         out_pw = int(out_w) * int(output_gap)
@@ -1374,8 +1374,8 @@ def _rho_hat_from_diagonal_count(diagonal_count: int, *, slots: int) -> int:
 def _conv_missing_halo_rows(edge: EdgeInfo, layout: LayoutState) -> int:
     if str(edge.op_kind) not in {"conv2d", "avgpool2d"}:
         return 0
-    missing_top = max(0, int(edge.requirement.alpha) - int(layout.alpha))
-    missing_bottom = max(0, int(edge.requirement.beta) - int(layout.beta))
+    missing_top = max(0, int(edge.requirement.top_beta) - int(layout.top_beta))
+    missing_bottom = max(0, int(edge.requirement.bottom_beta) - int(layout.bottom_beta))
     return int(missing_top + missing_bottom)
 
 
@@ -1388,8 +1388,8 @@ def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
     input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
         clear_shape=edge.shape,
         gap=int(layout.gap),
-        alpha=int(layout.alpha),
-        beta=int(layout.beta),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -1410,7 +1410,7 @@ def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            alpha=int(layout.alpha),
+            top_beta=int(layout.top_beta),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1438,8 +1438,8 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
     input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
         clear_shape=edge.shape,
         gap=int(layout.gap),
-        alpha=int(layout.alpha),
-        beta=int(layout.beta),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -1500,7 +1500,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            alpha=int(layout.alpha),
+            top_beta=int(layout.top_beta),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1523,7 +1523,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            alpha=int(layout.alpha),
+            top_beta=int(layout.top_beta),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1546,7 +1546,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            alpha=int(layout.alpha),
+            top_beta=int(layout.top_beta),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1687,8 +1687,8 @@ def _template_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotation
     input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
         clear_shape=edge.shape,
         gap=int(layout.gap),
-        alpha=int(layout.alpha),
-        beta=int(layout.beta),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -1705,7 +1705,7 @@ def _template_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotation
         output_phys_w=int(output_phys_w),
         input_gap=int(layout.gap),
         output_gap=int(output_gap),
-        alpha=int(layout.alpha),
+        top_beta=int(layout.top_beta),
         kernel_h=int(edge.kernel_size[0]),
         kernel_w=int(edge.kernel_size[1]),
         stride_h=int(edge.stride[0]),
@@ -1790,7 +1790,7 @@ def _lt_rotations(edge: EdgeInfo, layout: LayoutState, *, estimator: str | None 
 
 
 def _relayout_halo_side_count(layout: LayoutState) -> int:
-    return int(max(1, int(layout.tile_count)) * (int(int(layout.alpha) > 0) + int(int(layout.beta) > 0)))
+    return int(max(1, int(layout.tile_count)) * (int(int(layout.top_beta) > 0) + int(int(layout.bottom_beta) > 0)))
 
 
 def _relayout_rotations(layouts: Iterable[LayoutState]) -> int:
@@ -1802,7 +1802,7 @@ def _relayout_mask_mults(layouts: Iterable[LayoutState]) -> int:
 
 
 def _relayout_depth_units(layouts: Iterable[LayoutState]) -> int:
-    return int(sum(1 for layout in layouts if int(layout.alpha) > 0 or int(layout.beta) > 0))
+    return int(sum(1 for layout in layouts if int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0))
 
 
 def _relayout_transition_estimate(
@@ -1828,8 +1828,8 @@ def _relayout_transition_estimate(
             "depth_estimate": int(_relayout_depth_units((target_layout,))),
         }
 
-    source_has_halo = bool(int(source_layout.alpha) > 0 or int(source_layout.beta) > 0)
-    target_has_halo = bool(int(target_layout.alpha) > 0 or int(target_layout.beta) > 0)
+    source_has_halo = bool(int(source_layout.top_beta) > 0 or int(source_layout.bottom_beta) > 0)
+    target_has_halo = bool(int(target_layout.top_beta) > 0 or int(target_layout.bottom_beta) > 0)
     if not source_has_halo and target_has_halo:
         side_count = _relayout_halo_side_count(target_layout)
         return {
@@ -1883,7 +1883,7 @@ def _node_layout_row(
     fhe_shape: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     if physical_layout is None:
-        physical_layout = PHYSICAL_LOGICAL_HALO if int(layout.alpha) > 0 or int(layout.beta) > 0 else PHYSICAL_COMPACT
+        physical_layout = PHYSICAL_LOGICAL_HALO if int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0 else PHYSICAL_COMPACT
     return {
         "node": str(node),
         "shape": [] if shape is None else [int(value) for value in shape],
@@ -1920,7 +1920,7 @@ def _producer_fused_materialization_estimate(
         return {"enabled": False, "rotation_count": 0}
     if not _producer_fused_output_allowed(module):
         return {"enabled": False, "rotation_count": 0}
-    if int(output_layout.alpha) == 0 and int(output_layout.beta) == 0:
+    if int(output_layout.top_beta) == 0 and int(output_layout.bottom_beta) == 0:
         return {"enabled": False, "rotation_count": 0}
     semantic = _operator_semantic_output_layout(
         module,
@@ -1931,8 +1931,8 @@ def _producer_fused_materialization_estimate(
     grows_halo = (
         int(output_layout.gap) == int(semantic.gap)
         and (
-            int(output_layout.alpha) > int(semantic.alpha)
-            or int(output_layout.beta) > int(semantic.beta)
+            int(output_layout.top_beta) > int(semantic.top_beta)
+            or int(output_layout.bottom_beta) > int(semantic.bottom_beta)
         )
     )
     if not bool(grows_halo):
@@ -2131,7 +2131,7 @@ def _align_add_inputs(dag: NetworkDAG, rows_by_edge: dict[str, dict[str, Any]], 
         layouts = [LayoutState(**rows_by_edge[edge_id]["selected_layout"]) for edge_id in incoming if edge_id in rows_by_edge]
         if len(layouts) < 2 or len({layout.key() for layout in layouts}) == 1:
             continue
-        target = max(layouts, key=lambda item: (int(item.alpha + item.beta), int(item.stored_slots), int(item.stride)))
+        target = max(layouts, key=lambda item: (int(item.top_beta + item.bottom_beta), int(item.stored_slots), int(item.stride)))
         for edge_id in incoming:
             if edge_id not in rows_by_edge:
                 continue
@@ -2168,8 +2168,8 @@ def _fixed_max_layout_for_edge(
     fixed_like = _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=int(global_alpha),
-        beta=int(global_beta),
+        top_beta=int(global_alpha),
+        bottom_beta=int(global_beta),
         stride=max(1, int(edge.requirement.stride)),
         slots=int(slots),
     )
@@ -2224,7 +2224,7 @@ def _choose_non_dp_add_layout(
     if str(policy) == "greedy":
         return max(
             (live[edge.source] for edge in incoming),
-            key=lambda item: (int(item.alpha + item.beta), int(item.stored_slots), int(item.tile_count)),
+            key=lambda item: (int(item.top_beta + item.bottom_beta), int(item.stored_slots), int(item.tile_count)),
         )
     return incoming[0].requirement
 
@@ -2256,8 +2256,8 @@ def _no_halo_layout_for_edge(edge: EdgeInfo, *, slots: int) -> LayoutState:
     return _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=0,
-        beta=0,
+        top_beta=0,
+        bottom_beta=0,
         stride=max(1, int(edge.requirement.stride)),
         slots=int(slots),
     )
@@ -2272,8 +2272,8 @@ def _no_halo_layout_from_semantic(
     return _layout_for_shape(
         shape=edge.shape,
         gap=int(semantic.gap),
-        alpha=0,
-        beta=0,
+        top_beta=0,
+        bottom_beta=0,
         stride=max(1, int(semantic.stride)),
         slots=int(slots),
     )
@@ -2295,7 +2295,7 @@ def _non_dp_policy_uses_fusion(policy: str) -> bool:
 
 
 def _layout_has_halo(layout: LayoutState) -> bool:
-    return bool(int(layout.alpha) > 0 or int(layout.beta) > 0)
+    return bool(int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0)
 
 
 def _non_dp_consumer_fused_row(
@@ -2430,8 +2430,8 @@ def _plan_non_dp_topological(
         str(source): max(topo_index[str(edge.target)] for edge in source_edges)
         for source, source_edges in edges_by_source.items()
     }
-    global_alpha = max(int(edge.requirement.alpha) for edge in edges)
-    global_beta = max(int(edge.requirement.beta) for edge in edges)
+    global_alpha = max(int(edge.requirement.top_beta) for edge in edges)
+    global_beta = max(int(edge.requirement.bottom_beta) for edge in edges)
     base_policy = _base_non_dp_policy(str(policy))
     fuse_local_relayouts = _non_dp_policy_uses_fusion(str(policy))
     live: dict[str, LayoutState] = {}
@@ -2821,22 +2821,22 @@ def _fill_beta_to_tile_capacity(layout: LayoutState, *, shape: tuple[int, int, i
     max_stored_h = max(1, int(target_tiles) * int(slots) // int(row_width_slots))
     max_halo_rows = max(0, int(max_stored_h) - int(height) * int(gap))
     max_alpha_beta = int(max_halo_rows) // int(gap)
-    beta = max(int(layout.beta), int(max_alpha_beta) - int(layout.alpha))
+    bottom_beta = max(int(layout.bottom_beta), int(max_alpha_beta) - int(layout.top_beta))
     filled = _layout_for_shape(
         shape=shape,
         gap=int(layout.gap),
-        alpha=int(layout.alpha),
-        beta=int(beta),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(bottom_beta),
         stride=int(layout.stride),
         slots=int(slots),
     )
-    while int(filled.tile_count) > int(target_tiles) and int(beta) > int(layout.beta):
-        beta -= 1
+    while int(filled.tile_count) > int(target_tiles) and int(bottom_beta) > int(layout.bottom_beta):
+        bottom_beta -= 1
         filled = _layout_for_shape(
             shape=shape,
             gap=int(layout.gap),
-            alpha=int(layout.alpha),
-            beta=int(beta),
+            top_beta=int(layout.top_beta),
+            bottom_beta=int(bottom_beta),
             stride=int(layout.stride),
             slots=int(slots),
         )
@@ -2851,8 +2851,8 @@ def _source_layout_candidates(edges: Sequence[EdgeInfo], *, global_alpha: int, g
     fixed_like = _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=int(global_alpha),
-        beta=int(global_beta),
+        top_beta=int(global_alpha),
+        bottom_beta=int(global_beta),
         stride=max(1, int(local_need.stride)),
         slots=int(slots),
     )
@@ -2861,28 +2861,28 @@ def _source_layout_candidates(edges: Sequence[EdgeInfo], *, global_alpha: int, g
     reduced_alpha = int(global_alpha)
     reduced_beta = int(global_beta)
     target_tiles = max(int(edge.compact.tile_count), int(local_need.tile_count))
-    while (int(reduced_alpha) > int(local_need.alpha) or int(reduced_beta) > int(local_need.beta)):
+    while (int(reduced_alpha) > int(local_need.top_beta) or int(reduced_beta) > int(local_need.bottom_beta)):
         candidate = _layout_for_shape(
             shape=edge.shape,
             gap=int(edge.compact.gap),
-            alpha=int(reduced_alpha),
-            beta=int(reduced_beta),
+            top_beta=int(reduced_alpha),
+            bottom_beta=int(reduced_beta),
             stride=max(1, int(local_need.stride)),
             slots=int(slots),
         )
         if int(candidate.tile_count) <= int(target_tiles):
             break
-        if int(reduced_alpha) >= int(reduced_beta) and int(reduced_alpha) > int(local_need.alpha):
+        if int(reduced_alpha) >= int(reduced_beta) and int(reduced_alpha) > int(local_need.top_beta):
             reduced_alpha -= 1
-        elif int(reduced_beta) > int(local_need.beta):
+        elif int(reduced_beta) > int(local_need.bottom_beta):
             reduced_beta -= 1
         else:
             break
     capacity_safe = _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=int(reduced_alpha),
-        beta=int(reduced_beta),
+        top_beta=int(reduced_alpha),
+        bottom_beta=int(reduced_beta),
         stride=max(1, int(local_need.stride)),
         slots=int(slots),
     )
@@ -2898,28 +2898,28 @@ def _operator_semantic_output_layout(
 ) -> LayoutState:
     if isinstance(module, ConvTranspose2d):
         scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
-        alpha = int(source_layout.alpha)
-        beta = int(source_layout.beta) * int(scale)
+        top_beta = int(source_layout.top_beta)
+        bottom_beta = int(source_layout.bottom_beta) * int(scale)
     elif isinstance(module, AvgPool2d):
         stride_pair = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
         kernel_pair = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
         stride = max(1, int(stride_pair[0]))
         consume = max(0, int(kernel_pair[0]) - int(stride_pair[0]))
-        alpha = int(source_layout.alpha)
-        beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
+        top_beta = int(source_layout.top_beta)
+        bottom_beta = _side_after_downsample(source_layout.bottom_beta, consume=int(consume), stride=int(stride))
     elif isinstance(module, Conv2d):
         stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
         consume = _conv_halo_consume(module)
-        alpha = int(source_layout.alpha)
-        beta = _side_after_downsample(source_layout.beta, consume=int(consume), stride=int(stride))
+        top_beta = int(source_layout.top_beta)
+        bottom_beta = _side_after_downsample(source_layout.bottom_beta, consume=int(consume), stride=int(stride))
     else:
-        alpha = int(source_layout.alpha)
-        beta = int(source_layout.beta)
+        top_beta = int(source_layout.top_beta)
+        bottom_beta = int(source_layout.bottom_beta)
     return _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=int(alpha),
-        beta=int(beta),
+        top_beta=int(top_beta),
+        bottom_beta=int(bottom_beta),
         stride=max(1, int(source_layout.stride)),
         slots=int(slots),
     )
@@ -2940,7 +2940,7 @@ def _producer_fused_output_layout_candidates(
     edge = outgoing[0]
     layouts: list[LayoutState] = []
     local_need = _max_layout(outgoing, slots=int(slots))
-    if int(local_need.alpha) > 0 or int(local_need.beta) > 0:
+    if int(local_need.top_beta) > 0 or int(local_need.bottom_beta) > 0:
         layouts.append(local_need)
         layouts.append(_fill_beta_to_tile_capacity(local_need, shape=edge.shape, slots=int(slots)))
     return _dedupe_layouts(layouts)
@@ -2997,8 +2997,8 @@ def _operator_output_layout_candidates(
             )
         )
     if _native_operator_output_layout(module) and any(
-        int(dict(row["selected_layout"]).get("alpha", 0)) > 0
-        or int(dict(row["selected_layout"]).get("beta", 0)) > 0
+        int(dict(row["selected_layout"]).get("top_beta", 0)) > 0
+        or int(dict(row["selected_layout"]).get("bottom_beta", 0)) > 0
         for row in incoming_rows
     ):
         layouts.append(edge.compact)
@@ -3058,7 +3058,7 @@ def _output_physical_layout(
         }
         if len(physicals) == 1:
             return next(iter(physicals))
-    if int(output_layout.alpha) == 0 and int(output_layout.beta) == 0:
+    if int(output_layout.top_beta) == 0 and int(output_layout.bottom_beta) == 0:
         return PHYSICAL_COMPACT
     if bool(producer_fused.get("enabled", False)):
         return PHYSICAL_LOGICAL_HALO
@@ -3104,8 +3104,8 @@ def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tu
     halo = _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
-        alpha=max(1, int(edge.requirement.alpha)),
-        beta=max(1, int(edge.requirement.beta)),
+        top_beta=max(1, int(edge.requirement.top_beta)),
+        bottom_beta=max(1, int(edge.requirement.bottom_beta)),
         stride=max(1, int(edge.requirement.stride)),
         slots=int(slots),
     )
@@ -3129,7 +3129,7 @@ def _compact_align_shared_allowed(
 def _conv_native_stripe_candidate_allowed(edge: EdgeInfo, source_layout: LayoutState) -> bool:
     if str(edge.op_kind) != "conv2d":
         return False
-    if int(edge.requirement.alpha) == 0 and int(edge.requirement.beta) == 0:
+    if int(edge.requirement.top_beta) == 0 and int(edge.requirement.bottom_beta) == 0:
         return False
     if not source_layout.covers(edge.requirement):
         return False
@@ -3173,8 +3173,8 @@ def _provider_key_rotation_proxy(edge: EdgeInfo, layout: LayoutState) -> int:
     input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
         clear_shape=edge.shape,
         gap=int(layout.gap),
-        alpha=int(layout.alpha),
-        beta=int(layout.beta),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -3191,7 +3191,7 @@ def _provider_key_rotation_proxy(edge: EdgeInfo, layout: LayoutState) -> int:
         output_phys_w=int(output_phys_w),
         input_gap=int(layout.gap),
         output_gap=int(output_gap),
-        alpha=int(layout.alpha),
+        top_beta=int(layout.top_beta),
         kernel_h=int(edge.kernel_size[0]),
         kernel_w=int(edge.kernel_size[1]),
         stride_h=int(edge.stride[0]),
@@ -3236,7 +3236,7 @@ def _physical_for_candidate(layout: LayoutState, *, layout_mode: str, fallback: 
         return str(fallback)
     if str(layout_mode) == "native_halo_stripe":
         return PHYSICAL_NATIVE_SOURCE_STRIPE
-    if int(layout.alpha) > 0 or int(layout.beta) > 0:
+    if int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0:
         return PHYSICAL_LOGICAL_HALO
     return PHYSICAL_COMPACT
 
@@ -3347,7 +3347,7 @@ def enumerate_execution_candidates(
                 source_physical=str(source_physical),
                 target_physical=(
                     PHYSICAL_LOGICAL_HALO
-                    if int(selected_layout.alpha) > 0 or int(selected_layout.beta) > 0
+                    if int(selected_layout.top_beta) > 0 or int(selected_layout.bottom_beta) > 0
                     else PHYSICAL_COMPACT
                 ),
                 layout_mode="compact_align_shared",
@@ -3473,8 +3473,8 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
             _layout_for_shape(
                 shape=edge.shape,
                 gap=int(edge.compact.gap),
-                alpha=max(int(layout.alpha) for layout in source_layouts),
-                beta=max(int(layout.beta) for layout in source_layouts),
+                top_beta=max(int(layout.top_beta) for layout in source_layouts),
+                bottom_beta=max(int(layout.bottom_beta) for layout in source_layouts),
                 stride=max(int(layout.stride) for layout in source_layouts),
                 slots=int(edge.slots),
             )
@@ -3520,8 +3520,8 @@ def _plan_dp(
         str(source): max(topo_index[str(edge.target)] for edge in source_edges)
         for source, source_edges in edges_by_source.items()
     }
-    global_alpha = max(int(edge.requirement.alpha) for edge in edges)
-    global_beta = max(int(edge.requirement.beta) for edge in edges)
+    global_alpha = max(int(edge.requirement.top_beta) for edge in edges)
+    global_beta = max(int(edge.requirement.bottom_beta) for edge in edges)
 
     states: dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState] = {
         (): _FrontierState(
@@ -3880,8 +3880,8 @@ def _policy_add_inputs_aligned(policy_row: dict[str, Any]) -> bool:
             continue
         keys = {
             (
-                int(row["selected_layout"]["alpha"]),
-                int(row["selected_layout"]["beta"]),
+                int(row["selected_layout"]["top_beta"]),
+                int(row["selected_layout"]["bottom_beta"]),
                 int(row["selected_layout"]["stride"]),
                 int(row["selected_layout"]["gap"]),
             )

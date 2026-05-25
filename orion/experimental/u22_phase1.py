@@ -320,6 +320,28 @@ def _layout_policy_relayout_enabled() -> bool:
     }
 
 
+def _layout_top_beta(layout: dict[str, Any]) -> int:
+    return max(0, int(layout.get("top_beta", layout.get("alpha", 0)) or 0))
+
+
+def _layout_bottom_beta(layout: dict[str, Any]) -> int:
+    return max(0, int(layout.get("bottom_beta", layout.get("beta", 0)) or 0))
+
+
+def _layout_with_top_bottom_beta(
+    layout: dict[str, Any],
+    *,
+    top_beta: int | None = None,
+    bottom_beta: int | None = None,
+) -> dict[str, Any]:
+    updated = dict(layout)
+    updated.pop("alpha", None)
+    updated.pop("beta", None)
+    updated["top_beta"] = _layout_top_beta(layout) if top_beta is None else max(0, int(top_beta))
+    updated["bottom_beta"] = _layout_bottom_beta(layout) if bottom_beta is None else max(0, int(bottom_beta))
+    return updated
+
+
 def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node: str) -> tuple[dict[str, Any], ...]:
     if not _layout_policy_relayout_enabled():
         return ()
@@ -332,8 +354,8 @@ def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node:
         layout = dict(row.get("selected_layout", {}))
         if (
             str(row.get("op_kind", "")) != "add"
-            and int(layout.get("alpha", 0)) == 0
-            and int(layout.get("beta", 0)) == 0
+            and _layout_top_beta(layout) == 0
+            and _layout_bottom_beta(layout) == 0
         ):
             continue
         rows.append(dict(row))
@@ -341,7 +363,7 @@ def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node:
 
 
 def _layout_policy_has_halo(layout: dict[str, Any]) -> bool:
-    return bool(int(layout.get("alpha", 0)) > 0 or int(layout.get("beta", 0)) > 0)
+    return bool(_layout_top_beta(layout) > 0 or _layout_bottom_beta(layout) > 0)
 
 
 def _layout_policy_incoming_native_rows(compile_plan: dict[str, Any], *, node: str) -> tuple[dict[str, Any], ...]:
@@ -467,12 +489,12 @@ def _layout_policy_attach_backend_producer_outputs(
             continue
         layout = dict(row.get("selected_layout", {}) or {})
         gap = max(1, int(layout.get("gap", getattr(module, "output_gap", 1) or 1)))
-        alpha = max(0, int(layout.get("alpha", 0)))
+        top_beta = _layout_top_beta(layout)
         output_shape = _layout_policy_on_shape(row, layout)
         previous_shape = tuple(int(value) for value in getattr(module, "fhe_output_shape", torch.Size()))
         module.fhe_output_shape = output_shape
         module.layout_policy_output_layout = dict(layout)
-        module.layout_policy_output_row_offset = int(alpha * gap)
+        module.layout_policy_output_row_offset = int(top_beta * gap)
         module.layout_policy_output_materialization = "fused_relayout"
         attached.append(
             {
@@ -480,8 +502,8 @@ def _layout_policy_attach_backend_producer_outputs(
                 "physical_layout": str(row.get("physical_layout", "")),
                 "previous_fhe_output_shape": [int(value) for value in previous_shape],
                 "fhe_output_shape": [int(value) for value in output_shape],
-                "alpha": int(alpha),
-                "beta": int(layout.get("beta", 0)),
+                "top_beta": int(top_beta),
+                "bottom_beta": _layout_bottom_beta(layout),
                 "tile_count": int(layout.get("tile_count", 0) or 0),
             }
         )
@@ -500,7 +522,7 @@ def _layout_policy_input_pair_native_halo_enabled() -> bool:
 
 def _layout_policy_compact_on_shape(edge_row: dict[str, Any]) -> torch.Size:
     layout = dict(edge_row.get("selected_layout", {}))
-    compact_layout = {**layout, "alpha": 0, "beta": 0}
+    compact_layout = _layout_with_top_bottom_beta(layout, top_beta=0, bottom_beta=0)
     return _layout_policy_on_shape(edge_row, compact_layout)
 
 
@@ -510,23 +532,21 @@ def _layout_policy_on_shape(edge_row: dict[str, Any], layout: dict[str, Any]) ->
         raise ValueError(f"layout-policy relayout edge has invalid shape: {shape}")
     n, channels, height, width = shape
     gap = max(1, int(layout.get("gap", 1)))
-    alpha = max(0, int(layout.get("alpha", 0)))
-    beta = max(0, int(layout.get("beta", 0)))
+    top_beta = _layout_top_beta(layout)
+    bottom_beta = _layout_bottom_beta(layout)
     on_channels = int(math.ceil(int(channels) / float(gap * gap)))
     return torch.Size(
         (
             int(n),
             int(on_channels),
-            int(height * gap + (alpha + beta) * gap),
+            int(height * gap + (top_beta + bottom_beta) * gap),
             int(width * gap),
         )
     )
 
 
 def _layout_policy_zero_halo_layout(layout: dict[str, Any]) -> dict[str, Any]:
-    updated = dict(layout)
-    updated["alpha"] = 0
-    updated["beta"] = 0
+    updated = _layout_with_top_bottom_beta(layout, top_beta=0, bottom_beta=0)
     if "core_slots" in updated:
         updated["stored_slots"] = int(updated.get("core_slots", 0) or 0)
     return updated
@@ -549,7 +569,7 @@ def _layout_policy_native_halo_input_supported(base_executor: Any, relayout_rows
     if module is None:
         return False
     layout = dict(relayout_rows[0].get("selected_layout", {}))
-    if int(layout.get("alpha", 0)) == 0 and int(layout.get("beta", 0)) == 0:
+    if _layout_top_beta(layout) == 0 and _layout_bottom_beta(layout) == 0:
         return False
     return int(layout.get("gap", getattr(module, "input_gap", 1))) == int(getattr(module, "input_gap", 1))
 
@@ -578,11 +598,11 @@ def _layout_policy_native_module_attrs(
                 physical_input_layout = _layout_policy_zero_halo_layout(layout)
         gap = max(1, int(layout.get("gap", 1)))
         physical_gap = max(1, int(physical_input_layout.get("gap", gap)))
-        alpha = max(0, int(physical_input_layout.get("alpha", 0)))
+        top_beta = _layout_top_beta(physical_input_layout)
         attrs.update(
             {
                 "fhe_input_shape": _layout_policy_on_shape(row, physical_input_layout),
-                "layout_policy_input_row_offset": int(alpha * physical_gap),
+                "layout_policy_input_row_offset": int(top_beta * physical_gap),
                 "layout_policy_input_layout": dict(physical_input_layout),
                 "layout_policy_selected_input_layout": dict(layout),
                 "layout_policy_required_input_layout": dict(required_layout),
@@ -595,11 +615,11 @@ def _layout_policy_native_module_attrs(
         if output_row is not None:
             output_layout = dict(output_row.get("selected_layout", {}))
             output_gap = max(1, int(output_layout.get("gap", 1)))
-            output_alpha = max(0, int(output_layout.get("alpha", 0)))
+            output_top_beta = _layout_top_beta(output_layout)
             attrs.update(
                 {
                     "fhe_output_shape": _layout_policy_halo_on_shape(output_row),
-                    "layout_policy_output_row_offset": int(output_alpha * output_gap),
+                    "layout_policy_output_row_offset": int(output_top_beta * output_gap),
                     "layout_policy_output_layout": dict(output_layout),
                 }
             )
@@ -824,9 +844,9 @@ class LayoutPolicyRelayoutKernel:
             if str(direction) == "halo_to_compact":
                 source_layout = dict(selected_layout)
             else:
-                source_layout = {**target_layout, "alpha": 0, "beta": 0}
+                source_layout = _layout_with_top_bottom_beta(target_layout, top_beta=0, bottom_beta=0)
         if str(direction) == "halo_to_compact" and not dict(self.edge_row.get("target_layout", {}) or {}):
-            target_layout = {**selected_layout, "alpha": 0, "beta": 0}
+            target_layout = _layout_with_top_bottom_beta(selected_layout, top_beta=0, bottom_beta=0)
         if not target_layout:
             target_layout = dict(selected_layout)
         self.source_layout = dict(source_layout)
@@ -849,8 +869,8 @@ class LayoutPolicyRelayoutKernel:
     def operation_estimate(self) -> dict[str, int | str]:
         source_layout = dict(self.source_layout)
         target_layout = dict(self.target_layout)
-        alpha = max(0, int(target_layout.get("alpha", 0)))
-        beta = max(0, int(target_layout.get("beta", 0)))
+        top_beta = _layout_top_beta(target_layout)
+        bottom_beta = _layout_bottom_beta(target_layout)
         tile_count = max(
             1,
             int(
@@ -869,12 +889,12 @@ class LayoutPolicyRelayoutKernel:
                 )
             ),
         )
-        halo_sides = int(tile_count) * (int(alpha > 0) + int(beta > 0))
-        source_has_halo = bool(int(source_layout.get("alpha", 0)) > 0 or int(source_layout.get("beta", 0)) > 0)
-        target_has_halo = bool(int(target_layout.get("alpha", 0)) > 0 or int(target_layout.get("beta", 0)) > 0)
+        halo_sides = int(tile_count) * (int(top_beta > 0) + int(bottom_beta > 0))
+        source_has_halo = bool(_layout_top_beta(source_layout) > 0 or _layout_bottom_beta(source_layout) > 0)
+        target_has_halo = bool(_layout_top_beta(target_layout) > 0 or _layout_bottom_beta(target_layout) > 0)
         same_physical = bool(
-            int(source_layout.get("alpha", 0)) == int(target_layout.get("alpha", 0))
-            and int(source_layout.get("beta", 0)) == int(target_layout.get("beta", 0))
+            _layout_top_beta(source_layout) == _layout_top_beta(target_layout)
+            and _layout_bottom_beta(source_layout) == _layout_bottom_beta(target_layout)
             and int(source_layout.get("gap", 1)) == int(target_layout.get("gap", 1))
             and int(source_layout.get("tile_count", tile_count)) == int(target_layout.get("tile_count", tile_count))
         )
@@ -918,9 +938,9 @@ class LayoutPolicyRelayoutKernel:
                 f"got source gap {int(source_gap)} and target gap {int(target_gap)}"
             )
         gap = int(target_gap)
-        source_offset = int(max(0, int(self.source_layout.get("alpha", 0))) * gap)
-        target_offset = int(max(0, int(self.target_layout.get("alpha", 0))) * gap)
-        target_beta_rows = int(max(0, int(self.target_layout.get("beta", 0))) * gap)
+        source_offset = int(_layout_top_beta(self.source_layout) * gap)
+        target_offset = int(_layout_top_beta(self.target_layout) * gap)
+        target_bottom_beta_rows = int(_layout_bottom_beta(self.target_layout) * gap)
         clear_shape = [int(value) for value in self.edge_row.get("shape", [])]
         if len(clear_shape) != 4:
             raise ValueError(f"layout-policy relayout edge has invalid shape: {clear_shape}")
@@ -938,7 +958,7 @@ class LayoutPolicyRelayoutKernel:
                     elif int(target_h) >= int(target_offset + core_rows):
                         bottom_h = int(target_h) - int(target_offset + core_rows)
                         source_core_h = min(
-                            max(int(core_rows - target_beta_rows + bottom_h), 0),
+                            max(int(core_rows - target_bottom_beta_rows + bottom_h), 0),
                             int(core_rows) - 1,
                         )
                     else:
@@ -1652,8 +1672,8 @@ def _layout_policy_add_rows(compile_plan: dict[str, Any], *, node: str) -> tuple
 def _layout_policy_relayout_direction(row: dict[str, Any]) -> str:
     source_layout = dict(row.get("source_layout", {}) or {})
     target_layout = dict(row.get("target_layout", row.get("selected_layout", {})) or {})
-    source_has_halo = bool(int(source_layout.get("alpha", 0)) > 0 or int(source_layout.get("beta", 0)) > 0)
-    target_has_halo = bool(int(target_layout.get("alpha", 0)) > 0 or int(target_layout.get("beta", 0)) > 0)
+    source_has_halo = bool(_layout_top_beta(source_layout) > 0 or _layout_bottom_beta(source_layout) > 0)
+    target_has_halo = bool(_layout_top_beta(target_layout) > 0 or _layout_bottom_beta(target_layout) > 0)
     if bool(target_has_halo) and not bool(source_has_halo):
         return "compact_to_halo"
     if bool(source_has_halo) and not bool(target_has_halo):
@@ -1686,8 +1706,14 @@ class LayoutPolicyAddRuntimeExecutor:
             raise ValueError(f"layout-policy Add runtime for {self.node} is missing input rows for {missing}")
         target_keys = {
             tuple(
-                int(dict(row.get("selected_layout", {})).get(name, 0 if name in {"alpha", "beta"} else 1))
-                for name in ("alpha", "beta", "gap")
+                (
+                    _layout_top_beta(dict(row.get("selected_layout", {})))
+                    if name == "top_beta"
+                    else _layout_bottom_beta(dict(row.get("selected_layout", {})))
+                    if name == "bottom_beta"
+                    else int(dict(row.get("selected_layout", {})).get("gap", 1))
+                )
+                for name in ("top_beta", "bottom_beta", "gap")
             )
             for row in self.input_rows
         }
@@ -2015,8 +2041,8 @@ def _layout_policy_with_native_physical_output_counts(
             continue
         spec = getattr(plan, "spec", None)
         output_has_halo = bool(
-            int(getattr(spec, "output_alpha", 0) or 0) > 0
-            or int(getattr(spec, "output_beta", 0) or 0) > 0
+            int(getattr(spec, "output_top_beta", 0) or 0) > 0
+            or int(getattr(spec, "output_bottom_beta", 0) or 0) > 0
         )
         if not bool(output_has_halo):
             continue
@@ -2048,10 +2074,10 @@ def _layout_policy_relayout_operation_totals(kernels: Any) -> dict[str, int]:
 
 
 def _layout_policy_halo_side_count_from_layout(layout: dict[str, Any]) -> int:
-    alpha = max(0, int(layout.get("alpha", 0)))
-    beta = max(0, int(layout.get("beta", 0)))
+    top_beta = _layout_top_beta(layout)
+    bottom_beta = _layout_bottom_beta(layout)
     tile_count = max(1, int(layout.get("tile_count", 1) or 1))
-    return int(tile_count) * (int(alpha > 0) + int(beta > 0))
+    return int(tile_count) * (int(top_beta > 0) + int(bottom_beta > 0))
 
 
 def _layout_policy_rebuild_relayout_edges(edge_layouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2651,10 +2677,10 @@ class TconvK2S2PythonRuntimeExecutor:
         if cached_signature["fhe_input_shape"] and cached_signature != expected_signature:
             return False
         if not cached_signature["fhe_input_shape"] and (
-            bool(expected_signature["layout_policy_input_layout"].get("alpha", 0))
-            or bool(expected_signature["layout_policy_input_layout"].get("beta", 0))
-            or bool(expected_signature["layout_policy_output_layout"].get("alpha", 0))
-            or bool(expected_signature["layout_policy_output_layout"].get("beta", 0))
+            bool(_layout_top_beta(expected_signature["layout_policy_input_layout"]))
+            or bool(_layout_bottom_beta(expected_signature["layout_policy_input_layout"]))
+            or bool(_layout_top_beta(expected_signature["layout_policy_output_layout"]))
+            or bool(_layout_bottom_beta(expected_signature["layout_policy_output_layout"]))
         ):
             return False
         group_rows = list(metadata.get("groups_by_input_unit", []))
@@ -2808,16 +2834,16 @@ class TconvK2S2PythonRuntimeExecutor:
     def _input_halo_layout(self) -> dict[str, int]:
         layout = dict(getattr(self.module, "layout_policy_input_layout", {}) or {})
         return {
-            "alpha": max(0, int(layout.get("alpha", 0))),
-            "beta": max(0, int(layout.get("beta", 0))),
+            "top_beta": _layout_top_beta(layout),
+            "bottom_beta": _layout_bottom_beta(layout),
             "gap": max(1, int(layout.get("gap", getattr(self.module, "input_gap", 1)))),
         }
 
     def _output_halo_layout(self) -> dict[str, int]:
         layout = dict(getattr(self.module, "layout_policy_output_layout", {}) or {})
         return {
-            "alpha": max(0, int(layout.get("alpha", 0))),
-            "beta": max(0, int(layout.get("beta", 0))),
+            "top_beta": _layout_top_beta(layout),
+            "bottom_beta": _layout_bottom_beta(layout),
             "gap": max(1, int(layout.get("gap", getattr(self.module, "output_gap", 1)))),
         }
 
@@ -3212,8 +3238,8 @@ class TconvK2S2PythonRuntimeExecutor:
         h_in: int,
         w_in: int,
         input_gap: int,
-        input_alpha: int = 0,
-        input_beta: int = 0,
+        input_top_beta: int = 0,
+        input_bottom_beta: int = 0,
         input_physical_h: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         start = int(source_block) * int(slots)
@@ -3223,16 +3249,16 @@ class TconvK2S2PythonRuntimeExecutor:
             return empty, empty, empty, empty
         source_slots = torch.arange(int(start), int(stop), dtype=torch.int64)
         gap = max(1, int(input_gap))
-        alpha = max(0, int(input_alpha))
-        beta = max(0, int(input_beta))
-        physical_h = int(input_physical_h) if input_physical_h is not None else int((int(h_in) + int(alpha + beta)) * int(gap))
+        top_beta = max(0, int(input_top_beta))
+        bottom_beta = max(0, int(input_bottom_beta))
+        physical_h = int(input_physical_h) if input_physical_h is not None else int((int(h_in) + int(top_beta + bottom_beta)) * int(gap))
         if int(gap) == 1:
             plane = int(physical_h * w_in)
             ic = torch.div(source_slots, int(plane), rounding_mode="floor")
             rem = torch.remainder(source_slots, int(plane))
-            ih = torch.div(rem, int(w_in), rounding_mode="floor") - int(alpha)
+            ih = torch.div(rem, int(w_in), rounding_mode="floor") - int(top_beta)
             iw = torch.remainder(rem, int(w_in))
-            valid = (ic < int(c_in)) & (ih >= -int(alpha)) & (ih < int(h_in + beta))
+            valid = (ic < int(c_in)) & (ih >= -int(top_beta)) & (ih < int(h_in + bottom_beta))
             return source_slots[valid], ic[valid], ih[valid], iw[valid]
 
         packed_w = int(w_in * gap)
@@ -3244,12 +3270,12 @@ class TconvK2S2PythonRuntimeExecutor:
         rem = torch.remainder(source_slots, int(group_block))
         packed_h_index = torch.div(rem, int(packed_w), rounding_mode="floor")
         packed_w_index = torch.remainder(rem, int(packed_w))
-        ih = torch.div(packed_h_index, int(gap), rounding_mode="floor") - int(alpha)
+        ih = torch.div(packed_h_index, int(gap), rounding_mode="floor") - int(top_beta)
         iw = torch.div(packed_w_index, int(gap), rounding_mode="floor")
         phase_h = torch.remainder(packed_h_index, int(gap))
         phase_w = torch.remainder(packed_w_index, int(gap))
         ic = group * int(gap * gap) + phase_h * int(gap) + phase_w
-        valid = (ih >= -int(alpha)) & (ih < int(h_in + beta)) & (iw < int(w_in)) & (ic < int(c_in))
+        valid = (ih >= -int(top_beta)) & (ih < int(h_in + bottom_beta)) & (iw < int(w_in)) & (ic < int(c_in))
         return source_slots[valid], ic[valid], ih[valid], iw[valid]
 
     def _build_source_block_transforms(self, *, scheme: Any, level: int, source_block: int) -> tuple[list[Any | None], int]:
@@ -3266,14 +3292,14 @@ class TconvK2S2PythonRuntimeExecutor:
         slots = int(layout["slots"])
         input_layout = self._input_halo_layout()
         output_layout = self._output_halo_layout()
-        input_alpha = max(0, int(input_layout.get("alpha", 0)))
-        input_beta = max(0, int(input_layout.get("beta", 0)))
-        output_alpha = max(0, int(output_layout.get("alpha", 0)))
-        output_beta = max(0, int(output_layout.get("beta", 0)))
+        input_top_beta = _layout_top_beta(input_layout)
+        input_bottom_beta = _layout_bottom_beta(input_layout)
+        output_top_beta = _layout_top_beta(output_layout)
+        output_bottom_beta = _layout_bottom_beta(output_layout)
         output_materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
         fused_output_relayout = output_materialization == "fused_relayout"
         input_physical_h = int(getattr(self.module, "fhe_input_shape")[2])
-        output_total_h = int(h_out + output_alpha + output_beta)
+        output_total_h = int(h_out + output_top_beta + output_bottom_beta)
 
         source_slots, ic, ih, iw = self._source_position_tensors_for_block(
             source_block=int(source_block),
@@ -3282,8 +3308,8 @@ class TconvK2S2PythonRuntimeExecutor:
             h_in=int(h_in),
             w_in=int(w_in),
             input_gap=int(input_gap),
-            input_alpha=int(input_alpha),
-            input_beta=int(input_beta),
+            input_top_beta=int(input_top_beta),
+            input_bottom_beta=int(input_bottom_beta),
             input_physical_h=int(input_physical_h),
         )
         diagonal_parts: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = [
@@ -3312,9 +3338,9 @@ class TconvK2S2PythonRuntimeExecutor:
                     target_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
                     if bool(fused_output_relayout):
                         core_valid = (oh >= 0) & (oh < int(h_out))
-                        target_rows.append((oh + int(output_alpha), core_valid))
+                        target_rows.append((oh + int(output_top_beta), core_valid))
                         top_valid = core_valid & (oh == 0)
-                        for top_row in range(int(output_alpha)):
+                        for top_row in range(int(output_top_beta)):
                             target_rows.append(
                                 (
                                     torch.full_like(oh, int(top_row)),
@@ -3322,15 +3348,15 @@ class TconvK2S2PythonRuntimeExecutor:
                                 )
                             )
                         bottom_valid = core_valid & (oh == int(h_out) - 1)
-                        for bottom_row in range(int(output_beta)):
+                        for bottom_row in range(int(output_bottom_beta)):
                             target_rows.append(
                                 (
-                                    torch.full_like(oh, int(output_alpha + h_out + bottom_row)),
+                                    torch.full_like(oh, int(output_top_beta + h_out + bottom_row)),
                                     bottom_valid,
                                 )
                             )
                     else:
-                        oh_total = oh + int(output_alpha)
+                        oh_total = oh + int(output_top_beta)
                         target_rows.append(
                             (
                                 oh_total,
@@ -3419,8 +3445,8 @@ class TconvK2S2PythonRuntimeExecutor:
                         f"in_gap={int(input_gap)}:out_gap={int(output_gap)}:"
                         f"in={int(c_in)}x{int(h_in)}x{int(w_in)}:"
                         f"out={int(c_out)}x{int(h_out)}x{int(w_out)}:"
-                        f"in_halo={int(input_alpha)},{int(input_beta)}:"
-                        f"out_halo={int(output_alpha)},{int(output_beta)}"
+                        f"in_halo={int(input_top_beta)},{int(input_bottom_beta)}:"
+                        f"out_halo={int(output_top_beta)},{int(output_bottom_beta)}"
                     ),
                 )
             )
@@ -3448,9 +3474,9 @@ class TconvK2S2PythonRuntimeExecutor:
         on_channels, on_height, on_width = (int(value) for value in getattr(self.module, "fhe_output_shape")[1:])
         output_gap = max(1, int(getattr(self.module, "output_gap")))
         output_layout = self._output_halo_layout()
-        alpha = max(0, int(output_layout.get("alpha", 0)))
-        beta = max(0, int(output_layout.get("beta", 0)))
-        total_height = int(height + alpha + beta)
+        top_beta = _layout_top_beta(output_layout)
+        bottom_beta = _layout_bottom_beta(output_layout)
+        total_height = int(height + top_beta + bottom_beta)
         bias = getattr(self.module, "on_bias").to(dtype=torch.float32)
         clear = bias.reshape(1, int(channels), 1, 1).expand(int(n), int(channels), int(total_height), int(width))
         multiplexed = packing.multiplex(clear, int(output_gap)).squeeze(0)

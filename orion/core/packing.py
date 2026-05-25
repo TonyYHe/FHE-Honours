@@ -115,9 +115,9 @@ def construct_conv2d_bias(conv_layer):
     N, Co, Ho, Wo = conv_layer.output_shape 
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
     output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
-    alpha = max(0, int(output_layout.get("alpha", 0)))
-    beta = max(0, int(output_layout.get("beta", 0)))
-    total_h = int(Ho + alpha + beta)
+    top_beta = _layout_top_beta(output_layout)
+    bottom_beta = _layout_bottom_beta(output_layout)
+    total_h = int(Ho + top_beta + bottom_beta)
 
     bias = conv_layer.on_bias
     bias = bias.repeat_interleave(total_h * Wo)
@@ -499,6 +499,14 @@ def _packed_flat_indices(
     ).astype(np.int64)
 
 
+def _layout_top_beta(layout: dict) -> int:
+    return max(0, int(layout.get("top_beta", layout.get("alpha", 0)) or 0))
+
+
+def _layout_bottom_beta(layout: dict) -> int:
+    return max(0, int(layout.get("bottom_beta", layout.get("beta", 0)) or 0))
+
+
 def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     _, _, hi, wi = [int(value) for value in conv_layer.input_shape]
     _, _, ho, wo = [int(value) for value in conv_layer.output_shape]
@@ -506,17 +514,14 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
     pad_h, pad_w = [int(value) for value in conv_layer.padding]
     dil_h, dil_w = [int(value) for value in conv_layer.dilation]
     k_h, k_w = [int(value) for value in conv_layer.kernel_size]
-    input_layout = dict(getattr(conv_layer, "layout_policy_input_layout", {}) or {})
     output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
-    input_alpha = max(0, int(input_layout.get("alpha", 0)))
-    input_beta = max(0, int(input_layout.get("beta", 0)))
-    output_alpha = max(0, int(output_layout.get("alpha", 0)))
-    output_beta = max(0, int(output_layout.get("beta", 0)))
+    output_top_beta = _layout_top_beta(output_layout)
+    output_bottom_beta = _layout_bottom_beta(output_layout)
     output_materialization = str(getattr(conv_layer, "layout_policy_output_materialization", "") or "")
     fuse_output_relayout = output_materialization == "fused_relayout"
 
     target_oh_grid, ow_grid = np.meshgrid(
-        np.arange(-int(output_alpha), int(ho + output_beta), dtype=np.int64),
+        np.arange(-int(output_top_beta), int(ho + output_bottom_beta), dtype=np.int64),
         np.arange(wo, dtype=np.int64),
         indexing="ij",
     )
@@ -524,8 +529,8 @@ def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray,
         op_oh_grid = target_oh_grid.copy()
         top = op_oh_grid < 0
         bottom = op_oh_grid >= int(ho)
-        op_oh_grid[top] = op_oh_grid[top] + int(output_alpha)
-        op_oh_grid[bottom] = op_oh_grid[bottom] - int(output_beta)
+        op_oh_grid[top] = op_oh_grid[top] + int(output_top_beta)
+        op_oh_grid[bottom] = op_oh_grid[bottom] - int(output_bottom_beta)
         op_oh_grid = np.clip(op_oh_grid, 0, max(0, int(ho) - 1))
     else:
         op_oh_grid = target_oh_grid

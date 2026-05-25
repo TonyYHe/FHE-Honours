@@ -44,8 +44,8 @@ def _spec_for_size(size: int) -> NetworkSpec:
 def _layout_key(row: dict[str, Any], key: str = "selected_layout") -> tuple[int, int, int, int]:
     layout = dict(row.get(key, {}) or {})
     return (
-        int(layout.get("alpha", 0) or 0),
-        int(layout.get("beta", 0) or 0),
+        int(layout.get("top_beta", layout.get("alpha", 0)) or 0),
+        int(layout.get("bottom_beta", layout.get("beta", 0)) or 0),
         int(layout.get("stride", 0) or 0),
         int(layout.get("gap", 0) or 0),
     )

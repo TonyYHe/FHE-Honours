@@ -40,6 +40,14 @@ except Exception:
 DEFAULT_OUT = Path("/tmp/orion_lattigo_e2e_compare.json")
 
 
+def _layout_top_beta(layout: dict[str, Any]) -> int:
+    return max(0, int(layout.get("top_beta", layout.get("alpha", 0)) or 0))
+
+
+def _layout_bottom_beta(layout: dict[str, Any]) -> int:
+    return max(0, int(layout.get("bottom_beta", layout.get("beta", 0)) or 0))
+
+
 def _layout_policy_input_layout_row() -> dict[str, Any] | None:
     audit = dict(getattr(scheme, "region_first_attach_audit", {}) or {})
     graph = dict(audit.get("graph_audit", {}) or {})
@@ -47,7 +55,7 @@ def _layout_policy_input_layout_row() -> dict[str, Any] | None:
         if str(dict(row).get("node", "")) != "x":
             continue
         layout = dict(dict(row).get("selected_layout", {}) or {})
-        if int(layout.get("alpha", 0)) <= 0 and int(layout.get("beta", 0)) <= 0:
+        if _layout_top_beta(layout) <= 0 and _layout_bottom_beta(layout) <= 0:
             return None
         return dict(row)
     return None
@@ -56,13 +64,13 @@ def _layout_policy_input_layout_row() -> dict[str, Any] | None:
 def _layout_policy_plaintext_halo_input(x: torch.Tensor, row: dict[str, Any]) -> torch.Tensor:
     layout = dict(row.get("selected_layout", {}) or {})
     gap = max(1, int(layout.get("gap", 1)))
-    alpha = max(0, int(layout.get("alpha", 0)))
-    beta = max(0, int(layout.get("beta", 0)))
+    top_beta = _layout_top_beta(layout)
+    bottom_beta = _layout_bottom_beta(layout)
     compact = packing.multiplex(x, int(gap)).detach().cpu().to(dtype=torch.float32)
     if compact.dim() != 4:
         raise ValueError(f"layout-policy input halo expects NCHW input, got {tuple(compact.shape)}")
-    top_rows = int(alpha * gap)
-    bottom_rows = int(beta * gap)
+    top_rows = int(top_beta * gap)
+    bottom_rows = int(bottom_beta * gap)
     if top_rows <= 0 and bottom_rows <= 0:
         return compact
     halo = torch.zeros(
