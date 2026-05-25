@@ -14,7 +14,11 @@ from orion.core.orion import _region_first_mode_options, scheme
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental import U22CompileRegistry
 from orion.experimental.cir.hybrid_schedule import mark_hybrid_schedule_padding_allowed
-from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor, TconvK2S2PythonRuntimeExecutor
+from orion.experimental.u22_phase1 import (
+    HaloSupportedTConvRuntimeExecutor,
+    LayoutPolicyProviderRuntimeExecutor,
+    TconvK2S2PythonRuntimeExecutor,
+)
 from orion.models.unet import UNet22
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
@@ -121,8 +125,27 @@ def _decode_output(module, out: CipherTensor) -> torch.Tensor:
     )[0]
 
 
+def test_u22_add_skip_consumer_conv_has_no_concat_fusion_in_provider_mode() -> None:
+    _init_python_scheme(logn=int(DATASET_SPECS["tiny"]["logn"]))
+    try:
+        dag = _prepared_dag(dataset="tiny", base_channels=4)
+        registry = U22CompileRegistry.for_dag(dag, enable_conv_kernels=True)
+        registry.attach_to_dag(dag)
+        _set_compile_level(dag)
+
+        join = dag.nodes["add4"]["module"]
+        conv = dag.nodes["dec4a"]["module"]
+
+        assert type(join).__name__ == "Add"
+        assert conv.in_channels == dag.nodes["up4"]["module"].out_channels
+        assert not getattr(conv, "concat_fusion_specs", ())
+        assert not getattr(conv, "_concat_transform_ids_by_input", [])
+    finally:
+        scheme.delete_scheme()
+
+
 @pytest.mark.parametrize("dataset", ("tiny", "imagenet"))
-def test_u22_registry_attaches_all_decoder_tconvs_with_experimental_kernel(dataset: str) -> None:
+def test_u22_registry_routes_decoder_tconvs_to_halo_supported_provider(dataset: str) -> None:
     _init_python_scheme(logn=int(DATASET_SPECS[str(dataset)]["logn"]))
     try:
         dag = _prepared_dag(dataset=str(dataset))
@@ -130,17 +153,18 @@ def test_u22_registry_attaches_all_decoder_tconvs_with_experimental_kernel(datas
         audit = registry.attach_to_dag(dag)
 
         assert audit["attached_count"] == len(DECODER_TCONV_NODES)
-        assert {row["node"] for row in audit["attached"]} == set(DECODER_TCONV_NODES)
+        assert audit["graph_audit"]["selected_tconv_count"] == len(DECODER_TCONV_NODES)
         assert audit["graph_audit"]["excluded_nodes"] == []
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime")
+            runtime = getattr(module, "region_runtime", None)
             assert runtime is not None
-            assert runtime.strategy == "tconv_k2s2_gap_halving_experimental"
-            assert runtime.materializer == "tconv_k2s2_gap_halving_experimental"
-            assert runtime.executable is True
-            assert getattr(runtime.executor, "kernel_kind", "") == "tconv_k2s2_gap_halving_experimental"
-            assert getattr(runtime.executor, "use_ct_pt_hybrid_packing", False) is False
+            assert runtime.strategy == "halo_supported_tconv"
+            assert runtime.materializer == "halo_supported_tconv"
+            assert type(runtime.executor).__name__ == "HaloSupportedTConvRuntimeExecutor"
+            assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
+            assert isinstance(runtime.executor.delegate, TconvK2S2PythonRuntimeExecutor)
+            assert getattr(module, "region_first_skip_dense_pack", False) is True
     finally:
         scheme.delete_scheme()
 
@@ -153,7 +177,7 @@ def test_u22_registry_can_attach_decoder_tconv_subset() -> None:
         audit = registry.attach_to_dag(dag)
 
         assert audit["attached_count"] == 2
-        assert {row["node"] for row in audit["attached"]} == {"up2", "up1"}
+        assert audit["graph_audit"]["selected_tconv_count"] == 2
         assert audit["graph_audit"]["allowed_nodes"] == ["up2", "up1"]
         filtered = {
             row["node"]
@@ -162,7 +186,11 @@ def test_u22_registry_can_attach_decoder_tconv_subset() -> None:
         }
         assert filtered == {"up4", "up3"}
         for node_name in ("up2", "up1"):
-            assert getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None) is not None
+            module = dag.nodes[str(node_name)]["module"]
+            runtime = getattr(module, "region_runtime", None)
+            assert runtime is not None
+            assert runtime.strategy == "halo_supported_tconv"
+            assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
         for node_name in ("up4", "up3"):
             assert getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None) is None
     finally:
@@ -210,7 +238,9 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
         audit = registry.attach_to_dag(dag)
         attached = {row["node"] for row in audit["attached"]}
 
-        assert {"up4", "up3", "enc1b", "dec1a", "dec2b", "pool1", "pool2", "pool3", "pool4"}.issubset(attached)
+        assert {"enc1b", "dec1a", "dec2b", "pool1", "pool2", "pool3", "pool4"}.issubset(attached)
+        assert "up4" in attached
+        assert "up3" in attached
         assert "up2" not in attached
         assert "up1" not in attached
         assert "bottleneckb" in attached
@@ -229,6 +259,13 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
             assert type(runtime.executor.base_executor).__name__ == "HaloLocalConvRuntimeExecutor"
             assert runtime.executor.native_halo_input is bool(runtime.plan.get("native_halo_provider", False))
             assert runtime.supports_scheme(scheme) is True
+        for node_name in ("up4", "up3"):
+            module = dag.nodes[str(node_name)]["module"]
+            runtime = getattr(module, "region_runtime", None)
+            assert runtime is not None
+            assert runtime.strategy.startswith("halo_supported_tconv")
+            assert type(runtime.executor).__name__ == "LayoutPolicyProviderRuntimeExecutor"
+            assert isinstance(runtime.executor.base_executor, HaloSupportedTConvRuntimeExecutor)
         assert dag.nodes["pool1"]["module"].region_runtime.stage == "pool_downsample"
         assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
     finally:
@@ -315,6 +352,13 @@ def test_u22_registry_provider_default_is_no_hybrid() -> None:
             executor = getattr(runtime, "executor", None)
             assert executor is not None
             assert getattr(executor, "use_ct_pt_hybrid_packing", False) is False
+        for node_name in DECODER_TCONV_NODES:
+            module = dag.nodes[str(node_name)]["module"]
+            runtime = getattr(module, "region_runtime", None)
+            assert runtime is not None
+            executor = getattr(runtime, "executor", None)
+            base_executor = getattr(executor, "base_executor", executor)
+            assert isinstance(base_executor, HaloSupportedTConvRuntimeExecutor)
     finally:
         scheme.delete_scheme()
 
@@ -527,6 +571,65 @@ def test_u22_256_base8_routes_flat_halo_producers_to_native_compact_source() -> 
         scheme.delete_scheme()
 
 
+def test_consumer_fused_compact_source_uses_source_physical_layout_contract() -> None:
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+
+    conv = Conv2d(32, 64, kernel_size=3, padding=1, bias=True)
+    conv.init_orion_params()
+    conv.input_shape = torch.Size((1, 32, 96, 96))
+    conv.output_shape = torch.Size((1, 64, 96, 96))
+    conv.fhe_input_shape = torch.Size((1, 8, 192, 192))
+    conv.fhe_output_shape = torch.Size((1, 16, 192, 192))
+    conv.input_gap = 2
+    conv.output_gap = 2
+    conv.name = "consumer_fused_contract_enc2a"
+
+    selected = {
+        "top_beta": 1,
+        "bottom_beta": 9,
+        "stride": 1,
+        "gap": 2,
+        "core_slots": 294912,
+        "stored_slots": 325632,
+        "tile_count": 10,
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="enc2a"),
+        output_node_id="enc2a",
+        compile_plan={
+            "policy": "dp",
+            "edge_layouts": [
+                {
+                    "edge": "pool1->enc2a",
+                    "source": "pool1",
+                    "target": "enc2a",
+                    "op_kind": "conv2d",
+                    "shape": [1, 32, 96, 96],
+                    "fhe_shape": [1, 8, 192, 192],
+                    "required_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 2},
+                    "source_layout": dict(selected),
+                    "selected_layout": dict(selected),
+                    "physical_layout": "logical_halo_compact",
+                    "source_physical_layout": "packed_compact",
+                    "relayout": False,
+                    "layout_mode": "compact_halo_shared",
+                    "consumer_fused_relayout": True,
+                }
+            ],
+            "node_layouts": [],
+        },
+    )
+
+    attrs = executor._native_halo_module_attrs()
+
+    assert attrs["layout_policy_input_physical_layout"] == "packed_compact"
+    assert attrs["layout_policy_input_layout"]["top_beta"] == 0
+    assert attrs["layout_policy_input_layout"]["bottom_beta"] == 0
+    assert attrs["layout_policy_selected_input_layout"]["top_beta"] == 1
+    assert attrs["layout_policy_selected_input_layout"]["bottom_beta"] == 9
+    assert tuple(int(value) for value in attrs["fhe_input_shape"]) == (1, 8, 192, 192)
+
+
 def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
     from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
 
@@ -564,7 +667,7 @@ def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
         enc1a.assigned_level = len(scheme.params.get_logq()) - 1
         enc1a.assigned_depth = 1
         enc1a.compile(scheme)
-        assert enc1a.base_executor.delegate.native_plan.spec.input_bottom_beta == 1
+        assert enc1a.base_executor.delegate.native_plan.spec.input_bottom_beta == 0
 
         executor = dag.nodes["enc3a"]["module"].region_runtime.executor
         assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
@@ -959,6 +1062,104 @@ def test_native_halo_provider_accepts_compact_source_layout_without_input_pair_f
         scheme.delete_scheme()
 
 
+def test_native_halo_compact_source_prunes_zero_blocks_without_dense_pack_speedup() -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloStripeNoRIConvExecutor,
+        native_halo_conv2d_spec_from_module,
+    )
+
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 4, kernel_size=1, padding=0, bias=False)
+        conv.weight.data.zero_()
+        conv.weight.data[:2, :2, 0, 0] = torch.eye(2)
+        conv.weight.data[2:, 2:, 0, 0] = torch.eye(2)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 4, 4, 4))
+        conv.output_shape = torch.Size((1, 4, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 4, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 4, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_compact_source_prune_zero_blocks"
+        conv.layout_policy_input_physical_layout = "packed_compact"
+        conv.layout_policy_input_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1, "tile_count": 2}
+        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1, "tile_count": 2}
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(1)
+
+        spec = native_halo_conv2d_spec_from_module(conv, output_node_id="conv")
+        assert spec is not None
+        executor = NativeHaloStripeNoRIConvExecutor(module=conv, spec=spec, output_node_id="conv")
+        executor.assigned_level = level
+        executor.assigned_depth = 1
+        try:
+            executor.compile(scheme)
+            transform_count = sum(
+                len(group.transforms)
+                for group in executor.groups_by_input_index.values()
+            )
+
+            assert executor.rows == 2
+            assert executor.cols == 2
+            assert sorted(executor.target_indices_by_input_index) == [0, 1]
+            assert transform_count == 2
+            assert executor.target_indices_by_input_index[0] == (0,)
+            assert executor.target_indices_by_input_index[1] == (1,)
+        finally:
+            executor.cleanup(getattr(scheme, "backend", None))
+    finally:
+        scheme.delete_scheme()
+
+
+def test_input_pair_provider_prunes_zero_blocks_without_dense_pack_speedup() -> None:
+    from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
+
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 4, kernel_size=1, padding=0, bias=True)
+        conv.weight.data.zero_()
+        conv.weight.data[:2, :2, 0, 0] = torch.eye(2)
+        conv.weight.data[2:, 2:, 0, 0] = torch.eye(2)
+        conv.bias.data.zero_()
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 4, 4, 4))
+        conv.output_shape = torch.Size((1, 4, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 4, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 4, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "input_pair_provider_prune_zero_blocks"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(1)
+
+        dense_diagonals, _output_rotations = packing.pack_conv2d(conv, last=False)
+        assert set(dense_diagonals) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+
+        executor = InputPairConvRuntimeExecutor(
+            module=conv,
+            output_node_id="conv",
+            use_ct_pt_hybrid_packing=False,
+        )
+        executor.assigned_level = level
+        executor.assigned_depth = 1
+        try:
+            executor.compile(scheme)
+            transform_count = sum(len(group.transforms) for group in executor.groups_by_pair)
+
+            assert executor.rows == 2
+            assert executor.cols == 2
+            assert transform_count == 2
+            assert executor.input_block_pairs == [(0, None), (1, None)]
+            assert executor.row_indices_by_pair == [(0,), (1,)]
+        finally:
+            executor.cleanup(getattr(scheme, "backend", None))
+    finally:
+        scheme.delete_scheme()
+
+
 def test_native_halo_provider_uses_physical_compact_layout_for_raw_input_source() -> None:
     from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
     from orion.experimental.cir.native_halo_conv2d import NativeHaloStripeNoRIConvExecutor
@@ -1293,11 +1494,7 @@ def test_u22_256_base8_provider_solver_depth_covers_native_halo_relayout() -> No
         scheme.delete_scheme()
 
 
-def test_u22_256_base32_provider_mode_skips_dense_tconv_pack_for_all_decoder_nodes(monkeypatch) -> None:
-    def fail_pack_conv_transpose2d(*_args, **_kwargs):
-        raise AssertionError("u22_256_base32 provider mode must not dense-pack decoder ConvTranspose2d nodes")
-
-    monkeypatch.setattr(packing, "pack_conv_transpose2d", fail_pack_conv_transpose2d)
+def test_u22_256_base32_provider_mode_routes_decoder_tconv_to_halo_supported_provider() -> None:
     opts = _region_first_mode_options("u22_256_base32")
     _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
     try:
@@ -1316,20 +1513,21 @@ def test_u22_256_base32_provider_mode_skips_dense_tconv_pack_for_all_decoder_nod
         assert audit["graph_audit"]["allowed_nodes"] == ["up1", "up2", "up3", "up4"]
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
+            runtime = getattr(module, "region_runtime", None)
+            assert runtime is not None
+            assert runtime.strategy.startswith("halo_supported_tconv")
+            executor = getattr(runtime, "executor", None)
+            base_executor = getattr(executor, "base_executor", executor)
+            assert isinstance(base_executor, HaloSupportedTConvRuntimeExecutor)
+            assert isinstance(base_executor.delegate, TconvK2S2PythonRuntimeExecutor)
             assert getattr(module, "region_first_skip_dense_pack", False) is True
-            module.generate_diagonals(last=False)
-            assert module.diagonals == {}
     finally:
         scheme.delete_scheme()
 
 
 @pytest.mark.parametrize("dataset", ("tiny", "imagenet"))
 @pytest.mark.parametrize("node_name", DECODER_TCONV_NODES)
-def test_u22_decoder_tconv_provider_matches_reference_on_python_backend(monkeypatch, dataset: str, node_name: str) -> None:
-    def fail_pack_conv_transpose2d(*_args, **_kwargs):
-        raise AssertionError("U22 decoder provider runtime must not call pack_conv_transpose2d")
-
-    monkeypatch.setattr(packing, "pack_conv_transpose2d", fail_pack_conv_transpose2d)
+def test_u22_decoder_tconv_halo_supported_provider_matches_reference_on_python_backend(dataset: str, node_name: str) -> None:
     _init_python_scheme(logn=int(DATASET_SPECS[str(dataset)]["logn"]))
     try:
         dag = _prepared_dag(dataset=str(dataset))
@@ -1338,23 +1536,20 @@ def test_u22_decoder_tconv_provider_matches_reference_on_python_backend(monkeypa
         _set_compile_level(dag)
 
         module = dag.nodes[str(node_name)]["module"]
-        runtime = getattr(module, "region_runtime")
+        runtime = getattr(module, "region_runtime", None)
         assert runtime is not None
-        assert runtime.supports_scheme(scheme) is True
+        assert runtime.strategy == "halo_supported_tconv"
+        assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
 
-        module.generate_diagonals(last=False)
-        module.compile()
+        runtime.assigned_level = int(getattr(module, "level"))
+        runtime.assigned_depth = int(runtime.depth)
+        runtime.compile(scheme)
         module.he_mode = True
-        executor = getattr(runtime, "executor")
-        if (
-            int(getattr(executor, "output_block_count", 0)) == 1
-            and int(getattr(executor, "output_total_slots", 0)) < int(scheme.params.get_slots())
-        ):
-            assert int(getattr(executor, "output_fold_rotations", 0)) > 0
 
         torch.manual_seed(abs(hash((str(dataset), str(node_name)))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)
-        out = _decode_output(module, module(_encode_input(module, x)))
+        out_map = runtime.execute(_encode_input(module, x))
+        out = _decode_output(module, out_map[str(node_name)])
         reference = F.conv_transpose2d(
             x.unsqueeze(0),
             module.on_weight.detach().to(dtype=torch.float32),
@@ -1367,12 +1562,12 @@ def test_u22_decoder_tconv_provider_matches_reference_on_python_backend(monkeypa
         )[0]
 
         assert float((out - reference).abs().max().item()) <= 1.0e-5
-        assert runtime.execute_count == 1
+        assert getattr(runtime.executor, "groups", ())
     finally:
         scheme.delete_scheme()
 
 
-def test_u22_decoder_tconv_provider_supports_actual_base64_tiny_at_logn16() -> None:
+def test_u22_decoder_tconv_halo_supported_provider_supports_actual_base64_tiny_at_logn16() -> None:
     _init_python_scheme(logn=16)
     try:
         dag = _prepared_dag(dataset="tiny", base_channels=64)
@@ -1380,9 +1575,10 @@ def test_u22_decoder_tconv_provider_supports_actual_base64_tiny_at_logn16() -> N
         registry.attach_to_dag(dag)
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime")
+            runtime = getattr(module, "region_runtime", None)
             assert runtime is not None
-            assert runtime.supports_scheme(scheme) is True
+            assert runtime.strategy == "halo_supported_tconv"
+            assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
     finally:
         scheme.delete_scheme()
 

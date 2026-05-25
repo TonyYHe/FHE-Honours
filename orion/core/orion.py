@@ -36,6 +36,7 @@ from .tracer import StatsTracker, OrionTracer
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
+from .bootstrap_layout_compression import apply_bootstrap_layout_compression
 
 
 class _PackWorkerParams:
@@ -884,6 +885,9 @@ class Scheme:
             input_level, num_bootstraps, bootstrapper_slots = compile_cache.apply_bootstrap_plan(
                 network_dag,
                 compile_manifest["bootstrap_plan"],
+            )
+            network_dag.bootstrap_layout_compression_audit = apply_bootstrap_layout_compression(
+                network_dag
             )
             print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
         else:

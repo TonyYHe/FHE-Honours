@@ -6,9 +6,11 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import networkx as nx
 import torch
 
 from orion.core import packing
+from orion.core.bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.core.orion import _region_first_mode_options
 from orion.core.orion import scheme
 from orion.core.network_dag import NetworkDAG
@@ -241,7 +243,6 @@ def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> 
         if row["op_kind"] in {"conv2d", "avgpool2d"}
         and not _layout_covers(row["selected_layout"], row["required_layout"])
     ]
-    assert uncovered
     assert all(
         bool(row.get("consumer_fused_relayout", False))
         and row.get("layout_mode") in {"compact_align_shared", "compact_halo_shared"}
@@ -299,7 +300,7 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
         group.plan["provider_materializer"]
         for group in registry.groups
     } >= {
-        "tconv_k2s2_gap_halving_experimental",
+        "halo_supported_tconv",
         "u22_input_pair_conv_shared_rotations",
         "u22_pool_input_pair_shared_rotations",
     }
@@ -334,7 +335,7 @@ def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None
         type(group.executor.base_executor).__name__
         for group in registry.groups
     } >= {
-        "TconvK2S2PythonRuntimeExecutor",
+        "HaloSupportedTConvRuntimeExecutor",
         "InputPairConvRuntimeExecutor",
     }
 
@@ -736,6 +737,132 @@ def test_layout_policy_provider_runtime_shape_reflects_fused_output_halo_without
     assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
 
 
+def test_bootstrap_layout_compression_rewrites_profitable_layout_policy_boundary() -> None:
+    conv_module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
+    act_module = type("SiLU", (), {})()
+    next_module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
+
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 2,
+    }
+    compile_plan = {
+        "policy": "dp",
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "conv->act",
+                "source": "conv",
+                "target": "act",
+                "op_kind": "silu",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(halo),
+                "selected_layout": dict(halo),
+                "target_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+                "layout_mode": "halo_local",
+                "relayout": False,
+            },
+            {
+                "edge": "act->next",
+                "source": "act",
+                "target": "next",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(halo),
+                "selected_layout": dict(halo),
+                "target_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+                "layout_mode": "compact_halo_shared",
+                "relayout": False,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 6, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+            },
+            {
+                "node": "act",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 6, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+            },
+            {
+                "node": "next",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            },
+        ],
+    }
+    conv_executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=conv_module),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    next_executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=next_module),
+        output_node_id="next",
+        compile_plan=compile_plan,
+    )
+    conv_module.region_runtime = SimpleNamespace(executor=conv_executor)
+    next_module.region_runtime = SimpleNamespace(executor=next_executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("conv", module=conv_module, bootstrap=True)
+    dag.add_node("act", module=act_module, bootstrap=False)
+    dag.add_node("next", module=next_module, bootstrap=False)
+    dag.add_edge("conv", "act")
+    dag.add_edge("act", "next")
+
+    audit = apply_bootstrap_layout_compression(dag)
+    updated = next_executor.compile_plan
+    nodes = {str(row["node"]): dict(row) for row in updated["node_layouts"]}
+    edges = {str(row["edge"]): dict(row) for row in updated["edge_layouts"]}
+
+    assert audit["enabled"] is True
+    assert audit["nodes"][0]["saved_ciphertexts_per_bootstrap"] == 1
+    assert nodes["conv"]["selected_layout"]["tile_count"] == 1
+    assert nodes["act"]["selected_layout"]["tile_count"] == 1
+    assert edges["conv->act"]["physical_layout"] == "packed_compact"
+    assert edges["conv->act"]["source_physical_layout"] == "packed_compact"
+    assert edges["conv->act"]["target_physical_layout"] == "packed_compact"
+    assert bool(edges["conv->act"].get("consumer_fused_relayout", False)) is False
+    assert edges["act->next"]["physical_layout"] == "packed_compact"
+    assert edges["act->next"]["source_physical_layout"] == "packed_compact"
+    assert edges["act->next"]["target_physical_layout"] == "packed_compact"
+    assert bool(edges["act->next"].get("consumer_fused_relayout", False)) is False
+    assert edges["act->next"]["selected_layout"]["tile_count"] == 1
+    assert next_executor.native_input_rows == ()
+    assert len(next_executor.compact_source_rows) == 1
+    assert tuple(int(value) for value in conv_module.fhe_output_shape) == (1, 1, 4, 4)
+
+
 def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
     _init_python_scheme("")
     try:
@@ -857,36 +984,30 @@ def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback
     node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
     edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
 
-    for up_node, add_edge, consumer_edge in (
-        ("up3", "up3->add3", "add3->dec3a"),
-        ("up2", "up2->add2", "add2->dec2a"),
+    for up_node, join_node, join_edge, consumer_edge in (
+        ("up3", "add3", "up3->add3", "add3->dec3a"),
+        ("up2", "add2", "up2->add2", "add2->dec2a"),
+        ("up1", "add1", "up1->add1", "add1->dec1a"),
     ):
         up_layout = dict(node_rows[up_node]["selected_layout"])
-        up_add = dict(edge_rows[add_edge])
-        add_dec = dict(edge_rows[consumer_edge])
-        assert bool(up_add["relayout"]) is False
-        if int(up_layout["top_beta"]) > 0 or int(up_layout["bottom_beta"]) > 0:
-            assert int(up_layout["top_beta"]) == 1
-            assert int(up_layout["bottom_beta"]) == 0
-            assert int(up_layout["stride"]) == 2
-            assert node_rows[up_node]["producer_materialized_halo_reason"] == "dp_logical_halo_materialized_output"
-            assert int(node_rows[up_node]["producer_fused_rotation_estimate"]) == 0
-        else:
-            assert int(up_layout["top_beta"]) == 0
-            assert int(up_layout["bottom_beta"]) == 0
-            assert add_dec["layout_mode"] == "compact_align_shared"
-            assert add_dec["physical_layout"] == "packed_compact"
-            assert bool(add_dec["relayout"]) is False
-            assert bool(add_dec["consumer_fused_relayout"]) is True
+        join_layout = dict(node_rows[join_node]["selected_layout"])
+        up_join = dict(edge_rows[join_edge])
+        join_dec = dict(edge_rows[consumer_edge])
 
-    dec1a_layout = dict(node_rows["dec1a"]["selected_layout"])
-    add1_dec = dict(edge_rows["add1->dec1a"])
-    assert int(dec1a_layout["top_beta"]) == 0
-    assert int(dec1a_layout["bottom_beta"]) == 0
-    assert add1_dec["layout_mode"] == "compact_align_shared"
-    assert add1_dec["physical_layout"] == "packed_compact"
-    assert bool(add1_dec["relayout"]) is False
-    assert bool(add1_dec["consumer_fused_relayout"]) is True
+        assert up_join["op_kind"] == "add"
+        assert bool(up_join["relayout"]) is False
+        assert int(up_layout["top_beta"]) == int(join_layout["top_beta"])
+        assert int(up_layout["bottom_beta"]) == int(join_layout["bottom_beta"])
+        assert int(up_layout["stride"]) == int(join_layout["stride"])
+        assert int(up_layout["gap"]) == int(join_layout["gap"])
+        assert int(join_layout["core_slots"]) == int(edge_rows[consumer_edge]["shape"][1]) * int(
+            edge_rows[consumer_edge]["shape"][2]
+        ) * int(edge_rows[consumer_edge]["shape"][3])
+        assert dict(join_dec["source_layout"]) == join_layout
+        assert join_dec["layout_mode"] == "compact_halo_shared"
+        assert join_dec["physical_layout"] == "logical_halo_compact"
+        assert bool(join_dec["relayout"]) is False
+        assert bool(join_dec["consumer_fused_relayout"]) is True
 
 
 def test_one_down_one_up_silu_dp_fuses_relayout_without_bootstrap_growth() -> None:

@@ -280,6 +280,7 @@ class PolicyPlan:
             "producer_fused_rotation_estimate": int(self.producer_fused_rotation_estimate),
             "consumer_fused_relayout_count": int(self.consumer_fused_relayout_count),
             "consumer_fused_rotation_estimate": int(self.consumer_fused_rotation_estimate),
+            "compact_fallback_penalty_estimate": 0,
             "lt_bsgs_rotation_estimate": int(self.lt_bsgs_rotation_estimate),
             "planner_rotation_cost_estimate": int(self.planner_rotation_cost_estimate),
             "reported_rotation_estimate": int(self.reported_rotation_estimate),
@@ -725,6 +726,7 @@ def _edge_row(
     planner_rotation_cost: int | None = None,
     layout_mode: str = "halo_local",
     source_layout: LayoutState | None = None,
+    source_physical_layout: str | None = None,
     physical_layout: str | None = None,
     consumer_fused_relayout: bool = False,
     consumer_fused_rotation_estimate: int = 0,
@@ -800,6 +802,8 @@ def _edge_row(
         "lt_output_channel_multiplier": int(lt_stats["output_channel_multiplier"]),
         "lt_estimator": str(lt_stats.get("estimator", _normalize_layout_estimator(estimator))),
         "layout_mode": str(layout_mode),
+        "source_physical_layout": str(source_physical_layout or ""),
+        "target_physical_layout": str(physical_layout),
         "physical_layout": str(physical_layout),
         "consumer_fused_relayout": bool(consumer_fused_relayout),
         "consumer_fused_rotation_estimate": int(consumer_fused_rotation_estimate),
@@ -1316,7 +1320,7 @@ def _shared_bsgs_group_cost(
 
 
 def _lt_channel_multipliers(edge: EdgeInfo) -> tuple[int, int]:
-    if str(edge.op_kind) in {"add", "input"}:
+    if (str(edge.op_kind) in {"add", "concat", "input"}):
         return 0, 0
     input_channels = max(1, int(edge.input_channels or edge.shape[1]))
     if str(edge.op_kind) == "avgpool2d":
@@ -1393,7 +1397,7 @@ def _conv_missing_halo_rows(edge: EdgeInfo, layout: LayoutState) -> int:
 
 
 def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
-    if str(edge.op_kind) in {"add", "input"}:
+    if (str(edge.op_kind) in {"add", "concat", "input"}):
         return 0
     if edge.output_shape is None or edge.output_fhe_shape is None:
         return 0
@@ -1443,7 +1447,7 @@ def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
 
 
 def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> RotationEstimate:
-    if str(edge.op_kind) in {"add", "input"}:
+    if (str(edge.op_kind) in {"add", "concat", "input"}):
         return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     if edge.output_shape is None or edge.output_fhe_shape is None:
         return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -2044,7 +2048,7 @@ def _finalize_policy(
         sum(
             int(row.get("relayout_depth_estimate", 0) or 0)
             for row in edge_relayout_rows
-            if str(row.get("op_kind", "")) == "add"
+            if _is_join_op(str(row.get("op_kind", "")))
         )
     )
     lt_rotation_estimate = int(sum(int(row["lt_bsgs_rotation_estimate"]) for row in edge_rows))
@@ -2106,7 +2110,7 @@ def _finalize_policy(
 def _align_add_inputs(dag: NetworkDAG, rows_by_edge: dict[str, dict[str, Any]], relayout_layouts: list[LayoutState], *, slots: int) -> None:
     for node in dag.topological_sort():
         module = dag.nodes[node].get("module")
-        if type(module).__name__ != "Add":
+        if not _is_join_module(module):
             continue
         incoming = [f"{source}->{node}" for source in dag.predecessors(node)]
         layouts = [LayoutState(**rows_by_edge[edge_id]["selected_layout"]) for edge_id in incoming if edge_id in rows_by_edge]
@@ -2279,6 +2283,32 @@ def _layout_has_halo(layout: LayoutState) -> bool:
     return bool(int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0)
 
 
+def _is_join_module(module: Any | None) -> bool:
+    return type(module).__name__ in {"Add", "Concat"}
+
+
+def _is_join_op(op_kind: str) -> bool:
+    return str(op_kind) in {"add", "concat"}
+
+
+def _layout_for_join_output_shape(
+    layout: LayoutState,
+    *,
+    outgoing: Sequence[EdgeInfo],
+    slots: int,
+) -> LayoutState:
+    if not outgoing:
+        return layout
+    return _layout_for_shape(
+        shape=outgoing[0].shape,
+        gap=int(layout.gap),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
+        stride=int(layout.stride),
+        slots=int(slots),
+    )
+
+
 def _non_dp_consumer_fused_row(
     policy: str,
     edge: EdgeInfo,
@@ -2302,6 +2332,7 @@ def _non_dp_consumer_fused_row(
             relayout_reason="",
             layout_mode="native_halo_stripe",
             source_layout=source_layout,
+            source_physical_layout=str(source_physical),
             physical_layout=PHYSICAL_NATIVE_SOURCE_STRIPE,
             planner_rotation_cost=_consumer_fused_planner_rotation_cost(
                 edge,
@@ -2325,6 +2356,7 @@ def _non_dp_consumer_fused_row(
         relayout_reason="",
         layout_mode=str(layout_mode),
         source_layout=source_layout,
+        source_physical_layout=str(source_physical),
         physical_layout=str(physical_layout),
         consumer_fused_relayout=True,
         consumer_fused_rotation_estimate=0,
@@ -2359,7 +2391,7 @@ def _non_dp_producer_fused_output_preference(
         edge,
         slots=int(slots),
     )
-    if str(edge.op_kind) == "add":
+    if _is_join_op(str(edge.op_kind)):
         add_incoming = tuple(edges_by_target.get(str(edge.target), ()))
         if not add_incoming:
             return None
@@ -2427,7 +2459,7 @@ def _plan_non_dp_topological(
         module = dag.nodes[node].get("module")
         incoming_rows: list[dict[str, Any]] = []
 
-        if incoming and type(module).__name__ == "Add":
+        if incoming and _is_join_module(module):
             target_layout = _choose_non_dp_add_layout(
                 str(base_policy),
                 incoming,
@@ -2487,8 +2519,9 @@ def _plan_non_dp_topological(
                             relayout_reason=str(reason) if bool(relayout) else "",
                             lt_rotations=_lt_rotations(edge, target_layout),
                             source_layout=source_layout,
+                            source_physical_layout=str(source_physical),
                         )
-                )
+                    )
 
         rows.extend(incoming_rows)
 
@@ -2503,8 +2536,12 @@ def _plan_non_dp_topological(
         producer_materialized_halo = False
         producer_materialized_halo_reason = ""
         if incoming_rows:
-            if type(module).__name__ == "Add":
-                output_layout = LayoutState(**dict(incoming_rows[0]["selected_layout"]))
+            if _is_join_module(module):
+                output_layout = _layout_for_join_output_shape(
+                    LayoutState(**dict(incoming_rows[0]["selected_layout"])),
+                    outgoing=outgoing,
+                    slots=int(slots),
+                )
                 output_physical = str(incoming_rows[0].get("physical_layout", PHYSICAL_COMPACT))
             elif outgoing:
                 candidates = _operator_output_layout_candidates(
@@ -2545,6 +2582,7 @@ def _plan_non_dp_topological(
                         incoming_rows=incoming_rows,
                         output_layout=output_layout,
                         producer_fused=producer_fused,
+                        slots=int(slots),
                     )
                     logical_halo_materialized = bool(
                         str(output_physical) == PHYSICAL_LOGICAL_HALO
@@ -2668,7 +2706,7 @@ def _plan_orion_dense(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int)
 
         output_layout: LayoutState | None = None
         if incoming_rows and outgoing:
-            if type(module).__name__ == "Add":
+            if _is_join_module(module):
                 output_layout = _no_halo_layout_for_edge(outgoing[0], slots=int(slots))
             else:
                 semantic = _operator_semantic_output_layout(
@@ -3005,9 +3043,13 @@ def _dp_output_layout_candidates(
             global_beta=int(global_beta),
             slots=int(slots),
         )
-    if type(module).__name__ == "Add":
+    if _is_join_module(module):
         return _dedupe_layouts(
-            LayoutState(**dict(row["selected_layout"]))
+            _layout_for_join_output_shape(
+                LayoutState(**dict(row["selected_layout"])),
+                outgoing=outgoing,
+                slots=int(slots),
+            )
             for row in incoming_rows
         )
     if isinstance(module, ConvTranspose2d):
@@ -3031,6 +3073,7 @@ def _output_physical_layout(
     incoming_rows: Sequence[dict[str, Any]],
     output_layout: LayoutState,
     producer_fused: dict[str, Any],
+    slots: int,
 ) -> str:
     if _layout_preserving_output(module) and incoming_rows:
         physicals = {
@@ -3045,8 +3088,76 @@ def _output_physical_layout(
         return PHYSICAL_LOGICAL_HALO
     if isinstance(module, Conv2d) and not isinstance(module, ConvTranspose2d):
         if any(str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE for row in incoming_rows):
+            if not _native_conv_output_target_fits(
+                module,
+                incoming_rows=incoming_rows,
+                output_layout=output_layout,
+                slots=int(slots),
+            ):
+                return PHYSICAL_LOGICAL_HALO
             return PHYSICAL_NATIVE_SOURCE_STRIPE
     return PHYSICAL_LOGICAL_HALO
+
+
+def _native_conv_output_target_fits(
+    module: Any,
+    *,
+    incoming_rows: Sequence[dict[str, Any]],
+    output_layout: LayoutState,
+    slots: int,
+) -> bool:
+    if not incoming_rows:
+        return False
+    try:
+        from orion.experimental.cir.native_halo_conv2d import NativeHaloConv2DSpec, native_halo_conv2d_plan
+
+        input_shape = tuple(int(value) for value in getattr(module, "input_shape", ()))
+        output_shape = tuple(int(value) for value in getattr(module, "output_shape", ()))
+        if len(input_shape) < 4 or len(output_shape) < 4:
+            return False
+        kernel = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
+        stride = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
+        padding = _pair_tuple(getattr(module, "padding", (0, 0)), (0, 0))
+        dilation = _pair_tuple(getattr(module, "dilation", (1, 1)), (1, 1))
+        groups = max(1, int(getattr(module, "groups", 1) or 1))
+        if int(groups) != 1 or int(kernel[0]) != int(kernel[1]) or int(stride[0]) != int(stride[1]):
+            return False
+        if int(padding[0]) != int(padding[1]) or int(dilation[0]) != int(dilation[1]):
+            return False
+        input_layout = LayoutState(**dict(incoming_rows[0]["selected_layout"]))
+        label = "".join(ch if ch.isalnum() else "_" for ch in str(getattr(module, "name", "") or "conv")).strip("_") or "conv"
+        spec = NativeHaloConv2DSpec(
+            family_label=(
+                f"layout_policy_native_target_fit_{label}_{int(input_shape[1])}x{int(input_shape[2])}x{int(input_shape[3])}"
+                f"_to_{int(output_shape[1])}x{int(output_shape[2])}x{int(output_shape[3])}"
+                f"_k{int(kernel[0])}s{int(stride[0])}_gap{int(input_layout.gap)}to{int(output_layout.gap)}"
+            ),
+            c_in=int(input_shape[1]),
+            h_in=int(input_shape[2]),
+            w_in=int(input_shape[3]),
+            c_out=int(output_shape[1]),
+            h_out=int(output_shape[2]),
+            w_out=int(output_shape[3]),
+            gap_in=int(input_layout.gap),
+            gap_out=int(output_layout.gap),
+            kernel=int(kernel[0]),
+            stride=int(stride[0]),
+            pad=int(padding[0]),
+            dilation=int(dilation[0]),
+            groups=int(groups),
+            slot_count=int(slots),
+            input_top_beta=int(input_layout.top_beta),
+            input_bottom_beta=int(input_layout.bottom_beta),
+            output_top_beta=int(output_layout.top_beta),
+            output_bottom_beta=int(output_layout.bottom_beta),
+        )
+        native_halo_conv2d_plan(spec, require_native_target_fit=True)
+        return True
+    except ValueError as exc:
+        message = str(exc)
+        if "native halo" in message and "does not fit" in message:
+            return False
+        return False
 
 
 def _native_operator_output_layout(module: Any | None) -> bool:
@@ -3307,6 +3418,7 @@ def estimate_candidate_cost(
         relayout_reason=str(candidate.relayout_reason) if bool(candidate.relayout) else "",
         layout_mode=str(candidate.layout_mode),
         source_layout=candidate.source_layout,
+        source_physical_layout=str(candidate.source_physical),
         physical_layout=str(target_physical),
         consumer_fused_relayout=bool(candidate.consumer_fused_relayout),
         consumer_fused_rotation_estimate=int(candidate.consumer_fused_rotation_estimate),
@@ -3463,7 +3575,7 @@ def _plan_dp(
             live_physical = state.physical_dict()
             if any(edge.source not in live for edge in incoming):
                 continue
-            if incoming and type(dag.nodes[node].get("module")).__name__ == "Add":
+            if incoming and _is_join_module(dag.nodes[node].get("module")):
                 incoming_options = _incoming_add_options(incoming, live)
             else:
                 incoming_options_work: tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...] = (([], []),)
@@ -3526,7 +3638,7 @@ def _plan_dp(
                             compact is not None
                             and not _same_physical_layout(output_layout, compact)
                             and str(node) != "x"
-                            and type(module).__name__ != "Add"
+                            and not _is_join_module(module)
                             and not _direct_output_layout_without_relayout(module)
                         )
                         if bool(output_relayout):
@@ -3536,6 +3648,7 @@ def _plan_dp(
                             incoming_rows=incoming_rows,
                             output_layout=output_layout,
                             producer_fused=producer_fused,
+                            slots=int(slots),
                         )
                         candidate_storage = dict(next_physical)
                         candidate_storage[str(node)] = str(output_physical)

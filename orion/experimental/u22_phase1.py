@@ -342,6 +342,14 @@ def _layout_with_top_bottom_beta(
     return updated
 
 
+def _layout_policy_join_op_kind(value: Any) -> bool:
+    return str(value) in {"add", "concat"}
+
+
+def _layout_policy_join_module(module: Any | None) -> bool:
+    return type(module).__name__ in {"Add", "Concat"}
+
+
 def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node: str) -> tuple[dict[str, Any], ...]:
     if not _layout_policy_relayout_enabled():
         return ()
@@ -353,7 +361,7 @@ def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node:
             continue
         layout = dict(row.get("selected_layout", {}))
         if (
-            str(row.get("op_kind", "")) != "add"
+            not _layout_policy_join_op_kind(row.get("op_kind", ""))
             and _layout_top_beta(layout) == 0
             and _layout_bottom_beta(layout) == 0
         ):
@@ -552,6 +560,18 @@ def _layout_policy_zero_halo_layout(layout: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
+def _layout_policy_physical_compact_input_layout(row: dict[str, Any], logical_layout: dict[str, Any]) -> dict[str, Any]:
+    source_layout = dict(row.get("source_layout", {}) or {})
+    source_physical = str(row.get("source_physical_layout", "") or "")
+    if str(row.get("source", "")) == "x":
+        return _layout_policy_zero_halo_layout(logical_layout)
+    if source_physical == "packed_compact":
+        return _layout_policy_zero_halo_layout(source_layout or logical_layout)
+    if source_physical == "logical_halo_compact":
+        return dict(source_layout or logical_layout)
+    return dict(logical_layout)
+
+
 def _layout_policy_halo_on_shape(edge_row: dict[str, Any]) -> torch.Size:
     layout = dict(edge_row.get("selected_layout", {}))
     return _layout_policy_on_shape(edge_row, layout)
@@ -592,10 +612,18 @@ def _layout_policy_native_module_attrs(
             compact_input_rows and not native_input_rows and str(row.get("source", "")) != "x"
         )
         physical_input_layout = dict(layout)
-        if compact_input_rows and not native_input_rows and not bool(trust_selected_compact_layout):
-            physical_input_layout = dict(row.get("source_layout", {}) or {})
-            if not physical_input_layout or str(row.get("source", "")) == "x":
-                physical_input_layout = _layout_policy_zero_halo_layout(layout)
+        input_physical_layout = str(row.get("physical_layout", "") or "")
+        if compact_input_rows and not native_input_rows:
+            source_physical_layout = str(row.get("source_physical_layout", "") or "")
+            if source_physical_layout:
+                input_physical_layout = str(source_physical_layout)
+            if bool(row.get("consumer_fused_relayout", False)) or source_physical_layout:
+                physical_input_layout = _layout_policy_physical_compact_input_layout(row, layout)
+                trust_selected_compact_layout = bool(input_physical_layout == "logical_halo_compact")
+            elif not bool(trust_selected_compact_layout):
+                physical_input_layout = dict(row.get("source_layout", {}) or {})
+                if not physical_input_layout or str(row.get("source", "")) == "x":
+                    physical_input_layout = _layout_policy_zero_halo_layout(layout)
         gap = max(1, int(layout.get("gap", 1)))
         physical_gap = max(1, int(physical_input_layout.get("gap", gap)))
         top_beta = _layout_top_beta(physical_input_layout)
@@ -606,7 +634,7 @@ def _layout_policy_native_module_attrs(
                 "layout_policy_input_layout": dict(physical_input_layout),
                 "layout_policy_selected_input_layout": dict(layout),
                 "layout_policy_required_input_layout": dict(required_layout),
-                "layout_policy_input_physical_layout": str(row.get("physical_layout", "")),
+                "layout_policy_input_physical_layout": str(input_physical_layout),
                 "layout_policy_trust_selected_compact_input_layout": bool(trust_selected_compact_layout),
             }
         )
@@ -1058,6 +1086,13 @@ class LayoutPolicyEncryptedModuleRuntimeExecutor:
         self.relayout_rows = _layout_policy_incoming_relayout_rows(self.compile_plan, node=self.output_node_id)
         self.relayout_kernels: list[LayoutPolicyRelayoutKernel] = []
 
+    def update_layout_policy_compile_plan(self, compile_plan: dict[str, Any]) -> None:
+        if self._compiled_transform_ids:
+            self.cleanup(self._compiled_transform_backend)
+        self.compile_plan = dict(compile_plan)
+        self.relayout_rows = _layout_policy_incoming_relayout_rows(self.compile_plan, node=self.output_node_id)
+        self.relayout_kernels = []
+
     def supports_scheme(self, scheme: Any | None) -> bool:
         if scheme is None:
             return False
@@ -1273,6 +1308,34 @@ class LayoutPolicyProviderRuntimeExecutor:
         self.last_runtime_io: dict[str, Any] = {}
         self._compiled = False
         self._compiled_backend: Any | None = None
+
+    def update_layout_policy_compile_plan(self, compile_plan: dict[str, Any]) -> None:
+        if self._compiled:
+            self.cleanup(self._compiled_backend)
+        self.compile_plan = dict(compile_plan)
+        self.relayout_rows = _layout_policy_incoming_relayout_rows(self.compile_plan, node=self.output_node_id)
+        self.native_input_rows = _layout_policy_incoming_native_rows(self.compile_plan, node=self.output_node_id)
+        self.compact_source_rows = _layout_policy_incoming_compact_source_rows(
+            self.compile_plan,
+            node=self.output_node_id,
+        )
+        self.compact_align_shared_rows = _layout_policy_incoming_compact_align_shared_rows(
+            self.compile_plan,
+            node=self.output_node_id,
+        )
+        self.output_relayout_rows = _layout_policy_output_relayout_rows(self.compile_plan, node=self.output_node_id)
+        self.relayout_kernels = []
+        self.output_relayout_kernels = []
+        self.native_halo_input = _layout_policy_native_halo_input_supported(self.base_executor, self.native_input_rows)
+        self.native_physical_relayout_rows = _layout_policy_native_physical_relayout_rows(
+            self.base_executor,
+            self.compile_plan,
+            node=self.output_node_id,
+            native_input_rows=self.native_input_rows,
+            relayout_rows=self.relayout_rows,
+        )
+        self.native_physical_relayout_kernel = None
+        self._compiled = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_executor, name)
@@ -1663,7 +1726,7 @@ def _layout_policy_add_rows(compile_plan: dict[str, Any], *, node: str) -> tuple
     for row in compile_plan.get("edge_layouts", []):
         if str(row.get("target")) != str(node):
             continue
-        if str(row.get("op_kind", "")) != "add":
+        if not _layout_policy_join_op_kind(row.get("op_kind", "")):
             continue
         rows.append(dict(row))
     return tuple(rows)
@@ -1729,6 +1792,26 @@ class LayoutPolicyAddRuntimeExecutor:
         self.last_runtime_io: dict[str, Any] = {}
         self._compiled = False
         self._compiled_backend: Any | None = None
+
+    def update_layout_policy_compile_plan(self, compile_plan: dict[str, Any]) -> None:
+        if self._compiled:
+            self.cleanup(self._compiled_backend)
+        self.compile_plan = dict(compile_plan)
+        rows_by_source = {
+            str(row.get("source", "")): dict(row)
+            for row in _layout_policy_add_rows(self.compile_plan, node=self.node)
+        }
+        self.input_rows = tuple(
+            rows_by_source[str(source)]
+            for source in self.input_sources
+            if str(source) in rows_by_source
+        )
+        if len(self.input_rows) != len(self.input_sources):
+            missing = [str(source) for source in self.input_sources if str(source) not in rows_by_source]
+            raise ValueError(f"layout-policy Add runtime for {self.node} is missing input rows for {missing}")
+        self.relayout_rows = tuple(row for row in self.input_rows if bool(row.get("relayout", False)))
+        self.relayout_kernels = {}
+        self._compiled = False
 
     def supports_scheme(self, scheme: Any | None) -> bool:
         if scheme is None:
@@ -1865,6 +1948,52 @@ class LayoutPolicyAddRuntimeExecutor:
         self.relayout_kernels = {}
         self._compiled = False
         self._compiled_backend = None
+
+
+class LayoutPolicyConcatRuntimeExecutor(LayoutPolicyAddRuntimeExecutor):
+    def bootstrap_prescale_fusion_capable(self) -> bool:
+        return False
+
+    def __call__(self, *inputs: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        if len(inputs) == 1 and isinstance(inputs[0], (list, tuple)):
+            inputs = tuple(inputs[0])
+        if len(inputs) != len(self.input_rows):
+            raise ValueError(f"layout-policy Concat runtime for {self.node} expects {len(self.input_rows)} inputs")
+        scheme = getattr(inputs[0], "scheme", None) if inputs else None
+        if not self.supports_scheme(scheme):
+            return tuple(inputs), ()
+        self.compile(scheme)
+        relayout_started = time.time()
+        working: list[Any] = []
+        owned: list[Any] = []
+        for index, source_ct in enumerate(inputs):
+            kernel = self.relayout_kernels.get(int(index))
+            if kernel is None:
+                working.append(source_ct)
+                continue
+            out = kernel.apply(source_ct)
+            owned.append(out)
+            working.append(out)
+        relayout_s = float(time.time() - relayout_started)
+        relayout_ops = _layout_policy_relayout_operation_totals(self.relayout_kernels.values())
+        self.execute_count += 1
+        self.last_runtime_timing = {
+            "relayout_s": float(relayout_s),
+            "concat_s": 0.0,
+        }
+        self.last_runtime_io = {
+            "policy": str(self.compile_plan.get("policy", "")),
+            "runtime_lowering": "layout_policy_concat_join",
+            "backend": self._backend_name(scheme),
+            "relayout_edge_count": int(len(self.relayout_rows)),
+            "relayout_kernel_count": int(len(self.relayout_kernels)),
+            "relayout_rotation_count": int(relayout_ops["rotation_count"]),
+            "relayout_mask_mult_count": int(relayout_ops["mask_mult_count"]),
+            "relayout_sparse_lt_count": int(relayout_ops["sparse_lt_count"]),
+            "input_ciphertext_counts": [int(len(getattr(value, "ids", ())) or 0) for value in inputs],
+            "output_part_ciphertext_counts": [int(len(getattr(value, "ids", ())) or 0) for value in working],
+        }
+        return tuple(working), tuple(owned)
 
 
 class _Missing:
@@ -3698,6 +3827,80 @@ class TconvK2S2PythonRuntimeExecutor:
         return {self.output_node_id: out}
 
 
+class HaloSupportedTConvRuntimeExecutor:
+    kernel_kind = "halo_supported_tconv"
+    native_halo_input_capable = True
+    native_halo_output_capable = True
+
+    def __init__(
+        self,
+        *,
+        module: Any,
+        output_node_id: str,
+        use_ct_pt_hybrid_packing: bool = False,
+        project_complex_inputs_to_real: bool = True,
+        disable_tile_family_sharing: bool | None = None,
+    ) -> None:
+        self.module = module
+        self.output_node_id = str(output_node_id)
+        self.use_ct_pt_hybrid_packing = bool(use_ct_pt_hybrid_packing)
+        self.delegate = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id=str(output_node_id),
+            use_ct_pt_hybrid_packing=bool(use_ct_pt_hybrid_packing),
+            project_complex_inputs_to_real=bool(project_complex_inputs_to_real),
+            disable_tile_family_sharing=disable_tile_family_sharing,
+        )
+
+    @property
+    def assigned_level(self) -> int | None:
+        return self.delegate.assigned_level
+
+    @assigned_level.setter
+    def assigned_level(self, value: int | None) -> None:
+        self.delegate.assigned_level = None if value is None else int(value)
+
+    @property
+    def assigned_depth(self) -> int | None:
+        return self.delegate.assigned_depth
+
+    @assigned_depth.setter
+    def assigned_depth(self, value: int | None) -> None:
+        self.delegate.assigned_depth = None if value is None else int(value)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    def supports_scheme(self, scheme: Any | None) -> bool:
+        return bool(self.delegate.supports_scheme(scheme))
+
+    def compile(self, scheme: Any) -> None:
+        self.delegate.compile(scheme)
+
+    def __call__(self, source_ct: Any) -> dict[str, Any]:
+        return dict(self.delegate(source_ct))
+
+    def cleanup(self, backend: Any) -> None:
+        self.delegate.cleanup(backend)
+
+    def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
+        payload = dict(metadata or {})
+        delegate_metadata = payload.get("delegate_metadata")
+        if isinstance(delegate_metadata, dict):
+            self.delegate.load_compile_cache_metadata(delegate_metadata)
+        else:
+            self.delegate.load_compile_cache_metadata(payload)
+
+    def compile_cache_metadata(self) -> dict[str, Any]:
+        delegate_metadata = dict(self.delegate.compile_cache_metadata())
+        return {
+            **delegate_metadata,
+            "kind": type(self).__name__,
+            "delegate_kind": type(self.delegate).__name__,
+            "delegate_metadata": delegate_metadata,
+        }
+
+
 @dataclass
 class U22CompileRegistry:
     groups: tuple[RegionFirstRuntimeGroup, ...]
@@ -3820,16 +4023,16 @@ class U22CompileRegistry:
                         stage="decoder_up",
                         module_prefix=str(node),
                         conv_nodes=(str(node),),
-                        strategy="tconv_k2s2_gap_halving_experimental",
-                        materializer="tconv_k2s2_gap_halving_experimental",
+                        strategy="halo_supported_tconv",
+                        materializer="halo_supported_tconv",
                         depth=1,
                         solver_depth=1,
-                        boundary_actions=("packed_slot_gather", "phase_halving_output_repack"),
+                        boundary_actions=("halo_supported_tconv",),
                         expected_stats={},
                         executable=True,
                         fallback_reason="",
                         output_node_ids=(str(node),),
-                        executor=TconvK2S2PythonRuntimeExecutor(
+                        executor=HaloSupportedTConvRuntimeExecutor(
                             module=module,
                             output_node_id=str(node),
                             use_ct_pt_hybrid_packing=False,
@@ -3955,6 +4158,7 @@ class U22CompileRegistry:
                 compile_plan = dict(plan)
                 break
         add_attached: list[dict[str, Any]] = []
+        concat_attached: list[dict[str, Any]] = []
         backend_producer_attached: list[dict[str, Any]] = []
         if compile_plan is not None:
             backend_producer_attached = _layout_policy_attach_backend_producer_outputs(
@@ -3964,7 +4168,7 @@ class U22CompileRegistry:
             )
             for node in dag.topological_sort():
                 module = dag.nodes[node].get("module")
-                if type(module).__name__ != "Add":
+                if not _layout_policy_join_module(module):
                     continue
                 rows = _layout_policy_add_rows(compile_plan, node=str(node))
                 if not rows:
@@ -3979,12 +4183,17 @@ class U22CompileRegistry:
                 fx_node = dag.nodes[node].get("fx_node")
                 fx_inputs = tuple(str(value.name) for value in getattr(fx_node, "all_input_nodes", ()) or ())
                 input_sources = fx_inputs if fx_inputs else tuple(str(value) for value in dag.predecessors(node))
-                runtime = LayoutPolicyAddRuntimeExecutor(
+                is_concat = type(module).__name__ == "Concat"
+                runtime_cls = LayoutPolicyConcatRuntimeExecutor if bool(is_concat) else LayoutPolicyAddRuntimeExecutor
+                runtime = runtime_cls(
                     node=str(node),
                     compile_plan=compile_plan,
                     input_sources=tuple(input_sources),
                 )
-                module.layout_policy_add_runtime = runtime
+                if bool(is_concat):
+                    module.layout_policy_concat_runtime = runtime
+                else:
+                    module.layout_policy_add_runtime = runtime
                 relayout_depth = max(
                     [0]
                     + [
@@ -3995,14 +4204,16 @@ class U22CompileRegistry:
                 )
                 if hasattr(module, "set_depth"):
                     module.set_depth(max(int(getattr(module, "depth", 0) or 0), int(relayout_depth)))
-                add_attached.append(
-                    {
-                        "node": str(node),
-                        "input_sources": [str(value) for value in input_sources],
-                        "relayout_edge_count": int(sum(1 for row in rows if bool(row.get("relayout", False)))),
-                        "materialized_halo": bool(has_materialized_halo),
-                    }
-                )
+                row = {
+                    "node": str(node),
+                    "input_sources": [str(value) for value in input_sources],
+                    "relayout_edge_count": int(sum(1 for row in rows if bool(row.get("relayout", False)))),
+                    "materialized_halo": bool(has_materialized_halo),
+                }
+                if bool(is_concat):
+                    concat_attached.append(row)
+                else:
+                    add_attached.append(row)
         return {
             "attached_count": int(len(attached)),
             "attached": attached,
@@ -4010,6 +4221,8 @@ class U22CompileRegistry:
             "layout_policy_backend_producer_outputs": backend_producer_attached,
             "layout_policy_add_runtime_count": int(len(add_attached)),
             "layout_policy_add_runtimes": add_attached,
+            "layout_policy_concat_runtime_count": int(len(concat_attached)),
+            "layout_policy_concat_runtimes": concat_attached,
             "executable_region_count": int(sum(1 for group in self.groups if bool(group.executable))),
             "graph_audit": dict(self.graph_audit),
         }
