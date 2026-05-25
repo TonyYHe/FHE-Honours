@@ -1591,6 +1591,10 @@ def _retune_transform_group_bsgs(transforms: list[Any], *, slots: int) -> None:
         transform.giant_shifts = tuple(sorted(int(value) for value in giant))
 
 
+def _cached_transform_shell(*, level: int, scheme: Any) -> Any:
+    return SimpleNamespace(diagonals={}, level=int(level), scheme=scheme)
+
+
 class NativeHaloStripeNoRIConvExecutor:
     kernel_kind = "native_halo_stripe_no_ri_conv2d"
     use_ct_pt_hybrid_packing = False
@@ -1699,24 +1703,6 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def _runtime_spec(self) -> NativeHaloConv2DSpec:
         input_layout = dict(getattr(self.module, "layout_policy_input_layout", {}) or {})
-        required_input_layout = dict(getattr(self.module, "layout_policy_required_input_layout", {}) or {})
-        if self._uses_compact_source_input() and required_input_layout:
-            trust_selected_layout = bool(
-                getattr(self.module, "layout_policy_trust_selected_compact_input_layout", False)
-            )
-            selected_top_beta = _layout_top_beta(input_layout)
-            selected_bottom_beta = _layout_bottom_beta(input_layout)
-            required_top_beta = _layout_top_beta(required_input_layout)
-            required_bottom_beta = _layout_bottom_beta(required_input_layout)
-            selected_gap = max(1, int(input_layout.get("gap", self.spec.gap_in) or 1))
-            required_gap = max(1, int(required_input_layout.get("gap", self.spec.gap_in) or 1))
-            if (
-                not bool(trust_selected_layout)
-                or int(selected_gap) != int(required_gap)
-                or int(selected_top_beta) < int(required_top_beta)
-                or int(selected_bottom_beta) < int(required_bottom_beta)
-            ):
-                input_layout = required_input_layout
         output_layout = dict(getattr(self.module, "layout_policy_output_layout", {}) or {})
         return replace(
             self.spec,
@@ -1751,6 +1737,26 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
         self._compile_cache_metadata = dict(metadata or {})
+
+    def _empty_compile_timing(self) -> dict[str, float]:
+        return {
+            "prepare_plans_s": 0.0,
+            "prepare_transforms_s": 0.0,
+            "compile_unified_s": 0.0,
+            "build_transform_s": 0.0,
+            "retune_bsgs_s": 0.0,
+            "group_compile_s": 0.0,
+            "built_transform_count": 0.0,
+            "compiled_group_count": 0.0,
+            "evaluate_unified_s": 0.0,
+            "group_eval_s": 0.0,
+            "partial_wrap_s": 0.0,
+            "partial_rescale_s": 0.0,
+            "partial_accumulate_s": 0.0,
+            "postprocess_s": 0.0,
+            "input_relayout_s": 0.0,
+            "output_relayout_s": 0.0,
+        }
 
     def _bias_chunk(self, *, block_index: int) -> torch.Tensor | None:
         if self.bias_vector is None:
@@ -1822,6 +1828,65 @@ class NativeHaloStripeNoRIConvExecutor:
                 self._bias_plaintext_cache[(int(block_index), int(level))] = ptxt
             plaintexts.append(ptxt)
         return tuple(plaintexts)
+
+    def _compile_from_cache_metadata(self, scheme: Any) -> bool:
+        metadata = dict(self._compile_cache_metadata or {})
+        if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
+            return False
+
+        group_rows = list(metadata.get("groups_by_input_index", []))
+        if not group_rows:
+            raise RuntimeError(
+                f"Cached native halo Conv2d manifest for {self.output_node_id!r} is missing "
+                "groups_by_input_index; re-run with io_mode='save'."
+            )
+
+        self._refresh_runtime_plan()
+        self.rows = int(metadata.get("rows", self.rows))
+        self.cols = int(metadata.get("cols", self.cols))
+        module_bias = getattr(self.module, "on_bias", None)
+        self.bias_vector = None if module_bias is None else module_bias.detach().to(dtype=torch.float32)
+        input_level = int(self._level(scheme))
+        conv_level = int(input_level)
+        conv_output_level = max(0, int(input_level - 1))
+        self.bias_plaintexts = self._compile_bias_plaintexts_at_level(scheme, level=int(conv_output_level))
+        self.groups_by_input_index = {}
+        self.target_indices_by_input_index = {}
+        self.input_relayout_kernel = None
+        self.output_relayout_kernel = None
+        self.last_runtime_timing = self._empty_compile_timing()
+        self.last_runtime_counts = {}
+
+        compile_started = time.time()
+        for group_meta in group_rows:
+            input_index = int(group_meta.get("input_index", 0))
+            target_indices = tuple(int(value) for value in group_meta.get("target_indices", []))
+            if not target_indices:
+                continue
+            storage_key = str(group_meta.get("storage_key", ""))
+            if not storage_key:
+                raise RuntimeError(
+                    f"Cached native halo Conv2d manifest for {self.output_node_id!r} has an empty storage key "
+                    f"for input_index={input_index}."
+                )
+            group = UnifiedTransformGroup(
+                [_cached_transform_shell(level=int(conv_level), scheme=scheme) for _target in target_indices]
+            )
+            group._storage_key = storage_key
+            group.compile_unified(scheme.backend)
+            self.groups_by_input_index[int(input_index)] = group
+            self.target_indices_by_input_index[int(input_index)] = target_indices
+        if not self.groups_by_input_index:
+            raise RuntimeError(
+                f"Cached native halo Conv2d manifest for {self.output_node_id!r} did not contain any non-empty "
+                "transform groups; re-run with io_mode='save'."
+            )
+        self.compile_count += 1
+        elapsed = float(time.time() - compile_started)
+        self.last_runtime_timing["compile_unified_s"] = elapsed
+        self.last_runtime_timing["group_compile_s"] = elapsed
+        self.last_runtime_timing["compiled_group_count"] = float(len(self.groups_by_input_index))
+        return True
 
     def _compile_compact_source_layout_diagonals(
         self,
@@ -1974,26 +2039,12 @@ class NativeHaloStripeNoRIConvExecutor:
             self.cleanup(getattr(scheme, "backend", None))
         if self.groups_by_input_index:
             return
+        if self._compile_from_cache_metadata(scheme):
+            return
         prepare_started = time.time()
         self._validate_module()
-        self.last_runtime_timing = {
-            "prepare_plans_s": float(time.time() - prepare_started),
-            "prepare_transforms_s": 0.0,
-            "compile_unified_s": 0.0,
-            "build_transform_s": 0.0,
-            "retune_bsgs_s": 0.0,
-            "group_compile_s": 0.0,
-            "built_transform_count": 0.0,
-            "compiled_group_count": 0.0,
-            "evaluate_unified_s": 0.0,
-            "group_eval_s": 0.0,
-            "partial_wrap_s": 0.0,
-            "partial_rescale_s": 0.0,
-            "partial_accumulate_s": 0.0,
-            "postprocess_s": 0.0,
-            "input_relayout_s": 0.0,
-            "output_relayout_s": 0.0,
-        }
+        self.last_runtime_timing = self._empty_compile_timing()
+        self.last_runtime_timing["prepare_plans_s"] = float(time.time() - prepare_started)
         self.last_runtime_counts = {}
         module_bias = getattr(self.module, "on_bias", None)
         self.bias_vector = None if module_bias is None else module_bias.detach().to(dtype=torch.float32)
