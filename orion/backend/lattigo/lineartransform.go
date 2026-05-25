@@ -938,6 +938,33 @@ func validateLinearTransformPlaintextLevels(transformID int, transform lintrans.
 	}
 }
 
+//export EnableLinearTransformEvaluationProfile
+func EnableLinearTransformEvaluationProfile(enabled C.int) {
+	commonlintrans.EnableEvaluationProfile(int(enabled) != 0)
+}
+
+//export ResetLinearTransformEvaluationProfile
+func ResetLinearTransformEvaluationProfile() {
+	commonlintrans.ResetEvaluationProfile()
+}
+
+//export GetLinearTransformEvaluationProfileCounters
+func GetLinearTransformEvaluationProfileCounters() (*C.ulonglong, C.ulong) {
+	profile := commonlintrans.GetEvaluationProfile()
+	values := []uint64{
+		uint64(profile.DiagonalTermCount),
+		uint64(profile.QMulTermCount),
+		uint64(profile.QPMulTermCount),
+		uint64(profile.FinalModDownCount),
+		uint64(profile.TransformCount),
+		uint64(profile.BabyRotationCount),
+		uint64(profile.GiantRotationCount),
+		uint64(profile.InnerReduceCount),
+		uint64(profile.OuterReduceCount),
+	}
+	return SliceToCArray(values, convertUint64ToCULonglong)
+}
+
 //export DeleteLinearTransform
 func DeleteLinearTransform(id C.int) {
 	deleteStreamingLTState(int(id))

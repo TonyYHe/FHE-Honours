@@ -212,6 +212,139 @@ def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> 
     return _aggregate_runtime_fairness(timings, serving_hot_s=float(serving_hot_s))
 
 
+_LT_PROFILE_COUNTER_NAMES = (
+    "diag_terms",
+    "q_mul",
+    "qp_mul",
+    "final_moddown",
+    "transform_count",
+    "baby_rotation_count",
+    "giant_rotation_count",
+    "inner_reduce_count",
+    "outer_reduce_count",
+)
+
+
+def _set_lattigo_lt_profile_enabled(enabled: bool) -> bool:
+    backend = getattr(scheme, "backend", None)
+    enable = getattr(backend, "EnableLinearTransformEvaluationProfile", None)
+    reset = getattr(backend, "ResetLinearTransformEvaluationProfile", None)
+    if not callable(enable) or not callable(reset):
+        return False
+    if bool(enabled):
+        reset()
+        enable(1)
+    else:
+        enable(0)
+    return True
+
+
+def _collect_lattigo_lt_profile() -> dict[str, int]:
+    backend = getattr(scheme, "backend", None)
+    getter = getattr(backend, "GetLinearTransformEvaluationProfileCounters", None)
+    if not callable(getter):
+        return {}
+    values = [int(value) for value in getter()]
+    return {
+        str(name): int(values[index]) if index < len(values) else 0
+        for index, name in enumerate(_LT_PROFILE_COUNTER_NAMES)
+    }
+
+
+def _collect_provider_group_counts(net: torch.nn.Module) -> dict[str, Any]:
+    module_rows: list[dict[str, Any]] = []
+    totals = {
+        "executor_count": 0,
+        "source_group_count": 0,
+        "target_count": 0,
+        "partial_count": 0,
+        "same_target_partial_count": 0,
+        "same_target_accumulate_count": 0,
+        "same_source_same_target_merge_count": 0,
+        "runtime_partial_count": 0,
+        "runtime_partial_accumulate_count": 0,
+        "runtime_partial_rescale_count": 0,
+    }
+    seen: set[int] = set()
+    seen_group_sets: set[tuple[int, ...]] = set()
+    for module_name, module in net.named_modules():
+        runtime = getattr(module, "region_runtime", None)
+        executor = getattr(runtime, "executor", None)
+        if executor is None:
+            continue
+        for candidate in _walk_executor_objects(executor):
+            if id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            groups_by_input = getattr(candidate, "groups_by_input_index", None)
+            target_indices_by_input = getattr(candidate, "target_indices_by_input_index", None)
+            if not isinstance(groups_by_input, dict) or not groups_by_input:
+                continue
+            group_set_key = tuple(
+                id(group)
+                for _input_index, group in sorted(groups_by_input.items())
+            )
+            if group_set_key in seen_group_sets:
+                continue
+            seen_group_sets.add(group_set_key)
+            if not isinstance(target_indices_by_input, dict):
+                target_indices_by_input = {}
+            target_hist: dict[int, int] = {}
+            partial_count = 0
+            same_source_merge = 0
+            for input_index, _group in sorted(groups_by_input.items()):
+                per_source_targets = [
+                    int(value)
+                    for value in tuple(target_indices_by_input.get(int(input_index), ()) or ())
+                ]
+                partial_count += int(len(per_source_targets))
+                per_source_hist: dict[int, int] = {}
+                for target in per_source_targets:
+                    per_source_hist[int(target)] = int(per_source_hist.get(int(target), 0)) + 1
+                    target_hist[int(target)] = int(target_hist.get(int(target), 0)) + 1
+                same_source_merge += sum(
+                    max(0, int(count) - 1)
+                    for count in per_source_hist.values()
+                )
+            same_target_partial = sum(
+                int(count)
+                for count in target_hist.values()
+                if int(count) > 1
+            )
+            same_target_accumulate = sum(
+                max(0, int(count) - 1)
+                for count in target_hist.values()
+            )
+            runtime_counts = dict(getattr(candidate, "last_runtime_counts", {}) or {})
+            row = {
+                "module_path": str(module_name),
+                "node": str(getattr(module, "region_output_id", module_name)),
+                "executor": type(candidate).__name__,
+                "source_group_count": int(len(groups_by_input)),
+                "target_count": int(len(target_hist)),
+                "partial_count": int(partial_count),
+                "same_target_partial_count": int(same_target_partial),
+                "same_target_accumulate_count": int(same_target_accumulate),
+                "same_source_same_target_merge_count": int(same_source_merge),
+                "runtime_counts": runtime_counts,
+            }
+            module_rows.append(row)
+            totals["executor_count"] += 1
+            totals["source_group_count"] += int(row["source_group_count"])
+            totals["target_count"] += int(row["target_count"])
+            totals["partial_count"] += int(row["partial_count"])
+            totals["same_target_partial_count"] += int(row["same_target_partial_count"])
+            totals["same_target_accumulate_count"] += int(row["same_target_accumulate_count"])
+            totals["same_source_same_target_merge_count"] += int(row["same_source_same_target_merge_count"])
+            totals["runtime_partial_count"] += int(runtime_counts.get("partial_count", 0) or 0)
+            totals["runtime_partial_accumulate_count"] += int(runtime_counts.get("partial_accumulate_count", 0) or 0)
+            totals["runtime_partial_rescale_count"] += int(runtime_counts.get("partial_rescale_count", 0) or 0)
+    return {
+        "totals": totals,
+        "rows": module_rows,
+    }
+
+
 def _model_input_native_halo_plan(net: torch.nn.Module) -> dict[str, Any] | None:
     for module_name, module in net.named_modules():
         runtime = getattr(module, "region_runtime", None)
@@ -494,6 +627,24 @@ def _build_u22_256_base8_encoder(*, activation: str | None = None, silu_degree: 
     )
 
 
+def _build_u22_192_base8_encoder(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22Encoder(
+        dataset="kvasir_polyp_256",
+        base_dim=8,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
+def _build_u22_224_base8_encoder(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return UNet22Encoder(
+        dataset="kvasir_polyp_256",
+        base_dim=8,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
 def _build_u22_256_base64_encoder(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
     return UNet22Encoder(
         dataset="kvasir_polyp_256",
@@ -639,6 +790,34 @@ NETWORKS: dict[str, dict[str, Any]] = {
             backend=str(backend),
         ),
         "builder": _build_u22_256_base8_encoder,
+        "scope": "encoder",
+    },
+    "u22_192_base8_encoder": {
+        "label": "U22 192 base8 encoder",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 192, 192),
+        "provider_mode": "u22_256_base8",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_192_base8_encoder,
+        "scope": "encoder",
+    },
+    "u22_224_base8_encoder": {
+        "label": "U22 224 base8 encoder",
+        "model": "UNet22",
+        "dataset": "kvasir_polyp_256",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "u22_256_base8",
+        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
+            logn=16,
+            provider_mode=str(provider_mode),
+            backend=str(backend),
+        ),
+        "builder": _build_u22_224_base8_encoder,
         "scope": "encoder",
     },
     "u22_192_base64_encoder": {
@@ -1633,6 +1812,7 @@ def _run_forward_attempt(
     attempt_index: int,
     attempt_kind: str,
     profile_modules: bool,
+    profile_lt: bool,
     trace_forward_memory: bool,
     record_primary: bool,
 ) -> dict[str, Any]:
@@ -1678,6 +1858,7 @@ def _run_forward_attempt(
         attempt["device_memory_after_encrypt"] = _device_memory_snapshot()
         attempt["live_ciphertexts_after_encrypt"] = _live_ciphertext_snapshot()
         _write(payload, out_path)
+        lt_profile_enabled = _set_lattigo_lt_profile_enabled(True) if bool(profile_lt) else False
         try:
             out_ct = _attempt_timed(
                 payload,
@@ -1689,6 +1870,14 @@ def _run_forward_attempt(
                 record_primary_timing=bool(record_primary),
             )
         finally:
+            if bool(lt_profile_enabled):
+                _set_lattigo_lt_profile_enabled(False)
+                attempt["lattigo_lt_profile_after_he_forward"] = _collect_lattigo_lt_profile()
+                if bool(record_primary):
+                    payload["lattigo_lt_profile_after_forward"] = dict(
+                        attempt["lattigo_lt_profile_after_he_forward"]
+                    )
+                _write(payload, out_path)
             if profile_snapshot is not None:
                 snapshot = profile_snapshot()
                 if bool(profile_modules):
@@ -1704,7 +1893,9 @@ def _run_forward_attempt(
             net,
             serving_hot_s=float(attempt.get("timing_s", {}).get("he_forward", 0.0)),
         )
+        provider_group_counts = _collect_provider_group_counts(net)
         attempt["runtime_fairness_timing"] = dict(runtime_fairness)
+        attempt["provider_group_counts_after_forward"] = dict(provider_group_counts)
         attempt["resident_compute_s"] = runtime_fairness.get("resident_compute_s")
         attempt["serving_hot_s"] = runtime_fairness.get("serving_hot_s")
         attempt["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
@@ -1714,6 +1905,7 @@ def _run_forward_attempt(
         attempt["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         if bool(record_primary):
             payload["runtime_fairness_timing_after_forward"] = dict(runtime_fairness)
+            payload["provider_group_counts_after_forward"] = dict(provider_group_counts)
             payload["resident_compute_s"] = runtime_fairness.get("resident_compute_s")
             payload["serving_hot_s"] = runtime_fairness.get("serving_hot_s")
             payload["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
@@ -1797,6 +1989,7 @@ def _run_one(
     forward_runs: int = 1,
     warmup_runs: int = 0,
     profile_modules: bool = False,
+    profile_lt: bool = False,
     trace_forward_memory: bool = False,
     provider_mode_override: str | None = None,
     provider_no_hybrid: bool = False,
@@ -1867,6 +2060,7 @@ def _run_one(
         "forward_runs": int(forward_runs),
         "warmup_runs": int(warmup_runs),
         "profile_modules": bool(profile_modules),
+        "profile_lt": bool(profile_lt),
         "trace_forward_memory": bool(trace_forward_memory),
         "bootstrap_many_enabled": os.environ.get("ORION_LATTIGO_BOOTSTRAP_MANY", "0") != "0",
         "cheddar_runtime_env": env_defaults,
@@ -1937,6 +2131,7 @@ def _run_one(
                 attempt_index=int(attempt_index),
                 attempt_kind=str(attempt_kind),
                 profile_modules=bool(profile_modules),
+                profile_lt=bool(profile_lt),
                 trace_forward_memory=bool(trace_forward_memory),
                 record_primary=bool(int(attempt_index) == int(first_measured_index)),
             )
@@ -2236,6 +2431,11 @@ def main() -> int:
     )
     parser.add_argument("--profile-modules", action="store_true")
     parser.add_argument(
+        "--profile-lt",
+        action="store_true",
+        help="Collect Lattigo linear-transform evaluator counters during HE forward.",
+    )
+    parser.add_argument(
         "--trace-forward-memory",
         action="store_true",
         help="Write per-module forward memory/live-ciphertext events to a JSONL sidecar.",
@@ -2277,6 +2477,7 @@ def main() -> int:
         forward_runs=int(args.forward_runs),
         warmup_runs=int(args.warmup_runs),
         profile_modules=bool(args.profile_modules),
+        profile_lt=bool(args.profile_lt),
         trace_forward_memory=bool(args.trace_forward_memory),
         provider_mode_override=args.provider_mode,
         provider_no_hybrid=bool(args.provider_no_hybrid),

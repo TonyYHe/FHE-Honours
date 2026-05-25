@@ -901,6 +901,26 @@ class LattigoLibrary:
             restype=ArrayResultInt
         )
 
+        enable_profile = getattr(self.lib, "EnableLinearTransformEvaluationProfile", None)
+        reset_profile = getattr(self.lib, "ResetLinearTransformEvaluationProfile", None)
+        get_profile = getattr(self.lib, "GetLinearTransformEvaluationProfileCounters", None)
+        if enable_profile is not None and reset_profile is not None and get_profile is not None:
+            self.EnableLinearTransformEvaluationProfile = LattigoFunction(
+                enable_profile,
+                argtypes=[ctypes.c_int],
+                restype=None,
+            )
+            self.ResetLinearTransformEvaluationProfile = LattigoFunction(
+                reset_profile,
+                argtypes=[],
+                restype=None,
+            )
+            self.GetLinearTransformEvaluationProfileCounters = LattigoFunction(
+                get_profile,
+                argtypes=[],
+                restype=ArrayResultUInt64,
+            )
+
         self.GenerateAndSerializeRotationKey = LattigoFunction(
             self.lib.GenerateAndSerializeRotationKey,
             argtypes=[ctypes.c_int],
