@@ -280,9 +280,13 @@ def _normalize_u22_layout_policy(value: str) -> str:
         return "eager_fused"
     if normalized in {"greedy_fused", "greedy-fused", "greedy_local_fused", "greedy-local-fused"}:
         return "greedy_fused"
+    if normalized in {"always_fused", "always-fused", "always_relayout_fused", "always-relayout-fused"}:
+        return "always_fused"
     if normalized in {"orion", "dense", "orion_dense", "orion-dense", "oriondense", "no_halo", "no-halo", "nohalo"}:
         return "orion_dense"
-    if normalized in {"eager", "greedy", "dp"}:
+    if normalized in {"eager", "greedy", "always", "always_relayout", "always-relayout", "dp"}:
+        if normalized in {"always_relayout", "always-relayout"}:
+            return "always"
         return str(normalized)
     return "dp"
 
@@ -3936,7 +3940,18 @@ class U22CompileRegistry:
             bool(_wrap_layout_policy)
             and bool(enable_conv_kernels)
             and normalized_layout_policy
-            in {"fixed_max", "fixed_max_fused", "eager", "eager_fused", "greedy", "greedy_fused", "orion_dense", "dp"}
+            in {
+                "fixed_max",
+                "fixed_max_fused",
+                "eager",
+                "eager_fused",
+                "greedy",
+                "greedy_fused",
+                "always",
+                "always_fused",
+                "orion_dense",
+                "dp",
+            }
         ):
             provider_registry = cls.for_dag(
                 dag,

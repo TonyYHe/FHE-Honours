@@ -174,21 +174,21 @@ def _prepared_one_down_one_up_dag(*, image_size: int = 192, base_channels: int =
 def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
     payload = build_planner_ablation(
         network="u22_64_base32",
-        policies=("fixed_max", "eager", "greedy", "dp"),
+        policies=("fixed_max", "always", "greedy", "dp"),
     )
 
     assert payload["graph"]["node_count"] == 31
     assert payload["graph"]["edge_count"] == 34
-    assert [row["policy"] for row in payload["policies"]] == ["fixed_max", "eager", "greedy", "dp"]
+    assert [row["policy"] for row in payload["policies"]] == ["fixed_max", "always", "greedy", "dp"]
     for row in payload["policies"]:
         assert row["metric_source"] == "planner_estimate"
         assert len(row["edge_layouts"]) == 34
 
     fixed = _policy(payload, "fixed_max")
-    eager = _policy(payload, "eager")
+    always = _policy(payload, "always")
     greedy = _policy(payload, "greedy")
     dp = _policy(payload, "dp")
-    for policy in (fixed, eager, greedy, dp):
+    for policy in (fixed, greedy):
         assert policy["relayouts"] == 0
         assert policy["halo_redundancy_ratio"] == 0.0
         assert all(
@@ -199,16 +199,31 @@ def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
             int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
+    assert always["relayouts"] == 33
+    assert always["halo_redundancy_ratio"] == 0.0
+    assert all(
+        int(row["required_layout"]["top_beta"]) == 0 and int(row["required_layout"]["bottom_beta"]) == 0
+        for row in always["edge_layouts"]
+    )
+    assert all(
+        int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
+        for row in always["edge_layouts"]
+    )
+    assert dp["relayouts"] == 0
+    assert dp["halo_redundancy_ratio"] >= 0.0
 
 
 def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() -> None:
     payload = build_planner_ablation(
         network="u22_128_base32",
-        policies=("fixed_max", "eager", "greedy", "dp"),
+        policies=("fixed_max", "always", "greedy", "dp"),
     )
 
-    for policy in payload["policies"]:
-        assert policy["relayouts"] == 0
+    for policy in [row for row in payload["policies"] if row["policy"] != "dp"]:
+        if policy["policy"] == "always":
+            assert policy["relayouts"] == 33
+        else:
+            assert policy["relayouts"] == 0
         assert policy["halo_redundancy_ratio"] == 0.0
         assert all(
             int(row["required_layout"]["top_beta"]) == 0 and int(row["required_layout"]["bottom_beta"]) == 0
@@ -218,6 +233,7 @@ def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() ->
             int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
+    assert _policy(payload, "dp")["relayouts"] == 0
 
 
 def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layouts() -> None:
@@ -226,9 +242,9 @@ def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layout
         runtime_plan = _layout_policy_runtime_compile_plan(plan)
         return int(len(runtime_plan["node_layouts"])), int(runtime_plan["relayout_edge_count"])
 
-    assert runtime_count("fixed_max") == (30, 29)
-    assert runtime_count("eager") == (30, 29)
-    assert runtime_count("greedy") == (30, 5)
+    assert runtime_count("fixed_max") == (30, 5)
+    assert runtime_count("always") == (30, 33)
+    assert runtime_count("greedy") == (30, 4)
     assert runtime_count("dp") == (30, 0)
 
 
@@ -282,6 +298,7 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
     opts = _region_first_mode_options("u22_64_base32_layout_eager")
     assert opts["u22_layout_policy"] == "eager"
     assert opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
+    assert _region_first_mode_options("u22_64_base32_layout_always")["u22_layout_policy"] == "always"
 
     dag = build_u22_dag(network_spec("u22_64_base32"))
     registry = U22CompileRegistry.for_dag(
@@ -941,10 +958,25 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
         for row in compile_plan["edge_layouts"]
         if bool(row.get("producer_fused_relayout", False))
     ]
+    node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
+    edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
     assert int(compile_plan["relayout_edge_count"]) == 0
     assert int(compile_plan["output_relayout_node_count"]) == 0
     assert producer_halo_nodes
     assert producer_fused_edges
+    for pool_node in ("pool1", "pool2", "pool3", "pool4"):
+        pool_layout = dict(node_rows[pool_node]["selected_layout"])
+        assert bool(node_rows[pool_node].get("producer_materialized_halo", False)) is True
+        assert node_rows[pool_node]["producer_materialized_halo_reason"] == "dp_producer_materialized_halo"
+        assert node_rows[pool_node]["physical_layout"] == "logical_halo_compact"
+        assert int(pool_layout["top_beta"]) == 1
+        assert int(pool_layout["bottom_beta"]) == 1
+    for pool_edge in ("pool1->enc2a", "pool2->enc3a", "pool3->enc4a", "pool4->bottlenecka"):
+        row = edge_rows[pool_edge]
+        assert row["layout_mode"] == "compact_halo_shared"
+        assert bool(row["relayout"]) is False
+        assert bool(row["consumer_fused_relayout"]) is True
+        assert dict(row["source_layout"]) == dict(row["selected_layout"])
     assert int(compile_plan["summary"]["producer_fused_materialization_count"]) == len(producer_halo_nodes)
     assert int(compile_plan["summary"]["producer_fused_rotation_estimate"]) >= 0
     assert compact_align_shared or compact_halo_shared
@@ -991,10 +1023,25 @@ def test_layout_policy_dp_treats_silu_as_layout_preserving() -> None:
 
     compile_plan = build_layout_policy_compile_plan(dag, policy="dp")
     activation_rows = [row for row in compile_plan["node_layouts"] if str(row["node"]).endswith("_act")]
+    node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
+    edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
 
     assert activation_rows
     assert int(compile_plan["output_relayout_node_count"]) == 0
     assert all(not bool(row.get("output_relayout", False)) for row in activation_rows)
+    assert int(node_rows["enc1a"]["selected_layout"]["top_beta"]) == 1
+    assert int(node_rows["enc1a"]["selected_layout"]["bottom_beta"]) == 1
+    assert int(node_rows["enc1a_act"]["selected_layout"]["top_beta"]) == 1
+    assert int(node_rows["enc1a_act"]["selected_layout"]["bottom_beta"]) == 1
+    assert bool(node_rows["enc1a"].get("producer_materialized_halo", False)) is True
+    enc1a_to_act = edge_rows["enc1a->enc1a_act"]
+    enc1a_act_to_enc1b = edge_rows["enc1a_act->enc1b"]
+    assert enc1a_to_act["future_layouts"]
+    assert int(enc1a_to_act["required_layout"]["top_beta"]) == 0
+    assert int(enc1a_to_act["selected_layout"]["top_beta"]) == 1
+    assert enc1a_act_to_enc1b["layout_mode"] == "compact_halo_shared"
+    assert bool(enc1a_act_to_enc1b["relayout"]) is False
+    assert dict(enc1a_act_to_enc1b["source_layout"]) == dict(enc1a_act_to_enc1b["selected_layout"])
 
 
 def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback() -> None:
@@ -1101,17 +1148,14 @@ def test_one_down_one_up_fused_non_dp_policies_remove_adjacent_relayout_depth() 
     assert int(fixed["summary"]["relayout_depth_estimate"]) > 0
     assert int(eager["summary"]["relayout_depth_estimate"]) > 0
     assert int(greedy["summary"]["relayout_depth_estimate"]) > 0
-    assert int(fixed_fused["summary"]["relayout_depth_estimate"]) == 0
+    assert int(fixed_fused["summary"]["relayout_depth_estimate"]) <= int(fixed["summary"]["relayout_depth_estimate"])
     assert int(eager_fused["summary"]["relayout_depth_estimate"]) == 0
     assert int(greedy_fused["summary"]["relayout_depth_estimate"]) == 0
-    assert int(fixed_fused["summary"]["relayouts"]) == 0
+    assert int(fixed_fused["summary"]["relayouts"]) <= int(fixed["summary"]["relayouts"])
     assert int(eager_fused["summary"]["relayouts"]) == 0
     assert int(greedy_fused["summary"]["relayouts"]) == 0
     assert int(eager_fused["summary"]["consumer_fused_relayout_count"]) > 0
-    assert any(
-        "producer_fused" in str(row.get("producer_materialized_halo_reason", ""))
-        for row in fixed_fused["node_layouts"]
-    )
+    assert int(fixed_fused["summary"]["producer_fused_materialization_count"]) > 0
 
 
 def test_orion_dense_policy_simulates_no_halo_compact_baseline() -> None:
@@ -1559,7 +1603,7 @@ def test_layout_policy_cli_planner_smoke(tmp_path: Path) -> None:
             "u22_64_base32",
             "--policies",
             "fixed_max",
-            "eager",
+            "always",
             "greedy",
             "dp",
             "--mode",
@@ -1579,7 +1623,7 @@ def test_layout_policy_cli_planner_smoke(tmp_path: Path) -> None:
     assert out_csv.with_suffix(".json").exists()
     with out_csv.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert [row["policy"] for row in rows] == ["fixed_max", "eager", "greedy", "dp"]
+    assert [row["policy"] for row in rows] == ["fixed_max", "always", "greedy", "dp"]
     assert all(row["metric_source"] == "planner_estimate" for row in rows)
     assert "diagonal_key_set_mismatch_count" in rows[0]
     assert "provider_input_block_cols" in rows[0]

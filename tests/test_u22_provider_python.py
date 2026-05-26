@@ -702,7 +702,7 @@ def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
         executor.compile(scheme)
         assert executor.base_executor.rows > 0
         assert executor.base_executor.cols > 0
-        assert executor.base_executor.delegate.native_plan.spec.input_bottom_beta == 16
+        assert executor.base_executor.delegate.native_plan.spec.input_bottom_beta == 22
 
         enc4a = dag.nodes["enc4a"]["module"].region_runtime.executor
         assert isinstance(enc4a, LayoutPolicyProviderRuntimeExecutor)

@@ -386,6 +386,8 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                     "eager_fused": "eager_fused",
                     "greedy": "greedy",
                     "greedy_fused": "greedy_fused",
+                    "always": "always",
+                    "always_fused": "always_fused",
                     "orion": "orion_dense",
                     "dense": "orion_dense",
                     "oriondense": "orion_dense",
@@ -398,7 +400,7 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                     u22_layout_policy = str(policy_aliases[raw_policy])
                     index += 2
                     continue
-            if token in {"fixedmax", "eager", "greedy", "dp", "fused"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
+            if token in {"fixedmax", "eager", "greedy", "always", "dp", "fused"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
                 index += 1
                 continue
             if not token.startswith("up"):

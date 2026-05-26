@@ -39,6 +39,11 @@ POLICY_ALIASES = {
     "fixedmax": "fixed_max",
     "fixed-max": "fixed_max",
     "fixed_max": "fixed_max",
+    "max": "fixed_max",
+    "max_relayout": "fixed_max",
+    "max-relayout": "fixed_max",
+    "maximum_relayout": "fixed_max",
+    "maximum-relayout": "fixed_max",
     "fixed_fused": "fixed_max_fused",
     "fixed-fused": "fixed_max_fused",
     "fixedmax_fused": "fixed_max_fused",
@@ -59,6 +64,13 @@ POLICY_ALIASES = {
     "greedy-fused": "greedy_fused",
     "greedy_local_fused": "greedy_fused",
     "greedy-local-fused": "greedy_fused",
+    "always": "always",
+    "always_relayout": "always",
+    "always-relayout": "always",
+    "always_fused": "always_fused",
+    "always-fused": "always_fused",
+    "always_relayout_fused": "always_fused",
+    "always-relayout-fused": "always_fused",
     "orion": "orion_dense",
     "dense": "orion_dense",
     "orion_dense": "orion_dense",
@@ -72,12 +84,14 @@ POLICY_ALIASES = {
     "dp-global": "dp",
 }
 POLICY_LABELS = {
-    "fixed_max": "Fixed-Max-Halo",
+    "fixed_max": "Max-Re-Layout",
     "fixed_max_fused": "Fixed-Max-Halo+Fusion",
     "eager": "Eager-Re-Layout",
     "eager_fused": "Eager-Re-Layout+Fusion",
-    "greedy": "Greedy-Local",
+    "greedy": "Greedy-Max-Zero-Cycle",
     "greedy_fused": "Greedy-Local+Fusion",
+    "always": "Always-Re-Layout",
+    "always_fused": "Always-Re-Layout+Fusion",
     "orion_dense": "Orion-Dense-No-Halo",
     "dp": "DP-Global",
 }
@@ -154,6 +168,7 @@ class EdgeInfo:
     compact: LayoutState
     op_kind: str
     lt_rotation_base: int
+    future_layouts: tuple[LayoutState, ...] = ()
     output_shape: tuple[int, int, int, int] | None = None
     output_fhe_shape: tuple[int, int, int, int] | None = None
     kernel_size: tuple[int, int] = (1, 1)
@@ -673,26 +688,46 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
         outgoing = [edges_by_id[edge_id] for edge_id in outgoing_by_source.get(str(node), [])]
         if not outgoing:
             continue
-        demand_layouts: list[LayoutState] = []
+        hard_layouts: list[LayoutState] = []
+        optional_layouts: list[LayoutState] = []
         for edge in outgoing:
-            demand_layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
-        if not demand_layouts:
+            optional_layouts.append(edge.requirement)
+            optional_layouts.extend(tuple(edge.future_layouts))
+            hard_layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
+        if not hard_layouts and not optional_layouts:
             continue
-        top_beta = max(int(layout.top_beta) for layout in demand_layouts)
-        bottom_beta = max(int(layout.bottom_beta) for layout in demand_layouts)
-        stride = max(int(layout.stride) for layout in demand_layouts)
+        hard_top_beta = max([int(layout.top_beta) for layout in hard_layouts] or [0])
+        hard_bottom_beta = max([int(layout.bottom_beta) for layout in hard_layouts] or [0])
+        hard_stride = max([int(layout.stride) for layout in hard_layouts] or [1])
+        optional_top_beta = max([int(layout.top_beta) for layout in optional_layouts] or [0])
+        optional_bottom_beta = max([int(layout.bottom_beta) for layout in optional_layouts] or [0])
+        optional_stride = max([int(layout.stride) for layout in optional_layouts] or [1])
         for edge_id in incoming_by_target.get(str(node), []):
             edge = edges_by_id[str(edge_id)]
-            propagated = _layout_for_shape(
+            requirement = edge.requirement
+            if hard_layouts:
+                requirement = _layout_for_shape(
+                    shape=edge.shape,
+                    gap=int(edge.compact.gap),
+                    top_beta=max(int(edge.requirement.top_beta), int(hard_top_beta)),
+                    bottom_beta=max(int(edge.requirement.bottom_beta), int(hard_bottom_beta)),
+                    stride=max(int(edge.requirement.stride), int(hard_stride)),
+                    slots=int(slots),
+                )
+            propagated_optional = _layout_for_shape(
                 shape=edge.shape,
                 gap=int(edge.compact.gap),
-                top_beta=max(int(edge.requirement.top_beta), int(top_beta)),
-                bottom_beta=max(int(edge.requirement.bottom_beta), int(bottom_beta)),
-                stride=max(int(edge.requirement.stride), int(stride)),
+                top_beta=max(int(requirement.top_beta), int(optional_top_beta)),
+                bottom_beta=max(int(requirement.bottom_beta), int(optional_bottom_beta)),
+                stride=max(int(requirement.stride), int(optional_stride)),
                 slots=int(slots),
             )
-            if not _same_layout(propagated, edge.requirement):
-                edges_by_id[str(edge_id)] = replace(edge, requirement=propagated)
+            future_layouts = tuple(
+                layout for layout in _dedupe_layouts((*tuple(edge.future_layouts), propagated_optional))
+                if not _same_layout(layout, requirement)
+            )
+            if not _same_layout(requirement, edge.requirement) or tuple(edge.future_layouts) != future_layouts:
+                edges_by_id[str(edge_id)] = replace(edge, requirement=requirement, future_layouts=future_layouts)
     edges = list(edges_by_id.values())
     topo_index = {str(node): index for index, node in enumerate(dag.topological_sort())}
     return tuple(sorted(edges, key=lambda edge: (topo_index.get(edge.source, 10**9), topo_index.get(edge.target, 10**9))))
@@ -754,6 +789,105 @@ def _max_layout(edges: Sequence[EdgeInfo], *, slots: int) -> LayoutState:
     )
 
 
+def _max_layout_states(
+    layouts: Sequence[LayoutState],
+    *,
+    shape: tuple[int, int, int, int],
+    gap: int,
+    slots: int,
+) -> LayoutState:
+    if not layouts:
+        return _layout_for_shape(shape=shape, gap=int(gap), top_beta=0, bottom_beta=0, stride=1, slots=int(slots))
+    return _layout_for_shape(
+        shape=shape,
+        gap=int(gap),
+        top_beta=max(int(layout.top_beta) for layout in layouts),
+        bottom_beta=max(int(layout.bottom_beta) for layout in layouts),
+        stride=max(int(layout.stride) for layout in layouts),
+        slots=int(slots),
+    )
+
+
+def _input_demand_for_output_layout(
+    module: Any | None,
+    edge: EdgeInfo,
+    output_demand: LayoutState | None,
+    *,
+    slots: int,
+) -> LayoutState:
+    if output_demand is None:
+        return edge.requirement
+    if isinstance(module, (AvgPool2d, Conv2d)) and _compact_height_strip_fits_single_ct(
+        shape=edge.shape,
+        gap=int(edge.compact.gap),
+        slots=int(slots),
+    ):
+        return edge.requirement
+    if isinstance(module, ConvTranspose2d):
+        scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
+        top_beta = _ceil_div(int(output_demand.top_beta), int(scale))
+        bottom_beta = _ceil_div(int(output_demand.bottom_beta), int(scale))
+    elif isinstance(module, AvgPool2d):
+        stride_pair = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
+        kernel_pair = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
+        stride = max(1, int(stride_pair[0]))
+        consume = max(0, int(kernel_pair[0]) - int(stride_pair[0]))
+        top_beta = int(output_demand.top_beta) * int(stride) + int(consume)
+        bottom_beta = int(output_demand.bottom_beta) * int(stride) + int(consume)
+    elif isinstance(module, Conv2d):
+        stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
+        consume = _conv_halo_consume(module)
+        top_beta = int(output_demand.top_beta) * int(stride) + int(consume)
+        bottom_beta = int(output_demand.bottom_beta) * int(stride) + int(consume)
+    else:
+        top_beta = int(output_demand.top_beta)
+        bottom_beta = int(output_demand.bottom_beta)
+    return _layout_for_shape(
+        shape=edge.shape,
+        gap=int(edge.compact.gap),
+        top_beta=max(int(edge.requirement.top_beta), int(top_beta)),
+        bottom_beta=max(int(edge.requirement.bottom_beta), int(bottom_beta)),
+        stride=max(int(edge.requirement.stride), int(output_demand.stride)),
+        slots=int(slots),
+    )
+
+
+def _backward_max_demand_layouts(
+    dag: NetworkDAG,
+    edges: Sequence[EdgeInfo],
+    *,
+    slots: int,
+) -> dict[str, LayoutState]:
+    edges_by_source: dict[str, list[EdgeInfo]] = {}
+    edges_by_target: dict[str, list[EdgeInfo]] = {}
+    for edge in edges:
+        edges_by_source.setdefault(str(edge.source), []).append(edge)
+        edges_by_target.setdefault(str(edge.target), []).append(edge)
+    edge_demand: dict[str, LayoutState] = {}
+    topo = [str(node) for node in dag.topological_sort()]
+    for node in reversed(topo):
+        outgoing = tuple(edges_by_source.get(str(node), ()))
+        if outgoing:
+            first = outgoing[0]
+            output_demand = _max_layout_states(
+                [edge_demand.get(str(edge.edge_id), edge.requirement) for edge in outgoing],
+                shape=first.shape,
+                gap=int(first.compact.gap),
+                slots=int(slots),
+            )
+        else:
+            output_demand = None
+        module = dag.nodes[node].get("module")
+        for edge in edges_by_target.get(str(node), ()):
+            edge_demand[str(edge.edge_id)] = _input_demand_for_output_layout(
+                module,
+                edge,
+                output_demand,
+                slots=int(slots),
+            )
+    return edge_demand
+
+
 def _edge_row(
     edge: EdgeInfo,
     layout: LayoutState,
@@ -813,6 +947,7 @@ def _edge_row(
         "shape": [int(value) for value in edge.shape],
         "fhe_shape": [int(value) for value in edge.fhe_shape],
         "required_layout": edge.requirement.to_dict(),
+        "future_layouts": [layout.to_dict() for layout in tuple(edge.future_layouts)],
         "source_layout": {} if source_layout is None else source_layout.to_dict(),
         "selected_layout": layout.to_dict(),
         "target_layout": layout.to_dict(),
@@ -2181,8 +2316,11 @@ def _fixed_max_layout_for_edge(
     *,
     global_alpha: int,
     global_beta: int,
+    max_demand_layouts: dict[str, LayoutState] | None = None,
     slots: int,
 ) -> LayoutState:
+    if max_demand_layouts is not None and str(edge.edge_id) in max_demand_layouts:
+        return max_demand_layouts[str(edge.edge_id)]
     fixed_like = _layout_for_shape(
         shape=edge.shape,
         gap=int(edge.compact.gap),
@@ -2191,7 +2329,11 @@ def _fixed_max_layout_for_edge(
         stride=max(1, int(edge.requirement.stride)),
         slots=int(slots),
     )
-    return _fill_beta_to_tile_capacity(fixed_like, shape=edge.shape, slots=int(slots))
+    return fixed_like
+
+
+def _edge_requires_halo(edge: EdgeInfo) -> bool:
+    return bool(int(edge.requirement.top_beta) > 0 or int(edge.requirement.bottom_beta) > 0)
 
 
 def _choose_non_dp_input_layout(
@@ -2201,6 +2343,7 @@ def _choose_non_dp_input_layout(
     *,
     global_alpha: int,
     global_beta: int,
+    max_demand_layouts: dict[str, LayoutState] | None = None,
     slots: int,
 ) -> tuple[LayoutState, str]:
     if str(policy) == "fixed_max":
@@ -2208,16 +2351,25 @@ def _choose_non_dp_input_layout(
             edge,
             global_alpha=int(global_alpha),
             global_beta=int(global_beta),
+            max_demand_layouts=max_demand_layouts,
             slots=int(slots),
         )
         return layout, "fixed_max_restore_halo"
-    if str(policy) == "greedy" and source_layout.covers(edge.requirement):
-        return _layout_with_stride(source_layout, max(int(source_layout.stride), int(edge.requirement.stride))), ""
     if str(policy) == "greedy":
+        if source_layout.covers(edge.requirement):
+            return _layout_with_stride(source_layout, max(int(source_layout.stride), int(edge.requirement.stride))), ""
         return (
-            _fill_beta_to_tile_capacity(edge.requirement, shape=edge.shape, slots=int(slots)),
-            "greedy_capacity_fill_relayout",
+            _fixed_max_layout_for_edge(
+                edge,
+                global_alpha=int(global_alpha),
+                global_beta=int(global_beta),
+                max_demand_layouts=max_demand_layouts,
+                slots=int(slots),
+            ),
+            "greedy_restore_max_halo",
         )
+    if str(policy) == "always":
+        return edge.requirement, "always_relayout_to_consumer_requirement"
     return edge.requirement, "consumer_min_layout"
 
 
@@ -2228,6 +2380,7 @@ def _choose_non_dp_add_layout(
     *,
     global_alpha: int,
     global_beta: int,
+    max_demand_layouts: dict[str, LayoutState] | None = None,
     slots: int,
 ) -> LayoutState:
     if not incoming:
@@ -2237,13 +2390,28 @@ def _choose_non_dp_add_layout(
             incoming[0],
             global_alpha=int(global_alpha),
             global_beta=int(global_beta),
+            max_demand_layouts=max_demand_layouts,
             slots=int(slots),
         )
     if str(policy) == "greedy":
-        return max(
-            (live[edge.source] for edge in incoming),
-            key=lambda item: (int(item.top_beta + item.bottom_beta), int(item.stored_slots), int(item.tile_count)),
+        live_layouts = [live[edge.source] for edge in incoming]
+        required = _max_layout(incoming, slots=int(slots))
+        if all(layout.covers(required) for layout in live_layouts):
+            return _max_layout_states(
+                live_layouts,
+                shape=incoming[0].shape,
+                gap=int(incoming[0].compact.gap),
+                slots=int(slots),
+            )
+        return _fixed_max_layout_for_edge(
+            incoming[0],
+            global_alpha=int(global_alpha),
+            global_beta=int(global_beta),
+            max_demand_layouts=max_demand_layouts,
+            slots=int(slots),
         )
+    if str(policy) == "always":
+        return _max_layout(incoming, slots=int(slots))
     return incoming[0].requirement
 
 
@@ -2253,20 +2421,20 @@ def _source_initial_layout(
     *,
     global_alpha: int,
     global_beta: int,
+    max_demand_layouts: dict[str, LayoutState] | None = None,
     slots: int,
 ) -> LayoutState | None:
     if not outgoing:
         return None
-    if str(policy) == "fixed_max":
+    if str(policy) in {"fixed_max", "greedy"}:
         return _fixed_max_layout_for_edge(
             outgoing[0],
             global_alpha=int(global_alpha),
             global_beta=int(global_beta),
+            max_demand_layouts=max_demand_layouts,
             slots=int(slots),
         )
     local_need = _max_layout(outgoing, slots=int(slots))
-    if str(policy) == "greedy":
-        return _fill_beta_to_tile_capacity(local_need, shape=outgoing[0].shape, slots=int(slots))
     return local_need
 
 
@@ -2305,11 +2473,13 @@ def _base_non_dp_policy(policy: str) -> str:
         return "eager"
     if normalized == "greedy_fused":
         return "greedy"
+    if normalized == "always_fused":
+        return "always"
     return normalized
 
 
 def _non_dp_policy_uses_fusion(policy: str) -> bool:
-    return str(policy) in {"fixed_max_fused", "eager_fused", "greedy_fused"}
+    return str(policy) in {"fixed_max_fused", "eager_fused", "greedy_fused", "always_fused"}
 
 
 def _layout_has_halo(layout: LayoutState) -> bool:
@@ -2430,6 +2600,7 @@ def _non_dp_producer_fused_output_preference(
     edges_by_target: dict[str, list[EdgeInfo]],
     global_alpha: int,
     global_beta: int,
+    max_demand_layouts: dict[str, LayoutState] | None = None,
     slots: int,
 ) -> tuple[LayoutState, str] | None:
     if not incoming_rows or len(outgoing) != 1:
@@ -2457,6 +2628,7 @@ def _non_dp_producer_fused_output_preference(
             temp_live,
             global_alpha=int(global_alpha),
             global_beta=int(global_beta),
+            max_demand_layouts=max_demand_layouts,
             slots=int(slots),
         )
         reason = "add_input_alignment"
@@ -2467,6 +2639,7 @@ def _non_dp_producer_fused_output_preference(
             semantic,
             global_alpha=int(global_alpha),
             global_beta=int(global_beta),
+            max_demand_layouts=max_demand_layouts,
             slots=int(slots),
         )
     if int(target_layout.gap) != int(edge.compact.gap):
@@ -2498,7 +2671,9 @@ def _plan_non_dp_topological(
     global_alpha = max(int(edge.requirement.top_beta) for edge in edges)
     global_beta = max(int(edge.requirement.bottom_beta) for edge in edges)
     base_policy = _base_non_dp_policy(str(policy))
+    max_demand_layouts = _backward_max_demand_layouts(dag, edges, slots=int(slots))
     fuse_local_relayouts = _non_dp_policy_uses_fusion(str(policy))
+    force_every_relayout = str(base_policy) == "always"
     live: dict[str, LayoutState] = {}
     live_physical: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
@@ -2518,11 +2693,12 @@ def _plan_non_dp_topological(
                 live,
                 global_alpha=int(global_alpha),
                 global_beta=int(global_beta),
+                max_demand_layouts=max_demand_layouts,
                 slots=int(slots),
             )
             for edge in incoming:
                 source_layout = live[edge.source]
-                relayout = not _same_physical_layout(source_layout, target_layout)
+                relayout = bool(force_every_relayout) or not _same_physical_layout(source_layout, target_layout)
                 if bool(relayout):
                     relayout_layouts.append(target_layout)
                 incoming_rows.append(
@@ -2545,9 +2721,12 @@ def _plan_non_dp_topological(
                     source_layout,
                     global_alpha=int(global_alpha),
                     global_beta=int(global_beta),
+                    max_demand_layouts=max_demand_layouts,
                     slots=int(slots),
                 )
-                relayout = str(edge.source) != "x" and not _same_physical_layout(source_layout, target_layout)
+                relayout = str(edge.source) != "x" and (
+                    bool(force_every_relayout) or not _same_physical_layout(source_layout, target_layout)
+                )
                 fused_row = (
                     _non_dp_consumer_fused_row(
                         str(policy),
@@ -2613,6 +2792,7 @@ def _plan_non_dp_topological(
                         edges_by_target=edges_by_target,
                         global_alpha=int(global_alpha),
                         global_beta=int(global_beta),
+                        max_demand_layouts=max_demand_layouts,
                         slots=int(slots),
                     )
                     if bool(fuse_local_relayouts)
@@ -2659,6 +2839,7 @@ def _plan_non_dp_topological(
                 outgoing,
                 global_alpha=int(global_alpha),
                 global_beta=int(global_beta),
+                max_demand_layouts=max_demand_layouts,
                 slots=int(slots),
             )
             output_physical = PHYSICAL_LOGICAL_HALO if output_layout is not None and _layout_has_halo(output_layout) else PHYSICAL_COMPACT
@@ -2713,6 +2894,14 @@ def _plan_greedy(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> P
 
 def _plan_greedy_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
     return _plan_non_dp_topological(dag, edges, policy="greedy_fused", slots=int(slots))
+
+
+def _plan_always(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="always", slots=int(slots))
+
+
+def _plan_always_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="always_fused", slots=int(slots))
 
 
 def _plan_orion_dense(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
@@ -2961,10 +3150,13 @@ def _source_layout_candidates(edges: Sequence[EdgeInfo], *, global_alpha: int, g
         return ()
     edge = edges[0]
     local_need = _max_layout(edges, slots=int(slots))
+    future_layouts: list[LayoutState] = []
+    for item in edges:
+        future_layouts.extend(tuple(item.future_layouts))
     # DP compares actual layouts, so do not add capacity-fill halo that exists
     # only as alignment padding and is not demanded by a consumer.
     del global_alpha, global_beta
-    return _dedupe_layouts((edge.compact, local_need))
+    return _dedupe_layouts((edge.compact, local_need, *future_layouts))
 
 
 def _operator_semantic_output_layout(
@@ -3023,6 +3215,7 @@ def _producer_fused_output_layout_candidates(
         # not inflate that halo merely to fill otherwise unused tile capacity.
         layouts.append(local_need)
     for edge in outgoing:
+        layouts.extend(tuple(edge.future_layouts))
         layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
         if _is_join_op(edge.op_kind):
             layouts.append(
@@ -3895,6 +4088,10 @@ def plan_policy(
         return _plan_greedy(dag, edges, slots=int(slots))
     if normalized == "greedy_fused":
         return _plan_greedy_fused(dag, edges, slots=int(slots))
+    if normalized == "always":
+        return _plan_always(dag, edges, slots=int(slots))
+    if normalized == "always_fused":
+        return _plan_always_fused(dag, edges, slots=int(slots))
     if normalized == "orion_dense":
         return _plan_orion_dense(dag, edges, slots=int(slots))
     if normalized == "dp":
@@ -3977,7 +4174,7 @@ def build_layout_policy_compile_plan(
 def build_planner_ablation(
     *,
     network: str = "u22_64_base32",
-    policies: Sequence[str] = ("fixed_max", "eager", "greedy", "dp"),
+    policies: Sequence[str] = ("fixed_max", "always", "greedy", "dp"),
     slots: int = DEFAULT_SLOTS,
 ) -> dict[str, Any]:
     spec = network_spec(str(network))
