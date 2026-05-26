@@ -2832,6 +2832,8 @@ def _fill_beta_to_tile_capacity(layout: LayoutState, *, shape: tuple[int, int, i
     if _compact_height_strip_fits_single_ct(shape=shape, gap=int(layout.gap), slots=int(slots)):
         return layout
     target_tiles = max(1, int(layout.tile_count))
+    min_top_beta = int(layout.top_beta)
+    min_bottom_beta = int(layout.bottom_beta)
     _n, channels, height, width = shape
     gap = max(1, int(layout.gap))
     phase = max(1, int(gap) * int(gap))
@@ -2840,21 +2842,33 @@ def _fill_beta_to_tile_capacity(layout: LayoutState, *, shape: tuple[int, int, i
     max_stored_h = max(1, int(target_tiles) * int(slots) // int(row_width_slots))
     max_halo_rows = max(0, int(max_stored_h) - int(height) * int(gap))
     max_alpha_beta = int(max_halo_rows) // int(gap)
-    bottom_beta = max(int(layout.bottom_beta), int(max_alpha_beta) - int(layout.top_beta))
+    halo_budget = max(int(min_top_beta + min_bottom_beta), int(max_alpha_beta))
+    top_beta = max(int(min_top_beta), int(halo_budget // 2))
+    bottom_beta = int(halo_budget) - int(top_beta)
+    if int(bottom_beta) < int(min_bottom_beta):
+        bottom_beta = int(min_bottom_beta)
+        top_beta = int(halo_budget) - int(bottom_beta)
     filled = _layout_for_shape(
         shape=shape,
         gap=int(layout.gap),
-        top_beta=int(layout.top_beta),
+        top_beta=int(top_beta),
         bottom_beta=int(bottom_beta),
         stride=int(layout.stride),
         slots=int(slots),
     )
-    while int(filled.tile_count) > int(target_tiles) and int(bottom_beta) > int(layout.bottom_beta):
-        bottom_beta -= 1
+    while int(filled.tile_count) > int(target_tiles) and (
+        int(top_beta) > int(min_top_beta) or int(bottom_beta) > int(min_bottom_beta)
+    ):
+        if int(top_beta) > int(bottom_beta) and int(top_beta) > int(min_top_beta):
+            top_beta -= 1
+        elif int(bottom_beta) > int(min_bottom_beta):
+            bottom_beta -= 1
+        else:
+            top_beta -= 1
         filled = _layout_for_shape(
             shape=shape,
             gap=int(layout.gap),
-            top_beta=int(layout.top_beta),
+            top_beta=int(top_beta),
             bottom_beta=int(bottom_beta),
             stride=int(layout.stride),
             slots=int(slots),

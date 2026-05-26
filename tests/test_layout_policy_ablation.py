@@ -26,6 +26,8 @@ from orion.experimental.layout_policy_ablation import (
     run_backend_runtime_anchors,
     run_non_ckks_layout_simulation,
     run_runtime_anchor,
+    _fill_beta_to_tile_capacity,
+    _layout_for_shape,
     _runtime_config,
 )
 from orion.models.resnet import BasicBlock, ResNet
@@ -79,6 +81,17 @@ def _layout_covers(selected: dict, required: dict) -> bool:
         and int(selected["bottom_beta"]) >= int(required["bottom_beta"])
         and int(selected["stride"]) >= int(required["stride"])
     )
+
+
+def test_capacity_fill_balances_extra_halo_without_growing_tile_count() -> None:
+    shape = (1, 512, 28, 28)
+    required = _layout_for_shape(shape=shape, gap=8, top_beta=1, bottom_beta=1, stride=1, slots=32768)
+
+    filled = _fill_beta_to_tile_capacity(required, shape=shape, slots=32768)
+
+    assert int(required.tile_count) == 14
+    assert int(filled.tile_count) == int(required.tile_count)
+    assert (int(filled.top_beta), int(filled.bottom_beta)) == (2, 2)
 
 
 def _init_python_scheme(provider_mode: str) -> None:

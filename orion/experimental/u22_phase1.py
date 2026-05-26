@@ -89,12 +89,20 @@ def _u22_tconv_module_supported(module: Any) -> bool:
     )
 
 
+def _u22_same_shape_conv_kernel_padding_supported(module: Any) -> bool:
+    kernel = tuple(getattr(module, "kernel_size", ()))
+    padding = tuple(getattr(module, "padding", ()))
+    return (kernel, padding) in {
+        ((3, 3), (1, 1)),
+        ((1, 1), (0, 0)),
+    }
+
+
 def _u22_same_shape_conv_module_supported(module: Any) -> bool:
     return bool(
         isinstance(module, Conv2d)
-        and tuple(getattr(module, "kernel_size", ())) == (3, 3)
+        and _u22_same_shape_conv_kernel_padding_supported(module)
         and tuple(getattr(module, "stride", ())) == (1, 1)
-        and tuple(getattr(module, "padding", ())) == (1, 1)
         and tuple(getattr(module, "dilation", ())) == (1, 1)
         and int(getattr(module, "groups", 1)) == 1
         and int(getattr(module, "input_gap", -1)) == int(getattr(module, "output_gap", -2))
@@ -4074,7 +4082,7 @@ class U22CompileRegistry:
                         excluded_nodes.append(
                             {
                                 "node": str(node),
-                                "reason": "u22_conv_requires_3x3_stride1_same_spatial_layout",
+                                "reason": "u22_conv_requires_supported_same_shape_kernel_padding",
                             }
                         )
                     continue

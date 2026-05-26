@@ -18,6 +18,8 @@ from orion.experimental.u22_phase1 import (
     HaloSupportedTConvRuntimeExecutor,
     LayoutPolicyProviderRuntimeExecutor,
     TconvK2S2PythonRuntimeExecutor,
+    _u22_same_shape_conv_module_supported,
+    _u22_same_shape_conv_runtime_supported,
 )
 from orion.models.unet import UNet22
 from orion.nn.linear import Conv2d, ConvTranspose2d
@@ -270,6 +272,21 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
         assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
     finally:
         scheme.delete_scheme()
+
+
+def test_u22_same_shape_provider_accepts_1x1_output_head() -> None:
+    conv = Conv2d(64, 1, kernel_size=1, padding=0, bias=True)
+    conv.init_orion_params()
+    conv.name = "output"
+    conv.input_shape = torch.Size((1, 64, 224, 224))
+    conv.output_shape = torch.Size((1, 1, 224, 224))
+    conv.fhe_input_shape = torch.Size((1, 64, 224, 224))
+    conv.fhe_output_shape = torch.Size((1, 1, 224, 224))
+    conv.input_gap = 1
+    conv.output_gap = 1
+
+    assert _u22_same_shape_conv_module_supported(conv) is True
+    assert _u22_same_shape_conv_runtime_supported(conv) is True
 
 
 def test_u22_64_base32_provider_mode_attaches_all_linear_and_pool_nodes() -> None:
