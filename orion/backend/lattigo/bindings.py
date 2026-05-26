@@ -937,6 +937,22 @@ class LattigoLibrary:
                 restype=ArrayResultUInt64,
             )
 
+        consume_shared_cache_profile = getattr(self.lib, "ConsumeSharedCacheEvalProfileSeconds", None)
+        if consume_shared_cache_profile is not None:
+            self.ConsumeSharedCacheEvalProfileSeconds = LattigoFunction(
+                consume_shared_cache_profile,
+                argtypes=[],
+                restype=ArrayResultDouble,
+            )
+
+        transform_uses_streaming = getattr(self.lib, "LinearTransformUsesStreaming", None)
+        if transform_uses_streaming is not None:
+            self.LinearTransformUsesStreaming = LattigoFunction(
+                transform_uses_streaming,
+                argtypes=[ctypes.c_int],
+                restype=ctypes.c_int,
+            )
+
         self.GenerateAndSerializeRotationKey = LattigoFunction(
             self.lib.GenerateAndSerializeRotationKey,
             argtypes=[ctypes.c_int],

@@ -1383,6 +1383,17 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
     "eval_s",
     "eval_total_s",
     "unload_s",
+    "cpp_plan_s",
+    "cpp_level_adjust_s",
+    "cpp_baby_step_s",
+    "cpp_giant_step_s",
+    "stream_build_map_s",
+    "stream_encode_hoist_s",
+    "stream_load_payload_s",
+    "stream_eval_s",
+    "stream_accumulate_s",
+    "cpp_push_s",
+    "cpp_trim_s",
 )
 
 

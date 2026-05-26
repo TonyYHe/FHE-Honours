@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
@@ -56,6 +57,57 @@ var (
 	ltStreamingMu     sync.Mutex
 	ltStreamingStates = make(map[int]*lattigoStreamingLTState)
 )
+
+type sharedCacheEvalProfile struct {
+	planS              float64
+	levelAdjustS       float64
+	babyStepS          float64
+	giantStepS         float64
+	streamBuildMapS    float64
+	streamEncodeHoistS float64
+	streamLoadPayloadS float64
+	streamEvalS        float64
+	streamAccumulateS  float64
+	pushS              float64
+	trimS              float64
+}
+
+var (
+	sharedCacheEvalProfileMu     sync.Mutex
+	sharedCacheEvalProfileTotals sharedCacheEvalProfile
+)
+
+func accumulateSharedCacheEvalProfile(profile sharedCacheEvalProfile) {
+	sharedCacheEvalProfileMu.Lock()
+	sharedCacheEvalProfileTotals.planS += profile.planS
+	sharedCacheEvalProfileTotals.levelAdjustS += profile.levelAdjustS
+	sharedCacheEvalProfileTotals.babyStepS += profile.babyStepS
+	sharedCacheEvalProfileTotals.giantStepS += profile.giantStepS
+	sharedCacheEvalProfileTotals.streamBuildMapS += profile.streamBuildMapS
+	sharedCacheEvalProfileTotals.streamEncodeHoistS += profile.streamEncodeHoistS
+	sharedCacheEvalProfileTotals.streamLoadPayloadS += profile.streamLoadPayloadS
+	sharedCacheEvalProfileTotals.streamEvalS += profile.streamEvalS
+	sharedCacheEvalProfileTotals.streamAccumulateS += profile.streamAccumulateS
+	sharedCacheEvalProfileTotals.pushS += profile.pushS
+	sharedCacheEvalProfileTotals.trimS += profile.trimS
+	sharedCacheEvalProfileMu.Unlock()
+}
+
+func recordSharedCacheEvalProfile(update func(*sharedCacheEvalProfile)) {
+	sharedCacheEvalProfileMu.Lock()
+	update(&sharedCacheEvalProfileTotals)
+	sharedCacheEvalProfileMu.Unlock()
+}
+
+func resetSharedCacheEvalProfile() {
+	sharedCacheEvalProfileMu.Lock()
+	sharedCacheEvalProfileTotals = sharedCacheEvalProfile{}
+	sharedCacheEvalProfileMu.Unlock()
+}
+
+func secondsSince(started time.Time) float64 {
+	return time.Since(started).Seconds()
+}
 
 func ltCompileWorkerCount(n int) int {
 	if n <= 1 {
@@ -640,6 +692,12 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 	transforms []lintrans.LinearTransformation,
 	ctIn *rlwe.Ciphertext,
 ) ([]*rlwe.Ciphertext, error) {
+	profile := sharedCacheEvalProfile{}
+	defer func() {
+		accumulateSharedCacheEvalProfile(profile)
+	}()
+
+	planStarted := time.Now()
 	n := len(transformIDs)
 	outputs := make([]*rlwe.Ciphertext, n)
 	streamingStates := make([]*lattigoStreamingLTState, n)
@@ -664,14 +722,17 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 		plainTransforms = append(plainTransforms, transforms[i])
 		plainIndices = append(plainIndices, i)
 	}
+	profile.planS += secondsSince(planStarted)
 	if len(plainTransforms) > 0 {
 		plainOutputs := make([]*rlwe.Ciphertext, len(plainTransforms))
 		for i, transform := range plainTransforms {
 			plainOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
 		}
+		evalStarted := time.Now()
 		if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, plainTransforms, plainOutputs); err != nil {
 			return nil, err
 		}
+		profile.giantStepS += secondsSince(evalStarted)
 		for i, outputIndex := range plainIndices {
 			outputs[outputIndex] = plainOutputs[i]
 		}
@@ -690,14 +751,19 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 			if len(pendingTransforms) == 0 {
 				return nil
 			}
+			encodeStarted := time.Now()
 			encodeStreamingLTChunkBatch(pendingStates, pendingKeys, pendingTransforms)
+			profile.streamEncodeHoistS += secondsSince(encodeStarted)
 			chunkOutputs := make([]*rlwe.Ciphertext, len(pendingTransforms))
 			for i, transform := range pendingTransforms {
 				chunkOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
 			}
+			evalStarted := time.Now()
 			if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, pendingTransforms, chunkOutputs); err != nil {
 				return err
 			}
+			profile.streamEvalS += secondsSince(evalStarted)
+			accumulateStarted := time.Now()
 			for i, outputIndex := range pendingIndices {
 				if outputs[outputIndex] == nil {
 					outputs[outputIndex] = chunkOutputs[i]
@@ -708,7 +774,10 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 					chunkOutputs[i] = nil
 				}
 			}
+			profile.streamAccumulateS += secondsSince(accumulateStarted)
+			trimStarted := time.Now()
 			releaseStreamingLTChunkMemory(pendingTransforms)
+			profile.trimS += secondsSince(trimStarted)
 			pendingTransforms = pendingTransforms[:0]
 			pendingIndices = pendingIndices[:0]
 			pendingStates = pendingStates[:0]
@@ -720,7 +789,9 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 				continue
 			}
 			keys := state.chunks[chunkIndex]
+			buildStarted := time.Now()
 			pendingTransforms = append(pendingTransforms, state.newChunkShell(keys))
+			profile.streamBuildMapS += secondsSince(buildStarted)
 			pendingIndices = append(pendingIndices, transformIndex)
 			pendingStates = append(pendingStates, state)
 			pendingKeys = append(pendingKeys, keys)
@@ -1197,6 +1268,36 @@ func GetLinearTransformEvaluationProfileCounters() (*C.ulonglong, C.ulong) {
 		uint64(profile.OuterReduceCount),
 	}
 	return SliceToCArray(values, convertUint64ToCULonglong)
+}
+
+//export ConsumeSharedCacheEvalProfileSeconds
+func ConsumeSharedCacheEvalProfileSeconds() (*C.double, C.ulong) {
+	sharedCacheEvalProfileMu.Lock()
+	profile := sharedCacheEvalProfileTotals
+	sharedCacheEvalProfileTotals = sharedCacheEvalProfile{}
+	sharedCacheEvalProfileMu.Unlock()
+	values := []float64{
+		profile.planS,
+		profile.levelAdjustS,
+		profile.babyStepS,
+		profile.giantStepS,
+		profile.streamBuildMapS,
+		profile.streamEncodeHoistS,
+		profile.streamLoadPayloadS,
+		profile.streamEvalS,
+		profile.streamAccumulateS,
+		profile.pushS,
+		profile.trimS,
+	}
+	return SliceToCArray(values, convertFloat64ToCDouble)
+}
+
+//export LinearTransformUsesStreaming
+func LinearTransformUsesStreaming(id C.int) C.int {
+	if hasStreamingLTState(int(id)) {
+		return C.int(1)
+	}
+	return C.int(0)
 }
 
 //export DeleteLinearTransform
@@ -1891,9 +1992,13 @@ func EvaluateLinearTransformsWithSharedCache(
 			panic(err)
 		}
 		outIDs := make([]int, n)
+		pushStarted := time.Now()
 		for i, ct := range outputs {
 			outIDs[i] = PushCiphertext(ct)
 		}
+		recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+			profile.pushS += secondsSince(pushStarted)
+		})
 		return SliceToCArray(outIDs, convertIntToCInt)
 	}
 
@@ -1902,14 +2007,22 @@ func EvaluateLinearTransformsWithSharedCache(
 		outputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transforms[i].LevelQ)
 	}
 
+	evalStarted := time.Now()
 	if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, transforms, outputs); err != nil {
 		panic(err)
 	}
+	recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+		profile.giantStepS += secondsSince(evalStarted)
+	})
 
 	outIDs := make([]int, n)
+	pushStarted := time.Now()
 	for i, ct := range outputs {
 		outIDs[i] = PushCiphertext(ct)
 	}
+	recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+		profile.pushS += secondsSince(pushStarted)
+	})
 	return SliceToCArray(outIDs, convertIntToCInt)
 }
 
@@ -1997,6 +2110,7 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 			if len(partials) != len(targetGroups[sourceIndex]) {
 				panic(fmt.Errorf("streaming target-sum returned %d partials for %d targets", len(partials), len(targetGroups[sourceIndex])))
 			}
+			accumulateStarted := time.Now()
 			for localIndex, partial := range partials {
 				targetID := targetGroups[sourceIndex][localIndex]
 				if targetID < 0 || targetID >= targetCount {
@@ -2010,15 +2124,22 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 					panic(err)
 				}
 			}
+			recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+				profile.streamAccumulateS += secondsSince(accumulateStarted)
+			})
 		}
 
 		outIDs := make([]int, targetCount)
+		pushStarted := time.Now()
 		for i, ct := range outputs {
 			if ct == nil {
 				panic(fmt.Errorf("target-sum reduction produced no output for target %d", i))
 			}
 			outIDs[i] = PushCiphertext(ct)
 		}
+		recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+			profile.pushS += secondsSince(pushStarted)
+		})
 		return SliceToCArray(outIDs, convertIntToCInt)
 	}
 
@@ -2026,6 +2147,7 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 	for i := range outputs {
 		outputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, scheme.Params.MaxLevel())
 	}
+	evalStarted := time.Now()
 	if err := scheme.LinEvaluator.EvaluateManySourcesWithSharedCacheAdd(
 		ctIns,
 		transformGroups,
@@ -2034,10 +2156,17 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 	); err != nil {
 		panic(err)
 	}
+	recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+		profile.giantStepS += secondsSince(evalStarted)
+	})
 
 	outIDs := make([]int, targetCount)
+	pushStarted := time.Now()
 	for i, ct := range outputs {
 		outIDs[i] = PushCiphertext(ct)
 	}
+	recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
+		profile.pushS += secondsSince(pushStarted)
+	})
 	return SliceToCArray(outIDs, convertIntToCInt)
 }

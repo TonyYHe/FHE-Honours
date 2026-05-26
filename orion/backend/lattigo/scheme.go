@@ -141,6 +141,7 @@ func NewScheme(
 		Bootstrapper:  nil,
 	}
 	ResetOperationCounters()
+	resetSharedCacheEvalProfile()
 }
 
 //export DeleteScheme
@@ -148,6 +149,7 @@ func DeleteScheme() {
 	scheme = Scheme{}
 	commonlintrans.ClearOperationCallbacks()
 	ckks.ClearOperationCallbacks()
+	resetSharedCacheEvalProfile()
 
 	DeleteRotationKeys()
 	DeleteBootstrappers()
