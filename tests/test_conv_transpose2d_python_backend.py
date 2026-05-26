@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -226,6 +228,126 @@ def test_concat_stats_tracker_records_channel_sum_and_fusion_specs() -> None:
     assert len(getattr(out, "concat_fusion_specs", ()) or ()) == 2
     assert [spec["channel_start"] for spec in out.concat_fusion_specs] == [0, 4]
     assert [spec["channel_end"] for spec in out.concat_fusion_specs] == [4, 8]
+
+
+def test_concat_fusion_uses_unified_groups_without_dense_branch_pack(monkeypatch) -> None:
+    class TinyConcatNet(on.Module):
+        def __init__(self):
+            super().__init__()
+            self.left = on.Conv2d(1, 4, kernel_size=1, bias=True)
+            self.right = on.Conv2d(1, 4, kernel_size=1, bias=True)
+            self.cat = on.Concat(dim=1)
+            self.out = on.Conv2d(8, 2, kernel_size=1, bias=True)
+
+        def forward(self, x):
+            return self.out(self.cat(self.left(x), self.right(x)))
+
+    active_scheme = orion.init_scheme(_python_backend_config())
+    Module.set_scheme(active_scheme)
+    Module.set_margin(active_scheme.params.get_margin())
+    try:
+        torch.manual_seed(0)
+        net = TinyConcatNet()
+        net.eval()
+        x = torch.randn(1, 1, 8, 8)
+        clear = net(x)
+
+        original_pack_conv2d = packing.pack_conv2d
+
+        def guarded_pack_conv2d(layer, last):
+            if "_concat_source_" in str(getattr(layer, "name", "")):
+                raise AssertionError("concat fusion should use unified grouped transforms, not dense branch pack")
+            return original_pack_conv2d(layer, last)
+
+        monkeypatch.setattr(packing, "pack_conv2d", guarded_pack_conv2d)
+        orion.fit(net, x)
+        input_level = orion.compile(net)
+
+        assert getattr(net.out, "_concat_unified_groups_by_input", [])
+        assert not getattr(net.out, "_concat_transform_ids_by_input", [])
+
+        encrypted = orion.encrypt(orion.encode(x, input_level))
+        net.he()
+        fhe = net(encrypted).decrypt().decode()
+
+        assert fhe.shape == clear.shape
+        assert torch.allclose(fhe, clear, atol=1.0e-4, rtol=1.0e-4)
+    finally:
+        scheme.delete_scheme()
+
+
+def test_concat_fusion_uses_actual_join_part_layouts_for_compact_and_halo() -> None:
+    conv = on.Conv2d(4, 2, kernel_size=3, padding=1, bias=False)
+    conv.name = "out"
+    left_spec = {
+        "concat_node": "cat",
+        "source": "left",
+        "shape": (1, 2, 8, 8),
+        "fhe_shape": (1, 2, 8, 8),
+        "gap": 1,
+        "channels": 2,
+        "channel_start": 0,
+        "channel_end": 2,
+    }
+    right_spec = {
+        "concat_node": "cat",
+        "source": "right",
+        "shape": (1, 2, 8, 8),
+        "fhe_shape": (1, 2, 10, 8),
+        "gap": 1,
+        "channels": 2,
+        "channel_start": 2,
+        "channel_end": 4,
+    }
+    conv.concat_fusion_specs = (left_spec, right_spec)
+    halo_layout = {"top_beta": 1, "bottom_beta": 1, "gap": 1, "core_slots": 128, "stored_slots": 160}
+    compact_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1, "core_slots": 128, "stored_slots": 128}
+    conv.region_runtime = SimpleNamespace(
+        executor=SimpleNamespace(
+            compile_plan={
+                "edge_layouts": [
+                    {
+                        "edge": "left->cat",
+                        "source": "left",
+                        "target": "cat",
+                        "op_kind": "concat",
+                        "relayout": False,
+                        "physical_layout": "logical_halo_compact",
+                        "source_physical_layout": "packed_compact",
+                        "source_layout": dict(compact_layout),
+                        "selected_layout": dict(halo_layout),
+                    },
+                    {
+                        "edge": "right->cat",
+                        "source": "right",
+                        "target": "cat",
+                        "op_kind": "concat",
+                        "relayout": False,
+                        "physical_layout": "logical_halo_compact",
+                        "source_physical_layout": "logical_halo_compact",
+                        "source_layout": dict(halo_layout),
+                        "selected_layout": dict(halo_layout),
+                    },
+                    {
+                        "edge": "cat->out",
+                        "source": "cat",
+                        "target": "out",
+                        "op_kind": "conv2d",
+                        "selected_layout": dict(halo_layout),
+                    },
+                ],
+            },
+        ),
+    )
+
+    left_layout = conv._concat_source_input_layout(left_spec)
+    right_layout = conv._concat_source_input_layout(right_spec)
+
+    assert left_layout["top_beta"] == 0
+    assert left_layout["bottom_beta"] == 0
+    assert left_layout["stored_slots"] == left_layout["core_slots"]
+    assert right_layout["top_beta"] == 1
+    assert right_layout["bottom_beta"] == 1
 
 
 def test_concat_materialization_fallback_matches_channel_cat_on_python_backend() -> None:

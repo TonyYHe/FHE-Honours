@@ -607,6 +607,8 @@ class NewEvaluator:
         return 0
 
     def _dense_tconv_unified_requested(self, linear_layer) -> bool:
+        if bool(getattr(linear_layer, "dense_unified_bsgs", False)):
+            return True
         if linear_layer.__class__.__name__ != "ConvTranspose2d":
             return False
         if bool(getattr(linear_layer, "dense_tconv_unified_bsgs", False)):

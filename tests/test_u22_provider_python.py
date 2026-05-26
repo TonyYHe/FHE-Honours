@@ -146,6 +146,134 @@ def test_u22_concat_skip_consumer_conv_has_concat_fusion_specs_in_provider_mode(
         scheme.delete_scheme()
 
 
+def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join() -> None:
+    from orion.experimental.cir.native_halo_conv2d import _materialized_output_source_h
+
+    def layout_beta(layout: dict, name: str) -> int:
+        fallback = "alpha" if str(name) == "top_beta" else "beta"
+        return max(0, int(dict(layout).get(str(name), dict(layout).get(fallback, 0)) or 0))
+
+    def layout_on_shape(shape: torch.Size, layout: dict) -> torch.Size:
+        n, channels, height, width = (int(value) for value in shape)
+        gap = max(1, int(dict(layout).get("gap", 1) or 1))
+        top = layout_beta(layout, "top_beta")
+        bottom = layout_beta(layout, "bottom_beta")
+        return torch.Size((n, int((channels + gap * gap - 1) // (gap * gap)), height * gap + (top + bottom) * gap, width * gap))
+
+    def materialized_clear(core: torch.Tensor, layout: dict) -> torch.Tensor:
+        _, _, height, _ = (int(value) for value in core.shape)
+        top = layout_beta(layout, "top_beta")
+        bottom = layout_beta(layout, "bottom_beta")
+        rows = []
+        for out_h in range(-int(top), int(height + bottom)):
+            src = _materialized_output_source_h(
+                int(out_h),
+                h_out=int(height),
+                output_top_beta=int(top),
+                output_bottom_beta=int(bottom),
+            )
+            rows.append(core[:, :, int(src) : int(src) + 1, :])
+        return torch.cat(rows, dim=2) if rows else core
+
+    def encode_layout(core: torch.Tensor, layout: dict, level: int) -> CipherTensor:
+        packed = packing.multiplex(materialized_clear(core, layout), max(1, int(dict(layout).get("gap", 1) or 1)))
+        target = torch.zeros(tuple(int(value) for value in layout_on_shape(torch.Size(core.shape), layout)), dtype=torch.float32)
+        target[:, : packed.shape[1], : packed.shape[2], : packed.shape[3]] = packed
+        flat = target.flatten()
+        slots = int(scheme.params.get_slots())
+        ids: list[int] = []
+        for start in range(0, int(flat.numel()), int(slots)):
+            chunk = flat[int(start) : int(min(int(flat.numel()), int(start + slots)))]
+            padded = torch.zeros((int(slots),), dtype=torch.float32)
+            padded[: int(chunk.numel())] = chunk
+            ct = scheme.encrypt(scheme.encode(padded, level))
+            ids.append(int(ct.ids[0]))
+            ct.ids = []
+        return CipherTensor(scheme, ids, torch.Size(core.shape), torch.Size(target.shape))
+
+    def decode_layout(out: CipherTensor, *, channels: int, height: int, width: int, layout: dict) -> torch.Tensor:
+        decoded = out.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+        on_shape = torch.Size(out.on_shape)
+        packed = decoded.to(dtype=torch.float32).flatten()[: int(on_shape.numel())].reshape(tuple(int(value) for value in on_shape))
+        top = layout_beta(layout, "top_beta")
+        bottom = layout_beta(layout, "bottom_beta")
+        gap = max(1, int(dict(layout).get("gap", 1) or 1))
+        return packing._demultiplex(packed, int(gap), int(channels), int(height + top + bottom), int(width))
+
+    _init_python_scheme(logn=int(DATASET_SPECS["tiny"]["logn"]))
+    try:
+        torch.manual_seed(123)
+        dag = _prepared_dag(dataset="tiny", base_channels=4)
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=None,
+            enable_conv_kernels=True,
+            layout_policy="dp",
+        )
+        registry.attach_to_dag(dag)
+        _set_compile_level(dag)
+
+        conv = dag.nodes["dec4a"]["module"]
+        cat = dag.nodes[str(conv.concat_fusion_specs[0]["concat_node"])]["module"]
+        conv.generate_diagonals(last=False)
+        conv.compile()
+        cat.he_mode = True
+        conv.he_mode = True
+
+        plan_rows = {
+            (str(row.get("source", "")), str(row.get("target", ""))): dict(row)
+            for row in conv._concat_layout_compile_plan().get("edge_layouts", [])
+        }
+        concat_rows = [
+            plan_rows[(str(spec["source"]), str(spec["concat_node"]))]
+            for spec in conv.concat_fusion_specs
+        ]
+        assert any(bool(row.get("relayout", False)) for row in concat_rows)
+
+        level = len(scheme.params.get_logq()) - 1
+        parts = []
+        clear_parts = []
+        for index, spec in enumerate(conv.concat_fusion_specs):
+            row = concat_rows[int(index)]
+            source_layout = dict(row.get("source_layout", {}) or row.get("selected_layout", {}) or {})
+            torch.manual_seed(2000 + int(index))
+            core = torch.randn(tuple(int(value) for value in spec["shape"]), dtype=torch.float32)
+            parts.append(encode_layout(core, source_layout, level))
+            clear_parts.append(core)
+
+        concat_tensor = cat(*parts)
+        runtime_part_counts = [int(len(getattr(part, "ids", ()))) for part in concat_tensor.parts]
+        out = conv(concat_tensor)
+        output_attrs = conv._concat_output_layout_attrs()
+        output_layout = dict(output_attrs.get("layout_policy_output_layout", {}) or {"top_beta": 0, "bottom_beta": 0, "gap": conv.output_gap})
+        got = decode_layout(
+            out,
+            channels=int(conv.output_shape[1]),
+            height=int(conv.output_shape[2]),
+            width=int(conv.output_shape[3]),
+            layout=output_layout,
+        )
+        reference_core = F.conv2d(
+            torch.cat(clear_parts, dim=1),
+            conv.on_weight.detach().to(dtype=torch.float32),
+            conv.on_bias.detach().to(dtype=torch.float32),
+            stride=tuple(int(value) for value in conv.stride),
+            padding=tuple(int(value) for value in conv.padding),
+            dilation=tuple(int(value) for value in conv.dilation),
+            groups=int(conv.groups),
+        )
+        reference = materialized_clear(reference_core, output_layout)
+
+        assert getattr(conv, "_concat_unified_groups_by_input", [])
+        assert all(count > 0 for count in runtime_part_counts)
+        assert got.shape == reference.shape
+        assert float((got - reference).abs().max().item()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()
+
+
 @pytest.mark.parametrize("dataset", ("tiny", "imagenet"))
 def test_u22_registry_routes_decoder_tconvs_to_halo_supported_provider(dataset: str) -> None:
     _init_python_scheme(logn=int(DATASET_SPECS[str(dataset)]["logn"]))

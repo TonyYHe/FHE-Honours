@@ -31,6 +31,11 @@ class LinearTransform(Module):
                 for transform_ids in getattr(self, "_concat_transform_ids_by_input", []) or []:
                     for tid in dict(transform_ids).values():
                         backend.DeleteLinearTransform(tid)
+                for groups_by_source in getattr(self, "_concat_unified_groups_by_input", []) or []:
+                    for group in dict(groups_by_source).values():
+                        cleanup = getattr(group, "cleanup", None)
+                        if callable(cleanup):
+                            cleanup(backend)
             except Exception:
                 pass # avoids errors for GC at program termination
 
@@ -241,38 +246,182 @@ class Conv2d(LinearTransform):
         specs = self._concat_fusion_specs()
         return bool(specs and int(getattr(self, "groups", 1)) == 1)
 
+    def _concat_fusion_unified_supported(self) -> bool:
+        if not self._concat_fusion_supported():
+            return False
+        params = getattr(getattr(self, "scheme", None), "params", None)
+        backend = getattr(getattr(self, "scheme", None), "backend", None)
+        if params is None or backend is None:
+            return False
+        if not callable(getattr(backend, "GenerateLinearTransformsUnified", None)):
+            return False
+        if int(getattr(self, "output_shape", (1,))[0]) != 1:
+            return False
+        for spec in self._concat_fusion_specs():
+            shape = tuple(int(value) for value in spec.get("shape", ()))
+            if len(shape) < 4 or int(shape[0]) != 1:
+                return False
+            physical_layout = self._concat_source_input_physical_layout(dict(spec))
+            if physical_layout and str(physical_layout) not in {"packed_compact", "logical_halo_compact"}:
+                return False
+        output_attrs = self._concat_output_layout_attrs()
+        output_layout = dict(output_attrs.get("layout_policy_output_layout", {}) or {})
+        output_has_halo = bool(
+            self._concat_layout_top_beta(output_layout) > 0
+            or self._concat_layout_bottom_beta(output_layout) > 0
+        )
+        if bool(output_has_halo) and str(output_attrs.get("layout_policy_output_materialization", "") or "") != "fused_relayout":
+            return False
+        kernel_h, kernel_w = (int(value) for value in self.kernel_size)
+        stride_h, stride_w = (int(value) for value in self.stride)
+        pad_h, pad_w = (int(value) for value in self.padding)
+        dil_h, dil_w = (int(value) for value in self.dilation)
+        return bool(
+            int(kernel_h) == int(kernel_w)
+            and int(stride_h) == int(stride_w)
+            and int(pad_h) == int(pad_w)
+            and int(dil_h) == int(dil_w)
+        )
+
     def _concat_layout_top_beta(self, layout: dict) -> int:
         return max(0, int(dict(layout).get("top_beta", dict(layout).get("alpha", 0)) or 0))
 
     def _concat_layout_bottom_beta(self, layout: dict) -> int:
         return max(0, int(dict(layout).get("bottom_beta", dict(layout).get("beta", 0)) or 0))
 
+    def _concat_layout_policy_module_attrs(self) -> dict:
+        runtime = getattr(self, "region_runtime", None)
+        executor = getattr(runtime, "executor", None)
+        getter = getattr(executor, "_native_halo_module_attrs", None)
+        if callable(getter):
+            try:
+                attrs = getter()
+            except Exception:
+                attrs = {}
+            if isinstance(attrs, dict):
+                return dict(attrs)
+        return {}
+
+    def _concat_layout_compile_plan(self) -> dict:
+        runtime = getattr(self, "region_runtime", None)
+        executor = getattr(runtime, "executor", None)
+        compile_plan = getattr(executor, "compile_plan", None)
+        return dict(compile_plan) if isinstance(compile_plan, dict) else {}
+
+    def _concat_zero_halo_layout(self, layout: dict) -> dict:
+        updated = dict(layout)
+        updated.pop("alpha", None)
+        updated.pop("beta", None)
+        updated["top_beta"] = 0
+        updated["bottom_beta"] = 0
+        if "core_slots" in updated:
+            updated["stored_slots"] = int(updated.get("core_slots", 0) or 0)
+        return updated
+
     def _concat_conv_input_layout_row(self) -> dict:
         node = str(getattr(self, "name", "") or "")
         specs = self._concat_fusion_specs()
         concat_node = str(specs[0].get("concat_node", "")) if specs else ""
-        runtime = getattr(self, "region_runtime", None)
-        executor = getattr(runtime, "executor", None)
-        compile_plan = getattr(executor, "compile_plan", None)
-        if isinstance(compile_plan, dict):
-            for row in compile_plan.get("edge_layouts", []):
-                if str(row.get("target", "")) != node:
-                    continue
-                if concat_node and str(row.get("source", "")) != concat_node:
-                    continue
-                if str(row.get("op_kind", "")) != "conv2d":
-                    continue
-                return dict(row)
+        compile_plan = self._concat_layout_compile_plan()
+        for row in compile_plan.get("edge_layouts", []):
+            if str(row.get("target", "")) != node:
+                continue
+            if concat_node and str(row.get("source", "")) != concat_node:
+                continue
+            if str(row.get("op_kind", "")) != "conv2d":
+                continue
+            return dict(row)
         return {}
 
+    def _concat_join_input_layout_row(self, spec: dict) -> dict:
+        concat_node = str(spec.get("concat_node", "") or "")
+        source = str(spec.get("source", "") or "")
+        if not concat_node or not source:
+            return {}
+        compile_plan = self._concat_layout_compile_plan()
+        for row in compile_plan.get("edge_layouts", []):
+            if str(row.get("target", "")) != concat_node:
+                continue
+            if str(row.get("source", "")) != source:
+                continue
+            if str(row.get("op_kind", "")) != "concat":
+                continue
+            return dict(row)
+        return {}
+
+    def _concat_physical_input_layout_from_join_row(self, row: dict) -> dict:
+        selected_layout = dict(row.get("selected_layout", {}) or {})
+        if bool(row.get("relayout", False)):
+            return dict(selected_layout)
+        source_layout = dict(row.get("source_layout", {}) or selected_layout)
+        source_physical = str(row.get("source_physical_layout", "") or row.get("physical_layout", "") or "")
+        if str(row.get("source", "")) == "x" or source_physical == "packed_compact":
+            return self._concat_zero_halo_layout(source_layout or selected_layout)
+        if source_physical == "logical_halo_compact":
+            return dict(source_layout or selected_layout)
+        return dict(source_layout or selected_layout)
+
+    def _concat_source_input_physical_layout(self, spec: dict) -> str:
+        row = self._concat_join_input_layout_row(spec)
+        if row:
+            if bool(row.get("relayout", False)):
+                return str(row.get("physical_layout", "") or "")
+            return str(row.get("source_physical_layout", "") or row.get("physical_layout", "") or "")
+        attrs = self._concat_layout_policy_module_attrs()
+        return str(attrs.get("layout_policy_input_physical_layout", "") or "")
+
     def _concat_source_input_layout(self, spec: dict) -> dict:
+        join_row = self._concat_join_input_layout_row(spec)
+        if join_row:
+            return self._concat_physical_input_layout_from_join_row(join_row)
         layout = dict(getattr(self, "layout_policy_input_layout", {}) or {})
+        if layout:
+            return layout
+        attrs = self._concat_layout_policy_module_attrs()
+        layout = dict(attrs.get("layout_policy_input_layout", {}) or {})
         if layout:
             return layout
         row = self._concat_conv_input_layout_row()
         if row:
             return dict(row.get("selected_layout", {}) or {})
         return {}
+
+    def _concat_output_layout_attrs(self) -> dict:
+        attrs = self._concat_layout_policy_module_attrs()
+        module_layout = dict(getattr(self, "layout_policy_output_layout", {}) or {})
+        output_layout = dict(module_layout or attrs.get("layout_policy_output_layout", {}) or {})
+        output_gap = max(1, int(output_layout.get("gap", getattr(self, "output_gap", 1)) or 1))
+        output_top_beta = self._concat_layout_top_beta(output_layout)
+        output_row_offset = getattr(self, "layout_policy_output_row_offset", None)
+        if output_row_offset is None:
+            output_row_offset = attrs.get("layout_policy_output_row_offset", int(output_top_beta * output_gap))
+        output_materialization = getattr(self, "layout_policy_output_materialization", None)
+        if output_materialization is None:
+            output_materialization = attrs.get("layout_policy_output_materialization", "")
+        result = {
+            "layout_policy_output_layout": dict(output_layout),
+            "layout_policy_output_row_offset": int(output_row_offset or 0),
+            "layout_policy_output_materialization": str(output_materialization or ""),
+        }
+        if "fhe_output_shape" in attrs:
+            result["fhe_output_shape"] = torch.Size(attrs["fhe_output_shape"])
+        return result
+
+    def _concat_effective_fhe_output_shape(self, output_attrs: dict | None = None) -> torch.Size:
+        attrs = dict(output_attrs or self._concat_output_layout_attrs())
+        return torch.Size(attrs.get("fhe_output_shape", getattr(self, "fhe_output_shape")))
+
+    def _concat_construct_bias(self, output_attrs: dict | None = None) -> torch.Tensor:
+        attrs = dict(output_attrs or self._concat_output_layout_attrs())
+        effective_fhe_output_shape = self._concat_effective_fhe_output_shape(attrs)
+        bias_proxy = SimpleNamespace(
+            output_shape=self.output_shape,
+            fhe_output_shape=effective_fhe_output_shape,
+            output_gap=int(self.output_gap),
+            on_bias=self.on_bias,
+            layout_policy_output_layout=dict(attrs.get("layout_policy_output_layout", {}) or {}),
+        )
+        return packing.construct_conv2d_bias(bias_proxy)
 
     def _concat_source_fhe_shape(self, spec: dict, layout: dict) -> torch.Size:
         if not layout:
@@ -293,6 +442,10 @@ class Conv2d(LinearTransform):
 
     def _concat_source_proxy(self, spec: dict, *, weight: torch.Tensor, name: str):
         input_layout = self._concat_source_input_layout(spec)
+        output_attrs = self._concat_output_layout_attrs()
+        effective_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
+        output_layout_attrs = dict(output_attrs)
+        output_layout_attrs.pop("fhe_output_shape", None)
         input_gap = max(1, int(dict(input_layout).get("gap", int(spec["gap"])) or int(spec["gap"])))
         input_top_beta = self._concat_layout_top_beta(input_layout)
         return SimpleNamespace(
@@ -303,7 +456,7 @@ class Conv2d(LinearTransform):
             input_shape=torch.Size(spec["shape"]),
             output_shape=self.output_shape,
             fhe_input_shape=self._concat_source_fhe_shape(spec, input_layout),
-            fhe_output_shape=self.fhe_output_shape,
+            fhe_output_shape=effective_fhe_output_shape,
             input_gap=int(input_gap),
             output_gap=int(self.output_gap),
             groups=1,
@@ -318,11 +471,166 @@ class Conv2d(LinearTransform):
             layout_policy_input_layout=dict(input_layout),
             layout_policy_input_row_offset=int(input_top_beta * input_gap),
             layout_policy_selected_input_layout=dict(input_layout),
+            **output_layout_attrs,
         )
+
+    def _concat_output_ct_count(self) -> int:
+        slots = int(self.scheme.params.get_slots())
+        effective_fhe_output_shape = self._concat_effective_fhe_output_shape()
+        return max(1, int(math.ceil(int(effective_fhe_output_shape.numel()) / float(slots))))
+
+    def _compile_concat_fusion_unified_transforms(self) -> bool:
+        if not self._concat_fusion_unified_supported():
+            return False
+        if getattr(self, "_concat_unified_groups_by_input", None):
+            return True
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from orion.experimental.cir.native_halo_conv2d import (
+            NativeHaloConv2DSpec,
+            _build_compact_source_conv_transform,
+            _layout_bottom_beta,
+            _layout_top_beta,
+            _retune_transform_group_bsgs,
+            native_halo_conv2d_plan,
+        )
+        from orion.nn.unified_transform import UnifiedTransformGroup
+
+        slots = int(self.scheme.params.get_slots())
+        level = int(self.level)
+        output_attrs = self._concat_output_layout_attrs()
+        effective_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
+        target_ct_count = int(self._concat_output_ct_count())
+        output_layout = dict(output_attrs.get("layout_policy_output_layout", {}) or {})
+        output_top_beta = int(_layout_top_beta(output_layout))
+        output_bottom_beta = int(_layout_bottom_beta(output_layout))
+
+        self._concat_unified_groups_by_input = []
+        self._concat_unified_targets_by_input = []
+        self._concat_unified_output_ct_count = int(target_ct_count)
+        self._concat_fusion_fhe_output_shape = torch.Size(effective_fhe_output_shape)
+        self._concat_transform_ids_by_input = []
+        self._concat_diagonals_by_input = []
+        self._concat_output_rotations = 0
+
+        bias = self._concat_construct_bias(output_attrs)
+        self.on_bias_ptxt = self.scheme.encoder.encode(bias, int(self.level) - int(self.depth))
+
+        for input_index, concat_spec in enumerate(self._concat_fusion_specs()):
+            channel_start = int(concat_spec["channel_start"])
+            channel_end = int(concat_spec["channel_end"])
+            branch_weight = self.on_weight[:, channel_start:channel_end, :, :].detach().clone()
+            input_layout = self._concat_source_input_layout(concat_spec)
+            input_gap = max(1, int(dict(input_layout).get("gap", int(concat_spec["gap"])) or int(concat_spec["gap"])))
+            input_top_beta = int(_layout_top_beta(input_layout))
+            input_bottom_beta = int(_layout_bottom_beta(input_layout))
+            source_fhe_shape = self._concat_source_fhe_shape(concat_spec, input_layout)
+            source_ct_count = max(1, int(math.ceil(int(torch.Size(source_fhe_shape).numel()) / float(slots))))
+            n, channels, height, width = (int(value) for value in concat_spec["shape"])
+            del n
+            output_shape = tuple(int(value) for value in self.output_shape)
+            label = (
+                f"{getattr(self, 'name', self.__class__.__name__)}_concat{int(input_index)}"
+                f"_{int(channels)}x{int(height)}x{int(width)}"
+            )
+            label = "".join(ch if ch.isalnum() else "_" for ch in str(label)).strip("_") or "concat_conv"
+            native_spec = NativeHaloConv2DSpec(
+                family_label=str(label),
+                c_in=int(channels),
+                h_in=int(height),
+                w_in=int(width),
+                c_out=int(output_shape[1]),
+                h_out=int(output_shape[2]),
+                w_out=int(output_shape[3]),
+                gap_in=int(input_gap),
+                gap_out=int(self.output_gap),
+                kernel=int(self.kernel_size[0]),
+                stride=int(self.stride[0]),
+                pad=int(self.padding[0]),
+                dilation=int(self.dilation[0]),
+                groups=1,
+                slot_count=int(slots),
+                input_top_beta=int(input_top_beta),
+                input_bottom_beta=int(input_bottom_beta),
+                output_top_beta=int(output_top_beta),
+                output_bottom_beta=int(output_bottom_beta),
+            )
+            plan = native_halo_conv2d_plan(native_spec, require_native_target_fit=False)
+
+            def build_source(source_block: int) -> tuple[int, list[tuple[int, object]]]:
+                ordered: list[tuple[int, object]] = []
+                for stripe in plan.stripes:
+                    for target_group in range(int(plan.target_channel_group_count)):
+                        for target_block in range(int(target_ct_count)):
+                            transform = _build_compact_source_conv_transform(
+                                spec=native_spec,
+                                plan=plan,
+                                weight=branch_weight,
+                                stripe=stripe,
+                                source_block=int(source_block),
+                                target_group=int(target_group),
+                                level=int(level),
+                                scheme=self.scheme,
+                                source_layout=dict(input_layout),
+                                group_n1=1,
+                                compact_target_block=int(target_block),
+                            )
+                            if transform is not None:
+                                ordered.append((int(target_block), transform))
+                return int(source_block), ordered
+
+            raw_workers = __import__("os").environ.get("ORION_CONCAT_FUSION_BUILD_WORKERS", "1")
+            try:
+                requested_workers = int(raw_workers)
+            except (TypeError, ValueError):
+                requested_workers = 1
+            workers = max(1, min(int(source_ct_count), int(requested_workers)))
+            if int(workers) <= 1:
+                built = [build_source(int(source_block)) for source_block in range(int(source_ct_count))]
+            else:
+                with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-concat-fusion") as pool:
+                    built = list(pool.map(build_source, range(int(source_ct_count))))
+
+            groups_by_source: dict[int, UnifiedTransformGroup] = {}
+            targets_by_source: dict[int, tuple[int, ...]] = {}
+            for source_block, ordered in sorted(built, key=lambda item: int(item[0])):
+                if not ordered:
+                    continue
+                ordered.sort(key=lambda item: int(item[0]))
+                transforms = [transform for _target_index, transform in ordered]
+                _retune_transform_group_bsgs(transforms, slots=int(slots))
+                group = UnifiedTransformGroup(transforms)
+                group.compile_unified(self.scheme.backend)
+                groups_by_source[int(source_block)] = group
+                targets_by_source[int(source_block)] = tuple(int(target_index) for target_index, _transform in ordered)
+            if not groups_by_source:
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} produced no unified transforms "
+                    f"for concat input {int(input_index)}"
+                )
+            self._concat_unified_groups_by_input.append(groups_by_source)
+            self._concat_unified_targets_by_input.append(targets_by_source)
+
+        self.diagonals = {}
+        self.transform_ids = {}
+        self.output_rotations = 0
+        self._transform_backend = self.scheme.backend
+        return True
 
     def _generate_concat_fusion_diagonals(self, last: bool) -> bool:
         if not self._concat_fusion_supported():
             return False
+        if self._concat_fusion_unified_supported():
+            self._concat_diagonals_by_input = []
+            self._concat_transform_ids_by_input = []
+            self._concat_unified_groups_by_input = []
+            self._concat_unified_targets_by_input = []
+            self._concat_fusion_fhe_output_shape = self._concat_effective_fhe_output_shape()
+            self._concat_output_rotations = 0
+            self.diagonals = {}
+            self.output_rotations = 0
+            return True
         self._concat_diagonals_by_input = []
         self._concat_transform_ids_by_input = []
         self._concat_output_rotations = 0
@@ -350,11 +658,15 @@ class Conv2d(LinearTransform):
     def _compile_concat_fusion_transforms(self) -> bool:
         if not self._concat_fusion_supported():
             return False
+        if self._compile_concat_fusion_unified_transforms():
+            return True
         diagonals_by_input = list(getattr(self, "_concat_diagonals_by_input", []) or [])
         if not diagonals_by_input:
             self._generate_concat_fusion_diagonals(last=False)
             diagonals_by_input = list(getattr(self, "_concat_diagonals_by_input", []) or [])
-        bias = packing.construct_conv2d_bias(self)
+        output_attrs = self._concat_output_layout_attrs()
+        self._concat_fusion_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
+        bias = self._concat_construct_bias(output_attrs)
         self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level - self.depth)
         self._concat_transform_ids_by_input = []
         for input_index, diagonals in enumerate(diagonals_by_input):
@@ -365,7 +677,8 @@ class Conv2d(LinearTransform):
                 bsgs_ratio=float(self.bsgs_ratio),
                 scheme=self.scheme,
                 output_shape=self.output_shape,
-                fhe_output_shape=self.fhe_output_shape,
+                fhe_output_shape=self._concat_fusion_fhe_output_shape,
+                dense_unified_bsgs=True,
             )
             self._concat_transform_ids_by_input.append(dict(self.scheme.lt_evaluator.generate_transforms(proxy)))
         self.transform_ids = {}
@@ -373,9 +686,14 @@ class Conv2d(LinearTransform):
         return True
 
     def _concat_fusion_ready(self) -> bool:
-        return bool(getattr(self, "_concat_transform_ids_by_input", None))
+        return bool(
+            getattr(self, "_concat_transform_ids_by_input", None)
+            or getattr(self, "_concat_unified_groups_by_input", None)
+        )
 
     def _evaluate_concat_fusion(self, concat_tensor):
+        if getattr(self, "_concat_unified_groups_by_input", None):
+            return self._evaluate_concat_fusion_unified(concat_tensor)
         parts = tuple(concat_tensor.parts)
         transform_ids_by_input = list(getattr(self, "_concat_transform_ids_by_input", []) or [])
         if len(parts) != len(transform_ids_by_input):
@@ -390,7 +708,8 @@ class Conv2d(LinearTransform):
                 transform_ids=dict(transform_ids_by_input[int(input_index)]),
                 level=int(self.level),
                 output_shape=self.output_shape,
-                fhe_output_shape=self.fhe_output_shape,
+                fhe_output_shape=getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
+                dense_unified_bsgs=True,
             )
             partial = self.scheme.lt_evaluator.evaluate_transforms(proxy, source)
             if out is None:
@@ -404,6 +723,102 @@ class Conv2d(LinearTransform):
         slots = self.scheme.params.get_slots()
         for i in range(1, int(self.output_rotations) + 1):
             out += out.roll(slots // (2**i))
+        out += self.on_bias_ptxt
+        release_owned = getattr(concat_tensor, "release_owned_parts", None)
+        if callable(release_owned):
+            release_owned()
+        return out
+
+    def _evaluate_concat_fusion_unified(self, concat_tensor):
+        from orion.backend.python.tensors import CipherTensor
+        from orion.experimental.cir.r34_orion_same_shape import (
+            _align_ciphertexts_for_add,
+            _rescale_cipher_tensor,
+            _unified_output_fusion_enabled,
+        )
+        from orion.nn.unified_transform import UnifiedTransformGroup
+
+        parts = tuple(concat_tensor.parts)
+        groups_by_input = list(getattr(self, "_concat_unified_groups_by_input", []) or [])
+        targets_by_input = list(getattr(self, "_concat_unified_targets_by_input", []) or [])
+        if len(parts) != len(groups_by_input):
+            raise RuntimeError(
+                f"concat-fused Conv2d {getattr(self, 'name', '')} expected "
+                f"{len(groups_by_input)} inputs, got {len(parts)}"
+            )
+        slots = int(self.scheme.params.get_slots())
+        target_count = int(getattr(self, "_concat_unified_output_ct_count", self._concat_output_ct_count()))
+        output_blocks: list[object | None] = [None for _ in range(int(target_count))]
+        fuse_output_rescale = bool(_unified_output_fusion_enabled())
+
+        def add_partial(target_index: int, partial):
+            current = output_blocks[int(target_index)]
+            if current is None:
+                output_blocks[int(target_index)] = partial
+                return
+            lhs, rhs = _align_ciphertexts_for_add(current, partial)
+            output_blocks[int(target_index)] = lhs + rhs
+
+        for input_index, source in enumerate(parts):
+            groups_by_source = dict(groups_by_input[int(input_index)])
+            targets_by_source = dict(targets_by_input[int(input_index)])
+            sorted_items = [
+                (int(source_index), group)
+                for source_index, group in sorted(groups_by_source.items())
+                if int(source_index) < len(getattr(source, "ids", ()))
+            ]
+            target_sum_ids = None
+            if bool(fuse_output_rescale) and sorted_items:
+                target_sum_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+                    [group for _source_index, group in sorted_items],
+                    [int(source.ids[int(source_index)]) for source_index, _group in sorted_items],
+                    [targets_by_source[int(source_index)] for source_index, _group in sorted_items],
+                    int(target_count),
+                    self.scheme.backend,
+                )
+            if target_sum_ids is not None:
+                for target_index, output_id in enumerate(target_sum_ids):
+                    partial = CipherTensor(
+                        self.scheme,
+                        [int(output_id)],
+                        torch.Size([1, int(slots)]),
+                        torch.Size([1, int(slots)]),
+                    )
+                    add_partial(int(target_index), partial)
+                continue
+            for source_index, group in sorted_items:
+                output_ids = group.evaluate_unified(int(source.ids[int(source_index)]), self.scheme.backend)
+                for target_index, output_id in zip(targets_by_source[int(source_index)], output_ids):
+                    partial = CipherTensor(
+                        self.scheme,
+                        [int(output_id)],
+                        torch.Size([1, int(slots)]),
+                        torch.Size([1, int(slots)]),
+                    )
+                    if not bool(fuse_output_rescale):
+                        partial = _rescale_cipher_tensor(partial)
+                    add_partial(int(target_index), partial)
+
+        if bool(fuse_output_rescale):
+            for target_index, block in enumerate(output_blocks):
+                if block is not None:
+                    output_blocks[int(target_index)] = _rescale_cipher_tensor(block)
+        output_ids: list[int] = []
+        for target_index, block in enumerate(output_blocks):
+            if block is None:
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} missing output block {int(target_index)}"
+                )
+            output_ids.append(int(block.ids[0]))
+            block.ids = []
+        out = CipherTensor(
+            self.scheme,
+            output_ids,
+            self.output_shape,
+            getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
+        )
+        for i in range(1, int(self.output_rotations) + 1):
+            out += out.roll(int(slots) // (2**i))
         out += self.on_bias_ptxt
         release_owned = getattr(concat_tensor, "release_owned_parts", None)
         if callable(release_owned):
