@@ -1,11 +1,14 @@
 from types import SimpleNamespace
 
+import networkx as nx
 import torch
 
+from orion.core.level_dag import LevelDAG
 from orion.core.fuser import Fuser
 from orion.core.bootstrap_fusion import install_bootstrap_prescale_fusion
 from orion.core.tracer import OrionTracer
 from orion.nn.activation import ReLU
+from orion.nn.operations import Identity
 
 
 def test_linear_chebyshev_fusion_keeps_depth_when_prescale_is_identity() -> None:
@@ -77,10 +80,33 @@ def test_relu_trace_prescales_only_sign_branch() -> None:
     }
 
     assert ("x", "mult1") in edges
-    assert ("x", "mult2") in edges
+    assert ("x", "identity") in edges
+    assert ("identity", "mult2") in edges
+    assert ("x", "mult2") not in edges
     assert ("mult1", "sign_acts_0") in edges
     assert ("sign_acts_2", "mult2") in edges
     assert not any(str(node.target) == "<built-in function mul>" for node in traced.graph.nodes)
+
+
+def test_orion_identity_can_anchor_relu_direct_branch_bootstrap() -> None:
+    class Params:
+        def get_slots(self):
+            return 8
+
+    identity = Identity()
+    identity.scheme = SimpleNamespace(params=Params())
+    identity.fhe_input_shape = torch.Size([8])
+
+    network_dag = nx.DiGraph()
+    network_dag.add_node("identity", module=identity)
+    network_dag.add_node("join", module=None)
+
+    cost, boots = LevelDAG(l_eff=4, network_dag=network_dag).estimate_bootstrap_latency(
+        "identity@l=2", "join@l=3"
+    )
+
+    assert cost > 0
+    assert boots == 1
 
 
 def test_relu_output_bootstrap_fusion_scales_sign_and_biases_output_mult() -> None:

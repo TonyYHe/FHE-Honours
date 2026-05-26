@@ -628,8 +628,12 @@ def _diag_indices_for_task(
 _PLAN_CACHE: dict[tuple[Any, ...], NativeHaloConv2DPlan] = {}
 
 
-def native_halo_conv2d_plan(spec: NativeHaloConv2DSpec) -> NativeHaloConv2DPlan:
-    key = tuple(spec.to_dict().items())
+def native_halo_conv2d_plan(
+    spec: NativeHaloConv2DSpec,
+    *,
+    require_native_target_fit: bool = True,
+) -> NativeHaloConv2DPlan:
+    key = (tuple(spec.to_dict().items()), bool(require_native_target_fit))
     cached = _PLAN_CACHE.get(key)
     if cached is not None:
         return cached
@@ -643,7 +647,7 @@ def native_halo_conv2d_plan(spec: NativeHaloConv2DSpec) -> NativeHaloConv2DPlan:
     if _packed_active_slots(int(source_tile), int(source_h), int(spec.w_in), int(spec.gap_in)) > int(spec.slot_count):
         raise ValueError(f"native halo source tile does not fit {spec.family_label}")
     stripes = _stripes_for_source_h(spec, source_h=int(source_h))
-    if any(
+    if bool(require_native_target_fit) and any(
         _packed_active_slots(
             int(target_tile),
             int(stripe.target_h),
@@ -1605,7 +1609,14 @@ class NativeHaloStripeNoRIConvExecutor:
         self.module = module
         self.spec = spec
         self.output_node_id = str(output_node_id)
-        self.native_plan = native_halo_conv2d_plan(spec)
+        materialization = str(getattr(module, "layout_policy_output_materialization", "") or "")
+        self._native_plan_require_target_fit = not bool(
+            str(materialization) == "fused_relayout" or not _spec_has_output_halo(spec)
+        )
+        self.native_plan = native_halo_conv2d_plan(
+            spec,
+            require_native_target_fit=bool(self._native_plan_require_target_fit),
+        )
         self.slots = int(spec.slot_count)
         self.rows = int(self.native_plan.output_ct_count)
         self.cols = int(self.native_plan.input_ct_count)
@@ -1648,9 +1659,12 @@ class NativeHaloStripeNoRIConvExecutor:
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
 
-    def _uses_tight_compact_output(self) -> bool:
+    def _uses_tight_compact_output_for_spec(self, spec: NativeHaloConv2DSpec) -> bool:
         materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
-        return bool(str(materialization) == "fused_relayout" or not _spec_has_output_halo(self.native_plan.spec))
+        return bool(str(materialization) == "fused_relayout" or not _spec_has_output_halo(spec))
+
+    def _uses_tight_compact_output(self) -> bool:
+        return self._uses_tight_compact_output_for_spec(self.native_plan.spec)
 
     def _compact_output_storage_layout(self) -> str:
         if _spec_has_output_halo(self.native_plan.spec):
@@ -1714,9 +1728,17 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def _refresh_runtime_plan(self) -> bool:
         runtime_spec = self._runtime_spec()
-        changed = tuple(runtime_spec.to_dict().items()) != tuple(self.native_plan.spec.to_dict().items())
+        require_native_target_fit = not self._uses_tight_compact_output_for_spec(runtime_spec)
+        changed = (
+            tuple(runtime_spec.to_dict().items()) != tuple(self.native_plan.spec.to_dict().items())
+            or bool(require_native_target_fit) != bool(self._native_plan_require_target_fit)
+        )
         if bool(changed):
-            self.native_plan = native_halo_conv2d_plan(runtime_spec)
+            self.native_plan = native_halo_conv2d_plan(
+                runtime_spec,
+                require_native_target_fit=bool(require_native_target_fit),
+            )
+            self._native_plan_require_target_fit = bool(require_native_target_fit)
         self.slots = int(self.native_plan.spec.slot_count)
         self.rows = int(
             self._compact_output_ct_count()
@@ -1908,6 +1930,7 @@ class NativeHaloStripeNoRIConvExecutor:
             False,
             allow_hybrid=False,
         )
+        diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         self.last_runtime_timing["build_transform_s"] = float(
             self.last_runtime_timing.get("build_transform_s", 0.0)
         ) + float(time.time() - build_started)

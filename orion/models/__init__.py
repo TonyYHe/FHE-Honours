@@ -3,6 +3,7 @@ from .lenet import *
 from .lola import *
 from .resnet import *
 from .unet import *
+from .ternaus import *
 from .vgg import * 
 from .yolo import *
 from .mlp import *

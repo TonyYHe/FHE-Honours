@@ -7,6 +7,7 @@ from .bootstrap_fusion import (
     module_bootstrap_slots,
     runtime_fhe_output_shape,
 )
+from .bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.nn.operations import Bootstrap
 
 
@@ -187,47 +188,69 @@ class BootstrapSolver:
                         node_module.level = level
                 continue
 
-    def mark_bootstrap_locations(self):
+    def _mark_bootstrap_flags(self):
         # Makes things a bit easier below
         node_map = {}
         for node in self.shortest_path:
             name = node.split("@")[0]
             node_map[name] = node
 
-        # We'll use this empty level DAG to query the number of
-        # bootstraps per layer of the network dag.
+        # We'll use this empty level DAG to query whether each edge crosses
+        # a bootstrap boundary. The actual count is computed after optional
+        # layout compression has rewritten the bootstrap input shape.
         query = LevelDAG(
             l_eff=self.l_eff, network_dag=self.network_dag, path=None
         )
-        
-        total_bootstraps = 0
-        bootstrapper_slots = []
 
         for node in self.network_dag.nodes:
             node_w_level = node_map[node]
-            
             children = self.network_dag.successors(node)
             self.network_dag.nodes[node]["bootstrap"] = False
-            
+
             # Iterate over the layer's children to determine if their assigned
             # levels necessitate a bootstrap of the current layer.
             for child in children:
                 child_w_level = node_map[child]
                 _, curr_boots = query.estimate_bootstrap_latency(
                     node_w_level, child_w_level)
-                
-                total_bootstraps += curr_boots
                 if curr_boots > 0:
                     self.network_dag.nodes[node]["bootstrap"] = True
-                    slots = self.get_bootstrap_slots(node)
-                    
-                    # Add bootstrapper to generate
-                    if slots not in bootstrapper_slots:
-                        bootstrapper_slots.append(slots)
                     break
 
-        return total_bootstraps , bootstrapper_slots
-    
+        return node_map
+
+    def _count_marked_bootstraps(self, node_map):
+        query = LevelDAG(
+            l_eff=self.l_eff, network_dag=self.network_dag, path=None
+        )
+
+        total_bootstraps = 0
+        bootstrapper_slots = []
+        for node in self.network_dag.nodes:
+            if not bool(self.network_dag.nodes[node].get("bootstrap", False)):
+                continue
+            node_w_level = node_map[node]
+            for child in self.network_dag.successors(node):
+                child_w_level = node_map[child]
+                _, curr_boots = query.estimate_bootstrap_latency(
+                    node_w_level, child_w_level)
+                if curr_boots <= 0:
+                    continue
+                total_bootstraps += curr_boots
+                slots = self.get_bootstrap_slots(node)
+                if slots not in bootstrapper_slots:
+                    bootstrapper_slots.append(slots)
+                break
+
+        return total_bootstraps, bootstrapper_slots
+
+    def mark_bootstrap_locations(self):
+        node_map = self._mark_bootstrap_flags()
+        self.network_dag.bootstrap_layout_compression_audit = apply_bootstrap_layout_compression(
+            self.network_dag
+        )
+        return self._count_marked_bootstraps(node_map)
+
     def get_bootstrap_slots(self, node):
         # If we're here, then our auto-bootstrapper has determined that the 
         # output of this node will be bootstrapped. Therefore it must be an

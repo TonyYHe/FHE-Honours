@@ -71,11 +71,17 @@ class NewEvaluator:
         self._saved_io_linear_work_order: tuple[tuple[str, int, int, int], ...] = ()
         self._saved_io_external_work_order: list[object] = []
         self._saved_io_external_loaders: dict[object, object] = {}
+        self._saved_io_external_raw_work_order: list[object] = []
+        self._saved_io_external_raw_loaders: dict[object, object] = {}
+        self._saved_io_external_raw_host_bytes: dict[object, object] = {}
+        self._saved_io_external_predecode_work_order: list[object] = []
+        self._saved_io_external_predecode_loaders: dict[object, object] = {}
         self._saved_io_external_host_bytes: dict[object, object] = {}
         self._saved_io_external_device_bytes: dict[object, object] = {}
         self._saved_io_work_order: tuple[object, ...] = ()
         self._saved_io_work_index: dict[object, int] = {}
         self._dense_host_plaintext_payload_cache: dict[int, np.ndarray] = {}
+        self.last_saved_io_prewarm_profile: dict[str, object] = {}
         self.last_runtime_timing: dict[str, object] = self._empty_runtime_timing()
         self.new_evaluator()
 
@@ -191,24 +197,66 @@ class NewEvaluator:
         loader,
         host_bytes,
         device_bytes,
+        raw_loader=None,
+        raw_host_bytes=None,
+        predecode_loader=None,
     ) -> None:
         if key not in self._saved_io_external_loaders:
             self._saved_io_external_work_order.append(key)
         self._saved_io_external_loaders[key] = loader
         self._saved_io_external_host_bytes[key] = host_bytes
         self._saved_io_external_device_bytes[key] = device_bytes
+        if raw_loader is not None:
+            self.register_saved_io_raw_work_unit(
+                key,
+                raw_loader=raw_loader,
+                host_bytes=host_bytes if raw_host_bytes is None else raw_host_bytes,
+            )
+        if predecode_loader is not None:
+            self.register_saved_io_predecode_work_unit(
+                key,
+                predecode_loader=predecode_loader,
+            )
         self._rebuild_saved_io_work_order()
 
+    def register_saved_io_raw_work_unit(self, key, *, raw_loader, host_bytes) -> None:
+        if key not in self._saved_io_external_raw_loaders:
+            self._saved_io_external_raw_work_order.append(key)
+        self._saved_io_external_raw_loaders[key] = raw_loader
+        self._saved_io_external_raw_host_bytes[key] = host_bytes
+
+    def register_saved_io_predecode_work_unit(self, key, *, predecode_loader) -> None:
+        if key not in self._saved_io_external_predecode_loaders:
+            self._saved_io_external_predecode_work_order.append(key)
+        self._saved_io_external_predecode_loaders[key] = predecode_loader
+
     def unregister_saved_io_prefetch_work_unit(self, key) -> None:
-        if key not in self._saved_io_external_loaders:
+        if (
+            key not in self._saved_io_external_loaders
+            and key not in self._saved_io_external_raw_loaders
+            and key not in self._saved_io_external_predecode_loaders
+        ):
             return
         self._transform_io_prefetcher.discard(key, wait=True)
         self._saved_io_external_loaders.pop(key, None)
         self._saved_io_external_host_bytes.pop(key, None)
         self._saved_io_external_device_bytes.pop(key, None)
+        self._saved_io_external_raw_loaders.pop(key, None)
+        self._saved_io_external_raw_host_bytes.pop(key, None)
+        self._saved_io_external_predecode_loaders.pop(key, None)
         self._saved_io_external_work_order = [
             existing_key
             for existing_key in self._saved_io_external_work_order
+            if existing_key != key
+        ]
+        self._saved_io_external_raw_work_order = [
+            existing_key
+            for existing_key in self._saved_io_external_raw_work_order
+            if existing_key != key
+        ]
+        self._saved_io_external_predecode_work_order = [
+            existing_key
+            for existing_key in self._saved_io_external_predecode_work_order
             if existing_key != key
         ]
         self._rebuild_saved_io_work_order()
@@ -244,6 +292,160 @@ class NewEvaluator:
             key: index
             for index, key in enumerate(self._saved_io_work_order)
         }
+
+    def _saved_io_prewarm_work_order(self) -> tuple[object, ...]:
+        external = tuple(
+            key
+            for key in self._saved_io_external_raw_work_order
+            if key in self._saved_io_external_raw_loaders
+        )
+        return tuple(self._saved_io_linear_work_order) + external
+
+    def _saved_io_predecode_work_order(self) -> tuple[object, ...]:
+        return tuple(
+            key
+            for key in self._saved_io_external_predecode_work_order
+            if key in self._saved_io_external_predecode_loaders
+        )
+
+    def _saved_io_prewarm_chunk_bytes(self) -> int:
+        raw = os.environ.get("ORION_SAVED_IO_PREWARM_CHUNK_BYTES")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        raw_mib = os.environ.get("ORION_SAVED_IO_PREWARM_CHUNK_MB", "64")
+        try:
+            return max(1, int(float(raw_mib) * 1024**2))
+        except ValueError:
+            return 64 * 1024**2
+
+    def _raw_read_h5_dataset(self, dataset) -> int:
+        total_bytes = int(getattr(dataset, "size", 0)) * int(getattr(dataset.dtype, "itemsize", 1))
+        if total_bytes <= 0:
+            return 0
+        shape = tuple(int(v) for v in getattr(dataset, "shape", ()) or ())
+        if not shape:
+            _ = dataset[()]
+            return int(total_bytes)
+        chunk_bytes = int(self._saved_io_prewarm_chunk_bytes())
+        itemsize = max(1, int(dataset.dtype.itemsize))
+        trailing_items = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+        row_bytes = max(1, trailing_items * itemsize)
+        rows_per_chunk = max(1, int(chunk_bytes // row_bytes))
+        rows_per_chunk = min(rows_per_chunk, int(shape[0]))
+        buffer_shape = (rows_per_chunk,) + shape[1:]
+        buffer = np.empty(buffer_shape, dtype=dataset.dtype)
+        for start in range(0, int(shape[0]), rows_per_chunk):
+            stop = min(int(shape[0]), int(start + rows_per_chunk))
+            count = int(stop - start)
+            source = np.s_[start:stop] if len(shape) == 1 else (np.s_[start:stop],) + tuple(
+                np.s_[:] for _ in shape[1:]
+            )
+            dest = np.s_[:count] if len(shape) == 1 else (np.s_[:count],) + tuple(
+                np.s_[:] for _ in shape[1:]
+            )
+            dataset.read_direct(buffer, source_sel=source, dest_sel=dest)
+        return int(total_bytes)
+
+    def _raw_read_transform_io_bundle(self, layer_name, row, col, transform_id) -> dict[str, object]:
+        started = time.perf_counter()
+        profile: dict[str, object] = {
+            "kind": "linear_transform",
+            "key": (str(layer_name), int(row), int(col), int(transform_id)),
+            "bytes": 0,
+            "datasets": 0,
+            "seconds": 0.0,
+        }
+
+        def read_dataset(dataset) -> None:
+            profile["bytes"] = int(profile["bytes"]) + int(self._raw_read_h5_dataset(dataset))
+            profile["datasets"] = int(profile["datasets"]) + 1
+
+        if self.keys_path:
+            with h5py.File(self.keys_path, "r") as f:
+                for key_value, level in self.get_required_rotation_key_requests(transform_id):
+                    key_str = self._rotation_key_storage_name(key_value, level)
+                    if key_str not in f and str(int(key_value)) in f:
+                        key_str = str(int(key_value))
+                    read_dataset(f[key_str])
+
+        if self.diags_path:
+            with h5py.File(self.diags_path, "r") as f:
+                block = f[str(layer_name)]["plaintexts"][f"{int(row)}_{int(col)}"]
+                if _ENCODED_HOIST_PAYLOAD_DATASET in block:
+                    read_dataset(block[_ENCODED_HOIST_PAYLOAD_DATASET])
+                elif self._dense_block_has_coarse_payload(block):
+                    for name in (
+                        _DENSE_DIAG_INDICES_DATASET,
+                        _DENSE_DIAG_OFFSETS_DATASET,
+                        _DENSE_DIAG_LENGTHS_DATASET,
+                        _DENSE_DIAG_PAYLOAD_DATASET,
+                    ):
+                        if name in block:
+                            read_dataset(block[name])
+                elif not self._plaintext_payload_required():
+                    if _DENSE_DIAG_INDICES_DATASET in block:
+                        read_dataset(block[_DENSE_DIAG_INDICES_DATASET])
+                    else:
+                        for diag_idx in self._dense_block_diag_indices(block):
+                            key = str(int(diag_idx))
+                            if key in block:
+                                read_dataset(block[key])
+                else:
+                    for diag_idx in self._dense_block_diag_indices(block):
+                        key = str(int(diag_idx))
+                        if key in block:
+                            read_dataset(block[key])
+        profile["seconds"] = float(time.perf_counter() - started)
+        return profile
+
+    def prewarm_saved_io(self, *, mode: str = "raw", max_units: int | None = None) -> dict[str, object]:
+        mode_key = str(mode or "raw").strip().lower()
+        if mode_key in _FALSE_ENV_VALUES:
+            profile = {"mode": mode_key, "enabled": False}
+            self.last_saved_io_prewarm_profile = profile
+            return profile
+        if mode_key not in {"raw", "readahead", "predecode", "host-predecode"}:
+            raise ValueError(f"unsupported saved IO prewarm mode: {mode}")
+
+        started = time.perf_counter()
+        units: list[dict[str, object]] = []
+        total_bytes = 0
+        total_datasets = 0
+        predecode = mode_key in {"predecode", "host-predecode"}
+        work_order = self._saved_io_predecode_work_order() if predecode else self._saved_io_prewarm_work_order()
+        limit = None if max_units is None else max(0, int(max_units))
+        for index, key in enumerate(work_order):
+            if limit is not None and len(units) >= limit:
+                break
+            if predecode and key in self._saved_io_external_predecode_loaders:
+                item = self._saved_io_external_predecode_loaders[key]()
+            elif key in self._saved_io_external_raw_loaders:
+                item = self._saved_io_external_raw_loaders[key]()
+            else:
+                layer_name, row, col, transform_id = key
+                item = self._raw_read_transform_io_bundle(layer_name, row, col, transform_id)
+            if not isinstance(item, dict):
+                item = {"kind": "unknown", "key": repr(key), "bytes": 0, "datasets": 0, "seconds": 0.0}
+            item = dict(item)
+            item.setdefault("index", int(index))
+            total_bytes += int(item.get("bytes", 0) or 0)
+            total_datasets += int(item.get("datasets", 0) or 0)
+            units.append(item)
+        profile = {
+            "mode": "predecode" if predecode else "raw",
+            "enabled": True,
+            "unit_count": int(len(units)),
+            "available_unit_count": int(len(work_order)),
+            "bytes": int(total_bytes),
+            "datasets": int(total_datasets),
+            "seconds": float(time.perf_counter() - started),
+            "units": units,
+        }
+        self.last_saved_io_prewarm_profile = profile
+        return profile
 
     def _work_items_from_transform_ids(self, transform_ids: dict) -> list[tuple[int, int, int]]:
         if not transform_ids:
@@ -303,6 +505,18 @@ class NewEvaluator:
                     )
             if self.io_mode != "none" and not reuse_saved_plaintexts:
                 self._trim_backend_runtime_memory()
+
+        if self._dense_unified_compile_enabled(linear_layer, diagonals, io_mode=str(effective_io_mode)):
+            for _col, column_diagonals in self._diagonal_blocks_by_col(diagonals):
+                batch_ids = self._generate_transforms_unified_batch(
+                    column_diagonals,
+                    level=int(level),
+                    on_batch_result=finish_compiled_batch,
+                )
+                if batch_ids is None:
+                    break
+            else:
+                return lintransf_ids
 
         batch_ids = self._generate_transforms_batch(
             diagonals,
@@ -391,6 +605,35 @@ class NewEvaluator:
         if params is not None and hasattr(params, "get_slots"):
             return int(params.get_slots())
         return 0
+
+    def _dense_tconv_unified_requested(self, linear_layer) -> bool:
+        if linear_layer.__class__.__name__ != "ConvTranspose2d":
+            return False
+        if bool(getattr(linear_layer, "dense_tconv_unified_bsgs", False)):
+            return True
+        override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
+        return bool(override is not None and override.lower() in ("1", "true", "yes", "on"))
+
+    def _dense_unified_compile_enabled(self, linear_layer, diagonals, *, io_mode: str) -> bool:
+        if not self._dense_tconv_unified_requested(linear_layer):
+            return False
+        if str(io_mode) != "none" or self.io_mode != "none":
+            return False
+        if not callable(getattr(self.backend, "GenerateLinearTransformsUnified", None)):
+            return False
+        try:
+            return bool(diagonals) and all(
+                isinstance(key, tuple) and len(key) == 2
+                for key in diagonals.keys()
+            )
+        except AttributeError:
+            return False
+
+    def _diagonal_blocks_by_col(self, diagonals):
+        by_col = {}
+        for (row, col), diags in diagonals.items():
+            by_col.setdefault(int(col), {})[(int(row), int(col))] = diags
+        return [(int(col), by_col[int(col)]) for col in sorted(by_col)]
 
     def _flatten_diagonals(self, diags):
         diag_indices = sorted(int(idx) for idx in diags.keys())
@@ -586,6 +829,58 @@ class NewEvaluator:
             gc.collect()
             offset += int(batch_limit)
         return results
+
+    def _generate_transforms_unified_batch(
+        self,
+        diagonals,
+        *,
+        level: int,
+        on_batch_result=None,
+    ):
+        generate = getattr(self.backend, "GenerateLinearTransformsUnified", None)
+        if not callable(generate) or len(diagonals) <= 0:
+            return None
+
+        items = list(diagonals.items())
+        block_payloads = [self._build_block_payload(item) for item in items]
+        num_transforms = len(block_payloads)
+        diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
+        diag_idxs_lens = (ctypes.c_int * num_transforms)()
+        diag_data_ptrs = (ctypes.POINTER(ctypes.c_float) * num_transforms)()
+        diag_data_lens = (ctypes.c_int * num_transforms)()
+        levels = (ctypes.c_int * num_transforms)(*[int(level)] * num_transforms)
+
+        owned_arrays: list[object] = [levels]
+        for index, (_row, _col, diags_idxs, diags_data) in enumerate(block_payloads):
+            idx_array = np.ascontiguousarray(diags_idxs, dtype=np.int32)
+            data_array = np.ascontiguousarray(diags_data, dtype=np.float32)
+            owned_arrays.extend((idx_array, data_array))
+            diag_idxs_ptrs[index] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+            diag_idxs_lens[index] = int(idx_array.size)
+            diag_data_ptrs[index] = data_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            diag_data_lens[index] = int(data_array.size)
+
+        encode_started = time.perf_counter()
+        lintransf_ids = list(
+            generate(
+                int(num_transforms),
+                diag_idxs_ptrs,
+                diag_idxs_lens,
+                diag_data_ptrs,
+                diag_data_lens,
+                levels,
+            )
+        )
+        self._add_profile("encode_s", time.perf_counter() - encode_started)
+        batch_results = [
+            (row, col, diags_idxs, int(lintransf_id))
+            for (row, col, diags_idxs, _diags_data), lintransf_id in zip(block_payloads, lintransf_ids)
+        ]
+        if callable(on_batch_result):
+            on_batch_result(batch_results)
+        del block_payloads, owned_arrays, lintransf_ids
+        gc.collect()
+        return batch_results
     
     def get_required_rotation_keys(self, transform_id):
         return self.backend.GetLinearTransformRotationKeys(transform_id)
@@ -767,8 +1062,11 @@ class NewEvaluator:
             for j in range(cols)
             if int(transform_ids[i][j]) >= 0
         ]
-        dense_rectangular = int(len(work_items)) == int(rows * cols)
-        use_dense_shared_cache = bool(dense_rectangular) and self._dense_shared_cache_enabled(rows=rows, cols=cols)
+        use_dense_shared_cache = bool(work_items) and self._dense_shared_cache_enabled(
+            linear_layer,
+            rows=rows,
+            cols=cols,
+        )
         linear_layer._last_dense_shared_cache_eval = {
             "enabled": bool(use_dense_shared_cache),
             "group_count": int(cols) if bool(use_dense_shared_cache) else 0,
@@ -916,9 +1214,11 @@ class NewEvaluator:
         linear_layer._last_runtime_timing = dict(timing_payload)
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
 
-    def _dense_shared_cache_enabled(self, *, rows: int, cols: int) -> bool:
+    def _dense_shared_cache_enabled(self, linear_layer, *, rows: int, cols: int) -> bool:
+        requested = bool(self._dense_tconv_unified_requested(linear_layer))
         override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-        if override is None or override.lower() not in ("1", "true", "yes", "on"):
+        requested = bool(requested or (override is not None and override.lower() in ("1", "true", "yes", "on")))
+        if not bool(requested):
             return False
         if not callable(getattr(self.backend, "EvaluateLinearTransformsWithSharedCache", None)):
             return False
@@ -954,7 +1254,14 @@ class NewEvaluator:
         all_transform_ids: list[int] = []
         cts_out = [None for _ in range(int(rows))]
         for j in range(int(cols)):
-            column_ids = [int(transform_ids[i][j]) for i in range(int(rows))]
+            column_items = [
+                (int(i), int(transform_ids[i][j]))
+                for i in range(int(rows))
+                if int(transform_ids[i][j]) >= 0
+            ]
+            if not column_items:
+                continue
+            column_ids = [int(transform_id) for _row, transform_id in column_items]
             all_transform_ids.extend(column_ids)
             loaded_from_host_cache: list[int] = []
             if self._dense_host_payload_cache_enabled():
@@ -997,7 +1304,7 @@ class NewEvaluator:
                     "EvaluateLinearTransformsWithSharedCache returned "
                     f"{len(result_ids)} outputs for {len(column_ids)} dense transforms"
                 )
-            for i, res in enumerate(result_ids):
+            for (i, _transform_id), res in zip(column_items, result_ids):
                 ct = CipherTensor(self.scheme, int(res), out_shape, fhe_out_shape)
                 cts_out[int(i)] = ct if cts_out[int(i)] is None else cts_out[int(i)] + ct
 

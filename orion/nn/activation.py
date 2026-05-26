@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from orion.nn.module import Module, timer
-from orion.nn.operations import Mult
+from orion.nn.operations import Identity, Mult
 
 
 def _bootstrap_prescale_fusion(module):
@@ -287,6 +287,7 @@ class ReLU(Module):
         self.logerr = logerr 
         self.sign = _Sign(degrees, prec, logalpha, logerr)
         self.mult1 = Mult()
+        self.identity = Identity()
         self.mult2 = Mult()
         self.mult1._relu_parent_ref = weakref.ref(self)
         self.mult1._relu_role = "sign_prescale"
@@ -316,4 +317,4 @@ class ReLU(Module):
         if self.he_mode and bool(getattr(self, "region_first_probe_activation_bypass", False)):
             return x
         sign_input = self.mult1(x, self.prescale)
-        return self.mult2(x, self.sign(sign_input))
+        return self.mult2(self.identity(x), self.sign(sign_input))

@@ -146,6 +146,41 @@ def pack_conv_transpose2d(conv_layer: nn.Module, last: bool):
     return diagonals, output_rotations
 
 
+def _diagonal_has_nonzero(diag) -> bool:
+    if isinstance(diag, torch.Tensor):
+        return bool(torch.any(diag.detach() != 0).item())
+    return bool(np.any(np.asarray(diag) != 0))
+
+
+def prune_zero_diagonal_blocks(diagonals, *, preserve_empty_rows: bool = False):
+    pruned = {}
+    empty_blocks_by_row = {}
+    rows_with_nonzero = set()
+    for block_key, block in sorted(dict(diagonals).items()):
+        row, col = (int(value) for value in block_key)
+        nonzero_block = {
+            int(index): diag
+            for index, diag in dict(block or {}).items()
+            if _diagonal_has_nonzero(diag)
+        }
+        if nonzero_block:
+            pruned[(int(row), int(col))] = nonzero_block
+            rows_with_nonzero.add(int(row))
+        else:
+            empty_blocks_by_row.setdefault(int(row), []).append(((int(row), int(col)), dict(block or {})))
+    if bool(preserve_empty_rows):
+        for row, empty_blocks in sorted(empty_blocks_by_row.items()):
+            if int(row) in rows_with_nonzero or not empty_blocks:
+                continue
+            block_key, block = empty_blocks[0]
+            pruned[block_key] = block
+    return pruned
+
+
+def _prune_zero_diagonal_blocks(diagonals):
+    return prune_zero_diagonal_blocks(diagonals)
+
+
 def _pad_fhe_tensor(matrix: torch.Tensor, fhe_shape: torch.Size) -> torch.Tensor:
     padded = torch.zeros(fhe_shape, dtype=matrix.dtype)
     padded[

@@ -419,6 +419,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_group_reject_reasons = []
         prepare_started = time.perf_counter()
         diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
+        diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         keys = sorted((int(row), int(col)) for row, col in diagonals)
         self.rows = 0 if not keys else max(row for row, _col in keys) + 1
         self.cols = 0 if not keys else max(col for _row, col in keys) + 1

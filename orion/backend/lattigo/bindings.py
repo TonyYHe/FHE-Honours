@@ -1095,6 +1095,26 @@ class LattigoLibrary:
                 restype=ArrayResultInt
             )
 
+        enable_profile = getattr(self.lib, "EnableBootstrapProfile", None)
+        reset_profile = getattr(self.lib, "ResetBootstrapProfile", None)
+        get_profile = getattr(self.lib, "GetBootstrapProfileCounters", None)
+        if enable_profile is not None and reset_profile is not None and get_profile is not None:
+            self.EnableBootstrapProfile = LattigoFunction(
+                enable_profile,
+                argtypes=[ctypes.c_int],
+                restype=None,
+            )
+            self.ResetBootstrapProfile = LattigoFunction(
+                reset_profile,
+                argtypes=[],
+                restype=None,
+            )
+            self.GetBootstrapProfileCounters = LattigoFunction(
+                get_profile,
+                argtypes=[],
+                restype=ArrayResultUInt64,
+            )
+
         self.DeleteBootstrappers = LattigoFunction(
             self.lib.DeleteBootstrappers,
             argtypes=None,

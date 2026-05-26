@@ -32,19 +32,19 @@ class BasicBlock(on.Module):
 class Bottleneck(on.Module):
     expansion = 4
 
-    def __init__(self, Ci, Co, stride=1):
+    def __init__(self, Ci, Co, stride=1, activation="silu", silu_degree=127):
         super().__init__()
         self.conv1 = on.Conv2d(Ci, Co, kernel_size=1, bias=False)
         self.bn1   = on.BatchNorm2d(Co)
-        self.act1  = on.SiLU(degree=127) 
+        self.act1  = _make_activation(activation, silu_degree)
 
         self.conv2 = on.Conv2d(Co, Co, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2   = on.BatchNorm2d(Co)
-        self.act2  = on.SiLU(degree=127)  
+        self.act2  = _make_activation(activation, silu_degree)
 
         self.conv3 = on.Conv2d(Co, Co*self.expansion, kernel_size=1, stride=1, bias=False)
         self.bn3   = on.BatchNorm2d(Co*self.expansion)
-        self.act3  = on.SiLU(degree=127)  
+        self.act3  = _make_activation(activation, silu_degree)
 
         self.add = on.Add()
         self.shortcut = nn.Sequential()
@@ -111,7 +111,7 @@ class ResNet(on.Module):
             if block is BasicBlock:
                 layers.append(block(self.in_chans, chans, stride, activation=activation, silu_degree=silu_degree))
             else:
-                layers.append(block(self.in_chans, chans, stride))
+                layers.append(block(self.in_chans, chans, stride, activation=activation, silu_degree=silu_degree))
             self.in_chans = chans * block.expansion
         return nn.Sequential(*layers)
     
@@ -134,9 +134,19 @@ def ResNet20(dataset='cifar10'):
     conv1_params, num_classes = get_resnet_config(dataset)
     return ResNet(dataset, BasicBlock, [3,3,3], [16,32,64], conv1_params, num_classes)
 
-def ResNet32(dataset='cifar10'):
+def ResNet32(dataset='cifar10', activation="relu", silu_degree=127, stem_relu=True):
     conv1_params, num_classes = get_resnet_config(dataset)
-    return ResNet(dataset, BasicBlock, [5,5,5], [16,32,64], conv1_params, num_classes)
+    return ResNet(
+        dataset,
+        BasicBlock,
+        [5,5,5],
+        [16,32,64],
+        conv1_params,
+        num_classes,
+        activation=activation,
+        silu_degree=silu_degree,
+        stem_relu=stem_relu,
+    )
 
 def ResNet44(dataset='cifar10'):
     conv1_params, num_classes = get_resnet_config(dataset)
@@ -186,9 +196,19 @@ def ResNet34(dataset='imagenet', activation="relu", silu_degree=127, stem_relu=T
         stem_relu=stem_relu,
     )
 
-def ResNet50(dataset='imagenet'):
+def ResNet50(dataset='imagenet', activation="silu", silu_degree=127, stem_relu=True):
     conv1_params, num_classes = get_resnet_config(dataset)
-    return ResNet(dataset, Bottleneck, [3,4,6,3], [64,128,256,512], conv1_params, num_classes)
+    return ResNet(
+        dataset,
+        Bottleneck,
+        [3,4,6,3],
+        [64,128,256,512],
+        conv1_params,
+        num_classes,
+        activation=activation,
+        silu_degree=silu_degree,
+        stem_relu=stem_relu,
+    )
 
 def ResNet101(dataset='imagenet'):
     conv1_params, num_classes = get_resnet_config(dataset)

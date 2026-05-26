@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/realqhc/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/realqhc/lattigo/v6/core/rlwe"
@@ -20,6 +21,53 @@ import (
 // Map to store bootstrapping.Evaluators by their slot count
 // Initialize the map at package level
 var bootstrapperMap = make(map[int]*bootstrapping.Evaluator)
+
+const bootstrapProfileRowWidth = 17
+
+var (
+	bootstrapProfileMu      sync.Mutex
+	bootstrapProfileEnabled bool
+	bootstrapProfileSeq     uint64
+	bootstrapProfileRows    []uint64
+)
+
+func appendBootstrapProfile(row []uint64) {
+	if len(row) != bootstrapProfileRowWidth {
+		panic(fmt.Errorf("invalid bootstrap profile row width: got %d want %d", len(row), bootstrapProfileRowWidth))
+	}
+	bootstrapProfileMu.Lock()
+	defer bootstrapProfileMu.Unlock()
+	if !bootstrapProfileEnabled {
+		return
+	}
+	bootstrapProfileSeq++
+	row[0] = bootstrapProfileSeq
+	bootstrapProfileRows = append(bootstrapProfileRows, row...)
+}
+
+//export EnableBootstrapProfile
+func EnableBootstrapProfile(enabled C.int) {
+	bootstrapProfileMu.Lock()
+	defer bootstrapProfileMu.Unlock()
+	bootstrapProfileEnabled = int(enabled) != 0
+}
+
+//export ResetBootstrapProfile
+func ResetBootstrapProfile() {
+	bootstrapProfileMu.Lock()
+	defer bootstrapProfileMu.Unlock()
+	bootstrapProfileSeq = 0
+	bootstrapProfileRows = nil
+}
+
+//export GetBootstrapProfileCounters
+func GetBootstrapProfileCounters() (*C.ulonglong, C.ulong) {
+	bootstrapProfileMu.Lock()
+	defer bootstrapProfileMu.Unlock()
+	rows := make([]uint64, len(bootstrapProfileRows))
+	copy(rows, bootstrapProfileRows)
+	return SliceToCArray(rows, convertUint64ToCULonglong)
+}
 
 //export NewBootstrapper
 func NewBootstrapper(
@@ -65,15 +113,44 @@ func NewBootstrapper(
 
 //export Bootstrap
 func Bootstrap(ciphertextID, numSlots C.int) C.int {
+	totalStart := time.Now()
+	retrieveStart := time.Now()
 	ctIn := RetrieveCiphertext(int(ciphertextID))
+	retrieveNs := uint64(time.Since(retrieveStart).Nanoseconds())
 	bootstrapper := GetBootstrapper(int(numSlots))
+	inputLevel := uint64(ctIn.Level())
+	inputSlots := uint64(1 << ctIn.LogDimensions.Cols)
+	inputLogCols := uint64(ctIn.LogDimensions.Cols)
+	inputDegree := uint64(ctIn.Degree())
 
-	ctOut, err := bootstrapOne(bootstrapper, ctIn)
+	ctOut, timings, err := bootstrapOne(bootstrapper, ctIn)
 	if err != nil {
 		panic(err)
 	}
-
+	pushStart := time.Now()
 	idx := PushCiphertext(ctOut)
+	pushNs := uint64(time.Since(pushStart).Nanoseconds())
+	totalNs := uint64(time.Since(totalStart).Nanoseconds())
+
+	appendBootstrapProfile([]uint64{
+		0,
+		1,
+		uint64(numSlots),
+		inputLevel,
+		uint64(ctOut.Level()),
+		inputSlots,
+		uint64(1 << ctOut.LogDimensions.Cols),
+		inputLogCols,
+		uint64(ctOut.LogDimensions.Cols),
+		totalNs,
+		retrieveNs,
+		timings.copyNs,
+		timings.evaluatorNs,
+		timings.postscaleNs,
+		pushNs,
+		inputDegree,
+		uint64(ctOut.Degree()),
+	})
 	return C.int(idx)
 }
 
@@ -106,22 +183,36 @@ func BootstrapMany(ciphertextIDs *C.int, lenCiphertextIDs C.int, numSlots C.int)
 	return SliceToCArray(outIDs, convertIntToCInt)
 }
 
-func bootstrapOne(bootstrapper *bootstrapping.Evaluator, ctIn *rlwe.Ciphertext) (*rlwe.Ciphertext, error) {
+type bootstrapOneTimings struct {
+	copyNs      uint64
+	evaluatorNs uint64
+	postscaleNs uint64
+}
+
+func bootstrapOne(bootstrapper *bootstrapping.Evaluator, ctIn *rlwe.Ciphertext) (*rlwe.Ciphertext, bootstrapOneTimings, error) {
+	copyStart := time.Now()
 	ctBtp := ctIn.CopyNew()
 	ctBtp.LogDimensions.Cols = bootstrapper.LogMaxSlots()
-
-	ctOut, err := bootstrapper.Bootstrap(ctBtp)
-	if err != nil {
-		return nil, err
+	timings := bootstrapOneTimings{
+		copyNs: uint64(time.Since(copyStart).Nanoseconds()),
 	}
 
+	evaluatorStart := time.Now()
+	ctOut, err := bootstrapper.Bootstrap(ctBtp)
+	timings.evaluatorNs = uint64(time.Since(evaluatorStart).Nanoseconds())
+	if err != nil {
+		return nil, timings, err
+	}
+
+	postscaleStart := time.Now()
 	postscale := int(1 << (scheme.Params.LogMaxSlots() - bootstrapper.LogMaxSlots()))
 	if err := bootstrapper.Evaluator.Mul(ctOut, postscale, ctOut); err != nil {
-		return nil, err
+		return nil, timings, err
 	}
+	timings.postscaleNs = uint64(time.Since(postscaleStart).Nanoseconds())
 
 	ctOut.LogDimensions.Cols = scheme.Params.LogMaxSlots()
-	return ctOut, nil
+	return ctOut, timings, nil
 }
 
 func bootstrapMany(bootstrapper *bootstrapping.Evaluator, inputs []*rlwe.Ciphertext) ([]*rlwe.Ciphertext, error) {
@@ -129,7 +220,7 @@ func bootstrapMany(bootstrapper *bootstrapping.Evaluator, inputs []*rlwe.Ciphert
 	if workers <= 1 || len(inputs) <= 1 {
 		outputs := make([]*rlwe.Ciphertext, len(inputs))
 		for i, ctIn := range inputs {
-			ctOut, err := bootstrapOne(bootstrapper, ctIn)
+			ctOut, _, err := bootstrapOne(bootstrapper, ctIn)
 			if err != nil {
 				return nil, err
 			}
@@ -160,7 +251,7 @@ func bootstrapMany(bootstrapper *bootstrapping.Evaluator, inputs []*rlwe.Ciphert
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
-				ctOut, err := bootstrapOne(bootstrapper, inputs[index])
+				ctOut, _, err := bootstrapOne(bootstrapper, inputs[index])
 				if err != nil {
 					setErr(err)
 					continue

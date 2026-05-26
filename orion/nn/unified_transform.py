@@ -144,6 +144,8 @@ class UnifiedTransformGroup:
         self._prefetch_device_bytes: int | None = None
         self._saved_io_host_bytes_by_transform: dict[int, int] | None = None
         self._resident_plaintext_transform_ids: set[int] = set()
+        self._predecoded_plaintext_transform_ids: set[int] = set()
+        self._predecoded_rotation_keys: set[int] = set()
         self.memory_trace: list[dict[str, Any]] = []
         self.last_runtime_timing: dict[str, Any] = self._empty_runtime_timing()
         self.last_compile_profile: dict[str, Any] = self._empty_compile_profile()
@@ -1032,20 +1034,36 @@ class UnifiedTransformGroup:
         return scheduler
 
     def _register_shared_saved_io_work_unit(self, backend) -> None:
+        scheduler = self._shared_saved_io_scheduler()
+        if scheduler is None:
+            return
+        register_raw = getattr(scheduler, "register_saved_io_raw_work_unit", None)
+        if callable(register_raw):
+            register_raw(
+                self._saved_io_prefetch_key(),
+                raw_loader=lambda: self._raw_read_saved_io_bundle(backend),
+                host_bytes=lambda: self._estimate_prefetch_host_bytes(backend),
+            )
+        register_predecode = getattr(scheduler, "register_saved_io_predecode_work_unit", None)
+        if callable(register_predecode):
+            register_predecode(
+                self._saved_io_prefetch_key(),
+                predecode_loader=lambda: self._predecode_saved_io_for_inference(backend),
+            )
         if self._memory_bounded_eval_enabled(backend):
             try:
                 if len(self._memory_bounded_chunks(backend)) != 1:
                     return
             except Exception:
                 return
-        scheduler = self._shared_saved_io_scheduler()
-        if scheduler is None:
-            return
         scheduler.register_saved_io_prefetch_work_unit(
             self._saved_io_prefetch_key(),
             loader=lambda: self._read_and_prefetch_saved_io_bundle(backend),
             host_bytes=lambda: self._estimate_prefetch_host_bytes(backend),
             device_bytes=lambda: self._estimate_prefetch_device_bytes(backend),
+            raw_loader=lambda: self._raw_read_saved_io_bundle(backend),
+            raw_host_bytes=lambda: self._estimate_prefetch_host_bytes(backend),
+            predecode_loader=lambda: self._predecode_saved_io_for_inference(backend),
         )
 
     def _prepare_shared_cache_plans(self, backend) -> None:
@@ -1276,6 +1294,130 @@ class UnifiedTransformGroup:
         self._prefetch_device_bytes = int(total_bytes)
         return int(total_bytes)
 
+    def _saved_io_prewarm_chunk_bytes(self) -> int:
+        raw = os.environ.get("ORION_SAVED_IO_PREWARM_CHUNK_BYTES")
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+        raw_mib = os.environ.get("ORION_SAVED_IO_PREWARM_CHUNK_MB", "64")
+        try:
+            return max(1, int(float(raw_mib) * 1024**2))
+        except ValueError:
+            return 64 * 1024**2
+
+    def _raw_read_h5_dataset(self, dataset) -> int:
+        total_bytes = int(getattr(dataset, "size", 0)) * int(getattr(dataset.dtype, "itemsize", 1))
+        if total_bytes <= 0:
+            return 0
+        shape = tuple(int(v) for v in getattr(dataset, "shape", ()) or ())
+        if not shape:
+            _ = dataset[()]
+            return int(total_bytes)
+        chunk_bytes = int(self._saved_io_prewarm_chunk_bytes())
+        itemsize = max(1, int(dataset.dtype.itemsize))
+        trailing_items = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+        row_bytes = max(1, trailing_items * itemsize)
+        rows_per_chunk = max(1, int(chunk_bytes // row_bytes))
+        rows_per_chunk = min(rows_per_chunk, int(shape[0]))
+        buffer_shape = (rows_per_chunk,) + shape[1:]
+        buffer = np.empty(buffer_shape, dtype=dataset.dtype)
+        for start in range(0, int(shape[0]), rows_per_chunk):
+            stop = min(int(shape[0]), int(start + rows_per_chunk))
+            count = int(stop - start)
+            source = np.s_[start:stop] if len(shape) == 1 else (np.s_[start:stop],) + tuple(
+                np.s_[:] for _ in shape[1:]
+            )
+            dest = np.s_[:count] if len(shape) == 1 else (np.s_[:count],) + tuple(
+                np.s_[:] for _ in shape[1:]
+            )
+            dataset.read_direct(buffer, source_sel=source, dest_sel=dest)
+        return int(total_bytes)
+
+    def _raw_read_saved_io_bundle(self, backend) -> dict[str, object]:
+        started = time.perf_counter()
+        profile: dict[str, object] = {
+            "kind": "unified_transform_group",
+            "key": str(self._storage_key),
+            "bytes": 0,
+            "datasets": 0,
+            "seconds": 0.0,
+            "transform_count": int(len(self.unified_ids or ())),
+        }
+
+        def read_dataset(dataset) -> None:
+            profile["bytes"] = int(profile["bytes"]) + int(self._raw_read_h5_dataset(dataset))
+            profile["datasets"] = int(profile["datasets"]) + 1
+
+        if self._should_offload_rotation_keys():
+            with h5py.File(self._keys_path, "r") as handle:
+                for key, level in self._required_keys:
+                    key_name = self._rotation_key_storage_name(int(key), level)
+                    if key_name not in handle and str(int(key)) in handle:
+                        key_name = str(int(key))
+                    read_dataset(handle[key_name])
+
+        if self._offloaded_plaintext_diagonals:
+            selected_ids = self._plaintext_load_transform_ids(backend)
+            selected_ids -= set(int(value) for value in self._resident_plaintext_transform_ids)
+            handle, root = self._storage_group("r")
+            try:
+                storage = root[self._storage_key]
+                for transform_id, diag_indices in self._diag_indices_by_transform.items():
+                    if int(transform_id) not in selected_ids:
+                        continue
+                    transform_group = storage[self._storage_name_for_transform(int(transform_id))]
+                    if _ENCODED_HOIST_PAYLOAD_DATASET in transform_group:
+                        read_dataset(transform_group[_ENCODED_HOIST_PAYLOAD_DATASET])
+                        if "diag_indices" in transform_group:
+                            read_dataset(transform_group["diag_indices"])
+                        continue
+                    for name in ("diag_payload", "diag_offsets", "diag_lengths", "diag_indices"):
+                        if name in transform_group:
+                            read_dataset(transform_group[name])
+                    if not any(name in transform_group for name in ("diag_payload", "diag_indices")):
+                        for diag_idx in diag_indices:
+                            key = str(int(diag_idx))
+                            if key in transform_group:
+                                read_dataset(transform_group[key])
+            finally:
+                handle.close()
+        profile["seconds"] = float(time.perf_counter() - started)
+        return profile
+
+    def _predecode_saved_io_for_inference(self, backend) -> dict[str, object]:
+        started = time.perf_counter()
+        bundle = self._read_saved_io_bundle(backend, prefetch=False)
+        bytes_read = int(self._estimate_prefetch_host_bytes(backend))
+        transform_count = 0
+        rotation_key_count = 0
+        plaintext_count = 0
+        try:
+            self._predecode_saved_io_bundle_on_host(backend, bundle)
+            if bundle is not None:
+                keys = tuple(int(key) for key in bundle.get("rotation_keys_predecoded_on_host", ()))
+                self._predecoded_rotation_keys.update(keys)
+                rotation_key_count = int(len(keys))
+                for transform_id, payload in tuple(bundle.get("plaintexts", {}).items()):
+                    if payload.get("plaintexts_predecoded_on_host"):
+                        self._predecoded_plaintext_transform_ids.add(int(transform_id))
+                        plaintext_count += 1
+                transform_count = int(len(bundle.get("plaintexts", {}) or {}))
+        finally:
+            if bundle is not None:
+                bundle.clear()
+        return {
+            "kind": "unified_transform_group_predecode",
+            "key": str(self._storage_key),
+            "bytes": int(bytes_read),
+            "datasets": 0,
+            "seconds": float(time.perf_counter() - started),
+            "transform_count": int(transform_count),
+            "rotation_key_count": int(rotation_key_count),
+            "predecoded_plaintext_count": int(plaintext_count),
+        }
+
     def _read_saved_io_bundle(
         self,
         backend,
@@ -1301,6 +1443,18 @@ class UnifiedTransformGroup:
         if self._should_offload_rotation_keys():
             rotation_keys = []
             key_requests = tuple(required_keys) if required_keys is not None else self._required_keys
+            predecoded_keys = tuple(
+                int(key)
+                for key, _level in key_requests
+                if int(key) in self._predecoded_rotation_keys
+            )
+            if predecoded_keys:
+                bundle["rotation_keys_predecoded_on_host"] = predecoded_keys
+                key_requests = tuple(
+                    (int(key), level)
+                    for key, level in key_requests
+                    if int(key) not in self._predecoded_rotation_keys
+                )
             with h5py.File(self._keys_path, "r") as handle:
                 for key, level in key_requests:
                     key_name = self._rotation_key_storage_name(int(key), level)
@@ -1312,10 +1466,23 @@ class UnifiedTransformGroup:
         if bool(include_plaintexts) and self._offloaded_plaintext_diagonals:
             selected_ids = self._plaintext_load_transform_ids(backend, transform_ids)
             selected_ids -= set(int(value) for value in self._resident_plaintext_transform_ids)
+            predecoded_ids = selected_ids & set(int(value) for value in self._predecoded_plaintext_transform_ids)
+            selected_ids -= predecoded_ids
             handle, root = self._storage_group("r")
             try:
                 storage = root[self._storage_key]
                 plaintexts: dict[int, dict[str, object]] = {}
+                for transform_id in sorted(int(value) for value in predecoded_ids):
+                    plaintexts[int(transform_id)] = {
+                        "payload": np.zeros((0,), dtype=np.uint8),
+                        "offsets": (),
+                        "lengths": (),
+                        "diag_indices": tuple(
+                            int(value)
+                            for value in self._diag_indices_by_transform.get(int(transform_id), ())
+                        ),
+                        "plaintexts_predecoded_on_host": True,
+                    }
                 for transform_id, diag_indices in self._diag_indices_by_transform.items():
                     if int(transform_id) not in selected_ids:
                         continue
@@ -1403,6 +1570,7 @@ class UnifiedTransformGroup:
                     if int(key) in predecoded_keys and callable(install_predecoded_key):
                         if int(install_predecoded_key(int(key))) > 0:
                             loaded_requests.append((int(key), _level))
+                            self._predecoded_rotation_keys.discard(int(key))
                         continue
                     serial_key = serial_by_key.get(int(key))
                     if serial_key is not None:
@@ -1427,7 +1595,8 @@ class UnifiedTransformGroup:
                 return
             if predecoded_keys and callable(install_predecoded_key):
                 for key in sorted(predecoded_keys):
-                    install_predecoded_key(int(key))
+                    if int(install_predecoded_key(int(key))) > 0:
+                        self._predecoded_rotation_keys.discard(int(key))
                 bundle["rotation_keys_predecoded_on_host"] = ()
                 if not serial_by_key:
                     return
@@ -1687,6 +1856,7 @@ class UnifiedTransformGroup:
                         already_loaded=True,
                     ):
                         self._mark_plaintexts_resident(int(transform_id))
+                    self._predecoded_plaintext_transform_ids.discard(int(transform_id))
                     continue
                 encoded_payload = payload.get("encoded_payload")
                 if encoded_payload is not None:
@@ -2405,6 +2575,8 @@ class UnifiedTransformGroup:
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None
         self._resident_plaintext_transform_ids = set()
+        self._predecoded_plaintext_transform_ids = set()
+        self._predecoded_rotation_keys = set()
         self.memory_trace = []
         self._record_memory_event("before_compile_group", backend, ())
         if self._compile_unified_cached_load(backend, allow_save_resume=True):
@@ -2864,6 +3036,21 @@ class UnifiedTransformGroup:
                 device_bytes=0,
             )
 
+        scheduler = None
+        shared_prefetch_key = None
+        using_shared_prefetch = False
+        if len(chunks) == 1 and not stream_plaintexts:
+            scheduler = self._shared_saved_io_scheduler()
+            if scheduler is not None:
+                shared_prefetch_key = self._saved_io_prefetch_key()
+                using_shared_prefetch = bool(
+                    scheduler.fill_saved_io_prefetch_window(
+                        shared_prefetch_key,
+                        include_current=True,
+                        scratch_reserve_bytes=0,
+                    )
+                )
+
         self._record_memory_event(
             "before_eval_group_memory_bounded",
             backend,
@@ -2912,7 +3099,15 @@ class UnifiedTransformGroup:
                 memory_guard=memory_guard,
             )
             read_started = time.perf_counter()
-            bundle = self._io_prefetcher.consume(chunk_prefetch_key(int(chunk_index)))
+            if (
+                using_shared_prefetch
+                and scheduler is not None
+                and shared_prefetch_key is not None
+                and int(chunk_index) == 0
+            ):
+                bundle = scheduler.consume_saved_io_prefetch(shared_prefetch_key)
+            else:
+                bundle = self._io_prefetcher.consume(chunk_prefetch_key(int(chunk_index)))
             if bundle is None:
                 bundle = self._read_saved_io_bundle(
                     backend,
@@ -2922,7 +3117,19 @@ class UnifiedTransformGroup:
                     include_plaintexts=not stream_plaintexts,
                 )
             add_timing(chunk_timing, "read_bundle_s", time.perf_counter() - read_started)
-            schedule_chunk_prefetch(int(chunk_index) + 1)
+            if (
+                using_shared_prefetch
+                and scheduler is not None
+                and shared_prefetch_key is not None
+                and int(chunk_index) == 0
+            ):
+                scheduler.fill_saved_io_prefetch_window(
+                    shared_prefetch_key,
+                    include_current=False,
+                    scratch_reserve_bytes=0,
+                )
+            else:
+                schedule_chunk_prefetch(int(chunk_index) + 1)
             load_keys_started = time.perf_counter()
             self._load_rotation_keys(
                 backend,
@@ -3069,6 +3276,8 @@ class UnifiedTransformGroup:
         self._prefetch_device_bytes = None
         self._saved_io_host_bytes_by_transform = None
         self._resident_plaintext_transform_ids = set()
+        self._predecoded_plaintext_transform_ids = set()
+        self._predecoded_rotation_keys = set()
 
 
 def can_use_unified_bsgs(layers: List) -> bool:

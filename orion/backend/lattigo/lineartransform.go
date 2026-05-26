@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -111,6 +112,24 @@ func envOff(raw string) bool {
 	return raw == "0" || raw == "false" || raw == "FALSE" || raw == "no" || raw == "off"
 }
 
+func positiveIntEnv(name string) (int, bool) {
+	if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func positiveFloatEnv(name string) (float64, bool) {
+	if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed > 0 {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
 func lattigoStreamingLTMinPlaintexts() int {
 	if raw := os.Getenv("ORION_LATTIGO_STREAMING_LT_MIN_PLAINTEXTS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
@@ -120,22 +139,198 @@ func lattigoStreamingLTMinPlaintexts() int {
 	return 8192
 }
 
-func lattigoStreamingLTChunkPlaintexts() int {
-	if raw := os.Getenv("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			return parsed
+func hostMemoryInfoBytes() (total uint64, available uint64) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		valueKB, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.TrimSuffix(fields[0], ":") {
+		case "MemTotal":
+			total = valueKB * 1024
+		case "MemAvailable":
+			available = valueKB * 1024
 		}
 	}
-	return 1024
+	return total, available
 }
 
-func lattigoStreamingLTSharedTransformLimit() int {
-	if raw := os.Getenv("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			return parsed
+func compileMemoryReserveBytes(total uint64) uint64 {
+	if value, ok := positiveIntEnv("ORION_COMPILE_MEMORY_RESERVE_BYTES"); ok {
+		return uint64(value)
+	}
+	if value, ok := positiveFloatEnv("ORION_COMPILE_MEMORY_RESERVE_GB"); ok {
+		return uint64(value * float64(uint64(1)<<30))
+	}
+	fraction := 0.12
+	if value, ok := positiveFloatEnv("ORION_COMPILE_MEMORY_RESERVE_FRACTION"); ok {
+		fraction = math.Max(0, math.Min(0.95, value))
+	}
+	reserve := uint64(float64(total) * fraction)
+	minReserve := uint64(16) << 30
+	if reserve < minReserve {
+		return minReserve
+	}
+	return reserve
+}
+
+func streamingLTAutoBudgetBytes() uint64 {
+	total, available := hostMemoryInfoBytes()
+	if available == 0 {
+		return 0
+	}
+	reserve := compileMemoryReserveBytes(total)
+	if available <= reserve {
+		return 0
+	}
+	fraction := 0.75
+	if value, ok := positiveFloatEnv("ORION_LATTIGO_STREAMING_LT_MEMORY_FRACTION"); ok {
+		fraction = math.Max(0.05, math.Min(0.95, value))
+	}
+	return uint64(float64(available-reserve) * fraction)
+}
+
+func streamingLTMemoryOverhead() float64 {
+	if value, ok := positiveFloatEnv("ORION_LATTIGO_STREAMING_LT_MEMORY_OVERHEAD"); ok {
+		return math.Max(1.0, math.Min(16.0, value))
+	}
+	return 3.0
+}
+
+func streamingLTPlaintextBytes(levelQ, levelP int) uint64 {
+	if scheme.Params == nil {
+		return 0
+	}
+	if levelQ < 0 {
+		levelQ = 0
+	}
+	if levelP < 0 {
+		levelP = 0
+	}
+	moduli := uint64(levelQ + 1 + levelP + 1)
+	degree := uint64(1) << uint(scheme.Params.LogN())
+	return moduli * degree * uint64(8)
+}
+
+func floorPowerOfTwoInt(value uint64) int {
+	if value <= 1 {
+		return int(value)
+	}
+	power := uint64(1)
+	for power <= value/2 {
+		power *= 2
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if power > maxInt {
+		return int(maxInt)
+	}
+	return int(power)
+}
+
+func lattigoStreamingLTChunkPlaintextsFor(shell lintrans.LinearTransformation) int {
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS"); ok {
+		return value
+	}
+	minChunk := 512
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS_MIN"); ok {
+		minChunk = value
+	}
+	maxChunk := 4096
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS_MAX"); ok {
+		maxChunk = value
+	}
+	if maxChunk < minChunk {
+		maxChunk = minChunk
+	}
+	plaintextBytes := streamingLTPlaintextBytes(shell.LevelQ, shell.LevelP)
+	budget := streamingLTAutoBudgetBytes()
+	sharedTarget := runtime.GOMAXPROCS(0)
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS_MAX"); ok && value < sharedTarget {
+		sharedTarget = value
+	}
+	if sharedTarget < 1 {
+		sharedTarget = 1
+	}
+	if plaintextBytes == 0 || budget == 0 {
+		if 1024 < minChunk {
+			return minChunk
+		}
+		if 1024 > maxChunk {
+			return maxChunk
+		}
+		return 1024
+	}
+	perPlaintext := uint64(float64(plaintextBytes) * streamingLTMemoryOverhead())
+	if perPlaintext == 0 {
+		perPlaintext = plaintextBytes
+	}
+	capacity := budget / (uint64(sharedTarget) * perPlaintext)
+	chunk := floorPowerOfTwoInt(capacity)
+	if chunk < minChunk {
+		chunk = minChunk
+	}
+	if chunk > maxChunk {
+		chunk = maxChunk
+	}
+	if chunk < 1 {
+		chunk = 1
+	}
+	return chunk
+}
+
+func lattigoStreamingLTSharedTransformLimitFor(states []*lattigoStreamingLTState, chunkIndex int) int {
+	activeCount := 0
+	maxChunkBytes := uint64(0)
+	for _, state := range states {
+		if state == nil || chunkIndex < 0 || chunkIndex >= len(state.chunks) {
+			continue
+		}
+		activeCount++
+		plaintextBytes := streamingLTPlaintextBytes(state.shell.LevelQ, state.shell.LevelP)
+		chunkBytes := plaintextBytes * uint64(len(state.chunks[chunkIndex]))
+		if chunkBytes > maxChunkBytes {
+			maxChunkBytes = chunkBytes
 		}
 	}
-	return 2
+	if activeCount <= 0 {
+		return 1
+	}
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS"); ok {
+		return max(1, min(activeCount, value))
+	}
+	cpuLimit := runtime.GOMAXPROCS(0)
+	if cpuLimit < 1 {
+		cpuLimit = 1
+	}
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS_MAX"); ok {
+		cpuLimit = min(cpuLimit, value)
+	}
+	limit := min(activeCount, cpuLimit)
+	budget := streamingLTAutoBudgetBytes()
+	if budget == 0 || maxChunkBytes == 0 {
+		return max(1, limit)
+	}
+	perTransform := uint64(float64(maxChunkBytes) * streamingLTMemoryOverhead())
+	if perTransform == 0 {
+		perTransform = maxChunkBytes
+	}
+	memoryLimit := int(budget / perTransform)
+	return max(1, min(limit, memoryLimit))
+}
+
+func lattigoStreamingLTChunkPlaintexts() int {
+	if value, ok := positiveIntEnv("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS"); ok {
+		return value
+	}
+	return 1024
 }
 
 func lattigoStreamingLTEnabled(ioMode string, plaintextCount int) bool {
@@ -224,7 +419,7 @@ func newLinearTransformationShell(param lintrans.Parameters, explicitN1 int) lin
 
 func chunkLinearTransformKeys(shell lintrans.LinearTransformation, chunkLimit int) [][]int {
 	if chunkLimit <= 0 {
-		chunkLimit = lattigoStreamingLTChunkPlaintexts()
+		chunkLimit = lattigoStreamingLTChunkPlaintextsFor(shell)
 	}
 	appendChunked := func(chunks [][]int, keys []int) [][]int {
 		if len(keys) == 0 {
@@ -304,7 +499,7 @@ func newStreamingLTStateFromC(
 		slots:           slots,
 		diagData:        diagData,
 		diagOffsetByKey: offsets,
-		chunks:          chunkLinearTransformKeys(shell, lattigoStreamingLTChunkPlaintexts()),
+		chunks:          chunkLinearTransformKeys(shell, lattigoStreamingLTChunkPlaintextsFor(shell)),
 	}
 }
 
@@ -355,7 +550,7 @@ func (state *lattigoStreamingLTState) chunkDiagonals(keys []int) lintrans.Diagon
 	return diagonals
 }
 
-func (state *lattigoStreamingLTState) encodeChunk(keys []int) lintrans.LinearTransformation {
+func (state *lattigoStreamingLTState) newChunkShell(keys []int) lintrans.LinearTransformation {
 	ringQP := scheme.Params.RingQP().AtLevel(state.shell.LevelQ, state.shell.LevelP)
 	vec := make(map[int]ringqp.Poly, len(keys))
 	for _, key := range keys {
@@ -363,6 +558,37 @@ func (state *lattigoStreamingLTState) encodeChunk(keys []int) lintrans.LinearTra
 	}
 	chunk := state.shell
 	chunk.Vec = vec
+	return chunk
+}
+
+func encodeStreamingLTChunkBatch(
+	states []*lattigoStreamingLTState,
+	keyGroups [][]int,
+	transforms []lintrans.LinearTransformation,
+) {
+	if len(transforms) != len(states) || len(transforms) != len(keyGroups) {
+		panic(fmt.Errorf("streaming chunk batch length mismatch"))
+	}
+	if len(transforms) == 0 {
+		return
+	}
+	if len(transforms) == 1 {
+		if err := encodeSingleCKKSTransformDiagonalsParallel(states[0].chunkDiagonals(keyGroups[0]), transforms[0]); err != nil {
+			panic(err)
+		}
+		return
+	}
+	diagonalsList := make([]lintrans.Diagonals[float64], len(transforms))
+	for i, state := range states {
+		diagonalsList[i] = state.chunkDiagonals(keyGroups[i])
+	}
+	if err := encodeCKKSTransformsDiagonalsParallel(diagonalsList, transforms); err != nil {
+		panic(err)
+	}
+}
+
+func (state *lattigoStreamingLTState) encodeChunk(keys []int) lintrans.LinearTransformation {
+	chunk := state.newChunkShell(keys)
 	if err := encodeSingleCKKSTransformDiagonalsParallel(state.chunkDiagonals(keys), chunk); err != nil {
 		panic(err)
 	}
@@ -451,17 +677,20 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 		}
 	}
 
-	sharedLimit := lattigoStreamingLTSharedTransformLimit()
-	if sharedLimit < 1 {
-		sharedLimit = 1
-	}
 	for chunkIndex := 0; chunkIndex < maxChunks; chunkIndex++ {
+		sharedLimit := lattigoStreamingLTSharedTransformLimitFor(streamingStates, chunkIndex)
+		if sharedLimit < 1 {
+			sharedLimit = 1
+		}
 		pendingTransforms := make([]lintrans.LinearTransformation, 0, sharedLimit)
 		pendingIndices := make([]int, 0, sharedLimit)
+		pendingStates := make([]*lattigoStreamingLTState, 0, sharedLimit)
+		pendingKeys := make([][]int, 0, sharedLimit)
 		flush := func() error {
 			if len(pendingTransforms) == 0 {
 				return nil
 			}
+			encodeStreamingLTChunkBatch(pendingStates, pendingKeys, pendingTransforms)
 			chunkOutputs := make([]*rlwe.Ciphertext, len(pendingTransforms))
 			for i, transform := range pendingTransforms {
 				chunkOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
@@ -482,14 +711,19 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 			releaseStreamingLTChunkMemory(pendingTransforms)
 			pendingTransforms = pendingTransforms[:0]
 			pendingIndices = pendingIndices[:0]
+			pendingStates = pendingStates[:0]
+			pendingKeys = pendingKeys[:0]
 			return nil
 		}
 		for transformIndex, state := range streamingStates {
 			if state == nil || chunkIndex >= len(state.chunks) {
 				continue
 			}
-			pendingTransforms = append(pendingTransforms, state.encodeChunk(state.chunks[chunkIndex]))
+			keys := state.chunks[chunkIndex]
+			pendingTransforms = append(pendingTransforms, state.newChunkShell(keys))
 			pendingIndices = append(pendingIndices, transformIndex)
+			pendingStates = append(pendingStates, state)
+			pendingKeys = append(pendingKeys, keys)
 			if len(pendingTransforms) >= sharedLimit {
 				if err := flush(); err != nil {
 					return nil, err
@@ -1715,7 +1949,9 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 
 	ctIns := make([]*rlwe.Ciphertext, sourceCount)
 	transformGroups := make([][]lintrans.LinearTransformation, sourceCount)
+	transformIDGroups := make([][]int, sourceCount)
 	targetGroups := make([][]int, sourceCount)
+	streamingAny := false
 	for sourceIndex := 0; sourceIndex < sourceCount; sourceIndex++ {
 		start := offsetsSlice[sourceIndex]
 		end := offsetsSlice[sourceIndex+1]
@@ -1725,16 +1961,19 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 		ctIns[sourceIndex] = RetrieveCiphertext(ctxtIDsSlice[sourceIndex])
 		groupLen := end - start
 		transformGroups[sourceIndex] = make([]lintrans.LinearTransformation, groupLen)
+		transformIDGroups[sourceIndex] = make([]int, groupLen)
 		targetGroups[sourceIndex] = make([]int, groupLen)
 		for localIndex := 0; localIndex < groupLen; localIndex++ {
 			partialIndex := start + localIndex
 			transformID := transformIDsSlice[partialIndex]
 			transform := RetrieveLinearTransform(transformID)
 			if hasStreamingLTState(transformID) {
-				panic(fmt.Errorf("target-sum reduction does not support streaming linear transform %d", transformID))
+				streamingAny = true
+			} else {
+				validateLinearTransformPlaintextLevels(transformID, transform)
 			}
 			ensureLinearTransformRotationKeys(transform)
-			validateLinearTransformPlaintextLevels(transformID, transform)
+			transformIDGroups[sourceIndex][localIndex] = transformID
 			transformGroups[sourceIndex][localIndex] = transform
 			targetGroups[sourceIndex][localIndex] = targetIDsSlice[partialIndex]
 		}
@@ -1743,6 +1982,45 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 	scheme.LinEvaluator = lintrans.NewEvaluator(
 		scheme.Evaluator.WithKey(scheme.EvalKeys),
 	)
+
+	if streamingAny {
+		outputs := make([]*rlwe.Ciphertext, targetCount)
+		for sourceIndex := 0; sourceIndex < sourceCount; sourceIndex++ {
+			partials, err := evaluateStreamingLinearTransformsWithSharedCacheNew(
+				transformIDGroups[sourceIndex],
+				transformGroups[sourceIndex],
+				ctIns[sourceIndex],
+			)
+			if err != nil {
+				panic(err)
+			}
+			if len(partials) != len(targetGroups[sourceIndex]) {
+				panic(fmt.Errorf("streaming target-sum returned %d partials for %d targets", len(partials), len(targetGroups[sourceIndex])))
+			}
+			for localIndex, partial := range partials {
+				targetID := targetGroups[sourceIndex][localIndex]
+				if targetID < 0 || targetID >= targetCount {
+					panic(fmt.Errorf("target id out of range: target=%d count=%d", targetID, targetCount))
+				}
+				if outputs[targetID] == nil {
+					outputs[targetID] = partial
+					continue
+				}
+				if err = scheme.Evaluator.Add(outputs[targetID], partial, outputs[targetID]); err != nil {
+					panic(err)
+				}
+			}
+		}
+
+		outIDs := make([]int, targetCount)
+		for i, ct := range outputs {
+			if ct == nil {
+				panic(fmt.Errorf("target-sum reduction produced no output for target %d", i))
+			}
+			outIDs[i] = PushCiphertext(ct)
+		}
+		return SliceToCArray(outIDs, convertIntToCInt)
+	}
 
 	outputs := make([]*rlwe.Ciphertext, targetCount)
 	for i := range outputs {

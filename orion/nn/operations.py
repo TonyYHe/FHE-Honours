@@ -340,6 +340,8 @@ class Bootstrap(Module):
         self._prescale_ptxt_cache = {}
         self.preprocess_fused = False
         self.preprocess_fusion_kind = ""
+        self._bootstrap_runtime_profile = []
+        self._bootstrap_runtime_call_index = 0
 
     def extra_repr(self):
         l_eff = len(self.scheme.params.get_logq()) - 1
@@ -409,6 +411,80 @@ class Bootstrap(Module):
             "slots": int(x.slots()) if hasattr(x, "slots") else None,
         }
 
+    def _profile_value_summary(self, values):
+        values = list(values)
+        if not values:
+            return {"count": 0, "distinct": [], "min": None, "max": None, "sample": []}
+        numeric = [value for value in values if value is not None]
+        distinct = sorted({value for value in numeric})
+        return {
+            "count": int(len(values)),
+            "distinct": distinct[:16],
+            "distinct_count": int(len(distinct)),
+            "min": min(numeric) if numeric else None,
+            "max": max(numeric) if numeric else None,
+            "sample": values[:16],
+        }
+
+    def _profile_cipher_batch_stats(self, x):
+        ids = [int(value) for value in getattr(x, "ids", [])]
+        backend = getattr(x, "backend", None)
+        if backend is None:
+            scheme = getattr(x, "scheme", None)
+            backend = getattr(scheme, "backend", None)
+
+        def collect(method_name, convert):
+            method = getattr(backend, method_name, None) if backend is not None else None
+            values = []
+            errors = 0
+            if not callable(method):
+                return {"available": False, "values": [], "errors": 0}
+            for ciphertext_id in ids:
+                try:
+                    values.append(convert(method(int(ciphertext_id))))
+                except Exception:
+                    values.append(None)
+                    errors += 1
+            return {"available": True, "values": values, "errors": int(errors)}
+
+        levels = collect("GetCiphertextLevel", int)
+        scales = collect("GetCiphertextScale", int)
+        scale_log2 = collect("GetCiphertextScaleLog2", float)
+        slots = collect("GetCiphertextSlots", int)
+        degrees = collect("GetCiphertextDegree", int)
+        return {
+            "id_count": int(len(ids)),
+            "ids_sample": ids[:16],
+            "ids_tail": ids[-16:],
+            "level": self._profile_value_summary(levels["values"]),
+            "scale": self._profile_value_summary(scales["values"]),
+            "scale_log2": self._profile_value_summary(scale_log2["values"]),
+            "slots": self._profile_value_summary(slots["values"]),
+            "degree": self._profile_value_summary(degrees["values"]),
+            "query_errors": {
+                "level": int(levels["errors"]),
+                "scale": int(scales["errors"]),
+                "scale_log2": int(scale_log2["errors"]),
+                "slots": int(slots["errors"]),
+                "degree": int(degrees["errors"]),
+            },
+        }
+
+    def _new_bootstrap_runtime_record(self):
+        self._bootstrap_runtime_call_index += 1
+        return {
+            "call_index": int(self._bootstrap_runtime_call_index),
+            "name": str(getattr(self, "bootstrap_debug_name", "")),
+            "configured_input_level": int(self.input_level),
+            "configured_bootstrap_slots": int(getattr(self, "bootstrap_slots", 0) or 0),
+            "prescale": float(self.prescale),
+            "postscale": float(self.postscale),
+            "constant": float(self.constant),
+            "preprocess_fused": bool(getattr(self, "preprocess_fused", False)),
+            "preprocess_fusion_kind": str(getattr(self, "preprocess_fusion_kind", "")),
+            "timing_s": {},
+        }
+
     def _write_bootstrap_debug(self, *, phase: str, x, slots: int | None = None) -> None:
         path = os.environ.get("ORION_BOOTSTRAP_DEBUG_PATH", "")
         if not path:
@@ -435,31 +511,63 @@ class Bootstrap(Module):
     def forward(self, x):
         if not self.he_mode:
             return x
+
+        total_start = time.perf_counter()
+        profile_record = self._new_bootstrap_runtime_record()
+        profile_record["input_before_preprocess"] = self._profile_cipher_batch_stats(x)
         
         # Shift and scale into range [-1, 1]. Important caveat -- here we first
         # shift, then scale. This lets us zero out unused slots and enables
         # sparse bootstrapping (i.e., where slots < N/2). Full-slot producers
         # that can absorb this affine set preprocess_fused and arrive here
         # already scaled, saving the plaintext-multiply level.
+        preprocess_start = time.perf_counter()
+        add_shift_s = 0.0
+        prescale_mul_s = 0.0
         if not bool(getattr(self, "preprocess_fused", False)):
             if self.constant != 0:
+                step_start = time.perf_counter()
                 x += self.constant
+                add_shift_s = float(time.perf_counter() - step_start)
+            step_start = time.perf_counter()
             x *= self._get_prescale_ptxt(x.level())
+            prescale_mul_s = float(time.perf_counter() - step_start)
+        profile_record["timing_s"]["preprocess_total"] = float(time.perf_counter() - preprocess_start)
+        profile_record["timing_s"]["preprocess_add_shift"] = float(add_shift_s)
+        profile_record["timing_s"]["preprocess_prescale_mul"] = float(prescale_mul_s)
  
         slots = int(min(x.slots(), self.bootstrap_slots))
+        profile_record["runtime_slots"] = int(slots)
+        profile_record["input_to_backend"] = self._profile_cipher_batch_stats(x)
         self._write_bootstrap_debug(phase="before_bootstrap", x=x, slots=slots)
         if os.environ.get("ORION_ABORT_BEFORE_BOOTSTRAP", "0") != "0":
             raise RuntimeError(
                 f"aborting before bootstrap for debug: "
                 f"{getattr(self, 'bootstrap_debug_name', '')}"
             )
+        backend_start = time.perf_counter()
         x = x.bootstrap(slots=slots)
+        profile_record["timing_s"]["backend_bootstrap_call"] = float(time.perf_counter() - backend_start)
+        profile_record["output_from_backend"] = self._profile_cipher_batch_stats(x)
         self._write_bootstrap_debug(phase="after_bootstrap", x=x, slots=slots)
 
         # Scale and shift back to the original range
+        postprocess_start = time.perf_counter()
+        postscale_mul_s = 0.0
+        post_shift_s = 0.0
         if self.postscale != 1:
+            step_start = time.perf_counter()
             x *= self.postscale 
+            postscale_mul_s = float(time.perf_counter() - step_start)
         if self.constant != 0:
+            step_start = time.perf_counter()
             x -= self.constant
+            post_shift_s = float(time.perf_counter() - step_start)
+        profile_record["timing_s"]["postprocess_total"] = float(time.perf_counter() - postprocess_start)
+        profile_record["timing_s"]["postprocess_postscale_mul"] = float(postscale_mul_s)
+        profile_record["timing_s"]["postprocess_sub_shift"] = float(post_shift_s)
+        profile_record["timing_s"]["forward_total_inner"] = float(time.perf_counter() - total_start)
+        profile_record["output_after_postprocess"] = self._profile_cipher_batch_stats(x)
+        self._bootstrap_runtime_profile.append(profile_record)
 
         return x

@@ -131,6 +131,56 @@ def test_conv2d_direct_diagonals_match_legacy_toeplitz(embedding_method: str, sp
     _assert_diagonals_close(direct, legacy)
 
 
+def test_conv2d_pack_keeps_zero_blocks_for_dense_baseline() -> None:
+    layer = Conv2d(1, 1, kernel_size=1, bias=False)
+    layer.weight.data.zero_()
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=8, embedding_method="square")
+    _configure_conv2d(layer, torch.randn(1, 1, 4, 4), input_gap=1)
+
+    diagonals, output_rotations = packing.pack_conv2d(layer, last=False)
+
+    assert output_rotations == 0
+    assert len(diagonals) == 4
+    assert set(diagonals) == {(0, 0), (0, 1), (1, 0), (1, 1)}
+    assert packing.prune_zero_diagonal_blocks(diagonals) == {}
+    assert set(packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)) == {
+        (0, 0),
+        (1, 0),
+    }
+
+
+def test_conv_transpose2d_pack_keeps_zero_blocks_for_dense_baseline() -> None:
+    layer = ConvTranspose2d(1, 1, kernel_size=2, stride=2, padding=0, bias=False)
+    layer.weight.data.zero_()
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=8, embedding_method="square")
+    _configure_tconv2d(layer, torch.randn(1, 1, 2, 2), input_gap=1)
+
+    diagonals, output_rotations = packing.pack_conv_transpose2d(layer, last=False)
+
+    assert output_rotations == 0
+    assert diagonals
+    assert packing.prune_zero_diagonal_blocks(diagonals) == {}
+
+
+def test_prune_zero_diagonal_blocks_removes_empty_terms_and_preserves_empty_rows() -> None:
+    diagonals = {
+        (0, 0): {0: torch.zeros(4), 1: torch.tensor([0.0, 1.0, 0.0, 0.0])},
+        (0, 1): {0: torch.zeros(4)},
+        (1, 0): {0: torch.zeros(4)},
+    }
+
+    pruned = packing.prune_zero_diagonal_blocks(diagonals)
+    row_preserving = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
+
+    assert set(pruned) == {(0, 0)}
+    assert set(pruned[(0, 0)]) == {1}
+    assert torch.equal(pruned[(0, 0)][1], diagonals[(0, 0)][1])
+    assert set(row_preserving) == {(0, 0), (1, 0)}
+    assert set(row_preserving[(0, 0)]) == {1}
+
+
 @pytest.mark.parametrize(
     "spec",
     [

@@ -23,7 +23,8 @@ from orion.core import packing
 from orion.backend.python.tensors import CipherTensor
 from orion.backend.python.memory_lifecycle import trim_runtime_memory
 from orion.backend.python.compile_policy import auto_worker_count, policy_audit
-from orion.models.resnet import ResNet18, ResNet20, ResNet34
+from orion.models.resnet import ResNet18, ResNet20, ResNet32, ResNet34, ResNet50
+from orion.models.ternaus import TernausVGGUNet
 from orion.models.unet import UNet22, UNet22Encoder
 from orion.models.vgg import VGG
 from orion.nn.linear import LinearTransform
@@ -251,6 +252,107 @@ def _collect_lattigo_lt_profile() -> dict[str, int]:
     }
 
 
+_BOOTSTRAP_PROFILE_COUNTER_NAMES = (
+    "seq",
+    "kind",
+    "slots",
+    "input_level",
+    "output_level",
+    "input_slots",
+    "output_slots",
+    "input_log_cols",
+    "output_log_cols",
+    "total_ns",
+    "retrieve_ns",
+    "copy_ns",
+    "evaluator_bootstrap_ns",
+    "postscale_ns",
+    "push_ns",
+    "input_degree",
+    "output_degree",
+)
+
+
+def _set_lattigo_bootstrap_profile_enabled(enabled: bool) -> bool:
+    backend = getattr(scheme, "backend", None)
+    enable = getattr(backend, "EnableBootstrapProfile", None)
+    reset = getattr(backend, "ResetBootstrapProfile", None)
+    if not callable(enable) or not callable(reset):
+        return False
+    if bool(enabled):
+        reset()
+        enable(1)
+    else:
+        enable(0)
+    return True
+
+
+def _collect_lattigo_bootstrap_profile() -> dict[str, Any]:
+    backend = getattr(scheme, "backend", None)
+    getter = getattr(backend, "GetBootstrapProfileCounters", None)
+    if not callable(getter):
+        return {"available": False, "rows": [], "totals": {}}
+    values = [int(value) for value in getter()]
+    width = int(len(_BOOTSTRAP_PROFILE_COUNTER_NAMES))
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(values), width):
+        chunk = values[start : start + width]
+        if len(chunk) != width:
+            continue
+        row = {
+            str(name): int(chunk[index])
+            for index, name in enumerate(_BOOTSTRAP_PROFILE_COUNTER_NAMES)
+        }
+        for key in (
+            "total_ns",
+            "retrieve_ns",
+            "copy_ns",
+            "evaluator_bootstrap_ns",
+            "postscale_ns",
+            "push_ns",
+        ):
+            row[key.replace("_ns", "_s")] = float(row[key]) / 1e9
+        rows.append(row)
+
+    totals = {
+        "row_count": int(len(rows)),
+        "total_s": float(sum(float(row.get("total_s", 0.0)) for row in rows)),
+        "retrieve_s": float(sum(float(row.get("retrieve_s", 0.0)) for row in rows)),
+        "copy_s": float(sum(float(row.get("copy_s", 0.0)) for row in rows)),
+        "evaluator_bootstrap_s": float(
+            sum(float(row.get("evaluator_bootstrap_s", 0.0)) for row in rows)
+        ),
+        "postscale_s": float(sum(float(row.get("postscale_s", 0.0)) for row in rows)),
+        "push_s": float(sum(float(row.get("push_s", 0.0)) for row in rows)),
+    }
+    by_slots: dict[str, dict[str, float | int]] = {}
+    for row in rows:
+        key = str(int(row.get("slots", 0)))
+        entry = by_slots.setdefault(
+            key,
+            {
+                "row_count": 0,
+                "total_s": 0.0,
+                "evaluator_bootstrap_s": 0.0,
+                "postscale_s": 0.0,
+            },
+        )
+        entry["row_count"] = int(entry["row_count"]) + 1
+        entry["total_s"] = float(entry["total_s"]) + float(row.get("total_s", 0.0))
+        entry["evaluator_bootstrap_s"] = float(entry["evaluator_bootstrap_s"]) + float(
+            row.get("evaluator_bootstrap_s", 0.0)
+        )
+        entry["postscale_s"] = float(entry["postscale_s"]) + float(row.get("postscale_s", 0.0))
+    return {
+        "available": True,
+        "row_width": int(width),
+        "field_names": list(_BOOTSTRAP_PROFILE_COUNTER_NAMES),
+        "totals": totals,
+        "by_slots": by_slots,
+        "rows": rows,
+    }
+
+
 def _collect_provider_group_counts(net: torch.nn.Module) -> dict[str, Any]:
     module_rows: list[dict[str, Any]] = []
     totals = {
@@ -443,29 +545,6 @@ def _encrypt_model_input(
     return ct
 
 
-def _r20_config(provider_mode: str, *, backend: str = "lattigo") -> dict[str, Any]:
-    return {
-        "ckks_params": {
-            "LogN": 16,
-            "LogQ": [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40],
-            "LogP": [61, 61, 61],
-            "LogScale": 40,
-            "H": 192,
-            "RingType": "Standard",
-        },
-        "boot_params": {"LogP": [61, 61, 61, 61, 61, 61, 61, 61]},
-        "orion": {
-            "margin": 2,
-            "embedding_method": "hybrid",
-            "backend": str(backend),
-            "fuse_modules": True,
-            "debug": False,
-            "io_mode": "none",
-            "experimental_region_first": str(provider_mode),
-        },
-    }
-
-
 def _r18_config(provider_mode: str, *, backend: str = "lattigo") -> dict[str, Any]:
     return {
         "ckks_params": {
@@ -477,51 +556,6 @@ def _r18_config(provider_mode: str, *, backend: str = "lattigo") -> dict[str, An
             "RingType": "Standard",
         },
         "boot_params": {"LogP": [61, 61, 61, 61, 61, 61, 61, 61]},
-        "orion": {
-            "margin": 2,
-            "embedding_method": "hybrid",
-            "backend": str(backend),
-            "fuse_modules": True,
-            "debug": False,
-            "io_mode": "none",
-            "experimental_region_first": str(provider_mode),
-        },
-    }
-
-
-def _r34_config(provider_mode: str, *, backend: str = "lattigo") -> dict[str, Any]:
-    return {
-        "ckks_params": {
-            "LogN": 16,
-            "LogQ": [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40],
-            "LogP": [61, 61, 61],
-            "LogScale": 40,
-            "H": 192,
-            "RingType": "Standard",
-        },
-        "boot_params": {"LogP": [61, 61, 61, 61, 61, 61, 61, 61]},
-        "orion": {
-            "margin": 2,
-            "embedding_method": "hybrid",
-            "backend": str(backend),
-            "fuse_modules": True,
-            "debug": False,
-            "io_mode": "none",
-            "experimental_region_first": str(provider_mode),
-        },
-    }
-
-
-def _u22_config(*, logn: int, provider_mode: str, backend: str = "lattigo") -> dict[str, Any]:
-    return {
-        "ckks_params": {
-            "LogN": int(logn),
-            "LogQ": [45, 30, 30, 30, 45],
-            "LogP": [50],
-            "LogScale": 30,
-            "H": 64,
-            "RingType": "Standard",
-        },
         "orion": {
             "margin": 2,
             "embedding_method": "hybrid",
@@ -573,12 +607,41 @@ def _build_r34_imgnet(*, activation: str | None = None, silu_degree: int = 31) -
     )
 
 
-def _build_vgg16_imgnet(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+def _build_r32_imgnet(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return ResNet32(
+        dataset="imagenet",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=_stem_relu_for_activation(activation),
+    )
+
+
+def _build_r50_imgnet(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return ResNet50(
+        dataset="imagenet",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+        stem_relu=_stem_relu_for_activation(activation),
+    )
+
+
+def _build_vgg_imgnet_base16(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
     return VGG(
         "VGG16",
         dataset="imagenet",
         activation=_activation_or_relu(activation),
         silu_degree=int(silu_degree),
+        base_dim=16,
+    )
+
+
+def _build_vgg_imgnet_base64(*, activation: str | None = None, silu_degree: int = 31) -> torch.nn.Module:
+    return VGG(
+        "VGG16",
+        dataset="imagenet",
+        activation=_activation_or_relu(activation),
+        silu_degree=int(silu_degree),
+        base_dim=64,
     )
 
 
@@ -654,6 +717,20 @@ def _build_u22_256_base64_encoder(*, activation: str | None = None, silu_degree:
     )
 
 
+def _build_ternaus_vgg_unet_192_base64(
+    *,
+    activation: str | None = None,
+    silu_degree: int = 31,
+) -> torch.nn.Module:
+    return TernausVGGUNet(
+        in_channels=1,
+        out_channels=1,
+        base_dim=64,
+        activation=activation,
+        silu_degree=int(silu_degree),
+    )
+
+
 NETWORKS: dict[str, dict[str, Any]] = {
     "resnet20_cifar10": {
         "label": "ResNet20 CIFAR10",
@@ -661,7 +738,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "cifar10",
         "input_shape": (1, 3, 32, 32),
         "provider_mode": "",
-        "config": _r20_config,
+        "config": _r18_config,
         "builder": _build_r20_cifar10,
     },
     "r18_tiny": {
@@ -674,13 +751,22 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "builder": _build_r18_tiny,
     },
     "vgg16_imgnet": {
-        "label": "VGG16 ImageNet",
-        "model": "VGG16",
+        "label": "VGG16/base16 ImageNet 224",
+        "model": "VGG16-base16",
         "dataset": "imagenet",
         "input_shape": (1, 3, 224, 224),
         "provider_mode": "vgg_imgnet_layout_dp",
-        "config": _r34_config,
-        "builder": _build_vgg16_imgnet,
+        "config": _r18_config,
+        "builder": _build_vgg_imgnet_base16,
+    },
+    "vgg64_imgnet": {
+        "label": "VGG16/base64 ImageNet 224",
+        "model": "VGG16-base64",
+        "dataset": "imagenet",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "vgg_imgnet_layout_dp",
+        "config": _r18_config,
+        "builder": _build_vgg_imgnet_base64,
     },
     "r18_imgnet": {
         "label": "R18 ImageNet",
@@ -688,7 +774,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "imagenet",
         "input_shape": (1, 3, 224, 224),
         "provider_mode": "r18_imgnet_layout_dp",
-        "config": _r34_config,
+        "config": _r18_config,
         "builder": _build_r18_imgnet,
     },
     "r34_imgnet": {
@@ -697,8 +783,26 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "imagenet",
         "input_shape": (1, 3, 224, 224),
         "provider_mode": "r34_imgnet_phase1",
-        "config": _r34_config,
+        "config": _r18_config,
         "builder": _build_r34_imgnet,
+    },
+    "r32_imgnet": {
+        "label": "R32 ImageNet 224",
+        "model": "ResNet32",
+        "dataset": "imagenet",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "generic_layout_dp",
+        "config": _r18_config,
+        "builder": _build_r32_imgnet,
+    },
+    "r50_imgnet": {
+        "label": "R50 ImageNet 224",
+        "model": "ResNet50",
+        "dataset": "imagenet",
+        "input_shape": (1, 3, 224, 224),
+        "provider_mode": "generic_layout_dp",
+        "config": _r18_config,
+        "builder": _build_r50_imgnet,
     },
     "u22_64_base32": {
         "label": "U22 64 base32",
@@ -706,11 +810,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "montgomery_lung_64",
         "input_shape": (1, 1, 64, 64),
         "provider_mode": "u22_64_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_64_base32,
     },
     "u22_64_base8": {
@@ -719,11 +819,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "montgomery_lung_64",
         "input_shape": (1, 1, 64, 64),
         "provider_mode": "u22_64_base8",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_64_base8,
     },
     "u22_256_base32": {
@@ -732,11 +828,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 256, 256),
         "provider_mode": "u22_256_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base32,
     },
     "u22_224_base32": {
@@ -745,11 +837,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 224, 224),
         "provider_mode": "u22_256_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base32,
     },
     "u22_192_base32": {
@@ -758,11 +846,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 192, 192),
         "provider_mode": "u22_256_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base32,
     },
     "u22_256_base8": {
@@ -771,11 +855,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 256, 256),
         "provider_mode": "u22_256_base8",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base8,
     },
     "u22_256_base8_encoder": {
@@ -784,11 +864,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 256, 256),
         "provider_mode": "u22_256_base8",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base8_encoder,
         "scope": "encoder",
     },
@@ -798,11 +874,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 192, 192),
         "provider_mode": "u22_256_base8",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_192_base8_encoder,
         "scope": "encoder",
     },
@@ -812,11 +884,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 224, 224),
         "provider_mode": "u22_256_base8",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_224_base8_encoder,
         "scope": "encoder",
     },
@@ -826,11 +894,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 192, 192),
         "provider_mode": "u22_256_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base64_encoder,
         "scope": "encoder",
         "base_dim": 64,
@@ -841,11 +905,7 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 224, 224),
         "provider_mode": "u22_256_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base64_encoder,
         "scope": "encoder",
         "base_dim": 64,
@@ -856,13 +916,19 @@ NETWORKS: dict[str, dict[str, Any]] = {
         "dataset": "kvasir_polyp_256",
         "input_shape": (1, 3, 256, 256),
         "provider_mode": "u22_256_base32",
-        "config": lambda provider_mode, *, backend="lattigo": _u22_config(
-            logn=16,
-            provider_mode=str(provider_mode),
-            backend=str(backend),
-        ),
+        "config": _r18_config,
         "builder": _build_u22_256_base64_encoder,
         "scope": "encoder",
+        "base_dim": 64,
+    },
+    "ternaus_vgg_unet_192_base64": {
+        "label": "Ternaus-style VGG-UNet 192 base64",
+        "model": "TernausVGGUNet",
+        "dataset": "medical_seg_192",
+        "input_shape": (1, 1, 192, 192),
+        "provider_mode": "generic_layout_dp",
+        "config": _r18_config,
+        "builder": _build_ternaus_vgg_unet_192_base64,
         "base_dim": 64,
     },
 }
@@ -947,10 +1013,22 @@ def _lattigo_compile_worker_default() -> str:
                 "ORION_LT_COMPILE_WORKERS",
                 "ORION_UNIFIED_COMPILE_WORKERS",
                 "ORION_LATTIGO_COMPILE_WORKERS",
-                "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
             ),
             default_workers=4,
             estimated_per_worker_bytes=24 * 1024**3,
+            cpu_count=cpu_count,
+        )
+    )
+
+
+def _lattigo_diagonal_encode_worker_default() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return str(
+        auto_worker_count(
+            cpu_count,
+            ("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",),
+            default_workers=cpu_count,
+            estimated_per_worker_bytes=4 * 1024**3,
             cpu_count=cpu_count,
         )
     )
@@ -971,6 +1049,7 @@ def _lattigo_pack_worker_default() -> str:
 
 def _configure_lattigo_runtime_defaults() -> dict[str, str]:
     workers = _lattigo_compile_worker_default()
+    diagonal_encode_workers = _lattigo_diagonal_encode_worker_default()
     pack_workers = _lattigo_pack_worker_default()
     defaults = {
         "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
@@ -982,7 +1061,7 @@ def _configure_lattigo_runtime_defaults() -> dict[str, str]:
         "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS": workers,
         "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS": workers,
         "ORION_LATTIGO_COMPILE_WORKERS": workers,
-        "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": workers,
+        "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": diagonal_encode_workers,
         "ORION_LATTIGO_BOOTSTRAP_WORKERS": workers,
         "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "2",
         "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "1",
@@ -1005,6 +1084,38 @@ def _timed(payload: dict[str, Any], out_path: Path, step: str, fn: Callable[[], 
     payload.setdefault("timing_s", {})[str(step)] = float(time.perf_counter() - started)
     _write(payload, out_path)
     return value
+
+
+def _saved_io_prewarm_mode() -> str:
+    return str(os.environ.get("ORION_SAVED_IO_PREWARM_MODE", "") or "").strip().lower()
+
+
+def _saved_io_prewarm_enabled() -> bool:
+    return _saved_io_prewarm_mode() not in {"", "0", "false", "no", "off"}
+
+
+def _saved_io_prewarm_max_units() -> int | None:
+    raw = os.environ.get("ORION_SAVED_IO_PREWARM_MAX_UNITS")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
+
+
+def _prewarm_saved_io(scheme) -> dict[str, Any]:
+    mode = _saved_io_prewarm_mode() or "raw"
+    evaluator = getattr(scheme, "lt_evaluator", None)
+    prewarm = getattr(evaluator, "prewarm_saved_io", None)
+    if not callable(prewarm):
+        return {
+            "enabled": False,
+            "mode": str(mode),
+            "reason": "lt_evaluator_missing_prewarm_saved_io",
+        }
+    profile = prewarm(mode=str(mode), max_units=_saved_io_prewarm_max_units())
+    return dict(profile or {})
 
 
 def _align(reference: torch.Tensor, actual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1153,6 +1264,90 @@ def _module_category(module: Module) -> str:
     }:
         return "activation"
     return "other"
+
+
+def _timing_float(timing: dict[str, Any], key: str) -> float:
+    try:
+        return float(timing.get(str(key), 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _install_activation_breakdown_profiler(
+    net: torch.nn.Module,
+) -> tuple[Callable[[], dict[str, Any]], Callable[[], None]]:
+    rows_by_id: dict[int, dict[str, Any]] = {}
+    stacks: dict[int, list[float]] = {}
+    handles: list[Any] = []
+
+    def make_pre(row: dict[str, Any]):
+        @_dynamo_disable
+        def pre_hook(module: torch.nn.Module, inputs: tuple[Any, ...]) -> None:
+            if not bool(getattr(module, "he_mode", False)):
+                return
+            stacks.setdefault(int(id(module)), []).append(float(time.perf_counter()))
+
+        return pre_hook
+
+    def make_post(row: dict[str, Any]):
+        @_dynamo_disable
+        def post_hook(module: torch.nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
+            if not bool(getattr(module, "he_mode", False)):
+                return
+            stack = stacks.get(int(id(module))) or []
+            if not stack:
+                return
+            elapsed = float(time.perf_counter() - stack.pop())
+            row["call_count"] = int(row.get("call_count", 0)) + 1
+            row["elapsed_s"] = float(row.get("elapsed_s", 0.0)) + elapsed
+            row["max_call_s"] = max(float(row.get("max_call_s", 0.0)), elapsed)
+            row["last_call_s"] = float(elapsed)
+
+        return post_hook
+
+    for name, module in net.named_modules():
+        if not isinstance(module, Module):
+            continue
+        if _module_category(module) != "activation":
+            continue
+        bootstrapper = getattr(module, "bootstrapper", None)
+        row = {
+            "module_path": str(name),
+            "class": type(module).__name__,
+            "category": "activation",
+            "level": None if getattr(module, "level", None) is None else int(getattr(module, "level")),
+            "depth": None if getattr(module, "depth", None) is None else int(getattr(module, "depth")),
+            "bootstrapper_path": (
+                f"{name}.bootstrapper" if isinstance(bootstrapper, Bootstrap) else ""
+            ),
+            "call_count": 0,
+            "elapsed_s": 0.0,
+            "max_call_s": 0.0,
+            "last_call_s": 0.0,
+        }
+        rows_by_id[int(id(module))] = row
+        handles.append(module.register_forward_pre_hook(make_pre(row)))
+        handles.append(module.register_forward_hook(make_post(row)))
+
+    def snapshot() -> dict[str, Any]:
+        rows = sorted(rows_by_id.values(), key=lambda item: str(item["module_path"]))
+        active_rows = [dict(row) for row in rows if int(row.get("call_count", 0) or 0) > 0]
+        return {
+            "enabled": True,
+            "profiled_module_count": int(len(rows)),
+            "active_module_count": int(len(active_rows)),
+            "inclusive_elapsed_s": float(sum(float(row.get("elapsed_s", 0.0)) for row in active_rows)),
+            "rows": active_rows,
+        }
+
+    def remove() -> None:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+
+    return snapshot, remove
 
 
 def _install_he_module_profiler(
@@ -1407,6 +1602,421 @@ def _collect_region_audit(net: torch.nn.Module) -> dict[str, Any]:
         "selected_region_count": int(len(rows)),
         "executable_region_count": int(sum(1 for row in rows if bool(row["executable"]))),
         "rows": rows,
+    }
+
+
+def _iter_runtime_executors(net: torch.nn.Module):
+    seen: set[int] = set()
+    for module_name, module in net.named_modules():
+        roots = []
+        runtime = getattr(module, "region_runtime", None)
+        executor = getattr(runtime, "executor", None) if runtime is not None else None
+        if executor is not None:
+            roots.append(executor)
+        for attr in ("layout_policy_add_runtime", "layout_policy_concat_runtime"):
+            candidate = getattr(module, attr, None)
+            if candidate is not None:
+                roots.append(candidate)
+        for root in roots:
+            for candidate in _walk_executor_objects(root):
+                if id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                yield str(module_name), module, candidate
+
+
+def _iter_unified_groups(executor: Any):
+    seen: set[int] = set()
+
+    def emit(value: Any):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            iterable = list(value.values())
+        elif isinstance(value, (list, tuple, set)):
+            iterable = list(value)
+        else:
+            iterable = [value]
+        for item in iterable:
+            if item is None or not hasattr(item, "last_runtime_timing"):
+                continue
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            yield item
+
+    for attr in (
+        "group",
+        "groups",
+        "groups_by_input_block",
+        "groups_by_pair",
+        "groups_by_input",
+        "groups_by_input_chunk",
+        "groups_by_input_index",
+        "groups_by_source",
+    ):
+        yield from emit(getattr(executor, attr, None))
+
+
+def _collect_bootstrap_runtime_breakdown(bootstrap_report: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    totals = {
+        "bootstrap_s": 0.0,
+        "backend_bootstrap_s": 0.0,
+        "preprocess_s": 0.0,
+        "postprocess_s": 0.0,
+        "call_count": 0,
+    }
+    by_name: dict[str, float] = {}
+    for row in bootstrap_report.get("rows", []) or []:
+        row = dict(row)
+        name = str(row.get("name", ""))
+        profiles = list(row.get("runtime_profile", []) or [])
+        row_total = 0.0
+        row_backend = 0.0
+        row_pre = 0.0
+        row_post = 0.0
+        for profile in profiles:
+            timing = dict(dict(profile).get("timing_s", {}) or {})
+            total = _timing_float(timing, "forward_total_inner")
+            backend = _timing_float(timing, "backend_bootstrap_call")
+            pre = _timing_float(timing, "preprocess_total")
+            post = _timing_float(timing, "postprocess_total")
+            if total <= 0.0:
+                total = float(pre + backend + post)
+            row_total += float(total)
+            row_backend += float(backend)
+            row_pre += float(pre)
+            row_post += float(post)
+        by_name[str(name)] = float(by_name.get(str(name), 0.0) + row_total)
+        rows.append(
+            {
+                "name": str(name),
+                "bootstrap_slots": int(row.get("bootstrap_slots", 0) or 0),
+                "runtime_call_count": int(len(profiles)),
+                "bootstrap_s": float(row_total),
+                "backend_bootstrap_s": float(row_backend),
+                "preprocess_s": float(row_pre),
+                "postprocess_s": float(row_post),
+            }
+        )
+        totals["bootstrap_s"] += float(row_total)
+        totals["backend_bootstrap_s"] += float(row_backend)
+        totals["preprocess_s"] += float(row_pre)
+        totals["postprocess_s"] += float(row_post)
+        totals["call_count"] += int(len(profiles))
+    return {
+        "totals": totals,
+        "by_name": by_name,
+        "rows": rows,
+    }
+
+
+def _collect_activation_runtime_breakdown(
+    activation_profile: dict[str, Any] | None,
+    bootstrap_breakdown: dict[str, Any],
+) -> dict[str, Any]:
+    profile = dict(activation_profile or {})
+    boot_by_name = dict(bootstrap_breakdown.get("by_name", {}) or {})
+    rows: list[dict[str, Any]] = []
+    inclusive_s = 0.0
+    bootstrap_child_s = 0.0
+    activation_s = 0.0
+    call_count = 0
+    for row in profile.get("rows", []) or []:
+        row = dict(row)
+        elapsed = float(row.get("elapsed_s", 0.0) or 0.0)
+        child_path = str(row.get("bootstrapper_path", ""))
+        child_bootstrap = float(boot_by_name.get(child_path, 0.0) or 0.0)
+        core = max(0.0, float(elapsed - child_bootstrap))
+        row["bootstrap_child_s"] = float(child_bootstrap)
+        row["activation_excluding_bootstrap_s"] = float(core)
+        rows.append(row)
+        inclusive_s += float(elapsed)
+        bootstrap_child_s += float(child_bootstrap)
+        activation_s += float(core)
+        call_count += int(row.get("call_count", 0) or 0)
+    rows.sort(key=lambda item: float(item.get("activation_excluding_bootstrap_s", 0.0)), reverse=True)
+    return {
+        "enabled": bool(profile.get("enabled", False)),
+        "profiled_module_count": int(profile.get("profiled_module_count", 0) or 0),
+        "active_module_count": int(profile.get("active_module_count", 0) or 0),
+        "totals": {
+            "activation_s": float(activation_s),
+            "activation_inclusive_s": float(inclusive_s),
+            "bootstrap_child_s": float(bootstrap_child_s),
+            "call_count": int(call_count),
+        },
+        "top_rows": rows[:40],
+        "rows": sorted(rows, key=lambda item: str(item.get("module_path", ""))),
+    }
+
+
+def _compile_profile_float(profile: dict[str, Any], key: str) -> float:
+    return _timing_float(profile, key)
+
+
+def _collect_compile_operator_breakdown(
+    net: torch.nn.Module,
+    *,
+    compile_s: float | None = None,
+    compile_load_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    group_rows: list[dict[str, Any]] = []
+    executor_rows: list[dict[str, Any]] = []
+    seen_groups: set[int] = set()
+    totals: dict[str, Any] = {
+        "compile_s": None if compile_s is None else float(compile_s),
+        "group_count": 0,
+        "transform_count": 0,
+        "payload_bytes": 0,
+        "group_total_s": 0.0,
+        "group_flatten_s": 0.0,
+        "group_backend_generate_s": 0.0,
+        "group_rotation_key_compile_s": 0.0,
+        "group_record_keys_s": 0.0,
+        "group_save_unload_s": 0.0,
+        "group_compile_gc_s": 0.0,
+        "executor_prepare_s": 0.0,
+        "executor_compile_unified_s": 0.0,
+        "executor_build_transform_s": 0.0,
+        "executor_group_compile_s": 0.0,
+    }
+    for module_name, module, executor in _iter_runtime_executors(net):
+        executor_timing = dict(getattr(executor, "last_runtime_timing", {}) or {})
+        if executor_timing:
+            row = {
+                "module_path": str(module_name),
+                "node": str(getattr(module, "region_output_id", module_name)),
+                "executor": type(executor).__name__,
+                "timing": executor_timing,
+            }
+            executor_rows.append(row)
+            totals["executor_prepare_s"] += float(
+                _timing_float(executor_timing, "prepare_plans_s")
+                + _timing_float(executor_timing, "prepare_transforms_s")
+            )
+            totals["executor_compile_unified_s"] += _timing_float(executor_timing, "compile_unified_s")
+            totals["executor_build_transform_s"] += _timing_float(executor_timing, "build_transform_s")
+            totals["executor_group_compile_s"] += _timing_float(executor_timing, "group_compile_s")
+        for group in _iter_unified_groups(executor):
+            if id(group) in seen_groups:
+                continue
+            seen_groups.add(id(group))
+            profile = dict(getattr(group, "last_compile_profile", {}) or {})
+            if not profile:
+                continue
+            row = {
+                "module_path": str(module_name),
+                "node": str(getattr(module, "region_output_id", module_name)),
+                "executor": type(executor).__name__,
+                "storage_key": str(getattr(group, "_storage_key", "")),
+                "profile": profile,
+            }
+            group_rows.append(row)
+            totals["group_count"] += 1
+            totals["transform_count"] += int(profile.get("transform_count", 0) or 0)
+            totals["payload_bytes"] += int(profile.get("payload_bytes", 0) or 0)
+            for key, total_key in (
+                ("total_s", "group_total_s"),
+                ("flatten_s", "group_flatten_s"),
+                ("backend_generate_s", "group_backend_generate_s"),
+                ("rotation_key_compile_s", "group_rotation_key_compile_s"),
+                ("record_keys_s", "group_record_keys_s"),
+                ("save_unload_s", "group_save_unload_s"),
+                ("compile_gc_s", "group_compile_gc_s"),
+            ):
+                totals[total_key] += _compile_profile_float(profile, key)
+    return {
+        "totals": totals,
+        "compile_load_profile": dict(compile_load_profile or {}),
+        "group_rows": group_rows,
+        "executor_rows": executor_rows,
+    }
+
+
+def _group_mvm_kernel_s(timing: dict[str, Any]) -> float:
+    kernel = (
+        _timing_float(timing, "stream_eval_s")
+        + _timing_float(timing, "stream_accumulate_s")
+        + _timing_float(timing, "cpp_baby_step_s")
+        + _timing_float(timing, "cpp_giant_step_s")
+    )
+    if kernel > 0.0:
+        return float(kernel)
+    return float(
+        _timing_float(timing, "eval_s")
+        or _timing_float(timing, "eval_total_s")
+        or _timing_float(timing, "serving_hot_s")
+    )
+
+
+def _group_load_encode_s(timing: dict[str, Any]) -> float:
+    return float(
+        _timing_float(timing, "read_bundle_s")
+        + _timing_float(timing, "load_keys_s")
+        + _timing_float(timing, "load_plaintexts_s")
+        + _timing_float(timing, "stream_build_map_s")
+        + _timing_float(timing, "stream_encode_hoist_s")
+        + _timing_float(timing, "stream_load_payload_s")
+    )
+
+
+def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
+    group_rows: list[dict[str, Any]] = []
+    executor_rows: list[dict[str, Any]] = []
+    seen_groups: set[int] = set()
+    totals = {
+        "group_count": 0,
+        "mvm_kernel_s": 0.0,
+        "mvm_eval_total_s": 0.0,
+        "lt_runtime_load_encode_s": 0.0,
+        "lt_runtime_read_bundle_s": 0.0,
+        "lt_runtime_load_keys_s": 0.0,
+        "lt_runtime_load_plaintexts_s": 0.0,
+        "lt_runtime_stream_build_map_s": 0.0,
+        "lt_runtime_stream_encode_hoist_s": 0.0,
+        "lt_runtime_stream_load_payload_s": 0.0,
+        "lt_runtime_trim_unload_s": 0.0,
+        "executor_postprocess_s": 0.0,
+        "executor_rescale_s": 0.0,
+        "executor_accumulate_s": 0.0,
+    }
+    for module_name, module, executor in _iter_runtime_executors(net):
+        executor_timing = dict(getattr(executor, "last_runtime_timing", {}) or {})
+        if executor_timing:
+            executor_rows.append(
+                {
+                    "module_path": str(module_name),
+                    "node": str(getattr(module, "region_output_id", module_name)),
+                    "executor": type(executor).__name__,
+                    "timing": executor_timing,
+                    "counts": dict(getattr(executor, "last_runtime_counts", {}) or {}),
+                }
+            )
+            totals["executor_postprocess_s"] += float(
+                _timing_float(executor_timing, "postprocess_s")
+                + _timing_float(executor_timing, "bias_s")
+                + _timing_float(executor_timing, "output_fold_s")
+                + _timing_float(executor_timing, "projection_s")
+                + _timing_float(executor_timing, "input_pack_s")
+                + _timing_float(executor_timing, "real_extract_s")
+            )
+            totals["executor_rescale_s"] += float(
+                _timing_float(executor_timing, "partial_rescale_s")
+                + _timing_float(executor_timing, "relayout_s")
+            )
+            totals["executor_accumulate_s"] += float(
+                _timing_float(executor_timing, "accumulate_s")
+                + _timing_float(executor_timing, "partial_accumulate_s")
+            )
+        for group in _iter_unified_groups(executor):
+            if id(group) in seen_groups:
+                continue
+            seen_groups.add(id(group))
+            timing = dict(getattr(group, "last_runtime_timing", {}) or {})
+            if not timing:
+                continue
+            serving = _timing_float(timing, "serving_hot_s")
+            eval_total = (
+                _timing_float(timing, "eval_total_s")
+                or _timing_float(timing, "eval_s")
+                or serving
+            )
+            if serving <= 0.0 and eval_total <= 0.0:
+                continue
+            mvm_kernel = _group_mvm_kernel_s(timing)
+            load_encode = _group_load_encode_s(timing)
+            trim_unload = float(
+                _timing_float(timing, "unload_s")
+                + _timing_float(timing, "trim_s")
+                + _timing_float(timing, "cpp_trim_s")
+            )
+            row = {
+                "module_path": str(module_name),
+                "node": str(getattr(module, "region_output_id", module_name)),
+                "executor": type(executor).__name__,
+                "storage_key": str(getattr(group, "_storage_key", "")),
+                "transform_count": int(len(getattr(group, "unified_ids", []) or [])),
+                "runtime_fairness_mode": str(timing.get("runtime_fairness_mode", "unknown")),
+                "mvm_kernel_s": float(mvm_kernel),
+                "mvm_eval_total_s": float(eval_total),
+                "lt_runtime_load_encode_s": float(load_encode),
+                "lt_runtime_trim_unload_s": float(trim_unload),
+                "timing": timing,
+            }
+            group_rows.append(row)
+            totals["group_count"] += 1
+            totals["mvm_kernel_s"] += float(mvm_kernel)
+            totals["mvm_eval_total_s"] += float(eval_total)
+            totals["lt_runtime_load_encode_s"] += float(load_encode)
+            totals["lt_runtime_read_bundle_s"] += _timing_float(timing, "read_bundle_s")
+            totals["lt_runtime_load_keys_s"] += _timing_float(timing, "load_keys_s")
+            totals["lt_runtime_load_plaintexts_s"] += _timing_float(timing, "load_plaintexts_s")
+            totals["lt_runtime_stream_build_map_s"] += _timing_float(timing, "stream_build_map_s")
+            totals["lt_runtime_stream_encode_hoist_s"] += _timing_float(timing, "stream_encode_hoist_s")
+            totals["lt_runtime_stream_load_payload_s"] += _timing_float(timing, "stream_load_payload_s")
+            totals["lt_runtime_trim_unload_s"] += float(trim_unload)
+    group_rows.sort(key=lambda item: float(item.get("mvm_eval_total_s", 0.0)), reverse=True)
+    return {
+        "totals": totals,
+        "top_groups": group_rows[:60],
+        "group_rows": group_rows,
+        "executor_rows": executor_rows,
+    }
+
+
+def _collect_forward_operator_breakdown(
+    net: torch.nn.Module,
+    *,
+    he_forward_s: float | None,
+    activation_profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    bootstrap_report = _collect_bootstrap_report(net)
+    bootstrap = _collect_bootstrap_runtime_breakdown(bootstrap_report)
+    activation = _collect_activation_runtime_breakdown(activation_profile, bootstrap)
+    mvm = _collect_mvm_runtime_breakdown(net)
+    he_forward_value = None if he_forward_s is None else float(he_forward_s)
+    totals = {
+        "he_forward_s": he_forward_value,
+        "mvm_kernel_s": float(mvm["totals"].get("mvm_kernel_s", 0.0)),
+        "mvm_eval_total_s": float(mvm["totals"].get("mvm_eval_total_s", 0.0)),
+        "activation_s": float(activation["totals"].get("activation_s", 0.0)),
+        "activation_inclusive_s": float(activation["totals"].get("activation_inclusive_s", 0.0)),
+        "bootstrap_s": float(bootstrap["totals"].get("bootstrap_s", 0.0)),
+        "bootstrap_backend_s": float(bootstrap["totals"].get("backend_bootstrap_s", 0.0)),
+        "lt_runtime_load_encode_s": float(mvm["totals"].get("lt_runtime_load_encode_s", 0.0)),
+        "lt_runtime_trim_unload_s": float(mvm["totals"].get("lt_runtime_trim_unload_s", 0.0)),
+        "executor_postprocess_s": float(mvm["totals"].get("executor_postprocess_s", 0.0)),
+        "executor_rescale_s": float(mvm["totals"].get("executor_rescale_s", 0.0)),
+        "executor_accumulate_s": float(mvm["totals"].get("executor_accumulate_s", 0.0)),
+    }
+    accounted = float(
+        totals["mvm_kernel_s"]
+        + totals["activation_s"]
+        + totals["bootstrap_s"]
+        + totals["lt_runtime_load_encode_s"]
+        + totals["lt_runtime_trim_unload_s"]
+        + totals["executor_postprocess_s"]
+        + totals["executor_rescale_s"]
+        + totals["executor_accumulate_s"]
+    )
+    totals["accounted_s"] = float(accounted)
+    totals["unattributed_he_forward_s"] = (
+        None if he_forward_value is None else float(he_forward_value - accounted)
+    )
+    return {
+        "notes": [
+            "MVM is collected from UnifiedTransformGroup runtime timing and is streaming-safe.",
+            "mvm_kernel_s uses stream_eval+stream_accumulate or baby+giant-step counters, with eval_s as fallback.",
+            "lt_runtime_load_encode_s includes runtime artifact read/key/plaintext load plus streaming build-map/encode/load-payload time.",
+            "Activation is a targeted activation-only wall-time hook; direct bootstrap child time is subtracted.",
+            "Bootstrap uses Bootstrap._bootstrap_runtime_profile and does not require broad module profiling.",
+        ],
+        "totals": totals,
+        "mvm": mvm,
+        "activation": activation,
+        "bootstrap": bootstrap,
     }
 
 
@@ -1752,6 +2362,7 @@ def _collect_bootstrap_report(net: torch.nn.Module) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for name, module in net.named_modules():
         if isinstance(module, Bootstrap):
+            runtime_profile = list(getattr(module, "_bootstrap_runtime_profile", []) or [])
             rows.append(
                 {
                     "name": str(name),
@@ -1759,6 +2370,8 @@ def _collect_bootstrap_report(net: torch.nn.Module) -> dict[str, Any]:
                     "bootstrap_slots": int(getattr(module, "bootstrap_slots", 0) or 0),
                     "prescale": float(getattr(module, "prescale", 0.0)),
                     "postscale": float(getattr(module, "postscale", 0.0)),
+                    "runtime_profile": runtime_profile,
+                    "runtime_call_count": int(len(runtime_profile)),
                 }
             )
     by_slots: dict[str, int] = {}
@@ -1814,6 +2427,7 @@ def _run_forward_attempt(
     profile_modules: bool,
     profile_lt: bool,
     trace_forward_memory: bool,
+    operator_breakdown: bool,
     record_primary: bool,
 ) -> dict[str, Any]:
     memory_trace_path = (
@@ -1836,10 +2450,16 @@ def _run_forward_attempt(
 
     profile_snapshot = None
     remove_profile = None
+    activation_breakdown_snapshot = None
+    remove_activation_breakdown = None
     if bool(profile_modules) or memory_trace_path is not None:
         profile_snapshot, remove_profile = _install_he_module_profiler(
             net,
             memory_trace_path=memory_trace_path,
+        )
+    if bool(operator_breakdown):
+        activation_breakdown_snapshot, remove_activation_breakdown = (
+            _install_activation_breakdown_profiler(net)
         )
     x0_ct = None
     out_ct = None
@@ -1859,6 +2479,9 @@ def _run_forward_attempt(
         attempt["live_ciphertexts_after_encrypt"] = _live_ciphertext_snapshot()
         _write(payload, out_path)
         lt_profile_enabled = _set_lattigo_lt_profile_enabled(True) if bool(profile_lt) else False
+        bootstrap_profile_enabled = (
+            _set_lattigo_bootstrap_profile_enabled(True) if bool(profile_modules) else False
+        )
         try:
             out_ct = _attempt_timed(
                 payload,
@@ -1878,6 +2501,16 @@ def _run_forward_attempt(
                         attempt["lattigo_lt_profile_after_he_forward"]
                     )
                 _write(payload, out_path)
+            if bool(bootstrap_profile_enabled):
+                _set_lattigo_bootstrap_profile_enabled(False)
+                attempt["lattigo_bootstrap_profile_after_he_forward"] = (
+                    _collect_lattigo_bootstrap_profile()
+                )
+                if bool(record_primary):
+                    payload["lattigo_bootstrap_profile_after_forward"] = dict(
+                        attempt["lattigo_bootstrap_profile_after_he_forward"]
+                    )
+                _write(payload, out_path)
             if profile_snapshot is not None:
                 snapshot = profile_snapshot()
                 if bool(profile_modules):
@@ -1887,6 +2520,29 @@ def _run_forward_attempt(
                 _write(payload, out_path)
             if remove_profile is not None:
                 remove_profile()
+            if bool(operator_breakdown):
+                activation_profile = (
+                    activation_breakdown_snapshot()
+                    if activation_breakdown_snapshot is not None
+                    else None
+                )
+                try:
+                    attempt["operator_breakdown_after_forward"] = _collect_forward_operator_breakdown(
+                        net,
+                        he_forward_s=float(attempt.get("timing_s", {}).get("he_forward", 0.0)),
+                        activation_profile=activation_profile,
+                    )
+                    if bool(record_primary):
+                        payload["operator_breakdown_after_forward"] = attempt[
+                            "operator_breakdown_after_forward"
+                        ]
+                except Exception as exc:
+                    attempt["operator_breakdown_error"] = f"{type(exc).__name__}: {exc}"
+                    if bool(record_primary):
+                        payload["operator_breakdown_error"] = attempt["operator_breakdown_error"]
+                _write(payload, out_path)
+            if remove_activation_breakdown is not None:
+                remove_activation_breakdown()
         attempt["device_memory_after_he_forward"] = _device_memory_snapshot()
         attempt["live_ciphertexts_after_he_forward"] = _live_ciphertext_snapshot()
         runtime_fairness = _collect_runtime_fairness(
@@ -1965,6 +2621,11 @@ def _run_forward_attempt(
                 remove_profile()
             except Exception:
                 pass
+        if remove_activation_breakdown is not None:
+            try:
+                remove_activation_breakdown()
+            except Exception:
+                pass
         for tensor in (out_ct, x0_ct):
             release = getattr(tensor, "release", None)
             if callable(release):
@@ -1991,6 +2652,7 @@ def _run_one(
     profile_modules: bool = False,
     profile_lt: bool = False,
     trace_forward_memory: bool = False,
+    operator_breakdown: bool = False,
     provider_mode_override: str | None = None,
     io_mode: str = "none",
     io_dir: Path | None = None,
@@ -2054,7 +2716,10 @@ def _run_one(
         "profile_modules": bool(profile_modules),
         "profile_lt": bool(profile_lt),
         "trace_forward_memory": bool(trace_forward_memory),
+        "operator_breakdown": bool(operator_breakdown),
         "bootstrap_many_enabled": os.environ.get("ORION_LATTIGO_BOOTSTRAP_MANY", "0") != "0",
+        "saved_io_prewarm_mode": _saved_io_prewarm_mode(),
+        "saved_io_prewarm_max_units": _saved_io_prewarm_max_units(),
         "cheddar_runtime_env": env_defaults,
         "lattigo_runtime_env": lattigo_env_defaults,
         "config": config,
@@ -2092,6 +2757,24 @@ def _run_one(
         get_compile_load_profile = getattr(getattr(scheme, "lt_evaluator", None), "get_compile_load_profile", None)
         if callable(get_compile_load_profile):
             payload["compile_load_profile_after_compile"] = get_compile_load_profile()
+        try:
+            payload["operator_breakdown_after_compile"] = _collect_compile_operator_breakdown(
+                net,
+                compile_s=payload.get("timing_s", {}).get("compile"),
+                compile_load_profile=payload.get("compile_load_profile_after_compile", {}),
+            )
+        except Exception as exc:
+            payload["operator_breakdown_after_compile_error"] = f"{type(exc).__name__}: {exc}"
+        if _saved_io_prewarm_enabled():
+            payload["phase"] = "saved_io_prewarm"
+            _write(payload, out_path)
+            prewarm_profile = _timed(
+                payload,
+                out_path,
+                "saved_io_prewarm",
+                lambda: _prewarm_saved_io(scheme),
+            )
+            payload["saved_io_prewarm_profile_after_compile"] = dict(prewarm_profile)
         payload["device_memory_after_compile"] = _device_memory_snapshot()
         payload["compile_load_done"] = True
         payload["phase"] = "compile_load_done"
@@ -2125,6 +2808,7 @@ def _run_one(
                 profile_modules=bool(profile_modules),
                 profile_lt=bool(profile_lt),
                 trace_forward_memory=bool(trace_forward_memory),
+                operator_breakdown=bool(operator_breakdown),
                 record_primary=bool(int(attempt_index) == int(first_measured_index)),
             )
         ok_attempts = [
@@ -2432,6 +3116,11 @@ def main() -> int:
         action="store_true",
         help="Write per-module forward memory/live-ciphertext events to a JSONL sidecar.",
     )
+    parser.add_argument(
+        "--operator-breakdown",
+        action="store_true",
+        help="Collect streaming-safe MVM/activation/bootstrap/load breakdowns.",
+    )
     parser.add_argument("--provider-mode", type=str, default=None)
     parser.add_argument("--io-mode", choices=("none", "save", "load"), default="none")
     parser.add_argument("--io-dir", type=Path, default=None)
@@ -2466,6 +3155,7 @@ def main() -> int:
         profile_modules=bool(args.profile_modules),
         profile_lt=bool(args.profile_lt),
         trace_forward_memory=bool(args.trace_forward_memory),
+        operator_breakdown=bool(args.operator_breakdown),
         provider_mode_override=args.provider_mode,
         io_mode=str(args.io_mode),
         io_dir=args.io_dir,

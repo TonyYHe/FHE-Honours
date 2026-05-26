@@ -38,7 +38,7 @@ from orion.experimental.cir.runtime_group import (
 from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
 from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 from orion.models.resnet import ResNet18, ResNet34
-from orion.models.unet import UNet22, get_unet22_medical_spec
+from orion.models.unet import UNet22
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
 from orion.nn.unified_transform import UnifiedTransformGroup
@@ -86,10 +86,22 @@ def _bounded_lattigo_compile_workers_default() -> str:
                 "ORION_LT_COMPILE_WORKERS",
                 "ORION_UNIFIED_COMPILE_WORKERS",
                 "ORION_LATTIGO_COMPILE_WORKERS",
-                "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
             ),
             default_workers=4,
             estimated_per_worker_bytes=24 * 1024**3,
+            cpu_count=cpu_count,
+        )
+    )
+
+
+def _bounded_lattigo_diagonal_encode_workers_default() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    return str(
+        auto_worker_count(
+            cpu_count,
+            ("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",),
+            default_workers=cpu_count,
+            estimated_per_worker_bytes=4 * 1024**3,
             cpu_count=cpu_count,
         )
     )
@@ -150,6 +162,33 @@ U22_TCONV_CASES: tuple[dict[str, Any], ...] = (
     {"case": "up1", "node": "up1", "op": "conv_transpose2d", "stage": "decoder", "seed": 1001, "multiplicity": 1},
 )
 
+U22_ENCODER_CONV_CASES: tuple[dict[str, Any], ...] = (
+    {"case": "enc1a", "node": "enc1a", "op": "conv2d", "stage": "encoder", "seed": 1101, "multiplicity": 1},
+    {"case": "enc1b", "node": "enc1b", "op": "conv2d", "stage": "encoder", "seed": 1102, "multiplicity": 1},
+    {"case": "enc2a", "node": "enc2a", "op": "conv2d", "stage": "encoder", "seed": 1201, "multiplicity": 1},
+    {"case": "enc2b", "node": "enc2b", "op": "conv2d", "stage": "encoder", "seed": 1202, "multiplicity": 1},
+    {"case": "enc3a", "node": "enc3a", "op": "conv2d", "stage": "encoder", "seed": 1301, "multiplicity": 1},
+    {"case": "enc3b", "node": "enc3b", "op": "conv2d", "stage": "encoder", "seed": 1302, "multiplicity": 1},
+    {"case": "enc4a", "node": "enc4a", "op": "conv2d", "stage": "encoder", "seed": 1401, "multiplicity": 1},
+    {"case": "enc4b", "node": "enc4b", "op": "conv2d", "stage": "encoder", "seed": 1402, "multiplicity": 1},
+    {
+        "case": "bottlenecka",
+        "node": "bottlenecka",
+        "op": "conv2d",
+        "stage": "encoder",
+        "seed": 1501,
+        "multiplicity": 1,
+    },
+    {
+        "case": "bottleneckb",
+        "node": "bottleneckb",
+        "op": "conv2d",
+        "stage": "encoder",
+        "seed": 1502,
+        "multiplicity": 1,
+    },
+)
+
 NETWORK_SPECS: dict[str, dict[str, Any]] = {
     "r18_tiny": {
         "label": "R18 Tiny",
@@ -205,6 +244,59 @@ NETWORK_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
+NETWORK_SPECS.update(
+    {
+        "u22_192_base32_encoder": {
+            "label": "U-Net 22 base_dim=32 encoder 192x192",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 32,
+            "input_shape": (1, 3, 192, 192),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+        "u22_224_base32_encoder": {
+            "label": "U-Net 22 base_dim=32 encoder 224x224",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 32,
+            "input_shape": (1, 3, 224, 224),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+        "u22_384x288_base32_encoder": {
+            "label": "U-Net 22 base_dim=32 encoder 384x288",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 32,
+            "input_shape": (1, 3, 384, 288),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+        "u22_384_base32_encoder": {
+            "label": "U-Net 22 base_dim=32 encoder 384x384",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 32,
+            "input_shape": (1, 3, 384, 384),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+    }
+)
+
 
 E2E_CKKS_SPECS: dict[str, dict[str, Any]] = {
     "r18_tiny": {
@@ -240,6 +332,14 @@ E2E_CKKS_SPECS: dict[str, dict[str, Any]] = {
         "boot_logp": RESNET_BOOT_LOGP,
     },
 }
+
+for _u22_dim32_encoder_network in (
+    "u22_192_base32_encoder",
+    "u22_224_base32_encoder",
+    "u22_384x288_base32_encoder",
+    "u22_384_base32_encoder",
+):
+    E2E_CKKS_SPECS[_u22_dim32_encoder_network] = dict(E2E_CKKS_SPECS["u22_256_base32"])
 
 
 CHEDDAR_E2E_CKKS_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -790,14 +890,11 @@ def _prepare_resnet34_imgnet_dag(*, provider: bool) -> tuple[NetworkDAG, dict[st
 def _prepare_u22_dag(network: str, *, provider: bool) -> tuple[NetworkDAG, dict[str, Any]]:
     spec = NETWORK_SPECS[str(network)]
     dataset = str(spec["dataset"])
-    medical_spec = get_unet22_medical_spec(dataset)
+    input_shape = tuple(int(value) for value in spec["input_shape"])
     torch.manual_seed(0)
     net = UNet22(dataset=dataset, base_dim=int(spec["base_dim"]))
     net.eval()
-    x = torch.randn(
-        (1, int(medical_spec.in_channels), int(medical_spec.image_size), int(medical_spec.image_size)),
-        dtype=torch.float32,
-    )
+    x = torch.randn(input_shape, dtype=torch.float32)
     traced = OrionTracer().trace_model(net)
     StatsTracker(traced).propagate(x)
     dag = NetworkDAG(traced)
@@ -806,6 +903,11 @@ def _prepare_u22_dag(network: str, *, provider: bool) -> tuple[NetworkDAG, dict[
     attach_audit: dict[str, Any] = {}
     if bool(provider):
         opts = _region_first_mode_options(str(network))
+        if str(network).endswith("_base32_encoder"):
+            opts = dict(opts)
+            opts["u22_allowed_nodes"] = tuple(str(case["node"]) for case in spec["cases"])
+            opts["u22_conv_kernels"] = True
+            opts["u22_layout_policy"] = "dp"
         registry = U22CompileRegistry.for_dag(
             dag,
             allowed_nodes=opts["u22_allowed_nodes"],
@@ -822,7 +924,7 @@ def _prepare_dag(network: str, *, provider: bool) -> tuple[NetworkDAG, dict[str,
         return _prepare_resnet18_tiny_dag(provider=bool(provider))
     if str(network) == "r34_imgnet":
         return _prepare_resnet34_imgnet_dag(provider=bool(provider))
-    if str(network) in {"u22_64_base32", "u22_256_base32"}:
+    if str(network).startswith("u22_"):
         return _prepare_u22_dag(str(network), provider=bool(provider))
     raise KeyError(f"unknown network {network!r}")
 
@@ -1113,7 +1215,8 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
     rows = _dense_rows(module)
     output_rotations = int(getattr(module, "output_rotations", 0) or 0)
     output_rotation_evals = int(rows * output_rotations)
-    if _dense_shared_cache_stats_enabled(rows=int(rows), cols=int(cols)):
+    tconv_unified_stats = _dense_tconv_unified_stats_enabled(module)
+    if _dense_shared_cache_stats_enabled(module=module, rows=int(rows), cols=int(cols)) or bool(tconv_unified_stats):
         dense_groups = _dense_diag_entries_by_col(
             module,
             transform_ids,
@@ -1127,15 +1230,19 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
             shared_rotation_total = 0
             reported_unique_key_union_total = 0
             for col, group_entries in enumerate(dense_groups):
-                n1s = [
-                    _lattigo_find_best_bsgs_n1(
-                        set(entry["diag_indices"]),
-                        slots=int(slots),
-                        log_max_ratio=int(log_ratio),
-                    )
-                    for entry in group_entries
-                ]
-                cost = _shared_cache_bsgs_group_cost(group_entries, slots=int(slots), n1s=n1s)
+                if module.__class__.__name__ == "ConvTranspose2d":
+                    unified_n1, cost = _best_unified_common_n1(group_entries, slots=int(slots))
+                else:
+                    n1s = [
+                        _lattigo_find_best_bsgs_n1(
+                            set(entry["diag_indices"]),
+                            slots=int(slots),
+                            log_max_ratio=int(log_ratio),
+                        )
+                        for entry in group_entries
+                    ]
+                    unified_n1 = 0
+                    cost = _shared_cache_bsgs_group_cost(group_entries, slots=int(slots), n1s=n1s)
                 group_keys = {
                     int(key)
                     for entry in group_entries
@@ -1161,6 +1268,7 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
                         "unique_rotation_key_count": int(len(group_keys)),
                         "unique_rotation_keys": sorted(int(key) for key in group_keys),
                         "bsgs_log_ratio": int(log_ratio),
+                        "unified_n1": int(unified_n1),
                         "per_transform_bsgs": cost["per_transform_bsgs"],
                         "per_transform": [
                             item for item in per_transform if int(item["col"]) == int(col)
@@ -1175,7 +1283,8 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
                     "unique nonzero baby rotations per input-column group plus nonzero giant rotations per transform, "
                     "then Orion hybrid output rotations"
                 ),
-                "dense_shared_cache": True,
+                "dense_shared_cache": bool(_dense_shared_cache_stats_enabled(module=module, rows=int(rows), cols=int(cols))),
+                "dense_unified_bsgs_stats": bool(tconv_unified_stats),
                 "group_count": int(len(per_group)),
                 "transform_count": int(len(transform_ids)),
                 "rows": int(rows),
@@ -1211,9 +1320,19 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
     }
 
 
-def _dense_shared_cache_stats_enabled(*, rows: int, cols: int) -> bool:
+def _dense_tconv_unified_stats_enabled(module: Any) -> bool:
+    if module.__class__.__name__ != "ConvTranspose2d":
+        return False
+    if bool(getattr(module, "dense_tconv_unified_bsgs", False)):
+        return True
+    return bool(os.environ.get("ORION_DENSE_LT_SHARED_CACHE", "").lower() in ("1", "true", "yes", "on"))
+
+
+def _dense_shared_cache_stats_enabled(*, module: Any, rows: int, cols: int) -> bool:
     override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-    if override is None or override.lower() not in ("1", "true", "yes", "on"):
+    requested = bool(override is not None and override.lower() in ("1", "true", "yes", "on"))
+    requested = bool(requested or _dense_tconv_unified_stats_enabled(module))
+    if not bool(requested):
         return False
     if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "none":
         return False
@@ -1572,6 +1691,7 @@ def _module_metadata(module: Any) -> dict[str, Any]:
         )
     if isinstance(module, ConvTranspose2d):
         payload["output_padding"] = [int(v) for v in getattr(module, "output_padding")]
+        payload["dense_tconv_unified_bsgs"] = bool(getattr(module, "dense_tconv_unified_bsgs", False))
     return payload
 
 
@@ -2313,11 +2433,13 @@ def _run_worker(
         env["ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_ACTIVE"] = "1"
         env["ORION_NODE_BENCH_BOUNDED_LATTIGO_DENSE_MODE_ACTIVE"] = str(bounded_mode)
         compile_workers = _bounded_lattigo_compile_workers_default()
+        diagonal_encode_workers = _bounded_lattigo_diagonal_encode_workers_default()
         pack_workers = _bounded_lattigo_pack_workers_default()
         env.setdefault("ORION_PACK_CONV_WORKERS", pack_workers)
         env.setdefault("ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS", compile_workers)
         env.setdefault("ORION_LT_COMPILE_WORKERS", compile_workers)
         env.setdefault("ORION_LATTIGO_COMPILE_WORKERS", compile_workers)
+        env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", diagonal_encode_workers)
         env.setdefault("ORION_DENSE_LT_HOST_PAYLOAD_CACHE", "0")
         bounded_lattigo_dense_payload = {
             "enabled": True,
@@ -2329,6 +2451,9 @@ def _run_worker(
             "pack_conv_workers": str(env.get("ORION_PACK_CONV_WORKERS", "")),
             "lt_compile_workers": str(env.get("ORION_LT_COMPILE_WORKERS", "")),
             "lattigo_compile_workers": str(env.get("ORION_LATTIGO_COMPILE_WORKERS", "")),
+            "lattigo_diagonal_encode_workers": str(
+                env.get("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", "")
+            ),
         }
         if bounded_mode == "save":
             base_io_root = Path(env.get(LATTIGO_DENSE_IO_ROOT_ENV, str(REPO_ROOT / ".tmp" / "lattigo_dense_io")))
@@ -2379,11 +2504,6 @@ def _run_worker(
                 }
         else:
             env.setdefault("ORION_LATTIGO_STREAMING_LT", "force")
-            env.setdefault(
-                "ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS",
-                BOUNDED_LATTIGO_DENSE_STREAMING_CHUNK_PLAINTEXTS,
-            )
-            env.setdefault("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS", "2")
             bounded_lattigo_dense_payload.update(
                 {
                     "io_mode": "none",
@@ -2429,6 +2549,7 @@ def _run_worker(
         env["ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_ACTIVE"] = "1"
         env["ORION_NODE_BENCH_BOUNDED_LATTIGO_PROVIDER_MODE_ACTIVE"] = str(provider_mode)
         compile_workers = _bounded_lattigo_compile_workers_default()
+        diagonal_encode_workers = _bounded_lattigo_diagonal_encode_workers_default()
         pack_workers = _bounded_lattigo_pack_workers_default()
         env.setdefault("ORION_PACK_CONV_WORKERS", pack_workers)
         env.setdefault("ORION_LT_COMPILE_WORKERS", compile_workers)
@@ -2438,7 +2559,7 @@ def _run_worker(
         env.setdefault("ORION_UNIFIED_LOAD_BATCH_TRANSFORMS", compile_workers)
         env.setdefault("ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS", compile_workers)
         env.setdefault("ORION_LATTIGO_COMPILE_WORKERS", compile_workers)
-        env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", compile_workers)
+        env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", diagonal_encode_workers)
         env.setdefault("ORION_LATTIGO_BOOTSTRAP_WORKERS", compile_workers)
         env.setdefault("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "2")
         env.setdefault("ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM", "1")
@@ -2462,11 +2583,6 @@ def _run_worker(
             env[LATTIGO_BENCH_IO_MODE_ENV] = "none"
             env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "1")
             env.setdefault("ORION_LATTIGO_STREAMING_LT", "force")
-            env.setdefault(
-                "ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS",
-                BOUNDED_LATTIGO_PROVIDER_STREAMING_CHUNK_PLAINTEXTS,
-            )
-            env.setdefault("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS", "2")
         disk_watch_path = worker_lattigo_provider_io_root
         disk_before = _disk_usage_payload(base_io_root)
         min_disk_free_bytes = int(max(0.0, float(min_disk_free_gb)) * (1024**3))
@@ -2487,6 +2603,9 @@ def _run_worker(
                 env.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS", "")
             ),
             "stream_compile_batch_gb": str(env.get("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "")),
+            "lattigo_diagonal_encode_workers": str(
+                env.get("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", "")
+            ),
             "stream_load_plaintexts": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
             "stream_load_chunk_gb": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
             "save_encoded_plaintexts": str(env.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "")),

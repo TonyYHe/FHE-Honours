@@ -5,7 +5,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from orion.nn.linear import LinearTransform
-from .bootstrap_fusion import bootstrap_prescale_fusion_supported
+from .bootstrap_fusion import bootstrap_prescale_fusion_supported, module_bootstrap_ct_count
 
 class LevelDAG(nx.DiGraph):
     """
@@ -257,9 +257,7 @@ class LevelDAG(nx.DiGraph):
         return (0, 0)
 
     def get_num_input_cts(self, module):
-        num_slots = module.scheme.params.get_slots()
-        num_elements = module.fhe_input_shape.numel()
-        return int(math.ceil(num_elements / num_slots))
+        return int(module_bootstrap_ct_count(module))
 
     def shortest_path(self, source, target):
         """Relaxation stage of topological sort."""
