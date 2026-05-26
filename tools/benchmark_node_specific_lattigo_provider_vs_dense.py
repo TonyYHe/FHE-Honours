@@ -341,6 +341,67 @@ for _u22_dim32_encoder_network in (
 ):
     E2E_CKKS_SPECS[_u22_dim32_encoder_network] = dict(E2E_CKKS_SPECS["u22_256_base32"])
 
+NETWORK_SPECS.update(
+    {
+        "u22_192_base64_encoder": {
+            "label": "U-Net 22 base_dim=64 encoder 192x192",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 64,
+            "input_shape": (1, 3, 192, 192),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+        "u22_224_base64_encoder": {
+            "label": "U-Net 22 base_dim=64 encoder 224x224",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 64,
+            "input_shape": (1, 3, 224, 224),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+        "u22_384x288_base64_encoder": {
+            "label": "U-Net 22 base_dim=64 encoder 384x288",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 64,
+            "input_shape": (1, 3, 384, 288),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+        "u22_384_base64_encoder": {
+            "label": "U-Net 22 base_dim=64 encoder 384x384",
+            "model": "UNet22",
+            "dataset": "kvasir_polyp_256",
+            "base_dim": 64,
+            "input_shape": (1, 3, 384, 384),
+            "logn": 16,
+            "logq": RESNET_LOGQ,
+            "logp": RESNET_LOGP,
+            "cases": U22_ENCODER_CONV_CASES,
+            "coverage_note": "unique Conv2d encoder representatives only; provider attach enables Conv kernels for these nodes",
+        },
+    }
+)
+
+for _u22_dim64_encoder_network in (
+    "u22_192_base64_encoder",
+    "u22_224_base64_encoder",
+    "u22_384x288_base64_encoder",
+    "u22_384_base64_encoder",
+):
+    E2E_CKKS_SPECS[_u22_dim64_encoder_network] = dict(E2E_CKKS_SPECS["u22_256_base32"])
+
 
 CHEDDAR_E2E_CKKS_OVERRIDES: dict[str, dict[str, Any]] = {
     # Cheddar's current C++ adapter only exposes its LogScale=40 preset. Keep
@@ -903,7 +964,7 @@ def _prepare_u22_dag(network: str, *, provider: bool) -> tuple[NetworkDAG, dict[
     attach_audit: dict[str, Any] = {}
     if bool(provider):
         opts = _region_first_mode_options(str(network))
-        if str(network).endswith("_base32_encoder"):
+        if str(network).endswith("_encoder"):
             opts = dict(opts)
             opts["u22_allowed_nodes"] = tuple(str(case["node"]) for case in spec["cases"])
             opts["u22_conv_kernels"] = True
