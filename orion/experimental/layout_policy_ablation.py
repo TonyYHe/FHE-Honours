@@ -675,7 +675,6 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
             continue
         demand_layouts: list[LayoutState] = []
         for edge in outgoing:
-            demand_layouts.append(edge.requirement)
             demand_layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
         if not demand_layouts:
             continue
