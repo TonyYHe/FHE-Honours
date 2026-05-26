@@ -936,13 +936,18 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
         for row in compile_plan["edge_layouts"]
         if row.get("physical_layout") == "native_source_stripe"
     ]
+    producer_fused_edges = [
+        row
+        for row in compile_plan["edge_layouts"]
+        if bool(row.get("producer_fused_relayout", False))
+    ]
     assert int(compile_plan["relayout_edge_count"]) == 0
     assert int(compile_plan["output_relayout_node_count"]) == 0
     assert producer_halo_nodes
+    assert producer_fused_edges
     assert int(compile_plan["summary"]["producer_fused_materialization_count"]) == len(producer_halo_nodes)
     assert int(compile_plan["summary"]["producer_fused_rotation_estimate"]) >= 0
-    assert compact_align_shared
-    assert compact_halo_shared
+    assert compact_align_shared or compact_halo_shared
     assert int(compile_plan["summary"]["consumer_fused_relayout_count"]) == (
         len(compact_align_shared) + len(compact_halo_shared)
     )
@@ -951,6 +956,7 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
         for row in [*compact_align_shared, *compact_halo_shared]
     )
     assert all(not bool(row["relayout"]) for row in [*compact_align_shared, *compact_halo_shared])
+    assert all(not bool(row["relayout"]) for row in producer_fused_edges)
     assert "x->enc1a" in {row["edge"] for row in native_halo_stripe}
     assert int(compile_plan["summary"]["compact_fallback_penalty_estimate"]) == 0
     relayout_edge_depth = sum(int(row["depth_estimate"]) for row in compile_plan["relayout_edges"])

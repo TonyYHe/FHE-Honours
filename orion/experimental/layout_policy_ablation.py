@@ -498,6 +498,10 @@ def _consumer_requirement(module: Any | None) -> tuple[int, int, int, str, int]:
     return 0, 0, 1, type(module).__name__.lower() if module is not None else "input", 0
 
 
+def _layout_preserving_module_for_demand(module: Any | None) -> bool:
+    return isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+
+
 def _pair_tuple(value: Any, default: tuple[int, int]) -> tuple[int, int]:
     if value is None:
         return default
@@ -656,6 +660,41 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
                 activation_ct_mult_depth=int(_activation_ct_mult_depth(target_module)),
             ),
         )
+    edges_by_id = {str(edge.edge_id): edge for edge in edges}
+    incoming_by_target: dict[str, list[str]] = {}
+    outgoing_by_source: dict[str, list[str]] = {}
+    for edge in edges:
+        incoming_by_target.setdefault(str(edge.target), []).append(str(edge.edge_id))
+        outgoing_by_source.setdefault(str(edge.source), []).append(str(edge.edge_id))
+    for node in reversed([str(value) for value in dag.topological_sort()]):
+        module = dag.nodes[node].get("module")
+        if not _layout_preserving_module_for_demand(module):
+            continue
+        outgoing = [edges_by_id[edge_id] for edge_id in outgoing_by_source.get(str(node), [])]
+        if not outgoing:
+            continue
+        demand_layouts: list[LayoutState] = []
+        for edge in outgoing:
+            demand_layouts.append(edge.requirement)
+            demand_layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
+        if not demand_layouts:
+            continue
+        top_beta = max(int(layout.top_beta) for layout in demand_layouts)
+        bottom_beta = max(int(layout.bottom_beta) for layout in demand_layouts)
+        stride = max(int(layout.stride) for layout in demand_layouts)
+        for edge_id in incoming_by_target.get(str(node), []):
+            edge = edges_by_id[str(edge_id)]
+            propagated = _layout_for_shape(
+                shape=edge.shape,
+                gap=int(edge.compact.gap),
+                top_beta=max(int(edge.requirement.top_beta), int(top_beta)),
+                bottom_beta=max(int(edge.requirement.bottom_beta), int(bottom_beta)),
+                stride=max(int(edge.requirement.stride), int(stride)),
+                slots=int(slots),
+            )
+            if not _same_layout(propagated, edge.requirement):
+                edges_by_id[str(edge_id)] = replace(edge, requirement=propagated)
+    edges = list(edges_by_id.values())
     topo_index = {str(node): index for index, node in enumerate(dag.topological_sort())}
     return tuple(sorted(edges, key=lambda edge: (topo_index.get(edge.source, 10**9), topo_index.get(edge.target, 10**9))))
 
@@ -730,6 +769,8 @@ def _edge_row(
     physical_layout: str | None = None,
     consumer_fused_relayout: bool = False,
     consumer_fused_rotation_estimate: int = 0,
+    producer_fused_relayout: bool = False,
+    producer_fused_rotation_estimate: int = 0,
     estimator: str | None = None,
 ) -> dict[str, Any]:
     if str(layout_mode) == "compact_global_fallback":
@@ -807,6 +848,8 @@ def _edge_row(
         "physical_layout": str(physical_layout),
         "consumer_fused_relayout": bool(consumer_fused_relayout),
         "consumer_fused_rotation_estimate": int(consumer_fused_rotation_estimate),
+        "producer_fused_relayout": bool(producer_fused_relayout),
+        "producer_fused_rotation_estimate": int(producer_fused_rotation_estimate),
     }
 
 
@@ -1954,21 +1997,12 @@ def _producer_fused_materialization_estimate(
     )
     if not bool(grows_halo):
         return {"enabled": False, "rotation_count": 0}
-    fused_rotation_estimate = 0
-    compact_rotation_estimate = 0
-    output_edge_cache: dict[str, EdgeInfo] = {}
-    for edge in incoming:
-        output_edge_cache[str(edge.edge_id)] = _edge_with_output_layout(edge, output_layout)
-    for row in incoming_rows:
-        edge = next((item for item in incoming if str(item.edge_id) == str(row.get("edge", ""))), None)
-        if edge is None:
-            continue
-        input_layout = LayoutState(**dict(row["selected_layout"]))
-        compact_rotation_estimate += int(row.get("lt_bsgs_rotation_estimate", _lt_rotations(edge, input_layout)) or 0)
-        fused_rotation_estimate += _lt_rotations(output_edge_cache[str(edge.edge_id)], input_layout)
+    # This is not a separate LT. The producer emits the requested boundary rows
+    # as part of its existing transform; it may change diagonal work, but should
+    # not be charged as an independent rotation/depth path.
     return {
         "enabled": True,
-        "rotation_count": int(max(0, int(fused_rotation_estimate) - int(compact_rotation_estimate))),
+        "rotation_count": 0,
     }
 
 
@@ -2338,6 +2372,25 @@ def _non_dp_consumer_fused_row(
                 edge,
                 selected_layout,
                 layout_mode="native_halo_stripe",
+            ),
+        )
+    if str(edge.op_kind) == "conv_transpose2d" and source_layout.covers(edge.requirement):
+        physical_layout = PHYSICAL_LOGICAL_HALO if _layout_has_halo(selected_layout) else PHYSICAL_COMPACT
+        return _edge_row(
+            edge,
+            selected_layout,
+            relayout=False,
+            relayout_reason="",
+            layout_mode="compact_tconv_shared",
+            source_layout=source_layout,
+            source_physical_layout=str(source_physical),
+            physical_layout=str(physical_layout),
+            consumer_fused_relayout=True,
+            consumer_fused_rotation_estimate=0,
+            planner_rotation_cost=_consumer_fused_planner_rotation_cost(
+                edge,
+                selected_layout,
+                layout_mode="compact_tconv_shared",
             ),
         )
     if not _compact_align_shared_allowed(edge, source_layout, str(source_physical)):
@@ -2773,6 +2826,7 @@ def _source_candidate_rows(edges: Sequence[EdgeInfo], layouts: Sequence[LayoutSt
 @dataclass(frozen=True)
 class _FrontierState:
     score: float
+    layout_score: float
     live_layouts: tuple[tuple[str, LayoutState], ...]
     live_physical_layouts: tuple[tuple[str, str], ...]
     edge_rows: tuple[dict[str, Any], ...]
@@ -2815,10 +2869,37 @@ def _prune_dp_frontier(
         states.items(),
         key=lambda item: (
             float(item[1].score),
+            float(item[1].layout_score),
             len(item[1].relayout_layouts),
         ),
     )
     return dict(ranked[: int(DP_FRONTIER_STATE_LIMIT)])
+
+
+def _layout_halo_slot_cost(layout: LayoutState | None) -> float:
+    if layout is None:
+        return 0.0
+    return float(max(0, int(layout.stored_slots) - int(layout.core_slots)))
+
+
+def _row_layout_halo_slot_cost(row: dict[str, Any]) -> float:
+    layout = dict(row.get("selected_layout", {}) or {})
+    if not layout:
+        return 0.0
+    return float(max(0, int(layout.get("stored_slots", 0) or 0) - int(layout.get("core_slots", 0) or 0)))
+
+
+def _dp_layout_secondary_cost(
+    *,
+    incoming_rows: Sequence[dict[str, Any]],
+    output_layout: LayoutState | None,
+    output_relayouts: Sequence[LayoutState],
+) -> float:
+    return (
+        float(sum(_row_layout_halo_slot_cost(row) for row in incoming_rows))
+        + _layout_halo_slot_cost(output_layout)
+        + float(sum(_layout_halo_slot_cost(layout) for layout in output_relayouts))
+    )
 
 
 def _dedupe_layouts(layouts: Iterable[LayoutState]) -> tuple[LayoutState, ...]:
@@ -2881,45 +2962,10 @@ def _source_layout_candidates(edges: Sequence[EdgeInfo], *, global_alpha: int, g
         return ()
     edge = edges[0]
     local_need = _max_layout(edges, slots=int(slots))
-    fixed_like = _layout_for_shape(
-        shape=edge.shape,
-        gap=int(edge.compact.gap),
-        top_beta=int(global_alpha),
-        bottom_beta=int(global_beta),
-        stride=max(1, int(local_need.stride)),
-        slots=int(slots),
-    )
-    capacity_fill = _fill_beta_to_tile_capacity(local_need, shape=edge.shape, slots=int(slots))
-    fixed_capacity_fill = _fill_beta_to_tile_capacity(fixed_like, shape=edge.shape, slots=int(slots))
-    reduced_alpha = int(global_alpha)
-    reduced_beta = int(global_beta)
-    target_tiles = max(int(edge.compact.tile_count), int(local_need.tile_count))
-    while (int(reduced_alpha) > int(local_need.top_beta) or int(reduced_beta) > int(local_need.bottom_beta)):
-        candidate = _layout_for_shape(
-            shape=edge.shape,
-            gap=int(edge.compact.gap),
-            top_beta=int(reduced_alpha),
-            bottom_beta=int(reduced_beta),
-            stride=max(1, int(local_need.stride)),
-            slots=int(slots),
-        )
-        if int(candidate.tile_count) <= int(target_tiles):
-            break
-        if int(reduced_alpha) >= int(reduced_beta) and int(reduced_alpha) > int(local_need.top_beta):
-            reduced_alpha -= 1
-        elif int(reduced_beta) > int(local_need.bottom_beta):
-            reduced_beta -= 1
-        else:
-            break
-    capacity_safe = _layout_for_shape(
-        shape=edge.shape,
-        gap=int(edge.compact.gap),
-        top_beta=int(reduced_alpha),
-        bottom_beta=int(reduced_beta),
-        stride=max(1, int(local_need.stride)),
-        slots=int(slots),
-    )
-    return _dedupe_layouts((edge.compact, local_need, capacity_fill, capacity_safe, fixed_like, fixed_capacity_fill))
+    # DP compares actual layouts, so do not add capacity-fill halo that exists
+    # only as alignment padding and is not demanded by a consumer.
+    del global_alpha, global_beta
+    return _dedupe_layouts((edge.compact, local_need))
 
 
 def _operator_semantic_output_layout(
@@ -2931,19 +2977,19 @@ def _operator_semantic_output_layout(
 ) -> LayoutState:
     if isinstance(module, ConvTranspose2d):
         scale = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
-        top_beta = int(source_layout.top_beta)
+        top_beta = int(source_layout.top_beta) * int(scale)
         bottom_beta = int(source_layout.bottom_beta) * int(scale)
     elif isinstance(module, AvgPool2d):
         stride_pair = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
         kernel_pair = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
         stride = max(1, int(stride_pair[0]))
         consume = max(0, int(kernel_pair[0]) - int(stride_pair[0]))
-        top_beta = int(source_layout.top_beta)
+        top_beta = _side_after_downsample(source_layout.top_beta, consume=int(consume), stride=int(stride))
         bottom_beta = _side_after_downsample(source_layout.bottom_beta, consume=int(consume), stride=int(stride))
     elif isinstance(module, Conv2d):
         stride = max(1, int(_pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))[0]))
         consume = _conv_halo_consume(module)
-        top_beta = int(source_layout.top_beta)
+        top_beta = _side_after_downsample(source_layout.top_beta, consume=int(consume), stride=int(stride))
         bottom_beta = _side_after_downsample(source_layout.bottom_beta, consume=int(consume), stride=int(stride))
     else:
         top_beta = int(source_layout.top_beta)
@@ -2974,8 +3020,22 @@ def _producer_fused_output_layout_candidates(
     layouts: list[LayoutState] = []
     local_need = _max_layout(outgoing, slots=int(slots))
     if int(local_need.top_beta) > 0 or int(local_need.bottom_beta) > 0:
+        # Producer fusion may materialize consumer-demanded halo, but DP should
+        # not inflate that halo merely to fill otherwise unused tile capacity.
         layouts.append(local_need)
-        layouts.append(_fill_beta_to_tile_capacity(local_need, shape=edge.shape, slots=int(slots)))
+    for edge in outgoing:
+        layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
+        if _is_join_op(edge.op_kind):
+            layouts.append(
+                _layout_for_shape(
+                    shape=edge.shape,
+                    gap=int(edge.compact.gap),
+                    top_beta=max(2, int(edge.requirement.top_beta)),
+                    bottom_beta=max(2, int(edge.requirement.bottom_beta)),
+                    stride=max(2, int(edge.requirement.stride)),
+                    slots=int(slots),
+                )
+            )
     return _dedupe_layouts(layouts)
 
 
@@ -3193,13 +3253,10 @@ def _incoming_relayout_candidates(
     global_beta: int,
     slots: int,
 ) -> tuple[LayoutState, ...]:
-    del global_alpha, global_beta
-    capacity_fill = _fill_beta_to_tile_capacity(edge.requirement, shape=edge.shape, slots=int(slots))
-    return tuple(
-        layout
-        for layout in _dedupe_layouts((edge.requirement, capacity_fill))
-        if layout.covers(edge.requirement)
-    )
+    # Refill exactly the consumer requirement; larger capacity-fill layouts are
+    # explored by non-DP policies, not by the DP strip/refill comparison.
+    del global_alpha, global_beta, slots
+    return (edge.requirement,)
 
 
 def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tuple[LayoutState, ...]:
@@ -3215,7 +3272,7 @@ def _future_tconv_input_relayout_candidates(edge: EdgeInfo, *, slots: int) -> tu
         stride=max(1, int(edge.requirement.stride)),
         slots=int(slots),
     )
-    return _dedupe_layouts((halo, _fill_beta_to_tile_capacity(halo, shape=edge.shape, slots=int(slots))))
+    return (halo,)
 
 
 def _compact_align_shared_allowed(
@@ -3530,6 +3587,8 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
     for target_layout in _dedupe_layouts(candidates):
         rows: list[dict[str, Any]] = []
         relayouts: list[LayoutState] = []
+        fused_rows: list[dict[str, Any]] = []
+        fused_relayouts: list[LayoutState] = []
         for edge in incoming:
             source_layout = live[edge.source]
             relayout = not _same_physical_layout(source_layout, target_layout)
@@ -3545,7 +3604,32 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
                     source_layout=source_layout,
                 )
             )
+            source_has_halo = bool(int(source_layout.top_beta) > 0 or int(source_layout.bottom_beta) > 0)
+            target_has_halo = bool(int(target_layout.top_beta) > 0 or int(target_layout.bottom_beta) > 0)
+            source_fusable = bool(relayout and target_has_halo and not source_has_halo)
+            if bool(source_fusable):
+                fused_rows.append(
+                    _edge_row(
+                        edge,
+                        target_layout,
+                        relayout=False,
+                        relayout_reason="",
+                        lt_rotations=_lt_rotations(edge, target_layout),
+                        layout_mode="producer_fused_relayout",
+                        source_layout=source_layout,
+                        source_physical_layout=PHYSICAL_COMPACT,
+                        physical_layout=PHYSICAL_LOGICAL_HALO,
+                        producer_fused_relayout=True,
+                        producer_fused_rotation_estimate=0,
+                    )
+                )
+            else:
+                fused_rows.append(rows[-1])
+                if bool(relayout):
+                    fused_relayouts.append(target_layout)
         options.append((rows, relayouts))
+        if any(bool(row.get("producer_fused_relayout", False)) for row in fused_rows):
+            options.append((fused_rows, fused_relayouts))
     return tuple(options)
 
 
@@ -3573,6 +3657,7 @@ def _plan_dp(
     states: dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState] = {
         (): _FrontierState(
             score=0.0,
+            layout_score=0.0,
             live_layouts=(),
             live_physical_layouts=(),
             edge_rows=(),
@@ -3706,17 +3791,25 @@ def _plan_dp(
                         + float(int(producer_fused["rotation_count"]))
                         + float(sum(_relayout_linear_cost(layout) for layout in output_relayouts))
                     )
+                    candidate_layout_score = float(state.layout_score) + _dp_layout_secondary_cost(
+                        incoming_rows=incoming_rows,
+                        output_layout=output_layout,
+                        output_relayouts=output_relayouts,
+                    )
                     key = _frontier_key(candidate_live, candidate_storage)
                     existing = next_states.get(key)
                     if existing is None or (
                         candidate_score,
+                        candidate_layout_score,
                         len(candidate_relayouts),
                     ) < (
                         float(existing.score),
+                        float(existing.layout_score),
                         len(existing.relayout_layouts),
                     ):
                         next_states[key] = _FrontierState(
                             score=float(candidate_score),
+                            layout_score=float(candidate_layout_score),
                             live_layouts=_frontier_live_items(candidate_live),
                             live_physical_layouts=_frontier_physical_items(candidate_storage),
                             edge_rows=candidate_rows,
@@ -3732,6 +3825,7 @@ def _plan_dp(
         states.values(),
         key=lambda state: (
             float(state.score),
+            float(state.layout_score),
             len(state.relayout_layouts),
         ),
     )
