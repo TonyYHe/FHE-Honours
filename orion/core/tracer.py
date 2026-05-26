@@ -95,6 +95,32 @@ class StatsTracker(fx.Interpreter):
         parents = node.all_input_nodes
         if not parents:
             return
+
+        if self._is_concat_node(node):
+            shapes = [getattr(p, "output_shape") for p in parents]
+            fhe_shapes = [getattr(p, "fhe_output_shape") for p in parents]
+            gaps = [getattr(p, "output_gap") for p in parents]
+            if any(shape is None for shape in shapes) or any(shape is None for shape in fhe_shapes):
+                return
+            dim = self._concat_dim(node)
+            if int(dim) != 1:
+                raise ValueError(f"Concat node {node.name} only supports channel dim=1 under FHE")
+            ranks = {len(shape) for shape in shapes}
+            if len(ranks) > 1:
+                raise ValueError(f"Inconsistent ranks for concat {node.name}: {shapes}")
+            for axis in range(len(shapes[0])):
+                if int(axis) == int(dim):
+                    continue
+                values = {int(shape[axis]) for shape in shapes}
+                if len(values) > 1:
+                    raise ValueError(f"Inconsistent concat non-channel shapes for {node.name}: {shapes}")
+            if len({int(gap) for gap in gaps}) > 1:
+                raise ValueError(f"Inconsistent concat input gaps for {node.name}: {set(gaps)}")
+            for axis in (0, 2, 3):
+                values = {int(shape[axis]) for shape in fhe_shapes}
+                if len(values) > 1:
+                    raise ValueError(f"Inconsistent concat FHE physical axes for {node.name}: {fhe_shapes}")
+            return
             
         # Helper function to check consistency
         def check_consistency(attr_name, label):
@@ -129,6 +155,24 @@ class StatsTracker(fx.Interpreter):
             raise ValueError(
                 f"BatchNorm node {node} has multiple parents which prevents fusion"
             )
+
+    def _is_concat_node(self, node: fx.Node) -> bool:
+        if node.op != "call_module":
+            return False
+        try:
+            module = self.module.get_submodule(node.target)
+        except AttributeError:
+            return False
+        return isinstance(module, on.Concat)
+
+    def _concat_dim(self, node: fx.Node) -> int:
+        module = self.module.get_submodule(node.target)
+        dim = int(getattr(module, "dim", 1))
+        parents = node.all_input_nodes
+        rank = len(getattr(parents[0], "output_shape", ())) if parents else 0
+        if dim < 0:
+            dim += int(rank)
+        return int(dim)
     
     def update_input_stats(self, inp: tuple, node: fx.Node):
         # Update input statistics from actual tensor values
@@ -173,6 +217,9 @@ class StatsTracker(fx.Interpreter):
         # Determine output shape, preserving structure except for transforming ops
         if not node.input_shape:
             return result.shape
+
+        if self._is_concat_node(node):
+            return result.shape
             
         # Only LinearTransform modules change the output shape
         if node.op == "call_module":
@@ -184,6 +231,9 @@ class StatsTracker(fx.Interpreter):
         return node.input_shape
 
     def compute_fhe_output_gap(self, node: fx.Node):
+        if self._is_concat_node(node):
+            parents = node.all_input_nodes
+            return parents[0].output_gap if parents else node.input_gap
         if node.op == "call_module":
             module = self.module.get_submodule(node.target)
             if isinstance(module, LinearTransform):
@@ -197,6 +247,19 @@ class StatsTracker(fx.Interpreter):
     def compute_fhe_output_shape(self, node: fx.Node):
         if not node.input_shape:
             return node.output_shape
+
+        if self._is_concat_node(node):
+            parents = node.all_input_nodes
+            if not parents:
+                return node.output_shape
+            output_shape = node.output_shape
+            gap = int(parents[0].output_gap)
+            n = int(output_shape[0])
+            channels = int(output_shape[1])
+            height = int(output_shape[2])
+            width = int(output_shape[3])
+            on_channels = (int(channels) + int(gap * gap) - 1) // int(gap * gap)
+            return torch.Size((n, on_channels, int(height * gap), int(width * gap)))
 
         if node.op == "call_module":
             module = self.module.get_submodule(node.target)
@@ -231,6 +294,17 @@ class StatsTracker(fx.Interpreter):
         # Multiplexed aps
         module.input_gap = node.input_gap
         module.output_gap = node.output_gap
+
+        if isinstance(module, on.Concat):
+            parents = node.all_input_nodes
+            module.configure_from_stats(
+                input_shapes=[parent.output_shape for parent in parents],
+                input_fhe_shapes=[parent.fhe_output_shape for parent in parents],
+                input_gaps=[parent.output_gap for parent in parents],
+                output_shape=node.output_shape,
+                fhe_output_shape=node.fhe_output_shape,
+                output_gap=node.output_gap,
+            )
 
     def update_batch_size(self, batch_size):
         for node in self.module.graph.nodes:        

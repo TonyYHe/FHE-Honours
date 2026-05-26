@@ -127,7 +127,7 @@ def _decode_output(module, out: CipherTensor) -> torch.Tensor:
     )[0]
 
 
-def test_u22_add_skip_consumer_conv_has_no_concat_fusion_in_provider_mode() -> None:
+def test_u22_concat_skip_consumer_conv_has_concat_fusion_specs_in_provider_mode() -> None:
     _init_python_scheme(logn=int(DATASET_SPECS["tiny"]["logn"]))
     try:
         dag = _prepared_dag(dataset="tiny", base_channels=4)
@@ -135,12 +135,12 @@ def test_u22_add_skip_consumer_conv_has_no_concat_fusion_in_provider_mode() -> N
         registry.attach_to_dag(dag)
         _set_compile_level(dag)
 
-        join = dag.nodes["add4"]["module"]
+        join = dag.nodes["cat4"]["module"]
         conv = dag.nodes["dec4a"]["module"]
 
-        assert type(join).__name__ == "Add"
-        assert conv.in_channels == dag.nodes["up4"]["module"].out_channels
-        assert not getattr(conv, "concat_fusion_specs", ())
+        assert type(join).__name__ == "Concat"
+        assert conv.in_channels == 2 * dag.nodes["up4"]["module"].out_channels
+        assert len(getattr(conv, "concat_fusion_specs", ()) or ()) == 2
         assert not getattr(conv, "_concat_transform_ids_by_input", [])
     finally:
         scheme.delete_scheme()

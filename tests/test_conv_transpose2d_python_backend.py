@@ -5,12 +5,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 import orion
+import orion.nn as on
 from orion.core import packing
+from orion.core.network_dag import NetworkDAG
 from orion.core.orion import scheme
+from orion.core.tracer import OrionTracer, StatsTracker
 from orion.backend.python.tensors import CipherTensor
 from orion.models.unet import MiniUNet
 from orion.nn.linear import ConvTranspose2d
 from orion.nn.module import Module
+from orion.nn.operations import Concat
 
 
 PYTHON_BACKEND_CONFIG = {
@@ -180,6 +184,9 @@ def test_mini_unet_runs_end_to_end_on_python_backend(embedding_method: str, batc
         orion.fit(net, x)
         input_level = orion.compile(net)
 
+        assert type(net.add).__name__ == "Add"
+        assert not getattr(net.out, "_concat_transform_ids_by_input", [])
+
         encrypted = orion.encrypt(orion.encode(x, input_level))
         net.he()
         fhe = net(encrypted).decrypt().decode()
@@ -188,6 +195,67 @@ def test_mini_unet_runs_end_to_end_on_python_backend(embedding_method: str, batc
         assert torch.allclose(fhe, clear, atol=1.0e-4, rtol=1.0e-4)
     finally:
         scheme.delete_scheme()
+
+
+def test_concat_stats_tracker_records_channel_sum_and_fusion_specs() -> None:
+    class TinyConcatNet(on.Module):
+        def __init__(self):
+            super().__init__()
+            self.left = on.Conv2d(1, 4, kernel_size=1, bias=True)
+            self.right = on.Conv2d(1, 4, kernel_size=1, bias=True)
+            self.add = on.Concat(dim=1)
+            self.out = on.Conv2d(8, 1, kernel_size=1, bias=True)
+
+        def forward(self, x):
+            return self.out(self.add(self.left(x), self.right(x)))
+
+    torch.manual_seed(0)
+    net = TinyConcatNet()
+    traced = OrionTracer().trace_model(net)
+    StatsTracker(traced).propagate(torch.randn(1, 1, 8, 8))
+    dag = NetworkDAG(traced)
+    dag.build_dag()
+
+    concat = dag.nodes["add"]["module"]
+    out = dag.nodes["out"]["module"]
+
+    assert type(concat).__name__ == "Concat"
+    assert tuple(concat.output_shape) == (1, 8, 8, 8)
+    assert tuple(concat.fhe_output_shape) == (1, 8, 8, 8)
+    assert int(concat.output_gap) == 1
+    assert len(getattr(out, "concat_fusion_specs", ()) or ()) == 2
+    assert [spec["channel_start"] for spec in out.concat_fusion_specs] == [0, 4]
+    assert [spec["channel_end"] for spec in out.concat_fusion_specs] == [4, 8]
+
+
+def test_concat_materialization_fallback_matches_channel_cat_on_python_backend() -> None:
+    active_scheme = orion.init_scheme(_python_backend_config())
+    Module.set_scheme(active_scheme)
+    Module.set_margin(active_scheme.params.get_margin())
+    try:
+        concat = Concat(dim=1)
+        concat.name = "concat_materialize_toy"
+        concat.set_level(len(active_scheme.params.get_logq()) - 1)
+        concat.configure_from_stats(
+            input_shapes=[torch.Size((1, 1, 2, 2)), torch.Size((1, 2, 2, 2))],
+            input_fhe_shapes=[torch.Size((1, 1, 2, 2)), torch.Size((1, 2, 2, 2))],
+            input_gaps=[1, 1],
+            output_shape=torch.Size((1, 3, 2, 2)),
+            fhe_output_shape=torch.Size((1, 3, 2, 2)),
+            output_gap=1,
+        )
+        concat.he_mode = True
+        level = len(active_scheme.params.get_logq()) - 1
+        left = torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)
+        right = (torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2) + 10.0)
+        left_ct = active_scheme.encrypt(active_scheme.encode(left, level))
+        right_ct = active_scheme.encrypt(active_scheme.encode(right, level))
+
+        out = concat(left_ct, right_ct).materialize().decrypt().decode().to(dtype=torch.float32)
+
+        assert torch.allclose(out.reshape(1, 3, 2, 2), torch.cat([left, right], dim=1), atol=1.0e-5)
+    finally:
+        active_scheme.delete_scheme()
 
 
 def test_python_encoder_preserves_explicit_level_zero() -> None:

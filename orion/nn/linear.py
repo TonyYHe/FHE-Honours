@@ -1,5 +1,6 @@
 import sys
 import math
+from types import SimpleNamespace
 from abc import abstractmethod
 
 import torch
@@ -27,6 +28,9 @@ class LinearTransform(Module):
             try:
                 for tid in self.transform_ids.values():
                     backend.DeleteLinearTransform(tid)
+                for transform_ids in getattr(self, "_concat_transform_ids_by_input", []) or []:
+                    for tid in dict(transform_ids).values():
+                        backend.DeleteLinearTransform(tid)
             except Exception:
                 pass # avoids errors for GC at program termination
 
@@ -227,6 +231,185 @@ class Conv2d(LinearTransform):
                 f"padding={self.padding}, dilation={self.dilation}, "
                 f"groups={self.groups}, " + super().extra_repr())
 
+    def _is_concat_cipher_tensor(self, value) -> bool:
+        return bool(type(value).__name__ == "ConcatCipherTensor" and hasattr(value, "parts"))
+
+    def _concat_fusion_specs(self):
+        return tuple(getattr(self, "concat_fusion_specs", ()) or ())
+
+    def _concat_fusion_supported(self) -> bool:
+        specs = self._concat_fusion_specs()
+        return bool(specs and int(getattr(self, "groups", 1)) == 1)
+
+    def _concat_layout_top_beta(self, layout: dict) -> int:
+        return max(0, int(dict(layout).get("top_beta", dict(layout).get("alpha", 0)) or 0))
+
+    def _concat_layout_bottom_beta(self, layout: dict) -> int:
+        return max(0, int(dict(layout).get("bottom_beta", dict(layout).get("beta", 0)) or 0))
+
+    def _concat_conv_input_layout_row(self) -> dict:
+        node = str(getattr(self, "name", "") or "")
+        specs = self._concat_fusion_specs()
+        concat_node = str(specs[0].get("concat_node", "")) if specs else ""
+        runtime = getattr(self, "region_runtime", None)
+        executor = getattr(runtime, "executor", None)
+        compile_plan = getattr(executor, "compile_plan", None)
+        if isinstance(compile_plan, dict):
+            for row in compile_plan.get("edge_layouts", []):
+                if str(row.get("target", "")) != node:
+                    continue
+                if concat_node and str(row.get("source", "")) != concat_node:
+                    continue
+                if str(row.get("op_kind", "")) != "conv2d":
+                    continue
+                return dict(row)
+        return {}
+
+    def _concat_source_input_layout(self, spec: dict) -> dict:
+        layout = dict(getattr(self, "layout_policy_input_layout", {}) or {})
+        if layout:
+            return layout
+        row = self._concat_conv_input_layout_row()
+        if row:
+            return dict(row.get("selected_layout", {}) or {})
+        return {}
+
+    def _concat_source_fhe_shape(self, spec: dict, layout: dict) -> torch.Size:
+        if not layout:
+            return torch.Size(spec["fhe_shape"])
+        n, channels, height, width = (int(value) for value in spec["shape"])
+        gap = max(1, int(dict(layout).get("gap", int(spec["gap"])) or int(spec["gap"])))
+        top_beta = self._concat_layout_top_beta(layout)
+        bottom_beta = self._concat_layout_bottom_beta(layout)
+        on_channels = int(math.ceil(int(channels) / float(gap * gap)))
+        return torch.Size(
+            (
+                int(n),
+                int(on_channels),
+                int(height * gap + (top_beta + bottom_beta) * gap),
+                int(width * gap),
+            )
+        )
+
+    def _concat_source_proxy(self, spec: dict, *, weight: torch.Tensor, name: str):
+        input_layout = self._concat_source_input_layout(spec)
+        input_gap = max(1, int(dict(input_layout).get("gap", int(spec["gap"])) or int(spec["gap"])))
+        input_top_beta = self._concat_layout_top_beta(input_layout)
+        return SimpleNamespace(
+            name=str(name),
+            scheme=self.scheme,
+            on_weight=weight,
+            on_bias=torch.zeros(int(self.out_channels), dtype=torch.float32),
+            input_shape=torch.Size(spec["shape"]),
+            output_shape=self.output_shape,
+            fhe_input_shape=self._concat_source_fhe_shape(spec, input_layout),
+            fhe_output_shape=self.fhe_output_shape,
+            input_gap=int(input_gap),
+            output_gap=int(self.output_gap),
+            groups=1,
+            in_channels=int(spec["channels"]),
+            out_channels=int(self.out_channels),
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            bsgs_ratio=float(self.bsgs_ratio),
+            level=self.level,
+            layout_policy_input_layout=dict(input_layout),
+            layout_policy_input_row_offset=int(input_top_beta * input_gap),
+            layout_policy_selected_input_layout=dict(input_layout),
+        )
+
+    def _generate_concat_fusion_diagonals(self, last: bool) -> bool:
+        if not self._concat_fusion_supported():
+            return False
+        self._concat_diagonals_by_input = []
+        self._concat_transform_ids_by_input = []
+        self._concat_output_rotations = 0
+        for input_index, spec in enumerate(self._concat_fusion_specs()):
+            start = int(spec["channel_start"])
+            end = int(spec["channel_end"])
+            weight = self.on_weight[:, start:end, :, :].detach().clone()
+            proxy = self._concat_source_proxy(
+                spec,
+                weight=weight,
+                name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
+            )
+            diagonals, output_rotations = packing.pack_conv2d(proxy, bool(last))
+            if int(input_index) == 0:
+                self._concat_output_rotations = int(output_rotations)
+            elif int(output_rotations) != int(self._concat_output_rotations):
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} produced inconsistent output rotations"
+                )
+            self._concat_diagonals_by_input.append(diagonals)
+        self.diagonals = {}
+        self.output_rotations = int(self._concat_output_rotations)
+        return True
+
+    def _compile_concat_fusion_transforms(self) -> bool:
+        if not self._concat_fusion_supported():
+            return False
+        diagonals_by_input = list(getattr(self, "_concat_diagonals_by_input", []) or [])
+        if not diagonals_by_input:
+            self._generate_concat_fusion_diagonals(last=False)
+            diagonals_by_input = list(getattr(self, "_concat_diagonals_by_input", []) or [])
+        bias = packing.construct_conv2d_bias(self)
+        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level - self.depth)
+        self._concat_transform_ids_by_input = []
+        for input_index, diagonals in enumerate(diagonals_by_input):
+            proxy = SimpleNamespace(
+                name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
+                diagonals=diagonals,
+                level=int(self.level),
+                bsgs_ratio=float(self.bsgs_ratio),
+                scheme=self.scheme,
+                output_shape=self.output_shape,
+                fhe_output_shape=self.fhe_output_shape,
+            )
+            self._concat_transform_ids_by_input.append(dict(self.scheme.lt_evaluator.generate_transforms(proxy)))
+        self.transform_ids = {}
+        self._transform_backend = self.scheme.backend
+        return True
+
+    def _concat_fusion_ready(self) -> bool:
+        return bool(getattr(self, "_concat_transform_ids_by_input", None))
+
+    def _evaluate_concat_fusion(self, concat_tensor):
+        parts = tuple(concat_tensor.parts)
+        transform_ids_by_input = list(getattr(self, "_concat_transform_ids_by_input", []) or [])
+        if len(parts) != len(transform_ids_by_input):
+            raise RuntimeError(
+                f"concat-fused Conv2d {getattr(self, 'name', '')} expected "
+                f"{len(transform_ids_by_input)} inputs, got {len(parts)}"
+            )
+        out = None
+        for input_index, source in enumerate(parts):
+            proxy = SimpleNamespace(
+                name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
+                transform_ids=dict(transform_ids_by_input[int(input_index)]),
+                level=int(self.level),
+                output_shape=self.output_shape,
+                fhe_output_shape=self.fhe_output_shape,
+            )
+            partial = self.scheme.lt_evaluator.evaluate_transforms(proxy, source)
+            if out is None:
+                out = partial
+            else:
+                if bool(getattr(out.scheme.backend, "align_addition_scales", False)):
+                    scale = max(1, int(out.scale()))
+                    out.set_scale(int(scale))
+                    partial.set_scale(int(scale))
+                out = out + partial
+        slots = self.scheme.params.get_slots()
+        for i in range(1, int(self.output_rotations) + 1):
+            out += out.roll(slots // (2**i))
+        out += self.on_bias_ptxt
+        release_owned = getattr(concat_tensor, "release_owned_parts", None)
+        if callable(release_owned):
+            release_owned()
+        return out
+
     def compute_fhe_output_gap(self, **kwargs):
         # Strided convolutions increase the multiplexed gap by a factor 
         # of the stride.
@@ -253,6 +436,8 @@ class Conv2d(LinearTransform):
             self.diagonals = {}
             self.output_rotations = 0
             return
+        if self._generate_concat_fusion_diagonals(last=bool(last)):
+            return
         runtime = getattr(self, "region_runtime", None)
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
         if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
@@ -270,6 +455,8 @@ class Conv2d(LinearTransform):
     def compile(self):
         if bool(getattr(self, "region_first_probe_dense_bypass", False)):
             self.transform_ids = {}
+            return
+        if self._compile_concat_fusion_transforms():
             return
         runtime = getattr(self, "region_runtime", None)
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
@@ -300,6 +487,10 @@ class Conv2d(LinearTransform):
 
     def forward(self, x):
         # Forward pass that handles both cleartext and FHE inference.
+        if self.he_mode and self._is_concat_cipher_tensor(x):
+            if self._concat_fusion_ready():
+                return self._evaluate_concat_fusion(x)
+            x = x.materialize()
         runtime = getattr(self, "region_runtime", None)
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
         if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)) and bool(runtime_supported):

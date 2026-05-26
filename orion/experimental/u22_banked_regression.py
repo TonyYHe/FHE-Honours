@@ -32,7 +32,7 @@ U22_BANKED_REGRESSION_CASES: dict[str, U22BankedRegressionCase] = {
         case_name="u4_tiny",
         dataset="tiny",
         node_name="up4",
-        expected_rotations=43,
+        expected_rotations=46,
         expected_conjugations=0,
         assumption="Mapped to UNet22(dataset='tiny') decoder node up4 because no repo-local runner/spec for the locked case was present.",
     ),
@@ -40,7 +40,7 @@ U22_BANKED_REGRESSION_CASES: dict[str, U22BankedRegressionCase] = {
         case_name="u4_mini",
         dataset="imagenet",
         node_name="up4",
-        expected_rotations=30,
+        expected_rotations=38,
         expected_conjugations=0,
         assumption="Mapped to UNet22(dataset='imagenet') up4; rotations use per-UnifiedTransformGroup shared-key union.",
     ),
@@ -234,6 +234,10 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
         observed_rotations = int(rotation_key_stats["group_union_rotation_count"])
 
         observed_conjugations = 0
+        kernel_kinds = {
+            str(getattr(executor, "kernel_kind", "")),
+            str(getattr(getattr(executor, "delegate", None), "kernel_kind", "")),
+        }
         payload = {
             "status": "ok" if max_abs <= 1.0e-4 else "failed",
             "case": str(case.case_name),
@@ -241,7 +245,10 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
             "dataset": str(case.dataset),
             "node": str(case.node_name),
             "local_lattigo": bool(str(backend) == "lattigo"),
-            "experimental_kernel": bool(getattr(executor, "kernel_kind", "") == "tconv_k2s2_gap_halving_experimental"),
+            "experimental_kernel": bool(
+                "halo_supported_tconv" in kernel_kinds
+                or "tconv_k2s2_gap_halving_experimental" in kernel_kinds
+            ),
             "supports_scheme": bool(runtime.supports_scheme(scheme)),
             "strategy": str(getattr(runtime, "strategy", "")),
             "materializer": str(getattr(runtime, "materializer", "")),

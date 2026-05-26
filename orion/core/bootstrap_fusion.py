@@ -19,7 +19,11 @@ def runtime_fhe_output_shape(module: Any) -> torch.Size | Any:
 
     runtime = getattr(module, "region_runtime", None)
     executor = getattr(runtime, "executor", None) if runtime is not None else None
-    for candidate in (executor, getattr(module, "layout_policy_add_runtime", None)):
+    for candidate in (
+        executor,
+        getattr(module, "layout_policy_add_runtime", None),
+        getattr(module, "layout_policy_concat_runtime", None),
+    ):
         get_shape = getattr(candidate, "runtime_fhe_output_shape", None)
         if callable(get_shape):
             shape = get_shape()
@@ -46,6 +50,21 @@ def module_bootstrap_slots(module: Any) -> int:
     if shape is None:
         return 0
     return bootstrap_slots_for_shape(shape, max_slots=int(get_slots()))
+
+
+def module_bootstrap_ct_count(module: Any) -> int:
+    scheme = getattr(module, "scheme", None)
+    params = getattr(scheme, "params", None)
+    get_slots = getattr(params, "get_slots", None)
+    if not callable(get_slots):
+        return 0
+    shape = runtime_fhe_output_shape(module)
+    if shape is None:
+        return 0
+    elements = int(torch.Size(shape).numel())
+    if int(elements) <= 0:
+        return 0
+    return int(math.ceil(int(elements) / float(int(get_slots()))))
 
 
 def module_uses_full_bootstrap_slots(module: Any) -> bool:
@@ -142,6 +161,7 @@ def install_bootstrap_prescale_fusion(module: Any, bootstrapper: Any) -> bool:
         for candidate in (
             getattr(getattr(module, "region_runtime", None), "executor", None),
             getattr(module, "layout_policy_add_runtime", None),
+            getattr(module, "layout_policy_concat_runtime", None),
         ):
             if candidate is not None:
                 setattr(candidate, "_bootstrap_prescale_fusion", dict(affine))

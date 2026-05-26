@@ -72,6 +72,32 @@ def test_montgomery_lung64_forward_shape_on_small_base() -> None:
     assert tuple(out.shape) == (1, 1, 64, 64)
 
 
+def test_unet22_uses_concat_decoder_skips() -> None:
+    model = UNet22(dataset="tiny", base_dim=4)
+
+    assert type(model.cat4).__name__ == "Concat"
+    assert model.dec4a.in_channels == 2 * model.up4.out_channels
+    assert model.dec3a.in_channels == 2 * model.up3.out_channels
+    assert model.dec2a.in_channels == 2 * model.up2.out_channels
+    assert model.dec1a.in_channels == 2 * model.up1.out_channels
+
+
+@pytest.mark.parametrize(
+    ("name", "shape", "expected_channels"),
+    [
+        ("medical64", (1, 1, 64, 64), 1),
+        ("medical256", (1, 3, 256, 256), 1),
+    ],
+)
+def test_medical_unet22_forward_shapes_on_small_base(name: str, shape: tuple[int, ...], expected_channels: int) -> None:
+    model = get_unet22_medical_model(name, base_dim=4)
+    model.eval()
+
+    out = model(torch.randn(*shape))
+
+    assert tuple(out.shape) == (shape[0], expected_channels, shape[2], shape[3])
+
+
 def test_unknown_medical_spec_errors_clearly() -> None:
     with pytest.raises(ValueError, match="Unknown UNet22 medical model"):
         get_unet22_medical_spec("not_a_dataset")

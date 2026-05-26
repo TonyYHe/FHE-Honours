@@ -64,6 +64,9 @@ def test_operations():
     
     add = on.Add()
     assert isinstance(add, on.Add)
+
+    concat = on.Concat(dim=1)
+    assert isinstance(concat, on.Concat)
     
     mult = on.Mult()
     assert isinstance(mult, on.Mult)

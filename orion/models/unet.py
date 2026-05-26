@@ -186,8 +186,8 @@ class UNet22(on.Module):
     A compact 22-layer U-Net-style encoder/decoder.
 
     The layout follows four downsample stages, a two-conv bottleneck, and four
-    transposed-conv decoder stages. Skip paths use additive merges so the model
-    stays compatible with Orion's current operator set.
+    transposed-conv decoder stages. Skip paths use channel concatenation, the
+    standard U-Net decoder merge.
     """
 
     def __init__(
@@ -256,29 +256,29 @@ class UNet22(on.Module):
         self.bottleneckb_act = make_act()
 
         self.up4 = on.ConvTranspose2d(c5, c4, kernel_size=2, stride=2, bias=True)
-        self.add4 = on.Add()
-        self.dec4a = on.Conv2d(c4, c4, kernel_size=3, padding=1, bias=True)
+        self.cat4 = on.Concat(dim=1)
+        self.dec4a = on.Conv2d(c4 + c4, c4, kernel_size=3, padding=1, bias=True)
         self.dec4a_act = make_act()
         self.dec4b = on.Conv2d(c4, c4, kernel_size=3, padding=1, bias=True)
         self.dec4b_act = make_act()
 
         self.up3 = on.ConvTranspose2d(c4, c3, kernel_size=2, stride=2, bias=True)
-        self.add3 = on.Add()
-        self.dec3a = on.Conv2d(c3, c3, kernel_size=3, padding=1, bias=True)
+        self.cat3 = on.Concat(dim=1)
+        self.dec3a = on.Conv2d(c3 + c3, c3, kernel_size=3, padding=1, bias=True)
         self.dec3a_act = make_act()
         self.dec3b = on.Conv2d(c3, c3, kernel_size=3, padding=1, bias=True)
         self.dec3b_act = make_act()
 
         self.up2 = on.ConvTranspose2d(c3, c2, kernel_size=2, stride=2, bias=True)
-        self.add2 = on.Add()
-        self.dec2a = on.Conv2d(c2, c2, kernel_size=3, padding=1, bias=True)
+        self.cat2 = on.Concat(dim=1)
+        self.dec2a = on.Conv2d(c2 + c2, c2, kernel_size=3, padding=1, bias=True)
         self.dec2a_act = make_act()
         self.dec2b = on.Conv2d(c2, c2, kernel_size=3, padding=1, bias=True)
         self.dec2b_act = make_act()
 
         self.up1 = on.ConvTranspose2d(c2, c1, kernel_size=2, stride=2, bias=True)
-        self.add1 = on.Add()
-        self.dec1a = on.Conv2d(c1, c1, kernel_size=3, padding=1, bias=True)
+        self.cat1 = on.Concat(dim=1)
+        self.dec1a = on.Conv2d(c1 + c1, c1, kernel_size=3, padding=1, bias=True)
         self.dec1a_act = make_act()
         self.dec1b = on.Conv2d(c1, out_channels, kernel_size=3, padding=1, bias=True)
 
@@ -298,13 +298,13 @@ class UNet22(on.Module):
         x = _apply_u22_activation(self.bottlenecka_act, self.bottlenecka(self.pool4(skip4)))
         x = _apply_u22_activation(self.bottleneckb_act, self.bottleneckb(x))
 
-        x = _apply_u22_activation(self.dec4a_act, self.dec4a(self.add4(self.up4(x), skip4)))
+        x = _apply_u22_activation(self.dec4a_act, self.dec4a(self.cat4(self.up4(x), skip4)))
         x = _apply_u22_activation(self.dec4b_act, self.dec4b(x))
-        x = _apply_u22_activation(self.dec3a_act, self.dec3a(self.add3(self.up3(x), skip3)))
+        x = _apply_u22_activation(self.dec3a_act, self.dec3a(self.cat3(self.up3(x), skip3)))
         x = _apply_u22_activation(self.dec3b_act, self.dec3b(x))
-        x = _apply_u22_activation(self.dec2a_act, self.dec2a(self.add2(self.up2(x), skip2)))
+        x = _apply_u22_activation(self.dec2a_act, self.dec2a(self.cat2(self.up2(x), skip2)))
         x = _apply_u22_activation(self.dec2b_act, self.dec2b(x))
-        x = _apply_u22_activation(self.dec1a_act, self.dec1a(self.add1(self.up1(x), skip1)))
+        x = _apply_u22_activation(self.dec1a_act, self.dec1a(self.cat1(self.up1(x), skip1)))
         x = self.dec1b(x)
         return x
 

@@ -32,6 +32,53 @@ class NetworkDAG(nx.DiGraph):
                 self.add_node(node.name, fx_node=node, op=node.op, module=module)
                 for input_node in node.all_input_nodes:
                     self.add_edge(input_node.name, node.name)
+        self.attach_concat_fusion_specs()
+
+    def attach_concat_fusion_specs(self):
+        """Annotate Conv2d consumers that can fuse a preceding channel concat."""
+
+        for node in list(self.nodes):
+            module = self.nodes[node].get("module")
+            if type(module).__name__ != "Concat":
+                continue
+            fx_node = self.nodes[node].get("fx_node")
+            input_nodes = tuple(getattr(fx_node, "all_input_nodes", ()) or ())
+            if not input_nodes:
+                input_nodes = tuple(
+                    self.nodes[pred].get("fx_node")
+                    for pred in self.predecessors(node)
+                    if self.nodes[pred].get("fx_node") is not None
+                )
+            input_shapes = tuple(getattr(module, "concat_input_shapes", ()) or ())
+            input_fhe_shapes = tuple(getattr(module, "concat_input_fhe_shapes", ()) or ())
+            input_gaps = tuple(getattr(module, "concat_input_gaps", ()) or ())
+            if not input_shapes or len(input_shapes) != len(input_nodes):
+                continue
+            specs = []
+            channel_start = 0
+            for index, input_node in enumerate(input_nodes):
+                shape = input_shapes[int(index)]
+                channels = int(shape[1])
+                specs.append(
+                    {
+                        "concat_node": str(node),
+                        "source": str(input_node.name),
+                        "shape": tuple(int(value) for value in shape),
+                        "fhe_shape": tuple(int(value) for value in input_fhe_shapes[int(index)]),
+                        "gap": int(input_gaps[int(index)]),
+                        "channels": int(channels),
+                        "channel_start": int(channel_start),
+                        "channel_end": int(channel_start + channels),
+                    }
+                )
+                channel_start += int(channels)
+            for successor in self.successors(node):
+                successor_module = self.nodes[successor].get("module")
+                if type(successor_module).__name__ != "Conv2d":
+                    continue
+                if int(getattr(successor_module, "in_channels", -1)) != int(channel_start):
+                    continue
+                successor_module.concat_fusion_specs = tuple(dict(spec) for spec in specs)
 
     def find_residuals(self):
         """Finds pairs of fork/join nodes representing residual connections. 

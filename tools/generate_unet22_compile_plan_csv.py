@@ -26,7 +26,7 @@ from orion.models.unet import UNet22, _apply_u22_activation, _make_u22_activatio
 from orion.nn.module import Module
 from orion.nn.activation import SiLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
-from orion.nn.operations import Add
+from orion.nn.operations import Add, Concat
 from orion.nn.pooling import AvgPool2d
 import orion.nn as on
 
@@ -121,13 +121,13 @@ class UNet22PlusOutput(UNet22):
         x = _apply_u22_activation(self.bottlenecka_act, self.bottlenecka(self.pool4(skip4)))
         x = _apply_u22_activation(self.bottleneckb_act, self.bottleneckb(x))
 
-        x = _apply_u22_activation(self.dec4a_act, self.dec4a(self.add4(self.up4(x), skip4)))
+        x = _apply_u22_activation(self.dec4a_act, self.dec4a(self.cat4(self.up4(x), skip4)))
         x = _apply_u22_activation(self.dec4b_act, self.dec4b(x))
-        x = _apply_u22_activation(self.dec3a_act, self.dec3a(self.add3(self.up3(x), skip3)))
+        x = _apply_u22_activation(self.dec3a_act, self.dec3a(self.cat3(self.up3(x), skip3)))
         x = _apply_u22_activation(self.dec3b_act, self.dec3b(x))
-        x = _apply_u22_activation(self.dec2a_act, self.dec2a(self.add2(self.up2(x), skip2)))
+        x = _apply_u22_activation(self.dec2a_act, self.dec2a(self.cat2(self.up2(x), skip2)))
         x = _apply_u22_activation(self.dec2b_act, self.dec2b(x))
-        x = _apply_u22_activation(self.dec1a_act, self.dec1a(self.add1(self.up1(x), skip1)))
+        x = _apply_u22_activation(self.dec1a_act, self.dec1a(self.cat1(self.up1(x), skip1)))
         x = _apply_u22_activation(self.dec1b_act, self.dec1b(x))
         return self.output(x)
 
@@ -369,6 +369,8 @@ def _provider_static_support(module: Any) -> tuple[bool | str, str, str]:
         return "", "chebyshev_polynomial_activation", "not_a_provider_linear_kernel"
     if isinstance(module, Add):
         return "", "add_runtime_or_dense_add", "not_a_provider_linear_kernel"
+    if isinstance(module, Concat):
+        return "", "concat_runtime_or_consumer_fusion", "not_a_provider_linear_kernel"
     return "", "", "not_a_provider_linear_kernel"
 
 
