@@ -209,7 +209,7 @@ def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
         int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
         for row in always["edge_layouts"]
     )
-    assert dp["relayouts"] == 0
+    assert dp["relayouts"] == 4
     assert dp["halo_redundancy_ratio"] >= 0.0
 
 
@@ -233,7 +233,7 @@ def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() ->
             int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
-    assert _policy(payload, "dp")["relayouts"] == 0
+    assert _policy(payload, "dp")["relayouts"] == 3
 
 
 def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layouts() -> None:
@@ -245,18 +245,25 @@ def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layout
     assert runtime_count("fixed_max") == (30, 5)
     assert runtime_count("always") == (30, 33)
     assert runtime_count("greedy") == (30, 4)
-    assert runtime_count("dp") == (30, 0)
+    assert runtime_count("dp") == (30, 4)
 
 
-def test_u22_64_layout_policy_planner_aligns_add_inputs() -> None:
+def test_u22_64_layout_policy_planner_aligns_concat_inputs() -> None:
     payload = build_planner_ablation(network="u22_64_base32")
 
     for policy in payload["policies"]:
         rows = list(policy["edge_layouts"])
-        for add_node in ("add4", "add3", "add2", "add1"):
-            incoming = [row for row in rows if row["target"] == add_node]
+        for concat_node in ("cat4", "cat3", "cat2", "cat1"):
+            incoming = [row for row in rows if row["target"] == concat_node]
             assert len(incoming) == 2
             assert len({_layout_key(row) for row in incoming}) == 1
+            assert len({str(row["target_physical_layout"]) for row in incoming}) == 1
+            for row in incoming:
+                if (
+                    str(row.get("source_physical_layout", "")) == "packed_compact"
+                    and str(row.get("target_physical_layout", "")) == "logical_halo_compact"
+                ):
+                    assert bool(row["relayout"]) is True
 
 
 def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> None:
@@ -960,10 +967,16 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     ]
     node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
     edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
-    assert int(compile_plan["relayout_edge_count"]) == 0
+    assert int(compile_plan["relayout_edge_count"]) == 4
     assert int(compile_plan["output_relayout_node_count"]) == 0
     assert producer_halo_nodes
-    assert producer_fused_edges
+    assert producer_fused_edges == []
+    assert {str(row["edge"]) for row in compile_plan["relayout_edges"]} == {
+        "enc1b->cat1",
+        "enc2b->cat2",
+        "enc3b->cat3",
+        "enc4b->cat4",
+    }
     for pool_node in ("pool1", "pool2", "pool3", "pool4"):
         pool_layout = dict(node_rows[pool_node]["selected_layout"])
         assert bool(node_rows[pool_node].get("producer_materialized_halo", False)) is True
@@ -1044,23 +1057,23 @@ def test_layout_policy_dp_treats_silu_as_layout_preserving() -> None:
     assert dict(enc1a_act_to_enc1b["source_layout"]) == dict(enc1a_act_to_enc1b["selected_layout"])
 
 
-def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback() -> None:
+def test_layout_policy_dp_can_avoid_tconv_concat_relayout_with_shared_conv_fallback() -> None:
     dag = build_u22_dag(network_spec("u22_256_base32"))
     compile_plan = build_layout_policy_compile_plan(dag, policy="dp")
     node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
     edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
 
     for up_node, join_node, join_edge, consumer_edge in (
-        ("up3", "add3", "up3->add3", "add3->dec3a"),
-        ("up2", "add2", "up2->add2", "add2->dec2a"),
-        ("up1", "add1", "up1->add1", "add1->dec1a"),
+        ("up3", "cat3", "up3->cat3", "cat3->dec3a"),
+        ("up2", "cat2", "up2->cat2", "cat2->dec2a"),
+        ("up1", "cat1", "up1->cat1", "cat1->dec1a"),
     ):
         up_layout = dict(node_rows[up_node]["selected_layout"])
         join_layout = dict(node_rows[join_node]["selected_layout"])
         up_join = dict(edge_rows[join_edge])
         join_dec = dict(edge_rows[consumer_edge])
 
-        assert up_join["op_kind"] == "add"
+        assert up_join["op_kind"] == "concat"
         assert bool(up_join["relayout"]) is False
         assert int(up_layout["top_beta"]) == int(join_layout["top_beta"])
         assert int(up_layout["bottom_beta"]) == int(join_layout["bottom_beta"])
@@ -1076,7 +1089,7 @@ def test_layout_policy_dp_can_avoid_tconv_add_relayout_with_shared_conv_fallback
         assert bool(join_dec["consumer_fused_relayout"]) is True
 
 
-def test_one_down_one_up_silu_dp_fuses_relayout_without_bootstrap_growth() -> None:
+def test_one_down_one_up_silu_dp_accounts_for_join_relayout_without_bootstrap_growth() -> None:
     _init_long_python_scheme("")
     try:
         greedy_dag = _prepared_one_down_one_up_dag(image_size=192, base_channels=8)
@@ -1084,8 +1097,9 @@ def test_one_down_one_up_silu_dp_fuses_relayout_without_bootstrap_growth() -> No
         greedy_plan = build_layout_policy_compile_plan(greedy_dag, policy="greedy")
         dp_plan = build_layout_policy_compile_plan(dp_dag, policy="dp")
 
-        assert int(dp_plan["summary"]["relayout_depth_estimate"]) == 0
-        assert int(dp_plan["summary"]["relayouts"]) == 0
+        assert int(dp_plan["summary"]["relayout_depth_estimate"]) == 1
+        assert int(dp_plan["summary"]["relayouts"]) == 1
+        assert {str(row["edge"]) for row in dp_plan["relayout_edges"]} == {"enc_act->add"}
         assert int(dp_plan["summary"]["consumer_fused_relayout_count"]) > 0
         assert int(dp_plan["summary"]["total_ciphertext_tiles"]) < int(
             greedy_plan["summary"]["total_ciphertext_tiles"]
@@ -1119,7 +1133,7 @@ def test_one_down_one_up_silu_dp_fuses_relayout_without_bootstrap_growth() -> No
             ).solve()
             boot_counts[str(policy)] = int(bootstraps)
             if str(policy) == "dp":
-                assert int(audit["graph_audit"]["layout_policy_summary"]["relayout_depth_estimate"]) == 0
+                assert int(audit["graph_audit"]["layout_policy_summary"]["relayout_depth_estimate"]) == 1
                 mid_executor = dag.nodes["mid"]["module"].region_runtime.executor
                 assert isinstance(mid_executor, LayoutPolicyProviderRuntimeExecutor)
                 assert mid_executor.compact_align_shared_rows

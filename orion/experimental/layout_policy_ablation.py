@@ -2486,6 +2486,41 @@ def _layout_has_halo(layout: LayoutState) -> bool:
     return bool(int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0)
 
 
+def _compact_packing_for_layout(layout: LayoutState) -> str:
+    return PHYSICAL_LOGICAL_HALO if _layout_has_halo(layout) else PHYSICAL_COMPACT
+
+
+def _join_source_layout_for_physical(
+    edge: EdgeInfo,
+    source_layout: LayoutState,
+    source_physical: str,
+) -> LayoutState:
+    if str(source_physical) != PHYSICAL_COMPACT:
+        return source_layout
+    return _layout_for_shape(
+        shape=edge.shape,
+        gap=int(source_layout.gap),
+        top_beta=0,
+        bottom_beta=0,
+        stride=int(source_layout.stride),
+        slots=int(edge.slots),
+    )
+
+
+def _join_input_requires_relayout(
+    source_layout: LayoutState,
+    source_physical: str,
+    target_layout: LayoutState,
+) -> bool:
+    source_packing = str(source_physical or _compact_packing_for_layout(source_layout))
+    target_packing = _compact_packing_for_layout(target_layout)
+    if source_packing != target_packing:
+        return True
+    if source_packing == PHYSICAL_COMPACT:
+        return False
+    return not _same_physical_layout(source_layout, target_layout)
+
+
 def _is_join_module(module: Any | None) -> bool:
     return type(module).__name__ in {"Add", "Concat"}
 
@@ -2698,7 +2733,17 @@ def _plan_non_dp_topological(
             )
             for edge in incoming:
                 source_layout = live[edge.source]
-                relayout = bool(force_every_relayout) or not _same_physical_layout(source_layout, target_layout)
+                source_physical = live_physical.get(str(edge.source), _compact_packing_for_layout(source_layout))
+                physical_source_layout = _join_source_layout_for_physical(
+                    edge,
+                    source_layout,
+                    str(source_physical),
+                )
+                relayout = bool(force_every_relayout) or _join_input_requires_relayout(
+                    physical_source_layout,
+                    str(source_physical),
+                    target_layout,
+                )
                 if bool(relayout):
                     relayout_layouts.append(target_layout)
                 incoming_rows.append(
@@ -2708,7 +2753,9 @@ def _plan_non_dp_topological(
                         relayout=bool(relayout),
                         relayout_reason=f"{policy}_add_input_alignment" if bool(relayout) else "",
                         lt_rotations=_lt_rotations(edge, target_layout),
-                        source_layout=source_layout,
+                        source_layout=physical_source_layout,
+                        source_physical_layout=str(source_physical),
+                        physical_layout=_compact_packing_for_layout(target_layout),
                     )
                 )
         else:
@@ -3758,7 +3805,11 @@ def _incoming_non_add_options(
     return _estimate_candidate_options(candidates, estimator=estimator)
 
 
-def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutState]) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
+def _incoming_add_options(
+    incoming: Sequence[EdgeInfo],
+    live: dict[str, LayoutState],
+    live_physical: dict[str, str],
+) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
     source_layouts = [live[edge.source] for edge in incoming]
     candidates: list[LayoutState] = []
     if incoming:
@@ -3779,11 +3830,19 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
     for target_layout in _dedupe_layouts(candidates):
         rows: list[dict[str, Any]] = []
         relayouts: list[LayoutState] = []
-        fused_rows: list[dict[str, Any]] = []
-        fused_relayouts: list[LayoutState] = []
         for edge in incoming:
             source_layout = live[edge.source]
-            relayout = not _same_physical_layout(source_layout, target_layout)
+            source_physical = live_physical.get(str(edge.source), _compact_packing_for_layout(source_layout))
+            physical_source_layout = _join_source_layout_for_physical(
+                edge,
+                source_layout,
+                str(source_physical),
+            )
+            relayout = _join_input_requires_relayout(
+                physical_source_layout,
+                str(source_physical),
+                target_layout,
+            )
             if bool(relayout):
                 relayouts.append(target_layout)
             rows.append(
@@ -3793,35 +3852,12 @@ def _incoming_add_options(incoming: Sequence[EdgeInfo], live: dict[str, LayoutSt
                     relayout=bool(relayout),
                     relayout_reason="dp_add_input_alignment" if bool(relayout) else "",
                     lt_rotations=_lt_rotations(edge, target_layout),
-                    source_layout=source_layout,
+                    source_layout=physical_source_layout,
+                    source_physical_layout=str(source_physical),
+                    physical_layout=_compact_packing_for_layout(target_layout),
                 )
             )
-            source_has_halo = bool(int(source_layout.top_beta) > 0 or int(source_layout.bottom_beta) > 0)
-            target_has_halo = bool(int(target_layout.top_beta) > 0 or int(target_layout.bottom_beta) > 0)
-            source_fusable = bool(relayout and target_has_halo and not source_has_halo)
-            if bool(source_fusable):
-                fused_rows.append(
-                    _edge_row(
-                        edge,
-                        target_layout,
-                        relayout=False,
-                        relayout_reason="",
-                        lt_rotations=_lt_rotations(edge, target_layout),
-                        layout_mode="producer_fused_relayout",
-                        source_layout=source_layout,
-                        source_physical_layout=PHYSICAL_COMPACT,
-                        physical_layout=PHYSICAL_LOGICAL_HALO,
-                        producer_fused_relayout=True,
-                        producer_fused_rotation_estimate=0,
-                    )
-                )
-            else:
-                fused_rows.append(rows[-1])
-                if bool(relayout):
-                    fused_relayouts.append(target_layout)
         options.append((rows, relayouts))
-        if any(bool(row.get("producer_fused_relayout", False)) for row in fused_rows):
-            options.append((fused_rows, fused_relayouts))
     return tuple(options)
 
 
@@ -3867,7 +3903,7 @@ def _plan_dp(
             if any(edge.source not in live for edge in incoming):
                 continue
             if incoming and _is_join_module(dag.nodes[node].get("module")):
-                incoming_options = _incoming_add_options(incoming, live)
+                incoming_options = _incoming_add_options(incoming, live, live_physical)
             else:
                 incoming_options_work: tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...] = (([], []),)
                 for edge in incoming:
