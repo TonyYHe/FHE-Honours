@@ -122,6 +122,17 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
     "eval_s",
     "eval_total_s",
     "unload_s",
+    "cpp_plan_s",
+    "cpp_level_adjust_s",
+    "cpp_baby_step_s",
+    "cpp_giant_step_s",
+    "stream_build_map_s",
+    "stream_encode_hoist_s",
+    "stream_load_payload_s",
+    "stream_eval_s",
+    "stream_accumulate_s",
+    "cpp_push_s",
+    "cpp_trim_s",
 )
 
 
@@ -135,20 +146,32 @@ def _append_runtime_group(groups: list[Any], seen: set[int], group: Any) -> None
 def _executor_unified_groups(executor: Any) -> list[Any]:
     groups: list[Any] = []
     seen: set[int] = set()
+
+    def emit_value(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for _key, child in sorted(value.items()):
+                emit_value(child)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for child in list(value):
+                emit_value(child)
+            return
+        _append_runtime_group(groups, seen, value)
+
     for candidate in _walk_executor_objects(executor):
-        _append_runtime_group(groups, seen, getattr(candidate, "group", None))
-        for attr in ("groups", "groups_by_input_block", "groups_by_input_chunk", "groups_by_pair"):
-            value = getattr(candidate, attr, None)
-            if isinstance(value, dict):
-                for _key, group in sorted(value.items()):
-                    _append_runtime_group(groups, seen, group)
-            else:
-                for group in list(value or []):
-                    _append_runtime_group(groups, seen, group)
-        groups_by_input_index = getattr(candidate, "groups_by_input_index", None)
-        if isinstance(groups_by_input_index, dict):
-            for _key, group in sorted(groups_by_input_index.items()):
-                _append_runtime_group(groups, seen, group)
+        for attr in (
+            "group",
+            "groups",
+            "groups_by_input_block",
+            "groups_by_input_chunk",
+            "groups_by_pair",
+            "groups_by_input_index",
+            "groups_by_source",
+            "_concat_unified_groups_by_input",
+        ):
+            emit_value(getattr(candidate, attr, None))
     return groups
 
 
@@ -202,6 +225,13 @@ def _aggregate_runtime_fairness(timings: list[dict[str, Any]], *, serving_hot_s:
 def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> dict[str, Any]:
     timings: list[dict[str, Any]] = []
     for _module_name, module in net.named_modules():
+        layer_timing = getattr(module, "_last_runtime_timing", None)
+        if isinstance(layer_timing, dict):
+            timings.append(dict(layer_timing))
+        for group in _executor_unified_groups(module):
+            timing = getattr(group, "last_runtime_timing", None)
+            if isinstance(timing, dict):
+                timings.append(dict(timing))
         executor = getattr(getattr(module, "region_runtime", None), "executor", None)
         for group in _executor_unified_groups(executor):
             timing = getattr(group, "last_runtime_timing", None)
@@ -1638,6 +1668,9 @@ def _iter_unified_groups(executor: Any):
         else:
             iterable = [value]
         for item in iterable:
+            if isinstance(item, (dict, list, tuple, set)):
+                yield from emit(item)
+                continue
             if item is None or not hasattr(item, "last_runtime_timing"):
                 continue
             if id(item) in seen:
@@ -1654,6 +1687,7 @@ def _iter_unified_groups(executor: Any):
         "groups_by_input_chunk",
         "groups_by_input_index",
         "groups_by_source",
+        "_concat_unified_groups_by_input",
     ):
         yield from emit(getattr(executor, attr, None))
 
@@ -1877,11 +1911,93 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
         "lt_runtime_stream_build_map_s": 0.0,
         "lt_runtime_stream_encode_hoist_s": 0.0,
         "lt_runtime_stream_load_payload_s": 0.0,
+        "lt_runtime_stream_eval_s": 0.0,
+        "lt_runtime_stream_accumulate_s": 0.0,
         "lt_runtime_trim_unload_s": 0.0,
         "executor_postprocess_s": 0.0,
         "executor_rescale_s": 0.0,
         "executor_accumulate_s": 0.0,
     }
+
+    def add_timing_row(
+        *,
+        module_name: str,
+        module: torch.nn.Module,
+        executor_label: str,
+        storage_key: str,
+        transform_count: int,
+        timing: dict[str, Any],
+    ) -> None:
+        serving = _timing_float(timing, "serving_hot_s")
+        eval_total = (
+            _timing_float(timing, "eval_total_s")
+            or _timing_float(timing, "eval_s")
+            or serving
+        )
+        if serving <= 0.0 and eval_total <= 0.0:
+            return
+        mvm_kernel = _group_mvm_kernel_s(timing)
+        load_encode = _group_load_encode_s(timing)
+        trim_unload = float(
+            _timing_float(timing, "unload_s")
+            + _timing_float(timing, "trim_s")
+            + _timing_float(timing, "cpp_trim_s")
+        )
+        row = {
+            "module_path": str(module_name),
+            "node": str(getattr(module, "region_output_id", module_name)),
+            "executor": str(executor_label),
+            "storage_key": str(storage_key),
+            "transform_count": int(transform_count),
+            "runtime_fairness_mode": str(timing.get("runtime_fairness_mode", "unknown")),
+            "mvm_kernel_s": float(mvm_kernel),
+            "mvm_eval_total_s": float(eval_total),
+            "lt_runtime_load_encode_s": float(load_encode),
+            "lt_runtime_trim_unload_s": float(trim_unload),
+            "timing": dict(timing),
+        }
+        group_rows.append(row)
+        totals["group_count"] += 1
+        totals["mvm_kernel_s"] += float(mvm_kernel)
+        totals["mvm_eval_total_s"] += float(eval_total)
+        totals["lt_runtime_load_encode_s"] += float(load_encode)
+        totals["lt_runtime_read_bundle_s"] += _timing_float(timing, "read_bundle_s")
+        totals["lt_runtime_load_keys_s"] += _timing_float(timing, "load_keys_s")
+        totals["lt_runtime_load_plaintexts_s"] += _timing_float(timing, "load_plaintexts_s")
+        totals["lt_runtime_stream_build_map_s"] += _timing_float(timing, "stream_build_map_s")
+        totals["lt_runtime_stream_encode_hoist_s"] += _timing_float(timing, "stream_encode_hoist_s")
+        totals["lt_runtime_stream_load_payload_s"] += _timing_float(timing, "stream_load_payload_s")
+        totals["lt_runtime_stream_eval_s"] += _timing_float(timing, "stream_eval_s")
+        totals["lt_runtime_stream_accumulate_s"] += _timing_float(timing, "stream_accumulate_s")
+        totals["lt_runtime_trim_unload_s"] += float(trim_unload)
+
+    for module_name, module in net.named_modules():
+        layer_timing = dict(getattr(module, "_last_runtime_timing", {}) or {})
+        if layer_timing:
+            add_timing_row(
+                module_name=str(module_name),
+                module=module,
+                executor_label=f"{type(module).__name__}._last_runtime_timing",
+                storage_key="",
+                transform_count=0,
+                timing=layer_timing,
+            )
+        for group in _iter_unified_groups(module):
+            if id(group) in seen_groups:
+                continue
+            seen_groups.add(id(group))
+            timing = dict(getattr(group, "last_runtime_timing", {}) or {})
+            if not timing:
+                continue
+            add_timing_row(
+                module_name=str(module_name),
+                module=module,
+                executor_label=f"{type(module).__name__}.module_group",
+                storage_key=str(getattr(group, "_storage_key", "")),
+                transform_count=int(len(getattr(group, "unified_ids", []) or [])),
+                timing=timing,
+            )
+
     for module_name, module, executor in _iter_runtime_executors(net):
         executor_timing = dict(getattr(executor, "last_runtime_timing", {}) or {})
         if executor_timing:
@@ -1917,46 +2033,14 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
             timing = dict(getattr(group, "last_runtime_timing", {}) or {})
             if not timing:
                 continue
-            serving = _timing_float(timing, "serving_hot_s")
-            eval_total = (
-                _timing_float(timing, "eval_total_s")
-                or _timing_float(timing, "eval_s")
-                or serving
+            add_timing_row(
+                module_name=str(module_name),
+                module=module,
+                executor_label=type(executor).__name__,
+                storage_key=str(getattr(group, "_storage_key", "")),
+                transform_count=int(len(getattr(group, "unified_ids", []) or [])),
+                timing=timing,
             )
-            if serving <= 0.0 and eval_total <= 0.0:
-                continue
-            mvm_kernel = _group_mvm_kernel_s(timing)
-            load_encode = _group_load_encode_s(timing)
-            trim_unload = float(
-                _timing_float(timing, "unload_s")
-                + _timing_float(timing, "trim_s")
-                + _timing_float(timing, "cpp_trim_s")
-            )
-            row = {
-                "module_path": str(module_name),
-                "node": str(getattr(module, "region_output_id", module_name)),
-                "executor": type(executor).__name__,
-                "storage_key": str(getattr(group, "_storage_key", "")),
-                "transform_count": int(len(getattr(group, "unified_ids", []) or [])),
-                "runtime_fairness_mode": str(timing.get("runtime_fairness_mode", "unknown")),
-                "mvm_kernel_s": float(mvm_kernel),
-                "mvm_eval_total_s": float(eval_total),
-                "lt_runtime_load_encode_s": float(load_encode),
-                "lt_runtime_trim_unload_s": float(trim_unload),
-                "timing": timing,
-            }
-            group_rows.append(row)
-            totals["group_count"] += 1
-            totals["mvm_kernel_s"] += float(mvm_kernel)
-            totals["mvm_eval_total_s"] += float(eval_total)
-            totals["lt_runtime_load_encode_s"] += float(load_encode)
-            totals["lt_runtime_read_bundle_s"] += _timing_float(timing, "read_bundle_s")
-            totals["lt_runtime_load_keys_s"] += _timing_float(timing, "load_keys_s")
-            totals["lt_runtime_load_plaintexts_s"] += _timing_float(timing, "load_plaintexts_s")
-            totals["lt_runtime_stream_build_map_s"] += _timing_float(timing, "stream_build_map_s")
-            totals["lt_runtime_stream_encode_hoist_s"] += _timing_float(timing, "stream_encode_hoist_s")
-            totals["lt_runtime_stream_load_payload_s"] += _timing_float(timing, "stream_load_payload_s")
-            totals["lt_runtime_trim_unload_s"] += float(trim_unload)
     group_rows.sort(key=lambda item: float(item.get("mvm_eval_total_s", 0.0)), reverse=True)
     return {
         "totals": totals,
@@ -1986,6 +2070,11 @@ def _collect_forward_operator_breakdown(
         "bootstrap_s": float(bootstrap["totals"].get("bootstrap_s", 0.0)),
         "bootstrap_backend_s": float(bootstrap["totals"].get("backend_bootstrap_s", 0.0)),
         "lt_runtime_load_encode_s": float(mvm["totals"].get("lt_runtime_load_encode_s", 0.0)),
+        "lt_runtime_stream_build_map_s": float(mvm["totals"].get("lt_runtime_stream_build_map_s", 0.0)),
+        "lt_runtime_stream_encode_hoist_s": float(mvm["totals"].get("lt_runtime_stream_encode_hoist_s", 0.0)),
+        "lt_runtime_stream_load_payload_s": float(mvm["totals"].get("lt_runtime_stream_load_payload_s", 0.0)),
+        "lt_runtime_stream_eval_s": float(mvm["totals"].get("lt_runtime_stream_eval_s", 0.0)),
+        "lt_runtime_stream_accumulate_s": float(mvm["totals"].get("lt_runtime_stream_accumulate_s", 0.0)),
         "lt_runtime_trim_unload_s": float(mvm["totals"].get("lt_runtime_trim_unload_s", 0.0)),
         "executor_postprocess_s": float(mvm["totals"].get("executor_postprocess_s", 0.0)),
         "executor_rescale_s": float(mvm["totals"].get("executor_rescale_s", 0.0)),

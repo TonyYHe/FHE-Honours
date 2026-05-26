@@ -636,11 +636,26 @@ class UnifiedTransformGroup:
         for key, value in timing.items():
             if key in _RUNTIME_TIMING_KEYS:
                 payload[key] = float(value)
-        mode = self._runtime_fairness_mode(backend, memory_bounded=bool(memory_bounded))
+        stream_profile_s = float(
+            payload.get("stream_build_map_s", 0.0)
+            + payload.get("stream_encode_hoist_s", 0.0)
+            + payload.get("stream_load_payload_s", 0.0)
+            + payload.get("stream_eval_s", 0.0)
+            + payload.get("stream_accumulate_s", 0.0)
+        )
+        mode = (
+            "streaming_eval_encode"
+            if stream_profile_s > 0.0
+            else self._runtime_fairness_mode(backend, memory_bounded=bool(memory_bounded))
+        )
         payload["runtime_fairness_mode"] = str(mode)
         payload["artifact_read_s"] = float(payload.get("read_bundle_s", 0.0))
         payload["artifact_load_s"] = float(
-            payload.get("load_keys_s", 0.0) + payload.get("load_plaintexts_s", 0.0)
+            payload.get("load_keys_s", 0.0)
+            + payload.get("load_plaintexts_s", 0.0)
+            + payload.get("stream_build_map_s", 0.0)
+            + payload.get("stream_encode_hoist_s", 0.0)
+            + payload.get("stream_load_payload_s", 0.0)
         )
         payload["artifact_unload_s"] = float(payload.get("unload_s", 0.0))
         payload["serving_hot_s"] = float(total_s)

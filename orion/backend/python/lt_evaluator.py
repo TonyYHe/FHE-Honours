@@ -48,6 +48,27 @@ _COMPILE_PROFILE_KEYS = (
     "peak_device_bytes",
 )
 
+_RUNTIME_TIMING_KEYS = (
+    "read_bundle_s",
+    "load_keys_s",
+    "load_plaintexts_s",
+    "eval_s",
+    "eval_total_s",
+    "unload_s",
+    "trim_s",
+    "cpp_plan_s",
+    "cpp_level_adjust_s",
+    "cpp_baby_step_s",
+    "cpp_giant_step_s",
+    "stream_build_map_s",
+    "stream_encode_hoist_s",
+    "stream_load_payload_s",
+    "stream_eval_s",
+    "stream_accumulate_s",
+    "cpp_push_s",
+    "cpp_trim_s",
+)
+
 
 class NewEvaluator:
     def __init__(self, scheme):
@@ -86,21 +107,56 @@ class NewEvaluator:
         self.new_evaluator()
 
     def _empty_runtime_timing(self) -> dict[str, object]:
-        return {
-            "read_bundle_s": 0.0,
-            "load_keys_s": 0.0,
-            "load_plaintexts_s": 0.0,
-            "eval_s": 0.0,
-            "eval_total_s": 0.0,
-            "unload_s": 0.0,
-            "trim_s": 0.0,
-            "artifact_read_s": 0.0,
-            "artifact_load_s": 0.0,
-            "artifact_unload_s": 0.0,
-            "resident_compute_s": None,
-            "serving_hot_s": 0.0,
-            "runtime_fairness_mode": "unknown",
-        }
+        payload = {key: 0.0 for key in _RUNTIME_TIMING_KEYS}
+        payload.update(
+            {
+                "artifact_read_s": 0.0,
+                "artifact_load_s": 0.0,
+                "artifact_unload_s": 0.0,
+                "resident_compute_s": None,
+                "serving_hot_s": 0.0,
+                "runtime_fairness_mode": "unknown",
+            }
+        )
+        return payload
+
+    def _consume_shared_cache_eval_profile(self) -> dict[str, float]:
+        consume = getattr(self.backend, "ConsumeSharedCacheEvalProfileSeconds", None)
+        if not callable(consume):
+            return {}
+        try:
+            values = list(consume())
+        except Exception:
+            return {}
+        names = (
+            (
+                "cpp_plan_s",
+                "cpp_level_adjust_s",
+                "cpp_baby_step_s",
+                "cpp_giant_step_s",
+                "cpp_push_s",
+                "cpp_trim_s",
+            )
+            if len(values) <= 6
+            else (
+                "cpp_plan_s",
+                "cpp_level_adjust_s",
+                "cpp_baby_step_s",
+                "cpp_giant_step_s",
+                "stream_build_map_s",
+                "stream_encode_hoist_s",
+                "stream_load_payload_s",
+                "stream_eval_s",
+                "stream_accumulate_s",
+                "cpp_push_s",
+                "cpp_trim_s",
+            )
+        )
+        return {name: float(values[index]) for index, name in enumerate(names) if index < len(values)}
+
+    def _add_backend_eval_profile(self, runtime_timing: dict[str, float]) -> None:
+        for key, value in self._consume_shared_cache_eval_profile().items():
+            runtime_timing[key] = float(runtime_timing.get(key, 0.0) + float(value))
 
     def _transform_uses_backend_streaming(self, transform_id: int) -> bool:
         uses_streaming = getattr(self.backend, "LinearTransformUsesStreaming", None)
@@ -119,11 +175,25 @@ class NewEvaluator:
         for key, value in timing.items():
             if key in payload:
                 payload[key] = float(value)
-        streaming = any(self._transform_uses_backend_streaming(int(transform_id)) for transform_id in transform_ids)
+        stream_profile_s = float(
+            payload.get("stream_build_map_s", 0.0)
+            + payload.get("stream_encode_hoist_s", 0.0)
+            + payload.get("stream_load_payload_s", 0.0)
+            + payload.get("stream_eval_s", 0.0)
+            + payload.get("stream_accumulate_s", 0.0)
+        )
+        streaming = bool(
+            stream_profile_s > 0.0
+            or any(self._transform_uses_backend_streaming(int(transform_id)) for transform_id in transform_ids)
+        )
         payload["runtime_fairness_mode"] = "streaming_eval_encode" if streaming else "resident_compute"
         payload["artifact_read_s"] = float(payload.get("read_bundle_s", 0.0))
         payload["artifact_load_s"] = float(
-            float(payload.get("load_keys_s", 0.0)) + float(payload.get("load_plaintexts_s", 0.0))
+            float(payload.get("load_keys_s", 0.0))
+            + float(payload.get("load_plaintexts_s", 0.0))
+            + float(payload.get("stream_build_map_s", 0.0))
+            + float(payload.get("stream_encode_hoist_s", 0.0))
+            + float(payload.get("stream_load_payload_s", 0.0))
         )
         payload["artifact_unload_s"] = float(payload.get("unload_s", 0.0))
         payload["serving_hot_s"] = float(total_s)
@@ -1171,9 +1241,11 @@ class NewEvaluator:
                         scratch_reserve_bytes=self._estimate_transform_scratch_reserve_bytes(t_id),
                     )
 
+                self._consume_shared_cache_eval_profile()
                 eval_started = time.perf_counter()
                 res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
                 eval_elapsed = float(time.perf_counter() - eval_started)
+                self._add_backend_eval_profile(runtime_timing)
                 runtime_timing["eval_total_s"] += float(eval_elapsed)
                 runtime_timing["eval_s"] += float(eval_elapsed)
                 ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
@@ -1277,6 +1349,7 @@ class NewEvaluator:
                 runtime_timing["load_plaintexts_s"] += float(time.perf_counter() - load_started)
             transform_ids_array = (ctypes.c_int * len(column_ids))(*column_ids)
             try:
+                self._consume_shared_cache_eval_profile()
                 eval_started = time.perf_counter()
                 result_ids = list(
                     self.backend.EvaluateLinearTransformsWithSharedCache(
@@ -1286,6 +1359,7 @@ class NewEvaluator:
                     )
                 )
                 eval_elapsed = float(time.perf_counter() - eval_started)
+                self._add_backend_eval_profile(runtime_timing)
                 runtime_timing["eval_total_s"] += float(eval_elapsed)
                 runtime_timing["eval_s"] += float(eval_elapsed)
             finally:
