@@ -127,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("u22_64_base32", "u22_128_base32", "u22_256_base32"),
         default="u22_64_base32",
     )
-    parser.add_argument("--policies", nargs="+", default=("fixed_max", "always", "greedy", "dp"))
+    parser.add_argument("--policies", nargs="+", default=("fixed_max", "always_fused", "dp"))
     parser.add_argument("--mode", default="planner", help="Comma-separated: planner, planner,simulate, or planner,e2e.")
     parser.add_argument("--backend", choices=("lattigo", "cheddar", "python"), default="lattigo")
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)

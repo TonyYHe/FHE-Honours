@@ -4210,7 +4210,7 @@ def build_layout_policy_compile_plan(
 def build_planner_ablation(
     *,
     network: str = "u22_64_base32",
-    policies: Sequence[str] = ("fixed_max", "always", "greedy", "dp"),
+    policies: Sequence[str] = ("fixed_max", "always_fused", "dp"),
     slots: int = DEFAULT_SLOTS,
 ) -> dict[str, Any]:
     spec = network_spec(str(network))

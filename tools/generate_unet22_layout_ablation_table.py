@@ -13,15 +13,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from orion.core.auto_bootstrap import BootstrapSolver
-from orion.core.level_dag import LevelDAG
 from orion.experimental import layout_policy_ablation as lp
+from orion.experimental.u22_phase1 import U22CompileRegistry
 
 
-POLICIES = ("fixed_max", "always", "greedy", "dp")
+POLICIES = ("fixed_max", "always_fused", "dp")
 POLICY_TEX = {
     "fixed_max": "\\fixedmax",
-    "always": "\\textsc{Always-Re-Layout}",
-    "greedy": "\\textsc{Greedy-Max-Zero-Cycle}",
+    "always_fused": "\\textsc{Always+Fusion}",
     "dp": "\\textit{HaloDP}",
 }
 
@@ -67,59 +66,42 @@ def _attach_dummy_scheme(dag: Any) -> None:
             module.scheme = scheme
 
 
-def _bootstrap_boundaries(spec: lp.NetworkSpec) -> list[tuple[str, int, str]]:
+def _policy_bootstrap_count(spec: lp.NetworkSpec, policy: str) -> tuple[int, str]:
     dag = lp.build_u22_dag(spec)
     _attach_dummy_scheme(dag)
+    registry = U22CompileRegistry.for_dag(
+        dag,
+        allowed_nodes=None,
+        enable_conv_kernels=True,
+        layout_policy=str(policy),
+    )
+    audit = registry.attach_to_dag(dag)
     dag.find_residuals()
-    solver = BootstrapSolver(SimpleNamespace(), dag, l_eff=len(lp.U22_E2E_LOGQ) - 1)
-    solver.solve()
-
-    node_map: dict[str, str] = {}
-    for item in solver.shortest_path:
-        name = str(item).split("@")[0]
-        node_map[name] = str(item)
-
-    query = LevelDAG(l_eff=len(lp.U22_E2E_LOGQ) - 1, network_dag=dag, path=None)
-    boundaries: list[tuple[str, int, str]] = []
-    for node in dag.topological_sort():
-        node = str(node)
-        if not bool(dag.nodes[node].get("bootstrap", False)):
-            continue
-        for child in dag.successors(node):
-            child = str(child)
-            if node not in node_map or child not in node_map:
-                continue
-            _latency, boot_count = query.estimate_bootstrap_latency(node_map[node], node_map[child])
-            if int(boot_count) > 0:
-                boundaries.append((node, int(boot_count), child))
-                break
-    return boundaries
-
-
-def _policy_bootstrap_count(plan: lp.PolicyPlan, boundaries: list[tuple[str, int, str]]) -> tuple[int, str]:
-    node_layouts = {str(row["node"]): dict(row.get("selected_layout", {}) or {}) for row in plan.node_layouts}
-    total = 0
-    parts: list[str] = []
-    for node, repeats, target in boundaries:
-        layout = node_layouts.get(str(node), {})
-        tile_count = int(layout.get("tile_count", 0) or 0)
-        if tile_count <= 0:
-            raise RuntimeError(f"missing selected layout for bootstrap node {node!r}")
-        total += int(tile_count) * int(repeats)
-        parts.append(f"{node}:{tile_count}x{repeats}->{target}")
-    return int(total), ";".join(parts)
+    input_level, bootstraps, bootstrapper_slots = BootstrapSolver(
+        SimpleNamespace(),
+        dag,
+        l_eff=len(lp.U22_E2E_LOGQ) - 1,
+    ).solve()
+    summary = dict(audit.get("graph_audit", {}).get("layout_policy_summary", {}) or {})
+    detail = (
+        "policy_aware_solver_after_registry_attach;"
+        f"input_level={int(input_level)};"
+        f"slots={','.join(str(int(value)) for value in bootstrapper_slots)};"
+        f"relayout_depth={int(summary.get('relayout_depth_estimate', 0) or 0)};"
+        f"fused={int(summary.get('producer_fused_materialization_count', 0) or 0) + int(summary.get('consumer_fused_relayout_count', 0) or 0)}"
+    )
+    return int(bootstraps), detail
 
 
 def build_rows(network: str, *, slots: int = lp.DEFAULT_SLOTS) -> list[dict[str, Any]]:
     spec = _network_spec(network)
     dag = lp.build_u22_dag(spec)
     edges = lp.build_edge_infos(dag, slots=int(slots))
-    boundaries = _bootstrap_boundaries(spec)
 
     rows: list[dict[str, Any]] = []
     for policy in POLICIES:
         plan = lp.plan_policy(dag, edges, policy, slots=int(slots))
-        boot_count, boot_detail = _policy_bootstrap_count(plan, boundaries)
+        boot_count, boot_detail = _policy_bootstrap_count(spec, str(policy))
         rows.append(
             {
                 "network": spec.network,
@@ -165,7 +147,7 @@ def render_latex(rows: list[dict[str, Any]]) -> str:
         "\\renewcommand{\\arraystretch}{1}",
         f"\\caption{{Compile-plan re-layout scheduling on the ${image_size}\\times{image_size}$ U\\text{{-}}Net. "
         "\\textit{HaloDP} balances carried halos against fused layout transitions; Boot counts policy-specific "
-        "ciphertext bootstraps at the selected compile-time bootstrap boundaries.}",
+        "ciphertext bootstraps from the depth-aware solver after applying each layout policy.}",
         "\\label{tab:relayout_ablation}",
         "\\resizebox{\\columnwidth}{!}{%",
         "\\begin{tabular}{lrrrrrrr}",

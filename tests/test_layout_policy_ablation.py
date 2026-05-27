@@ -1617,8 +1617,7 @@ def test_layout_policy_cli_planner_smoke(tmp_path: Path) -> None:
             "u22_64_base32",
             "--policies",
             "fixed_max",
-            "always",
-            "greedy",
+            "always_fused",
             "dp",
             "--mode",
             "planner",
@@ -1637,10 +1636,31 @@ def test_layout_policy_cli_planner_smoke(tmp_path: Path) -> None:
     assert out_csv.with_suffix(".json").exists()
     with out_csv.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert [row["policy"] for row in rows] == ["fixed_max", "always", "greedy", "dp"]
+    assert [row["policy"] for row in rows] == ["fixed_max", "always_fused", "dp"]
     assert all(row["metric_source"] == "planner_estimate" for row in rows)
     assert "diagonal_key_set_mismatch_count" in rows[0]
     assert "provider_input_block_cols" in rows[0]
+
+
+def test_u22_224_silu7_policy_table_uses_always_fused_and_policy_aware_bootstrap() -> None:
+    from tools import generate_u22_224_silu7_policy_runtime_table as table
+
+    rows, metadata = table._planner_rows()
+    by_policy = {str(row["policy"]): row for row in rows}
+
+    assert [str(row["policy"]) for row in rows] == ["fixed_max", "always_fused", "dp"]
+    assert str(metadata["bootstrap_source"]) == "policy_aware_bootstrap_solver_after_registry_attach"
+    assert int(by_policy["fixed_max"]["boot"]) == 205
+    assert int(by_policy["always_fused"]["boot"]) == 169
+    assert int(by_policy["dp"]["boot"]) == 169
+    assert int(by_policy["always_fused"]["fused_relayout"]) > 0
+    assert int(by_policy["always_fused"]["rotation"]) > int(by_policy["dp"]["rotation"])
+
+
+def test_u22_224_silu7_provider_runner_accepts_always_fused_policy() -> None:
+    from tools import run_u22_base32_silu7_streaming_provider_e2e as runner
+
+    assert runner._provider_mode("always_fused") == "u22_256_base32_layout_always_fused"
 
 
 def test_layout_policy_cli_non_ckks_simulation_smoke(tmp_path: Path) -> None:
