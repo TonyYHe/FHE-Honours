@@ -12,9 +12,15 @@ Start here:
 The mainline is:
 
 1. Prove dense resident Orion is memory-prohibitive on exact U22+output worst layers.
-2. Build a strong Orion dense streaming LT baseline: multicore compile, BSGS preserved inside streamed chunks, compute time reported layer-by-layer with total I/O excluded.
+2. Build a strong Orion dense single-slot layer-cache baseline: compile keeps raw diagonal payloads, runtime materializes one dense op at a time, BSGS is preserved inside each independent LT, and compute time is reported layer-by-layer with total I/O excluded.
 3. Compare that baseline against HaloED provider layer-by-layer with the same reporting convention.
 4. Keep RAM and feasibility evidence separate from compute-time comparisons.
+
+Use `ORION_SINGLE_SLOT_LAYER_CACHE=1` for the canonical layer-cache mode.  Do
+not use removed aliases or dense shared-LT knobs.  Dense Orion executes
+independent LTs; HaloED/provider uses grouped provider kernels where the
+provider lowering exposes shared-source structure.  ConvTranspose2d stays on
+the common dense path for both dense and provider modes.
 
 ## Exact U22 Model
 
@@ -77,8 +83,9 @@ For the comparison tables:
 - Exclude total I/O time from the primary comparison.
 - Report compile time separately.
 - Report peak RSS separately.
-- State whether BSGS/sharing is preserved within each streamed chunk.
-- Record the chunk/budget setting for Orion dense streaming.
+- Report `layer_cache_encode_s`, `layer_cache_key_prepare_s`,
+  `layer_cache_evict_s`, and `layer_cache_turnover_s` separately.
+- State whether BSGS/sharing is preserved within each materialized op/group.
 
 For dense resident infeasibility:
 

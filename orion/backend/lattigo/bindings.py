@@ -814,11 +814,43 @@ class LattigoLibrary:
             restype=None
         )
 
+        live_transform_count = getattr(self.lib, "GetLiveLinearTransformCount", None)
+        if live_transform_count is not None:
+            self.GetLiveLinearTransformCount = LattigoFunction(
+                live_transform_count,
+                argtypes=[],
+                restype=ctypes.c_int,
+            )
+
         self.GetLinearTransformRotationKeys = LattigoFunction(
             self.lib.GetLinearTransformRotationKeys,
             argtypes=[ctypes.c_int],
             restype=ArrayResultInt
         )
+
+        plan_rotation_keys = getattr(self.lib, "PlanLinearTransformRotationKeys", None)
+        if plan_rotation_keys is not None:
+            self.PlanLinearTransformRotationKeys = LattigoFunction(
+                plan_rotation_keys,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # diagIdxs
+                    ctypes.c_int,  # level
+                    ctypes.c_float,  # bsgsRatio
+                ],
+                restype=ArrayResultInt
+            )
+
+        plan_rotation_key_requests = getattr(self.lib, "PlanLinearTransformRotationKeyRequests", None)
+        if plan_rotation_key_requests is not None:
+            self.PlanLinearTransformRotationKeyRequests = LattigoFunction(
+                plan_rotation_key_requests,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # diagIdxs
+                    ctypes.c_int,  # level
+                    ctypes.c_float,  # bsgsRatio
+                ],
+                restype=ArrayResultInt
+            )
 
         get_empty_plaintext_keys = getattr(self.lib, "GetLinearTransformEmptyPlaintextKeys", None)
         if get_empty_plaintext_keys is not None:
@@ -846,6 +878,19 @@ class LattigoLibrary:
             ],
             restype=ArrayResultInt
         )
+
+        plan_unified_rotation_keys = getattr(self.lib, "PlanLinearTransformsUnifiedRotationKeys", None)
+        if plan_unified_rotation_keys is not None:
+            self.PlanLinearTransformsUnifiedRotationKeys = LattigoFunction(
+                plan_unified_rotation_keys,
+                argtypes=[
+                    ctypes.c_int,  # numTransforms
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
+                    ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
+                    ctypes.POINTER(ctypes.c_int),  # levels
+                ],
+                restype=ArrayResultInt
+            )
 
         self.GenerateLinearTransformsUnifiedComplex = LattigoFunction(
             self.lib.GenerateLinearTransformsUnifiedComplex,

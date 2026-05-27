@@ -105,7 +105,6 @@ class NewEvaluator:
         self._saved_io_external_device_bytes: dict[object, object] = {}
         self._saved_io_work_order: tuple[object, ...] = ()
         self._saved_io_work_index: dict[object, int] = {}
-        self._dense_host_plaintext_payload_cache: dict[int, np.ndarray] = {}
         self.last_saved_io_prewarm_profile: dict[str, object] = {}
         self.last_runtime_timing: dict[str, object] = self._empty_runtime_timing()
         self.new_evaluator()
@@ -190,7 +189,19 @@ class NewEvaluator:
             stream_profile_s > 0.0
             or any(self._transform_uses_backend_streaming(int(transform_id)) for transform_id in transform_ids)
         )
-        payload["runtime_fairness_mode"] = "streaming_eval_encode" if streaming else "resident_compute"
+        layer_cache_turnover_s = float(
+            payload.get("layer_cache_turnover_s", 0.0)
+            or (
+                float(payload.get("layer_cache_encode_s", 0.0))
+                + float(payload.get("layer_cache_key_prepare_s", 0.0))
+                + float(payload.get("layer_cache_evict_s", 0.0))
+            )
+        )
+        payload["layer_cache_turnover_s"] = float(layer_cache_turnover_s)
+        if layer_cache_turnover_s > 0.0:
+            payload["runtime_fairness_mode"] = "single_slot_layer_cache"
+        else:
+            payload["runtime_fairness_mode"] = "streaming_eval_encode" if streaming else "resident_compute"
         payload["artifact_read_s"] = float(payload.get("read_bundle_s", 0.0))
         payload["artifact_load_s"] = float(
             float(payload.get("load_keys_s", 0.0))
@@ -547,6 +558,132 @@ class NewEvaluator:
             for row, col in sorted(keys)
         ]
 
+    def single_slot_layer_cache_enabled(self) -> bool:
+        raw_value = os.environ.get("ORION_SINGLE_SLOT_LAYER_CACHE")
+        if raw_value is None or raw_value.strip().lower() in _FALSE_ENV_VALUES:
+            return False
+        return self.io_mode == "none"
+
+    def dense_layer_cache_enabled_for(self, linear_layer) -> bool:
+        if not self.single_slot_layer_cache_enabled():
+            return False
+        layer_io_mode = getattr(linear_layer, "get_io_mode", lambda: self.io_mode)()
+        if str(layer_io_mode) != "none":
+            return False
+        if bool(getattr(linear_layer, "_disable_dense_layer_cache", False)):
+            return False
+        return bool(getattr(linear_layer, "diagonals", {}) or {})
+
+    def _plan_linear_transform_rotation_key_requests(
+        self,
+        diag_idxs,
+        *,
+        level: int,
+        bsgs_ratio: float,
+    ) -> tuple[tuple[int, int | None], ...]:
+        request_planner = getattr(self.backend, "PlanLinearTransformRotationKeyRequests", None)
+        if callable(request_planner):
+            flat = list(
+                request_planner(
+                    np.ascontiguousarray(diag_idxs, dtype=np.int32).tolist(),
+                    int(level),
+                    float(bsgs_ratio),
+                )
+            )
+            if len(flat) % 2 != 0:
+                raise RuntimeError("backend returned malformed planned rotation key requests")
+            requests: dict[int, int] = {}
+            for index in range(0, len(flat), 2):
+                key = int(flat[index])
+                key_level = int(flat[index + 1])
+                requests[key] = max(key_level, requests.get(key, key_level))
+            return tuple(sorted((int(key), int(key_level)) for key, key_level in requests.items()))
+        planner = getattr(self.backend, "PlanLinearTransformRotationKeys", None)
+        if callable(planner):
+            keys = planner(
+                np.ascontiguousarray(diag_idxs, dtype=np.int32).tolist(),
+                int(level),
+                float(bsgs_ratio),
+            )
+            return tuple((int(key), None) for key in keys)
+        raise RuntimeError(
+            "ORION_SINGLE_SLOT_LAYER_CACHE requires backend PlanLinearTransformRotationKeys "
+            "or PlanLinearTransformRotationKeyRequests support"
+        )
+
+    def generate_rotation_key_requests(self, requests) -> None:
+        started = time.perf_counter()
+        normalized = {
+            (int(key), None if level is None else int(level))
+            for key, level in requests
+        }
+        keys_to_gen = tuple(sorted(normalized.difference(self.saved_rotation_keys)))
+        self.saved_rotation_keys.update(keys_to_gen)
+
+        if self.io_mode == "none":
+            for key, level in keys_to_gen:
+                self._generate_rotation_key(key, level)
+        elif self.io_mode in ("save", "load"):
+            with h5py.File(self.keys_path, "a") as f:
+                for key, level in keys_to_gen:
+                    key_str = self._rotation_key_storage_name(key, level)
+                    if key_str in f or str(int(key)) in f:
+                        continue
+                    serial_key, ptr = self._generate_and_serialize_rotation_key(key, level)
+                    try:
+                        f.create_dataset(key_str, data=serial_key)
+                    finally:
+                        self.backend.FreeCArray(ptr)
+        self._add_profile("key_prepare_s", time.perf_counter() - started)
+
+    def _defer_dense_layer_cache_compile(self, linear_layer, diagonals, *, level: int, bsgs_ratio: float):
+        flatten_started = time.perf_counter()
+        items = list(diagonals.items())
+        workers = self._lt_worker_count(len(items))
+        if workers <= 1:
+            payloads = [self._build_block_payload(item) for item in items]
+        else:
+            futures = []
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-dense-layer-cache") as pool:
+                for index, item in enumerate(items):
+                    futures.append((index, pool.submit(self._build_block_payload, item)))
+                ordered = [None] * len(futures)
+                wait_started = time.perf_counter()
+                for index, future in futures:
+                    ordered[index] = future.result()
+                self._add_profile("wait_s", time.perf_counter() - wait_started)
+            payloads = list(ordered)
+        self._add_profile("diag_generate_s", time.perf_counter() - flatten_started)
+
+        key_requests: dict[int, int | None] = {}
+        for _row, _col, diag_idxs, _diag_data in payloads:
+            for key, key_level in self._plan_linear_transform_rotation_key_requests(
+                diag_idxs,
+                level=int(level),
+                bsgs_ratio=float(bsgs_ratio),
+            ):
+                if key_level is None:
+                    key_requests[int(key)] = None
+                else:
+                    current = key_requests.get(int(key))
+                    key_requests[int(key)] = int(key_level) if current is None else max(int(current), int(key_level))
+        self.generate_rotation_key_requests(tuple(sorted((int(key), key_level) for key, key_level in key_requests.items())))
+
+        linear_layer._dense_layer_cache_deferred = True
+        linear_layer._dense_layer_cache_payloads = tuple(payloads)
+        linear_layer._dense_layer_cache_level = int(level)
+        linear_layer._dense_layer_cache_bsgs_ratio = float(bsgs_ratio)
+        linear_layer._dense_layer_cache_active_transform_ids = {}
+        linear_layer._dense_layer_cache_pending_timing = {
+            "layer_cache_encode_s": 0.0,
+            "layer_cache_key_prepare_s": 0.0,
+            "layer_cache_evict_s": 0.0,
+            "layer_cache_turnover_s": 0.0,
+        }
+        linear_layer.diagonals = {}
+        gc.collect()
+        return {}
+
     def generate_transforms(self, linear_layer):
         layer_name = linear_layer.name
         diagonals = linear_layer.diagonals 
@@ -570,22 +707,18 @@ class NewEvaluator:
             for row, col, diags_idxs, lintransf_id in batch_ids:
                 lintransf_ids[(int(row), int(col))] = int(lintransf_id)
                 self.generate_rotation_keys(int(lintransf_id))
-                self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
                 if self.io_mode == "save" and not reuse_saved_plaintexts:
                     self.save_plaintext_diagonals(
                         layer_name, int(lintransf_id), int(row), int(col), diags_idxs
                     )
-        if self._dense_unified_compile_enabled(linear_layer, diagonals, io_mode=str(effective_io_mode)):
-            for _col, column_diagonals in self._diagonal_blocks_by_col(diagonals):
-                batch_ids = self._generate_transforms_unified_batch(
-                    column_diagonals,
-                    level=int(level),
-                    on_batch_result=finish_compiled_batch,
-                )
-                if batch_ids is None:
-                    break
-            else:
-                return lintransf_ids
+
+        if self.dense_layer_cache_enabled_for(linear_layer):
+            return self._defer_dense_layer_cache_compile(
+                linear_layer,
+                diagonals,
+                level=int(level),
+                bsgs_ratio=float(bsgs_ratio),
+            )
 
         batch_ids = self._generate_transforms_batch(
             diagonals,
@@ -615,7 +748,6 @@ class NewEvaluator:
             # Now we can generate any new rotation keys needed for
             # this linear transform.
             self.generate_rotation_keys(lintransf_id)
-            self._cache_dense_host_plaintexts_if_enabled(int(lintransf_id))
             if self.io_mode == "save" and not reuse_saved_plaintexts:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
@@ -624,40 +756,6 @@ class NewEvaluator:
             linear_layer.diagonals = {}
             gc.collect()
         return lintransf_ids
-
-    def _dense_host_payload_cache_enabled(self) -> bool:
-        override = os.environ.get("ORION_DENSE_LT_HOST_PAYLOAD_CACHE")
-        if override is None:
-            return False
-        if override.lower() in ("0", "false", "no", "off"):
-            return False
-        if self.io_mode != "none":
-            return False
-        return self._encoded_plaintext_payload_supported()
-
-    def _cache_dense_host_plaintexts_if_enabled(self, transform_id: int) -> None:
-        if not self._dense_host_payload_cache_enabled():
-            return
-        transform_id = int(transform_id)
-        if transform_id in self._dense_host_plaintext_payload_cache:
-            return
-        load_batch = getattr(self.backend, "LoadPlaintextDiagonalsBatch", None)
-        if callable(load_batch):
-            load_batch([], [], [], [], int(transform_id))
-        else:
-            loader = getattr(self.backend, "LoadLinearTransformPlaintexts", None)
-            if not callable(loader):
-                return
-            loader(np.zeros((0,), dtype=np.uint8), int(transform_id))
-        serial_payload, payload_ptr = self.backend.SerializeLinearTransformPlaintexts(int(transform_id))
-        try:
-            self._dense_host_plaintext_payload_cache[int(transform_id)] = np.asarray(
-                serial_payload,
-                dtype=np.uint8,
-            ).copy()
-        finally:
-            self.backend.FreeCArray(payload_ptr)
-            self.backend.RemovePlaintextDiagonals(int(transform_id))
 
     def _slot_count_from_diags(self, diags):
         for diag in diags.values():
@@ -671,37 +769,6 @@ class NewEvaluator:
         if params is not None and hasattr(params, "get_slots"):
             return int(params.get_slots())
         return 0
-
-    def _dense_tconv_unified_requested(self, linear_layer) -> bool:
-        if bool(getattr(linear_layer, "dense_unified_bsgs", False)):
-            return True
-        if linear_layer.__class__.__name__ != "ConvTranspose2d":
-            return False
-        if bool(getattr(linear_layer, "dense_tconv_unified_bsgs", False)):
-            return True
-        override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-        return bool(override is not None and override.lower() in ("1", "true", "yes", "on"))
-
-    def _dense_unified_compile_enabled(self, linear_layer, diagonals, *, io_mode: str) -> bool:
-        if not self._dense_tconv_unified_requested(linear_layer):
-            return False
-        if str(io_mode) != "none" or self.io_mode != "none":
-            return False
-        if not callable(getattr(self.backend, "GenerateLinearTransformsUnified", None)):
-            return False
-        try:
-            return bool(diagonals) and all(
-                isinstance(key, tuple) and len(key) == 2
-                for key in diagonals.keys()
-            )
-        except AttributeError:
-            return False
-
-    def _diagonal_blocks_by_col(self, diagonals):
-        by_col = {}
-        for (row, col), diags in diagonals.items():
-            by_col.setdefault(int(col), {})[(int(row), int(col))] = diags
-        return [(int(col), by_col[int(col)]) for col in sorted(by_col)]
 
     def _flatten_diagonals(self, diags):
         diag_indices = sorted(int(idx) for idx in diags.keys())
@@ -893,57 +960,197 @@ class NewEvaluator:
             offset += int(batch_limit)
         return results
 
-    def _generate_transforms_unified_batch(
+    def _generate_transforms_from_payloads_batch(
         self,
-        diagonals,
+        payloads,
         *,
         level: int,
-        on_batch_result=None,
+        bsgs_ratio: float,
+        io_mode: str,
+        add_compile_profile: bool,
     ):
-        generate = getattr(self.backend, "GenerateLinearTransformsUnified", None)
-        if not callable(generate) or len(diagonals) <= 0:
-            return None
+        generate_batch = getattr(self.backend, "GenerateLinearTransformsBatch", None)
+        payload_list = list(payloads or ())
+        if not payload_list:
+            return []
 
-        items = list(diagonals.items())
-        block_payloads = [self._build_block_payload(item) for item in items]
-        num_transforms = len(block_payloads)
-        diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
-        diag_idxs_lens = (ctypes.c_int * num_transforms)()
-        diag_data_ptrs = (ctypes.POINTER(ctypes.c_float) * num_transforms)()
-        diag_data_lens = (ctypes.c_int * num_transforms)()
-        levels = (ctypes.c_int * num_transforms)(*[int(level)] * num_transforms)
+        if not callable(generate_batch):
+            results = []
+            for row, col, diag_idxs, diag_data in payload_list:
+                encode_started = time.perf_counter()
+                transform_id = self.backend.GenerateLinearTransform(
+                    np.asarray(diag_idxs, dtype=np.int32).tolist(),
+                    np.asarray(diag_data, dtype=np.float32).tolist(),
+                    int(level),
+                    float(bsgs_ratio),
+                    str(io_mode),
+                )
+                if add_compile_profile:
+                    self._add_profile("encode_s", time.perf_counter() - encode_started)
+                results.append((int(row), int(col), np.asarray(diag_idxs, dtype=np.int32), int(transform_id)))
+            return results
 
-        owned_arrays: list[object] = [levels]
-        for index, (_row, _col, diags_idxs, diags_data) in enumerate(block_payloads):
-            idx_array = np.ascontiguousarray(diags_idxs, dtype=np.int32)
-            data_array = np.ascontiguousarray(diags_data, dtype=np.float32)
-            owned_arrays.extend((idx_array, data_array))
-            diag_idxs_ptrs[index] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
-            diag_idxs_lens[index] = int(idx_array.size)
-            diag_data_ptrs[index] = data_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-            diag_data_lens[index] = int(data_array.size)
+        batch_limit = self._lt_compile_batch_limit(len(payload_list), index_only=False)
+        results = []
+        offset = 0
+        while offset < len(payload_list):
+            block_payloads = payload_list[int(offset): int(offset + batch_limit)]
+            num_transforms = len(block_payloads)
+            diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
+            diag_idxs_lens = (ctypes.c_int * num_transforms)()
+            diag_data_ptrs = (ctypes.POINTER(ctypes.c_float) * num_transforms)()
+            diag_data_lens = (ctypes.c_int * num_transforms)()
+            levels = (ctypes.c_int * num_transforms)(*[int(level)] * num_transforms)
 
-        encode_started = time.perf_counter()
-        lintransf_ids = list(
-            generate(
-                int(num_transforms),
-                diag_idxs_ptrs,
-                diag_idxs_lens,
-                diag_data_ptrs,
-                diag_data_lens,
-                levels,
+            owned_arrays: list[object] = [levels]
+            for index, (_row, _col, diags_idxs, diags_data) in enumerate(block_payloads):
+                idx_array = np.ascontiguousarray(diags_idxs, dtype=np.int32)
+                data_array = np.ascontiguousarray(diags_data, dtype=np.float32)
+                owned_arrays.extend((idx_array, data_array))
+                diag_idxs_ptrs[index] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+                diag_idxs_lens[index] = int(idx_array.size)
+                diag_data_ptrs[index] = data_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+                diag_data_lens[index] = int(data_array.size)
+
+            encode_started = time.perf_counter()
+            lintransf_ids = list(
+                generate_batch(
+                    int(num_transforms),
+                    diag_idxs_ptrs,
+                    diag_idxs_lens,
+                    diag_data_ptrs,
+                    diag_data_lens,
+                    levels,
+                    float(bsgs_ratio),
+                    str(io_mode),
+                )
             )
+            if add_compile_profile:
+                self._add_profile("encode_s", time.perf_counter() - encode_started)
+            batch_results = [
+                (int(row), int(col), np.asarray(diags_idxs, dtype=np.int32), int(lintransf_id))
+                for (row, col, diags_idxs, _diags_data), lintransf_id in zip(block_payloads, lintransf_ids)
+            ]
+            results.extend(batch_results)
+            del block_payloads, owned_arrays, lintransf_ids
+            gc.collect()
+            offset += int(batch_limit)
+        return results
+
+    def dense_layer_cache_needs_materialize(self, linear_layer) -> bool:
+        return bool(
+            getattr(linear_layer, "_dense_layer_cache_deferred", False)
+            and not getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {})
         )
-        self._add_profile("encode_s", time.perf_counter() - encode_started)
-        batch_results = [
-            (row, col, diags_idxs, int(lintransf_id))
-            for (row, col, diags_idxs, _diags_data), lintransf_id in zip(block_payloads, lintransf_ids)
-        ]
-        if callable(on_batch_result):
-            on_batch_result(batch_results)
-        del block_payloads, owned_arrays, lintransf_ids
-        gc.collect()
-        return batch_results
+
+    def materialize_dense_layer_cache(self, linear_layer) -> dict[str, float]:
+        if not self.dense_layer_cache_needs_materialize(linear_layer):
+            return {
+                "layer_cache_encode_s": 0.0,
+                "layer_cache_key_prepare_s": 0.0,
+            }
+        payloads = tuple(getattr(linear_layer, "_dense_layer_cache_payloads", ()) or ())
+        if not payloads:
+            raise RuntimeError(f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no payloads")
+        started = time.perf_counter()
+        batch_results = self._generate_transforms_from_payloads_batch(
+            payloads,
+            level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
+            bsgs_ratio=float(getattr(linear_layer, "_dense_layer_cache_bsgs_ratio", linear_layer.bsgs_ratio)),
+            io_mode="none",
+            add_compile_profile=False,
+        )
+        transform_ids = {
+            (int(row), int(col)): int(transform_id)
+            for row, col, _diag_idxs, transform_id in batch_results
+        }
+        linear_layer.transform_ids = dict(transform_ids)
+        linear_layer._dense_layer_cache_active_transform_ids = dict(transform_ids)
+        bias = getattr(linear_layer, "_dense_layer_cache_bias", None)
+        if bias is not None:
+            linear_layer.on_bias_ptxt = self.scheme.encoder.encode(
+                bias,
+                int(linear_layer.level) - int(linear_layer.depth),
+            )
+        encode_s = float(time.perf_counter() - started)
+        key_started = time.perf_counter()
+        # Rotation keys are generated during compile/load from raw diagonal
+        # indices. Forward only binds the materialized transform ids to those
+        # already-resident keys.
+        key_prepare_s = float(time.perf_counter() - key_started)
+        pending = dict(getattr(linear_layer, "_dense_layer_cache_pending_timing", {}) or {})
+        pending["layer_cache_encode_s"] = float(pending.get("layer_cache_encode_s", 0.0) + encode_s)
+        pending["layer_cache_key_prepare_s"] = float(
+            pending.get("layer_cache_key_prepare_s", 0.0) + key_prepare_s
+        )
+        pending["layer_cache_turnover_s"] = float(
+            pending.get("layer_cache_encode_s", 0.0)
+            + pending.get("layer_cache_key_prepare_s", 0.0)
+            + pending.get("layer_cache_evict_s", 0.0)
+        )
+        linear_layer._dense_layer_cache_pending_timing = pending
+        return {
+            "layer_cache_encode_s": float(encode_s),
+            "layer_cache_key_prepare_s": float(key_prepare_s),
+        }
+
+    def _consume_dense_layer_cache_pending_timing(self, linear_layer) -> dict[str, float]:
+        pending = dict(getattr(linear_layer, "_dense_layer_cache_pending_timing", {}) or {})
+        linear_layer._dense_layer_cache_pending_timing = {
+            "layer_cache_encode_s": 0.0,
+            "layer_cache_key_prepare_s": 0.0,
+            "layer_cache_evict_s": 0.0,
+            "layer_cache_turnover_s": 0.0,
+        }
+        return {
+            key: float(pending.get(key, 0.0))
+            for key in (
+                "layer_cache_encode_s",
+                "layer_cache_key_prepare_s",
+                "layer_cache_evict_s",
+                "layer_cache_turnover_s",
+            )
+        }
+
+    def evict_dense_layer_cache(self, linear_layer, *, clear_bias: bool = True) -> float:
+        active = dict(getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {}) or {})
+        if not active:
+            return 0.0
+        started = time.perf_counter()
+        for transform_id in active.values():
+            try:
+                self.backend.DeleteLinearTransform(int(transform_id))
+            except Exception:
+                pass
+        linear_layer.transform_ids = {}
+        linear_layer._dense_layer_cache_active_transform_ids = {}
+        if bool(clear_bias) and hasattr(linear_layer, "on_bias_ptxt"):
+            linear_layer.on_bias_ptxt = None
+        return float(time.perf_counter() - started)
+
+    def finish_dense_layer_cache_runtime(self, linear_layer, evict_s: float) -> None:
+        if not getattr(linear_layer, "_dense_layer_cache_deferred", False):
+            return
+        payload = dict(getattr(linear_layer, "_last_runtime_timing", None) or self.last_runtime_timing)
+        for key in _RUNTIME_TIMING_KEYS:
+            payload.setdefault(key, 0.0)
+        payload["layer_cache_evict_s"] = float(payload.get("layer_cache_evict_s", 0.0) + float(evict_s))
+        payload["layer_cache_turnover_s"] = float(
+            payload.get("layer_cache_encode_s", 0.0)
+            + payload.get("layer_cache_key_prepare_s", 0.0)
+            + payload.get("layer_cache_evict_s", 0.0)
+        )
+        payload["runtime_fairness_mode"] = "single_slot_layer_cache"
+        payload["artifact_load_s"] = float(
+            float(payload.get("load_keys_s", 0.0))
+            + float(payload.get("load_plaintexts_s", 0.0))
+            + float(payload.get("stream_build_map_s", 0.0))
+            + float(payload.get("stream_encode_hoist_s", 0.0))
+            + float(payload.get("stream_load_payload_s", 0.0))
+        )
+        payload["artifact_unload_s"] = float(payload.get("unload_s", 0.0))
+        linear_layer._last_runtime_timing = dict(payload)
+        self.last_runtime_timing = dict(payload)
     
     def get_required_rotation_keys(self, transform_id):
         return self.backend.GetLinearTransformRotationKeys(transform_id)
@@ -1110,6 +1317,13 @@ class NewEvaluator:
             return int(f[linear_layer.name]["output_rotations"][()])
 
     def evaluate_transforms(self, linear_layer, in_ctensor):
+        if self.dense_layer_cache_needs_materialize(linear_layer):
+            self.materialize_dense_layer_cache(linear_layer)
+            try:
+                return self.evaluate_transforms(linear_layer, in_ctensor)
+            finally:
+                evict_s = self.evict_dense_layer_cache(linear_layer, clear_bias=True)
+                self.finish_dense_layer_cache_runtime(linear_layer, evict_s)
         layer_name = linear_layer.name
         out_shape = linear_layer.output_shape
         fhe_out_shape = linear_layer.fhe_output_shape 
@@ -1146,45 +1360,22 @@ class NewEvaluator:
             for j in range(cols)
             if int(transform_ids[i][j]) >= 0
         ]
-        use_dense_shared_cache = (
-            bool(work_items)
-            and not bool(allow_sparse_output_rows)
-            and self._dense_shared_cache_enabled(
-                linear_layer,
-                rows=rows,
-                cols=cols,
-            )
-        )
-        linear_layer._last_dense_shared_cache_eval = {
-            "enabled": bool(use_dense_shared_cache),
-            "group_count": int(cols) if bool(use_dense_shared_cache) else 0,
-            "group_axis": "input_column" if bool(use_dense_shared_cache) else "",
-            "transform_count": int(len(work_items)),
-            "io_mode": str(self.io_mode),
-            "host_payload_cache": bool(self._dense_host_payload_cache_enabled()),
-            "host_payload_cache_count": int(len(self._dense_host_plaintext_payload_cache)),
-        }
-        if bool(use_dense_shared_cache):
-            return self._evaluate_transforms_with_dense_shared_cache(
-                linear_layer,
-                in_ctensor,
-                rows=int(rows),
-                cols=int(cols),
-                transform_ids=transform_ids,
-                out_shape=out_shape,
-                fhe_out_shape=fhe_out_shape,
-                skip_post_rescale=bool(skip_post_rescale),
-            )
         group_started = time.perf_counter()
         runtime_timing = {
             "read_bundle_s": 0.0,
             "load_keys_s": 0.0,
             "load_plaintexts_s": 0.0,
+            "layer_cache_encode_s": 0.0,
+            "layer_cache_key_prepare_s": 0.0,
+            "layer_cache_evict_s": 0.0,
+            "layer_cache_turnover_s": 0.0,
             "eval_s": 0.0,
             "eval_total_s": 0.0,
             "unload_s": 0.0,
             "trim_s": 0.0,
         }
+        for key, value in self._consume_dense_layer_cache_pending_timing(linear_layer).items():
+            runtime_timing[key] = float(runtime_timing.get(key, 0.0) + float(value))
         prefetch_sequence, use_global_prefetch_sequence = self._transform_prefetch_sequence(
             layer_name,
             work_items,
@@ -1313,116 +1504,6 @@ class NewEvaluator:
         )
         linear_layer._last_runtime_timing = dict(timing_payload)
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
-
-    def _dense_shared_cache_enabled(self, linear_layer, *, rows: int, cols: int) -> bool:
-        requested = bool(self._dense_tconv_unified_requested(linear_layer))
-        override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-        requested = bool(requested or (override is not None and override.lower() in ("1", "true", "yes", "on")))
-        if not bool(requested):
-            return False
-        if not callable(getattr(self.backend, "EvaluateLinearTransformsWithSharedCache", None)):
-            return False
-        if self.io_mode != "none":
-            # Save/load mode needs coordinated chunk IO and eviction. Keep the
-            # established scalar path there until the cached path is taught the
-            # same column-wise schedule.
-            return False
-        return int(rows) > 1 and int(cols) > 0
-
-    def _evaluate_transforms_with_dense_shared_cache(
-        self,
-        linear_layer,
-        in_ctensor,
-        *,
-        rows: int,
-        cols: int,
-        transform_ids,
-        out_shape,
-        fhe_out_shape,
-        skip_post_rescale: bool,
-    ):
-        group_started = time.perf_counter()
-        runtime_timing = {
-            "read_bundle_s": 0.0,
-            "load_keys_s": 0.0,
-            "load_plaintexts_s": 0.0,
-            "eval_s": 0.0,
-            "eval_total_s": 0.0,
-            "unload_s": 0.0,
-            "trim_s": 0.0,
-        }
-        all_transform_ids: list[int] = []
-        cts_out = [None for _ in range(int(rows))]
-        for j in range(int(cols)):
-            column_items = [
-                (int(i), int(transform_ids[i][j]))
-                for i in range(int(rows))
-                if int(transform_ids[i][j]) >= 0
-            ]
-            if not column_items:
-                continue
-            column_ids = [int(transform_id) for _row, transform_id in column_items]
-            all_transform_ids.extend(column_ids)
-            loaded_from_host_cache: list[int] = []
-            if self._dense_host_payload_cache_enabled():
-                load_started = time.perf_counter()
-                for transform_id in column_ids:
-                    payload = self._dense_host_plaintext_payload_cache.get(int(transform_id))
-                    if payload is None:
-                        continue
-                    self.backend.LoadLinearTransformPlaintexts(payload, int(transform_id))
-                    loaded_from_host_cache.append(int(transform_id))
-                runtime_timing["load_plaintexts_s"] += float(time.perf_counter() - load_started)
-            transform_ids_array = (ctypes.c_int * len(column_ids))(*column_ids)
-            try:
-                self._consume_shared_cache_eval_profile()
-                eval_started = time.perf_counter()
-                result_ids = list(
-                    self.backend.EvaluateLinearTransformsWithSharedCache(
-                        transform_ids_array,
-                        len(column_ids),
-                        int(in_ctensor.ids[j]),
-                    )
-                )
-                eval_elapsed = float(time.perf_counter() - eval_started)
-                self._add_backend_eval_profile(runtime_timing)
-                runtime_timing["eval_total_s"] += float(eval_elapsed)
-                runtime_timing["eval_s"] += float(eval_elapsed)
-            finally:
-                unload_started = time.perf_counter()
-                for transform_id in loaded_from_host_cache:
-                    self.backend.RemovePlaintextDiagonals(int(transform_id))
-                runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
-                if loaded_from_host_cache:
-                    self._forward_memory_guard(
-                        reason="after_dense_shared_cache_unload",
-                        raise_on_low=False,
-                    )
-            if len(result_ids) != len(column_ids):
-                raise RuntimeError(
-                    "EvaluateLinearTransformsWithSharedCache returned "
-                    f"{len(result_ids)} outputs for {len(column_ids)} dense transforms"
-                )
-            for (i, _transform_id), res in zip(column_items, result_ids):
-                ct = CipherTensor(self.scheme, int(res), out_shape, fhe_out_shape)
-                cts_out[int(i)] = ct if cts_out[int(i)] is None else cts_out[int(i)] + ct
-
-        output_ids = []
-        for i, ct_out in enumerate(cts_out):
-            if ct_out is None:
-                raise RuntimeError(f"dense shared-cache LT missing output row {int(i)}")
-            if bool(skip_post_rescale):
-                output_ids.append(int(ct_out.ids[0]))
-                ct_out.ids = []
-            else:
-                output_ids.append(int(self.evaluator.rescale(ct_out.ids[0], in_place=False)))
-        timing_payload = self._publish_runtime_timing(
-            runtime_timing,
-            transform_ids=all_transform_ids,
-            total_s=float(time.perf_counter() - group_started),
-        )
-        linear_layer._last_runtime_timing = dict(timing_payload)
-        return CipherTensor(self.scheme, output_ids, out_shape, fhe_out_shape)
 
     def _transform_id_matrix(self, transform_ids: dict, *, input_cols: int):
         work_items = self._work_items_from_transform_ids(transform_ids)

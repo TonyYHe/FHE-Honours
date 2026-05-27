@@ -466,7 +466,7 @@ def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> N
 
 
 def test_single_slot_layer_cache_evicts_between_tiny_64_layers(monkeypatch) -> None:
-    monkeypatch.setenv("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
     monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "2")
     slots_64 = 64 * 64
     backend = _SingleSlotTrackingBackend()
@@ -1343,7 +1343,7 @@ def test_single_slot_layer_cache_runs_and_evicts_on_lattigo_backend(monkeypatch)
     if not shared_library.exists():
         pytest.skip("local Lattigo shared library has not been built")
 
-    monkeypatch.setenv("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
     monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "2")
     monkeypatch.setenv("ORION_LATTIGO_STREAMING_LT", "0")
 
@@ -1460,7 +1460,6 @@ finally:
     def run_probe(*, legacy: bool) -> int:
         env = dict(os.environ)
         env["ORION_LATTIGO_STREAMING_LT"] = "force"
-        env["ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE"] = "0"
         env["ORION_SINGLE_SLOT_LAYER_CACHE"] = "0"
         if legacy:
             env["ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT"] = "1"

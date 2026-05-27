@@ -1894,6 +1894,51 @@ int AddLinearTransformFromDescriptor(const int *diag_idxs, int diag_count,
   return g_scheme->transforms.Add(std::move(state));
 }
 
+ArrayResultInt PlanLinearTransformRotationKeyRequests(
+    const int *diagIdxs, int diagIdxsLen, int level, float bsgsRatio) {
+  RequireScheme();
+  if (level < 0 || level > g_scheme->param->default_encryption_level_) {
+    throw std::runtime_error(
+        "linear transform level is outside supported preset range");
+  }
+  std::vector<int> diag_indices;
+  diag_indices.reserve(std::max(0, diagIdxsLen));
+  const int normalized_width = DefaultRotationWidth();
+  for (int i = 0; i < diagIdxsLen; ++i) {
+    diag_indices.push_back(NormalizeRotationIndex(diagIdxs[i], normalized_width));
+  }
+  const auto [bs, gs] =
+      ChooseLinearTransformSplit(diag_indices, normalized_width, bsgsRatio);
+  LinearTransformState state(std::move(diag_indices), level, normalized_width,
+                             bs, gs);
+  CacheLinearTransformMetadata(state);
+  std::vector<int> flat;
+  flat.reserve(state.cached_rotation_key_requests.size() * 2);
+  for (const auto &[key, key_level] : state.cached_rotation_key_requests) {
+    if (key != 0) {
+      flat.push_back(key);
+      flat.push_back(key_level);
+    }
+  }
+  return MakeIntArrayResult(flat);
+}
+
+ArrayResultInt PlanLinearTransformRotationKeys(const int *diagIdxs,
+                                               int diagIdxsLen, int level,
+                                               float bsgsRatio) {
+  ArrayResultInt requests =
+      PlanLinearTransformRotationKeyRequests(diagIdxs, diagIdxsLen, level,
+                                             bsgsRatio);
+  std::vector<int> keys;
+  keys.reserve(requests.Length / 2);
+  for (size_t index = 0; index + 1 < requests.Length; index += 2) {
+    keys.push_back(requests.Data[index]);
+  }
+  ArrayResultInt out = MakeIntArrayResult(keys);
+  std::free(requests.Data);
+  return out;
+}
+
 int DefaultLinearTransformDescriptorWidth() {
   return std::max(1, g_scheme->param->degree_ / 2);
 }

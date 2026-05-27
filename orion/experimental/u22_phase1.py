@@ -530,6 +530,51 @@ def _layout_policy_attach_backend_producer_outputs(
     return attached
 
 
+def _layout_policy_attach_backend_consumer_inputs(
+    dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    provider_nodes: set[str],
+) -> list[dict[str, Any]]:
+    attached: list[dict[str, Any]] = []
+    for row in compile_plan.get("edge_layouts", []):
+        target = str(row.get("target", ""))
+        if not target or target in provider_nodes or target not in dag.nodes:
+            continue
+        if _layout_policy_join_op_kind(row.get("op_kind", "")):
+            continue
+        module = dag.nodes[target].get("module")
+        if not isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d)):
+            continue
+        layout = dict(row.get("selected_layout", {}) or {})
+        if not _layout_policy_has_halo(layout):
+            continue
+        input_shape = _layout_policy_on_shape(dict(row), layout)
+        previous_shape = tuple(int(value) for value in getattr(module, "fhe_input_shape", torch.Size()))
+        gap = max(1, int(layout.get("gap", getattr(module, "input_gap", 1) or 1)))
+        top_beta = _layout_top_beta(layout)
+        module.fhe_input_shape = input_shape
+        module.layout_policy_input_layout = dict(layout)
+        module.layout_policy_selected_input_layout = dict(layout)
+        module.layout_policy_required_input_layout = dict(row.get("required_layout", layout) or layout)
+        module.layout_policy_input_physical_layout = str(row.get("physical_layout", "") or "")
+        module.layout_policy_input_row_offset = int(top_beta * gap)
+        attached.append(
+            {
+                "edge": str(row.get("edge", "")),
+                "source": str(row.get("source", "")),
+                "target": str(target),
+                "physical_layout": str(row.get("physical_layout", "")),
+                "previous_fhe_input_shape": [int(value) for value in previous_shape],
+                "fhe_input_shape": [int(value) for value in input_shape],
+                "top_beta": int(top_beta),
+                "bottom_beta": _layout_bottom_beta(layout),
+                "gap": int(gap),
+            }
+        )
+    return attached
+
+
 def _layout_policy_input_pair_native_halo_enabled() -> bool:
     return str(os.environ.get("ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO", "1")).strip().lower() not in {
         "",
@@ -2300,7 +2345,6 @@ def _layout_policy_runtime_compile_plan(compile_plan: dict[str, Any]) -> dict[st
         "runtime_materialization": "producer_layout_propagation",
     }
 
-
 def _layout_policy_transform_groups(executor: Any) -> list[Any]:
     groups: list[Any] = []
     group = getattr(executor, "group", None)
@@ -4023,47 +4067,13 @@ class U22CompileRegistry:
         for node in dag.topological_sort():
             module = dag.nodes[node].get("module")
             if isinstance(module, ConvTranspose2d):
-                if allowed is not None and str(node) not in allowed:
-                    excluded_nodes.append(
-                        {
-                            "node": str(node),
-                            "reason": "u22_ablation_filtered_out",
-                        }
-                    )
-                    continue
-                if not _u22_tconv_module_supported(module):
-                    excluded_nodes.append(
-                        {
-                            "node": str(node),
-                            "reason": "experimental_tconv_requires_k2s2_gap_halving",
-                        }
-                    )
-                    continue
-                groups.append(
-                    RegionFirstRuntimeGroup(
-                        region_id=f"u22_tconv_{node}",
-                        network="U22",
-                        stage="decoder_up",
-                        module_prefix=str(node),
-                        conv_nodes=(str(node),),
-                        strategy="halo_supported_tconv",
-                        materializer="halo_supported_tconv",
-                        depth=1,
-                        solver_depth=1,
-                        boundary_actions=("halo_supported_tconv",),
-                        expected_stats={},
-                        executable=True,
-                        fallback_reason="",
-                        output_node_ids=(str(node),),
-                        executor=HaloSupportedTConvRuntimeExecutor(
-                            module=module,
-                            output_node_id=str(node),
-                            use_ct_pt_hybrid_packing=False,
-                        ),
-                        fused_weight_count=1,
-                    )
+                excluded_nodes.append(
+                    {
+                        "node": str(node),
+                        "reason": "tconv_uses_common_dense_path",
+                    }
                 )
-                selected_tconv_count += 1
+                continue
             elif bool(enable_conv_kernels) and isinstance(module, AvgPool2d):
                 if not _u22_pool_module_supported(module):
                     excluded_nodes.append(
@@ -4183,8 +4193,14 @@ class U22CompileRegistry:
         add_attached: list[dict[str, Any]] = []
         concat_attached: list[dict[str, Any]] = []
         backend_producer_attached: list[dict[str, Any]] = []
+        backend_consumer_attached: list[dict[str, Any]] = []
         if compile_plan is not None:
             backend_producer_attached = _layout_policy_attach_backend_producer_outputs(
+                dag,
+                compile_plan,
+                provider_nodes=provider_nodes,
+            )
+            backend_consumer_attached = _layout_policy_attach_backend_consumer_inputs(
                 dag,
                 compile_plan,
                 provider_nodes=provider_nodes,
@@ -4242,6 +4258,8 @@ class U22CompileRegistry:
             "attached": attached,
             "layout_policy_backend_producer_output_count": int(len(backend_producer_attached)),
             "layout_policy_backend_producer_outputs": backend_producer_attached,
+            "layout_policy_backend_consumer_input_count": int(len(backend_consumer_attached)),
+            "layout_policy_backend_consumer_inputs": backend_consumer_attached,
             "layout_policy_add_runtime_count": int(len(add_attached)),
             "layout_policy_add_runtimes": add_attached,
             "layout_policy_concat_runtime_count": int(len(concat_attached)),

@@ -120,7 +120,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "PYTHONUNBUFFERED": "1",
     "MALLOC_ARENA_MAX": "2",
     "ORION_COMPILE_PARALLEL_POLICY": "manual",
-    "ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE": "1",
+    "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
     "ORION_SINGLE_SLOT_ENCODE_WORKERS": "16",
     "ORION_LATTIGO_STREAMING_LT": "0",
     "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "0",
@@ -139,7 +139,7 @@ ENV_DEFAULTS: dict[str, str] = {
 ENV_TUNING_KEYS = (
     "GOMAXPROCS",
     "ORION_COMPILE_MEMORY_RESERVE_GB",
-    "ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE",
+    "ORION_SINGLE_SLOT_LAYER_CACHE",
     "ORION_SINGLE_SLOT_ENCODE_WORKERS",
     "ORION_LT_COMPILE_WORKERS",
     "ORION_UNIFIED_COMPILE_WORKERS",
@@ -150,8 +150,6 @@ ENV_TUNING_KEYS = (
     "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
     "ORION_PACK_CONV_WORKERS",
     "ORION_LATTIGO_BOOTSTRAP_WORKERS",
-    "ORION_DENSE_LT_SHARED_CACHE",
-    "ORION_DENSE_LT_HOST_PAYLOAD_CACHE",
     "ORION_CONCAT_FUSION",
 )
 
@@ -289,8 +287,6 @@ def run_one(args: argparse.Namespace) -> int:
     os.environ.update(_apply_env_defaults(os.environ))
     mode = str(args.mode)
     if mode == "dense":
-        os.environ["ORION_DENSE_LT_SHARED_CACHE"] = "0"
-        os.environ["ORION_DENSE_LT_HOST_PAYLOAD_CACHE"] = "0"
         os.environ["ORION_CONCAT_FUSION"] = "1"
     else:
         os.environ.setdefault("ORION_CONCAT_FUSION", "1")
@@ -448,7 +444,11 @@ def _empty_layer_stats() -> dict[str, Any]:
     return {
         "row_count": 0,
         "transform_count": 0,
-        "stream_encode_s": 0.0,
+        "legacy_load_encode_s": 0.0,
+        "layer_cache_turnover_s": 0.0,
+        "layer_cache_encode_s": 0.0,
+        "layer_cache_key_prepare_s": 0.0,
+        "layer_cache_evict_s": 0.0,
         "lt_accumulate_s": 0.0,
         "eval_total_s": 0.0,
         "stream_build_map_s": 0.0,
@@ -559,6 +559,18 @@ def _layer_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         stream_eval = _as_float(timing.get("stream_eval_s"))
         stream_accum = _as_float(timing.get("stream_accumulate_s"))
         baby_giant = _as_float(timing.get("cpp_baby_step_s")) + _as_float(timing.get("cpp_giant_step_s"))
+        layer_cache_encode = _as_float(row.get("lt_layer_cache_encode_s")) or _as_float(
+            timing.get("layer_cache_encode_s")
+        )
+        layer_cache_key_prepare = _as_float(row.get("lt_layer_cache_key_prepare_s")) or _as_float(
+            timing.get("layer_cache_key_prepare_s")
+        )
+        layer_cache_evict = _as_float(row.get("lt_layer_cache_evict_s")) or _as_float(
+            timing.get("layer_cache_evict_s")
+        )
+        layer_cache_turnover = _as_float(row.get("lt_layer_cache_turnover_s")) or (
+            layer_cache_encode + layer_cache_key_prepare + layer_cache_evict
+        )
         lt_accum = stream_eval + stream_accum + baby_giant
         if lt_accum <= 0.0:
             lt_accum = _as_float(row.get("mvm_kernel_s"))
@@ -571,7 +583,11 @@ def _layer_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         entry["stream_eval_s"] += stream_eval
         entry["stream_accumulate_s"] += stream_accum
         entry["cpp_baby_giant_s"] += baby_giant
-        entry["stream_encode_s"] += stream_build + stream_encode + stream_payload
+        entry["legacy_load_encode_s"] += stream_build + stream_encode + stream_payload
+        entry["layer_cache_turnover_s"] += layer_cache_turnover
+        entry["layer_cache_encode_s"] += layer_cache_encode
+        entry["layer_cache_key_prepare_s"] += layer_cache_key_prepare
+        entry["layer_cache_evict_s"] += layer_cache_evict
         entry["lt_accumulate_s"] += lt_accum
         entry["eval_total_s"] += _as_float(row.get("mvm_eval_total_s"))
     return stats
@@ -604,13 +620,23 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
     hot_s = None
     if encrypt_s is not None and he_forward_s is not None and decode_s is not None:
         hot_s = float(encrypt_s + he_forward_s + decode_s)
-    total_stream_encode = None
+    total_legacy_load_encode = None
+    total_layer_cache_turnover = None
+    total_layer_cache_encode = None
+    total_layer_cache_key_prepare = None
+    total_layer_cache_evict = None
     total_lt_accumulate = None
     if has_payload:
-        total_stream_encode = (
+        total_legacy_load_encode = _as_float(totals.get("lt_runtime_load_encode_s")) or (
             _as_float(totals.get("lt_runtime_stream_build_map_s"))
             + _as_float(totals.get("lt_runtime_stream_encode_hoist_s"))
             + _as_float(totals.get("lt_runtime_stream_load_payload_s"))
+        )
+        total_layer_cache_encode = _as_float(totals.get("lt_layer_cache_encode_s"))
+        total_layer_cache_key_prepare = _as_float(totals.get("lt_layer_cache_key_prepare_s"))
+        total_layer_cache_evict = _as_float(totals.get("lt_layer_cache_evict_s"))
+        total_layer_cache_turnover = _as_float(totals.get("lt_layer_cache_turnover_s")) or (
+            total_layer_cache_encode + total_layer_cache_key_prepare + total_layer_cache_evict
         )
         total_lt_accumulate = _as_float(totals.get("mvm_kernel_s"))
     total_row = [
@@ -621,9 +647,13 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
         status,
         "TOTAL",
         _fmt_int(_metric(payload or {}, ("operator_breakdown_after_forward", "mvm", "totals", "group_count"))),
-        _fmt_float(total_stream_encode),
+        _fmt_float(total_layer_cache_turnover),
+        _fmt_float(total_layer_cache_encode),
+        _fmt_float(total_layer_cache_key_prepare),
+        _fmt_float(total_layer_cache_evict),
         _fmt_float(total_lt_accumulate),
         _fmt_float(totals.get("mvm_eval_total_s")),
+        _fmt_float(total_legacy_load_encode),
         _fmt_float(totals.get("lt_runtime_stream_build_map_s")),
         _fmt_float(totals.get("lt_runtime_stream_encode_hoist_s")),
         _fmt_float(totals.get("lt_runtime_stream_load_payload_s")),
@@ -662,9 +692,13 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
                 status if has_row else ("pending" if payload is None else "no-row"),
                 layer,
                 _fmt_int(item["transform_count"] or item["row_count"]) if has_row else "",
-                _fmt_float(item["stream_encode_s"]) if has_row else "",
+                _fmt_float(item["layer_cache_turnover_s"]) if has_row else "",
+                _fmt_float(item["layer_cache_encode_s"]) if has_row else "",
+                _fmt_float(item["layer_cache_key_prepare_s"]) if has_row else "",
+                _fmt_float(item["layer_cache_evict_s"]) if has_row else "",
                 _fmt_float(item["lt_accumulate_s"]) if has_row else "",
                 _fmt_float(item["eval_total_s"]) if has_row else "",
+                _fmt_float(item["legacy_load_encode_s"]) if has_row else "",
                 _fmt_float(item["stream_build_map_s"]) if has_row else "",
                 _fmt_float(item["stream_encode_hoist_s"]) if has_row else "",
                 _fmt_float(item["stream_load_payload_s"]) if has_row else "",
@@ -704,6 +738,10 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
                 "",
                 "",
                 "",
+                "",
+                "",
+                "",
+                "",
                 _fmt_int(record.get("module_count")),
                 _fmt_float(record.get("bootstrap_s")),
                 _bootstrap_anchor_name(str(record.get("name", ""))),
@@ -730,9 +768,13 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "status",
         "layer",
         "groups/transforms",
-        "stream+encode s",
+        "layer cache turnover s",
+        "layer cache encode s",
+        "layer cache key prep s",
+        "layer cache evict s",
         "LT+accum s",
         "eval total s",
+        "legacy load/encode s",
         "stream build s",
         "encode hoist s",
         "stream load s",
@@ -759,6 +801,10 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "---",
         "---",
         "---",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
         "---:",
         "---:",
         "---:",
@@ -848,7 +894,7 @@ def run_all(args: argparse.Namespace) -> int:
             "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
             "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
             "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_unified_bsgs": "shared-cache path disabled via ORION_DENSE_LT_SHARED_CACHE=0; concat fusion remains enabled via ORION_CONCAT_FUSION=1",
+            "dense_lt": "independent Orion LT; concat fusion is common via ORION_CONCAT_FUSION=1",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
         },
     }

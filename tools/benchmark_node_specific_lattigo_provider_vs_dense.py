@@ -743,13 +743,6 @@ def _eager_materialize_dense_transforms(module: Any, *, backend: str, effective_
 
     if str(backend) != "cheddar" or str(effective_path_kind) != "dense":
         return {"enabled": False, "seconds": 0.0, "transform_count": 0}
-    if os.environ.get("ORION_DENSE_LT_HOST_PAYLOAD_CACHE", "").lower() not in ("", "0", "false", "no", "off"):
-        return {
-            "enabled": False,
-            "seconds": 0.0,
-            "transform_count": int(len(_compiled_transform_ids(module))),
-            "reason": "dense host payload cache materializes plaintext payloads during compile",
-        }
 
     backend_obj = getattr(scheme, "backend", None)
     load_batch = getattr(backend_obj, "LoadPlaintextDiagonalsBatch", None)
@@ -1276,92 +1269,6 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
     rows = _dense_rows(module)
     output_rotations = int(getattr(module, "output_rotations", 0) or 0)
     output_rotation_evals = int(rows * output_rotations)
-    tconv_unified_stats = _dense_tconv_unified_stats_enabled(module)
-    if _dense_shared_cache_stats_enabled(module=module, rows=int(rows), cols=int(cols)) or bool(tconv_unified_stats):
-        dense_groups = _dense_diag_entries_by_col(
-            module,
-            transform_ids,
-            rows=int(rows),
-            cols=int(cols),
-        )
-        if dense_groups:
-            slots = int(scheme.params.get_slots())
-            log_ratio = _dense_bsgs_log_ratio(module)
-            per_group: list[dict[str, Any]] = []
-            shared_rotation_total = 0
-            reported_unique_key_union_total = 0
-            for col, group_entries in enumerate(dense_groups):
-                if module.__class__.__name__ == "ConvTranspose2d":
-                    unified_n1, cost = _best_unified_common_n1(group_entries, slots=int(slots))
-                else:
-                    n1s = [
-                        _lattigo_find_best_bsgs_n1(
-                            set(entry["diag_indices"]),
-                            slots=int(slots),
-                            log_max_ratio=int(log_ratio),
-                        )
-                        for entry in group_entries
-                    ]
-                    unified_n1 = 0
-                    cost = _shared_cache_bsgs_group_cost(group_entries, slots=int(slots), n1s=n1s)
-                group_keys = {
-                    int(key)
-                    for entry in group_entries
-                    for key in _rotation_keys(int(entry["transform_id"]))
-                }
-                shared_rotation_total += int(cost["actual_rotation_callback_count"])
-                reported_unique_key_union_total += int(cost["reported_unique_key_union_count"])
-                per_group.append(
-                    {
-                        "group_index": int(col),
-                        "input_col": int(col),
-                        "transform_count": int(len(group_entries)),
-                        "transform_rotation_key_count_total": int(
-                            sum(int(item["rotation_key_count"]) for item in per_transform if int(item["col"]) == int(col))
-                        ),
-                        "shared_rotation_eval_count": int(cost["actual_rotation_callback_count"]),
-                        "actual_rotation_callback_count": int(cost["actual_rotation_callback_count"]),
-                        "shared_baby_rotation_count": int(cost["shared_baby_rotation_count"]),
-                        "giant_rotation_count_total": int(cost["giant_rotation_count_total"]),
-                        "sum_per_transform_rotation_count": int(cost["sum_per_transform_rotation_count"]),
-                        "reported_unique_key_union_count": int(cost["reported_unique_key_union_count"]),
-                        "compiled_unique_rotation_key_count": int(len(group_keys)),
-                        "unique_rotation_key_count": int(len(group_keys)),
-                        "unique_rotation_keys": sorted(int(key) for key in group_keys),
-                        "bsgs_log_ratio": int(log_ratio),
-                        "unified_n1": int(unified_n1),
-                        "per_transform_bsgs": cost["per_transform_bsgs"],
-                        "per_transform": [
-                            item for item in per_transform if int(item["col"]) == int(col)
-                        ],
-                    }
-                )
-            actual_total = int(shared_rotation_total + output_rotation_evals)
-            return {
-                "source": "compiled_lattigo_transform_diagonal_indices",
-                "method": (
-                    "actual dense shared-cache BSGS callback-equivalent count: "
-                    "unique nonzero baby rotations per input-column group plus nonzero giant rotations per transform, "
-                    "then Orion hybrid output rotations"
-                ),
-                "dense_shared_cache": bool(_dense_shared_cache_stats_enabled(module=module, rows=int(rows), cols=int(cols))),
-                "dense_unified_bsgs_stats": bool(tconv_unified_stats),
-                "group_count": int(len(per_group)),
-                "transform_count": int(len(transform_ids)),
-                "rows": int(rows),
-                "cols": int(cols),
-                "transform_rotation_key_count_total": int(transform_rotation_total),
-                "shared_rotation_eval_count_total": int(shared_rotation_total),
-                "actual_rotation_callback_count": int(actual_total),
-                "reported_unique_key_union_count": int(reported_unique_key_union_total + output_rotation_evals),
-                "unique_rotation_key_count": int(len(unique_keys)),
-                "output_rotations_per_output_ct": int(output_rotations),
-                "output_rotation_eval_count": int(output_rotation_evals),
-                "rotation_eval_count": int(actual_total),
-                "unique_rotation_keys": sorted(int(key) for key in unique_keys),
-                "per_transform": per_transform,
-                "per_group": per_group,
-            }
     return {
         "source": "compiled_lattigo_transform_galois_elements",
         "method": "sum per dense transform invocation BSGS rotation keys plus Orion hybrid output rotations",
@@ -1379,27 +1286,6 @@ def _linear_transform_rotation_stats(module: Any) -> dict[str, Any]:
         "unique_rotation_keys": sorted(int(key) for key in unique_keys),
         "per_transform": per_transform,
     }
-
-
-def _dense_tconv_unified_stats_enabled(module: Any) -> bool:
-    if module.__class__.__name__ != "ConvTranspose2d":
-        return False
-    if bool(getattr(module, "dense_tconv_unified_bsgs", False)):
-        return True
-    return bool(os.environ.get("ORION_DENSE_LT_SHARED_CACHE", "").lower() in ("1", "true", "yes", "on"))
-
-
-def _dense_shared_cache_stats_enabled(*, module: Any, rows: int, cols: int) -> bool:
-    override = os.environ.get("ORION_DENSE_LT_SHARED_CACHE")
-    requested = bool(override is not None and override.lower() in ("1", "true", "yes", "on"))
-    requested = bool(requested or _dense_tconv_unified_stats_enabled(module))
-    if not bool(requested):
-        return False
-    if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "none":
-        return False
-    if not callable(getattr(scheme.backend, "EvaluateLinearTransformsWithSharedCache", None)):
-        return False
-    return int(rows) > 1 and int(cols) > 0
 
 
 def _append_group(groups: list[Any], seen: set[int], group: Any) -> None:
@@ -1463,10 +1349,7 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
 
 
 def _runtime_fairness_mode_from_env() -> str:
-    raw_single_slot = os.environ.get("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE") or os.environ.get(
-        "ORION_SINGLE_SLOT_LAYER_CACHE",
-        "",
-    )
+    raw_single_slot = os.environ.get("ORION_SINGLE_SLOT_LAYER_CACHE", "")
     if str(raw_single_slot).strip().lower() in {"1", "true", "yes", "on"}:
         return "single_slot_layer_cache"
     raw = os.environ.get("ORION_LATTIGO_STREAMING_LT", "")
@@ -1781,7 +1664,6 @@ def _module_metadata(module: Any) -> dict[str, Any]:
         )
     if isinstance(module, ConvTranspose2d):
         payload["output_padding"] = [int(v) for v in getattr(module, "output_padding")]
-        payload["dense_tconv_unified_bsgs"] = bool(getattr(module, "dense_tconv_unified_bsgs", False))
     return payload
 
 
@@ -2457,8 +2339,6 @@ def _run_worker(
     command.extend(["--ckks-profile", str(ckks_profile)])
 
     env = os.environ.copy()
-    if str(path_kind) == "dense":
-        env.setdefault("ORION_DENSE_LT_SHARED_CACHE", "0")
     worker_cheddar_io_root: Path | None = None
     worker_lattigo_dense_io_root: Path | None = None
     worker_lattigo_provider_io_root: Path | None = None
@@ -2527,7 +2407,6 @@ def _run_worker(
         env.setdefault("ORION_LT_COMPILE_WORKERS", compile_workers)
         env.setdefault("ORION_LATTIGO_COMPILE_WORKERS", compile_workers)
         env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", diagonal_encode_workers)
-        env.setdefault("ORION_DENSE_LT_HOST_PAYLOAD_CACHE", "0")
         bounded_lattigo_dense_payload = {
             "enabled": True,
             "mode": str(bounded_mode),
@@ -2556,7 +2435,6 @@ def _run_worker(
             env[LATTIGO_BENCH_DIAGS_PATH_ENV] = str(worker_lattigo_dense_io_root / "diagonals.h5")
             env[LATTIGO_BENCH_KEYS_PATH_ENV] = str(worker_lattigo_dense_io_root / "keys.h5")
             env.setdefault("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "1")
-            env.setdefault("ORION_DENSE_LT_SHARED_CACHE", "0")
             disk_watch_path = worker_lattigo_dense_io_root
             disk_before = _disk_usage_payload(base_io_root)
             min_disk_free_bytes = int(max(0.0, float(min_disk_free_gb)) * (1024**3))
@@ -2568,7 +2446,6 @@ def _run_worker(
                     "diags_path": str(worker_lattigo_dense_io_root / "diagonals.h5"),
                     "keys_path": str(worker_lattigo_dense_io_root / "keys.h5"),
                     "saved_io_prefetch_lookahead": str(env.get("ORION_SAVED_IO_PREFETCH_LOOKAHEAD", "")),
-                    "dense_shared_cache": str(env.get("ORION_DENSE_LT_SHARED_CACHE", "")),
                 }
             )
             if min_disk_free_bytes > 0 and int(disk_before["free_bytes"]) < min_disk_free_bytes:
@@ -2590,7 +2467,7 @@ def _run_worker(
                     "min_disk_free_bytes": int(min_disk_free_bytes),
                 }
         else:
-            env.setdefault("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+            env.setdefault("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
             env.setdefault("ORION_SINGLE_SLOT_ENCODE_WORKERS", "16")
             env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
             env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "0")
@@ -2668,7 +2545,7 @@ def _run_worker(
             env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
         else:
             env[LATTIGO_BENCH_IO_MODE_ENV] = "none"
-            env.setdefault("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+            env.setdefault("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
             env.setdefault("ORION_SINGLE_SLOT_ENCODE_WORKERS", "16")
             env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "0")
             env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
@@ -2697,7 +2574,7 @@ def _run_worker(
             "lattigo_diagonal_encode_workers": str(
                 env.get("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", "")
             ),
-            "single_slot_layer_cache": str(env.get("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "")),
+            "single_slot_layer_cache": str(env.get("ORION_SINGLE_SLOT_LAYER_CACHE", "")),
             "single_slot_encode_workers": str(env.get("ORION_SINGLE_SLOT_ENCODE_WORKERS", "")),
             "stream_load_plaintexts": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
             "stream_load_chunk_gb": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
@@ -3433,8 +3310,7 @@ def main() -> int:
             "compile_runs_per_path": 1,
             "rotation_count_note": (
                 "rotation_eval_count is the callback-equivalent BSGS rotation count after planning: "
-                "the default dense path counts each Orion submatrix transform independently; shared-cache "
-                "dense evaluation is disabled unless ORION_DENSE_LT_SHARED_CACHE is explicitly enabled. "
+                "the default dense path counts each Orion submatrix transform independently. "
                 "Provider shared-cache paths count unique nonzero baby rotations per family plus nonzero "
                 "giant rotations per transform, and dense output-fold rotations are added where the runtime still uses them. "
                 "runtime_rotation_eval_count is measured during the timed Lattigo forward with runtime operation "

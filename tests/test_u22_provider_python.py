@@ -282,19 +282,16 @@ def test_u22_registry_routes_decoder_tconvs_to_halo_supported_provider(dataset: 
         registry = U22CompileRegistry.for_dag(dag)
         audit = registry.attach_to_dag(dag)
 
-        assert audit["attached_count"] == len(DECODER_TCONV_NODES)
-        assert audit["graph_audit"]["selected_tconv_count"] == len(DECODER_TCONV_NODES)
-        assert audit["graph_audit"]["excluded_nodes"] == []
+        assert audit["attached_count"] == 0
+        assert audit["graph_audit"]["selected_tconv_count"] == 0
+        excluded = {row["node"]: row["reason"] for row in audit["graph_audit"]["excluded_nodes"]}
+        assert {node: excluded[node] for node in DECODER_TCONV_NODES} == {
+            node: "tconv_uses_common_dense_path" for node in DECODER_TCONV_NODES
+        }
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime", None)
-            assert runtime is not None
-            assert runtime.strategy == "halo_supported_tconv"
-            assert runtime.materializer == "halo_supported_tconv"
-            assert type(runtime.executor).__name__ == "HaloSupportedTConvRuntimeExecutor"
-            assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
-            assert isinstance(runtime.executor.delegate, TconvK2S2PythonRuntimeExecutor)
-            assert getattr(module, "region_first_skip_dense_pack", False) is True
+            assert getattr(module, "region_runtime", None) is None
+            assert not getattr(module, "region_first_skip_dense_pack", False)
     finally:
         scheme.delete_scheme()
 
@@ -306,22 +303,16 @@ def test_u22_registry_can_attach_decoder_tconv_subset() -> None:
         registry = U22CompileRegistry.for_dag(dag, allowed_nodes=("up2", "up1"))
         audit = registry.attach_to_dag(dag)
 
-        assert audit["attached_count"] == 2
-        assert audit["graph_audit"]["selected_tconv_count"] == 2
+        assert audit["attached_count"] == 0
+        assert audit["graph_audit"]["selected_tconv_count"] == 0
         assert audit["graph_audit"]["allowed_nodes"] == ["up2", "up1"]
-        filtered = {
+        common_dense = {
             row["node"]
             for row in audit["graph_audit"]["excluded_nodes"]
-            if row["reason"] == "u22_ablation_filtered_out"
+            if row["reason"] == "tconv_uses_common_dense_path"
         }
-        assert filtered == {"up4", "up3"}
-        for node_name in ("up2", "up1"):
-            module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime", None)
-            assert runtime is not None
-            assert runtime.strategy == "halo_supported_tconv"
-            assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
-        for node_name in ("up4", "up3"):
+        assert common_dense == set(DECODER_TCONV_NODES)
+        for node_name in DECODER_TCONV_NODES:
             assert getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None) is None
     finally:
         scheme.delete_scheme()
@@ -369,14 +360,14 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
         attached = {row["node"] for row in audit["attached"]}
 
         assert {"enc1b", "dec1a", "dec2b", "pool1", "pool2", "pool3", "pool4"}.issubset(attached)
-        assert "up4" in attached
-        assert "up3" in attached
+        assert "up4" not in attached
+        assert "up3" not in attached
         assert "up2" not in attached
         assert "up1" not in attached
         assert "bottleneckb" in attached
         assert audit["graph_audit"]["allowed_nodes"] == ["up4", "up3"]
         assert audit["graph_audit"]["enable_conv_kernels"] is True
-        assert audit["graph_audit"]["selected_tconv_count"] == 2
+        assert audit["graph_audit"]["selected_tconv_count"] == 0
         assert audit["graph_audit"]["selected_conv_count"] >= 15
         assert audit["graph_audit"]["selected_pool_count"] == 4
         assert audit["graph_audit"]["selected_generic_conv_count"] == 3
@@ -389,13 +380,8 @@ def test_u22_registry_can_attach_up34_and_same_shape_conv_kernels() -> None:
             assert type(runtime.executor.base_executor).__name__ == "HaloLocalConvRuntimeExecutor"
             assert runtime.executor.native_halo_input is bool(runtime.plan.get("native_halo_provider", False))
             assert runtime.supports_scheme(scheme) is True
-        for node_name in ("up4", "up3"):
-            module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime", None)
-            assert runtime is not None
-            assert runtime.strategy.startswith("halo_supported_tconv")
-            assert type(runtime.executor).__name__ == "LayoutPolicyProviderRuntimeExecutor"
-            assert isinstance(runtime.executor.base_executor, HaloSupportedTConvRuntimeExecutor)
+        for node_name in DECODER_TCONV_NODES:
+            assert getattr(dag.nodes[str(node_name)]["module"], "region_runtime", None) is None
         assert dag.nodes["pool1"]["module"].region_runtime.stage == "pool_downsample"
         assert dag.nodes["bottleneckb"]["module"].region_runtime.stage == "single_block_conv"
     finally:
@@ -443,25 +429,24 @@ def test_u22_64_base32_provider_mode_attaches_all_linear_and_pool_nodes() -> Non
             "pool4",
             "bottlenecka",
             "bottleneckb",
-            "up4",
             "dec4a",
             "dec4b",
-            "up3",
             "dec3a",
             "dec3b",
-            "up2",
             "dec2a",
             "dec2b",
-            "up1",
             "dec1a",
             "dec1b",
         }
 
         assert attached == expected
-        assert audit["attached_count"] == 26
-        assert audit["executable_region_count"] == 26
-        assert audit["graph_audit"]["excluded_nodes"] == []
-        assert audit["graph_audit"]["selected_tconv_count"] == 4
+        assert audit["attached_count"] == 22
+        assert audit["executable_region_count"] == 22
+        excluded = {row["node"]: row["reason"] for row in audit["graph_audit"]["excluded_nodes"]}
+        assert {node: excluded[node] for node in DECODER_TCONV_NODES} == {
+            node: "tconv_uses_common_dense_path" for node in DECODER_TCONV_NODES
+        }
+        assert audit["graph_audit"]["selected_tconv_count"] == 0
         assert audit["graph_audit"]["selected_conv_count"] == 18
         assert audit["graph_audit"]["selected_pool_count"] == 4
         assert audit["graph_audit"]["selected_generic_conv_count"] == 4
@@ -486,7 +471,7 @@ def test_u22_registry_provider_default_is_no_hybrid() -> None:
         )
         audit = registry.attach_to_dag(dag)
         assert "use_real_imag_hybrid" not in audit["graph_audit"]
-        assert audit["executable_region_count"] == 26
+        assert audit["executable_region_count"] == 22
         attached_modules = [
             dag.nodes[str(row["node"])]["module"]
             for row in audit["attached"]
@@ -499,11 +484,7 @@ def test_u22_registry_provider_default_is_no_hybrid() -> None:
             assert getattr(executor, "use_ct_pt_hybrid_packing", False) is False
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime", None)
-            assert runtime is not None
-            executor = getattr(runtime, "executor", None)
-            base_executor = getattr(executor, "base_executor", executor)
-            assert isinstance(base_executor, HaloSupportedTConvRuntimeExecutor)
+            assert getattr(module, "region_runtime", None) is None
     finally:
         scheme.delete_scheme()
 
@@ -873,7 +854,7 @@ def test_u22_224_silu7_layout_policies_validate_native_provider_plans() -> None:
         scheme.delete_scheme()
 
 
-def test_u22_224_silu7_dp_preserves_native_physical_layout_across_activation() -> None:
+def test_u22_224_silu7_dp_carries_halo_layout_across_activation() -> None:
     from orion.experimental.layout_policy_ablation import build_layout_policy_compile_plan
 
     _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
@@ -901,10 +882,11 @@ def test_u22_224_silu7_dp_preserves_native_physical_layout_across_activation() -
         nodes = {str(row["node"]): dict(row) for row in plan["node_layouts"]}
 
         assert edges["x->enc1a"]["physical_layout"] == "native_source_stripe"
-        assert edges["enc1a->enc1a_act"]["physical_layout"] == "native_source_stripe"
-        assert nodes["enc1a_act"]["physical_layout"] == "native_source_stripe"
-        assert edges["enc1a_act->enc1b"]["layout_mode"] == "native_halo_stripe"
-        assert edges["enc1a_act->enc1b"]["physical_layout"] == "native_source_stripe"
+        assert edges["enc1a->enc1a_act"]["layout_mode"] == "halo_local"
+        assert edges["enc1a->enc1a_act"]["physical_layout"] == "logical_halo_compact"
+        assert nodes["enc1a_act"]["physical_layout"] == "logical_halo_compact"
+        assert edges["enc1a_act->enc1b"]["layout_mode"] == "compact_halo_shared"
+        assert edges["enc1a_act->enc1b"]["physical_layout"] == "logical_halo_compact"
         assert edges["enc1a_act->enc1b"]["relayout"] is False
     finally:
         scheme.delete_scheme()
@@ -1569,21 +1551,21 @@ def test_node_specific_benchmark_u22_provider_helper_uses_full_default_provider_
             or int(dict(row.get("selected_layout", {})).get("bottom_beta", 0)) > 0
         ]
 
-        assert audit["attached_count"] == 26
-        assert audit["executable_region_count"] == 26
-        assert graph["selected_tconv_count"] == 4
+        assert audit["attached_count"] == 22
+        assert audit["executable_region_count"] == 22
+        assert graph["selected_tconv_count"] == 0
         assert graph["selected_conv_count"] == 18
         assert graph["selected_pool_count"] == 4
         assert graph["enable_conv_kernels"] is True
         assert graph["layout_policy"] == "dp"
         assert graph["layout_policy_edge_layout_count"] == 34
         expected_halo_edges = {
-            "u22_64_base32": 0,
-            "u22_256_base32": 4,
+            "u22_64_base32": 12,
+            "u22_256_base32": 30,
         }[str(network)]
         expected_relayouts = {
-            "u22_64_base32": 0,
-            "u22_256_base32": 0,
+            "u22_64_base32": 4,
+            "u22_256_base32": 4,
         }[str(network)]
         assert len(halo_edges) == expected_halo_edges
         assert int(graph["layout_policy_relayout_edge_count"]) == expected_relayouts
@@ -1639,7 +1621,7 @@ def test_u22_256_base8_provider_solver_depth_covers_native_halo_relayout() -> No
         scheme.delete_scheme()
 
 
-def test_u22_256_base32_provider_mode_routes_decoder_tconv_to_halo_supported_provider() -> None:
+def test_u22_256_base32_provider_mode_keeps_decoder_tconv_on_common_dense_path() -> None:
     opts = _region_first_mode_options("u22_256_base32")
     _init_python_scheme(logn=int(DATASET_SPECS["kvasir_polyp_256"]["logn"]))
     try:
@@ -1653,19 +1635,15 @@ def test_u22_256_base32_provider_mode_routes_decoder_tconv_to_halo_supported_pro
         _set_compile_level(dag)
 
         attached = {row["node"] for row in audit["attached"]}
-        assert set(DECODER_TCONV_NODES).issubset(attached)
-        assert audit["graph_audit"]["selected_tconv_count"] == 4
+        assert set(DECODER_TCONV_NODES).isdisjoint(attached)
+        assert audit["graph_audit"]["selected_tconv_count"] == 0
         assert audit["graph_audit"]["allowed_nodes"] == ["up1", "up2", "up3", "up4"]
+        excluded = {row["node"]: row["reason"] for row in audit["graph_audit"]["excluded_nodes"]}
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime", None)
-            assert runtime is not None
-            assert runtime.strategy.startswith("halo_supported_tconv")
-            executor = getattr(runtime, "executor", None)
-            base_executor = getattr(executor, "base_executor", executor)
-            assert isinstance(base_executor, HaloSupportedTConvRuntimeExecutor)
-            assert isinstance(base_executor.delegate, TconvK2S2PythonRuntimeExecutor)
-            assert getattr(module, "region_first_skip_dense_pack", False) is True
+            assert excluded[str(node_name)] == "tconv_uses_common_dense_path"
+            assert getattr(module, "region_runtime", None) is None
+            assert not getattr(module, "region_first_skip_dense_pack", False)
     finally:
         scheme.delete_scheme()
 
@@ -1673,6 +1651,7 @@ def test_u22_256_base32_provider_mode_routes_decoder_tconv_to_halo_supported_pro
 @pytest.mark.parametrize("dataset", ("tiny", "imagenet"))
 @pytest.mark.parametrize("node_name", DECODER_TCONV_NODES)
 def test_u22_decoder_tconv_halo_supported_provider_matches_reference_on_python_backend(dataset: str, node_name: str) -> None:
+    pytest.skip("TConv provider is not part of the mainline; dense/provider both use the common dense path.")
     _init_python_scheme(logn=int(DATASET_SPECS[str(dataset)]["logn"]))
     try:
         dag = _prepared_dag(dataset=str(dataset))
@@ -1720,10 +1699,7 @@ def test_u22_decoder_tconv_halo_supported_provider_supports_actual_base64_tiny_a
         registry.attach_to_dag(dag)
         for node_name in DECODER_TCONV_NODES:
             module = dag.nodes[str(node_name)]["module"]
-            runtime = getattr(module, "region_runtime", None)
-            assert runtime is not None
-            assert runtime.strategy == "halo_supported_tconv"
-            assert isinstance(runtime.executor, HaloSupportedTConvRuntimeExecutor)
+            assert getattr(module, "region_runtime", None) is None
     finally:
         scheme.delete_scheme()
 

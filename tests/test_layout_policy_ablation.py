@@ -337,9 +337,12 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
         group.plan["provider_materializer"]
         for group in registry.groups
     } >= {
-        "halo_supported_tconv",
         "u22_input_pair_conv_shared_rotations",
         "u22_pool_input_pair_shared_rotations",
+    }
+    excluded = {row["node"]: row["reason"] for row in audit["graph_audit"]["excluded_nodes"]}
+    assert {node: excluded[node] for node in ("up4", "up3", "up2", "up1")} == {
+        node: "tconv_uses_common_dense_path" for node in ("up4", "up3", "up2", "up1")
     }
     fake_lattigo_scheme = type(
         "FakeScheme",
@@ -372,8 +375,12 @@ def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None
         type(group.executor.base_executor).__name__
         for group in registry.groups
     } >= {
-        "HaloSupportedTConvRuntimeExecutor",
         "InputPairConvRuntimeExecutor",
+        "HaloLocalConvRuntimeExecutor",
+    }
+    excluded = {row["node"]: row["reason"] for row in registry.graph_audit["excluded_nodes"]}
+    assert {node: excluded[node] for node in ("up4", "up3", "up2", "up1")} == {
+        node: "tconv_uses_common_dense_path" for node in ("up4", "up3", "up2", "up1")
     }
 
 

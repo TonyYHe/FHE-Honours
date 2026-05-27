@@ -179,10 +179,7 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
 
 
 def _runtime_fairness_mode_from_env() -> str:
-    raw_single_slot = os.environ.get("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE") or os.environ.get(
-        "ORION_SINGLE_SLOT_LAYER_CACHE",
-        "",
-    )
+    raw_single_slot = os.environ.get("ORION_SINGLE_SLOT_LAYER_CACHE", "")
     if str(raw_single_slot).strip().lower() in {"1", "true", "yes", "on"}:
         return "single_slot_layer_cache"
     raw = os.environ.get("ORION_LATTIGO_STREAMING_LT", "")

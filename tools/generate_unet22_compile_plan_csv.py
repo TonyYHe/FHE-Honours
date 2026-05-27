@@ -10,15 +10,16 @@ from typing import Any
 
 import torch
 
+from orion.core import packing
 from orion.experimental import layout_policy_ablation as layout_planner
 from orion.experimental.u22_phase1 import (
     _u22_input_pair_conv_module_supported,
     _u22_pool_module_supported,
     _u22_same_shape_conv_module_supported,
-    _u22_tconv_module_supported,
 )
 from orion.core.auto_bootstrap import BootstrapSolver
 from orion.core.bootstrap_fusion import module_bootstrap_ct_count, module_bootstrap_slots
+from orion.core.fuser import Fuser
 from orion.core.level_dag import LevelDAG
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
@@ -136,6 +137,9 @@ class _DummyParams:
     def get_slots(self) -> int:
         return int(SLOTS)
 
+    def get_embedding_method(self) -> str:
+        return "hybrid"
+
     def get_debug_status(self) -> bool:
         return False
 
@@ -144,6 +148,14 @@ class _DummyParams:
 
     def get_compile_save_resume(self) -> bool:
         return False
+
+
+class _DiagonalCountProxy:
+    def __init__(self, count: int):
+        self.count = int(count)
+
+    def __len__(self) -> int:
+        return int(self.count)
 
 
 def _ceil_div(left: int, right: int) -> int:
@@ -305,6 +317,7 @@ def _build_real_unet22_dag(*, height: int, width: int, in_channels: int, out_cha
 
     dag = NetworkDAG(traced)
     dag.build_dag()
+    Fuser(dag).fuse_modules()
     for node in dag.nodes:
         module = dag.nodes[node].get("module")
         if module is not None:
@@ -357,8 +370,7 @@ def _provider_static_support(module: Any) -> tuple[bool | str, str, str]:
         ok = _u22_pool_module_supported(module)
         return bool(ok), "u22_pool_provider" if ok else "", "" if ok else "u22_pool_requires_stride2_avgpool"
     if isinstance(module, ConvTranspose2d):
-        ok = _u22_tconv_module_supported(module)
-        return bool(ok), "u22_tconv_provider" if ok else "", "" if ok else "u22_tconv_requires_k2s2_gap_halving"
+        return False, "", "tconv_uses_common_dense_path"
     if isinstance(module, Conv2d):
         if _u22_same_shape_conv_module_supported(module):
             return True, "u22_same_shape_conv_provider", ""
@@ -396,6 +408,31 @@ def _fusion_side(in_rows: list[dict[str, Any]], node_row: dict[str, Any]) -> tup
     if any(item.startswith("source_to_target:") for item in notes):
         sides.append("source_to_target")
     return "+".join(sides), ";".join(notes)
+
+
+def _packed_diagonal_count(module: Module, *, last: bool) -> int:
+    if not isinstance(module, (Conv2d, ConvTranspose2d, AvgPool2d)):
+        return 0
+    return int(packing.estimate_packed_diagonal_count(module, bool(last)))
+
+
+def _packed_diagonal_counts_for_dag(dag: Any, original_nodes: list[str]) -> dict[str, int]:
+    topo_sort = [str(node) for node in dag.topological_sort()]
+    last_linear = ""
+    for node in reversed(topo_sort):
+        module = dag.nodes[node].get("module")
+        if isinstance(module, (Conv2d, ConvTranspose2d, AvgPool2d)):
+            last_linear = str(node)
+            break
+
+    counts: dict[str, int] = {}
+    for node in original_nodes:
+        module = dag.nodes[node].get("module")
+        count = _packed_diagonal_count(module, last=str(node) == str(last_linear)) if module is not None else 0
+        counts[str(node)] = int(count)
+        if int(count) > 0:
+            module.diagonals = {(0, 0): _DiagonalCountProxy(int(count))}
+    return counts
 
 
 def _attach_bootstrap_dummy_scheme(dag: Any) -> None:
@@ -502,6 +539,7 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
         for node in dag.topological_sort()
         if str(node) != "x" and dag.nodes[node].get("module") is not None
     ]
+    packed_diagonal_counts = _packed_diagonal_counts_for_dag(dag, original_nodes)
     plan = layout_planner.build_layout_policy_compile_plan(
         dag,
         policy=POLICY,
@@ -567,7 +605,8 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
         )
         producer_rot = int(node_row.get("producer_fused_rotation_estimate", 0) or 0)
         consumer_rot = sum(int(row.get("consumer_fused_rotation_estimate", 0) or 0) for row in in_rows)
-        diag_count = sum(int(row.get("lt_ct_pt_mult_estimate", 0) or 0) for row in in_rows)
+        lt_ct_pt_mult = sum(int(row.get("lt_ct_pt_mult_estimate", 0) or 0) for row in in_rows)
+        diag_count = int(packed_diagonal_counts.get(str(node), 0))
         activation_ct_mult = sum(int(row.get("activation_ct_mult_estimate", 0) or 0) for row in in_rows)
         total_rot = int(planner_lt_rot + relayout_rot + producer_rot + consumer_rot)
         is_activation = isinstance(module, SiLU)
@@ -576,6 +615,7 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
             planner_lt_rot = 0
             producer_rot = 0
             consumer_rot = 0
+            lt_ct_pt_mult = 0
             diag_count = 0
             total_rot = int(relayout_rot)
         lt_estimators = sorted(
@@ -619,7 +659,7 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
                 "policy": POLICY,
                 "layout_estimator": str(plan.get("layout_estimator", ESTIMATOR)),
                 "rotation_estimator": "template_unweighted_diagonal_bsgs",
-                "diagonal_estimator": "template_unweighted_diagonal",
+                "diagonal_estimator": "dense_packed_unique_block_diagonal_count",
                 "slot_count": SLOTS,
                 "compile_node_index": int(compile_index),
                 "unet22_body_linear_layer_index": int(linear_index) if is_unet_linear and not is_output_layer else "",
@@ -662,6 +702,7 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
                 "producer_fused_rotation_estimate": int(producer_rot),
                 "consumer_fused_rotation_estimate": int(consumer_rot),
                 "diagonal_count": int(diag_count),
+                "lt_ct_pt_mult_estimate": int(lt_ct_pt_mult),
                 "activation_ct_mult_estimate": int(activation_ct_mult),
                 "lt_transform_count_estimate": 0 if is_activation else sum(int(row.get("lt_transform_count_estimate", 0) or 0) for row in in_rows),
                 "lt_bsgs_group_count_estimate": 0 if is_activation else sum(int(row.get("lt_bsgs_group_count_estimate", 0) or 0) for row in in_rows),
@@ -751,7 +792,8 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
                 "case_relayout_rotation_estimate": int(summary.get("relayout_rotation_estimate", 0) or 0),
                 "case_relayout_mask_mult_estimate": int(summary.get("relayout_mask_mult_estimate", 0) or 0),
                 "case_relayout_depth_estimate": int(summary.get("relayout_depth_estimate", 0) or 0),
-                "case_diagonal_count_estimate": int(summary.get("lt_ct_pt_mult_estimate", 0) or 0),
+                "case_diagonal_count_estimate": 0,
+                "case_lt_ct_pt_mult_estimate": int(summary.get("lt_ct_pt_mult_estimate", 0) or 0),
                 "case_activation_ct_mult_estimate": int(summary.get("activation_ct_mult_estimate", 0) or 0),
                 "case_ct_pt_mult_estimate": int(summary.get("ct_pt_mult_estimate", 0) or 0),
                 "case_halo_redundancy_ratio": float(summary.get("halo_redundancy_ratio", 0.0) or 0.0),
@@ -767,10 +809,11 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
         "case_relayout_mask_mult_estimate": int(sum(int(row["relayout_mask_mult_estimate"]) for row in rows)),
         "case_relayout_depth_estimate": int(sum(int(row["relayout_depth_estimate"]) for row in rows)),
         "case_diagonal_count_estimate": int(sum(int(row["diagonal_count"]) for row in rows)),
+        "case_lt_ct_pt_mult_estimate": int(sum(int(row["lt_ct_pt_mult_estimate"]) for row in rows)),
         "case_activation_ct_mult_estimate": int(sum(int(row["activation_ct_mult_estimate"]) for row in rows)),
     }
     corrected_case_values["case_ct_pt_mult_estimate"] = int(
-        corrected_case_values["case_diagonal_count_estimate"]
+        corrected_case_values["case_lt_ct_pt_mult_estimate"]
         + corrected_case_values["case_relayout_mask_mult_estimate"]
         + corrected_case_values["case_activation_ct_mult_estimate"]
     )

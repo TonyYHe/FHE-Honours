@@ -12,11 +12,18 @@ Current active gate, as of May 27, 2026:
 - Metrics: runtime rotations and `LT+accumulate s`; no streamed encode time in this table
 - Execution containment: one worker per table row with an RSS watchdog
 
+The `HW` column is the original U-Net input size, not necessarily the logical
+Conv input size.  The table simulates encoder-stage packing:
+
+- `Conv 32,32`: logical `32 x H x W`, multiplex/input/output gap `1`, packed FHE `32 x H x W`
+- `Conv 64,64`: logical `64 x H/2 x W/2`, multiplex/input/output gap `2`, four channels per packed group, packed FHE `16 x H x W`
+- `Conv 128,128`: logical `128 x H/4 x W/4`, multiplex/input/output gap `4`, sixteen channels per packed group, packed FHE `8 x H x W`
+
 The old dim32 encoder dense/provider matrix is provenance for this kernel-table
 gate. Reuse only exact-shape, non-stream rows; do not mix rows whose HW, channel
-count, path, or halo setting differs. Older provider JSONs without an explicit
-halo field are treated as provider halo `1/1`, which is the default provider
-setting.
+count, stage gap, path, or halo setting differs. Older provider JSONs without
+an explicit halo field are treated as provider halo `1/1`, which is the default
+provider setting.
 
 Historical dense-resident infeasibility evidence below used U22 `base_dim=64`.
 That evidence is still useful as a memory caution, but it is no longer the
@@ -37,12 +44,45 @@ The fair comparison path is:
 3. If a resident path exceeds the RSS cap, rerun that exact node/input/path with single-slot layer cache and record the encode worker count.
 4. Compare compute time separately from memory feasibility. Do not mix resident dense RAM certificates, streamed fallback timings, and HaloED timings without labeling the path.
 
-Streaming does not mean disabling BSGS.  The intended baseline is now a single-slot layer cache: compile prepares and keeps the cleartext raw diagonal payloads for every unified BSGS group, runtime materializes/encodes exactly the current layer's plaintexts, evaluates the layer with the normal resident BSGS/shared-cache path, then evicts those plaintexts before the next layer.  Report layer compute time separately from `layer_cache_turnover_s` (`layer_cache_encode_s + layer_cache_key_prepare_s + layer_cache_evict_s`).  Legacy chunked Lattigo LT streaming is not the mainline and requires the explicit `ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT=1` gate.
+Streaming does not mean disabling BSGS.  The intended baseline is now a single-slot layer cache: compile prepares and keeps cleartext raw diagonal payloads, runtime materializes/encodes exactly the current dense op or provider group, evaluates it, then evicts those plaintexts before the next op/group.  Orion dense remains independent LT evaluation; HaloED/provider uses grouped provider kernels where the lowering exposes shared-source structure.  Report layer compute time separately from `layer_cache_turnover_s` (`layer_cache_encode_s + layer_cache_key_prepare_s + layer_cache_evict_s`).  Legacy chunked Lattigo LT streaming is not the mainline and requires the explicit `ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT=1` gate.
+
+## Dim32 Packed-Diagonal Level Replay
+
+Use this fixed replay script when estimating all-preencoded plaintext memory for
+the four dim32 U22 input sizes:
+
+```bash
+.venv/bin/python tools/replay_u22_dim32_packed_diag_levels.py \
+  --plan-csv .tmp/results/u22_dim32_4sizes_compile_plan_packed_diags.csv \
+  --out-csv .tmp/results/u22_dim32_4sizes_packed_diag_level_replay.csv \
+  --out-json .tmp/results/u22_dim32_4sizes_packed_diag_level_replay.json
+```
+
+The input CSV supplies `diagonal_count` only.  The replay intentionally ignores
+source `assigned_level`, rebuilds the real traced U22+output DAG, applies the
+same fuser as `Scheme.compile()`, injects a lightweight diagonal-count proxy
+into each LT module, and reruns `BootstrapSolver`.  This prevents stale
+pre-fuser or zero-LT-cost level plans from contaminating memory estimates.
+
+Memory formula for `encoded_assigned`:
+
+`sum_node D_node * (assigned_level_node + 1 + 3) * 65536 * 8`
+
+Latest local replay output:
+
+| input | diagonals | encoded assigned TiB |
+| --- | ---: | ---: |
+| 192x192 | 646,875 | 2.502 |
+| 224x224 | 899,296 | 3.522 |
+| 384x288 | 1,881,093 | 7.384 |
+| 384x384 | 2,398,659 | 9.404 |
 
 ## Step 0: Conv Kernel Table
 
 Goal: compare default resident Orion dense LT against HaloED/provider native
 halo Conv kernels for the three channel sizes and four HW sizes above.
+`Conv64` and `Conv128` use the U-Net stage-packed logical input sizes described
+above, while keeping the packed FHE canvas at the original `HW`.
 If a resident row hits the RSS cap or OOMs, record that row as a resident
 feasibility failure; do not silently replace it with a streamed result in this
 table.
@@ -75,44 +115,44 @@ rsync -az --checksum "corg:/home/qihan/orion/$run_root/" ".tmp/results/$base/"
 ```
 
 <!-- CONV_KERNEL_TABLE_START -->
-| HW | kernel | path / beta | status | input halo T/B | rotations | LT+accumulate s | hot run s | compile s | input ct | output ct | peak RSS GiB | runtime mode | result file | note |
-| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
-| 192x192 | Conv 32,32 | Orion dense | ok |  | 15,152 | 1808.4 | 1821.6 | 76.2 | 36 | 36 |  | resident_compute | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_192x192_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc1b/dense |
-| 192x192 | Conv 32,32 | provider halo=1/1 | ok | 1/1 | 5,360 | 699.4 | 700.9 | 235.5 | 48 | 36 |  | unknown | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_192x192_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc1b/provider |
-| 192x192 | Conv 32,32 | provider halo=2/2 | running | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_192x192_provider_halo2.json |  |
-| 224x224 | Conv 32,32 | Orion dense | ok |  | 22,823 | 3136.1 | 3153.1 | 161.5 | 49 | 49 |  | resident_compute | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_224x224_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc1b/dense |
-| 224x224 | Conv 32,32 | provider halo=1/1 | ok | 1/1 | 11,216 | 1301.7 | 1303.7 | 364.6 | 64 | 49 |  | unknown | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_224x224_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc1b/provider |
-| 224x224 | Conv 32,32 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_224x224_provider_halo2.json |  |
-| 384x288 | Conv 32,32 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_384x288_orion.json |  |
-| 384x288 | Conv 32,32 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_384x288_provider_halo1.json |  |
-| 384x288 | Conv 32,32 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_384x288_provider_halo2.json |  |
-| 384x384 | Conv 32,32 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_384x384_orion.json |  |
-| 384x384 | Conv 32,32 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_384x384_provider_halo1.json |  |
-| 384x384 | Conv 32,32 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv32_384x384_provider_halo2.json |  |
-| 192x192 | Conv 64,64 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_192x192_orion.json |  |
-| 192x192 | Conv 64,64 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_192x192_provider_halo1.json |  |
-| 192x192 | Conv 64,64 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_192x192_provider_halo2.json |  |
-| 224x224 | Conv 64,64 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_224x224_orion.json |  |
-| 224x224 | Conv 64,64 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_224x224_provider_halo1.json |  |
-| 224x224 | Conv 64,64 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_224x224_provider_halo2.json |  |
-| 384x288 | Conv 64,64 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_384x288_orion.json |  |
-| 384x288 | Conv 64,64 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_384x288_provider_halo1.json |  |
-| 384x288 | Conv 64,64 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_384x288_provider_halo2.json |  |
-| 384x384 | Conv 64,64 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_384x384_orion.json |  |
-| 384x384 | Conv 64,64 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_384x384_provider_halo1.json |  |
-| 384x384 | Conv 64,64 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv64_384x384_provider_halo2.json |  |
-| 192x192 | Conv 128,128 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_192x192_orion.json |  |
-| 192x192 | Conv 128,128 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_192x192_provider_halo1.json |  |
-| 192x192 | Conv 128,128 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_192x192_provider_halo2.json |  |
-| 224x224 | Conv 128,128 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_224x224_orion.json |  |
-| 224x224 | Conv 128,128 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_224x224_provider_halo1.json |  |
-| 224x224 | Conv 128,128 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_224x224_provider_halo2.json |  |
-| 384x288 | Conv 128,128 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_384x288_orion.json |  |
-| 384x288 | Conv 128,128 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_384x288_provider_halo1.json |  |
-| 384x288 | Conv 128,128 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_384x288_provider_halo2.json |  |
-| 384x384 | Conv 128,128 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_384x384_orion.json |  |
-| 384x384 | Conv 128,128 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_384x384_provider_halo1.json |  |
-| 384x384 | Conv 128,128 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_corg_20260527T020548Z/rows/conv128_384x384_provider_halo2.json |  |
+| HW | kernel | logical input | multiplex | channels/group | packed FHE input | path / beta | status | input halo T/B | rotations | LT+accumulate s | hot run s | compile s | input ct | output ct | peak RSS GiB | runtime mode | result file | note |
+| --- | --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | Orion dense | ok |  | 15,152 | 1808.4 | 1821.6 | 76.2 | 36 | 36 |  | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_192x192_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc1b/dense |
+| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | provider halo=1/1 | ok | 1/1 | 5,360 | 699.4 | 700.9 | 235.5 | 48 | 36 |  | unknown | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_192x192_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc1b/provider |
+| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | provider halo=2/2 | ok | 2/2 | 5,360 | 273.8 | 354.2 | 135.5 | 48 | 36 | 140.2 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_192x192_provider_halo2.json |  |
+| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | Orion dense | ok |  | 22,823 | 3136.1 | 3153.1 | 161.5 | 49 | 49 |  | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_224x224_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc1b/dense |
+| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | provider halo=1/1 | ok | 1/1 | 11,216 | 1301.7 | 1303.7 | 364.6 | 64 | 49 |  | unknown | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_224x224_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc1b/provider |
+| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | provider halo=2/2 | ok | 2/2 | 10,208 | 415.6 | 519.5 | 166.2 | 64 | 49 | 194.8 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_224x224_provider_halo2.json |  |
+| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | Orion dense | ok |  | 55,056 | 3149.6 | 3177.3 | 124.9 | 108 | 108 | 264.7 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_384x288_orion.json |  |
+| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | provider halo=1/1 | ok | 1/1 | 14,480 | 806.4 | 1082.1 | 362.3 | 128 | 108 | 405.2 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_384x288_provider_halo1.json |  |
+| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | provider halo=2/2 | ok | 2/2 | 14,480 | 803.8 | 1088.0 | 402.4 | 128 | 108 | 405.2 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_384x288_provider_halo2.json |  |
+| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | Orion dense | ok |  | 69,888 | 4374.3 | 4445.7 | 164.4 | 144 | 144 | 305.3 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_384x384_orion.json |  |
+| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | provider halo=1/1 | ok | 1/1 | 10,032 | 858.3 | 1188.1 | 417.9 | 160 | 144 | 492.6 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_384x384_provider_halo1.json |  |
+| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | provider halo=2/2 | ok | 2/2 | 10,032 | 840.3 | 1158.5 | 404.0 | 160 | 144 | 487.8 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv32_384x384_provider_halo2.json |  |
+| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | Orion dense | ok |  | 9,724 | 1199.8 | 1203.3 | 113.1 | 18 | 18 |  | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_192x192_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc2b/dense |
+| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | provider halo=1/1 | ok | 1/1 | 2,305 | 498.2 | 498.8 | 291.6 | 19 | 18 |  | unknown | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_192x192_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc2b/provider |
+| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | provider halo=2/2 | ok | 2/2 | 2,672 | 135.9 | 172.5 | 88.9 | 32 | 18 | 149.9 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_192x192_provider_halo2.json |  |
+| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | Orion dense | ok |  | 14,764 | 2152.4 | 2158.9 | 267.3 | 25 | 25 |  | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_224x224_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc2b/dense |
+| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider halo=1/1 | ok | 1/1 | 4,109 | 759.4 | 760.5 | 289.6 | 26 | 25 |  | unknown | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_224x224_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc2b/provider |
+| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider halo=2/2 | ok | 2/2 | 4,064 | 227.8 | 270.9 | 126.4 | 32 | 25 | 155.0 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_224x224_provider_halo2.json |  |
+| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | Orion dense | ok |  | 34,836 | 1962.7 | 1973.3 | 157.9 | 54 | 54 | 371.8 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_384x288_orion.json |  |
+| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider halo=1/1 | ok | 1/1 | 5,648 | 401.2 | 498.7 | 243.5 | 64 | 54 | 314.7 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_384x288_provider_halo1.json |  |
+| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider halo=2/2 | ok | 2/2 | 5,648 | 406.2 | 505.7 | 237.2 | 64 | 54 | 334.1 | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_384x288_provider_halo2.json |  |
+| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | Orion dense | running |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_384x384_orion.json |  |
+| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_384x384_provider_halo1.json |  |
+| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv64_384x384_provider_halo2.json |  |
+| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | Orion dense | ok |  | 5,399 | 812.9 | 813.9 | 166.7 | 9 | 9 |  | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_192x192_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc3b/dense |
+| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider halo=1/1 | ok | 1/1 | 2,638 | 525.3 | 525.6 | 350.6 | 10 | 9 |  | unknown | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_192x192_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_192_base32_encoder/enc3b/provider |
+| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_192x192_provider_halo2.json |  |
+| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | Orion dense | ok |  | 8,552 | 1248.0 | 1249.3 | 270.3 | 13 | 13 |  | resident_compute | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_224x224_orion.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc3b/dense |
+| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider halo=1/1 | ok | 1/1 | 4,427 | 709.9 | 710.3 | 366.3 | 14 | 13 |  | unknown | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_224x224_provider_halo1.json | reused: auto_dense_provider_corg_20260526T130718Z.json:u22_224_base32_encoder/enc3b/provider |
+| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_224x224_provider_halo2.json |  |
+| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_384x288_orion.json |  |
+| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_384x288_provider_halo1.json |  |
+| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_384x288_provider_halo2.json |  |
+| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | Orion dense | pending |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_384x384_orion.json |  |
+| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider halo=1/1 | pending | 1/1 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_384x384_provider_halo1.json |  |
+| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider halo=2/2 | pending | 2/2 |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z/rows/conv128_384x384_provider_halo2.json |  |
 <!-- CONV_KERNEL_TABLE_END -->
 
 ## Step 1: Dim32 Encoder Baseline
@@ -127,7 +167,7 @@ Run policy:
 - Use `io_mode=none`; do not write dense encoded plaintext caches to SSD.
 - Start with `ORION_LATTIGO_STREAMING_LT=0`.
 - Run both `--paths dense` and `--paths provider`; the comparison row is incomplete until both paths have a result or a labeled failure.
-- On `rss_watermark`, OOM, or similar memory failure, rerun only the failed node/input/path with `ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE=1`, `ORION_SINGLE_SLOT_ENCODE_WORKERS=<fixed worker count>`, `ORION_LATTIGO_STREAMING_LT=0`, `ORION_LATTIGO_MEMORY_BOUNDED_COMPILE=0`, and `ORION_LATTIGO_MEMORY_BOUNDED_EVAL=0`.
+- On `rss_watermark`, OOM, or similar memory failure, rerun only the failed node/input/path with `ORION_SINGLE_SLOT_LAYER_CACHE=1`, `ORION_SINGLE_SLOT_ENCODE_WORKERS=<fixed worker count>`, `ORION_LATTIGO_STREAMING_LT=0`, `ORION_LATTIGO_MEMORY_BOUNDED_COMPILE=0`, and `ORION_LATTIGO_MEMORY_BOUNDED_EVAL=0`.
 - Record peak RSS, compile time, compute time, layer-cache turnover time, rotations, ciphertext counts, whether single-slot layer cache was used, and exact result JSON path for both paths.
 
 Active runs:
@@ -201,8 +241,8 @@ Conv2d nodes as Step 1, but with `base_dim=64`.
 
 Run policy:
 
-- Use single-slot layer cache for both dense and provider paths from the first attempt.
-- Keep dense shared-cache / unified-BSGS disabled (`ORION_DENSE_LT_SHARED_CACHE=0`).
+- Use the common single-slot layer cache for dense and provider paths from the first attempt.
+- Keep ConvTranspose2d on the common dense path for both dense and provider modes.
 - Keep provider optimizations enabled: DP layout policy, relayout kernels, native halo,
   output fusion, and shared rotation keys.
 - Use `io_mode=none`; report compute time excluding total I/O, and report layer-cache turnover separately.
@@ -377,12 +417,13 @@ concat materialization.  Bootstrap-many is disabled for both paths
 (`ORION_LATTIGO_BOOTSTRAP_MANY=0`) so the table reflects the default single
 bootstrap path rather than batched bootstrap scheduling.
 
-The table below is per-layer.  `stream+encode s` is computed per layer from
-`stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s`.
-`LT+accum s` is computed per layer from
-`stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s`
-with `mvm_kernel_s` as the fallback for non-streaming dense timing.  Each
-layer row also reports `boot after count` and `boot after s`: bootstraps
+The table below is per-layer.  `layer cache turnover s` is the single-slot
+resident layer-cache overhead
+(`layer_cache_encode_s + layer_cache_key_prepare_s + layer_cache_evict_s`).
+`LT+accum s` is the actual linear-transform/accumulation compute time, using
+`mvm_kernel_s` as the primary value.  Legacy chunk-stream load/encode columns
+are retained for audit only and should be zero in the single-slot mainline.
+Each layer row also reports `boot after count` and `boot after s`: bootstraps
 attached to activation/pool/cat nodes are attributed back to the preceding U22
 linear layer when that is unambiguous, and otherwise emitted as `boot-only:*`
 rows.  Each shape/path also has a `TOTAL` row with total runtime, rotations,

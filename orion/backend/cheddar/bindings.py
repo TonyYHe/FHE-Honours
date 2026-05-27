@@ -129,6 +129,18 @@ class CheddarLibrary(LattigoLibrary):
 
     def setup_lt_evaluator(self):
         super().setup_lt_evaluator()
+        plan_rotation_key_requests = getattr(self.lib, "PlanLinearTransformRotationKeyRequests", None)
+        if plan_rotation_key_requests is not None:
+            self.PlanLinearTransformRotationKeyRequests = LattigoFunction(
+                plan_rotation_key_requests,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_float,
+                ],
+                restype=ArrayResultInt,
+            )
         self.GetLinearTransformRotationKeyRequests = LattigoFunction(
             self.lib.GetLinearTransformRotationKeyRequests,
             argtypes=[ctypes.c_int],

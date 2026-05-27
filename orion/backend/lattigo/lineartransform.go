@@ -134,10 +134,6 @@ func ltDiagonalEncodeWorkerCount(n int) int {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			workers = parsed
 		}
-	} else if raw := os.Getenv("ORION_UNIFIED_SINGLE_SLOT_ENCODE_WORKERS"); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
-			workers = parsed
-		}
 	} else if raw := os.Getenv("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			workers = parsed
@@ -1310,6 +1306,11 @@ func DeleteLinearTransform(id C.int) {
 	ltHeap.Delete(int(id))
 }
 
+//export GetLiveLinearTransformCount
+func GetLiveLinearTransformCount() C.int {
+	return C.int(len(ltHeap.GetLiveKeys()))
+}
+
 //export NewLinearTransformEvaluator
 func NewLinearTransformEvaluator() {
 	scheme.LinEvaluator = lintrans.NewEvaluator(
@@ -1513,6 +1514,52 @@ func GetLinearTransformRotationKeys(transformID C.int) (*C.int, C.ulong) {
 	galEls := transform.GaloisElements(scheme.Params)
 
 	arrPtr, length := SliceToCArray(galEls, convertULongtoInt)
+	return arrPtr, length
+}
+
+//export PlanLinearTransformRotationKeys
+func PlanLinearTransformRotationKeys(
+	diagIdxsC *C.int, diagIdxsLen C.int,
+	level C.int,
+	bsgsRatio C.float,
+) (*C.int, C.ulong) {
+	diagIdxs := CArrayToSlice(diagIdxsC, diagIdxsLen, convertCIntToInt)
+	ltparams := lintrans.Parameters{
+		DiagonalsIndexList:        diagIdxs,
+		LevelQ:                    int(level),
+		LevelP:                    scheme.Params.MaxLevelP(),
+		Scale:                     rlwe.NewScale(scheme.Params.Q()[int(level)]),
+		LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+		LogBabyStepGiantStepRatio: int(math.Log(float64(bsgsRatio))),
+	}
+	transform := newLinearTransformationShell(ltparams, 0)
+	galEls := transform.GaloisElements(scheme.Params)
+	arrPtr, length := SliceToCArray(galEls, convertULongtoInt)
+	return arrPtr, length
+}
+
+//export PlanLinearTransformRotationKeyRequests
+func PlanLinearTransformRotationKeyRequests(
+	diagIdxsC *C.int, diagIdxsLen C.int,
+	level C.int,
+	bsgsRatio C.float,
+) (*C.int, C.ulong) {
+	diagIdxs := CArrayToSlice(diagIdxsC, diagIdxsLen, convertCIntToInt)
+	ltparams := lintrans.Parameters{
+		DiagonalsIndexList:        diagIdxs,
+		LevelQ:                    int(level),
+		LevelP:                    scheme.Params.MaxLevelP(),
+		Scale:                     rlwe.NewScale(scheme.Params.Q()[int(level)]),
+		LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+		LogBabyStepGiantStepRatio: int(math.Log(float64(bsgsRatio))),
+	}
+	transform := newLinearTransformationShell(ltparams, 0)
+	galEls := transform.GaloisElements(scheme.Params)
+	flat := make([]int, 0, len(galEls)*2)
+	for _, galEl := range galEls {
+		flat = append(flat, int(galEl), int(level))
+	}
+	arrPtr, length := SliceToCArray(flat, convertIntToCInt)
 	return arrPtr, length
 }
 
@@ -1865,6 +1912,47 @@ func GenerateLinearTransformsUnified(
 		registerStreamingLTState(ids[i], streamingStates[i])
 	}
 	return SliceToCArray(ids, convertIntToCInt)
+}
+
+//export PlanLinearTransformsUnifiedRotationKeys
+func PlanLinearTransformsUnifiedRotationKeys(
+	numTransforms C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	levels *C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	params := make([]lintrans.Parameters, n)
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		params[i] = lintrans.Parameters{
+			DiagonalsIndexList:        diagIdxs,
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: 1,
+		}
+	}
+	if !unifiedNoBSGSEnabled() {
+		applyOptimalUnifiedBSGSRatio(params)
+	}
+	transforms := newUnifiedLoadTransformations(params)
+	keys := make(map[int]struct{})
+	for _, transform := range transforms {
+		for _, galEl := range transform.GaloisElements(scheme.Params) {
+			keys[int(galEl)] = struct{}{}
+		}
+	}
+	ordered := make([]int, 0, len(keys))
+	for key := range keys {
+		ordered = append(ordered, key)
+	}
+	sort.Ints(ordered)
+	return SliceToCArray(ordered, convertIntToCInt)
 }
 
 //export GenerateLinearTransformsUnifiedComplex

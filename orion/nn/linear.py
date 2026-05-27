@@ -29,6 +29,8 @@ class LinearTransform(Module):
             try:
                 for tid in self.transform_ids.values():
                     backend.DeleteLinearTransform(tid)
+                for tid in getattr(self, "_dense_layer_cache_active_transform_ids", {}).values():
+                    backend.DeleteLinearTransform(tid)
                 for transform_ids in getattr(self, "_concat_transform_ids_by_input", []) or []:
                     for tid in dict(transform_ids).values():
                         backend.DeleteLinearTransform(tid)
@@ -37,6 +39,9 @@ class LinearTransform(Module):
                         cleanup = getattr(group, "cleanup", None)
                         if callable(cleanup):
                             cleanup(backend)
+                for proxy in getattr(self, "_concat_transform_sources_by_input", []) or []:
+                    for tid in getattr(proxy, "_dense_layer_cache_active_transform_ids", {}).values():
+                        backend.DeleteLinearTransform(tid)
             except Exception:
                 pass # avoids errors for GC at program termination
 
@@ -95,15 +100,25 @@ class LinearTransform(Module):
 
     @timer
     def evaluate_transforms(self, x):
-        out = self.scheme.lt_evaluator.evaluate_transforms(self, x)
+        layer_cache_active = False
+        if self.scheme.lt_evaluator.dense_layer_cache_needs_materialize(self):
+            self.scheme.lt_evaluator.materialize_dense_layer_cache(self)
+            layer_cache_active = True
+        try:
+            out = self.scheme.lt_evaluator.evaluate_transforms(self, x)
 
-        # Hybrid method's output rotations
-        slots = self.scheme.params.get_slots()
-        for i in range(1, self.output_rotations+1):
-            out += out.roll(slots // (2**i))
+            # Hybrid method's output rotations
+            slots = self.scheme.params.get_slots()
+            for i in range(1, self.output_rotations+1):
+                out += out.roll(slots // (2**i))
 
-        out += self.on_bias_ptxt
-        return out
+            if self.on_bias_ptxt is not None:
+                out += self.on_bias_ptxt
+            return out
+        finally:
+            if bool(layer_cache_active):
+                evict_s = self.scheme.lt_evaluator.evict_dense_layer_cache(self, clear_bias=True)
+                self.scheme.lt_evaluator.finish_dense_layer_cache_runtime(self, evict_s)
 
 
 class Linear(LinearTransform):    
@@ -164,7 +179,11 @@ class Linear(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_linear_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        if self.scheme.lt_evaluator.dense_layer_cache_enabled_for(self):
+            self._dense_layer_cache_bias = bias.detach().clone()
+            self.on_bias_ptxt = None
+        else:
+            self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
         self._transform_backend = self.scheme.backend
     
@@ -483,6 +502,26 @@ class Conv2d(LinearTransform):
         effective_fhe_output_shape = self._concat_effective_fhe_output_shape()
         return max(1, int(math.ceil(int(effective_fhe_output_shape.numel()) / float(slots))))
 
+    def _concat_store_compile_bias(self, bias) -> None:
+        if self.scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            self._concat_layer_cache_bias = bias.detach().clone()
+            self.on_bias_ptxt = None
+        else:
+            self.on_bias_ptxt = self.scheme.encoder.encode(bias, int(self.level) - int(self.depth))
+
+    def _concat_materialize_bias_for_eval(self) -> bool:
+        if self.on_bias_ptxt is not None:
+            return False
+        bias = getattr(self, "_concat_layer_cache_bias", None)
+        if bias is None:
+            return False
+        self.on_bias_ptxt = self.scheme.encoder.encode(bias, int(self.level) - int(self.depth))
+        return True
+
+    def _concat_evict_bias_after_eval(self, materialized: bool) -> None:
+        if bool(materialized):
+            self.on_bias_ptxt = None
+
     def _compile_concat_fusion_unified_transforms(self) -> bool:
         if not self._concat_fusion_unified_supported():
             return False
@@ -515,11 +554,12 @@ class Conv2d(LinearTransform):
         self._concat_unified_output_ct_count = int(target_ct_count)
         self._concat_fusion_fhe_output_shape = torch.Size(effective_fhe_output_shape)
         self._concat_transform_ids_by_input = []
+        self._concat_transform_sources_by_input = []
         self._concat_diagonals_by_input = []
         self._concat_output_rotations = 0
 
         bias = self._concat_construct_bias(output_attrs)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, int(self.level) - int(self.depth))
+        self._concat_store_compile_bias(bias)
 
         for input_index, concat_spec in enumerate(self._concat_fusion_specs()):
             channel_start = int(concat_spec["channel_start"])
@@ -671,8 +711,9 @@ class Conv2d(LinearTransform):
         output_attrs = self._concat_output_layout_attrs()
         self._concat_fusion_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
         bias = self._concat_construct_bias(output_attrs)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level - self.depth)
+        self._concat_store_compile_bias(bias)
         self._concat_transform_ids_by_input = []
+        self._concat_transform_sources_by_input = []
         for input_index, diagonals in enumerate(diagonals_by_input):
             proxy = SimpleNamespace(
                 name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
@@ -682,9 +723,10 @@ class Conv2d(LinearTransform):
                 scheme=self.scheme,
                 output_shape=self.output_shape,
                 fhe_output_shape=self._concat_fusion_fhe_output_shape,
-                dense_unified_bsgs=True,
             )
-            self._concat_transform_ids_by_input.append(dict(self.scheme.lt_evaluator.generate_transforms(proxy)))
+            proxy.transform_ids = dict(self.scheme.lt_evaluator.generate_transforms(proxy))
+            self._concat_transform_sources_by_input.append(proxy)
+            self._concat_transform_ids_by_input.append(dict(proxy.transform_ids))
         self.transform_ids = {}
         self._transform_backend = self.scheme.backend
         return True
@@ -692,46 +734,57 @@ class Conv2d(LinearTransform):
     def _concat_fusion_ready(self) -> bool:
         return bool(
             getattr(self, "_concat_transform_ids_by_input", None)
+            or getattr(self, "_concat_transform_sources_by_input", None)
             or getattr(self, "_concat_unified_groups_by_input", None)
         )
 
     def _evaluate_concat_fusion(self, concat_tensor):
         if getattr(self, "_concat_unified_groups_by_input", None):
             return self._evaluate_concat_fusion_unified(concat_tensor)
+        bias_materialized = self._concat_materialize_bias_for_eval()
         parts = tuple(concat_tensor.parts)
         transform_ids_by_input = list(getattr(self, "_concat_transform_ids_by_input", []) or [])
-        if len(parts) != len(transform_ids_by_input):
-            raise RuntimeError(
-                f"concat-fused Conv2d {getattr(self, 'name', '')} expected "
-                f"{len(transform_ids_by_input)} inputs, got {len(parts)}"
-            )
-        out = None
-        for input_index, source in enumerate(parts):
-            proxy = SimpleNamespace(
-                name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
-                transform_ids=dict(transform_ids_by_input[int(input_index)]),
-                level=int(self.level),
-                output_shape=self.output_shape,
-                fhe_output_shape=getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
-                dense_unified_bsgs=True,
-            )
-            partial = self.scheme.lt_evaluator.evaluate_transforms(proxy, source)
-            if out is None:
-                out = partial
-            else:
-                if bool(getattr(out.scheme.backend, "align_addition_scales", False)):
-                    scale = max(1, int(out.scale()))
-                    out.set_scale(int(scale))
-                    partial.set_scale(int(scale))
-                out = out + partial
-        slots = self.scheme.params.get_slots()
-        for i in range(1, int(self.output_rotations) + 1):
-            out += out.roll(slots // (2**i))
-        out += self.on_bias_ptxt
-        release_owned = getattr(concat_tensor, "release_owned_parts", None)
-        if callable(release_owned):
-            release_owned()
-        return out
+        transform_sources = list(getattr(self, "_concat_transform_sources_by_input", []) or [])
+        if not transform_sources:
+            transform_sources = [
+                SimpleNamespace(
+                    name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
+                    transform_ids=dict(transform_ids_by_input[int(input_index)]),
+                    level=int(self.level),
+                    output_shape=self.output_shape,
+                    fhe_output_shape=getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
+                )
+                for input_index in range(len(transform_ids_by_input))
+            ]
+        try:
+            if len(parts) != len(transform_sources):
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} expected "
+                    f"{len(transform_sources)} inputs, got {len(parts)}"
+                )
+            out = None
+            for input_index, source in enumerate(parts):
+                proxy = transform_sources[int(input_index)]
+                partial = self.scheme.lt_evaluator.evaluate_transforms(proxy, source)
+                if out is None:
+                    out = partial
+                else:
+                    if bool(getattr(out.scheme.backend, "align_addition_scales", False)):
+                        scale = max(1, int(out.scale()))
+                        out.set_scale(int(scale))
+                        partial.set_scale(int(scale))
+                    out = out + partial
+            slots = self.scheme.params.get_slots()
+            for i in range(1, int(self.output_rotations) + 1):
+                out += out.roll(slots // (2**i))
+            if self.on_bias_ptxt is not None:
+                out += self.on_bias_ptxt
+            return out
+        finally:
+            self._concat_evict_bias_after_eval(bias_materialized)
+            release_owned = getattr(concat_tensor, "release_owned_parts", None)
+            if callable(release_owned):
+                release_owned()
 
     def _evaluate_concat_fusion_unified(self, concat_tensor):
         from orion.backend.python.tensors import CipherTensor
@@ -742,10 +795,12 @@ class Conv2d(LinearTransform):
         )
         from orion.nn.unified_transform import UnifiedTransformGroup
 
+        bias_materialized = self._concat_materialize_bias_for_eval()
         parts = tuple(concat_tensor.parts)
         groups_by_input = list(getattr(self, "_concat_unified_groups_by_input", []) or [])
         targets_by_input = list(getattr(self, "_concat_unified_targets_by_input", []) or [])
         if len(parts) != len(groups_by_input):
+            self._concat_evict_bias_after_eval(bias_materialized)
             raise RuntimeError(
                 f"concat-fused Conv2d {getattr(self, 'name', '')} expected "
                 f"{len(groups_by_input)} inputs, got {len(parts)}"
@@ -823,10 +878,12 @@ class Conv2d(LinearTransform):
         )
         for i in range(1, int(self.output_rotations) + 1):
             out += out.roll(int(slots) // (2**i))
-        out += self.on_bias_ptxt
+        if self.on_bias_ptxt is not None:
+            out += self.on_bias_ptxt
         release_owned = getattr(concat_tensor, "release_owned_parts", None)
         if callable(release_owned):
             release_owned()
+        self._concat_evict_bias_after_eval(bias_materialized)
         return out
 
     def compute_fhe_output_gap(self, **kwargs):
@@ -900,7 +957,11 @@ class Conv2d(LinearTransform):
         # We delay constructing the bias until now, so that any fusing can 
         # modify the bias variable beforehand.
         bias = packing.construct_conv2d_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        if self.scheme.lt_evaluator.dense_layer_cache_enabled_for(self):
+            self._dense_layer_cache_bias = bias.detach().clone()
+            self.on_bias_ptxt = None
+        else:
+            self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
         self._transform_backend = self.scheme.backend
 
@@ -1049,7 +1110,11 @@ class ConvTranspose2d(LinearTransform):
             self.diagonals, self.on_bias, self.output_rotations = self.load_transforms()
 
         bias = packing.construct_conv_transpose2d_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level - self.depth)
+        if self.scheme.lt_evaluator.dense_layer_cache_enabled_for(self):
+            self._dense_layer_cache_bias = bias.detach().clone()
+            self.on_bias_ptxt = None
+        else:
+            self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level - self.depth)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
         self._transform_backend = self.scheme.backend
 

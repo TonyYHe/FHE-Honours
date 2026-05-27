@@ -65,6 +65,50 @@ class ConvKernelRow:
         return f"{int(self.height)}x{int(self.width)}"
 
     @property
+    def stage_gap(self) -> int:
+        mapping = {32: 1, 64: 2, 128: 4}
+        try:
+            return int(mapping[int(self.channels)])
+        except KeyError as exc:
+            raise ValueError(f"unsupported U-Net stage channel count: {self.channels}") from exc
+
+    @property
+    def channel_group_size(self) -> int:
+        return int(self.stage_gap) * int(self.stage_gap)
+
+    @property
+    def logical_height(self) -> int:
+        if int(self.height) % int(self.stage_gap) != 0:
+            raise ValueError(f"HW height {self.height} is not divisible by stage gap {self.stage_gap}")
+        return int(self.height) // int(self.stage_gap)
+
+    @property
+    def logical_width(self) -> int:
+        if int(self.width) % int(self.stage_gap) != 0:
+            raise ValueError(f"HW width {self.width} is not divisible by stage gap {self.stage_gap}")
+        return int(self.width) // int(self.stage_gap)
+
+    @property
+    def logical_hw(self) -> str:
+        return f"{int(self.logical_height)}x{int(self.logical_width)}"
+
+    @property
+    def fhe_channels(self) -> int:
+        if int(self.channels) % int(self.channel_group_size) != 0:
+            raise ValueError(
+                f"channels {self.channels} are not divisible by channel group size {self.channel_group_size}"
+            )
+        return int(self.channels) // int(self.channel_group_size)
+
+    @property
+    def logical_chw(self) -> str:
+        return f"{int(self.channels)}x{int(self.logical_height)}x{int(self.logical_width)}"
+
+    @property
+    def packed_chw(self) -> str:
+        return f"{int(self.fhe_channels)}x{int(self.height)}x{int(self.width)}"
+
+    @property
     def path(self) -> str:
         return "dense" if str(self.variant) == "orion" else "provider"
 
@@ -154,6 +198,36 @@ def _result_input_chw(result: dict[str, Any]) -> tuple[int, int, int] | None:
         return None
 
 
+def _result_input_chw_gap(result: dict[str, Any]) -> tuple[int, int, int, int]:
+    module = result.get("module") if isinstance(result.get("module"), dict) else {}
+    chw = _result_input_chw(result)
+    if chw is None:
+        raise ValueError("missing input CHW")
+    raw_gap = module.get("input_gap")
+    if raw_gap is None:
+        raw_gap = result.get("input_gap")
+    try:
+        gap = int(raw_gap) if raw_gap is not None else 0
+    except (TypeError, ValueError):
+        gap = 0
+    channels, height, width = chw
+    if gap <= 0:
+        fhe_shape = module.get("fhe_input_shape") or result.get("fhe_input_shape")
+        if isinstance(fhe_shape, (list, tuple)) and len(fhe_shape) >= 4:
+            try:
+                fhe_height = int(fhe_shape[2])
+                fhe_width = int(fhe_shape[3])
+                height_ratio = int(fhe_height // int(height)) if int(height) > 0 and fhe_height % int(height) == 0 else 0
+                width_ratio = int(fhe_width // int(width)) if int(width) > 0 and fhe_width % int(width) == 0 else 0
+                if height_ratio > 0 and height_ratio == width_ratio:
+                    gap = int(height_ratio)
+            except (TypeError, ValueError, ZeroDivisionError):
+                gap = 0
+    if gap <= 0:
+        gap = 1
+    return int(channels), int(height), int(width), max(1, int(gap))
+
+
 def _explicit_halo(result: dict[str, Any]) -> tuple[int | None, int | None]:
     top = result.get("input_halo_top")
     bottom = result.get("input_halo_bottom")
@@ -220,8 +294,14 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "backend": str(result.get("backend", "lattigo")),
         "row_id": row.row_id,
         "hw": row.hw,
+        "logical_hw": row.logical_hw,
         "channels": int(row.channels),
         "conv": f"{int(row.channels)},{int(row.channels)}",
+        "input_gap": int(row.stage_gap),
+        "output_gap": int(row.stage_gap),
+        "channel_group_size": int(row.channel_group_size),
+        "logical_chw": row.logical_chw,
+        "packed_chw": row.packed_chw,
         "variant": str(row.variant),
         "variant_label": VARIANT_LABELS[str(row.variant)],
         "path": row.path,
@@ -251,7 +331,10 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
 def reuse_existing_rows(run_root: Path, rows: list[ConvKernelRow], sources: list[Path], *, force: bool = False) -> int:
     if not sources:
         return 0
-    row_by_key = {(row.path, row.channels, row.height, row.width, row.halo): row for row in rows}
+    row_by_key = {
+        (row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, row.halo): row
+        for row in rows
+    }
     reused = 0
     for json_path in _iter_reuse_jsons([Path(value) for value in sources]):
         payload = _read_json(json_path)
@@ -260,13 +343,13 @@ def reuse_existing_rows(run_root: Path, rows: list[ConvKernelRow], sources: list
         for result, path_name, source_label in _candidate_results_from_payload(payload, json_path):
             if result.get("status") != "ok" or _is_streaming_result(result):
                 continue
-            chw = _result_input_chw(result)
-            if chw is None:
+            try:
+                channels, height, width, gap = _result_input_chw_gap(result)
+            except ValueError:
                 continue
-            channels, height, width = chw
             path_kind = _result_path_kind(result, fallback=path_name)
             if path_kind == "dense":
-                key = ("dense", int(channels), int(height), int(width), None)
+                key = ("dense", int(channels), int(height), int(width), int(gap), None)
             elif path_kind == "provider":
                 top, bottom = _explicit_halo(result)
                 # Older provider JSONs did not record the halo setting; those
@@ -275,7 +358,7 @@ def reuse_existing_rows(run_root: Path, rows: list[ConvKernelRow], sources: list
                     top = bottom = 1
                 if top is None or bottom is None or top != bottom:
                     continue
-                key = ("provider", int(channels), int(height), int(width), int(top))
+                key = ("provider", int(channels), int(height), int(width), int(gap), int(top))
             else:
                 continue
             row = row_by_key.get(key)
@@ -385,15 +468,15 @@ def _make_conv(row: ConvKernelRow, *, seed: int) -> Conv2d:
     conv.eval()
     conv.name = row.row_id
     conv.region_output_id = str(conv.name)
-    x = torch.randn((1, int(row.channels), int(row.height), int(row.width)), dtype=torch.float32)
+    x = torch.randn((1, int(row.channels), int(row.logical_height), int(row.logical_width)), dtype=torch.float32)
     y = conv(x)
     conv.init_orion_params()
     conv.input_shape = torch.Size(x.shape)
     conv.output_shape = torch.Size(y.shape)
-    conv.input_gap = 1
-    conv.output_gap = 1
-    conv.fhe_input_shape = torch.Size(x.shape)
-    conv.fhe_output_shape = torch.Size(y.shape)
+    conv.input_gap = int(row.stage_gap)
+    conv.output_gap = int(row.stage_gap)
+    conv.fhe_input_shape = torch.Size((1, int(row.fhe_channels), int(row.height), int(row.width)))
+    conv.fhe_output_shape = torch.Size((1, int(row.fhe_channels), int(row.height), int(row.width)))
     if row.halo is not None:
         conv.layout_policy_input_layout = {"top_beta": int(row.halo), "bottom_beta": int(row.halo)}
     conv.set_level(len(scheme.params.get_logq()) - 1)
@@ -658,8 +741,14 @@ def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> di
             "backend": str(backend),
             "row_id": row.row_id,
             "hw": row.hw,
+            "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_gap": int(row.stage_gap),
+            "output_gap": int(row.stage_gap),
+            "channel_group_size": int(row.channel_group_size),
+            "logical_chw": row.logical_chw,
+            "packed_chw": row.packed_chw,
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
@@ -691,6 +780,8 @@ def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> di
             "module": {
                 "input_shape": [int(value) for value in tuple(conv.input_shape)],
                 "output_shape": [int(value) for value in tuple(conv.output_shape)],
+                "input_gap": int(getattr(conv, "input_gap", 1)),
+                "output_gap": int(getattr(conv, "output_gap", 1)),
                 "fhe_input_shape": [int(value) for value in tuple(conv.fhe_input_shape)],
                 "fhe_output_shape": [int(value) for value in tuple(conv.fhe_output_shape)],
             },
@@ -719,7 +810,6 @@ def _env_snapshot() -> dict[str, str]:
         "ORION_LT_COMPILE_WORKERS",
         "ORION_LATTIGO_COMPILE_WORKERS",
         "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
-        "ORION_DENSE_LT_SHARED_CACHE",
     ]
     return {key: str(os.environ.get(key, "")) for key in keys}
 
@@ -736,8 +826,6 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated["ORION_LATTIGO_MEMORY_BOUNDED_COMPILE"] = "0"
     updated["ORION_LATTIGO_MEMORY_BOUNDED_EVAL"] = "0"
     updated.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", str(cpu_count))
-    updated["ORION_DENSE_LT_SHARED_CACHE"] = "0"
-    updated["ORION_DENSE_LT_HOST_PAYLOAD_CACHE"] = "0"
     updated.setdefault("ORION_CONCAT_FUSION", "0")
     return updated
 
@@ -779,6 +867,10 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
             [
                 row.hw,
                 f"Conv {int(row.channels)},{int(row.channels)}",
+                row.logical_chw,
+                str(int(row.stage_gap)),
+                str(int(row.channel_group_size)),
+                row.packed_chw,
                 VARIANT_LABELS[str(row.variant)],
                 status,
                 "" if row.halo is None else f"{int(row.halo)}/{int(row.halo)}",
@@ -801,6 +893,10 @@ def _markdown_table(rows: list[list[str]]) -> str:
     headers = [
         "HW",
         "kernel",
+        "logical input",
+        "multiplex",
+        "channels/group",
+        "packed FHE input",
         "path / beta",
         "status",
         "input halo T/B",
@@ -818,6 +914,10 @@ def _markdown_table(rows: list[list[str]]) -> str:
     aligns = [
         "---",
         "---",
+        "---",
+        "---",
+        "---:",
+        "---:",
         "---",
         "---",
         "---",
@@ -850,6 +950,10 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
     headers = [
         "HW",
         "kernel",
+        "logical_input",
+        "multiplex",
+        "channels_per_group",
+        "packed_fhe_input",
         "path_beta",
         "status",
         "input_halo_tb",
@@ -891,8 +995,14 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "created_at_utc": _now_utc(),
             "row_id": row.row_id,
             "hw": row.hw,
+            "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_gap": int(row.stage_gap),
+            "output_gap": int(row.stage_gap),
+            "channel_group_size": int(row.channel_group_size),
+            "logical_chw": row.logical_chw,
+            "packed_chw": row.packed_chw,
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
@@ -913,8 +1023,14 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "finished_at_utc": _now_utc(),
             "row_id": row.row_id,
             "hw": row.hw,
+            "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_gap": int(row.stage_gap),
+            "output_gap": int(row.stage_gap),
+            "channel_group_size": int(row.channel_group_size),
+            "logical_chw": row.logical_chw,
+            "packed_chw": row.packed_chw,
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
@@ -955,6 +1071,11 @@ def run_all(args: argparse.Namespace) -> int:
             "orion": "dense Conv2d path with default resident Lattigo LT",
             "provider_halo1": "native halo provider with input_top_beta=input_bottom_beta=1",
             "provider_halo2": "native halo provider with input_top_beta=input_bottom_beta=2",
+            "u_net_stage_packing": {
+                "Conv 32,32": "logical 32xHorigxWorig, multiplex/input_gap/output_gap=1, packed FHE 32xHorigxWorig",
+                "Conv 64,64": "logical 64x(Horig/2)x(Worig/2), multiplex/input_gap/output_gap=2, 4 channels/group, packed FHE 16xHorigxWorig",
+                "Conv 128,128": "logical 128x(Horig/4)x(Worig/4), multiplex/input_gap/output_gap=4, 16 channels/group, packed FHE 8xHorigxWorig",
+            },
         },
         "env": {key: str(env.get(key, "")) for key in sorted(_env_snapshot())},
     }
@@ -1094,13 +1215,20 @@ def run_one(args: argparse.Namespace) -> int:
             "backend": str(args.backend),
             "row_id": row.row_id,
             "hw": row.hw,
+            "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_gap": int(row.stage_gap),
+            "output_gap": int(row.stage_gap),
+            "channel_group_size": int(row.channel_group_size),
+            "logical_chw": row.logical_chw,
+            "packed_chw": row.packed_chw,
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
             "input_halo_top": row.halo,
             "input_halo_bottom": row.halo,
+            "kernel": "3x3/pad1/stride1",
             "error_type": type(exc).__name__,
             "error": str(exc),
             "traceback": traceback.format_exc(),

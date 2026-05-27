@@ -10,6 +10,7 @@ import torch
 
 import orion
 from orion.backend.python.lt_evaluator import NewEvaluator
+from orion.backend.python.tensors import CipherTensor
 from orion.backend.python import compile_cache
 from orion.core import packing
 from orion.core import orion as orion_core
@@ -324,6 +325,185 @@ def test_dense_compile_batches_are_memory_bounded(monkeypatch) -> None:
     }
 
 
+def test_dense_layer_cache_compile_defers_backend_generation(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.planned = []
+            self.generated_keys = []
+            self.batch_calls = []
+            self.deleted = []
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def PlanLinearTransformRotationKeys(self, diag_idxs, level, bsgs_ratio):
+            self.planned.append((tuple(int(v) for v in diag_idxs), int(level), float(bsgs_ratio)))
+            return [int(v) + 1000 for v in diag_idxs]
+
+        def GenerateLinearTransformRotationKey(self, key):
+            self.generated_keys.append(int(key))
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            self.batch_calls.append(int(num_transforms))
+            return list(range(700, 700 + int(num_transforms)))
+
+        def GenerateLinearTransform(self, *_args):
+            raise AssertionError("compile must not generate dense transforms")
+
+        def DeleteLinearTransform(self, transform_id):
+            self.deleted.append(int(transform_id))
+
+    class Encoder:
+        def __init__(self):
+            self.encoded = []
+
+        def encode(self, value, level):
+            self.encoded.append((torch.as_tensor(value).clone(), int(level)))
+            return object()
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    backend = Backend()
+    encoder = Encoder()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=SimpleNamespace(),
+        encoder=encoder,
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    layer = SimpleNamespace(
+        name="layer_cache_compile",
+        diagonals={
+            (0, 0): {0: [1.0, 0.0, 0.0, 0.0]},
+            (0, 1): {1: [0.0, 2.0, 0.0, 0.0]},
+        },
+        level=2,
+        depth=1,
+        bsgs_ratio=2,
+        get_io_mode=lambda: "none",
+        _dense_layer_cache_bias=torch.ones(4),
+    )
+
+    transform_ids = evaluator.generate_transforms(layer)
+
+    assert transform_ids == {}
+    assert layer.diagonals == {}
+    assert layer._dense_layer_cache_deferred is True
+    assert len(layer._dense_layer_cache_payloads) == 2
+    assert backend.batch_calls == []
+    assert encoder.encoded == []
+    assert backend.planned == [((0,), 2, 2.0), ((1,), 2, 2.0)]
+    assert sorted(backend.generated_keys) == [1000, 1001]
+
+    timing = evaluator.materialize_dense_layer_cache(layer)
+
+    assert backend.batch_calls == [2]
+    assert set(layer.transform_ids) == {(0, 0), (0, 1)}
+    assert len(encoder.encoded) == 1
+    assert timing["layer_cache_encode_s"] >= 0.0
+
+    evict_s = evaluator.evict_dense_layer_cache(layer)
+
+    assert evict_s >= 0.0
+    assert layer.transform_ids == {}
+    assert backend.deleted == [700, 701]
+
+
+def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.generated_batches = []
+            self.generated_keys = []
+            self.evaluated = []
+            self.shared_called = False
+            self.deleted = []
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
+            return [int(v) + 2000 for v in diag_idxs]
+
+        def GenerateLinearTransformRotationKey(self, key):
+            self.generated_keys.append(int(key))
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            ids = list(range(810, 810 + int(num_transforms)))
+            self.generated_batches.append(ids)
+            return ids
+
+        def EvaluateLinearTransform(self, transform_id, ciphertext_id):
+            self.evaluated.append((int(transform_id), int(ciphertext_id)))
+            return int(transform_id) + int(ciphertext_id)
+
+        def EvaluateLinearTransformsWithSharedCache(self, *_args):
+            self.shared_called = True
+            raise AssertionError("dense layer cache must keep independent LT eval")
+
+        def DeleteLinearTransform(self, transform_id):
+            self.deleted.append(int(transform_id))
+
+        def DeleteCiphertext(self, _ciphertext_id):
+            return None
+
+    class Evaluator:
+        def __init__(self):
+            self.adds = []
+            self.rescales = []
+
+        def add_ciphertext(self, left, right, _in_place=False):
+            out = int(left) + int(right) + 100
+            self.adds.append((int(left), int(right), out))
+            return out
+
+        def rescale(self, value, in_place=False):
+            out = int(value) + 1000
+            self.rescales.append((int(value), bool(in_place), out))
+            return out
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    backend = Backend()
+    fake_eval = Evaluator()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=fake_eval,
+        encoder=SimpleNamespace(encode=lambda value, level: object()),
+        encryptor=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    layer = SimpleNamespace(
+        name="layer_cache_eval",
+        diagonals={
+            (0, 0): {0: [1.0, 0.0, 0.0, 0.0]},
+            (0, 1): {1: [0.0, 2.0, 0.0, 0.0]},
+        },
+        level=2,
+        depth=1,
+        bsgs_ratio=2,
+        get_io_mode=lambda: "none",
+        output_shape=torch.Size((1, 1, 1, 1)),
+        fhe_output_shape=torch.Size((1, 1, 1, 1)),
+    )
+    evaluator.generate_transforms(layer)
+    assert backend.generated_keys == [2000, 2001]
+    x = CipherTensor(fake_scheme, [5, 7], layer.output_shape, layer.fhe_output_shape)
+
+    out = evaluator.evaluate_transforms(layer, x)
+
+    assert out.ids == [int(fake_eval.rescales[0][2])]
+    assert backend.generated_batches == [[810, 811]]
+    assert backend.evaluated == [(810, 5), (811, 7)]
+    assert backend.generated_keys == [2000, 2001]
+    assert backend.shared_called is False
+    assert backend.deleted == [810, 811]
+    assert layer.transform_ids == {}
+    assert evaluator.last_runtime_timing["runtime_fairness_mode"] == "single_slot_layer_cache"
+    assert evaluator.last_runtime_timing["layer_cache_encode_s"] >= 0.0
+    assert evaluator.last_runtime_timing["layer_cache_evict_s"] >= 0.0
+
+
 def test_dense_save_load_compile_defaults_to_provider_sized_batches(monkeypatch) -> None:
     monkeypatch.setenv("ORION_COMPILE_PARALLEL_POLICY", "manual")
     for name in (
@@ -472,25 +652,6 @@ def test_dense_legacy_fine_payload_streams_when_chunk_limit_is_small(tmp_path, m
         {"transform_id": 88, "diag_indices": [3], "segments": [[3, 30]]},
         {"transform_id": 88, "diag_indices": [5], "segments": [[5, 50]]},
     ]
-
-
-def test_dense_shared_cache_is_opt_in(monkeypatch) -> None:
-    class Backend:
-        def EvaluateLinearTransformsWithSharedCache(self):
-            raise AssertionError("only presence is checked")
-
-    evaluator = object.__new__(NewEvaluator)
-    evaluator.backend = Backend()
-    evaluator.io_mode = "none"
-
-    monkeypatch.delenv("ORION_DENSE_LT_SHARED_CACHE", raising=False)
-    assert evaluator._dense_shared_cache_enabled(rows=2, cols=2) is False
-
-    monkeypatch.setenv("ORION_DENSE_LT_SHARED_CACHE", "0")
-    assert evaluator._dense_shared_cache_enabled(rows=2, cols=2) is False
-
-    monkeypatch.setenv("ORION_DENSE_LT_SHARED_CACHE", "1")
-    assert evaluator._dense_shared_cache_enabled(rows=2, cols=2) is True
 
 
 def test_transform_metadata_validation_ignores_rotation_request_order() -> None:

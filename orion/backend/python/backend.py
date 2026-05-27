@@ -554,6 +554,15 @@ class PythonBackend:
         transform = self._linear_transforms[int(transform_id)]
         return [int(idx) for idx in transform.diag_indices]
 
+    def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
+        return [int(idx) for idx in np.asarray(diag_idxs, dtype=np.int32).reshape(-1)]
+
+    def PlanLinearTransformRotationKeyRequests(self, diag_idxs, level, bsgs_ratio):
+        flat: list[int] = []
+        for key in self.PlanLinearTransformRotationKeys(diag_idxs, level, bsgs_ratio):
+            flat.extend([int(key), int(level)])
+        return flat
+
     def GenerateLinearTransformRotationKey(self, key):
         self._rotation_keys.add(int(key))
 
@@ -654,6 +663,9 @@ class PythonBackend:
 
     def DeleteLinearTransform(self, transform_id) -> None:
         self._linear_transforms.pop(int(transform_id), None)
+
+    def GetLiveLinearTransformCount(self) -> int:
+        return int(len(self._linear_transforms))
 
     # ---------- #
     # Polynomial #

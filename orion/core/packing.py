@@ -270,10 +270,14 @@ def construct_conv_transpose2d_toeplitz(conv_layer):
 def construct_conv_transpose2d_bias(conv_layer):
     N, Co, Ho, Wo = conv_layer.output_shape
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
+    output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
+    top_beta = _layout_top_beta(output_layout)
+    bottom_beta = _layout_bottom_beta(output_layout)
+    total_h = int(Ho + top_beta + bottom_beta)
 
     bias = conv_layer.on_bias
-    bias = bias.repeat_interleave(Ho * Wo)
-    bias = bias.reshape(1, Co, Ho, Wo)
+    bias = bias.repeat_interleave(total_h * Wo)
+    bias = bias.reshape(1, Co, total_h, Wo)
     bias_multiplexed = multiplex(bias, conv_layer.output_gap).squeeze(0)
 
     mC, mH, mW = bias_multiplexed.shape
@@ -534,6 +538,112 @@ def _packed_flat_indices(
     ).astype(np.int64)
 
 
+def _packed_flat_indices_for_channels(
+    channels: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    *,
+    gap: int,
+    height: int,
+    width: int,
+    row_offset: int = 0,
+) -> np.ndarray:
+    channels = np.asarray(channels, dtype=np.int64).reshape(-1)
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    cols = np.asarray(cols, dtype=np.int64).reshape(-1)
+    gap = int(gap)
+    phase = channels % int(gap * gap)
+    packed_channel = channels // int(gap * gap)
+    channel_base = (
+        (packed_channel * int(height) + phase // int(gap) + int(row_offset)) * int(width)
+        + phase % int(gap)
+    ).astype(np.int64)
+    spatial = (rows * int(gap) * int(width) + cols * int(gap)).astype(np.int64)
+    return channel_base[:, None] + spatial[None, :]
+
+
+def _diagonal_key_values(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    *,
+    matrix_height: int,
+    matrix_width: int,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    allow_hybrid: bool = True,
+) -> np.ndarray:
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    num_slots = int(num_slots)
+    num_block_rows = math.ceil(int(matrix_height) / int(num_slots))
+    num_block_cols = math.ceil(int(matrix_width) / int(num_slots))
+    if (
+        bool(allow_hybrid)
+        and int(num_block_rows) == 1
+        and str(embed_method) == "hybrid"
+        and not bool(is_last_layer)
+    ):
+        block_height = 2 ** math.ceil(math.log2(int(matrix_height)))
+    else:
+        block_height = int(num_slots)
+
+    if int(block_height) == int(num_slots):
+        block_rows = rows // int(num_slots)
+        local_rows = rows - block_rows * int(num_slots)
+        block_cols = cols // int(num_slots)
+        local_cols = cols - block_cols * int(num_slots)
+        diag_idxs = (local_cols - local_rows) % int(num_slots)
+    else:
+        block_rows = np.zeros_like(rows)
+        block_cols = cols // int(num_slots)
+        local_cols = cols - block_cols * int(num_slots)
+        diag_idxs = (local_cols - rows) % int(block_height)
+
+    return ((block_rows * int(num_block_cols) + block_cols) * int(num_slots) + diag_idxs).reshape(-1)
+
+
+def _append_diagonal_key_chunk(
+    chunks: list[np.ndarray],
+    rows: np.ndarray,
+    cols: np.ndarray,
+    *,
+    matrix_height: int,
+    matrix_width: int,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    allow_hybrid: bool = True,
+) -> None:
+    values = _diagonal_key_values(
+        rows,
+        cols,
+        matrix_height=int(matrix_height),
+        matrix_width=int(matrix_width),
+        num_slots=int(num_slots),
+        embed_method=str(embed_method),
+        is_last_layer=bool(is_last_layer),
+        allow_hybrid=bool(allow_hybrid),
+    )
+    if values.size:
+        chunks.append(np.unique(values))
+
+
+def _count_diagonal_key_chunks(chunks: list[np.ndarray]) -> int:
+    if not chunks:
+        return 0
+    if len(chunks) == 1:
+        return int(chunks[0].size)
+    return int(np.unique(np.concatenate(chunks)).size)
+
+
+def _channel_chunk_shape(spatial_count: int, outer_count: int, inner_count: int, max_chunk_items: int) -> tuple[int, int]:
+    channel_area = max(1, int(max_chunk_items) // max(1, int(spatial_count)))
+    outer = max(1, min(int(outer_count), int(math.sqrt(channel_area))))
+    inner = max(1, min(int(inner_count), int(channel_area) // int(outer)))
+    return int(outer), int(inner)
+
+
 def _layout_top_beta(layout: dict) -> int:
     return max(0, int(layout.get("top_beta", layout.get("alpha", 0)) or 0))
 
@@ -750,6 +860,8 @@ def direct_diagonalize_conv_transpose2d(
     _, on_co, on_ho, on_wo = [int(value) for value in conv_layer.fhe_output_shape]
     input_gap = int(conv_layer.input_gap)
     output_gap = int(conv_layer.output_gap)
+    input_row_offset = max(0, int(getattr(conv_layer, "layout_policy_input_row_offset", 0) or 0))
+    output_row_offset = max(0, int(getattr(conv_layer, "layout_policy_output_row_offset", 0) or 0))
     input_block_size = int(on_ci * on_hi * on_wi)
     output_block_size = int(on_co * on_ho * on_wo)
 
@@ -786,6 +898,7 @@ def direct_diagonalize_conv_transpose2d(
                             gap=int(output_gap),
                             height=int(on_ho),
                             width=int(on_wo),
+                            row_offset=int(output_row_offset),
                         )
                         local_cols = _packed_flat_indices(
                             int(ic),
@@ -794,6 +907,7 @@ def direct_diagonalize_conv_transpose2d(
                             gap=int(input_gap),
                             height=int(on_hi),
                             width=int(on_wi),
+                            row_offset=int(input_row_offset),
                         )
                         for batch in range(int(n_batch)):
                             target.add_constant_entries(
@@ -825,6 +939,290 @@ def direct_diagonalize_conv_transpose2d(
                 accumulator.merge_from(future.result())
 
     return accumulator.finish(start_time)
+
+
+def estimate_direct_conv2d_diagonal_count(
+    conv_layer,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    *,
+    allow_hybrid: bool = True,
+    max_chunk_items: int | None = None,
+) -> int:
+    """Count packed block diagonals without materializing plaintext payloads."""
+
+    if max_chunk_items is None:
+        max_chunk_items = int(os.environ.get("ORION_PACK_DIAGONAL_COUNT_MAX_ITEMS", "2000000"))
+    max_chunk_items = max(1, int(max_chunk_items))
+
+    weight_np = conv_layer.on_weight.detach().cpu().to(dtype=torch.float32).numpy()
+
+    n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
+    _, co, _, _ = [int(value) for value in conv_layer.output_shape]
+    _, on_ci, on_hi, on_wi = [int(value) for value in conv_layer.fhe_input_shape]
+    _, on_co, on_ho, on_wo = [int(value) for value in conv_layer.fhe_output_shape]
+    input_gap = int(conv_layer.input_gap)
+    output_gap = int(conv_layer.output_gap)
+    input_row_offset = max(0, int(getattr(conv_layer, "layout_policy_input_row_offset", 0) or 0))
+    output_row_offset = max(0, int(getattr(conv_layer, "layout_policy_output_row_offset", 0) or 0))
+    input_block_size = int(on_ci * on_hi * on_wi)
+    output_block_size = int(on_co * on_ho * on_wo)
+    matrix_shape = (
+        int(torch.Size(conv_layer.fhe_output_shape).numel()),
+        int(torch.Size(conv_layer.fhe_input_shape).numel()),
+    )
+    spatial_cache = _conv2d_spatial_cache(conv_layer)
+    groups = int(conv_layer.groups)
+    in_channels_per_group = int(conv_layer.in_channels // groups)
+    out_channels_per_group = int(conv_layer.out_channels // groups)
+
+    key_chunks: list[np.ndarray] = []
+    for kh in range(int(weight_np.shape[2])):
+        for kw in range(int(weight_np.shape[3])):
+            oh, ow, ih, iw = spatial_cache[(int(kh), int(kw))]
+            if oh.size == 0:
+                continue
+            for group in range(int(groups)):
+                oc_group_start = int(group) * int(out_channels_per_group)
+                oc_group_end = min(int(co), int(oc_group_start) + int(out_channels_per_group))
+                ic_group_start = int(group) * int(in_channels_per_group)
+                ic_group_end = min(int(ci), int(ic_group_start) + int(in_channels_per_group))
+                output_chunk, input_chunk = _channel_chunk_shape(
+                    int(oh.size),
+                    int(oc_group_end - oc_group_start),
+                    int(ic_group_end - ic_group_start),
+                    int(max_chunk_items),
+                )
+                for oc_start in range(int(oc_group_start), int(oc_group_end), int(output_chunk)):
+                    oc_end = min(int(oc_group_end), int(oc_start) + int(output_chunk))
+                    output_channels = np.arange(int(oc_start), int(oc_end), dtype=np.int64)
+                    row_indices = _packed_flat_indices_for_channels(
+                        output_channels,
+                        oh,
+                        ow,
+                        gap=int(output_gap),
+                        height=int(on_ho),
+                        width=int(on_wo),
+                        row_offset=int(output_row_offset),
+                    )[:, None, :]
+                    for ic_start in range(int(ic_group_start), int(ic_group_end), int(input_chunk)):
+                        ic_end = min(int(ic_group_end), int(ic_start) + int(input_chunk))
+                        input_channels = np.arange(int(ic_start), int(ic_end), dtype=np.int64)
+                        rel_start = int(ic_start) - int(ic_group_start)
+                        rel_end = int(ic_end) - int(ic_group_start)
+                        weight_block = weight_np[
+                            int(oc_start):int(oc_end),
+                            int(rel_start):int(rel_end),
+                            int(kh),
+                            int(kw),
+                        ]
+                        if not bool(np.any(weight_block != 0.0)):
+                            continue
+                        if not bool(np.all(weight_block != 0.0)):
+                            for local_oc, oc in enumerate(output_channels.tolist()):
+                                nonzero_rel = np.flatnonzero(weight_block[int(local_oc)] != 0.0)
+                                if nonzero_rel.size == 0:
+                                    continue
+                                sparse_inputs = input_channels[nonzero_rel]
+                                sparse_cols = _packed_flat_indices_for_channels(
+                                    sparse_inputs,
+                                    ih,
+                                    iw,
+                                    gap=int(input_gap),
+                                    height=int(on_hi),
+                                    width=int(on_wi),
+                                    row_offset=int(input_row_offset),
+                                )[None, :, :]
+                                sparse_rows = row_indices[int(local_oc):int(local_oc) + 1]
+                                for batch in range(int(n_batch)):
+                                    _append_diagonal_key_chunk(
+                                        key_chunks,
+                                        sparse_rows + int(batch) * int(output_block_size),
+                                        sparse_cols + int(batch) * int(input_block_size),
+                                        matrix_height=int(matrix_shape[0]),
+                                        matrix_width=int(matrix_shape[1]),
+                                        num_slots=int(num_slots),
+                                        embed_method=str(embed_method),
+                                        is_last_layer=bool(is_last_layer),
+                                        allow_hybrid=bool(allow_hybrid),
+                                    )
+                            continue
+                        col_indices = _packed_flat_indices_for_channels(
+                            input_channels,
+                            ih,
+                            iw,
+                            gap=int(input_gap),
+                            height=int(on_hi),
+                            width=int(on_wi),
+                            row_offset=int(input_row_offset),
+                        )[None, :, :]
+                        for batch in range(int(n_batch)):
+                            _append_diagonal_key_chunk(
+                                key_chunks,
+                                row_indices + int(batch) * int(output_block_size),
+                                col_indices + int(batch) * int(input_block_size),
+                                matrix_height=int(matrix_shape[0]),
+                                matrix_width=int(matrix_shape[1]),
+                                num_slots=int(num_slots),
+                                embed_method=str(embed_method),
+                                is_last_layer=bool(is_last_layer),
+                                allow_hybrid=bool(allow_hybrid),
+                            )
+    return _count_diagonal_key_chunks(key_chunks)
+
+
+def estimate_direct_conv_transpose2d_diagonal_count(
+    conv_layer,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    *,
+    allow_hybrid: bool = True,
+    max_chunk_items: int | None = None,
+) -> int:
+    """Count packed block diagonals for ConvTranspose2d without payloads."""
+
+    if max_chunk_items is None:
+        max_chunk_items = int(os.environ.get("ORION_PACK_DIAGONAL_COUNT_MAX_ITEMS", "2000000"))
+    max_chunk_items = max(1, int(max_chunk_items))
+
+    weight_np = conv_layer.on_weight.detach().cpu().to(dtype=torch.float32).numpy()
+    n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
+    _, co, _, _ = [int(value) for value in conv_layer.output_shape]
+    _, on_ci, on_hi, on_wi = [int(value) for value in conv_layer.fhe_input_shape]
+    _, on_co, on_ho, on_wo = [int(value) for value in conv_layer.fhe_output_shape]
+    input_gap = int(conv_layer.input_gap)
+    output_gap = int(conv_layer.output_gap)
+    input_row_offset = max(0, int(getattr(conv_layer, "layout_policy_input_row_offset", 0) or 0))
+    output_row_offset = max(0, int(getattr(conv_layer, "layout_policy_output_row_offset", 0) or 0))
+    input_block_size = int(on_ci * on_hi * on_wi)
+    output_block_size = int(on_co * on_ho * on_wo)
+    matrix_shape = (
+        int(torch.Size(conv_layer.fhe_output_shape).numel()),
+        int(torch.Size(conv_layer.fhe_input_shape).numel()),
+    )
+    groups = int(conv_layer.groups)
+    in_channels_per_group = int(conv_layer.in_channels // groups)
+    out_channels_per_group = int(conv_layer.out_channels // groups)
+    spatial_cache = _tconv2d_spatial_cache(conv_layer)
+
+    key_chunks: list[np.ndarray] = []
+    for kh in range(int(weight_np.shape[2])):
+        for kw in range(int(weight_np.shape[3])):
+            ih, iw, oh, ow = spatial_cache[(int(kh), int(kw))]
+            if ih.size == 0:
+                continue
+            for group in range(int(groups)):
+                ic_group_start = int(group) * int(in_channels_per_group)
+                ic_group_end = min(int(ci), int(ic_group_start) + int(in_channels_per_group))
+                oc_group_start = int(group) * int(out_channels_per_group)
+                oc_group_end = min(int(co), int(oc_group_start) + int(out_channels_per_group))
+                input_chunk, output_chunk = _channel_chunk_shape(
+                    int(ih.size),
+                    int(ic_group_end - ic_group_start),
+                    int(oc_group_end - oc_group_start),
+                    int(max_chunk_items),
+                )
+                for ic_start in range(int(ic_group_start), int(ic_group_end), int(input_chunk)):
+                    ic_end = min(int(ic_group_end), int(ic_start) + int(input_chunk))
+                    input_channels = np.arange(int(ic_start), int(ic_end), dtype=np.int64)
+                    col_indices = _packed_flat_indices_for_channels(
+                        input_channels,
+                        ih,
+                        iw,
+                        gap=int(input_gap),
+                        height=int(on_hi),
+                        width=int(on_wi),
+                        row_offset=int(input_row_offset),
+                    )[:, None, :]
+                    for oc_start in range(int(oc_group_start), int(oc_group_end), int(output_chunk)):
+                        oc_end = min(int(oc_group_end), int(oc_start) + int(output_chunk))
+                        rel_start = int(oc_start) - int(oc_group_start)
+                        rel_end = int(oc_end) - int(oc_group_start)
+                        output_channels = np.arange(int(oc_start), int(oc_end), dtype=np.int64)
+                        weight_block = weight_np[
+                            int(ic_start):int(ic_end),
+                            int(rel_start):int(rel_end),
+                            int(kh),
+                            int(kw),
+                        ]
+                        if not bool(np.any(weight_block != 0.0)):
+                            continue
+                        if not bool(np.all(weight_block != 0.0)):
+                            for local_ic, ic in enumerate(input_channels.tolist()):
+                                nonzero_rel = np.flatnonzero(weight_block[int(local_ic)] != 0.0)
+                                if nonzero_rel.size == 0:
+                                    continue
+                                sparse_outputs = output_channels[nonzero_rel]
+                                sparse_rows = _packed_flat_indices_for_channels(
+                                    sparse_outputs,
+                                    oh,
+                                    ow,
+                                    gap=int(output_gap),
+                                    height=int(on_ho),
+                                    width=int(on_wo),
+                                    row_offset=int(output_row_offset),
+                                )[None, :, :]
+                                sparse_cols = col_indices[int(local_ic):int(local_ic) + 1]
+                                for batch in range(int(n_batch)):
+                                    _append_diagonal_key_chunk(
+                                        key_chunks,
+                                        sparse_rows + int(batch) * int(output_block_size),
+                                        sparse_cols + int(batch) * int(input_block_size),
+                                        matrix_height=int(matrix_shape[0]),
+                                        matrix_width=int(matrix_shape[1]),
+                                        num_slots=int(num_slots),
+                                        embed_method=str(embed_method),
+                                        is_last_layer=bool(is_last_layer),
+                                        allow_hybrid=bool(allow_hybrid),
+                                    )
+                            continue
+                        row_indices = _packed_flat_indices_for_channels(
+                            output_channels,
+                            oh,
+                            ow,
+                            gap=int(output_gap),
+                            height=int(on_ho),
+                            width=int(on_wo),
+                            row_offset=int(output_row_offset),
+                        )[None, :, :]
+                        for batch in range(int(n_batch)):
+                            _append_diagonal_key_chunk(
+                                key_chunks,
+                                row_indices + int(batch) * int(output_block_size),
+                                col_indices + int(batch) * int(input_block_size),
+                                matrix_height=int(matrix_shape[0]),
+                                matrix_width=int(matrix_shape[1]),
+                                num_slots=int(num_slots),
+                                embed_method=str(embed_method),
+                                is_last_layer=bool(is_last_layer),
+                                allow_hybrid=bool(allow_hybrid),
+                            )
+    return _count_diagonal_key_chunks(key_chunks)
+
+
+def estimate_packed_diagonal_count(linear_layer: nn.Module, last: bool, *, max_chunk_items: int | None = None) -> int:
+    slots = linear_layer.scheme.params.get_slots()
+    embed_method = linear_layer.scheme.params.get_embedding_method()
+    if hasattr(linear_layer, "kernel_size") and hasattr(linear_layer, "stride"):
+        if type(linear_layer).__name__ == "ConvTranspose2d":
+            return estimate_direct_conv_transpose2d_diagonal_count(
+                linear_layer,
+                int(slots),
+                str(embed_method),
+                bool(last),
+                max_chunk_items=max_chunk_items,
+            )
+        return estimate_direct_conv2d_diagonal_count(
+            linear_layer,
+            int(slots),
+            str(embed_method),
+            bool(last),
+            max_chunk_items=max_chunk_items,
+        )
+    return 0
+
 
 def pack_linear(linear_layer: nn.Module, last: bool):
     slots = linear_layer.scheme.params.get_slots()

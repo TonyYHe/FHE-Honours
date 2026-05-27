@@ -132,16 +132,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _single_slot_layer_cache_enabled() -> bool:
-    return bool(
-        _env_bool("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE")
-        or _env_bool("ORION_SINGLE_SLOT_LAYER_CACHE")
-    )
+    return bool(_env_bool("ORION_SINGLE_SLOT_LAYER_CACHE"))
 
 
 def _single_slot_encode_workers(item_count: int) -> int:
     raw = os.environ.get("ORION_SINGLE_SLOT_ENCODE_WORKERS")
-    if raw is None:
-        raw = os.environ.get("ORION_UNIFIED_SINGLE_SLOT_ENCODE_WORKERS")
     try:
         requested = int(raw) if raw is not None else 16
     except (TypeError, ValueError):
@@ -270,6 +265,30 @@ class UnifiedTransformGroup:
         }
         return payloads, bool(has_complex), profile, float(flatten_s)
 
+    def _plan_single_slot_rotation_keys(self, backend, payloads) -> tuple[tuple[int, int | None], ...]:
+        planner = getattr(backend, "PlanLinearTransformsUnifiedRotationKeys", None)
+        if callable(planner) and payloads:
+            count = len(payloads)
+            diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * count)()
+            diag_idxs_lens = (ctypes.c_int * count)()
+            levels = (ctypes.c_int * count)()
+            owned_arrays: list[object] = [levels]
+            for index, (diag_idxs, _diag_data, level) in enumerate(payloads):
+                idx_array = np.ascontiguousarray(diag_idxs, dtype=np.int32)
+                owned_arrays.append(idx_array)
+                diag_idxs_ptrs[index] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+                diag_idxs_lens[index] = int(idx_array.size)
+                levels[index] = int(level)
+            keys = planner(int(count), diag_idxs_ptrs, diag_idxs_lens, levels)
+            del owned_arrays
+            return tuple((int(key), None) for key in keys)
+
+        keys: dict[int, int | None] = {}
+        for diag_idxs, _diag_data, _level in payloads:
+            for key in np.asarray(diag_idxs, dtype=np.int32).reshape(-1):
+                keys[int(key)] = None
+        return tuple(sorted((int(key), level) for key, level in keys.items()))
+
     def _defer_single_slot_compile(self, backend, *, started_at: float) -> None:
         payloads, has_complex, raw_profile, flatten_s = self._prepare_single_slot_payloads()
         self._single_slot_payloads = payloads
@@ -288,8 +307,13 @@ class UnifiedTransformGroup:
         self.unified_ids = None
         self._diag_indices_by_transform = {}
         self._storage_name_by_transform = {}
-        self._required_keys = ()
+        plan_keys_started = time.perf_counter()
+        self._required_keys = self._plan_single_slot_rotation_keys(backend, payloads)
         self._required_keys_by_transform = {}
+        self._add_compile_profile("record_keys_s", time.perf_counter() - plan_keys_started)
+        rotation_key_started = time.perf_counter()
+        self._compile_rotation_keys(backend)
+        self._add_compile_profile("rotation_key_compile_s", time.perf_counter() - rotation_key_started)
         self._offloaded_plaintext_diagonals = False
         self._single_slot_deferred = True
         self.is_compiled = True
@@ -399,17 +423,9 @@ class UnifiedTransformGroup:
             int(transform_id): str(int(transform_id))
             for transform_id in self.unified_ids
         }
-        self._required_keys = ()
-        self._required_keys_by_transform = {}
-        record_keys_started = time.perf_counter()
-        for transform_id in self.unified_ids:
-            self._record_transform_key_requests(backend, int(transform_id))
-        self._add_compile_profile("record_keys_s", time.perf_counter() - record_keys_started)
         encode_s = float(time.perf_counter() - started)
         rotation_key_started = time.perf_counter()
-        self._compile_rotation_keys(backend)
         key_prepare_s = float(time.perf_counter() - rotation_key_started)
-        self._add_compile_profile("rotation_key_compile_s", key_prepare_s)
         self._set_compile_profile("total_s", time.perf_counter() - started)
         self.is_compiled = True
         self._single_slot_deferred = False
