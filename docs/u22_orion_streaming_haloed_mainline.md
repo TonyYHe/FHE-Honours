@@ -435,6 +435,17 @@ Repro command:
 .venv/bin/python tools/run_u22_dim32_dense_provider_e2e_matrix.py
 ```
 
+Network-level summary:
+
+<!-- U22_BASE32_SILU7_NETWORK_SUMMARY_TABLE_START -->
+| input | dataset | I/O ch | dense status | Halo status | dense HE forward s | Halo HE forward s | dense/Halo HE | dense hot E2E s | Halo hot E2E s | dense rotations | Halo rotations | dense boots | Halo boots | dense RSS GiB | Halo RSS GiB | runtime mode | result files | note |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 192x192 | IBSR BRAIN 2D | 1->4 | pending | pending |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| 224x224 | HanCo Hand | 3->1 | pending | pending |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| 384x288 | CVC-ClinicDB | 3->1 | pending | pending |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| 384x384 | Satellite cloud | 4->1 | pending | pending |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+<!-- U22_BASE32_SILU7_NETWORK_SUMMARY_TABLE_END -->
+
 <!-- U22_BASE32_SILU7_STREAMING_PROVIDER_E2E_TABLE_START -->
 | input | dataset | I/O ch | path | status | layer | groups/transforms | stream+encode s | LT+accum s | eval total s | stream build s | encode hoist s | stream load s | LT eval s | LT accum s | baby+giant s | boot after count | boot after s | boot after nodes | compile s | HE forward s | hot E2E s | rotations | boots | runtime mode | peak RSS GiB | result file | note |
 | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |

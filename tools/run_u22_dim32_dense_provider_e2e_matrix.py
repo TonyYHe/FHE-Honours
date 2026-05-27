@@ -23,6 +23,7 @@ from tools.generate_unet22_compile_plan_csv import UNet22PlusOutput
 
 
 DOC_MARKER = "U22_BASE32_SILU7_STREAMING_PROVIDER_E2E_TABLE"
+SUMMARY_DOC_MARKER = "U22_BASE32_SILU7_NETWORK_SUMMARY_TABLE"
 DEFAULT_RUN_ROOT_BASE = REPO_ROOT / ".tmp" / "results"
 LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_u22_dim32_dense_provider_e2e_matrix.txt"
 
@@ -116,17 +117,26 @@ PROVIDER_MODES = {
     "fixed_max": "u22_256_base32_layout_fixedmax",
 }
 
+CPU_COUNT = max(1, int(os.cpu_count() or 1))
+
 ENV_DEFAULTS: dict[str, str] = {
     "PYTHONUNBUFFERED": "1",
     "MALLOC_ARENA_MAX": "2",
+    "GOMAXPROCS": str(CPU_COUNT),
     "ORION_COMPILE_PARALLEL_POLICY": "manual",
     "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
-    "ORION_SINGLE_SLOT_ENCODE_WORKERS": "16",
+    "ORION_SINGLE_SLOT_ENCODE_WORKERS": str(CPU_COUNT),
     "ORION_LATTIGO_STREAMING_LT": "0",
     "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "0",
     "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "0",
     "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "0",
     "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
+    "ORION_PACK_CONV_WORKERS": str(CPU_COUNT),
+    "ORION_DIRECT_PACK_WORKERS": str(CPU_COUNT),
+    "ORION_LT_COMPILE_WORKERS": str(CPU_COUNT),
+    "ORION_UNIFIED_COMPILE_WORKERS": str(CPU_COUNT),
+    "ORION_LATTIGO_COMPILE_WORKERS": str(CPU_COUNT),
+    "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": str(CPU_COUNT),
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
@@ -149,6 +159,8 @@ ENV_TUNING_KEYS = (
     "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
     "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
     "ORION_PACK_CONV_WORKERS",
+    "ORION_DIRECT_PACK_WORKERS",
+    "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
     "ORION_LATTIGO_BOOTSTRAP_WORKERS",
     "ORION_CONCAT_FUSION",
 )
@@ -834,6 +846,117 @@ def _markdown_table(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
+    result_path, _log_path = _case_paths(run_root, case, mode)
+    payload = _read_json(result_path)
+    payload = payload if isinstance(payload, dict) else {}
+    timing = payload.get("timing_s", {}) if isinstance(payload.get("timing_s"), dict) else {}
+    encrypt_s = _forward_timing(payload, "encrypt")
+    he_forward_s = _forward_timing(payload, "he_forward")
+    decode_s = _forward_timing(payload, "decrypt_decode")
+    hot_s = None
+    if encrypt_s is not None and he_forward_s is not None and decode_s is not None:
+        hot_s = float(encrypt_s + he_forward_s + decode_s)
+    return {
+        "status": str(payload.get("status", "pending" if not payload else "unknown")),
+        "compile_s": timing.get("compile") if isinstance(timing, dict) else None,
+        "he_forward_s": he_forward_s,
+        "hot_e2e_s": hot_s,
+        "rotations": _rotation_count(payload),
+        "boots": _bootstrap_count(payload),
+        "peak_rss_gib": _metric(payload, ("runner", "maxrss_bytes")),
+        "runtime_mode": _runtime_mode(payload),
+        "result_path": str(result_path),
+        "note": _first_error(result_path, payload),
+    }
+
+
+def _ratio(numerator: Any, denominator: Any) -> float | None:
+    left = _as_float(numerator)
+    right = _as_float(denominator)
+    if right <= 0.0:
+        return None
+    return float(left / right)
+
+
+def _network_summary_table(run_root: Path, cases: list[str]) -> str:
+    headers = [
+        "input",
+        "dataset",
+        "I/O ch",
+        "dense status",
+        "Halo status",
+        "dense HE forward s",
+        "Halo HE forward s",
+        "dense/Halo HE",
+        "dense hot E2E s",
+        "Halo hot E2E s",
+        "dense rotations",
+        "Halo rotations",
+        "dense boots",
+        "Halo boots",
+        "dense RSS GiB",
+        "Halo RSS GiB",
+        "runtime mode",
+        "result files",
+        "note",
+    ]
+    aligns = [
+        "---",
+        "---",
+        "---",
+        "---",
+        "---",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---",
+        "---",
+        "---",
+    ]
+    rows: list[list[str]] = []
+    for case in cases:
+        spec = CASES[str(case)]
+        dense = _case_summary(run_root, str(case), "dense")
+        provider = _case_summary(run_root, str(case), "provider")
+        notes = [str(value) for value in (dense.get("note"), provider.get("note")) if str(value or "")]
+        rows.append(
+            [
+                str(case),
+                str(spec["dataset"]),
+                f"{int(spec['input_shape'][1])}->{int(spec['out_channels'])}",
+                str(dense["status"]),
+                str(provider["status"]),
+                _fmt_float(dense["he_forward_s"]),
+                _fmt_float(provider["he_forward_s"]),
+                _fmt_float(_ratio(dense["he_forward_s"], provider["he_forward_s"])),
+                _fmt_float(dense["hot_e2e_s"]),
+                _fmt_float(provider["hot_e2e_s"]),
+                _fmt_int(dense["rotations"]),
+                _fmt_int(provider["rotations"]),
+                _fmt_int(dense["boots"]),
+                _fmt_int(provider["boots"]),
+                _gib(dense["peak_rss_gib"]),
+                _gib(provider["peak_rss_gib"]),
+                str(provider["runtime_mode"] or dense["runtime_mode"]),
+                f"dense:{dense['result_path']}; provider:{provider['result_path']}",
+                "; ".join(notes),
+            ]
+        )
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(aligns) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(_markdown_escape(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
 def _replace_block(text: str, marker: str, body: str) -> str:
     start = f"<!-- {marker}_START -->"
     end = f"<!-- {marker}_END -->"
@@ -853,7 +976,9 @@ def update_doc(doc_path: Path, run_root: Path, cases: list[str], modes: list[str
             rows.extend(_case_table_rows(Path(run_root), str(case), str(mode)))
     table = _markdown_table(rows)
     text = Path(doc_path).read_text(encoding="utf-8")
-    Path(doc_path).write_text(_replace_block(text, DOC_MARKER, table), encoding="utf-8")
+    text = _replace_block(text, DOC_MARKER, table)
+    text = _replace_block(text, SUMMARY_DOC_MARKER, _network_summary_table(Path(run_root), cases))
+    Path(doc_path).write_text(text, encoding="utf-8")
     summary = {
         "run_root": str(run_root),
         "doc": str(doc_path),
