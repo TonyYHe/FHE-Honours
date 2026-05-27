@@ -28,6 +28,7 @@ var (
 	ltPredecodeMu             sync.Mutex
 	ltPredecodedRotationKeys  = make(map[uint64]*rlwe.GaloisKey)
 	ltPredecodedPlaintextVecs = make(map[int]map[int]ringqp.Poly)
+	ltGOMAXPROCSMu            sync.Mutex
 )
 
 func clearPredecodedLinearTransformArtifacts() {
@@ -150,6 +151,17 @@ func ltDiagonalEncodeWorkerCount(n int) int {
 		workers = n
 	}
 	return workers
+}
+
+func withTemporaryGOMAXPROCS(workers int, fn func() error) error {
+	if workers <= 0 {
+		return fn()
+	}
+	ltGOMAXPROCSMu.Lock()
+	defer ltGOMAXPROCSMu.Unlock()
+	previous := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(previous)
+	return fn()
 }
 
 func unifiedNoBSGSEnabled() bool {
@@ -896,52 +908,54 @@ func encodeSingleCKKSTransformDiagonalsParallel[T ckks.Float](
 		return lintrans.Encode(ckks.NewEncoder(*scheme.Params), diagonals, transform)
 	}
 
-	metaData := *commonTransform.MetaData
-	metaData.Scale = commonTransform.Scale
-	jobCh := make(chan diagonalEncodeJob, len(jobs))
-	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
+	return withTemporaryGOMAXPROCS(workers, func() error {
+		metaData := *commonTransform.MetaData
+		metaData.Scale = commonTransform.Scale
+		jobCh := make(chan diagonalEncodeJob, len(jobs))
+		var wg sync.WaitGroup
+		var once sync.Once
+		var firstErr error
 
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			encoder := ckks.NewEncoder(*scheme.Params)
-			workerMetaData := metaData
-			buf := make([]T, rows*cols)
-			for job := range jobCh {
-				values, err := commonDiagonals.At(job.key, cols)
-				if err != nil {
-					once.Do(func() {
-						firstErr = fmt.Errorf("cannot Encode: %w", err)
-					})
-					continue
-				}
-				embedValues := values
-				if job.rot != 0 {
-					for row := 0; row < rows; row++ {
-						start := row * cols
-						end := start + cols
-						utils.RotateSliceAllocFree(values[start:end], job.rot, buf[start:end])
+		for worker := 0; worker < workers; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				encoder := ckks.NewEncoder(*scheme.Params)
+				workerMetaData := metaData
+				buf := make([]T, rows*cols)
+				for job := range jobCh {
+					values, err := commonDiagonals.At(job.key, cols)
+					if err != nil {
+						once.Do(func() {
+							firstErr = fmt.Errorf("cannot Encode: %w", err)
+						})
+						continue
 					}
-					embedValues = buf
+					embedValues := values
+					if job.rot != 0 {
+						for row := 0; row < rows; row++ {
+							start := row * cols
+							end := start + cols
+							utils.RotateSliceAllocFree(values[start:end], job.rot, buf[start:end])
+						}
+						embedValues = buf
+					}
+					if err := encoder.Embed(embedValues, &workerMetaData, job.vec); err != nil {
+						once.Do(func() {
+							firstErr = err
+						})
+					}
 				}
-				if err := encoder.Embed(embedValues, &workerMetaData, job.vec); err != nil {
-					once.Do(func() {
-						firstErr = err
-					})
-				}
-			}
-		}()
-	}
+			}()
+		}
 
-	for _, job := range jobs {
-		jobCh <- job
-	}
-	close(jobCh)
-	wg.Wait()
-	return firstErr
+		for _, job := range jobs {
+			jobCh <- job
+		}
+		close(jobCh)
+		wg.Wait()
+		return firstErr
+	})
 }
 
 func encodeCKKSTransformsDiagonalsParallel[T ckks.Float](
@@ -1021,54 +1035,56 @@ func encodeCKKSTransformsDiagonalsParallel[T ckks.Float](
 		return nil
 	}
 
-	jobCh := make(chan diagonalEncodeBatchJob, len(jobs))
-	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
+	return withTemporaryGOMAXPROCS(workers, func() error {
+		jobCh := make(chan diagonalEncodeBatchJob, len(jobs))
+		var wg sync.WaitGroup
+		var once sync.Once
+		var firstErr error
 
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			encoder := ckks.NewEncoder(*scheme.Params)
-			buf := make([]T, maxValuesLen)
-			for job := range jobCh {
-				transformIndex := int(job.transform)
-				commonTransform := commonTransforms[transformIndex]
-				rows := rowsByTransform[transformIndex]
-				cols := colsByTransform[transformIndex]
-				values, err := commonDiagonals[transformIndex].At(job.key, cols)
-				if err != nil {
-					once.Do(func() {
-						firstErr = fmt.Errorf("cannot Encode: %w", err)
-					})
-					continue
-				}
-				embedValues := values
-				if job.rot != 0 {
-					for row := 0; row < rows; row++ {
-						start := row * cols
-						end := start + cols
-						utils.RotateSliceAllocFree(values[start:end], job.rot, buf[start:end])
+		for worker := 0; worker < workers; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				encoder := ckks.NewEncoder(*scheme.Params)
+				buf := make([]T, maxValuesLen)
+				for job := range jobCh {
+					transformIndex := int(job.transform)
+					commonTransform := commonTransforms[transformIndex]
+					rows := rowsByTransform[transformIndex]
+					cols := colsByTransform[transformIndex]
+					values, err := commonDiagonals[transformIndex].At(job.key, cols)
+					if err != nil {
+						once.Do(func() {
+							firstErr = fmt.Errorf("cannot Encode: %w", err)
+						})
+						continue
 					}
-					embedValues = buf[:rows*cols]
+					embedValues := values
+					if job.rot != 0 {
+						for row := 0; row < rows; row++ {
+							start := row * cols
+							end := start + cols
+							utils.RotateSliceAllocFree(values[start:end], job.rot, buf[start:end])
+						}
+						embedValues = buf[:rows*cols]
+					}
+					workerMetaData := *commonTransform.MetaData
+					workerMetaData.Scale = commonTransform.Scale
+					if err := encoder.Embed(embedValues, &workerMetaData, job.vec); err != nil {
+						once.Do(func() {
+							firstErr = err
+						})
+					}
 				}
-				workerMetaData := *commonTransform.MetaData
-				workerMetaData.Scale = commonTransform.Scale
-				if err := encoder.Embed(embedValues, &workerMetaData, job.vec); err != nil {
-					once.Do(func() {
-						firstErr = err
-					})
-				}
-			}
-		}()
-	}
-	for _, job := range jobs {
-		jobCh <- job
-	}
-	close(jobCh)
-	wg.Wait()
-	return firstErr
+			}()
+		}
+		for _, job := range jobs {
+			jobCh <- job
+		}
+		close(jobCh)
+		wg.Wait()
+		return firstErr
+	})
 }
 
 func encodeFloatTransformsParallel(

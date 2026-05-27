@@ -122,7 +122,7 @@ CPU_COUNT = max(1, int(os.cpu_count() or 1))
 ENV_DEFAULTS: dict[str, str] = {
     "PYTHONUNBUFFERED": "1",
     "MALLOC_ARENA_MAX": "2",
-    "GOMAXPROCS": str(CPU_COUNT),
+    "GOMAXPROCS": "1",
     "ORION_COMPILE_PARALLEL_POLICY": "manual",
     "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
     "ORION_SINGLE_SLOT_ENCODE_WORKERS": str(CPU_COUNT),
@@ -180,6 +180,7 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated = dict(env)
     for key, value in ENV_DEFAULTS.items():
         updated.setdefault(key, value)
+    updated["GOMAXPROCS"] = ENV_DEFAULTS["GOMAXPROCS"]
     return updated
 
 
