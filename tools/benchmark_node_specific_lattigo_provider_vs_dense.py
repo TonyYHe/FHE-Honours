@@ -2634,7 +2634,7 @@ def _run_worker(
         env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", diagonal_encode_workers)
         env.setdefault("ORION_LATTIGO_BOOTSTRAP_WORKERS", compile_workers)
         env.setdefault("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "2")
-        env.setdefault("ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM", "1")
+        env.setdefault("ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM", "0")
         env.setdefault("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE", "1")
         if provider_mode == "save":
             env[LATTIGO_BENCH_IO_MODE_ENV] = "save"

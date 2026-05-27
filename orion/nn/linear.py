@@ -1,5 +1,6 @@
 import sys
 import math
+import os
 from types import SimpleNamespace
 from abc import abstractmethod
 
@@ -243,6 +244,9 @@ class Conv2d(LinearTransform):
         return tuple(getattr(self, "concat_fusion_specs", ()) or ())
 
     def _concat_fusion_supported(self) -> bool:
+        raw_enabled = os.environ.get("ORION_CONCAT_FUSION", "1").strip().lower()
+        if raw_enabled in ("", "0", "false", "no", "off"):
+            return False
         specs = self._concat_fusion_specs()
         return bool(specs and int(getattr(self, "groups", 1)) == 1)
 

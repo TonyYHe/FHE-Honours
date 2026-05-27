@@ -1,0 +1,1152 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import io
+import json
+import math
+import os
+import resource
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterator
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import torch
+
+from orion.backend.python.tensors import CipherTensor
+from orion.core.orion import scheme
+from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+from orion.experimental.cir.r34_orion_same_shape import _align_ciphertexts_for_add, _rescale_cipher_tensor
+from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
+from orion.nn.linear import Conv2d
+from orion.nn.module import Module
+from tools import benchmark_node_specific_lattigo_provider_vs_dense as bench
+
+
+DOC_MARKER = "CONV_KERNEL_TABLE"
+DEFAULT_RUN_ROOT_BASE = REPO_ROOT / ".tmp" / "results"
+LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_conv_kernel_table.txt"
+DEFAULT_DOC = REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md"
+ROW_DIR_NAME = "rows"
+
+DEFAULT_HW = ("192x192", "224x224", "384x288", "384x384")
+DEFAULT_CHANNELS = (32, 64, 128)
+DEFAULT_VARIANTS = ("orion", "provider_halo1", "provider_halo2")
+VARIANT_LABELS = {
+    "orion": "Orion dense",
+    "provider_halo1": "provider halo=1/1",
+    "provider_halo2": "provider halo=2/2",
+}
+
+
+@dataclass(frozen=True)
+class ConvKernelRow:
+    channels: int
+    height: int
+    width: int
+    variant: str
+
+    @property
+    def hw(self) -> str:
+        return f"{int(self.height)}x{int(self.width)}"
+
+    @property
+    def path(self) -> str:
+        return "dense" if str(self.variant) == "orion" else "provider"
+
+    @property
+    def halo(self) -> int | None:
+        if str(self.variant) == "provider_halo1":
+            return 1
+        if str(self.variant) == "provider_halo2":
+            return 2
+        return None
+
+    @property
+    def row_id(self) -> str:
+        return f"conv{int(self.channels)}_{self.hw}_{self.variant}".replace("x", "x")
+
+
+@contextlib.contextmanager
+def _capture_stdout() -> Iterator[io.StringIO]:
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        yield buffer
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _default_run_root() -> Path:
+    return DEFAULT_RUN_ROOT_BASE / f"conv_kernel_table_{datetime.now().strftime('%Y%m%dT%H%M%SZ')}"
+
+
+def _parse_hw(value: str) -> tuple[int, int]:
+    text = str(value).strip().lower().replace("*", "x")
+    if "x" not in text:
+        raise argparse.ArgumentTypeError(f"HW must look like HxW, got {value!r}")
+    left, right = text.split("x", 1)
+    try:
+        height = int(left)
+        width = int(right)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"HW must look like HxW, got {value!r}") from exc
+    if height <= 0 or width <= 0:
+        raise argparse.ArgumentTypeError(f"HW must be positive, got {value!r}")
+    return int(height), int(width)
+
+
+def _row_path(run_root: Path, row: ConvKernelRow) -> Path:
+    return Path(run_root) / ROW_DIR_NAME / f"{row.row_id}.json"
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - surface corrupt files in the table.
+        return {"status": "bad_json", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _iter_reuse_jsons(sources: list[Path]) -> Iterator[Path]:
+    for source in sources:
+        path = Path(source)
+        if path.is_file() and path.suffix == ".json":
+            yield path
+        elif path.is_dir():
+            for item in sorted(path.rglob("*.json")):
+                if "fontlist" in item.name:
+                    continue
+                yield item
+
+
+def _result_path_kind(result: dict[str, Any], fallback: str = "") -> str:
+    path = str(result.get("path") or fallback or "")
+    if path == "orion":
+        return "dense"
+    return path
+
+
+def _result_input_chw(result: dict[str, Any]) -> tuple[int, int, int] | None:
+    module = result.get("module") if isinstance(result.get("module"), dict) else {}
+    shape = module.get("input_shape") or result.get("module_input_shape") or result.get("input_shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) < 4:
+        return None
+    try:
+        return int(shape[1]), int(shape[2]), int(shape[3])
+    except (TypeError, ValueError):
+        return None
+
+
+def _explicit_halo(result: dict[str, Any]) -> tuple[int | None, int | None]:
+    top = result.get("input_halo_top")
+    bottom = result.get("input_halo_bottom")
+    if top is None or bottom is None:
+        return None, None
+    try:
+        return int(top), int(bottom)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _is_streaming_result(result: dict[str, Any]) -> bool:
+    env = result.get("env") if isinstance(result.get("env"), dict) else {}
+    raw = str(env.get("ORION_LATTIGO_STREAMING_LT", "") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on", "force", "forced"}:
+        return True
+    mode = str(result.get("runtime_mode") or result.get("runtime_fairness_mode") or "")
+    return "stream" in mode.lower()
+
+
+def _candidate_results_from_payload(payload: dict[str, Any], source_path: Path) -> Iterator[tuple[dict[str, Any], str, str]]:
+    if payload.get("status") == "ok" and (payload.get("row_id") or payload.get("module")):
+        yield payload, _result_path_kind(payload), str(source_path)
+
+    for detail in payload.get("details", []) if isinstance(payload.get("details"), list) else []:
+        if not isinstance(detail, dict):
+            continue
+        case = str(detail.get("case", ""))
+        for path_name in ("dense", "provider"):
+            result = detail.get(path_name)
+            if isinstance(result, dict):
+                yield result, path_name, f"{source_path}:{case}/{path_name}"
+
+    for network in payload.get("networks", []) if isinstance(payload.get("networks"), list) else []:
+        if not isinstance(network, dict):
+            continue
+        network_name = str(network.get("network", ""))
+        for case in network.get("cases", []) if isinstance(network.get("cases"), list) else []:
+            if not isinstance(case, dict):
+                continue
+            node = str(case.get("node") or case.get("case") or "")
+            paths = case.get("paths") if isinstance(case.get("paths"), dict) else {}
+            for path_name, wrapper in paths.items():
+                if not isinstance(wrapper, dict):
+                    continue
+                result = wrapper.get("result") if isinstance(wrapper.get("result"), dict) else wrapper
+                if isinstance(result, dict):
+                    yield result, str(path_name), f"{source_path}:{network_name}/{node}/{path_name}"
+
+
+def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_label: str) -> dict[str, Any]:
+    timing = dict(result.get("runtime_fairness_timing") or {})
+    rotation_count = (
+        result.get("runtime_rotation_eval_count")
+        if result.get("runtime_rotation_eval_count") is not None
+        else result.get("rotation_eval_count", result.get("post_bsgs_rotation_eval_count", 0))
+    )
+    input_cts = result.get("input_cts", result.get("source_ciphertext_count", result.get("runtime_source_cts", 0)))
+    output_cts = result.get("output_cts", result.get("output_ciphertext_count", result.get("runtime_output_cts", 0)))
+    return {
+        "status": "ok",
+        "created_at_utc": _now_utc(),
+        "reused_from": str(source_label),
+        "backend": str(result.get("backend", "lattigo")),
+        "row_id": row.row_id,
+        "hw": row.hw,
+        "channels": int(row.channels),
+        "conv": f"{int(row.channels)},{int(row.channels)}",
+        "variant": str(row.variant),
+        "variant_label": VARIANT_LABELS[str(row.variant)],
+        "path": row.path,
+        "input_halo_top": row.halo,
+        "input_halo_bottom": row.halo,
+        "kernel": "3x3/pad1/stride1",
+        "compile_s": float(result.get("compile_s") or 0.0),
+        "generate_diagonals_s": float(result.get("generate_diagonals_s") or 0.0),
+        "compile_backend_s": float(result.get("compile_backend_s") or 0.0),
+        "run_count": int(result.get("run_count") or len(result.get("hot_run_s", []) or []) or 1),
+        "hot_run_s": [float(value) for value in (result.get("hot_run_s") or [])],
+        "hot_run_mean_s": float(result.get("hot_run_mean_s") or result.get("serving_hot_s") or 0.0),
+        "runtime_fairness_timing": timing,
+        "lt_accumulate_s": float(_lt_accumulate_s(timing) or result.get("resident_compute_s") or result.get("hot_run_mean_s") or 0.0),
+        "runtime_mode": str(result.get("runtime_fairness_mode") or timing.get("runtime_fairness_mode") or ""),
+        "rotation_eval_count": int(rotation_count or 0),
+        "runtime_operation_counts": dict(result.get("runtime_operation_counts") or {}),
+        "input_cts": int(input_cts or 0),
+        "output_cts": int(output_cts or 0),
+        "module": dict(result.get("module") or {}),
+        "rotation_stats": dict(result.get("rotation_stats") or {}),
+        "maxrss_bytes": None if result.get("maxrss_bytes") is None else int(result.get("maxrss_bytes") or 0),
+        "env": dict(result.get("env") or {}),
+    }
+
+
+def reuse_existing_rows(run_root: Path, rows: list[ConvKernelRow], sources: list[Path], *, force: bool = False) -> int:
+    if not sources:
+        return 0
+    row_by_key = {(row.path, row.channels, row.height, row.width, row.halo): row for row in rows}
+    reused = 0
+    for json_path in _iter_reuse_jsons([Path(value) for value in sources]):
+        payload = _read_json(json_path)
+        if not isinstance(payload, dict):
+            continue
+        for result, path_name, source_label in _candidate_results_from_payload(payload, json_path):
+            if result.get("status") != "ok" or _is_streaming_result(result):
+                continue
+            chw = _result_input_chw(result)
+            if chw is None:
+                continue
+            channels, height, width = chw
+            path_kind = _result_path_kind(result, fallback=path_name)
+            if path_kind == "dense":
+                key = ("dense", int(channels), int(height), int(width), None)
+            elif path_kind == "provider":
+                top, bottom = _explicit_halo(result)
+                # Older provider JSONs did not record the halo setting; those
+                # runs used the default provider halo, which is top/bottom 1/1.
+                if top is None and bottom is None:
+                    top = bottom = 1
+                if top is None or bottom is None or top != bottom:
+                    continue
+                key = ("provider", int(channels), int(height), int(width), int(top))
+            else:
+                continue
+            row = row_by_key.get(key)
+            if row is None:
+                continue
+            target = _row_path(run_root, row)
+            if not force:
+                existing = _read_json(target)
+                if isinstance(existing, dict) and existing.get("status") == "ok":
+                    continue
+            _write_json(target, _normalise_reused_result(row, result, source_label))
+            reused += 1
+    return int(reused)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _fmt_float(value: Any, digits: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(number):
+        return ""
+    return f"{number:.{digits}f}"
+
+
+def _fmt_int(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _gib_from_bytes(value: Any) -> str:
+    try:
+        return f"{float(value) / (1024 ** 3):.1f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _markdown_escape(value: Any) -> str:
+    return str(value).replace("\n", " ").replace("|", "\\|")
+
+
+def _replace_block(text: str, marker: str, body: str) -> str:
+    start = f"<!-- {marker}_START -->"
+    end = f"<!-- {marker}_END -->"
+    left, sep, rest = text.partition(start)
+    if not sep:
+        raise ValueError(f"missing marker {start}")
+    _old, sep, right = rest.partition(end)
+    if not sep:
+        raise ValueError(f"missing marker {end}")
+    return f"{left}{start}\n{body}\n{end}{right}"
+
+
+def _config(*, backend: str) -> dict[str, Any]:
+    return {
+        "ckks_params": {
+            "LogN": 16,
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": str(backend),
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+
+
+def _init_scheme(*, backend: str) -> None:
+    scheme.init_scheme(_config(backend=str(backend)))
+    Module.set_scheme(scheme)
+    Module.set_margin(scheme.params.get_margin())
+
+
+def _cleanup_scheme() -> None:
+    try:
+        scheme.delete_scheme()
+    except Exception:
+        pass
+
+
+def _make_conv(row: ConvKernelRow, *, seed: int) -> Conv2d:
+    torch.manual_seed(int(seed))
+    conv = Conv2d(
+        int(row.channels),
+        int(row.channels),
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        bias=True,
+    )
+    conv.eval()
+    conv.name = row.row_id
+    conv.region_output_id = str(conv.name)
+    x = torch.randn((1, int(row.channels), int(row.height), int(row.width)), dtype=torch.float32)
+    y = conv(x)
+    conv.init_orion_params()
+    conv.input_shape = torch.Size(x.shape)
+    conv.output_shape = torch.Size(y.shape)
+    conv.input_gap = 1
+    conv.output_gap = 1
+    conv.fhe_input_shape = torch.Size(x.shape)
+    conv.fhe_output_shape = torch.Size(y.shape)
+    if row.halo is not None:
+        conv.layout_policy_input_layout = {"top_beta": int(row.halo), "bottom_beta": int(row.halo)}
+    conv.set_level(len(scheme.params.get_logq()) - 1)
+    return conv
+
+
+def _attach_provider_runtime(conv: Conv2d, row: ConvKernelRow) -> None:
+    executor = HaloLocalConvRuntimeExecutor(
+        module=conv,
+        output_node_id=str(conv.region_output_id),
+    )
+    runtime = RegionFirstRuntimeGroup(
+        region_id=f"conv_kernel_{row.row_id}",
+        network="conv_kernel_table",
+        stage="synthetic",
+        module_prefix=str(conv.name),
+        conv_nodes=(str(conv.region_output_id),),
+        strategy="native_halo_stripe_no_ri_conv2d",
+        materializer="native_halo_stripe_no_ri",
+        depth=1,
+        boundary_actions=("native_halo_stripe_no_ri_conv2d",),
+        expected_stats={},
+        executable=True,
+        executor=executor,
+    )
+    conv.region_runtime = runtime
+    conv.region_first_skip_dense_pack = True
+
+
+def _ct_count_from_shape(shape: Any, *, slots: int) -> int:
+    return max(1, int((int(torch.Size(shape).numel()) + int(slots) - 1) // int(slots)))
+
+
+def _dense_rows_cols(module: Any) -> tuple[int, int]:
+    keys = list(dict(getattr(module, "transform_ids", {}) or {}).keys())
+    if not keys:
+        return 0, 0
+    rows = max(int(row) for row, _col in keys) + 1
+    cols = max(int(col) for _row, col in keys) + 1
+    return int(rows), int(cols)
+
+
+def _make_cipher_source(
+    *,
+    count: int,
+    seed: int,
+    shape: torch.Size,
+    fhe_shape: torch.Size,
+) -> CipherTensor:
+    ids: list[int] = []
+    level = len(scheme.params.get_logq()) - 1
+    gen = torch.Generator().manual_seed(int(seed))
+    slots = int(scheme.params.get_slots())
+    for _index in range(int(count)):
+        packed = torch.randn((int(slots),), generator=gen, dtype=torch.float32) * 0.01
+        ct = scheme.encrypt(scheme.encode(packed, int(level)))
+        ids.append(int(ct.ids[0]))
+        ct.ids = []
+    return CipherTensor(scheme, ids, torch.Size(shape), torch.Size(fhe_shape))
+
+
+def _make_compact_source(module: Any, *, count: int, seed: int) -> CipherTensor:
+    return _make_cipher_source(
+        count=int(count),
+        seed=int(seed),
+        shape=torch.Size(getattr(module, "input_shape")),
+        fhe_shape=torch.Size(getattr(module, "fhe_input_shape")),
+    )
+
+
+def _native_provider_delegate(executor: Any) -> Any:
+    return getattr(executor, "delegate", executor)
+
+
+def _runtime_operation_counts() -> dict[str, Any]:
+    counts = bench._runtime_operation_counters()
+    return {} if counts is None else dict(counts)
+
+
+def _unified_group_runtime_fairness(executor: Any, *, serving_hot_s: float) -> dict[str, Any]:
+    timings: list[dict[str, Any]] = []
+    for group in bench._executor_unified_groups(executor):
+        timing = getattr(group, "last_runtime_timing", None)
+        if isinstance(timing, dict):
+            timings.append(dict(timing))
+    return bench._aggregate_runtime_fairness_timings(timings, serving_hot_s=float(serving_hot_s))
+
+
+def _run_dense_forward(module: Any, *, source_count: int, seed: int) -> dict[str, Any]:
+    module.he_mode = True
+    source = _make_compact_source(module, count=int(source_count), seed=int(seed))
+    counters_enabled = bench._reset_runtime_operation_counters()
+    started = time.perf_counter()
+    out = module(source)
+    bench._synchronize_backend()
+    elapsed = float(time.perf_counter() - started)
+    fairness = bench._runtime_fairness_for_module(module, serving_hot_s=float(elapsed))
+    counts = _runtime_operation_counts() if bool(counters_enabled) else {}
+    output_count = int(len(getattr(out, "ids", []) or []))
+    del out
+    del source
+    return {
+        "elapsed_s": float(elapsed),
+        "runtime_fairness_timing": dict(fairness),
+        "operation_counts": dict(counts),
+        "output_cts": int(output_count),
+    }
+
+
+def _run_native_provider_forward(executor: Any, *, source_count: int, seed: int) -> dict[str, Any]:
+    delegate = _native_provider_delegate(executor)
+    native_shape = torch.Size(delegate.runtime_native_fhe_output_shape())
+    source = _make_cipher_source(
+        count=int(source_count),
+        seed=int(seed),
+        shape=torch.Size([int(source_count), int(scheme.params.get_slots())]),
+        fhe_shape=torch.Size([int(source_count), int(scheme.params.get_slots())]),
+    )
+    counters_enabled = bench._reset_runtime_operation_counters()
+    started = time.perf_counter()
+    ids = tuple(int(value) for value in getattr(source, "ids", ()))
+    if len(ids) < int(source_count):
+        raise RuntimeError(f"native provider requires {source_count} source CTs, got {len(ids)}")
+
+    output_blocks: list[Any | None] = [None for _ in range(int(delegate.rows))]
+    evaluate_started = time.perf_counter()
+    for input_index, group in sorted(dict(delegate.groups_by_input_index).items()):
+        output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
+        target_indices = tuple(int(value) for value in delegate.target_indices_by_input_index[int(input_index)])
+        for target_index, output_id in zip(target_indices, output_ids):
+            partial = CipherTensor(
+                scheme,
+                [int(output_id)],
+                torch.Size([1, int(delegate.slots)]),
+                torch.Size([1, int(delegate.slots)]),
+            )
+            partial = _rescale_cipher_tensor(partial)
+            if output_blocks[int(target_index)] is None:
+                output_blocks[int(target_index)] = partial
+            else:
+                lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
+                output_blocks[int(target_index)] = lhs + rhs
+    delegate.last_runtime_timing["evaluate_unified_s"] = float(time.perf_counter() - evaluate_started)
+
+    postprocess_started = time.perf_counter()
+    output_ids: list[int] = []
+    for block_index, block_ct in enumerate(output_blocks):
+        if block_ct is None:
+            raise RuntimeError(f"missing native halo output block {block_index}")
+        block_ct = delegate._add_bias(block_ct, block_index=int(block_index))
+        block_ct.set_scale(int(scheme.params.get_default_scale()))
+        output_ids.append(int(block_ct.ids[0]))
+        block_ct.ids = []
+    native_output = CipherTensor(scheme, output_ids, native_shape, native_shape)
+    delegate.last_runtime_timing["postprocess_s"] = float(time.perf_counter() - postprocess_started)
+    delegate.last_runtime_timing["input_relayout_s"] = 0.0
+    delegate.last_runtime_timing["output_relayout_s"] = 0.0
+    bench._synchronize_backend()
+    elapsed = float(time.perf_counter() - started)
+    fairness = _unified_group_runtime_fairness(executor, serving_hot_s=float(elapsed))
+    counts = _runtime_operation_counts() if bool(counters_enabled) else {}
+    output_count = int(len(getattr(native_output, "ids", []) or []))
+    del native_output
+    del source
+    return {
+        "elapsed_s": float(elapsed),
+        "runtime_fairness_timing": dict(fairness),
+        "operation_counts": dict(counts),
+        "output_cts": int(output_count),
+        "executor_last_runtime_timing": dict(getattr(delegate, "last_runtime_timing", {}) or {}),
+    }
+
+
+def _metadata_for_native_executor(executor: Any) -> dict[str, Any]:
+    get_metadata = getattr(executor, "compile_cache_metadata", None)
+    return dict(get_metadata()) if callable(get_metadata) else {}
+
+
+def _stream_encode_s(timing: dict[str, Any]) -> float:
+    return float(timing.get("stream_build_map_s") or 0.0) + float(timing.get("stream_encode_hoist_s") or 0.0) + float(
+        timing.get("stream_load_payload_s") or 0.0
+    )
+
+
+def _lt_accumulate_s(timing: dict[str, Any]) -> float:
+    total = (
+        float(timing.get("stream_eval_s") or 0.0)
+        + float(timing.get("stream_accumulate_s") or 0.0)
+        + float(timing.get("cpp_baby_step_s") or 0.0)
+        + float(timing.get("cpp_giant_step_s") or 0.0)
+    )
+    if total <= 0.0:
+        total = float(timing.get("eval_s") or timing.get("eval_total_s") or 0.0)
+    return float(total)
+
+
+def _maxrss_bytes() -> int:
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+
+
+def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> dict[str, Any]:
+    started = time.perf_counter()
+    if str(backend) != "python":
+        bench._require_backend(str(backend))
+    _init_scheme(backend=str(backend))
+    compile_stdout = ""
+    try:
+        conv = _make_conv(row, seed=int(seed))
+        if row.path == "provider":
+            _attach_provider_runtime(conv, row)
+        with _capture_stdout() as buffer:
+            generate_started = time.perf_counter()
+            conv.generate_diagonals(last=False)
+            generate_diagonals_s = float(time.perf_counter() - generate_started)
+            compile_started = time.perf_counter()
+            conv.compile()
+            compile_backend_s = float(time.perf_counter() - compile_started)
+            compile_stdout = buffer.getvalue()
+
+        slots = int(scheme.params.get_slots())
+        compact_input_cts = _ct_count_from_shape(conv.fhe_input_shape, slots=int(slots))
+        compact_output_cts = _ct_count_from_shape(conv.fhe_output_shape, slots=int(slots))
+        if row.path == "dense":
+            dense_rows, dense_cols = _dense_rows_cols(conv)
+            rotation_stats = bench._linear_transform_rotation_stats(conv)
+            source_count = int(dense_cols)
+            input_cts = int(dense_cols)
+            output_cts = int(dense_rows)
+            provider_metadata: dict[str, Any] = {}
+        else:
+            executor = getattr(conv.region_runtime, "executor")
+            provider_metadata = _metadata_for_native_executor(executor)
+            native_plan = dict(
+                provider_metadata.get("native_halo_conv2d_plan", {})
+                or provider_metadata.get("r34_native_aligned_halo_plan", {})
+                or {}
+            )
+            rotation_stats = bench._provider_rotation_stats(conv, path_kind="provider")
+            source_count = int(native_plan.get("input_ct_count", getattr(executor, "cols", 0)) or 0)
+            input_cts = int(source_count)
+            output_cts = int(native_plan.get("output_ct_count", getattr(executor, "rows", 0)) or 0)
+
+        runs: list[dict[str, Any]] = []
+        for index in range(int(repeats)):
+            run_seed = int(seed) + 50_000 + int(index) * 1009
+            if row.path == "dense":
+                run_payload = _run_dense_forward(conv, source_count=int(source_count), seed=int(run_seed))
+            else:
+                run_payload = _run_native_provider_forward(
+                    getattr(conv.region_runtime, "executor"),
+                    source_count=int(source_count),
+                    seed=int(run_seed),
+                )
+            runs.append(dict(run_payload))
+
+        first_counts = dict((runs[0].get("operation_counts") if runs else {}) or {})
+        timing = dict((runs[0].get("runtime_fairness_timing") if runs else {}) or {})
+        rotation_runtime = first_counts.get("rotation")
+        result = {
+            "status": "ok",
+            "created_at_utc": _now_utc(),
+            "backend": str(backend),
+            "row_id": row.row_id,
+            "hw": row.hw,
+            "channels": int(row.channels),
+            "conv": f"{int(row.channels)},{int(row.channels)}",
+            "variant": str(row.variant),
+            "variant_label": VARIANT_LABELS[str(row.variant)],
+            "path": row.path,
+            "input_halo_top": row.halo,
+            "input_halo_bottom": row.halo,
+            "kernel": "3x3/pad1/stride1",
+            "compile_s": float(generate_diagonals_s + compile_backend_s),
+            "generate_diagonals_s": float(generate_diagonals_s),
+            "compile_backend_s": float(compile_backend_s),
+            "run_count": int(repeats),
+            "hot_run_s": [float(item.get("elapsed_s") or 0.0) for item in runs],
+            "hot_run_mean_s": (
+                sum(float(item.get("elapsed_s") or 0.0) for item in runs) / max(1, int(len(runs)))
+            ),
+            "runtime_fairness_timing": dict(timing),
+            "stream_encode_s": float(_stream_encode_s(timing)),
+            "lt_accumulate_s": float(_lt_accumulate_s(timing)),
+            "runtime_mode": str(timing.get("runtime_fairness_mode", "")),
+            "rotation_eval_count": int(rotation_runtime if rotation_runtime is not None else rotation_stats.get("rotation_eval_count", 0)),
+            "planned_rotation_eval_count": int(rotation_stats.get("rotation_eval_count", 0) or 0),
+            "runtime_operation_counts": {
+                "available": bool(first_counts),
+                "first_run": dict(first_counts),
+            },
+            "input_cts": int(input_cts),
+            "output_cts": int(output_cts),
+            "compact_input_cts": int(compact_input_cts),
+            "compact_output_cts": int(compact_output_cts),
+            "module": {
+                "input_shape": [int(value) for value in tuple(conv.input_shape)],
+                "output_shape": [int(value) for value in tuple(conv.output_shape)],
+                "fhe_input_shape": [int(value) for value in tuple(conv.fhe_input_shape)],
+                "fhe_output_shape": [int(value) for value in tuple(conv.fhe_output_shape)],
+            },
+            "provider_metadata": provider_metadata,
+            "rotation_stats": rotation_stats,
+            "compile_stdout_tail": str(compile_stdout[-12000:]),
+            "maxrss_bytes": int(_maxrss_bytes()),
+            "elapsed_s": float(time.perf_counter() - started),
+            "env": _env_snapshot(),
+        }
+        return result
+    finally:
+        _cleanup_scheme()
+
+
+def _env_snapshot() -> dict[str, str]:
+    keys = [
+        "GOMAXPROCS",
+        "MALLOC_ARENA_MAX",
+        "ORION_COMPILE_PARALLEL_POLICY",
+        "ORION_LATTIGO_STREAMING_LT",
+        "ORION_UNIFIED_STREAM_COMPILE_IO_NONE",
+        "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE",
+        "ORION_LATTIGO_MEMORY_BOUNDED_EVAL",
+        "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
+        "ORION_LT_COMPILE_WORKERS",
+        "ORION_LATTIGO_COMPILE_WORKERS",
+        "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
+        "ORION_DENSE_LT_SHARED_CACHE",
+    ]
+    return {key: str(os.environ.get(key, "")) for key in keys}
+
+
+def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
+    updated = dict(env)
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    updated.setdefault("PYTHONUNBUFFERED", "1")
+    updated.setdefault("MALLOC_ARENA_MAX", "2")
+    updated.setdefault("GOMAXPROCS", str(cpu_count))
+    updated.setdefault("ORION_COMPILE_PARALLEL_POLICY", "auto")
+    updated["ORION_LATTIGO_STREAMING_LT"] = "0"
+    updated["ORION_UNIFIED_STREAM_COMPILE_IO_NONE"] = "0"
+    updated["ORION_LATTIGO_MEMORY_BOUNDED_COMPILE"] = "0"
+    updated["ORION_LATTIGO_MEMORY_BOUNDED_EVAL"] = "0"
+    updated.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", str(cpu_count))
+    updated["ORION_DENSE_LT_SHARED_CACHE"] = "0"
+    updated["ORION_DENSE_LT_HOST_PAYLOAD_CACHE"] = "0"
+    updated.setdefault("ORION_CONCAT_FUSION", "0")
+    return updated
+
+
+def _rows_from_args(args: argparse.Namespace) -> list[ConvKernelRow]:
+    hw_values = [_parse_hw(str(value)) for value in args.hw]
+    rows: list[ConvKernelRow] = []
+    for channels in [int(value) for value in args.channels]:
+        for height, width in hw_values:
+            for variant in [str(value) for value in args.variants]:
+                rows.append(
+                    ConvKernelRow(
+                        channels=int(channels),
+                        height=int(height),
+                        width=int(width),
+                        variant=str(variant),
+                    )
+                )
+    return rows
+
+
+def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]:
+    table_rows: list[list[str]] = []
+    for row in rows:
+        result_path = _row_path(Path(run_root), row)
+        payload = _read_json(result_path)
+        status = "pending" if payload is None else str(payload.get("status", "unknown"))
+        note = ""
+        if isinstance(payload, dict) and status != "ok":
+            note = str(payload.get("failure_kind") or payload.get("error") or payload.get("message") or "")[:120]
+        elif isinstance(payload, dict) and payload.get("reused_from"):
+            source = str(payload.get("reused_from"))
+            source_file, _sep, source_detail = source.partition(":")
+            note = f"reused: {Path(source_file).name}"
+            if source_detail:
+                note = f"{note}:{source_detail}"
+            note = note[:120]
+        table_rows.append(
+            [
+                row.hw,
+                f"Conv {int(row.channels)},{int(row.channels)}",
+                VARIANT_LABELS[str(row.variant)],
+                status,
+                "" if row.halo is None else f"{int(row.halo)}/{int(row.halo)}",
+                _fmt_int((payload or {}).get("rotation_eval_count") if isinstance(payload, dict) else None),
+                _fmt_float((payload or {}).get("lt_accumulate_s") if isinstance(payload, dict) else None),
+                _fmt_float((payload or {}).get("hot_run_mean_s") if isinstance(payload, dict) else None),
+                _fmt_float((payload or {}).get("compile_s") if isinstance(payload, dict) else None),
+                _fmt_int((payload or {}).get("input_cts") if isinstance(payload, dict) else None),
+                _fmt_int((payload or {}).get("output_cts") if isinstance(payload, dict) else None),
+                _gib_from_bytes((payload or {}).get("maxrss_bytes") if isinstance(payload, dict) else None),
+                str((payload or {}).get("runtime_mode", "") if isinstance(payload, dict) else ""),
+                str(result_path),
+                note,
+            ]
+        )
+    return table_rows
+
+
+def _markdown_table(rows: list[list[str]]) -> str:
+    headers = [
+        "HW",
+        "kernel",
+        "path / beta",
+        "status",
+        "input halo T/B",
+        "rotations",
+        "LT+accumulate s",
+        "hot run s",
+        "compile s",
+        "input ct",
+        "output ct",
+        "peak RSS GiB",
+        "runtime mode",
+        "result file",
+        "note",
+    ]
+    aligns = [
+        "---",
+        "---",
+        "---",
+        "---",
+        "---",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
+        "---",
+        "---",
+        "---",
+    ]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(aligns) + " |"]
+    for row in rows:
+        lines.append("| " + " | ".join(_markdown_escape(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def update_doc(doc_path: Path, run_root: Path, rows: list[ConvKernelRow]) -> None:
+    table = _markdown_table(_table_payload(Path(run_root), rows))
+    text = Path(doc_path).read_text(encoding="utf-8")
+    Path(doc_path).write_text(_replace_block(text, DOC_MARKER, table), encoding="utf-8")
+
+
+def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
+    csv_path = Path(run_root) / "conv_kernel_table.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "HW",
+        "kernel",
+        "path_beta",
+        "status",
+        "input_halo_tb",
+        "rotations",
+        "lt_accumulate_s",
+        "hot_run_s",
+        "compile_s",
+        "input_ct",
+        "output_ct",
+        "peak_rss_gib",
+        "runtime_mode",
+        "result_file",
+        "note",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        writer.writerows(_table_payload(Path(run_root), rows))
+
+
+def _process_rss_bytes(pid: int) -> int | None:
+    try:
+        with Path(f"/proc/{int(pid)}/status").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except OSError:
+        return None
+    return None
+
+
+def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Namespace) -> None:
+    _write_json(
+        path,
+        {
+            "status": "running",
+            "created_at_utc": _now_utc(),
+            "row_id": row.row_id,
+            "hw": row.hw,
+            "channels": int(row.channels),
+            "conv": f"{int(row.channels)},{int(row.channels)}",
+            "variant": str(row.variant),
+            "variant_label": VARIANT_LABELS[str(row.variant)],
+            "path": row.path,
+            "input_halo_top": row.halo,
+            "input_halo_bottom": row.halo,
+            "kernel": "3x3/pad1/stride1",
+            "run_root": str(args.run_root),
+            "env": _env_snapshot(),
+        },
+    )
+
+
+def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, message: str, return_code: int | None) -> None:
+    payload = _read_json(path) or {}
+    payload.update(
+        {
+            "status": "error",
+            "finished_at_utc": _now_utc(),
+            "row_id": row.row_id,
+            "hw": row.hw,
+            "channels": int(row.channels),
+            "conv": f"{int(row.channels)},{int(row.channels)}",
+            "variant": str(row.variant),
+            "variant_label": VARIANT_LABELS[str(row.variant)],
+            "path": row.path,
+            "input_halo_top": row.halo,
+            "input_halo_bottom": row.halo,
+            "failure_kind": str(failure_kind),
+            "message": str(message),
+            "return_code": None if return_code is None else int(return_code),
+        }
+    )
+    _write_json(path, payload)
+
+
+def run_all(args: argparse.Namespace) -> int:
+    run_root = Path(args.run_root)
+    rows = _rows_from_args(args)
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / ROW_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    LATEST_POINTER.parent.mkdir(parents=True, exist_ok=True)
+    LATEST_POINTER.write_text(str(run_root) + "\n", encoding="utf-8")
+
+    env = _apply_env_defaults(os.environ)
+    manifest = {
+        "status": "running",
+        "created_at_utc": _now_utc(),
+        "script": str(Path(__file__).relative_to(REPO_ROOT)),
+        "run_root": str(run_root),
+        "doc": str(args.doc),
+        "backend": str(args.backend),
+        "channels": [int(value) for value in args.channels],
+        "hw": [str(value) for value in args.hw],
+        "variants": [str(value) for value in args.variants],
+        "repeats": int(args.repeats),
+        "rss_cap_gib": float(args.max_worker_rss_gb),
+        "measurement": {
+            "io_mode": "none",
+            "lt_accumulate_s": "resident eval_s / eval_total_s, excluding artifact I/O",
+            "orion": "dense Conv2d path with default resident Lattigo LT",
+            "provider_halo1": "native halo provider with input_top_beta=input_bottom_beta=1",
+            "provider_halo2": "native halo provider with input_top_beta=input_bottom_beta=2",
+        },
+        "env": {key: str(env.get(key, "")) for key in sorted(_env_snapshot())},
+    }
+    _write_json(run_root / "manifest.json", manifest)
+    reused_count = reuse_existing_rows(
+        run_root,
+        rows,
+        [Path(value) for value in getattr(args, "reuse_from", [])],
+        force=bool(args.force),
+    )
+    if reused_count:
+        manifest["reused_rows"] = int(reused_count)
+        _write_json(run_root / "manifest.json", manifest)
+    update_doc(Path(args.doc), run_root, rows)
+    _write_summary_csv(run_root, rows)
+    if bool(getattr(args, "prepare_only", False)):
+        manifest["status"] = "prepared"
+        manifest["prepared_at_utc"] = _now_utc()
+        _write_json(run_root / "manifest.json", manifest)
+        return 0
+
+    active: subprocess.Popen[str] | None = None
+
+    def _terminate(_signum: int, _frame: Any) -> None:
+        if active is not None and active.poll() is None:
+            active.terminate()
+        raise KeyboardInterrupt
+
+    old_int = signal.signal(signal.SIGINT, _terminate)
+    old_term = signal.signal(signal.SIGTERM, _terminate)
+    try:
+        for row in rows:
+            result_path = _row_path(run_root, row)
+            if not bool(args.force):
+                payload = _read_json(result_path)
+                if isinstance(payload, dict) and payload.get("status") == "ok":
+                    print(f"[{datetime.now().isoformat(timespec='seconds')}] skip {row.row_id}", flush=True)
+                    continue
+            _write_running_placeholder(result_path, row, args)
+            update_doc(Path(args.doc), run_root, rows)
+            _write_summary_csv(run_root, rows)
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--run-one",
+                "--backend",
+                str(args.backend),
+                "--channels",
+                str(row.channels),
+                "--hw",
+                row.hw,
+                "--variants",
+                str(row.variant),
+                "--repeats",
+                str(args.repeats),
+                "--seed",
+                str(args.seed),
+                "--out",
+                str(result_path),
+            ]
+            log_path = result_path.with_suffix(".log")
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] start {row.row_id}", flush=True)
+            print(" ".join(shlex.quote(part) for part in command), flush=True)
+            with log_path.open("w", encoding="utf-8") as log_file:
+                active = subprocess.Popen(
+                    command,
+                    cwd=str(REPO_ROOT),
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                rss_cap = int(float(args.max_worker_rss_gb) * (1024**3)) if float(args.max_worker_rss_gb) > 0 else 0
+                killed_for_rss = False
+                peak_rss = 0
+                while active.poll() is None:
+                    rss = _process_rss_bytes(int(active.pid))
+                    if rss is not None:
+                        peak_rss = max(int(peak_rss), int(rss))
+                    if rss_cap > 0 and rss is not None and int(rss) > int(rss_cap):
+                        killed_for_rss = True
+                        active.terminate()
+                        time.sleep(5)
+                        if active.poll() is None:
+                            active.kill()
+                        break
+                    time.sleep(float(args.poll_interval_s))
+                return_code = active.wait()
+            active = None
+            if killed_for_rss:
+                _mark_worker_failure(
+                    result_path,
+                    row,
+                    failure_kind="rss_cap_exceeded",
+                    message=f"worker RSS exceeded {float(args.max_worker_rss_gb):.1f} GiB; peak observed {_gib_from_bytes(peak_rss)} GiB",
+                    return_code=return_code,
+                )
+            elif int(return_code) != 0:
+                tail = ""
+                try:
+                    tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
+                except OSError:
+                    pass
+                _mark_worker_failure(
+                    result_path,
+                    row,
+                    failure_kind="worker_failed",
+                    message=tail[-2000:],
+                    return_code=return_code,
+                )
+            update_doc(Path(args.doc), run_root, rows)
+            _write_summary_csv(run_root, rows)
+            if int(return_code) != 0 and bool(args.fail_fast):
+                manifest["status"] = "error"
+                manifest["finished_at_utc"] = _now_utc()
+                _write_json(run_root / "manifest.json", manifest)
+                return int(return_code) if int(return_code) != 0 else 1
+        manifest["status"] = "finished"
+        manifest["finished_at_utc"] = _now_utc()
+        _write_json(run_root / "manifest.json", manifest)
+        update_doc(Path(args.doc), run_root, rows)
+        _write_summary_csv(run_root, rows)
+        return 0
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+
+
+def run_one(args: argparse.Namespace) -> int:
+    row = _rows_from_args(args)[0]
+    try:
+        payload = _run_row(row, backend=str(args.backend), repeats=int(args.repeats), seed=int(args.seed))
+    except Exception as exc:  # noqa: BLE001
+        payload = {
+            "status": "error",
+            "created_at_utc": _now_utc(),
+            "backend": str(args.backend),
+            "row_id": row.row_id,
+            "hw": row.hw,
+            "channels": int(row.channels),
+            "conv": f"{int(row.channels)},{int(row.channels)}",
+            "variant": str(row.variant),
+            "variant_label": VARIANT_LABELS[str(row.variant)],
+            "path": row.path,
+            "input_halo_top": row.halo,
+            "input_halo_bottom": row.halo,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "maxrss_bytes": int(_maxrss_bytes()),
+            "env": _env_snapshot(),
+        }
+    _write_json(Path(args.out), payload)
+    return 0 if payload.get("status") == "ok" else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run Conv C,C kernel table for Orion dense and native halo provider.")
+    parser.add_argument("--run-root", type=Path, default=_default_run_root())
+    parser.add_argument("--doc", type=Path, default=DEFAULT_DOC)
+    parser.add_argument("--backend", choices=("lattigo", "python"), default="lattigo")
+    parser.add_argument("--channels", type=int, nargs="+", default=list(DEFAULT_CHANNELS))
+    parser.add_argument("--hw", nargs="+", default=list(DEFAULT_HW))
+    parser.add_argument("--variants", nargs="+", choices=tuple(DEFAULT_VARIANTS), default=list(DEFAULT_VARIANTS))
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=20260527)
+    parser.add_argument("--max-worker-rss-gb", type=float, default=850.0)
+    parser.add_argument("--poll-interval-s", type=float, default=2.0)
+    parser.add_argument(
+        "--reuse-from",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="Existing JSON files or result directories to import exact-shape non-stream rows from before running missing rows.",
+    )
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true", help="Prepare/reuse rows and update the doc without launching workers.")
+    parser.add_argument("--update-doc-only", action="store_true")
+    parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--out", type=Path, default=Path("/tmp/conv_kernel_row.json"), help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if bool(args.update_doc_only):
+        update_doc(Path(args.doc), Path(args.run_root), _rows_from_args(args))
+        _write_summary_csv(Path(args.run_root), _rows_from_args(args))
+        return 0
+    if bool(args.run_one):
+        os.environ.update(_apply_env_defaults(os.environ))
+        return run_one(args)
+    return run_all(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

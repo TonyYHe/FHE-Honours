@@ -1094,7 +1094,7 @@ def _configure_lattigo_runtime_defaults() -> dict[str, str]:
         "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": diagonal_encode_workers,
         "ORION_LATTIGO_BOOTSTRAP_WORKERS": workers,
         "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "2",
-        "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "1",
+        "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "0",
         "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     }
     applied: dict[str, str] = {}
