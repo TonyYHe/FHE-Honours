@@ -631,13 +631,15 @@ HanCo Hand `224x224`, `3 -> 1`, SiLU degree 7. Fill the two rightmost time
 columns with compute time only, excluding total I/O. Metric cells use the compact
 `metric=count` form: rotations for linear operator, pooling, upsample, and
 re-layout rows; CT-CT multiplications for SiLU rows; and bootstrap ciphertexts
-for bootstrap rows. The dense metric column is left blank until Orion dense
-layer metrics are filled in; the HaloED metric column is populated from the
-current compile plan. The `beta` column records the selected output halo for
-operator/activation/merge rows and the bootstrap-input halo after any drop-halo
-cleanup for bootstrap rows. Downsample rows (`pool1..pool4`) and upsample rows
-(`up4..up1`) are kept as their own nodes because layout transitions and
-re-layout annotations can attach to those boundaries. Concat rows are also kept
+for bootstrap rows. `bootstrap-drop` is reserved for CT-saving halo drops before
+bootstrap, not for cleanup that leaves the bootstrap CT count unchanged. The
+dense metric column is left blank until Orion dense layer metrics are filled in;
+the HaloED metric column is populated from the current compile plan. The `beta`
+column records the selected output halo for operator/activation/merge rows and
+the bootstrap-input halo after any CT-saving drop-halo cleanup for bootstrap
+rows. Downsample rows (`pool1..pool4`) and upsample rows (`up4..up1`) are kept
+as their own nodes because layout transitions and re-layout annotations can
+attach to those boundaries. Concat rows are also kept
 so skip-merge explicit alignment does not disappear from the trace.
 
 Source compile-plan CSV: `.tmp/results/unet22_plus_output_dim32_real_trace_edge_compile_plan_4cases.csv`.
@@ -652,47 +654,47 @@ Source compile-plan CSV: `.tmp/results/unet22_plus_output_dim32_real_trace_edge_
 | 5 | `enc1b_act` | SiLU act |  | ct-ct=147 | 49 | 0 | carry |  |  |
 | 6 | `pool1` | downsample/pool |  | rot=160 | 13 | 1 | fused |  |  |
 | 7 | `enc2a` | Conv2d |  | rot=6656 | 25 | 1 | fused |  |  |
-| 8 | `enc2a_act` | SiLU act |  | ct-ct=75 | 25 | 1 | carry+bootstrap-drop |  |  |
-| 9 | `bootstrap_after_enc2a_act` | Bootstrap |  | boot=25 | 25 | 0 | drop halo before bootstrap; target `enc2b` |  |  |
+| 8 | `enc2a_act` | SiLU act |  | ct-ct=75 | 25 | 1 | carry |  |  |
+| 9 | `bootstrap_after_enc2a_act` | Bootstrap |  | boot=25 | 25 | 1 | no CT-saving halo drop; target `enc2b` |  |  |
 | 10 | `enc2b` | Conv2d |  | rot=13312 | 25 | 0 | fused |  |  |
 | 11 | `enc2b_act` | SiLU act |  | ct-ct=75 | 25 | 0 | carry |  |  |
 | 12 | `pool2` | downsample/pool |  | rot=320 | 7 | 1 | carry |  |  |
 | 13 | `enc3a` | Conv2d |  | rot=17408 | 13 | 1 | fused |  |  |
-| 14 | `enc3a_act` | SiLU act |  | ct-ct=39 | 13 | 1 | carry+bootstrap-drop |  |  |
-| 15 | `bootstrap_after_enc3a_act` | Bootstrap |  | boot=13 | 13 | 0 | drop halo before bootstrap; target `enc3b` |  |  |
+| 14 | `enc3a_act` | SiLU act |  | ct-ct=39 | 13 | 1 | carry |  |  |
+| 15 | `bootstrap_after_enc3a_act` | Bootstrap |  | boot=13 | 13 | 1 | no CT-saving halo drop; target `enc3b` |  |  |
 | 16 | `enc3b` | Conv2d |  | rot=34816 | 13 | 0 | fused |  |  |
 | 17 | `enc3b_act` | SiLU act |  | ct-ct=39 | 13 | 0 | carry |  |  |
 | 18 | `pool3` | downsample/pool |  | rot=640 | 4 | 1 | carry |  |  |
 | 19 | `enc4a` | Conv2d |  | rot=67584 | 7 | 1 | fused |  |  |
-| 20 | `enc4a_act` | SiLU act |  | ct-ct=21 | 7 | 1 | carry+bootstrap-drop |  |  |
-| 21 | `bootstrap_after_enc4a_act` | Bootstrap |  | boot=7 | 7 | 0 | drop halo before bootstrap; target `enc4b` |  |  |
+| 20 | `enc4a_act` | SiLU act |  | ct-ct=21 | 7 | 1 | carry |  |  |
+| 21 | `bootstrap_after_enc4a_act` | Bootstrap |  | boot=7 | 7 | 1 | no CT-saving halo drop; target `enc4b` |  |  |
 | 22 | `enc4b` | Conv2d |  | rot=135168 | 7 | 0 | fused |  |  |
 | 23 | `enc4b_act` | SiLU act |  | ct-ct=21 | 7 | 0 | carry |  |  |
 | 24 | `pool4` | downsample/pool |  | rot=1280 | 2 | 1 | carry |  |  |
 | 25 | `bottlenecka` | Conv2d |  | rot=266240 | 4 | 1 | fused |  |  |
-| 26 | `bottlenecka_act` | SiLU act |  | ct-ct=12 | 4 | 1 | carry+bootstrap-drop |  |  |
-| 27 | `bootstrap_after_bottlenecka_act` | Bootstrap |  | boot=4 | 4 | 0 | drop halo before bootstrap; target `bottleneckb` |  |  |
+| 26 | `bottlenecka_act` | SiLU act |  | ct-ct=12 | 4 | 1 | carry |  |  |
+| 27 | `bootstrap_after_bottlenecka_act` | Bootstrap |  | boot=4 | 4 | 1 | no CT-saving halo drop; target `bottleneckb` |  |  |
 | 28 | `bottleneckb` | Conv2d |  | rot=532480 | 4 | 1 | fused |  |  |
 | 29 | `bottleneckb_act` | SiLU act |  | ct-ct=12 | 4 | 1 | carry |  |  |
 | 30 | `up4` | upsample/tconv |  | rot=4096 | 7 | 2 | carry |  |  |
 | 31 | `cat4` | skip merge |  | relayout-rot=14 | 14 | 2 | enc4b_act->cat4:explicit:dp_add_input_alignment:mode=halo_local;up4->cat4:carry:layout_same_carry_halo:mode=halo_local |  |  |
 | 32 | `dec4a` | Conv2d |  | rot=9216 | 7 | 1 | fused |  |  |
-| 33 | `dec4a_act` | SiLU act |  | ct-ct=21 | 7 | 1 | carry+bootstrap-drop |  |  |
-| 34 | `bootstrap_after_dec4a_act` | Bootstrap |  | boot=7 | 7 | 0 | drop halo before bootstrap; target `dec4b` |  |  |
+| 33 | `dec4a_act` | SiLU act |  | ct-ct=21 | 7 | 1 | carry |  |  |
+| 34 | `bootstrap_after_dec4a_act` | Bootstrap |  | boot=7 | 7 | 1 | no CT-saving halo drop; target `dec4b` |  |  |
 | 35 | `dec4b` | Conv2d |  | rot=135168 | 7 | 1 | fused |  |  |
 | 36 | `dec4b_act` | SiLU act |  | ct-ct=21 | 7 | 1 | carry |  |  |
 | 37 | `up3` | upsample/tconv |  | rot=2048 | 14 | 2 | carry |  |  |
 | 38 | `cat3` | skip merge |  | relayout-rot=28 | 27 | 2 | enc3b_act->cat3:explicit:dp_add_input_alignment:mode=halo_local;up3->cat3:carry:layout_same_carry_halo:mode=halo_local |  |  |
 | 39 | `dec3a` | Conv2d |  | rot=4608 | 13 | 1 | fused |  |  |
-| 40 | `dec3a_act` | SiLU act |  | ct-ct=39 | 13 | 1 | carry+bootstrap-drop |  |  |
-| 41 | `bootstrap_after_dec3a_act` | Bootstrap |  | boot=13 | 13 | 0 | drop halo before bootstrap; target `dec3b` |  |  |
+| 40 | `dec3a_act` | SiLU act |  | ct-ct=39 | 13 | 1 | carry |  |  |
+| 41 | `bootstrap_after_dec3a_act` | Bootstrap |  | boot=13 | 13 | 1 | no CT-saving halo drop; target `dec3b` |  |  |
 | 42 | `dec3b` | Conv2d |  | rot=34816 | 13 | 1 | fused |  |  |
 | 43 | `dec3b_act` | SiLU act |  | ct-ct=39 | 13 | 1 | carry |  |  |
 | 44 | `up2` | upsample/tconv |  | rot=1024 | 26 | 2 | carry |  |  |
 | 45 | `cat2` | skip merge |  | relayout-rot=52 | 51 | 2 | enc2b_act->cat2:explicit:dp_add_input_alignment:mode=halo_local;up2->cat2:carry:layout_same_carry_halo:mode=halo_local |  |  |
 | 46 | `dec2a` | Conv2d |  | rot=2304 | 25 | 1 | fused |  |  |
-| 47 | `dec2a_act` | SiLU act |  | ct-ct=75 | 25 | 1 | carry+bootstrap-drop |  |  |
-| 48 | `bootstrap_after_dec2a_act` | Bootstrap |  | boot=25 | 25 | 0 | drop halo before bootstrap; target `dec2b` |  |  |
+| 47 | `dec2a_act` | SiLU act |  | ct-ct=75 | 25 | 1 | carry |  |  |
+| 48 | `bootstrap_after_dec2a_act` | Bootstrap |  | boot=25 | 25 | 1 | no CT-saving halo drop; target `dec2b` |  |  |
 | 49 | `dec2b` | Conv2d |  | rot=13312 | 25 | 1 | fused |  |  |
 | 50 | `dec2b_act` | SiLU act |  | ct-ct=75 | 25 | 1 | carry |  |  |
 | 51 | `up1` | upsample/tconv |  | rot=512 | 50 | 2 | carry |  |  |
