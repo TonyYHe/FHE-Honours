@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -241,13 +244,26 @@ class _FakeSavedIOScheduler:
         self.registered = []
         self.unregistered = []
 
-    def register_saved_io_prefetch_work_unit(self, key, *, loader, host_bytes, device_bytes) -> None:
+    def register_saved_io_prefetch_work_unit(
+        self,
+        key,
+        *,
+        loader,
+        host_bytes,
+        device_bytes,
+        raw_loader=None,
+        raw_host_bytes=None,
+        predecode_loader=None,
+    ) -> None:
         self.registered.append(
             {
                 "key": key,
                 "loader": loader,
                 "host_bytes": host_bytes,
                 "device_bytes": device_bytes,
+                "raw_loader": raw_loader,
+                "raw_host_bytes": raw_host_bytes,
+                "predecode_loader": predecode_loader,
             }
         )
 
@@ -259,6 +275,49 @@ class _FakeSavedIOScheduler:
 
     def consume_saved_io_prefetch(self, key):
         return None
+
+
+class _SingleSlotTrackingBackend(_FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.live_plaintext_transforms: set[int] = set()
+        self.live_before_generate: list[tuple[int, ...]] = []
+        self.max_live_plaintext_transforms = 0
+
+    def GenerateLinearTransformsUnified(
+        self,
+        num_transforms,
+        diag_idxs_ptrs,
+        diag_idxs_lens,
+        diag_data_ptrs,
+        diag_data_lens,
+        levels_array,
+    ):
+        self.live_before_generate.append(tuple(sorted(self.live_plaintext_transforms)))
+        ids = super().GenerateLinearTransformsUnified(
+            num_transforms,
+            diag_idxs_ptrs,
+            diag_idxs_lens,
+            diag_data_ptrs,
+            diag_data_lens,
+            levels_array,
+        )
+        for transform_id in ids:
+            self.live_plaintext_transforms.add(int(transform_id))
+        self.max_live_plaintext_transforms = max(
+            int(self.max_live_plaintext_transforms),
+            int(len(self.live_plaintext_transforms)),
+        )
+        return ids
+
+    def EvaluateLinearTransformsWithSharedCache(self, transform_ids_array, num_transforms, ct_input_id):
+        ids = [int(transform_ids_array[i]) for i in range(int(num_transforms))]
+        assert set(ids).issubset(self.live_plaintext_transforms)
+        return super().EvaluateLinearTransformsWithSharedCache(transform_ids_array, num_transforms, ct_input_id)
+
+    def DeleteLinearTransform(self, transform_id):
+        super().DeleteLinearTransform(transform_id)
+        self.live_plaintext_transforms.discard(int(transform_id))
 
 
 def _fake_transform(
@@ -404,6 +463,64 @@ def test_unified_transform_group_compiles_and_evaluates_with_fake_backend() -> N
     group.cleanup(backend)
     assert backend.deleted == [11, 12]
     assert group.is_compiled is False
+
+
+def test_single_slot_layer_cache_evicts_between_tiny_64_layers(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "2")
+    slots_64 = 64 * 64
+    backend = _SingleSlotTrackingBackend()
+    backend.rotation_keys = {
+        11: [1],
+        12: [3],
+        13: [5],
+    }
+    groups = [
+        UnifiedTransformGroup(
+            (
+                _fake_transform(
+                    {
+                        0: torch.ones(slots_64),
+                        layer_index + 1: torch.ones(slots_64),
+                    },
+                    level=2,
+                ),
+            )
+        )
+        for layer_index in range(3)
+    ]
+
+    for group in groups:
+        group.compile_unified(backend)
+        assert group.is_compiled is True
+        assert group.unified_ids is None
+        assert group.last_compile_profile["mode"] == "single_slot_deferred"
+        assert group.last_compile_profile["flatten_s"] >= 0.0
+        assert group._single_slot_payloads is not None
+        assert all(getattr(transform, "diagonals", None) == {} for transform in group.transforms)
+
+    assert backend.generated == []
+
+    for layer_index, group in enumerate(groups):
+        assert group.evaluate_unified(64 + int(layer_index), backend) == [100]
+        assert group.last_compile_profile["mode"] == "single_slot_materialize"
+        assert group.last_compile_profile["flatten_s"] == 0.0
+        runtime = group.last_runtime_timing
+        assert runtime["runtime_fairness_mode"] == "single_slot_layer_cache"
+        assert runtime["resident_compute_s"] == pytest.approx(runtime["eval_s"])
+        assert runtime["layer_cache_encode_s"] > 0.0
+        assert runtime["layer_cache_evict_s"] >= 0.0
+        assert runtime["layer_cache_turnover_s"] == pytest.approx(
+            runtime["layer_cache_encode_s"]
+            + runtime["layer_cache_key_prepare_s"]
+            + runtime["layer_cache_evict_s"]
+        )
+
+    assert backend.live_before_generate == [(), (), ()]
+    assert backend.max_live_plaintext_transforms == 1
+    assert backend.live_plaintext_transforms == set()
+    assert backend.deleted == [11, 12, 13]
+    assert [entry["num_transforms"] for entry in backend.generated] == [1, 1, 1]
 
 
 def test_unified_transform_sources_target_sum_uses_compatible_targets() -> None:
@@ -1219,6 +1336,150 @@ def test_unified_transform_group_runs_on_lattigo_backend() -> None:
         assert float((decoded[1][:8] - 2.0 * x[:8]).abs().max()) <= 1.0e-4
     finally:
         scheme.delete_scheme()
+
+
+def test_single_slot_layer_cache_runs_and_evicts_on_lattigo_backend(monkeypatch) -> None:
+    shared_library = Path("orion/backend/lattigo/lattigo-linux.so")
+    if not shared_library.exists():
+        pytest.skip("local Lattigo shared library has not been built")
+
+    monkeypatch.setenv("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "2")
+    monkeypatch.setenv("ORION_LATTIGO_STREAMING_LT", "0")
+
+    config = {
+        "ckks_params": {
+            "LogN": 12,
+            "LogQ": [45, 30, 30, 45],
+            "LogP": [50],
+            "LogScale": 30,
+            "H": 64,
+            "RingType": "Standard",
+        },
+        "orion": {
+            "margin": 2,
+            "embedding_method": "hybrid",
+            "backend": "lattigo",
+            "fuse_modules": True,
+            "debug": False,
+            "io_mode": "none",
+        },
+    }
+    scheme.init_scheme(config)
+    try:
+        slots = int(scheme.params.get_slots())
+        level = len(scheme.params.get_logq()) - 1
+        transform_a = SimpleNamespace(
+            diagonals={(0, 0): {0: [1.0] * slots}},
+            level=level,
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, slots]),
+            output_shape=torch.Size([1, slots]),
+        )
+        transform_b = SimpleNamespace(
+            diagonals={(0, 0): {0: [2.0] * slots}},
+            level=level,
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, slots]),
+            output_shape=torch.Size([1, slots]),
+        )
+        group = UnifiedTransformGroup([transform_a, transform_b])
+        group.compile_unified(scheme.backend)
+
+        assert group.unified_ids is None
+        assert group.last_compile_profile["mode"] == "single_slot_deferred"
+        assert transform_a.diagonals == {}
+        assert transform_b.diagonals == {}
+
+        x = torch.zeros(slots, dtype=torch.float32)
+        x[:8] = torch.linspace(0.1, 0.8, 8)
+        ct = scheme.encrypt(scheme.encode(x, level))
+        output_ids = group.evaluate_unified(ct.ids[0], scheme.backend)
+
+        assert group.unified_ids is None
+        runtime = group.last_runtime_timing
+        assert runtime["runtime_fairness_mode"] == "single_slot_layer_cache"
+        assert runtime["layer_cache_encode_s"] > 0.0
+        assert runtime["layer_cache_turnover_s"] == pytest.approx(
+            runtime["layer_cache_encode_s"]
+            + runtime["layer_cache_key_prepare_s"]
+            + runtime["layer_cache_evict_s"]
+        )
+
+        decoded = []
+        for output_id in output_ids:
+            out_ct = CipherTensor(scheme, [int(output_id)], torch.Size([1, slots]), torch.Size([1, slots]))
+            decoded.append(out_ct.decrypt().decode().reshape(-1))
+        assert float((decoded[0][:8] - x[:8]).abs().max()) <= 1.0e-4
+        assert float((decoded[1][:8] - 2.0 * x[:8]).abs().max()) <= 1.0e-4
+    finally:
+        scheme.delete_scheme()
+
+
+def test_lattigo_streaming_lt_force_requires_legacy_gate() -> None:
+    shared_library = Path("orion/backend/lattigo/lattigo-linux.so")
+    if not shared_library.exists():
+        pytest.skip("local Lattigo shared library has not been built")
+
+    probe = """
+from orion.core.orion import scheme
+config = {
+    "ckks_params": {
+        "LogN": 12,
+        "LogQ": [45, 30, 30, 45],
+        "LogP": [50],
+        "LogScale": 30,
+        "H": 64,
+        "RingType": "Standard",
+    },
+    "orion": {
+        "margin": 2,
+        "embedding_method": "hybrid",
+        "backend": "lattigo",
+        "fuse_modules": True,
+        "debug": False,
+        "io_mode": "none",
+    },
+}
+scheme.init_scheme(config)
+try:
+    slots = int(scheme.params.get_slots())
+    level = len(scheme.params.get_logq()) - 1
+    transform_id = scheme.backend.GenerateLinearTransform(
+        [0, 1],
+        [1.0] * slots + [0.5] * slots,
+        level,
+        1.0,
+        "none",
+    )
+    print(int(scheme.backend.LinearTransformUsesStreaming(int(transform_id))))
+finally:
+    scheme.delete_scheme()
+"""
+
+    def run_probe(*, legacy: bool) -> int:
+        env = dict(os.environ)
+        env["ORION_LATTIGO_STREAMING_LT"] = "force"
+        env["ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE"] = "0"
+        env["ORION_SINGLE_SLOT_LAYER_CACHE"] = "0"
+        if legacy:
+            env["ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT"] = "1"
+        else:
+            env.pop("ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT", None)
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return int(completed.stdout.strip())
+
+    assert run_probe(legacy=False) == 0
+    assert run_probe(legacy=True) == 1
 
 
 def test_unified_transform_sources_target_sum_runs_on_lattigo_backend() -> None:

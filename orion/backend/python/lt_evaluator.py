@@ -52,6 +52,10 @@ _RUNTIME_TIMING_KEYS = (
     "read_bundle_s",
     "load_keys_s",
     "load_plaintexts_s",
+    "layer_cache_encode_s",
+    "layer_cache_key_prepare_s",
+    "layer_cache_evict_s",
+    "layer_cache_turnover_s",
     "eval_s",
     "eval_total_s",
     "unload_s",
@@ -216,14 +220,12 @@ class NewEvaluator:
         *,
         reason: str,
         needed_bytes: int = 0,
-        force_trim: bool = False,
         raise_on_low: bool = True,
     ) -> dict[str, object]:
         return guard_host_memory(
             self.backend,
             reason=str(reason),
             needed_bytes=int(max(0, int(needed_bytes or 0))),
-            force_trim=bool(force_trim),
             raise_on_low=bool(raise_on_low),
         )
 
@@ -573,9 +575,6 @@ class NewEvaluator:
                     self.save_plaintext_diagonals(
                         layer_name, int(lintransf_id), int(row), int(col), diags_idxs
                     )
-            if self.io_mode != "none" and not reuse_saved_plaintexts:
-                self._trim_backend_runtime_memory()
-
         if self._dense_unified_compile_enabled(linear_layer, diagonals, io_mode=str(effective_io_mode)):
             for _col, column_diagonals in self._diagonal_blocks_by_col(diagonals):
                 batch_ids = self._generate_transforms_unified_batch(
@@ -621,9 +620,6 @@ class NewEvaluator:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
-            if self.io_mode != "none" and not reuse_saved_plaintexts:
-                self._trim_backend_runtime_memory()
-
         if self.io_mode == "save":
             linear_layer.diagonals = {}
             gc.collect()
@@ -814,11 +810,6 @@ class NewEvaluator:
                     for diag_name in block.keys()
                 }
         return diagonals, int(output_rotations)
-
-    def _trim_backend_runtime_memory(self) -> None:
-        trim = getattr(self.backend, "TrimRuntimeMemory", None)
-        if callable(trim):
-            trim()
 
     def _generate_transforms_batch(
         self,
@@ -1285,13 +1276,10 @@ class NewEvaluator:
                     if bundle is not None:
                         bundle.clear()
                     runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
-                    trim_started = time.perf_counter()
                     self._forward_memory_guard(
                         reason=f"after_lt_block_unload:{layer_name}:{int(i)}:{int(j)}",
-                        force_trim=True,
                         raise_on_low=False,
                     )
-                    runtime_timing["trim_s"] += float(time.perf_counter() - trim_started)
                 work_index += 1
 
             if ct_out is None:
@@ -1406,13 +1394,10 @@ class NewEvaluator:
                     self.backend.RemovePlaintextDiagonals(int(transform_id))
                 runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
                 if loaded_from_host_cache:
-                    trim_started = time.perf_counter()
                     self._forward_memory_guard(
                         reason="after_dense_shared_cache_unload",
-                        force_trim=True,
                         raise_on_low=False,
                     )
-                    runtime_timing["trim_s"] += float(time.perf_counter() - trim_started)
             if len(result_ids) != len(column_ids):
                 raise RuntimeError(
                     "EvaluateLinearTransformsWithSharedCache returned "

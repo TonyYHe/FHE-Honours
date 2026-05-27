@@ -41,19 +41,19 @@ POLICY_PROVIDER_SUFFIX: dict[str, str] = {
 ENV_DEFAULTS: dict[str, str] = {
     "PYTHONUNBUFFERED": "1",
     "MALLOC_ARENA_MAX": "2",
-    "ORION_COMPILE_PARALLEL_POLICY": "auto",
-    "ORION_LATTIGO_STREAMING_LT": "force",
-    "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "1",
-    "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "1",
-    "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "1",
+    "ORION_COMPILE_PARALLEL_POLICY": "manual",
+    "ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE": "1",
+    "ORION_SINGLE_SLOT_ENCODE_WORKERS": "16",
+    "ORION_LATTIGO_STREAMING_LT": "0",
+    "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "0",
+    "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "0",
+    "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "0",
     "ORION_LATTIGO_BOOTSTRAP_MANY": "1",
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
-    "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "0",
-    "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "4",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
 }
 
@@ -332,6 +332,10 @@ def _case_row(run_root: Path, size: str) -> tuple[list[str], dict[str, Any]]:
     act_s = _breakdown_timing(payload or {}, "activation_s")
     boot_s = _breakdown_timing(payload or {}, "bootstrap_s")
     load_encode_s = _breakdown_timing(payload or {}, "lt_runtime_load_encode_s")
+    layer_turnover_s = _breakdown_timing(payload or {}, "lt_layer_cache_turnover_s")
+    layer_encode_s = _breakdown_timing(payload or {}, "lt_layer_cache_encode_s")
+    layer_key_prepare_s = _breakdown_timing(payload or {}, "lt_layer_cache_key_prepare_s")
+    layer_evict_s = _breakdown_timing(payload or {}, "lt_layer_cache_evict_s")
     unattributed_s = _breakdown_timing(payload or {}, "unattributed_he_forward_s")
     row = [
         str(size),
@@ -347,6 +351,7 @@ def _case_row(run_root: Path, size: str) -> tuple[list[str], dict[str, Any]]:
         _format_float(act_s),
         _format_float(boot_s),
         _format_float(load_encode_s),
+        _format_float(layer_turnover_s),
         _format_float(unattributed_s),
         _runtime_mode(payload or {}),
         _format_int(_rotation_count(payload or {})),
@@ -371,6 +376,10 @@ def _case_row(run_root: Path, size: str) -> tuple[list[str], dict[str, Any]]:
         "activation_s": act_s,
         "bootstrap_s": boot_s,
         "lt_runtime_load_encode_s": load_encode_s,
+        "lt_layer_cache_turnover_s": layer_turnover_s,
+        "lt_layer_cache_encode_s": layer_encode_s,
+        "lt_layer_cache_key_prepare_s": layer_key_prepare_s,
+        "lt_layer_cache_evict_s": layer_evict_s,
         "unattributed_he_forward_s": unattributed_s,
         "runtime_mode": _runtime_mode(payload or {}),
         "rotation_count": _rotation_count(payload or {}),
@@ -399,6 +408,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "ACT s",
         "boot s",
         "LT load/enc s",
+        "layer turnover s",
         "unattrib HE s",
         "runtime mode",
         "rotations",
@@ -415,6 +425,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "---",
         "---",
         "---",
+        "---:",
         "---:",
         "---:",
         "---:",
@@ -613,7 +624,7 @@ def _default_run_root() -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run local U22 base32 SiLU7 full-network provider E2E with streaming LT."
+        description="Run local U22 base32 SiLU7 full-network provider E2E with single-slot layer-cache LT."
     )
     parser.add_argument("--run-root", type=Path, default=_default_run_root())
     parser.add_argument("--doc", type=Path, default=REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md")

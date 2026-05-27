@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import gc
 import os
-import time
 from typing import Any
 
 
@@ -25,35 +23,6 @@ def host_memory_info() -> dict[str, int] | None:
     if total is None or available is None:
         return None
     return {"total_bytes": int(total), "available_bytes": int(available)}
-
-
-def runtime_trim_enabled(backend: Any) -> bool:
-    trim = getattr(backend, "TrimRuntimeMemory", None)
-    if not callable(trim):
-        return False
-    for name in ("ORION_FORWARD_TRIM_RUNTIME_MEMORY", "ORION_TRIM_RUNTIME_AFTER_UNLOAD"):
-        raw_value = os.environ.get(name)
-        if raw_value is not None:
-            return raw_value.strip().lower() not in _FALSE_ENV_VALUES
-    return True
-
-
-def trim_runtime_memory(backend: Any, *, reason: str = "") -> dict[str, Any]:
-    started = time.perf_counter()
-    gc.collect()
-    backend_trim_s = 0.0
-    trim = getattr(backend, "TrimRuntimeMemory", None)
-    if callable(trim):
-        try:
-            backend_trim_s = float(trim())
-        except Exception:
-            backend_trim_s = 0.0
-    gc.collect()
-    return {
-        "reason": str(reason),
-        "trim_s": float(time.perf_counter() - started),
-        "backend_trim_s": float(backend_trim_s),
-    }
 
 
 def forward_min_available_bytes() -> int:
@@ -84,7 +53,6 @@ def guard_host_memory(
     *,
     reason: str,
     needed_bytes: int = 0,
-    force_trim: bool = False,
     raise_on_low: bool = True,
 ) -> dict[str, Any]:
     before = host_memory_info()
@@ -93,7 +61,6 @@ def guard_host_memory(
         "needed_bytes": int(max(0, int(needed_bytes or 0))),
         "min_available_bytes": int(forward_min_available_bytes()),
         "before": before,
-        "trim": None,
         "after": before,
     }
     if not host_memory_guard_enabled():
@@ -107,13 +74,8 @@ def guard_host_memory(
             return False
         return int(info["available_bytes"]) - needed < min_available
 
-    if bool(force_trim) or low(before):
-        if runtime_trim_enabled(backend):
-            result["trim"] = trim_runtime_memory(backend, reason=reason)
-        after = host_memory_info()
-        result["after"] = after
-    else:
-        after = before
+    after = host_memory_info() if low(before) else before
+    result["after"] = after
 
     if bool(raise_on_low) and low(after):
         available = 0 if after is None else int(after["available_bytes"])

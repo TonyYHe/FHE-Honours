@@ -1437,6 +1437,10 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
     "artifact_read_s",
     "artifact_load_s",
     "artifact_unload_s",
+    "layer_cache_encode_s",
+    "layer_cache_key_prepare_s",
+    "layer_cache_evict_s",
+    "layer_cache_turnover_s",
     "trim_s",
     "read_bundle_s",
     "load_keys_s",
@@ -1459,8 +1463,18 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
 
 
 def _runtime_fairness_mode_from_env() -> str:
+    raw_single_slot = os.environ.get("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE") or os.environ.get(
+        "ORION_SINGLE_SLOT_LAYER_CACHE",
+        "",
+    )
+    if str(raw_single_slot).strip().lower() in {"1", "true", "yes", "on"}:
+        return "single_slot_layer_cache"
     raw = os.environ.get("ORION_LATTIGO_STREAMING_LT", "")
-    if str(raw).strip().lower() in {"1", "true", "yes", "on", "force", "always"}:
+    raw_legacy = os.environ.get("ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT", "")
+    if (
+        str(raw_legacy).strip().lower() in {"1", "true", "yes", "on"}
+        and str(raw).strip().lower() in {"1", "true", "yes", "on", "force", "always"}
+    ):
         return "streaming_eval_encode"
     return "unknown"
 
@@ -1490,6 +1504,8 @@ def _aggregate_runtime_fairness_timings(timings: list[dict[str, Any]], *, servin
         resident_available = False
     elif any(mode == "streaming_eval_encode" for mode in modes):
         mode = "streaming_eval_encode"
+    elif any(mode == "single_slot_layer_cache" for mode in modes):
+        mode = "single_slot_layer_cache"
     elif any(mode == "memory_bounded_load_eval" for mode in modes):
         mode = "memory_bounded_load_eval"
     elif modes and all(mode == "resident_compute" for mode in modes):
@@ -1531,6 +1547,8 @@ def _mean_runtime_fairness(timings: list[dict[str, Any]]) -> dict[str, Any]:
     modes = [str(item.get("runtime_fairness_mode", "unknown") or "unknown") for item in timings]
     if any(mode == "streaming_eval_encode" for mode in modes):
         mode = "streaming_eval_encode"
+    elif any(mode == "single_slot_layer_cache" for mode in modes):
+        mode = "single_slot_layer_cache"
     elif any(mode == "memory_bounded_load_eval" for mode in modes):
         mode = "memory_bounded_load_eval"
     elif modes and all(mode == "resident_compute" for mode in modes):
@@ -1866,15 +1884,12 @@ def _install_unified_individual_eval_ablation():
                 add_timing("unload_s", time.perf_counter() - unload_started)
                 if bundle is not None:
                     bundle.clear()
-                trim_started = time.perf_counter()
                 trim_event = self._forward_memory_guard(
                     backend,
                     reason=f"after_unified_individual_unload:{self._storage_key}:{int(transform_index)}",
                     transform_ids=chunk_ids,
-                    force_trim=True,
                     raise_on_low=False,
                 )
-                add_timing("trim_s", time.perf_counter() - trim_started)
                 self._record_memory_event(
                     "after_eval_individual_transform_unload",
                     backend,
@@ -2575,17 +2590,17 @@ def _run_worker(
                     "min_disk_free_bytes": int(min_disk_free_bytes),
                 }
         else:
-            env.setdefault("ORION_LATTIGO_STREAMING_LT", "force")
+            env.setdefault("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+            env.setdefault("ORION_SINGLE_SLOT_ENCODE_WORKERS", "16")
+            env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
+            env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "0")
+            env.setdefault("ORION_LATTIGO_MEMORY_BOUNDED_COMPILE", "0")
+            env.setdefault("ORION_LATTIGO_MEMORY_BOUNDED_EVAL", "0")
             bounded_lattigo_dense_payload.update(
                 {
                     "io_mode": "none",
-                    "streaming_lt": str(env.get("ORION_LATTIGO_STREAMING_LT", "")),
-                    "streaming_lt_chunk_plaintexts": str(
-                        env.get("ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS", "")
-                    ),
-                    "streaming_lt_shared_transforms": str(
-                        env.get("ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS", "")
-                    ),
+                    "streaming_mode": "single_slot_layer_cache",
+                    "single_slot_encode_workers": str(env.get("ORION_SINGLE_SLOT_ENCODE_WORKERS", "")),
                 }
             )
 
@@ -2632,9 +2647,9 @@ def _run_worker(
         env.setdefault("ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS", compile_workers)
         env.setdefault("ORION_LATTIGO_COMPILE_WORKERS", compile_workers)
         env.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", diagonal_encode_workers)
+        env.setdefault("ORION_SINGLE_SLOT_ENCODE_WORKERS", diagonal_encode_workers)
         env.setdefault("ORION_LATTIGO_BOOTSTRAP_WORKERS", compile_workers)
         env.setdefault("ORION_UNIFIED_STREAM_COMPILE_BATCH_GB", "2")
-        env.setdefault("ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM", "0")
         env.setdefault("ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE", "1")
         if provider_mode == "save":
             env[LATTIGO_BENCH_IO_MODE_ENV] = "save"
@@ -2653,8 +2668,12 @@ def _run_worker(
             env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
         else:
             env[LATTIGO_BENCH_IO_MODE_ENV] = "none"
-            env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "1")
-            env.setdefault("ORION_LATTIGO_STREAMING_LT", "force")
+            env.setdefault("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "1")
+            env.setdefault("ORION_SINGLE_SLOT_ENCODE_WORKERS", "16")
+            env.setdefault("ORION_UNIFIED_STREAM_COMPILE_IO_NONE", "0")
+            env.setdefault("ORION_LATTIGO_STREAMING_LT", "0")
+            env.setdefault("ORION_LATTIGO_MEMORY_BOUNDED_COMPILE", "0")
+            env.setdefault("ORION_LATTIGO_MEMORY_BOUNDED_EVAL", "0")
         disk_watch_path = worker_lattigo_provider_io_root
         disk_before = _disk_usage_payload(base_io_root)
         min_disk_free_bytes = int(max(0.0, float(min_disk_free_gb)) * (1024**3))
@@ -2678,6 +2697,8 @@ def _run_worker(
             "lattigo_diagonal_encode_workers": str(
                 env.get("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", "")
             ),
+            "single_slot_layer_cache": str(env.get("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE", "")),
+            "single_slot_encode_workers": str(env.get("ORION_SINGLE_SLOT_ENCODE_WORKERS", "")),
             "stream_load_plaintexts": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_PLAINTEXTS", "")),
             "stream_load_chunk_gb": str(env.get("ORION_UNIFIED_LT_STREAM_LOAD_CHUNK_GB", "")),
             "save_encoded_plaintexts": str(env.get("ORION_UNIFIED_LT_SAVE_ENCODED_PLAINTEXTS", "")),

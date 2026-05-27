@@ -4,9 +4,7 @@ import (
 	"C"
 
 	"runtime"
-	"runtime/debug"
 	"sync/atomic"
-	"time"
 
 	"github.com/realqhc/lattigo/v6/circuits/ckks/bootstrapping"
 	"github.com/realqhc/lattigo/v6/circuits/ckks/lintrans"
@@ -34,7 +32,6 @@ type Scheme struct {
 }
 
 var scheme Scheme
-var runtimeMemoryTrimSeconds float64
 var opRotationCount uint64
 var opLintransRotationCount uint64
 var opDirectRotationCount uint64
@@ -77,15 +74,6 @@ func GetOperationCounters() (*C.ulonglong, C.ulonglong) {
 	}
 	arrPtr, length := SliceToCArray(values, convertUint64ToCULonglong)
 	return arrPtr, C.ulonglong(length)
-}
-
-func trimRuntimeMemory() float64 {
-	started := time.Now()
-	runtime.GC()
-	debug.FreeOSMemory()
-	elapsed := time.Since(started).Seconds()
-	runtimeMemoryTrimSeconds += elapsed
-	return elapsed
 }
 
 //export NewScheme
@@ -160,19 +148,6 @@ func DeleteScheme() {
 	polyHeap.Reset()
 	ptHeap.Reset()
 	ctHeap.Reset()
-	trimRuntimeMemory()
-}
-
-//export TrimRuntimeMemory
-func TrimRuntimeMemory() C.double {
-	return C.double(trimRuntimeMemory())
-}
-
-//export ConsumeRuntimeMemoryTrimSeconds
-func ConsumeRuntimeMemoryTrimSeconds() C.double {
-	elapsed := runtimeMemoryTrimSeconds
-	runtimeMemoryTrimSeconds = 0
-	return C.double(elapsed)
 }
 
 //export GetRuntimeMemoryStats

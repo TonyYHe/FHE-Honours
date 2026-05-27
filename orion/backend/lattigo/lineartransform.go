@@ -6,7 +6,6 @@ import (
 	"math"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,7 +68,6 @@ type sharedCacheEvalProfile struct {
 	streamEvalS        float64
 	streamAccumulateS  float64
 	pushS              float64
-	trimS              float64
 }
 
 var (
@@ -89,7 +87,6 @@ func accumulateSharedCacheEvalProfile(profile sharedCacheEvalProfile) {
 	sharedCacheEvalProfileTotals.streamEvalS += profile.streamEvalS
 	sharedCacheEvalProfileTotals.streamAccumulateS += profile.streamAccumulateS
 	sharedCacheEvalProfileTotals.pushS += profile.pushS
-	sharedCacheEvalProfileTotals.trimS += profile.trimS
 	sharedCacheEvalProfileMu.Unlock()
 }
 
@@ -133,7 +130,15 @@ func ltDiagonalEncodeWorkerCount(n int) int {
 		return 1
 	}
 	workers := runtime.GOMAXPROCS(0)
-	if raw := os.Getenv("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS"); raw != "" {
+	if raw := os.Getenv("ORION_SINGLE_SLOT_ENCODE_WORKERS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			workers = parsed
+		}
+	} else if raw := os.Getenv("ORION_UNIFIED_SINGLE_SLOT_ENCODE_WORKERS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			workers = parsed
+		}
+	} else if raw := os.Getenv("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			workers = parsed
 		}
@@ -387,6 +392,9 @@ func lattigoStreamingLTChunkPlaintexts() int {
 
 func lattigoStreamingLTEnabled(ioMode string, plaintextCount int) bool {
 	if ioMode != "none" || plaintextCount <= 0 {
+		return false
+	}
+	if !envBool(os.Getenv("ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT")) {
 		return false
 	}
 	raw := os.Getenv("ORION_LATTIGO_STREAMING_LT")
@@ -651,8 +659,6 @@ func releaseStreamingLTChunkMemory(chunks []lintrans.LinearTransformation) {
 	for i := range chunks {
 		chunks[i].Vec = nil
 	}
-	runtime.GC()
-	debug.FreeOSMemory()
 }
 
 func evaluateStreamingLinearTransformNew(
@@ -775,9 +781,7 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 				}
 			}
 			profile.streamAccumulateS += secondsSince(accumulateStarted)
-			trimStarted := time.Now()
 			releaseStreamingLTChunkMemory(pendingTransforms)
-			profile.trimS += secondsSince(trimStarted)
 			pendingTransforms = pendingTransforms[:0]
 			pendingIndices = pendingIndices[:0]
 			pendingStates = pendingStates[:0]
@@ -1287,7 +1291,6 @@ func ConsumeSharedCacheEvalProfileSeconds() (*C.double, C.ulong) {
 		profile.streamEvalS,
 		profile.streamAccumulateS,
 		profile.pushS,
-		profile.trimS,
 	}
 	return SliceToCArray(values, convertFloat64ToCDouble)
 }

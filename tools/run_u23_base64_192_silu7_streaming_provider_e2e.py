@@ -37,30 +37,27 @@ LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_u23_base64_192_silu7_streaming_pro
 ENV_DEFAULTS: dict[str, str] = {
     "PYTHONUNBUFFERED": "1",
     "MALLOC_ARENA_MAX": "2",
-    "ORION_COMPILE_PARALLEL_POLICY": "auto",
-    "ORION_LATTIGO_STREAMING_LT": "force",
-    "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "1",
-    "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "1",
-    "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "1",
+    "ORION_COMPILE_PARALLEL_POLICY": "manual",
+    "ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE": "1",
+    "ORION_SINGLE_SLOT_ENCODE_WORKERS": "16",
+    "ORION_LATTIGO_STREAMING_LT": "0",
+    "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "0",
+    "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "0",
+    "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "0",
     "ORION_LATTIGO_BOOTSTRAP_MANY": "1",
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
-    "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "0",
-    "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "4",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
 }
 
 ENV_TUNING_KEYS: tuple[str, ...] = (
     "GOMAXPROCS",
     "ORION_COMPILE_MEMORY_RESERVE_GB",
-    "ORION_LATTIGO_STREAMING_LT_MEMORY_FRACTION",
-    "ORION_LATTIGO_STREAMING_LT_MEMORY_OVERHEAD",
-    "ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS_MIN",
-    "ORION_LATTIGO_STREAMING_LT_CHUNK_PLAINTEXTS_MAX",
-    "ORION_LATTIGO_STREAMING_LT_SHARED_TRANSFORMS_MAX",
+    "ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE",
+    "ORION_SINGLE_SLOT_ENCODE_WORKERS",
     "ORION_LT_COMPILE_WORKERS",
     "ORION_UNIFIED_COMPILE_WORKERS",
     "ORION_LATTIGO_COMPILE_WORKERS",
@@ -68,7 +65,6 @@ ENV_TUNING_KEYS: tuple[str, ...] = (
     "ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS",
     "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
     "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
-    "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
     "ORION_PACK_CONV_WORKERS",
     "ORION_LATTIGO_BOOTSTRAP_WORKERS",
 )
@@ -344,6 +340,10 @@ def _case_row(run_root: Path) -> tuple[list[str], dict[str, Any]]:
     act_s = _breakdown_timing(payload or {}, "activation_s")
     boot_s = _breakdown_timing(payload or {}, "bootstrap_s")
     load_encode_s = _breakdown_timing(payload or {}, "lt_runtime_load_encode_s")
+    layer_turnover_s = _breakdown_timing(payload or {}, "lt_layer_cache_turnover_s")
+    layer_encode_s = _breakdown_timing(payload or {}, "lt_layer_cache_encode_s")
+    layer_key_prepare_s = _breakdown_timing(payload or {}, "lt_layer_cache_key_prepare_s")
+    layer_evict_s = _breakdown_timing(payload or {}, "lt_layer_cache_evict_s")
     unattributed_s = _breakdown_timing(payload or {}, "unattributed_he_forward_s")
     compile_s = timing.get("compile") if isinstance(timing, dict) else None
     row = [
@@ -367,6 +367,7 @@ def _case_row(run_root: Path) -> tuple[list[str], dict[str, Any]]:
         _format_float(act_s),
         _format_float(boot_s),
         _format_float(load_encode_s),
+        _format_float(layer_turnover_s),
         _format_float(unattributed_s),
         _runtime_mode(payload or {}),
         _format_int(_rotation_count(payload or {})),
@@ -394,6 +395,10 @@ def _case_row(run_root: Path) -> tuple[list[str], dict[str, Any]]:
         "activation_s": act_s,
         "bootstrap_s": boot_s,
         "lt_runtime_load_encode_s": load_encode_s,
+        "lt_layer_cache_turnover_s": layer_turnover_s,
+        "lt_layer_cache_encode_s": layer_encode_s,
+        "lt_layer_cache_key_prepare_s": layer_key_prepare_s,
+        "lt_layer_cache_evict_s": layer_evict_s,
         "unattributed_he_forward_s": unattributed_s,
         "runtime_mode": _runtime_mode(payload or {}),
         "rotation_count": _rotation_count(payload or {}),
@@ -429,6 +434,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "ACT s",
         "boot s",
         "LT load/enc s",
+        "layer turnover s",
         "unattrib HE s",
         "runtime mode",
         "rotations",
@@ -449,6 +455,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "---",
         "---",
         "---",
+        "---:",
         "---:",
         "---:",
         "---:",
@@ -630,7 +637,7 @@ def _default_run_root() -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run U23 192x192 base64 SiLU7 provider E2E with streaming LT."
+        description="Run U23 192x192 base64 SiLU7 provider E2E with single-slot layer-cache LT."
     )
     parser.add_argument("--run-root", type=Path, default=_default_run_root())
     parser.add_argument("--doc", type=Path, default=REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md")

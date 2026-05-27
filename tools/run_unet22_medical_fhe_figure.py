@@ -17,7 +17,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from orion.backend.python.memory_lifecycle import trim_runtime_memory
 from orion.core.orion import scheme
 from orion.models.unet import get_unet22_medical_model
 from scripts.train_unet22_medical_seg import DATASETS, build_dataset, normalize_dataset_key, split_indices
@@ -458,9 +457,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     release = getattr(tensor, "release", None)
                     if callable(release):
                         release()
-                backend = getattr(scheme, "backend", None)
-                if backend is not None:
-                    trim_runtime_memory(backend, reason=f"after_unet22_medical_sample_{actual_index}")
                 payload.update(
                     {
                         "status": "running_fhe",
@@ -499,9 +495,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
         finally:
-            backend = getattr(scheme, "backend", None)
-            if backend is not None:
-                trim_runtime_memory(backend, reason="after_unet22_medical_fhe_figure")
             scheme.delete_scheme()
     finally:
         if args.bootstrap_margin is not None:

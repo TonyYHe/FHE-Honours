@@ -147,7 +147,6 @@ class LattigoLibrary:
             ),
             True,
         )
-        self.runtime_memory_trim_supported = False
         eval_budget = _read_env_int("ORION_LATTIGO_UNIFIED_EVAL_BUDGET_BYTES")
         if eval_budget is not None:
             self.unified_transform_eval_budget_bytes = max(1, int(eval_budget))
@@ -218,23 +217,6 @@ class LattigoLibrary:
             argtypes=None,
             restype=None
         )
-
-        trim_runtime_memory = getattr(self.lib, "TrimRuntimeMemory", None)
-        if trim_runtime_memory is not None:
-            self.TrimRuntimeMemory = LattigoFunction(
-                trim_runtime_memory,
-                argtypes=[],
-                restype=ctypes.c_double,
-            )
-            self.runtime_memory_trim_supported = True
-
-        consume_runtime_trim = getattr(self.lib, "ConsumeRuntimeMemoryTrimSeconds", None)
-        if consume_runtime_trim is not None:
-            self.ConsumeRuntimeMemoryTrimSeconds = LattigoFunction(
-                consume_runtime_trim,
-                argtypes=[],
-                restype=ctypes.c_double,
-            )
 
         runtime_memory_stats = getattr(self.lib, "GetRuntimeMemoryStats", None)
         if runtime_memory_stats is not None:

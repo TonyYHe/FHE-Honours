@@ -34,10 +34,10 @@ The fair comparison path is:
 
 1. For every U22 `base_dim=32` encoder unique Conv2d node, run both Orion dense LT and HaloED/provider with the same reporting convention.
 2. Run each node in an isolated worker with an RSS cap and disk watermark so host availability and GPU access for other users are not put at risk.
-3. If a non-streaming path exceeds the RSS cap, rerun that exact node/input/path with streamed LT and record the chunk/budget policy.
+3. If a resident path exceeds the RSS cap, rerun that exact node/input/path with single-slot layer cache and record the encode worker count.
 4. Compare compute time separately from memory feasibility. Do not mix resident dense RAM certificates, streamed fallback timings, and HaloED timings without labeling the path.
 
-Streaming does not mean disabling BSGS.  The intended baseline streams LT artifacts by BSGS group / input-column group / tile-family chunk.  Within each chunk, baby-step reuse and BSGS sharing should be preserved.  Cross-chunk sharing is limited by the memory budget, and that limit must be reported.
+Streaming does not mean disabling BSGS.  The intended baseline is now a single-slot layer cache: compile prepares and keeps the cleartext raw diagonal payloads for every unified BSGS group, runtime materializes/encodes exactly the current layer's plaintexts, evaluates the layer with the normal resident BSGS/shared-cache path, then evicts those plaintexts before the next layer.  Report layer compute time separately from `layer_cache_turnover_s` (`layer_cache_encode_s + layer_cache_key_prepare_s + layer_cache_evict_s`).  Legacy chunked Lattigo LT streaming is not the mainline and requires the explicit `ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT=1` gate.
 
 ## Step 0: Conv Kernel Table
 
@@ -127,8 +127,8 @@ Run policy:
 - Use `io_mode=none`; do not write dense encoded plaintext caches to SSD.
 - Start with `ORION_LATTIGO_STREAMING_LT=0`.
 - Run both `--paths dense` and `--paths provider`; the comparison row is incomplete until both paths have a result or a labeled failure.
-- On `rss_watermark`, OOM, or similar memory failure, rerun only the failed node/input/path with `ORION_LATTIGO_STREAMING_LT=force`.
-- Record peak RSS, compile time, compute time, rotations, ciphertext counts, whether streaming was used, and exact result JSON path for both paths.
+- On `rss_watermark`, OOM, or similar memory failure, rerun only the failed node/input/path with `ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE=1`, `ORION_SINGLE_SLOT_ENCODE_WORKERS=<fixed worker count>`, `ORION_LATTIGO_STREAMING_LT=0`, `ORION_LATTIGO_MEMORY_BOUNDED_COMPILE=0`, and `ORION_LATTIGO_MEMORY_BOUNDED_EVAL=0`.
+- Record peak RSS, compile time, compute time, layer-cache turnover time, rotations, ciphertext counts, whether single-slot layer cache was used, and exact result JSON path for both paths.
 
 Active runs:
 
@@ -201,11 +201,11 @@ Conv2d nodes as Step 1, but with `base_dim=64`.
 
 Run policy:
 
-- Use streamed LT for both dense and provider paths from the first attempt.
+- Use single-slot layer cache for both dense and provider paths from the first attempt.
 - Keep dense shared-cache / unified-BSGS disabled (`ORION_DENSE_LT_SHARED_CACHE=0`).
 - Keep provider optimizations enabled: DP layout policy, relayout kernels, native halo,
-  output fusion, shared rotation keys, compile trimming, and memory-bounded streaming.
-- Use `io_mode=none`; report compute time excluding total I/O.
+  output fusion, and shared rotation keys.
+- Use `io_mode=none`; report compute time excluding total I/O, and report layer-cache turnover separately.
 
 Active runs:
 
@@ -307,31 +307,31 @@ Interpretation:
 - Sequential layer replay memory is the maximum single-layer peak, not the sum of all layer peaks.
 - All-resident dense cache memory is closer to the sum of resident artifacts and is expected to be infeasible.
 
-## Step 3: Historical Strong Orion Streaming Baseline
+## Step 3: Strong Orion Single-Slot Streaming Baseline
 
-Goal: run Orion dense streaming LT layer-by-layer against the same exact U22 layers.
+Goal: run Orion dense LT with the single-slot layer cache against the same exact U22 layers.
 
 Policy to test:
 
-- Multicore LT compile enabled.
-- Streaming artifact residency enabled.
-- BSGS preserved within the streamed chunk.
-- Fill each chunk up to a controlled memory budget; on `corg`, test a large budget near 1 TiB to maximize baby-step sharing.
-- Record chunk size / group size, because the chunk boundary determines how much sharing is preserved.
+- Compile prepares all cleartext raw diagonal payloads for each unified BSGS group.
+- Runtime materializes/encodes only the current layer plaintexts.
+- BSGS/shared-cache behavior inside that layer is the normal resident path.
+- After the layer evaluates, evict the current layer plaintexts before moving on.
+- Record `layer_cache_turnover_s` separately from layer compute time.
 
 Open question for this step:
 
-Can we use most of the 1 TiB RAM to keep the largest possible baby-step cache per chunk, while still avoiding dense resident OOM?  This should be measured by sweeping chunk budgets, not assumed.
+What fixed `ORION_SINGLE_SLOT_ENCODE_WORKERS` value gives the best layer turnover time on the target host without increasing RSS spikes?
 
 <!-- U22_STREAMING_TABLE_START -->
-| layer | backend path | chunk/budget | status | peak RSS GiB | compile s | compute s | I/O s excluded | BSGS/sharing note | result file |
+| layer | backend path | layer cache policy | status | peak RSS GiB | compile s | compute s | turnover s | BSGS/sharing note | result file |
 |---|---|---|---|---:|---:|---:|---:|---|---|
-| enc1b | Orion dense streaming | pending | pending |  |  |  | yes |  |  |
-| dec1a | Orion dense streaming | pending | pending |  |  |  | yes |  |  |
-| dec1b | Orion dense streaming | pending | pending |  |  |  | yes |  |  |
-| output | Orion dense streaming | pending | pending |  |  |  | yes |  |  |
-| enc4b | Orion dense streaming | pending | pending |  |  |  | yes |  |  |
-| bottleneckb | Orion dense streaming | pending | pending |  |  |  | yes |  |  |
+| enc1b | Orion dense single-slot | pending | pending |  |  |  |  | resident layer BSGS |  |
+| dec1a | Orion dense single-slot | pending | pending |  |  |  |  | resident layer BSGS |  |
+| dec1b | Orion dense single-slot | pending | pending |  |  |  |  | resident layer BSGS |  |
+| output | Orion dense single-slot | pending | pending |  |  |  |  | resident layer BSGS |  |
+| enc4b | Orion dense single-slot | pending | pending |  |  |  |  | resident layer BSGS |  |
+| bottleneckb | Orion dense single-slot | pending | pending |  |  |  |  | resident layer BSGS |  |
 <!-- U22_STREAMING_TABLE_END -->
 
 ## Step 4: HaloED Layer-By-Layer

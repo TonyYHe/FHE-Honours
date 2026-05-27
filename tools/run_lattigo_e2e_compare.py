@@ -21,7 +21,6 @@ if str(REPO_ROOT) not in sys.path:
 from orion.core.orion import scheme
 from orion.core import packing
 from orion.backend.python.tensors import CipherTensor
-from orion.backend.python.memory_lifecycle import trim_runtime_memory
 from orion.backend.python.compile_policy import auto_worker_count, policy_audit
 from orion.models.resnet import ResNet18, ResNet20, ResNet32, ResNet34, ResNet50
 from orion.models.ternaus import TernausVGGUNet
@@ -115,6 +114,10 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
     "artifact_read_s",
     "artifact_load_s",
     "artifact_unload_s",
+    "layer_cache_encode_s",
+    "layer_cache_key_prepare_s",
+    "layer_cache_evict_s",
+    "layer_cache_turnover_s",
     "trim_s",
     "read_bundle_s",
     "load_keys_s",
@@ -176,8 +179,18 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
 
 
 def _runtime_fairness_mode_from_env() -> str:
+    raw_single_slot = os.environ.get("ORION_UNIFIED_SINGLE_SLOT_LAYER_CACHE") or os.environ.get(
+        "ORION_SINGLE_SLOT_LAYER_CACHE",
+        "",
+    )
+    if str(raw_single_slot).strip().lower() in {"1", "true", "yes", "on"}:
+        return "single_slot_layer_cache"
     raw = os.environ.get("ORION_LATTIGO_STREAMING_LT", "")
-    if str(raw).strip().lower() in {"1", "true", "yes", "on", "force", "always"}:
+    raw_legacy = os.environ.get("ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT", "")
+    if (
+        str(raw_legacy).strip().lower() in {"1", "true", "yes", "on"}
+        and str(raw).strip().lower() in {"1", "true", "yes", "on", "force", "always"}
+    ):
         return "streaming_eval_encode"
     return "unknown"
 
@@ -207,6 +220,8 @@ def _aggregate_runtime_fairness(timings: list[dict[str, Any]], *, serving_hot_s:
         resident_available = False
     elif any(mode == "streaming_eval_encode" for mode in modes):
         mode = "streaming_eval_encode"
+    elif any(mode == "single_slot_layer_cache" for mode in modes):
+        mode = "single_slot_layer_cache"
     elif any(mode == "memory_bounded_load_eval" for mode in modes):
         mode = "memory_bounded_load_eval"
     elif modes and all(mode == "resident_compute" for mode in modes):
@@ -1092,9 +1107,9 @@ def _configure_lattigo_runtime_defaults() -> dict[str, str]:
         "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS": workers,
         "ORION_LATTIGO_COMPILE_WORKERS": workers,
         "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": diagonal_encode_workers,
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS": diagonal_encode_workers,
         "ORION_LATTIGO_BOOTSTRAP_WORKERS": workers,
         "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "2",
-        "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "0",
         "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     }
     applied: dict[str, str] = {}
@@ -1905,6 +1920,10 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
         "mvm_kernel_s": 0.0,
         "mvm_eval_total_s": 0.0,
         "lt_runtime_load_encode_s": 0.0,
+        "lt_layer_cache_turnover_s": 0.0,
+        "lt_layer_cache_encode_s": 0.0,
+        "lt_layer_cache_key_prepare_s": 0.0,
+        "lt_layer_cache_evict_s": 0.0,
         "lt_runtime_read_bundle_s": 0.0,
         "lt_runtime_load_keys_s": 0.0,
         "lt_runtime_load_plaintexts_s": 0.0,
@@ -1943,6 +1962,14 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
             + _timing_float(timing, "trim_s")
             + _timing_float(timing, "cpp_trim_s")
         )
+        layer_cache_turnover = float(
+            _timing_float(timing, "layer_cache_turnover_s")
+            or (
+                _timing_float(timing, "layer_cache_encode_s")
+                + _timing_float(timing, "layer_cache_key_prepare_s")
+                + _timing_float(timing, "layer_cache_evict_s")
+            )
+        )
         row = {
             "module_path": str(module_name),
             "node": str(getattr(module, "region_output_id", module_name)),
@@ -1953,6 +1980,10 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
             "mvm_kernel_s": float(mvm_kernel),
             "mvm_eval_total_s": float(eval_total),
             "lt_runtime_load_encode_s": float(load_encode),
+            "lt_layer_cache_turnover_s": float(layer_cache_turnover),
+            "lt_layer_cache_encode_s": _timing_float(timing, "layer_cache_encode_s"),
+            "lt_layer_cache_key_prepare_s": _timing_float(timing, "layer_cache_key_prepare_s"),
+            "lt_layer_cache_evict_s": _timing_float(timing, "layer_cache_evict_s"),
             "lt_runtime_trim_unload_s": float(trim_unload),
             "timing": dict(timing),
         }
@@ -1961,6 +1992,10 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
         totals["mvm_kernel_s"] += float(mvm_kernel)
         totals["mvm_eval_total_s"] += float(eval_total)
         totals["lt_runtime_load_encode_s"] += float(load_encode)
+        totals["lt_layer_cache_turnover_s"] += float(layer_cache_turnover)
+        totals["lt_layer_cache_encode_s"] += _timing_float(timing, "layer_cache_encode_s")
+        totals["lt_layer_cache_key_prepare_s"] += _timing_float(timing, "layer_cache_key_prepare_s")
+        totals["lt_layer_cache_evict_s"] += _timing_float(timing, "layer_cache_evict_s")
         totals["lt_runtime_read_bundle_s"] += _timing_float(timing, "read_bundle_s")
         totals["lt_runtime_load_keys_s"] += _timing_float(timing, "load_keys_s")
         totals["lt_runtime_load_plaintexts_s"] += _timing_float(timing, "load_plaintexts_s")
@@ -2070,6 +2105,10 @@ def _collect_forward_operator_breakdown(
         "bootstrap_s": float(bootstrap["totals"].get("bootstrap_s", 0.0)),
         "bootstrap_backend_s": float(bootstrap["totals"].get("backend_bootstrap_s", 0.0)),
         "lt_runtime_load_encode_s": float(mvm["totals"].get("lt_runtime_load_encode_s", 0.0)),
+        "lt_layer_cache_turnover_s": float(mvm["totals"].get("lt_layer_cache_turnover_s", 0.0)),
+        "lt_layer_cache_encode_s": float(mvm["totals"].get("lt_layer_cache_encode_s", 0.0)),
+        "lt_layer_cache_key_prepare_s": float(mvm["totals"].get("lt_layer_cache_key_prepare_s", 0.0)),
+        "lt_layer_cache_evict_s": float(mvm["totals"].get("lt_layer_cache_evict_s", 0.0)),
         "lt_runtime_stream_build_map_s": float(mvm["totals"].get("lt_runtime_stream_build_map_s", 0.0)),
         "lt_runtime_stream_encode_hoist_s": float(mvm["totals"].get("lt_runtime_stream_encode_hoist_s", 0.0)),
         "lt_runtime_stream_load_payload_s": float(mvm["totals"].get("lt_runtime_stream_load_payload_s", 0.0)),
@@ -2098,7 +2137,8 @@ def _collect_forward_operator_breakdown(
         "notes": [
             "MVM is collected from UnifiedTransformGroup runtime timing and is streaming-safe.",
             "mvm_kernel_s uses stream_eval+stream_accumulate or baby+giant-step counters, with eval_s as fallback.",
-            "lt_runtime_load_encode_s includes runtime artifact read/key/plaintext load plus streaming build-map/encode/load-payload time.",
+            "lt_runtime_load_encode_s includes runtime artifact read/key/plaintext load plus legacy chunk-stream build-map/encode/load-payload time.",
+            "Single-slot layer-cache turnover is reported separately as lt_layer_cache_turnover_s.",
             "Activation is a targeted activation-only wall-time hook; direct bootstrap child time is subtracted.",
             "Bootstrap uses Bootstrap._bootstrap_runtime_profile and does not require broad module profiling.",
         ],
@@ -2646,6 +2686,10 @@ def _run_forward_attempt(
         attempt["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
         attempt["artifact_load_s"] = runtime_fairness.get("artifact_load_s")
         attempt["artifact_unload_s"] = runtime_fairness.get("artifact_unload_s")
+        attempt["layer_cache_turnover_s"] = runtime_fairness.get("layer_cache_turnover_s")
+        attempt["layer_cache_encode_s"] = runtime_fairness.get("layer_cache_encode_s")
+        attempt["layer_cache_key_prepare_s"] = runtime_fairness.get("layer_cache_key_prepare_s")
+        attempt["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
         attempt["trim_s"] = runtime_fairness.get("trim_s")
         attempt["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         if bool(record_primary):
@@ -2656,6 +2700,10 @@ def _run_forward_attempt(
             payload["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
             payload["artifact_load_s"] = runtime_fairness.get("artifact_load_s")
             payload["artifact_unload_s"] = runtime_fairness.get("artifact_unload_s")
+            payload["layer_cache_turnover_s"] = runtime_fairness.get("layer_cache_turnover_s")
+            payload["layer_cache_encode_s"] = runtime_fairness.get("layer_cache_encode_s")
+            payload["layer_cache_key_prepare_s"] = runtime_fairness.get("layer_cache_key_prepare_s")
+            payload["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
             payload["trim_s"] = runtime_fairness.get("trim_s")
             payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         _write(payload, out_path)
@@ -2722,9 +2770,6 @@ def _run_forward_attempt(
                     release()
                 except Exception:
                     pass
-        backend = getattr(scheme, "backend", None)
-        if backend is not None:
-            trim_runtime_memory(backend, reason=f"after_forward_attempt:{int(attempt_index)}")
         gc.collect()
 
 
@@ -2930,6 +2975,10 @@ def _run_one(
             payload["artifact_read_s"] = runtime_fairness.get("artifact_read_s")
             payload["artifact_load_s"] = runtime_fairness.get("artifact_load_s")
             payload["artifact_unload_s"] = runtime_fairness.get("artifact_unload_s")
+            payload["layer_cache_turnover_s"] = runtime_fairness.get("layer_cache_turnover_s")
+            payload["layer_cache_encode_s"] = runtime_fairness.get("layer_cache_encode_s")
+            payload["layer_cache_key_prepare_s"] = runtime_fairness.get("layer_cache_key_prepare_s")
+            payload["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
             payload["trim_s"] = runtime_fairness.get("trim_s")
             payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         payload["status"] = "ok"
@@ -2982,6 +3031,8 @@ def _mean_runtime_fairness(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     modes = [str(timing.get("runtime_fairness_mode", "unknown") or "unknown") for timing in timings]
     if any(mode == "streaming_eval_encode" for mode in modes):
         mode = "streaming_eval_encode"
+    elif any(mode == "single_slot_layer_cache" for mode in modes):
+        mode = "single_slot_layer_cache"
     elif any(mode == "memory_bounded_load_eval" for mode in modes):
         mode = "memory_bounded_load_eval"
     elif modes and all(mode == "resident_compute" for mode in modes):
@@ -3072,6 +3123,10 @@ def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict
         "artifact_read_s": _runtime_fairness_value(dense, "artifact_read_s"),
         "artifact_load_s": _runtime_fairness_value(dense, "artifact_load_s"),
         "artifact_unload_s": _runtime_fairness_value(dense, "artifact_unload_s"),
+        "layer_cache_turnover_s": _runtime_fairness_value(dense, "layer_cache_turnover_s"),
+        "layer_cache_encode_s": _runtime_fairness_value(dense, "layer_cache_encode_s"),
+        "layer_cache_key_prepare_s": _runtime_fairness_value(dense, "layer_cache_key_prepare_s"),
+        "layer_cache_evict_s": _runtime_fairness_value(dense, "layer_cache_evict_s"),
         "trim_s": _runtime_fairness_value(dense, "trim_s"),
         "runtime_fairness_mode": _runtime_fairness_mode(dense),
     }
@@ -3081,6 +3136,10 @@ def _summarize(*, dense_path: Path, provider_path: Path, out_path: Path) -> dict
         "artifact_read_s": _runtime_fairness_value(provider, "artifact_read_s"),
         "artifact_load_s": _runtime_fairness_value(provider, "artifact_load_s"),
         "artifact_unload_s": _runtime_fairness_value(provider, "artifact_unload_s"),
+        "layer_cache_turnover_s": _runtime_fairness_value(provider, "layer_cache_turnover_s"),
+        "layer_cache_encode_s": _runtime_fairness_value(provider, "layer_cache_encode_s"),
+        "layer_cache_key_prepare_s": _runtime_fairness_value(provider, "layer_cache_key_prepare_s"),
+        "layer_cache_evict_s": _runtime_fairness_value(provider, "layer_cache_evict_s"),
         "trim_s": _runtime_fairness_value(provider, "trim_s"),
         "runtime_fairness_mode": _runtime_fairness_mode(provider),
     }
