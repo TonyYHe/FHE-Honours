@@ -637,6 +637,70 @@ def _count_diagonal_key_chunks(chunks: list[np.ndarray]) -> int:
     return int(np.unique(np.concatenate(chunks)).size)
 
 
+def _diagonal_key_chunks_to_indices(
+    chunks: list[np.ndarray],
+    *,
+    matrix_height: int,
+    matrix_width: int,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    allow_hybrid: bool = True,
+) -> dict[tuple[int, int], tuple[int, ...]]:
+    num_slots = int(num_slots)
+    num_block_rows = math.ceil(int(matrix_height) / int(num_slots))
+    num_block_cols = math.ceil(int(matrix_width) / int(num_slots))
+    if (
+        bool(allow_hybrid)
+        and int(num_block_rows) == 1
+        and str(embed_method) == "hybrid"
+        and not bool(is_last_layer)
+    ):
+        block_height = 2 ** math.ceil(math.log2(int(matrix_height)))
+    else:
+        block_height = int(num_slots)
+
+    indices: dict[tuple[int, int], set[int]] = {
+        (int(row), int(col)): set()
+        for row in range(int(num_block_rows))
+        for col in range(int(num_block_cols))
+    }
+    if chunks:
+        keys = np.unique(np.concatenate(chunks)) if len(chunks) > 1 else np.unique(chunks[0])
+        for raw_key in np.asarray(keys, dtype=np.int64).reshape(-1):
+            key = int(raw_key)
+            block_linear = int(key // int(num_slots))
+            diag_idx = int(key % int(num_slots))
+            row = int(block_linear // int(num_block_cols))
+            col = int(block_linear % int(num_block_cols))
+            if 0 <= row < int(num_block_rows) and 0 <= col < int(num_block_cols):
+                indices.setdefault((int(row), int(col)), set()).add(int(diag_idx))
+    return {
+        block: tuple(sorted(values)) if values else (0,)
+        for block, values in sorted(indices.items())
+    }
+
+
+def _packed_output_rotations(
+    *,
+    matrix_height: int,
+    num_slots: int,
+    embed_method: str,
+    is_last_layer: bool,
+    allow_hybrid: bool = True,
+) -> int:
+    num_block_rows = math.ceil(int(matrix_height) / int(num_slots))
+    if (
+        bool(allow_hybrid)
+        and int(num_block_rows) == 1
+        and str(embed_method) == "hybrid"
+        and not bool(is_last_layer)
+    ):
+        block_height = 2 ** math.ceil(math.log2(int(matrix_height)))
+        return int(math.log2(int(num_slots) // int(block_height)))
+    return 0
+
+
 def _channel_chunk_shape(spatial_count: int, outer_count: int, inner_count: int, max_chunk_items: int) -> tuple[int, int]:
     channel_area = max(1, int(max_chunk_items) // max(1, int(spatial_count)))
     outer = max(1, min(int(outer_count), int(math.sqrt(channel_area))))
@@ -949,6 +1013,7 @@ def estimate_direct_conv2d_diagonal_count(
     *,
     allow_hybrid: bool = True,
     max_chunk_items: int | None = None,
+    return_indices: bool = False,
 ) -> int:
     """Count packed block diagonals without materializing plaintext payloads."""
 
@@ -1069,6 +1134,16 @@ def estimate_direct_conv2d_diagonal_count(
                                 is_last_layer=bool(is_last_layer),
                                 allow_hybrid=bool(allow_hybrid),
                             )
+    if bool(return_indices):
+        return _diagonal_key_chunks_to_indices(
+            key_chunks,
+            matrix_height=int(matrix_shape[0]),
+            matrix_width=int(matrix_shape[1]),
+            num_slots=int(num_slots),
+            embed_method=str(embed_method),
+            is_last_layer=bool(is_last_layer),
+            allow_hybrid=bool(allow_hybrid),
+        )
     return _count_diagonal_key_chunks(key_chunks)
 
 
@@ -1080,6 +1155,7 @@ def estimate_direct_conv_transpose2d_diagonal_count(
     *,
     allow_hybrid: bool = True,
     max_chunk_items: int | None = None,
+    return_indices: bool = False,
 ) -> int:
     """Count packed block diagonals for ConvTranspose2d without payloads."""
 
@@ -1199,7 +1275,59 @@ def estimate_direct_conv_transpose2d_diagonal_count(
                                 is_last_layer=bool(is_last_layer),
                                 allow_hybrid=bool(allow_hybrid),
                             )
+    if bool(return_indices):
+        return _diagonal_key_chunks_to_indices(
+            key_chunks,
+            matrix_height=int(matrix_shape[0]),
+            matrix_width=int(matrix_shape[1]),
+            num_slots=int(num_slots),
+            embed_method=str(embed_method),
+            is_last_layer=bool(is_last_layer),
+            allow_hybrid=bool(allow_hybrid),
+        )
     return _count_diagonal_key_chunks(key_chunks)
+
+
+def pack_conv2d_diagonal_indices(conv_layer: nn.Module, last: bool, *, allow_hybrid: bool = True):
+    slots = int(conv_layer.scheme.params.get_slots())
+    embed_method = str(conv_layer.scheme.params.get_embedding_method())
+    indices = estimate_direct_conv2d_diagonal_count(
+        conv_layer,
+        slots,
+        embed_method,
+        bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        return_indices=True,
+    )
+    output_rotations = _packed_output_rotations(
+        matrix_height=int(torch.Size(conv_layer.fhe_output_shape).numel()),
+        num_slots=int(slots),
+        embed_method=str(embed_method),
+        is_last_layer=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+    )
+    return indices, int(output_rotations)
+
+
+def pack_conv_transpose2d_diagonal_indices(conv_layer: nn.Module, last: bool, *, allow_hybrid: bool = True):
+    slots = int(conv_layer.scheme.params.get_slots())
+    embed_method = str(conv_layer.scheme.params.get_embedding_method())
+    indices = estimate_direct_conv_transpose2d_diagonal_count(
+        conv_layer,
+        slots,
+        embed_method,
+        bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        return_indices=True,
+    )
+    output_rotations = _packed_output_rotations(
+        matrix_height=int(torch.Size(conv_layer.fhe_output_shape).numel()),
+        num_slots=int(slots),
+        embed_method=str(embed_method),
+        is_last_layer=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+    )
+    return indices, int(output_rotations)
 
 
 def estimate_packed_diagonal_count(linear_layer: nn.Module, last: bool, *, max_chunk_items: int | None = None) -> int:

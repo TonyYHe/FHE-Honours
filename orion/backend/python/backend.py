@@ -563,6 +563,13 @@ class PythonBackend:
             flat.extend([int(key), int(level)])
         return flat
 
+    def PlanLinearTransformsUnifiedRotationKeys(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, _levels_array):
+        keys: set[int] = set()
+        for transform_index in range(int(num_transforms)):
+            for diag_index in range(int(diag_idxs_lens[transform_index])):
+                keys.add(int(diag_idxs_ptrs[transform_index][diag_index]))
+        return sorted(keys)
+
     def GenerateLinearTransformRotationKey(self, key):
         self._rotation_keys.add(int(key))
 

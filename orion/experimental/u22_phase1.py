@@ -1057,9 +1057,21 @@ class LayoutPolicyRelayoutKernel:
                         target_index = _flat_nchw_index(int(n), int(c), int(target_h), int(w), target)
                         yield int(source_index), int(target_index)
 
-    def compile(self, scheme: Any, *, level: int) -> None:
-        self.cleanup(getattr(scheme, "backend", None))
-        slots = int(scheme.params.get_slots())
+    def _diag_indices_by_block(self, slots: int) -> dict[tuple[int, int], tuple[int, ...]]:
+        indices: dict[tuple[int, int], set[int]] = {}
+        for source_index, output_index in self._iter_mappings(int(slots)):
+            input_block = int(source_index // int(slots))
+            output_block = int(output_index // int(slots))
+            source_local = int(source_index % int(slots))
+            output_local = int(output_index % int(slots))
+            diag_index = int((source_local - output_local) % int(slots))
+            indices.setdefault((int(output_block), int(input_block)), set()).add(int(diag_index))
+        return {
+            block: tuple(sorted(values)) if values else (0,)
+            for block, values in sorted(indices.items())
+        }
+
+    def _build_diagonals(self, slots: int) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
         diagonals: dict[tuple[int, int], dict[int, torch.Tensor]] = {}
         for source_index, output_index in self._iter_mappings(int(slots)):
             input_block = int(source_index // int(slots))
@@ -1073,8 +1085,18 @@ class LayoutPolicyRelayoutKernel:
                 diag = torch.zeros((int(slots),), dtype=torch.float32)
                 block[int(diag_index)] = diag
             diag[int(output_local)] = float(self.output_scale)
+        return diagonals
+
+    def compile(self, scheme: Any, *, level: int) -> None:
+        self.cleanup(getattr(scheme, "backend", None))
+        slots = int(scheme.params.get_slots())
         self.level = int(level)
-        self.diagonals = diagonals
+        if scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            self._dense_layer_cache_diag_indices_by_block = self._diag_indices_by_block(int(slots))
+            self._dense_layer_cache_build_diagonals = lambda self=self, slots=int(slots): self._build_diagonals(int(slots))
+            self.diagonals = {}
+        else:
+            self.diagonals = self._build_diagonals(int(slots))
         self.transform_ids = {
             (int(row), int(col)): int(transform_id)
             for (row, col), transform_id in scheme.lt_evaluator.generate_transforms(self).items()
@@ -1096,7 +1118,7 @@ class LayoutPolicyRelayoutKernel:
         return ptxt
 
     def apply(self, source_ct: Any) -> Any:
-        if not self.transform_ids:
+        if not self.transform_ids and not getattr(self, "_dense_layer_cache_deferred", False):
             raise RuntimeError(f"layout-policy relayout kernel {self.name} has not been compiled")
         out = source_ct.scheme.lt_evaluator.evaluate_transforms(self, source_ct)
         bias_ptxt = self._bias_plaintext(out)
@@ -1114,6 +1136,8 @@ class LayoutPolicyRelayoutKernel:
                     pass
         self.transform_ids = {}
         self.diagonals = {}
+        self._dense_layer_cache_diag_indices_by_block = {}
+        self._dense_layer_cache_build_diagonals = None
         for ptxt in self._bias_ptxt_cache.values():
             release = getattr(ptxt, "release", None)
             if callable(release):

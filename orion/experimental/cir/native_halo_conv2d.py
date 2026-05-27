@@ -28,6 +28,12 @@ def _ceil_div(left: int, right: int) -> int:
     return -(-int(left) // int(right))
 
 
+def _single_slot_layer_cache_enabled_for_scheme(scheme: Any) -> bool:
+    evaluator = getattr(scheme, "lt_evaluator", None)
+    enabled = getattr(evaluator, "single_slot_layer_cache_enabled", None)
+    return callable(enabled) and bool(enabled())
+
+
 def _pair(value: Any, *, default: tuple[int, int] = (1, 1)) -> tuple[int, int]:
     if value is None:
         return tuple(default)
@@ -916,9 +922,21 @@ class NativeHaloRelayoutKernel:
     def _iter_mappings(self):
         return self._iter_compact_to_native() if self.direction == "compact_to_native" else self._iter_native_to_compact()
 
-    def compile(self, scheme: Any, *, level: int) -> None:
-        self.cleanup(getattr(scheme, "backend", None))
-        slots = int(self.spec.slot_count)
+    def _diag_indices_by_block(self, slots: int) -> dict[tuple[int, int], tuple[int, ...]]:
+        indices: dict[tuple[int, int], set[int]] = {}
+        for source_index, output_index in self._iter_mappings():
+            input_block = int(source_index // int(slots))
+            output_block = int(output_index // int(slots))
+            source_local = int(source_index % int(slots))
+            output_local = int(output_index % int(slots))
+            diag_index = int((source_local - output_local) % int(slots))
+            indices.setdefault((int(output_block), int(input_block)), set()).add(int(diag_index))
+        return {
+            block: tuple(sorted(values)) if values else (0,)
+            for block, values in sorted(indices.items())
+        }
+
+    def _build_diagonals(self, slots: int) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
         diagonals: dict[tuple[int, int], dict[int, torch.Tensor]] = {}
         for source_index, output_index in self._iter_mappings():
             input_block = int(source_index // int(slots))
@@ -932,36 +950,61 @@ class NativeHaloRelayoutKernel:
                 diag = torch.zeros((int(slots),), dtype=torch.float32)
                 block[int(diag_index)] = diag
             diag[int(output_local)] = 1.0
+        return diagonals
+
+    def compile(self, scheme: Any, *, level: int) -> None:
+        self.cleanup(getattr(scheme, "backend", None))
+        slots = int(self.spec.slot_count)
         self.level = int(level)
-        self.diagonals = diagonals
+        if scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            self._dense_layer_cache_diag_indices_by_block = self._diag_indices_by_block(int(slots))
+            self._dense_layer_cache_build_diagonals = lambda self=self, slots=int(slots): self._build_diagonals(int(slots))
+            self.diagonals = {}
+        else:
+            self.diagonals = self._build_diagonals(int(slots))
         self.transform_ids = {
             (int(row), int(col)): int(transform_id)
             for (row, col), transform_id in scheme.lt_evaluator.generate_transforms(self).items()
         }
 
     def apply(self, source_ct: Any) -> Any:
-        if not self.transform_ids:
+        if not self.transform_ids and not getattr(self, "_dense_layer_cache_deferred", False):
             raise RuntimeError(f"native halo relayout kernel {self.name} has not been compiled")
         return source_ct.scheme.lt_evaluator.evaluate_transforms(self, source_ct)
 
+    def _diag_indices_for_metadata(self) -> dict[tuple[int, int], tuple[int, ...]]:
+        indices = getattr(self, "_dense_layer_cache_diag_indices_by_block", None)
+        if indices:
+            return {
+                (int(row), int(col)): tuple(int(value) for value in values)
+                for (row, col), values in dict(indices).items()
+            }
+        return {
+            (int(row), int(col)): tuple(int(value) for value in dict(block or {}).keys())
+            for (row, col), block in dict(self.diagonals or {}).items()
+        }
+
     def operation_estimate(self) -> dict[str, int | str]:
+        diag_indices = self._diag_indices_for_metadata()
         return {
             "kind": "native_halo_physical_relayout_lt",
-            "rotation_count": int(sum(len(block) for block in self.diagonals.values())),
+            "rotation_count": int(sum(len(block) for block in diag_indices.values())),
             "mask_mult_count": 0,
-            "sparse_lt_count": int(len(self.transform_ids) or 1),
+            "sparse_lt_count": int(len(diag_indices) or len(self.transform_ids) or 1),
         }
 
     def to_metadata(self) -> dict[str, Any]:
+        diag_indices = self._diag_indices_for_metadata()
+        block_keys = set(diag_indices) | set(dict(self.transform_ids or {}).keys())
         return {
             "direction": str(self.direction),
             "name": str(self.name),
             "level": None if self.level is None else int(self.level),
             "source_layout": dict(self.source_layout),
-            "rows": int(max((int(row) for row, _col in self.transform_ids), default=-1) + 1),
-            "cols": int(max((int(col) for _row, col in self.transform_ids), default=-1) + 1),
-            "lt_tasks": int(len(self.transform_ids)),
-            "diagonal_count": int(sum(len(block) for block in self.diagonals.values())),
+            "rows": int(max((int(row) for row, _col in block_keys), default=-1) + 1),
+            "cols": int(max((int(col) for _row, col in block_keys), default=-1) + 1),
+            "lt_tasks": int(len(block_keys)),
+            "diagonal_count": int(sum(len(block) for block in diag_indices.values())),
         }
 
     def cleanup(self, backend: Any | None) -> None:
@@ -975,6 +1018,8 @@ class NativeHaloRelayoutKernel:
                         pass
         self.transform_ids = {}
         self.diagonals = {}
+        self._dense_layer_cache_diag_indices_by_block = {}
+        self._dense_layer_cache_build_diagonals = None
 
 
 def _build_conv_transform(
@@ -989,6 +1034,7 @@ def _build_conv_transform(
     scheme: Any,
     group_n1: int,
     compact_target_block: int | None = None,
+    force_payload: bool = False,
 ) -> Any | None:
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
@@ -1137,6 +1183,69 @@ def _build_conv_transform(
         return None
     diag_indices = torch.div(keys, int(slots), rounding_mode="floor").to(dtype=torch.int64)
     output_slots = torch.remainder(keys, int(slots)).to(dtype=torch.int64)
+    target_index = (
+        int(compact_target_block)
+        if bool(compact_output)
+        else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
+    )
+    source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
+    diag_set = set(int(value) for value in torch.unique_consecutive(diag_indices).tolist())
+    if not diag_set:
+        return None
+    baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
+    if bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload)):
+        def build_diagonals(
+            *,
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            group_n1=int(group_n1),
+            compact_target_block=compact_target_block,
+        ):
+            rebuilt = _build_conv_transform(
+                spec=spec,
+                plan=plan,
+                weight=weight,
+                stripe=stripe,
+                source_group=int(source_group),
+                target_group=int(target_group),
+                level=int(level),
+                scheme=scheme,
+                group_n1=int(group_n1),
+                compact_target_block=compact_target_block,
+                force_payload=True,
+            )
+            if rebuilt is None:
+                return {}
+            return getattr(rebuilt, "diagonals", {})
+
+        return SimpleNamespace(
+            name=(
+                f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+                f"_tgt{int(target_group)}"
+                + ("" if not bool(compact_output) else f"_compact{int(compact_target_block)}")
+            ),
+            diagonals={},
+            _single_slot_diag_indices_by_block={(0, 0): tuple(sorted(int(value) for value in diag_set))},
+            _single_slot_build_diagonals=build_diagonals,
+            level=int(level),
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, int(slots)]),
+            output_shape=torch.Size([1, int(slots)]),
+            target_index=int(target_index),
+            input_id=f"native_source_tile_{int(source_index)}",
+            selected_n1=int(group_n1),
+            baby_shifts=tuple(sorted(int(value) for value in baby)),
+            giant_shifts=tuple(sorted(int(value) for value in giant)),
+            rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+            rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+        )
+
     diag_tensors: dict[int, torch.Tensor] = {}
     unique, counts = torch.unique_consecutive(diag_indices, return_counts=True)
     start = 0
@@ -1146,13 +1255,6 @@ def _build_conv_transform(
         diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
         diag_tensors[int(diag_value)] = diag
         start = int(end)
-    target_index = (
-        int(compact_target_block)
-        if bool(compact_output)
-        else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
-    )
-    source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
-    baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_tensors), slots=int(slots), n1=int(group_n1))
     return SimpleNamespace(
         name=(
             f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
@@ -1185,6 +1287,7 @@ def _build_conv_transforms_for_compact_output(
     level: int,
     scheme: Any,
     group_n1: int,
+    force_payload: bool = False,
 ) -> list[tuple[int, Any]]:
     slots = int(spec.slot_count)
     source_start = int(source_group) * int(plan.source_channel_tile)
@@ -1313,6 +1416,64 @@ def _build_conv_transforms_for_compact_output(
             continue
         diag_indices = torch.div(keys, int(slots), rounding_mode="floor").to(dtype=torch.int64)
         output_slots = torch.remainder(keys, int(slots)).to(dtype=torch.int64)
+        diag_set = set(int(value) for value in torch.unique_consecutive(diag_indices).tolist())
+        if not diag_set:
+            continue
+        baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
+        if bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload)):
+            def build_diagonals(
+                *,
+                target_block=int(target_block),
+                spec=spec,
+                plan=plan,
+                weight=weight,
+                stripe=stripe,
+                source_group=int(source_group),
+                target_group=int(target_group),
+                level=int(level),
+                scheme=scheme,
+                group_n1=int(group_n1),
+            ):
+                rebuilt = _build_conv_transforms_for_compact_output(
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    stripe=stripe,
+                    source_group=int(source_group),
+                    target_group=int(target_group),
+                    level=int(level),
+                    scheme=scheme,
+                    group_n1=int(group_n1),
+                    force_payload=True,
+                )
+                for rebuilt_target, rebuilt_transform in rebuilt:
+                    if int(rebuilt_target) == int(target_block):
+                        return getattr(rebuilt_transform, "diagonals", {})
+                return {}
+
+            transform = SimpleNamespace(
+                name=(
+                    f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+                    f"_tgt{int(target_group)}_compact{int(target_block)}"
+                ),
+                diagonals={},
+                _single_slot_diag_indices_by_block={(0, 0): tuple(sorted(int(value) for value in diag_set))},
+                _single_slot_build_diagonals=build_diagonals,
+                level=int(level),
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, int(slots)]),
+                output_shape=torch.Size([1, int(slots)]),
+                target_index=int(target_block),
+                input_id=f"native_source_tile_{int(source_index)}",
+                selected_n1=int(group_n1),
+                baby_shifts=tuple(sorted(int(value) for value in baby)),
+                giant_shifts=tuple(sorted(int(value) for value in giant)),
+                rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+                rotation_cost_owner=bool(int(target_group) == 0 and int(target_block) == 0),
+            )
+            transforms.append((int(target_block), transform))
+            continue
+
         diag_tensors: dict[int, torch.Tensor] = {}
         unique, counts = torch.unique_consecutive(diag_indices, return_counts=True)
         start = 0
@@ -1322,9 +1483,6 @@ def _build_conv_transforms_for_compact_output(
             diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
             diag_tensors[int(diag_value)] = diag
             start = int(end)
-        if not diag_tensors:
-            continue
-        baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_tensors), slots=int(slots), n1=int(group_n1))
         transform = SimpleNamespace(
             name=(
                 f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
@@ -1394,6 +1552,7 @@ def _build_compact_source_conv_transform(
     source_layout: dict[str, Any],
     group_n1: int,
     compact_target_block: int | None = None,
+    force_payload: bool = False,
 ) -> Any | None:
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
@@ -1543,6 +1702,71 @@ def _build_compact_source_conv_transform(
         return None
     diag_indices = torch.div(keys, int(slots), rounding_mode="floor").to(dtype=torch.int64)
     output_slots = torch.remainder(keys, int(slots)).to(dtype=torch.int64)
+    target_index = (
+        int(compact_target_block)
+        if bool(compact_output)
+        else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
+    )
+    diag_set = set(int(value) for value in torch.unique_consecutive(diag_indices).tolist())
+    if not diag_set:
+        return None
+    baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
+    single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
+    if bool(single_slot_recipe):
+        def build_diagonals(
+            *,
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=int(source_block),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            source_layout=dict(source_layout),
+            group_n1=int(group_n1),
+            compact_target_block=compact_target_block,
+        ):
+            rebuilt = _build_compact_source_conv_transform(
+                spec=spec,
+                plan=plan,
+                weight=weight,
+                stripe=stripe,
+                source_block=int(source_block),
+                target_group=int(target_group),
+                level=int(level),
+                scheme=scheme,
+                source_layout=dict(source_layout),
+                group_n1=int(group_n1),
+                compact_target_block=compact_target_block,
+                force_payload=True,
+            )
+            if rebuilt is None:
+                return {}
+            return getattr(rebuilt, "diagonals", {})
+
+        return SimpleNamespace(
+            name=(
+                f"native_halo_{spec.family_label}_compactsrc{int(source_block)}"
+                f"_s{int(stripe.index)}_tgt{int(target_group)}"
+                + ("" if not bool(compact_output) else f"_compact{int(compact_target_block)}")
+            ),
+            diagonals={},
+            _single_slot_diag_indices_by_block={(0, 0): tuple(sorted(int(value) for value in diag_set))},
+            _single_slot_build_diagonals=build_diagonals,
+            level=int(level),
+            scheme=scheme,
+            fhe_output_shape=torch.Size([1, int(slots)]),
+            output_shape=torch.Size([1, int(slots)]),
+            target_index=int(target_index),
+            input_id=f"compact_source_block_{int(source_block)}",
+            selected_n1=int(group_n1),
+            baby_shifts=tuple(sorted(int(value) for value in baby)),
+            giant_shifts=tuple(sorted(int(value) for value in giant)),
+            rotation_group_id=f"native_halo:{spec.family_label}:compact_src{int(source_block)}",
+            rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+        )
+
     diag_tensors: dict[int, torch.Tensor] = {}
     unique, counts = torch.unique_consecutive(diag_indices, return_counts=True)
     start = 0
@@ -1552,12 +1776,6 @@ def _build_compact_source_conv_transform(
         diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
         diag_tensors[int(diag_value)] = diag
         start = int(end)
-    target_index = (
-        int(compact_target_block)
-        if bool(compact_output)
-        else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
-    )
-    baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_tensors), slots=int(slots), n1=int(group_n1))
     return SimpleNamespace(
         name=(
             f"native_halo_{spec.family_label}_compactsrc{int(source_block)}"
@@ -1580,15 +1798,24 @@ def _build_compact_source_conv_transform(
 
 
 def _retune_transform_group_bsgs(transforms: list[Any], *, slots: int) -> None:
+    def diag_set_for(transform: Any) -> set[int]:
+        indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
+        if indices_by_block is not None:
+            values: set[int] = set()
+            for diag_indices in dict(indices_by_block).values():
+                values.update(int(value) for value in diag_indices)
+            return values
+        return set(int(value) for value in dict(transform.diagonals.get((0, 0), {})).keys())
+
     diag_sets = tuple(
-        set(int(value) for value in dict(transform.diagonals.get((0, 0), {})).keys())
+        diag_set_for(transform)
         for transform in transforms
     )
     if not diag_sets:
         return
     n1, _rotations, _baby_count, _giant_count = _native_best_common_bsgs(diag_sets, slots=int(slots))
     for transform in transforms:
-        diag_set = set(int(value) for value in dict(transform.diagonals.get((0, 0), {})).keys())
+        diag_set = diag_set_for(transform)
         baby, giant = _bsgs_rotation_sets(diag_set, slots=int(slots), n1=int(n1))
         transform.selected_n1 = int(n1)
         transform.baby_shifts = tuple(sorted(int(value) for value in baby))
@@ -1922,20 +2149,42 @@ class NativeHaloStripeNoRIConvExecutor:
         weight = getattr(self.module, "on_weight").detach()
         if int(getattr(self.module, "groups", 1) or 1) > 1:
             weight = packing.resolve_grouped_conv(self.module)
-        diagonals, output_rotations = packing.direct_diagonalize_conv2d(
-            self.module,
-            weight,
-            int(self.slots),
-            str(scheme.params.get_embedding_method()),
-            False,
-            allow_hybrid=False,
-        )
-        diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
+        single_slot = bool(_single_slot_layer_cache_enabled_for_scheme(scheme))
+        if bool(single_slot):
+            diagonals, output_rotations = packing.pack_conv2d_diagonal_indices(
+                self.module,
+                False,
+                allow_hybrid=False,
+            )
+        else:
+            diagonals, output_rotations = packing.direct_diagonalize_conv2d(
+                self.module,
+                weight,
+                int(self.slots),
+                str(scheme.params.get_embedding_method()),
+                False,
+                allow_hybrid=False,
+            )
+            diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         self.last_runtime_timing["build_transform_s"] = float(
             self.last_runtime_timing.get("build_transform_s", 0.0)
         ) + float(time.time() - build_started)
         if int(output_rotations) != 0:
             raise RuntimeError("compact-source provider diagonal generator does not support hybrid output rotations")
+
+        def build_block_diagonals(target_index: int, source_index: int):
+            packed, runtime_output_rotations = packing.direct_diagonalize_conv2d(
+                self.module,
+                weight,
+                int(self.slots),
+                str(scheme.params.get_embedding_method()),
+                False,
+                allow_hybrid=False,
+            )
+            if int(runtime_output_rotations) != 0:
+                raise RuntimeError("compact-source provider diagonal generator does not support hybrid output rotations")
+            block = dict(packed.get((int(target_index), int(source_index)), {}) or {})
+            return {(0, 0): block} if block else {}
 
         ordered_by_source: dict[int, list[tuple[int, Any]]] = {}
         for (target_index, source_index), diag_map in sorted(dict(diagonals).items()):
@@ -1943,11 +2192,13 @@ class NativeHaloStripeNoRIConvExecutor:
                 continue
             if int(target_index) < 0 or int(target_index) >= int(self.rows):
                 continue
-            diag_tensors = {int(index): value for index, value in dict(diag_map or {}).items()}
-            if not diag_tensors:
+            diag_indices = tuple(
+                sorted(int(index) for index in (diag_map if bool(single_slot) else dict(diag_map or {}).keys()))
+            )
+            if not diag_indices:
                 continue
             baby, giant = _bsgs_rotation_sets(
-                set(int(value) for value in diag_tensors),
+                set(int(value) for value in diag_indices),
                 slots=int(self.slots),
                 n1=1,
             )
@@ -1956,7 +2207,22 @@ class NativeHaloStripeNoRIConvExecutor:
                     f"native_halo_{self.native_plan.spec.family_label}"
                     f"_compact_dense_src{int(source_index)}_tgt{int(target_index)}"
                 ),
-                diagonals={(0, 0): {int(index): value for index, value in sorted(diag_tensors.items())}},
+                diagonals=(
+                    {}
+                    if bool(single_slot)
+                    else {(0, 0): {int(index): value for index, value in sorted(dict(diag_map or {}).items())}}
+                ),
+                _single_slot_diag_indices_by_block=({(0, 0): tuple(diag_indices)} if bool(single_slot) else None),
+                _single_slot_build_diagonals=(
+                    (
+                        lambda target_index=int(target_index), source_index=int(source_index): build_block_diagonals(
+                            int(target_index),
+                            int(source_index),
+                        )
+                    )
+                    if bool(single_slot)
+                    else None
+                ),
                 level=int(level),
                 scheme=scheme,
                 fhe_output_shape=torch.Size([1, int(self.slots)]),

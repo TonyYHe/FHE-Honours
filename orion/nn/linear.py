@@ -95,6 +95,17 @@ class LinearTransform(Module):
         self.diagonals = {}
         return True
 
+    def _install_single_slot_payload_recipe(self, *, diag_indices_by_block, build_diagonals) -> None:
+        indices = {
+            (int(row), int(col)): tuple(int(value) for value in values)
+            for (row, col), values in dict(diag_indices_by_block).items()
+        }
+        self._dense_layer_cache_diag_indices_by_block = indices
+        self._dense_layer_cache_build_diagonals = build_diagonals
+        self._single_slot_diag_indices_by_block = indices
+        self._single_slot_build_diagonals = build_diagonals
+        self.diagonals = {}
+
     def compile(self):
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
@@ -675,6 +686,11 @@ class Conv2d(LinearTransform):
             self.diagonals = {}
             self.output_rotations = 0
             return True
+        if self.scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            raise RuntimeError(
+                "ORION_SINGLE_SLOT_LAYER_CACHE requires unified concat fusion; "
+                "non-unified concat fallback would compile resident raw diagonals"
+            )
         self._concat_diagonals_by_input = []
         self._concat_transform_ids_by_input = []
         self._concat_output_rotations = 0
@@ -922,6 +938,14 @@ class Conv2d(LinearTransform):
             return
         if self.load_cached_transform_metadata():
             return
+        if self.scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            diag_indices, output_rotations = packing.pack_conv2d_diagonal_indices(self, bool(last))
+            self.output_rotations = int(output_rotations)
+            self._install_single_slot_payload_recipe(
+                diag_indices_by_block=diag_indices,
+                build_diagonals=lambda self=self, last=bool(last): packing.pack_conv2d(self, bool(last))[0],
+            )
+            return
         # Generate Toeplitz diagonals and determine the number of output
         # rotations if the `hybrid` packing method is used.
         self.diagonals, self.output_rotations = packing.pack_conv2d(self, last)
@@ -1087,6 +1111,14 @@ class ConvTranspose2d(LinearTransform):
             self.output_rotations = 0
             return
         if self.load_cached_transform_metadata():
+            return
+        if self.scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            diag_indices, output_rotations = packing.pack_conv_transpose2d_diagonal_indices(self, bool(last))
+            self.output_rotations = int(output_rotations)
+            self._install_single_slot_payload_recipe(
+                diag_indices_by_block=diag_indices,
+                build_diagonals=lambda self=self, last=bool(last): packing.pack_conv_transpose2d(self, bool(last))[0],
+            )
             return
         self.diagonals, self.output_rotations = packing.pack_conv_transpose2d(self, last)
         if self.get_io_mode() == "save":

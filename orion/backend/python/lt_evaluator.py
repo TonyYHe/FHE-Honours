@@ -572,7 +572,16 @@ class NewEvaluator:
             return False
         if bool(getattr(linear_layer, "_disable_dense_layer_cache", False)):
             return False
-        return bool(getattr(linear_layer, "diagonals", {}) or {})
+        return bool(
+            getattr(linear_layer, "diagonals", {})
+            or getattr(linear_layer, "_dense_layer_cache_diag_indices_by_block", None)
+        )
+
+    def _diag_indices_by_block_from_diagonals(self, diagonals) -> dict[tuple[int, int], tuple[int, ...]]:
+        return {
+            (int(row), int(col)): tuple(sorted(int(index) for index in dict(diags).keys()))
+            for (row, col), diags in dict(diagonals or {}).items()
+        }
 
     def _plan_linear_transform_rotation_key_requests(
         self,
@@ -637,26 +646,23 @@ class NewEvaluator:
         self._add_profile("key_prepare_s", time.perf_counter() - started)
 
     def _defer_dense_layer_cache_compile(self, linear_layer, diagonals, *, level: int, bsgs_ratio: float):
-        flatten_started = time.perf_counter()
-        items = list(diagonals.items())
-        workers = self._lt_worker_count(len(items))
-        if workers <= 1:
-            payloads = [self._build_block_payload(item) for item in items]
-        else:
-            futures = []
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-dense-layer-cache") as pool:
-                for index, item in enumerate(items):
-                    futures.append((index, pool.submit(self._build_block_payload, item)))
-                ordered = [None] * len(futures)
-                wait_started = time.perf_counter()
-                for index, future in futures:
-                    ordered[index] = future.result()
-                self._add_profile("wait_s", time.perf_counter() - wait_started)
-            payloads = list(ordered)
-        self._add_profile("diag_generate_s", time.perf_counter() - flatten_started)
+        plan_started = time.perf_counter()
+        diag_indices_by_block = getattr(linear_layer, "_dense_layer_cache_diag_indices_by_block", None)
+        build_diagonals = getattr(linear_layer, "_dense_layer_cache_build_diagonals", None)
+        if diag_indices_by_block is None or not callable(build_diagonals):
+            raise RuntimeError(
+                f"ORION_SINGLE_SLOT_LAYER_CACHE dense layer {getattr(linear_layer, 'name', '<unnamed>')} "
+                "requires diagonal-index metadata and a runtime diagonal recipe; compile must not retain raw payloads"
+            )
+        diag_indices_by_block = {
+            (int(row), int(col)): tuple(int(value) for value in values)
+            for (row, col), values in dict(diag_indices_by_block).items()
+        }
+        linear_layer._dense_layer_cache_diag_indices_by_block = dict(diag_indices_by_block)
+        self._add_profile("diag_generate_s", time.perf_counter() - plan_started)
 
         key_requests: dict[int, int | None] = {}
-        for _row, _col, diag_idxs, _diag_data in payloads:
+        for _block, diag_idxs in sorted(diag_indices_by_block.items()):
             for key, key_level in self._plan_linear_transform_rotation_key_requests(
                 diag_idxs,
                 level=int(level),
@@ -670,7 +676,6 @@ class NewEvaluator:
         self.generate_rotation_key_requests(tuple(sorted((int(key), key_level) for key, key_level in key_requests.items())))
 
         linear_layer._dense_layer_cache_deferred = True
-        linear_layer._dense_layer_cache_payloads = tuple(payloads)
         linear_layer._dense_layer_cache_level = int(level)
         linear_layer._dense_layer_cache_bsgs_ratio = float(bsgs_ratio)
         linear_layer._dense_layer_cache_active_transform_ids = {}
@@ -1043,23 +1048,61 @@ class NewEvaluator:
             and not getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {})
         )
 
+    def _dense_layer_cache_build_payloads(self, linear_layer):
+        build_diagonals = getattr(linear_layer, "_dense_layer_cache_build_diagonals", None)
+        if not callable(build_diagonals):
+            raise RuntimeError(
+                f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no payload recipe"
+            )
+        diagonals = build_diagonals()
+        diag_indices_by_block = dict(getattr(linear_layer, "_dense_layer_cache_diag_indices_by_block", {}) or {})
+        if not diag_indices_by_block:
+            diag_indices_by_block = self._diag_indices_by_block_from_diagonals(diagonals)
+        items = []
+        for block, diag_idxs in sorted(diag_indices_by_block.items()):
+            row, col = (int(value) for value in block)
+            source = dict(diagonals.get((int(row), int(col)), {}) or {})
+            if not source:
+                slots = int(getattr(self.params, "get_slots", lambda: 0)() or 0)
+                source = {0: np.zeros((int(slots),), dtype=np.float32)}
+            items.append(((int(row), int(col)), source))
+
+        workers = self._lt_worker_count(len(items))
+        if workers <= 1:
+            return [self._build_block_payload(item) for item in items]
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-dense-layer-cache-materialize") as pool:
+            for index, item in enumerate(items):
+                futures.append((index, pool.submit(self._build_block_payload, item)))
+            ordered = [None] * len(futures)
+            wait_started = time.perf_counter()
+            for index, future in futures:
+                ordered[index] = future.result()
+            self._add_profile("wait_s", time.perf_counter() - wait_started)
+        return list(ordered)
+
     def materialize_dense_layer_cache(self, linear_layer) -> dict[str, float]:
         if not self.dense_layer_cache_needs_materialize(linear_layer):
             return {
                 "layer_cache_encode_s": 0.0,
                 "layer_cache_key_prepare_s": 0.0,
             }
-        payloads = tuple(getattr(linear_layer, "_dense_layer_cache_payloads", ()) or ())
+        payloads = tuple(self._dense_layer_cache_build_payloads(linear_layer))
         if not payloads:
             raise RuntimeError(f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no payloads")
         started = time.perf_counter()
-        batch_results = self._generate_transforms_from_payloads_batch(
-            payloads,
-            level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
-            bsgs_ratio=float(getattr(linear_layer, "_dense_layer_cache_bsgs_ratio", linear_layer.bsgs_ratio)),
-            io_mode="none",
-            add_compile_profile=False,
-        )
+        try:
+            batch_results = self._generate_transforms_from_payloads_batch(
+                payloads,
+                level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
+                bsgs_ratio=float(getattr(linear_layer, "_dense_layer_cache_bsgs_ratio", linear_layer.bsgs_ratio)),
+                io_mode="none",
+                add_compile_profile=False,
+            )
+        finally:
+            del payloads
+            gc.collect()
         transform_ids = {
             (int(row), int(col)): int(transform_id)
             for row, col, _diag_idxs, transform_id in batch_results
@@ -1117,8 +1160,11 @@ class NewEvaluator:
         if not active:
             return 0.0
         started = time.perf_counter()
+        remove_plaintexts = getattr(self.backend, "RemovePlaintextDiagonals", None)
         for transform_id in active.values():
             try:
+                if callable(remove_plaintexts):
+                    remove_plaintexts(int(transform_id))
                 self.backend.DeleteLinearTransform(int(transform_id))
             except Exception:
                 pass

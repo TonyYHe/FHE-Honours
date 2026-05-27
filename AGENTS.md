@@ -12,7 +12,7 @@ Start here:
 The mainline is:
 
 1. Prove dense resident Orion is memory-prohibitive on exact U22+output worst layers.
-2. Build a strong Orion dense single-slot layer-cache baseline: compile keeps raw diagonal payloads, runtime materializes one dense op at a time, BSGS is preserved inside each independent LT, and compute time is reported layer-by-layer with total I/O excluded.
+2. Build a strong Orion dense single-slot layer-cache baseline: compile keeps diagonal-index metadata and runtime diagonal recipes, runtime materializes one dense op at a time without resident raw payloads or encoded plaintexts, BSGS is preserved inside each independent LT, and compute time is reported layer-by-layer with total I/O excluded.
 3. Compare that baseline against HaloED provider layer-by-layer with the same reporting convention.
 4. Keep RAM and feasibility evidence separate from compute-time comparisons.
 
@@ -21,6 +21,9 @@ not use removed aliases or dense shared-LT knobs.  Dense Orion executes
 independent LTs; HaloED/provider uses grouped provider kernels where the
 provider lowering exposes shared-source structure.  ConvTranspose2d stays on
 the common dense path for both dense and provider modes.
+Kernel-level benchmarks remain resident by default; single-slot is only for
+full-network/E2E memory-bounded evaluation unless a task explicitly says
+otherwise.
 
 ## Exact U22 Model
 

@@ -443,6 +443,7 @@ def _config(*, backend: str) -> dict[str, Any]:
 
 
 def _init_scheme(*, backend: str) -> None:
+    os.environ["ORION_SINGLE_SLOT_LAYER_CACHE"] = "0"
     scheme.init_scheme(_config(backend=str(backend)))
     Module.set_scheme(scheme)
     Module.set_margin(scheme.params.get_margin())
@@ -806,6 +807,7 @@ def _env_snapshot() -> dict[str, str]:
         "ORION_UNIFIED_STREAM_COMPILE_IO_NONE",
         "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE",
         "ORION_LATTIGO_MEMORY_BOUNDED_EVAL",
+        "ORION_SINGLE_SLOT_LAYER_CACHE",
         "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
         "ORION_LT_COMPILE_WORKERS",
         "ORION_LATTIGO_COMPILE_WORKERS",
@@ -825,6 +827,7 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated["ORION_UNIFIED_STREAM_COMPILE_IO_NONE"] = "0"
     updated["ORION_LATTIGO_MEMORY_BOUNDED_COMPILE"] = "0"
     updated["ORION_LATTIGO_MEMORY_BOUNDED_EVAL"] = "0"
+    updated["ORION_SINGLE_SLOT_LAYER_CACHE"] = "0"
     updated.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", str(cpu_count))
     updated.setdefault("ORION_CONCAT_FUSION", "0")
     return updated

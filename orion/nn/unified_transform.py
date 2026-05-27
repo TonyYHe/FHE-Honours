@@ -175,6 +175,7 @@ class UnifiedTransformGroup:
         self._single_slot_deferred = False
         self._single_slot_active_backend = None
         self._single_slot_payloads: list[tuple[np.ndarray, np.ndarray, int]] | None = None
+        self._single_slot_recipes: list[tuple[np.ndarray, int, Any]] | None = None
         self._single_slot_has_complex = False
         self.memory_trace: list[dict[str, Any]] = []
         self.last_runtime_timing: dict[str, Any] = self._empty_runtime_timing()
@@ -232,38 +233,50 @@ class UnifiedTransformGroup:
     def _set_compile_profile(self, key: str, value: Any) -> None:
         self.last_compile_profile[str(key)] = value
 
-    def _prepare_single_slot_payloads(self) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], bool, dict[str, Any], float]:
+    def _diag_indices_for_single_slot_transform(self, transform) -> np.ndarray:
+        indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
+        if indices_by_block is None:
+            indices_by_block = getattr(transform, "_dense_layer_cache_diag_indices_by_block", None)
+        values: set[int] = set()
+        if indices_by_block is not None:
+            for diag_indices in dict(indices_by_block).values():
+                values.update(int(value) for value in diag_indices)
+        else:
+            raise RuntimeError(
+                "ORION_SINGLE_SLOT_LAYER_CACHE unified/provider transforms require "
+                "_single_slot_diag_indices_by_block metadata; compile must not scan raw diagonals"
+            )
+        if not values:
+            raise ValueError("all transforms must have generated diagonal indices before unified compilation")
+        return np.asarray(sorted(values), dtype=np.int32)
+
+    def _prepare_single_slot_recipes(self) -> tuple[list[tuple[np.ndarray, int, Any]], bool, dict[str, Any], float]:
         complex_started = time.perf_counter()
         has_complex = self._transforms_have_complex_diagonals()
         detect_complex_s = float(time.perf_counter() - complex_started)
-        flatten_workers = int(_single_slot_encode_workers(len(self.transforms)))
-        flatten_started = time.perf_counter()
-        if flatten_workers > 1 and len(self.transforms) > 1:
-            with ThreadPoolExecutor(
-                max_workers=int(flatten_workers),
-                thread_name_prefix="orion-single-slot-raw",
-            ) as executor:
-                payloads = list(
-                    executor.map(
-                        lambda transform: self._flatten_transform_diagonals(transform, has_complex=has_complex),
-                        self.transforms,
-                    )
+        started = time.perf_counter()
+        recipes: list[tuple[np.ndarray, int, Any]] = []
+        for transform in self.transforms:
+            build_diagonals = getattr(transform, "_single_slot_build_diagonals", None)
+            if not callable(build_diagonals):
+                raise RuntimeError(
+                    "ORION_SINGLE_SLOT_LAYER_CACHE unified/provider transforms require "
+                    "_single_slot_build_diagonals recipe; raw diagonals must not be captured at compile"
                 )
-        else:
-            payloads = [
-                self._flatten_transform_diagonals(transform, has_complex=has_complex)
-                for transform in self.transforms
-            ]
-        flatten_s = float(time.perf_counter() - flatten_started)
+            level = getattr(transform, "level", None)
+            if level is None:
+                level = len(transform.scheme.params.get_logq()) - 1
+            recipes.append((self._diag_indices_for_single_slot_transform(transform), int(level), transform))
+        plan_s = float(time.perf_counter() - started)
         profile = {
             "has_complex": bool(has_complex),
-            "worker_count": int(flatten_workers),
-            "diag_index_count": int(sum(int(payload[0].size) for payload in payloads)),
-            "diag_data_count": int(sum(int(payload[1].size) for payload in payloads)),
-            "payload_bytes": int(sum(int(payload[0].nbytes + payload[1].nbytes) for payload in payloads)),
+            "worker_count": 0,
+            "diag_index_count": int(sum(int(recipe[0].size) for recipe in recipes)),
+            "diag_data_count": 0,
+            "payload_bytes": 0,
             "detect_complex_s": float(detect_complex_s),
         }
-        return payloads, bool(has_complex), profile, float(flatten_s)
+        return recipes, bool(has_complex), profile, float(plan_s)
 
     def _plan_single_slot_rotation_keys(self, backend, payloads) -> tuple[tuple[int, int | None], ...]:
         planner = getattr(backend, "PlanLinearTransformsUnifiedRotationKeys", None)
@@ -273,7 +286,9 @@ class UnifiedTransformGroup:
             diag_idxs_lens = (ctypes.c_int * count)()
             levels = (ctypes.c_int * count)()
             owned_arrays: list[object] = [levels]
-            for index, (diag_idxs, _diag_data, level) in enumerate(payloads):
+            for index, payload in enumerate(payloads):
+                diag_idxs = payload[0]
+                level = payload[2] if len(payload) >= 3 and isinstance(payload[2], (int, np.integer)) else payload[1]
                 idx_array = np.ascontiguousarray(diag_idxs, dtype=np.int32)
                 owned_arrays.append(idx_array)
                 diag_idxs_ptrs[index] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
@@ -282,16 +297,17 @@ class UnifiedTransformGroup:
             keys = planner(int(count), diag_idxs_ptrs, diag_idxs_lens, levels)
             del owned_arrays
             return tuple((int(key), None) for key in keys)
-
-        keys: dict[int, int | None] = {}
-        for diag_idxs, _diag_data, _level in payloads:
-            for key in np.asarray(diag_idxs, dtype=np.int32).reshape(-1):
-                keys[int(key)] = None
-        return tuple(sorted((int(key), level) for key, level in keys.items()))
+        if payloads:
+            raise RuntimeError(
+                "ORION_SINGLE_SLOT_LAYER_CACHE requires backend PlanLinearTransformsUnifiedRotationKeys "
+                "for unified/provider groups"
+            )
+        return ()
 
     def _defer_single_slot_compile(self, backend, *, started_at: float) -> None:
-        payloads, has_complex, raw_profile, flatten_s = self._prepare_single_slot_payloads()
-        self._single_slot_payloads = payloads
+        recipes, has_complex, raw_profile, plan_s = self._prepare_single_slot_recipes()
+        self._single_slot_recipes = recipes
+        self._single_slot_payloads = None
         self._single_slot_has_complex = bool(has_complex)
         self._set_compile_profile("mode", "single_slot_deferred")
         self._set_compile_profile("has_complex", bool(raw_profile["has_complex"]))
@@ -303,12 +319,12 @@ class UnifiedTransformGroup:
         self._set_compile_profile("diag_data_count", int(raw_profile["diag_data_count"]))
         self._set_compile_profile("payload_bytes", int(raw_profile["payload_bytes"]))
         self._set_compile_profile("detect_complex_s", float(raw_profile["detect_complex_s"]))
-        self._set_compile_profile("flatten_s", float(flatten_s))
+        self._set_compile_profile("flatten_s", float(plan_s))
         self.unified_ids = None
         self._diag_indices_by_transform = {}
         self._storage_name_by_transform = {}
         plan_keys_started = time.perf_counter()
-        self._required_keys = self._plan_single_slot_rotation_keys(backend, payloads)
+        self._required_keys = self._plan_single_slot_rotation_keys(backend, recipes)
         self._required_keys_by_transform = {}
         self._add_compile_profile("record_keys_s", time.perf_counter() - plan_keys_started)
         rotation_key_started = time.perf_counter()
@@ -399,30 +415,66 @@ class UnifiedTransformGroup:
                 "layer_cache_encode_s": 0.0,
                 "layer_cache_key_prepare_s": 0.0,
             }
-        payloads = self._single_slot_payloads
-        if payloads is None:
-            payloads, has_complex, _raw_profile, _flatten_s = self._prepare_single_slot_payloads()
-            self._single_slot_payloads = payloads
-            self._single_slot_has_complex = bool(has_complex)
         started = time.perf_counter()
+        recipes = self._single_slot_recipes
+        if recipes is None:
+            recipes, has_complex, _raw_profile, _plan_s = self._prepare_single_slot_recipes()
+            self._single_slot_recipes = recipes
+            self._single_slot_has_complex = bool(has_complex)
+        flatten_workers = int(_single_slot_encode_workers(len(self.transforms)))
+        if flatten_workers > 1 and len(self.transforms) > 1:
+            with ThreadPoolExecutor(
+                max_workers=int(flatten_workers),
+                thread_name_prefix="orion-single-slot-materialize",
+            ) as executor:
+                payloads = list(
+                    executor.map(
+                        lambda transform: self._flatten_transform_diagonals(
+                            transform,
+                            has_complex=bool(self._single_slot_has_complex),
+                            require_recipe=True,
+                        ),
+                        self.transforms,
+                    )
+                )
+        else:
+            payloads = [
+                self._flatten_transform_diagonals(
+                    transform,
+                    has_complex=bool(self._single_slot_has_complex),
+                    require_recipe=True,
+                )
+                for transform in self.transforms
+            ]
+        for transform in self.transforms:
+            release_cache = getattr(transform, "_single_slot_release_diagonal_cache", None)
+            if callable(release_cache):
+                try:
+                    release_cache()
+                except Exception:
+                    pass
         self.last_compile_profile = self._empty_compile_profile()
         self._record_memory_event("before_single_slot_layer_encode", backend, ())
         self._set_compile_profile("mode", "single_slot_materialize")
         self._set_compile_profile("has_complex", bool(self._single_slot_has_complex))
-        self._set_compile_profile("worker_count", int(_single_slot_encode_workers(len(self.transforms))))
-        self.unified_ids = self._generate_unified_backend_batch(
-            backend,
-            list(payloads),
-            has_complex=bool(self._single_slot_has_complex),
-        )
-        self._diag_indices_by_transform = {
-            int(transform_id): tuple(int(idx) for idx in diag_idxs)
-            for transform_id, (diag_idxs, _diag_data, _level) in zip(self.unified_ids, payloads)
-        }
-        self._storage_name_by_transform = {
-            int(transform_id): str(int(transform_id))
-            for transform_id in self.unified_ids
-        }
+        self._set_compile_profile("worker_count", int(flatten_workers))
+        try:
+            self.unified_ids = self._generate_unified_backend_batch(
+                backend,
+                list(payloads),
+                has_complex=bool(self._single_slot_has_complex),
+            )
+            self._diag_indices_by_transform = {
+                int(transform_id): tuple(int(idx) for idx in diag_idxs)
+                for transform_id, (diag_idxs, _diag_data, _level) in zip(self.unified_ids, payloads)
+            }
+            self._storage_name_by_transform = {
+                int(transform_id): str(int(transform_id))
+                for transform_id in self.unified_ids
+            }
+        finally:
+            del payloads
+            gc.collect()
         encode_s = float(time.perf_counter() - started)
         rotation_key_started = time.perf_counter()
         key_prepare_s = float(time.perf_counter() - rotation_key_started)
@@ -451,7 +503,13 @@ class UnifiedTransformGroup:
         started = time.perf_counter()
         ids = [int(value) for value in (self.unified_ids or ())]
         self._io_prefetcher.clear(wait=True)
+        remove_plaintexts = getattr(backend, "RemovePlaintextDiagonals", None)
         for transform_id in ids:
+            if callable(remove_plaintexts):
+                try:
+                    remove_plaintexts(int(transform_id))
+                except Exception:
+                    pass
             backend.DeleteLinearTransform(int(transform_id))
         self._forward_memory_guard(
             backend,
@@ -2302,6 +2360,8 @@ class UnifiedTransformGroup:
 
     def _transforms_have_complex_diagonals(self) -> bool:
         for transform in self.transforms:
+            if bool(getattr(transform, "_single_slot_has_complex_diagonals", False)):
+                return True
             for _block_key, block_diags in getattr(transform, "diagonals", {}).items():
                 for _diag_idx, diag_values in block_diags.items():
                     if isinstance(diag_values, torch.Tensor):
@@ -2311,9 +2371,24 @@ class UnifiedTransformGroup:
                         return True
         return False
 
-    def _flatten_transform_diagonals(self, transform, *, has_complex: bool) -> tuple[np.ndarray, np.ndarray, int]:
+    def _flatten_transform_diagonals(
+        self,
+        transform,
+        *,
+        has_complex: bool,
+        require_recipe: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         all_diagonals: dict[int, torch.Tensor] = {}
-        for _block_key, block_diags in getattr(transform, "diagonals", {}).items():
+        build_diagonals = getattr(transform, "_single_slot_build_diagonals", None)
+        if callable(build_diagonals):
+            source_diagonals = build_diagonals()
+        elif bool(require_recipe):
+            raise RuntimeError(
+                "ORION_SINGLE_SLOT_LAYER_CACHE unified/provider transforms require a runtime diagonal recipe"
+            )
+        else:
+            source_diagonals = getattr(transform, "diagonals", {})
+        for _block_key, block_diags in dict(source_diagonals or {}).items():
             for diag_idx, diag_values in block_diags.items():
                 if isinstance(diag_values, torch.Tensor):
                     values = diag_values.detach().reshape(-1)
@@ -2870,6 +2945,7 @@ class UnifiedTransformGroup:
         self._single_slot_deferred = False
         self._single_slot_active_backend = None
         self._single_slot_payloads = None
+        self._single_slot_recipes = None
         self._single_slot_has_complex = False
         self._storage_name_by_transform = {}
         self._prefetch_host_bytes = None
@@ -3099,6 +3175,7 @@ class UnifiedTransformGroup:
                 return self._evaluate_unified_memory_bounded(int(ct_input_id), backend)
         if (
             len(self.unified_ids) == 1
+            and not bool(self._single_slot_layer_cache)
             and not self._should_offload_rotation_keys()
             and not self._offloaded_plaintext_diagonals
             and callable(getattr(backend, "EvaluateLinearTransform", None))
@@ -3569,6 +3646,7 @@ class UnifiedTransformGroup:
         self._single_slot_deferred = False
         self._single_slot_active_backend = None
         self._single_slot_payloads = None
+        self._single_slot_recipes = None
         self._single_slot_has_complex = False
 
 
@@ -3577,4 +3655,12 @@ def can_use_unified_bsgs(layers: List) -> bool:
 
     if len(layers) < 2:
         return False
-    return all(isinstance(layer, LinearTransform) and bool(getattr(layer, "diagonals", {})) for layer in layers)
+    return all(
+        isinstance(layer, LinearTransform)
+        and bool(
+            getattr(layer, "diagonals", {})
+            or getattr(layer, "_single_slot_diag_indices_by_block", None)
+            or getattr(layer, "_dense_layer_cache_diag_indices_by_block", None)
+        )
+        for layer in layers
+    )

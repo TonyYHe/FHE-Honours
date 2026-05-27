@@ -34,6 +34,71 @@ def _delete_ciphertext_ids(scheme: Any, ids: list[int]) -> None:
             pass
 
 
+def _single_slot_layer_cache_enabled(scheme: Any) -> bool:
+    evaluator = getattr(scheme, "lt_evaluator", None)
+    enabled = getattr(evaluator, "single_slot_layer_cache_enabled", None)
+    return callable(enabled) and bool(enabled())
+
+
+def _primary_diag_indices(transform: Any | None) -> tuple[int, ...]:
+    if transform is None:
+        return ()
+    indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
+    if indices_by_block:
+        values: set[int] = set()
+        for diag_indices in dict(indices_by_block).values():
+            values.update(int(value) for value in diag_indices)
+        return tuple(sorted(values))
+    return tuple(
+        sorted(
+            int(key)
+            for key in dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {}).keys()
+        )
+    )
+
+
+def _diag_key_stub(diag_indices: Any) -> dict[int, torch.Tensor]:
+    return {int(index): torch.empty((0,), dtype=torch.float32) for index in diag_indices}
+
+
+def _release_single_slot_cache(transform: Any | None) -> None:
+    if transform is None:
+        return
+    release = getattr(transform, "_single_slot_release_diagonal_cache", None)
+    if callable(release):
+        release()
+
+
+def _runtime_primary_diagonals(transform: Any | None) -> dict[int, Any]:
+    if transform is None:
+        return {}
+    build = getattr(transform, "_single_slot_build_diagonals", None)
+    if callable(build):
+        return dict(build().get((0, 0), {}) or {})
+    return dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
+
+
+def _conv2d_block_runtime_recipe(module: Any):
+    cache: dict[str, Any] = {}
+
+    def packed_diagonals():
+        packed = cache.get("diagonals")
+        if packed is None:
+            packed, _output_rotations = packing.pack_conv2d(module, last=False)
+            packed = packing.prune_zero_diagonal_blocks(packed, preserve_empty_rows=True)
+            cache["diagonals"] = packed
+        return packed
+
+    def build_block(row: int, col: int):
+        block = dict(packed_diagonals().get((int(row), int(col)), {}) or {})
+        return {(0, 0): block} if block else {}
+
+    def release():
+        cache.clear()
+
+    return build_block, release
+
+
 def _transform_proxy(
     *,
     name: str,
@@ -44,10 +109,22 @@ def _transform_proxy(
     input_id: str,
     slots: int,
     scheme: Any,
+    diag_indices: tuple[int, ...] | None = None,
+    build_diagonals: Any | None = None,
+    release_diagonal_cache: Any | None = None,
 ) -> Any:
+    if callable(build_diagonals):
+        indices = tuple(sorted(int(value) for value in (diag_indices or diagonals.keys())))
+        diagonal_payload = _diag_key_stub(indices)
+    else:
+        indices = tuple(sorted(int(value) for value in diagonals.keys()))
+        diagonal_payload = dict(diagonals)
     return SimpleNamespace(
         name=str(name),
-        diagonals={(0, 0): dict(diagonals)},
+        diagonals={(0, 0): diagonal_payload},
+        _single_slot_diag_indices_by_block=({(0, 0): indices} if callable(build_diagonals) else None),
+        _single_slot_build_diagonals=build_diagonals,
+        _single_slot_release_diagonal_cache=release_diagonal_cache,
         level=int(level),
         scheme=scheme,
         fhe_output_shape=torch.Size([1, int(slots)]),
@@ -97,17 +174,48 @@ def _merge_input_pair_to_complex(left: Any | None, right: Any | None, *, name: s
     if not hybrid_pair_schedule_compatible(left, right, int(slots)):
         reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
         raise ValueError(f"input-pair hybrid merge requires identical schedules: {reason}")
-    left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
-    right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
-    keys = sorted(set(int(key) for key in left_diags) | set(int(key) for key in right_diags))
-    merged: dict[int, torch.Tensor] = {}
-    for key in keys:
-        left_tensor = _diag_tensor(left_diags.get(int(key)), slots=int(slots))
-        right_tensor = _diag_tensor(right_diags.get(int(key)), slots=int(slots))
-        merged[int(key)] = left_tensor.to(dtype=torch.complex64) * 0.5 - 1j * right_tensor.to(dtype=torch.complex64) * 0.5
+    single_slot = bool(
+        callable(getattr(left, "_single_slot_build_diagonals", None))
+        or callable(getattr(right, "_single_slot_build_diagonals", None))
+    )
+    if bool(single_slot):
+        keys = sorted(set(_primary_diag_indices(left)) | set(_primary_diag_indices(right)))
+
+        def build_diagonals(left=left, right=right, slots=int(slots)):
+            left_diags = _runtime_primary_diagonals(left)
+            right_diags = _runtime_primary_diagonals(right)
+            merged: dict[int, torch.Tensor] = {}
+            for key in sorted(set(int(value) for value in left_diags) | set(int(value) for value in right_diags)):
+                left_tensor = _diag_tensor(left_diags.get(int(key)), slots=int(slots))
+                right_tensor = _diag_tensor(right_diags.get(int(key)), slots=int(slots))
+                merged[int(key)] = (
+                    left_tensor.to(dtype=torch.complex64) * 0.5
+                    - 1j * right_tensor.to(dtype=torch.complex64) * 0.5
+                )
+            return {(0, 0): merged}
+
+        diagonal_payload = _diag_key_stub(keys)
+    else:
+        left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
+        right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
+        keys = sorted(set(int(key) for key in left_diags) | set(int(key) for key in right_diags))
+        merged: dict[int, torch.Tensor] = {}
+        for key in keys:
+            left_tensor = _diag_tensor(left_diags.get(int(key)), slots=int(slots))
+            right_tensor = _diag_tensor(right_diags.get(int(key)), slots=int(slots))
+            merged[int(key)] = left_tensor.to(dtype=torch.complex64) * 0.5 - 1j * right_tensor.to(dtype=torch.complex64) * 0.5
+        diagonal_payload = merged
+        build_diagonals = None
     return SimpleNamespace(
         name=str(name),
-        diagonals={(0, 0): merged},
+        diagonals={(0, 0): diagonal_payload},
+        _single_slot_diag_indices_by_block=({(0, 0): tuple(int(value) for value in keys)} if bool(single_slot) else None),
+        _single_slot_build_diagonals=build_diagonals,
+        _single_slot_has_complex_diagonals=bool(single_slot),
+        _single_slot_release_diagonal_cache=lambda left=left, right=right: (
+            _release_single_slot_cache(left),
+            _release_single_slot_cache(right),
+        ),
         level=int(anchor.level),
         scheme=anchor.scheme,
         fhe_output_shape=anchor.fhe_output_shape,
@@ -123,17 +231,48 @@ def _merge_branch_pair_to_complex(real_transform: Any | None, imag_transform: An
         raise ValueError("at least one branch transform is required")
     anchor = real_transform if real_transform is not None else imag_transform
     slots = int(anchor.fhe_output_shape[-1])
-    real_diags = dict(getattr(real_transform, "diagonals", {}).get((0, 0), {})) if real_transform is not None else {}
-    imag_diags = dict(getattr(imag_transform, "diagonals", {}).get((0, 0), {})) if imag_transform is not None else {}
-    keys = sorted(set(int(key) for key in real_diags) | set(int(key) for key in imag_diags))
-    merged: dict[int, torch.Tensor] = {}
-    for key in keys:
-        real_tensor = _diag_tensor(real_diags.get(int(key)), slots=int(slots))
-        imag_tensor = _diag_tensor(imag_diags.get(int(key)), slots=int(slots))
-        merged[int(key)] = (real_tensor.to(dtype=torch.complex64) + 1j * imag_tensor.to(dtype=torch.complex64)) * 0.5
+    single_slot = bool(
+        callable(getattr(real_transform, "_single_slot_build_diagonals", None))
+        or callable(getattr(imag_transform, "_single_slot_build_diagonals", None))
+    )
+    if bool(single_slot):
+        keys = sorted(set(_primary_diag_indices(real_transform)) | set(_primary_diag_indices(imag_transform)))
+
+        def build_diagonals(real_transform=real_transform, imag_transform=imag_transform, slots=int(slots)):
+            real_diags = _runtime_primary_diagonals(real_transform)
+            imag_diags = _runtime_primary_diagonals(imag_transform)
+            merged: dict[int, torch.Tensor] = {}
+            for key in sorted(set(int(value) for value in real_diags) | set(int(value) for value in imag_diags)):
+                real_tensor = _diag_tensor(real_diags.get(int(key)), slots=int(slots))
+                imag_tensor = _diag_tensor(imag_diags.get(int(key)), slots=int(slots))
+                merged[int(key)] = (
+                    real_tensor.to(dtype=torch.complex64)
+                    + 1j * imag_tensor.to(dtype=torch.complex64)
+                ) * 0.5
+            return {(0, 0): merged}
+
+        diagonal_payload = _diag_key_stub(keys)
+    else:
+        real_diags = dict(getattr(real_transform, "diagonals", {}).get((0, 0), {})) if real_transform is not None else {}
+        imag_diags = dict(getattr(imag_transform, "diagonals", {}).get((0, 0), {})) if imag_transform is not None else {}
+        keys = sorted(set(int(key) for key in real_diags) | set(int(key) for key in imag_diags))
+        merged: dict[int, torch.Tensor] = {}
+        for key in keys:
+            real_tensor = _diag_tensor(real_diags.get(int(key)), slots=int(slots))
+            imag_tensor = _diag_tensor(imag_diags.get(int(key)), slots=int(slots))
+            merged[int(key)] = (real_tensor.to(dtype=torch.complex64) + 1j * imag_tensor.to(dtype=torch.complex64)) * 0.5
+        diagonal_payload = merged
+        build_diagonals = None
     return SimpleNamespace(
         name=str(name),
-        diagonals={(0, 0): merged},
+        diagonals={(0, 0): diagonal_payload},
+        _single_slot_diag_indices_by_block=({(0, 0): tuple(int(value) for value in keys)} if bool(single_slot) else None),
+        _single_slot_build_diagonals=build_diagonals,
+        _single_slot_has_complex_diagonals=bool(single_slot),
+        _single_slot_release_diagonal_cache=lambda real_transform=real_transform, imag_transform=imag_transform: (
+            _release_single_slot_cache(real_transform),
+            _release_single_slot_cache(imag_transform),
+        ),
         level=int(anchor.level),
         scheme=anchor.scheme,
         fhe_output_shape=anchor.fhe_output_shape,
@@ -420,6 +559,12 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         prepare_started = time.perf_counter()
         diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
         diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
+        single_slot = bool(_single_slot_layer_cache_enabled(scheme))
+        runtime_block_builder, release_runtime_cache = (
+            _conv2d_block_runtime_recipe(self.module)
+            if bool(single_slot)
+            else (None, None)
+        )
         keys = sorted((int(row), int(col)) for row, col in diagonals)
         self.rows = 0 if not keys else max(row for row, _col in keys) + 1
         self.cols = 0 if not keys else max(col for _row, col in keys) + 1
@@ -437,6 +582,18 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                 input_id=f"input_{int(col)}",
                 slots=int(slots),
                 scheme=scheme,
+                diag_indices=tuple(sorted(int(index) for index in dict(diag).keys())),
+                build_diagonals=(
+                    (
+                        lambda row=int(row), col=int(col), runtime_block_builder=runtime_block_builder: runtime_block_builder(
+                            int(row),
+                            int(col),
+                        )
+                    )
+                    if callable(runtime_block_builder)
+                    else None
+                ),
+                release_diagonal_cache=release_runtime_cache,
             )
             for (row, col), diag in diagonals.items()
         }
@@ -787,6 +944,17 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
         prepare_started = time.perf_counter()
         conv_diags, conv_output_rotations = packing.pack_conv2d(self.conv_module, last=False)
         shortcut_diags, shortcut_output_rotations = packing.pack_conv2d(self.shortcut_module, last=False)
+        single_slot = bool(_single_slot_layer_cache_enabled(scheme))
+        conv_runtime_block_builder, conv_release_runtime_cache = (
+            _conv2d_block_runtime_recipe(self.conv_module)
+            if bool(single_slot)
+            else (None, None)
+        )
+        shortcut_runtime_block_builder, shortcut_release_runtime_cache = (
+            _conv2d_block_runtime_recipe(self.shortcut_module)
+            if bool(single_slot)
+            else (None, None)
+        )
         if int(conv_output_rotations) != int(shortcut_output_rotations):
             raise RuntimeError("branch-pair provider requires matching output-rotation counts")
         keys = sorted(
@@ -808,6 +976,18 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 input_id=f"input_{int(col)}",
                 slots=int(slots),
                 scheme=scheme,
+                diag_indices=tuple(sorted(int(index) for index in dict(diag).keys())),
+                build_diagonals=(
+                    (
+                        lambda row=int(row), col=int(col), conv_runtime_block_builder=conv_runtime_block_builder: conv_runtime_block_builder(
+                            int(row),
+                            int(col),
+                        )
+                    )
+                    if callable(conv_runtime_block_builder)
+                    else None
+                ),
+                release_diagonal_cache=conv_release_runtime_cache,
             )
             for (row, col), diag in conv_diags.items()
         }
@@ -821,6 +1001,18 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 input_id=f"input_{int(col)}",
                 slots=int(slots),
                 scheme=scheme,
+                diag_indices=tuple(sorted(int(index) for index in dict(diag).keys())),
+                build_diagonals=(
+                    (
+                        lambda row=int(row), col=int(col), shortcut_runtime_block_builder=shortcut_runtime_block_builder: shortcut_runtime_block_builder(
+                            int(row),
+                            int(col),
+                        )
+                    )
+                    if callable(shortcut_runtime_block_builder)
+                    else None
+                ),
+                release_diagonal_cache=shortcut_release_runtime_cache,
             )
             for (row, col), diag in shortcut_diags.items()
         }

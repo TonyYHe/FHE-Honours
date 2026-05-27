@@ -95,6 +95,13 @@ def _assert_diagonals_close(left, right) -> None:
             assert torch.allclose(lval, rval, atol=1.0e-6, rtol=1.0e-6)
 
 
+def _diag_indices(diagonals) -> dict[tuple[int, int], tuple[int, ...]]:
+    return {
+        (int(row), int(col)): tuple(sorted(int(index) for index in dict(block).keys()))
+        for (row, col), block in dict(diagonals).items()
+    }
+
+
 @pytest.mark.parametrize("embedding_method", ["square", "hybrid"])
 @pytest.mark.parametrize(
     "spec",
@@ -130,6 +137,44 @@ def test_conv2d_direct_diagonals_match_legacy_toeplitz(embedding_method: str, sp
 
     assert direct_rotations == legacy_rotations
     _assert_diagonals_close(direct, legacy)
+
+
+def test_conv2d_single_slot_diagonal_indices_match_full_pack() -> None:
+    torch.manual_seed(0)
+    layer = Conv2d(2, 3, kernel_size=3, padding=1, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=64, embedding_method="square")
+    _configure_conv2d(layer, torch.randn(1, 2, 3, 3), input_gap=1)
+
+    direct, direct_rotations = packing.pack_conv2d(layer, last=False)
+    indices, index_rotations = packing.pack_conv2d_diagonal_indices(layer, last=False)
+
+    assert int(index_rotations) == int(direct_rotations)
+    assert indices == _diag_indices(direct)
+
+
+def test_conv2d_single_slot_generate_diagonals_installs_recipe_without_payload(monkeypatch) -> None:
+    torch.manual_seed(0)
+    layer = Conv2d(2, 3, kernel_size=3, padding=1, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=64, embedding_method="square")
+    layer.scheme.lt_evaluator = SimpleNamespace(single_slot_layer_cache_enabled=lambda: True)
+    _configure_conv2d(layer, torch.randn(1, 2, 3, 3), input_gap=1)
+    original_pack = packing.pack_conv2d
+
+    def fail_pack_conv2d(*_args, **_kwargs):
+        raise AssertionError("single-slot generate_diagonals must not materialize payload diagonals")
+
+    monkeypatch.setattr(packing, "pack_conv2d", fail_pack_conv2d)
+    layer.generate_diagonals(last=False)
+
+    assert layer.diagonals == {}
+    assert layer._dense_layer_cache_diag_indices_by_block
+    assert callable(layer._dense_layer_cache_build_diagonals)
+
+    monkeypatch.setattr(packing, "pack_conv2d", original_pack)
+    rebuilt = layer._dense_layer_cache_build_diagonals()
+    assert _diag_indices(rebuilt) == layer._dense_layer_cache_diag_indices_by_block
 
 
 def test_conv2d_pack_keeps_zero_blocks_for_dense_baseline() -> None:
@@ -215,6 +260,44 @@ def test_conv_transpose2d_direct_diagonals_match_legacy_toeplitz(spec: dict) -> 
 
     assert direct_rotations == legacy_rotations
     _assert_diagonals_close(direct, legacy)
+
+
+def test_conv_transpose2d_single_slot_diagonal_indices_match_full_pack() -> None:
+    torch.manual_seed(1)
+    layer = ConvTranspose2d(2, 3, kernel_size=2, stride=2, padding=0, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=128, embedding_method="hybrid")
+    _configure_tconv2d(layer, torch.randn(1, 2, 2, 2), input_gap=1)
+
+    direct, direct_rotations = packing.pack_conv_transpose2d(layer, last=False)
+    indices, index_rotations = packing.pack_conv_transpose2d_diagonal_indices(layer, last=False)
+
+    assert int(index_rotations) == int(direct_rotations)
+    assert indices == _diag_indices(direct)
+
+
+def test_conv_transpose2d_single_slot_generate_diagonals_installs_recipe_without_payload(monkeypatch) -> None:
+    torch.manual_seed(1)
+    layer = ConvTranspose2d(2, 3, kernel_size=2, stride=2, padding=0, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=128, embedding_method="hybrid")
+    layer.scheme.lt_evaluator = SimpleNamespace(single_slot_layer_cache_enabled=lambda: True)
+    _configure_tconv2d(layer, torch.randn(1, 2, 2, 2), input_gap=1)
+    original_pack = packing.pack_conv_transpose2d
+
+    def fail_pack_conv_transpose2d(*_args, **_kwargs):
+        raise AssertionError("single-slot generate_diagonals must not materialize tconv payload diagonals")
+
+    monkeypatch.setattr(packing, "pack_conv_transpose2d", fail_pack_conv_transpose2d)
+    layer.generate_diagonals(last=False)
+
+    assert layer.diagonals == {}
+    assert layer._dense_layer_cache_diag_indices_by_block
+    assert callable(layer._dense_layer_cache_build_diagonals)
+
+    monkeypatch.setattr(packing, "pack_conv_transpose2d", original_pack)
+    rebuilt = layer._dense_layer_cache_build_diagonals()
+    assert _diag_indices(rebuilt) == layer._dense_layer_cache_diag_indices_by_block
 
 
 def test_dense_compile_batches_independent_transforms_without_unified_api() -> None:
@@ -371,12 +454,15 @@ def test_dense_layer_cache_compile_defers_backend_generation(monkeypatch) -> Non
         params=_FakeParams(slots=4),
     )
     evaluator = NewEvaluator(fake_scheme)
+    stored_diagonals = {
+        (0, 0): {0: [1.0, 0.0, 0.0, 0.0]},
+        (0, 1): {1: [0.0, 2.0, 0.0, 0.0]},
+    }
     layer = SimpleNamespace(
         name="layer_cache_compile",
-        diagonals={
-            (0, 0): {0: [1.0, 0.0, 0.0, 0.0]},
-            (0, 1): {1: [0.0, 2.0, 0.0, 0.0]},
-        },
+        diagonals=stored_diagonals,
+        _dense_layer_cache_diag_indices_by_block={(0, 0): (0,), (0, 1): (1,)},
+        _dense_layer_cache_build_diagonals=lambda stored_diagonals=stored_diagonals: stored_diagonals,
         level=2,
         depth=1,
         bsgs_ratio=2,
@@ -389,7 +475,8 @@ def test_dense_layer_cache_compile_defers_backend_generation(monkeypatch) -> Non
     assert transform_ids == {}
     assert layer.diagonals == {}
     assert layer._dense_layer_cache_deferred is True
-    assert len(layer._dense_layer_cache_payloads) == 2
+    assert not hasattr(layer, "_dense_layer_cache_payloads")
+    assert set(layer._dense_layer_cache_diag_indices_by_block) == {(0, 0), (0, 1)}
     assert backend.batch_calls == []
     assert encoder.encoded == []
     assert backend.planned == [((0,), 2, 2.0), ((1,), 2, 2.0)]
@@ -473,12 +560,15 @@ def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch) -> 
         params=_FakeParams(slots=4),
     )
     evaluator = NewEvaluator(fake_scheme)
+    stored_diagonals = {
+        (0, 0): {0: [1.0, 0.0, 0.0, 0.0]},
+        (0, 1): {1: [0.0, 2.0, 0.0, 0.0]},
+    }
     layer = SimpleNamespace(
         name="layer_cache_eval",
-        diagonals={
-            (0, 0): {0: [1.0, 0.0, 0.0, 0.0]},
-            (0, 1): {1: [0.0, 2.0, 0.0, 0.0]},
-        },
+        diagonals=stored_diagonals,
+        _dense_layer_cache_diag_indices_by_block={(0, 0): (0,), (0, 1): (1,)},
+        _dense_layer_cache_build_diagonals=lambda stored_diagonals=stored_diagonals: stored_diagonals,
         level=2,
         depth=1,
         bsgs_ratio=2,

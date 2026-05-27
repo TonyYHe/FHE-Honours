@@ -61,6 +61,13 @@ class _FakeBackend:
     def GetLinearTransformRotationKeys(self, transform_id):
         return list(self.rotation_keys[int(transform_id)])
 
+    def PlanLinearTransformsUnifiedRotationKeys(self, num_transforms, diag_idxs_ptrs, diag_idxs_lens, levels_array):
+        keys = set()
+        for transform_index in range(int(num_transforms)):
+            for diag_index in range(int(diag_idxs_lens[transform_index])):
+                keys.add(int(diag_idxs_ptrs[transform_index][diag_index]))
+        return sorted(keys)
+
     def GenerateLinearTransformRotationKey(self, key):
         self.generated_keys.append(int(key))
 
@@ -329,8 +336,15 @@ def _fake_transform(
     keys_path="",
     compile_save_resume=False,
 ):
+    source_diagonals = {(0, 0): dict(diagonals)}
+    stored_diagonals = {(int(row), int(col)): dict(block) for (row, col), block in source_diagonals.items()}
     return SimpleNamespace(
-        diagonals={(0, 0): dict(diagonals)},
+        diagonals={(int(row), int(col)): dict(block) for (row, col), block in source_diagonals.items()},
+        _single_slot_diag_indices_by_block={(0, 0): tuple(sorted(int(index) for index in dict(diagonals).keys()))},
+        _single_slot_build_diagonals=lambda stored_diagonals=stored_diagonals: {
+            (int(row), int(col)): dict(block)
+            for (row, col), block in stored_diagonals.items()
+        },
         level=int(level),
         scheme=SimpleNamespace(
             params=SimpleNamespace(
@@ -496,7 +510,8 @@ def test_single_slot_layer_cache_evicts_between_tiny_64_layers(monkeypatch) -> N
         assert group.unified_ids is None
         assert group.last_compile_profile["mode"] == "single_slot_deferred"
         assert group.last_compile_profile["flatten_s"] >= 0.0
-        assert group._single_slot_payloads is not None
+        assert group._single_slot_payloads is None
+        assert group._single_slot_recipes is not None
         assert all(getattr(transform, "diagonals", None) == {} for transform in group.transforms)
 
     assert backend.generated == []
@@ -521,6 +536,48 @@ def test_single_slot_layer_cache_evicts_between_tiny_64_layers(monkeypatch) -> N
     assert backend.live_plaintext_transforms == set()
     assert backend.deleted == [11, 12, 13]
     assert [entry["num_transforms"] for entry in backend.generated] == [1, 1, 1]
+
+
+def test_single_slot_requires_recipe_and_never_generates_backend_ids_at_compile(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    missing_recipe = SimpleNamespace(
+        diagonals={(0, 0): {0: torch.ones(8)}},
+        level=2,
+        scheme=SimpleNamespace(params=SimpleNamespace(get_logq=lambda: [0, 1, 2])),
+    )
+    group = UnifiedTransformGroup((missing_recipe,))
+    backend = _FakeBackend()
+
+    with pytest.raises(RuntimeError, match="runtime diagonal recipe|_single_slot_build_diagonals"):
+        group.compile_unified(backend)
+
+    assert backend.generated == []
+    assert backend.generated_keys == []
+
+
+def test_single_slot_materializes_whole_group_once_and_evicts_once(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "1")
+    backend = _SingleSlotTrackingBackend()
+    transforms = (
+        _fake_transform({0: torch.ones(16)}, level=2),
+        _fake_transform({1: torch.ones(16) * 2}, level=2),
+    )
+    group = UnifiedTransformGroup(transforms)
+
+    group.compile_unified(backend)
+
+    assert backend.generated == []
+    assert backend.generated_keys == [0, 1]
+
+    outputs = group.evaluate_unified(77, backend)
+
+    assert outputs == [100, 101]
+    assert [entry["num_transforms"] for entry in backend.generated] == [2]
+    assert backend.evaluated == [([11, 12], 77)]
+    assert backend.deleted == [11, 12]
+    assert backend.live_plaintext_transforms == set()
+    assert group.unified_ids is None
 
 
 def test_unified_transform_sources_target_sum_uses_compatible_targets() -> None:
@@ -1371,6 +1428,8 @@ def test_single_slot_layer_cache_runs_and_evicts_on_lattigo_backend(monkeypatch)
         level = len(scheme.params.get_logq()) - 1
         transform_a = SimpleNamespace(
             diagonals={(0, 0): {0: [1.0] * slots}},
+            _single_slot_diag_indices_by_block={(0, 0): (0,)},
+            _single_slot_build_diagonals=lambda slots=slots: {(0, 0): {0: [1.0] * slots}},
             level=level,
             scheme=scheme,
             fhe_output_shape=torch.Size([1, slots]),
@@ -1378,6 +1437,8 @@ def test_single_slot_layer_cache_runs_and_evicts_on_lattigo_backend(monkeypatch)
         )
         transform_b = SimpleNamespace(
             diagonals={(0, 0): {0: [2.0] * slots}},
+            _single_slot_diag_indices_by_block={(0, 0): (0,)},
+            _single_slot_build_diagonals=lambda slots=slots: {(0, 0): {0: [2.0] * slots}},
             level=level,
             scheme=scheme,
             fhe_output_shape=torch.Size([1, slots]),
