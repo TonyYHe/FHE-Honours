@@ -371,7 +371,9 @@ segmentation shapes:
 For each shape, run both Orion dense and provider paths.  Provider uses DP
 layout planning, streaming LT, and all current provider optimizations.  Dense
 uses streaming/memory-bounded LT, but explicitly disables the dense
-unified-BSGS/shared-cache path.  Bootstrap-many is disabled for both paths
+unified-BSGS/shared-cache path.  Dense keeps concat fusion enabled
+(`ORION_CONCAT_FUSION=1`) so U-Net skip merges do not fall back to sparse
+concat materialization.  Bootstrap-many is disabled for both paths
 (`ORION_LATTIGO_BOOTSTRAP_MANY=0`) so the table reflects the default single
 bootstrap path rather than batched bootstrap scheduling.
 

@@ -132,6 +132,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_UNIFIED_LT_FORCE_COMPILE_TRIM_EACH_TRANSFORM": "0",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
+    "ORION_CONCAT_FUSION": "1",
 }
 
 ENV_TUNING_KEYS = (
@@ -289,7 +290,7 @@ def run_one(args: argparse.Namespace) -> int:
     if mode == "dense":
         os.environ["ORION_DENSE_LT_SHARED_CACHE"] = "0"
         os.environ["ORION_DENSE_LT_HOST_PAYLOAD_CACHE"] = "0"
-        os.environ["ORION_CONCAT_FUSION"] = "0"
+        os.environ["ORION_CONCAT_FUSION"] = "1"
     else:
         os.environ.setdefault("ORION_CONCAT_FUSION", "1")
     env_snapshot = dict(os.environ)
@@ -846,7 +847,7 @@ def run_all(args: argparse.Namespace) -> int:
             "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
             "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
             "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_unified_bsgs": "disabled via ORION_DENSE_LT_SHARED_CACHE=0 and ORION_CONCAT_FUSION=0 for dense runs",
+            "dense_unified_bsgs": "shared-cache path disabled via ORION_DENSE_LT_SHARED_CACHE=0; concat fusion remains enabled via ORION_CONCAT_FUSION=1",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
         },
     }
