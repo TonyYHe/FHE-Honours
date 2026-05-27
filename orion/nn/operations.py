@@ -238,6 +238,7 @@ class Concat(Module):
             raise RuntimeError("Concat shapes have not been initialized by StatsTracker")
         level = int(self.level) if self.level is not None else int(len(scheme.params.get_logq()) - 1)
         slots = int(scheme.params.get_slots())
+        expected_output_rows = int(math.ceil(int(np.prod(tuple(int(v) for v in self.fhe_output_shape))) / int(slots)))
         self.transform_ids_by_input = []
         for input_index in range(len(self.concat_input_shapes)):
             diagonals = self._diagonals_for_input(int(input_index), slots=int(slots))
@@ -249,6 +250,8 @@ class Concat(Module):
                 scheme=scheme,
                 output_shape=self.output_shape,
                 fhe_output_shape=self.fhe_output_shape,
+                allow_sparse_output_rows=True,
+                expected_output_rows=int(expected_output_rows),
             )
             self.transform_ids_by_input.append(dict(scheme.lt_evaluator.generate_transforms(proxy)))
         self._compiled_backend = getattr(scheme, "backend", None)
@@ -267,6 +270,13 @@ class Concat(Module):
                 level=int(self.level) if self.level is not None else int(len(scheme.params.get_logq()) - 1),
                 output_shape=self.output_shape,
                 fhe_output_shape=self.fhe_output_shape,
+                allow_sparse_output_rows=True,
+                expected_output_rows=int(
+                    math.ceil(
+                        int(np.prod(tuple(int(v) for v in self.fhe_output_shape)))
+                        / int(scheme.params.get_slots())
+                    )
+                ),
             )
             partial = scheme.lt_evaluator.evaluate_transforms(proxy, source)
             if out is None:

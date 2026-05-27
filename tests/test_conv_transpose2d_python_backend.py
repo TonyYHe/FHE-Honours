@@ -355,27 +355,50 @@ def test_concat_materialization_fallback_matches_channel_cat_on_python_backend()
     Module.set_scheme(active_scheme)
     Module.set_margin(active_scheme.params.get_margin())
     try:
+        slots = int(active_scheme.params.get_slots())
+        height = 16
+        width = 16
+        values_per_channel = int(height * width)
+        left_channels = max(1, (int(slots) + int(values_per_channel) - 1) // int(values_per_channel))
+        right_channels = 1
         concat = Concat(dim=1)
         concat.name = "concat_materialize_toy"
         concat.set_level(len(active_scheme.params.get_logq()) - 1)
         concat.configure_from_stats(
-            input_shapes=[torch.Size((1, 1, 2, 2)), torch.Size((1, 2, 2, 2))],
-            input_fhe_shapes=[torch.Size((1, 1, 2, 2)), torch.Size((1, 2, 2, 2))],
+            input_shapes=[
+                torch.Size((1, left_channels, height, width)),
+                torch.Size((1, right_channels, height, width)),
+            ],
+            input_fhe_shapes=[
+                torch.Size((1, left_channels, height, width)),
+                torch.Size((1, right_channels, height, width)),
+            ],
             input_gaps=[1, 1],
-            output_shape=torch.Size((1, 3, 2, 2)),
-            fhe_output_shape=torch.Size((1, 3, 2, 2)),
+            output_shape=torch.Size((1, left_channels + right_channels, height, width)),
+            fhe_output_shape=torch.Size((1, left_channels + right_channels, height, width)),
             output_gap=1,
         )
         concat.he_mode = True
         level = len(active_scheme.params.get_logq()) - 1
-        left = torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)
-        right = (torch.arange(8, dtype=torch.float32).reshape(1, 2, 2, 2) + 10.0)
+        left = torch.arange(
+            left_channels * height * width,
+            dtype=torch.float32,
+        ).reshape(1, left_channels, height, width)
+        right = (
+            torch.arange(right_channels * height * width, dtype=torch.float32)
+            .reshape(1, right_channels, height, width)
+            + 10.0
+        )
         left_ct = active_scheme.encrypt(active_scheme.encode(left, level))
         right_ct = active_scheme.encrypt(active_scheme.encode(right, level))
 
         out = concat(left_ct, right_ct).materialize().decrypt().decode().to(dtype=torch.float32)
 
-        assert torch.allclose(out.reshape(1, 3, 2, 2), torch.cat([left, right], dim=1), atol=1.0e-5)
+        assert torch.allclose(
+            out.reshape(1, left_channels + right_channels, height, width),
+            torch.cat([left, right], dim=1),
+            atol=1.0e-5,
+        )
     finally:
         active_scheme.delete_scheme()
 

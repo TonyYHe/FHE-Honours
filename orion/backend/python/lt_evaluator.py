@@ -1123,21 +1123,46 @@ class NewEvaluator:
         out_shape = linear_layer.output_shape
         fhe_out_shape = linear_layer.fhe_output_shape 
         skip_post_rescale = bool(getattr(self.backend, "lt_outputs_are_rescaled", False))
+        allow_sparse_output_rows = bool(getattr(linear_layer, "allow_sparse_output_rows", False))
 
         rows, cols, transform_ids = self._transform_id_matrix(
             getattr(linear_layer, "transform_ids", {}) or {},
             input_cols=len(in_ctensor),
         )
+        expected_output_rows = getattr(linear_layer, "expected_output_rows", None)
+        if expected_output_rows is not None:
+            expected_output_rows = int(expected_output_rows)
+            if expected_output_rows < int(rows):
+                raise ValueError(
+                    f"Linear transform expected_output_rows={expected_output_rows} "
+                    f"is smaller than compiled row count {int(rows)}"
+                )
+            if expected_output_rows > int(rows):
+                if int(rows) == 0:
+                    cols = int(len(in_ctensor))
+                    transform_ids = np.full((int(expected_output_rows), int(cols)), -1, dtype=int)
+                else:
+                    pad = np.full(
+                        (int(expected_output_rows) - int(rows), int(cols)),
+                        -1,
+                        dtype=int,
+                    )
+                    transform_ids = np.vstack([transform_ids, pad])
+                rows = int(expected_output_rows)
         work_items = [
             (int(i), int(j), int(transform_ids[i][j]))
             for i in range(rows)
             for j in range(cols)
             if int(transform_ids[i][j]) >= 0
         ]
-        use_dense_shared_cache = bool(work_items) and self._dense_shared_cache_enabled(
-            linear_layer,
-            rows=rows,
-            cols=cols,
+        use_dense_shared_cache = (
+            bool(work_items)
+            and not bool(allow_sparse_output_rows)
+            and self._dense_shared_cache_enabled(
+                linear_layer,
+                rows=rows,
+                cols=cols,
+            )
         )
         linear_layer._last_dense_shared_cache_eval = {
             "enabled": bool(use_dense_shared_cache),
@@ -1270,6 +1295,9 @@ class NewEvaluator:
                 work_index += 1
 
             if ct_out is None:
+                if bool(allow_sparse_output_rows):
+                    cts_out.append(None)
+                    continue
                 raise ValueError(f"Linear transform row {int(i)} has no nonempty blocks")
             
             # We know the output of this accumulation will just be one ciphertext
@@ -1279,6 +1307,16 @@ class NewEvaluator:
             else:
                 ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
                 cts_out.append(ct_out_rescaled)
+        if bool(allow_sparse_output_rows) and any(ct_id is None for ct_id in cts_out):
+            reference_id = next((int(ct_id) for ct_id in cts_out if ct_id is not None), None)
+            if reference_id is None:
+                raise ValueError(f"Linear transform {layer_name} has no nonempty output rows")
+            cts_out = [
+                int(ct_id)
+                if ct_id is not None
+                else int(self.evaluator.mul_scalar(int(reference_id), 0, in_place=False))
+                for ct_id in cts_out
+            ]
 
         timing_payload = self._publish_runtime_timing(
             runtime_timing,
