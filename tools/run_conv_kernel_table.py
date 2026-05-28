@@ -46,10 +46,11 @@ ROW_DIR_NAME = "rows"
 DEFAULT_HW = ("192x192", "224x224", "384x288", "384x384")
 DEFAULT_CHANNELS = (32, 64, 128)
 DEFAULT_VARIANTS = ("orion", "provider_halo1", "provider_halo2")
+PROVIDER_OUTPUT_LAYOUTS = ("native_stripe", "tight_compact")
 VARIANT_LABELS = {
     "orion": "Orion dense",
-    "provider_halo1": "provider halo=1/1",
-    "provider_halo2": "provider halo=2/2",
+    "provider_halo1": "provider beta=1",
+    "provider_halo2": "provider beta=2",
 }
 
 
@@ -287,6 +288,11 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
     )
     input_cts = result.get("input_cts", result.get("source_ciphertext_count", result.get("runtime_source_cts", 0)))
     output_cts = result.get("output_cts", result.get("output_ciphertext_count", result.get("runtime_output_cts", 0)))
+    input_halo_top, input_halo_bottom = _explicit_halo(result)
+    if input_halo_top is None:
+        input_halo_top = row.halo
+    if input_halo_bottom is None:
+        input_halo_bottom = row.halo
     return {
         "status": "ok",
         "created_at_utc": _now_utc(),
@@ -305,8 +311,10 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "variant": str(row.variant),
         "variant_label": VARIANT_LABELS[str(row.variant)],
         "path": row.path,
-        "input_halo_top": row.halo,
-        "input_halo_bottom": row.halo,
+        "provider_requested_input_halo": row.halo,
+        "input_halo_top": input_halo_top,
+        "input_halo_bottom": input_halo_bottom,
+        "provider_output_storage_layout": _provider_result_output_layout(result) if row.path == "provider" else "",
         "kernel": "3x3/pad1/stride1",
         "compile_s": float(result.get("compile_s") or 0.0),
         "generate_diagonals_s": float(result.get("generate_diagonals_s") or 0.0),
@@ -328,13 +336,33 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
     }
 
 
-def reuse_existing_rows(run_root: Path, rows: list[ConvKernelRow], sources: list[Path], *, force: bool = False) -> int:
+def _provider_result_output_layout(result: dict[str, Any]) -> str:
+    metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
+    return str(
+        result.get("provider_output_storage_layout")
+        or metadata.get("runtime_output_storage_layout")
+        or result.get("runtime_output_storage_layout")
+        or ""
+    )
+
+
+def reuse_existing_rows(
+    run_root: Path,
+    rows: list[ConvKernelRow],
+    sources: list[Path],
+    *,
+    force: bool = False,
+    clip_provider_boundary_halo: bool = False,
+    provider_output_layout: str = "native_stripe",
+) -> int:
     if not sources:
         return 0
-    row_by_key = {
-        (row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, row.halo): row
-        for row in rows
-    }
+    row_by_key: dict[tuple[str, int, int, int, int, int | None], ConvKernelRow] = {}
+    for row in rows:
+        halo_key = row.halo
+        if row.path == "provider" and bool(clip_provider_boundary_halo):
+            halo_key = 0
+        row_by_key[(row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, halo_key)] = row
     reused = 0
     for json_path in _iter_reuse_jsons([Path(value) for value in sources]):
         payload = _read_json(json_path)
@@ -354,9 +382,12 @@ def reuse_existing_rows(run_root: Path, rows: list[ConvKernelRow], sources: list
                 top, bottom = _explicit_halo(result)
                 # Older provider JSONs did not record the halo setting; those
                 # runs used the default provider halo, which is top/bottom 1/1.
-                if top is None and bottom is None:
+                if top is None and bottom is None and not bool(clip_provider_boundary_halo):
                     top = bottom = 1
                 if top is None or bottom is None or top != bottom:
+                    continue
+                expected_layout = "native_halo_stripe" if str(provider_output_layout) == "native_stripe" else "tight_compact"
+                if _provider_result_output_layout(result) != expected_layout:
                     continue
                 key = ("provider", int(channels), int(height), int(width), int(gap), int(top))
             else:
@@ -482,6 +513,45 @@ def _make_conv(row: ConvKernelRow, *, seed: int) -> Conv2d:
         conv.layout_policy_input_layout = {"top_beta": int(row.halo), "bottom_beta": int(row.halo)}
     conv.set_level(len(scheme.params.get_logq()) - 1)
     return conv
+
+
+def _effective_provider_input_halo(
+    row: ConvKernelRow,
+    *,
+    clip_boundary_halo: bool,
+) -> tuple[int | None, int | None]:
+    if row.halo is None:
+        return None, None
+    if bool(clip_boundary_halo):
+        return 0, 0
+    return int(row.halo), int(row.halo)
+
+
+def _apply_provider_input_halo(
+    conv: Conv2d,
+    row: ConvKernelRow,
+    *,
+    clip_boundary_halo: bool,
+) -> tuple[int | None, int | None]:
+    top, bottom = _effective_provider_input_halo(row, clip_boundary_halo=bool(clip_boundary_halo))
+    if top is not None and bottom is not None:
+        conv.layout_policy_input_layout = {"top_beta": int(top), "bottom_beta": int(bottom)}
+    return top, bottom
+
+
+def _apply_provider_output_layout(conv: Conv2d, row: ConvKernelRow, *, output_layout: str) -> str:
+    if row.path != "provider":
+        return ""
+    layout = str(output_layout or "native_stripe")
+    if layout == "native_stripe":
+        conv.layout_policy_output_materialization = "native_halo_stripe"
+        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0}
+        return "native_halo_stripe"
+    if layout == "tight_compact":
+        conv.layout_policy_output_materialization = "fused_relayout"
+        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0}
+        return "tight_compact"
+    raise ValueError(f"unsupported provider output layout: {output_layout!r}")
 
 
 def _attach_provider_runtime(conv: Conv2d, row: ConvKernelRow) -> None:
@@ -678,7 +748,15 @@ def _maxrss_bytes() -> int:
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
 
 
-def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> dict[str, Any]:
+def _run_row(
+    row: ConvKernelRow,
+    *,
+    backend: str,
+    repeats: int,
+    seed: int,
+    clip_provider_boundary_halo: bool = False,
+    provider_output_layout: str = "native_stripe",
+) -> dict[str, Any]:
     started = time.perf_counter()
     if str(backend) != "python":
         bench._require_backend(str(backend))
@@ -686,6 +764,16 @@ def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> di
     compile_stdout = ""
     try:
         conv = _make_conv(row, seed=int(seed))
+        input_halo_top, input_halo_bottom = _apply_provider_input_halo(
+            conv,
+            row,
+            clip_boundary_halo=bool(clip_provider_boundary_halo and row.path == "provider"),
+        )
+        applied_provider_output_layout = _apply_provider_output_layout(
+            conv,
+            row,
+            output_layout=str(provider_output_layout),
+        )
         if row.path == "provider":
             _attach_provider_runtime(conv, row)
         with _capture_stdout() as buffer:
@@ -718,7 +806,16 @@ def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> di
             rotation_stats = bench._provider_rotation_stats(conv, path_kind="provider")
             source_count = int(native_plan.get("input_ct_count", getattr(executor, "cols", 0)) or 0)
             input_cts = int(source_count)
-            output_cts = int(native_plan.get("output_ct_count", getattr(executor, "rows", 0)) or 0)
+            output_cts = int(
+                provider_metadata.get("runtime_output_ct_count")
+                or native_plan.get("output_ct_count", getattr(executor, "rows", 0))
+                or 0
+            )
+            provider_output_storage_layout = str(
+                provider_metadata.get("runtime_output_storage_layout")
+                or native_plan.get("output_storage_layout")
+                or ""
+            )
 
         runs: list[dict[str, Any]] = []
         for index in range(int(repeats)):
@@ -753,8 +850,11 @@ def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> di
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
-            "input_halo_top": row.halo,
-            "input_halo_bottom": row.halo,
+            "provider_requested_input_halo": row.halo,
+            "provider_boundary_halo_clipped": bool(clip_provider_boundary_halo and row.path == "provider"),
+            "provider_output_layout": applied_provider_output_layout,
+            "input_halo_top": input_halo_top,
+            "input_halo_bottom": input_halo_bottom,
             "kernel": "3x3/pad1/stride1",
             "compile_s": float(generate_diagonals_s + compile_backend_s),
             "generate_diagonals_s": float(generate_diagonals_s),
@@ -787,6 +887,7 @@ def _run_row(row: ConvKernelRow, *, backend: str, repeats: int, seed: int) -> di
                 "fhe_output_shape": [int(value) for value in tuple(conv.fhe_output_shape)],
             },
             "provider_metadata": provider_metadata,
+            "provider_output_storage_layout": provider_output_storage_layout if row.path == "provider" else "",
             "rotation_stats": rotation_stats,
             "compile_stdout_tail": str(compile_stdout[-12000:]),
             "maxrss_bytes": int(_maxrss_bytes()),
@@ -866,6 +967,19 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
             if source_detail:
                 note = f"{note}:{source_detail}"
             note = note[:120]
+        halo_cell = ""
+        if row.halo is not None:
+            top = (payload or {}).get("input_halo_top") if isinstance(payload, dict) else row.halo
+            bottom = (payload or {}).get("input_halo_bottom") if isinstance(payload, dict) else row.halo
+            requested = (payload or {}).get("provider_requested_input_halo") if isinstance(payload, dict) else row.halo
+            clipped = bool((payload or {}).get("provider_boundary_halo_clipped")) if isinstance(payload, dict) else False
+            if clipped:
+                halo_cell = f"{int(top)}/{int(bottom)} (beta={int(requested)})"
+            elif top is not None and bottom is not None:
+                halo_cell = f"{int(top)}/{int(bottom)}"
+            else:
+                halo_cell = f"{int(row.halo)}/{int(row.halo)}"
+        output_layout = _provider_result_output_layout(payload) if isinstance(payload, dict) else ""
         table_rows.append(
             [
                 row.hw,
@@ -876,7 +990,8 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
                 row.packed_chw,
                 VARIANT_LABELS[str(row.variant)],
                 status,
-                "" if row.halo is None else f"{int(row.halo)}/{int(row.halo)}",
+                halo_cell,
+                output_layout,
                 _fmt_int((payload or {}).get("rotation_eval_count") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("lt_accumulate_s") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("hot_run_mean_s") if isinstance(payload, dict) else None),
@@ -903,6 +1018,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "path / beta",
         "status",
         "input halo T/B",
+        "output layout",
         "rotations",
         "LT+accumulate s",
         "hot run s",
@@ -915,6 +1031,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "note",
     ]
     aligns = [
+        "---",
         "---",
         "---",
         "---",
@@ -960,6 +1077,7 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
         "path_beta",
         "status",
         "input_halo_tb",
+        "output_layout",
         "rotations",
         "lt_accumulate_s",
         "hot_run_s",
@@ -991,6 +1109,11 @@ def _process_rss_bytes(pid: int) -> int | None:
 
 
 def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Namespace) -> None:
+    input_halo_top, input_halo_bottom = _effective_provider_input_halo(
+        row,
+        clip_boundary_halo=bool(getattr(args, "clip_provider_boundary_halo", False) and row.path == "provider"),
+    )
+    provider_output_layout = "native_halo_stripe" if row.path == "provider" and str(args.provider_output_layout) == "native_stripe" else ""
     _write_json(
         path,
         {
@@ -1009,8 +1132,14 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
-            "input_halo_top": row.halo,
-            "input_halo_bottom": row.halo,
+            "provider_requested_input_halo": row.halo,
+            "provider_boundary_halo_clipped": bool(
+                getattr(args, "clip_provider_boundary_halo", False) and row.path == "provider"
+            ),
+            "provider_output_layout": provider_output_layout,
+            "provider_output_storage_layout": provider_output_layout,
+            "input_halo_top": input_halo_top,
+            "input_halo_bottom": input_halo_bottom,
             "kernel": "3x3/pad1/stride1",
             "run_root": str(args.run_root),
             "env": _env_snapshot(),
@@ -1020,6 +1149,10 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
 
 def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, message: str, return_code: int | None) -> None:
     payload = _read_json(path) or {}
+    input_halo_top = payload.get("input_halo_top", row.halo)
+    input_halo_bottom = payload.get("input_halo_bottom", row.halo)
+    provider_output_layout = payload.get("provider_output_layout", "")
+    provider_output_storage_layout = payload.get("provider_output_storage_layout", provider_output_layout)
     payload.update(
         {
             "status": "error",
@@ -1037,8 +1170,11 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
-            "input_halo_top": row.halo,
-            "input_halo_bottom": row.halo,
+            "provider_requested_input_halo": row.halo,
+            "provider_output_layout": provider_output_layout,
+            "provider_output_storage_layout": provider_output_storage_layout,
+            "input_halo_top": input_halo_top,
+            "input_halo_bottom": input_halo_bottom,
             "failure_kind": str(failure_kind),
             "message": str(message),
             "return_code": None if return_code is None else int(return_code),
@@ -1068,12 +1204,14 @@ def run_all(args: argparse.Namespace) -> int:
         "variants": [str(value) for value in args.variants],
         "repeats": int(args.repeats),
         "rss_cap_gib": float(args.max_worker_rss_gb),
+        "clip_provider_boundary_halo": bool(args.clip_provider_boundary_halo),
+        "provider_output_layout": str(args.provider_output_layout),
         "measurement": {
             "io_mode": "none",
             "lt_accumulate_s": "resident eval_s / eval_total_s, excluding artifact I/O",
             "orion": "dense Conv2d path with default resident Lattigo LT",
-            "provider_halo1": "native halo provider with input_top_beta=input_bottom_beta=1",
-            "provider_halo2": "native halo provider with input_top_beta=input_bottom_beta=2",
+            "provider_halo1": "native halo provider with requested beta=1",
+            "provider_halo2": "native halo provider with requested beta=2",
             "u_net_stage_packing": {
                 "Conv 32,32": "logical 32xHorigxWorig, multiplex/input_gap/output_gap=1, packed FHE 32xHorigxWorig",
                 "Conv 64,64": "logical 64x(Horig/2)x(Worig/2), multiplex/input_gap/output_gap=2, 4 channels/group, packed FHE 16xHorigxWorig",
@@ -1088,6 +1226,8 @@ def run_all(args: argparse.Namespace) -> int:
         rows,
         [Path(value) for value in getattr(args, "reuse_from", [])],
         force=bool(args.force),
+        clip_provider_boundary_halo=bool(args.clip_provider_boundary_halo),
+        provider_output_layout=str(args.provider_output_layout),
     )
     if reused_count:
         manifest["reused_rows"] = int(reused_count)
@@ -1138,7 +1278,11 @@ def run_all(args: argparse.Namespace) -> int:
                 str(args.seed),
                 "--out",
                 str(result_path),
+                "--provider-output-layout",
+                str(args.provider_output_layout),
             ]
+            if bool(args.clip_provider_boundary_halo):
+                command.append("--clip-provider-boundary-halo")
             log_path = result_path.with_suffix(".log")
             print(f"[{datetime.now().isoformat(timespec='seconds')}] start {row.row_id}", flush=True)
             print(" ".join(shlex.quote(part) for part in command), flush=True)
@@ -1210,8 +1354,22 @@ def run_all(args: argparse.Namespace) -> int:
 def run_one(args: argparse.Namespace) -> int:
     row = _rows_from_args(args)[0]
     try:
-        payload = _run_row(row, backend=str(args.backend), repeats=int(args.repeats), seed=int(args.seed))
+        payload = _run_row(
+            row,
+            backend=str(args.backend),
+            repeats=int(args.repeats),
+            seed=int(args.seed),
+            clip_provider_boundary_halo=bool(args.clip_provider_boundary_halo),
+            provider_output_layout=str(args.provider_output_layout),
+        )
     except Exception as exc:  # noqa: BLE001
+        input_halo_top, input_halo_bottom = _effective_provider_input_halo(
+            row,
+            clip_boundary_halo=bool(args.clip_provider_boundary_halo and row.path == "provider"),
+        )
+        provider_output_layout = (
+            "native_halo_stripe" if row.path == "provider" and str(args.provider_output_layout) == "native_stripe" else ""
+        )
         payload = {
             "status": "error",
             "created_at_utc": _now_utc(),
@@ -1229,8 +1387,12 @@ def run_one(args: argparse.Namespace) -> int:
             "variant": str(row.variant),
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
-            "input_halo_top": row.halo,
-            "input_halo_bottom": row.halo,
+            "provider_requested_input_halo": row.halo,
+            "provider_boundary_halo_clipped": bool(args.clip_provider_boundary_halo and row.path == "provider"),
+            "provider_output_layout": provider_output_layout,
+            "provider_output_storage_layout": provider_output_layout,
+            "input_halo_top": input_halo_top,
+            "input_halo_bottom": input_halo_bottom,
             "kernel": "3x3/pad1/stride1",
             "error_type": type(exc).__name__,
             "error": str(exc),
@@ -1262,6 +1424,17 @@ def main() -> int:
         help="Existing JSON files or result directories to import exact-shape non-stream rows from before running missing rows.",
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--clip-provider-boundary-halo",
+        action="store_true",
+        help="For provider rows, keep the requested beta label but omit global top/bottom input halo at image boundaries.",
+    )
+    parser.add_argument(
+        "--provider-output-layout",
+        choices=PROVIDER_OUTPUT_LAYOUTS,
+        default="native_stripe",
+        help="Provider output storage layout for kernel rows; native_stripe preserves channel-aligned native stripe output.",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare/reuse rows and update the doc without launching workers.")
     parser.add_argument("--update-doc-only", action="store_true")

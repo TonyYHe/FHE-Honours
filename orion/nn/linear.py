@@ -533,6 +533,22 @@ class Conv2d(LinearTransform):
         if bool(materialized):
             self.on_bias_ptxt = None
 
+    def _concat_release_unified_diagonal_caches(self) -> None:
+        seen: set[int] = set()
+        for groups_by_source in getattr(self, "_concat_unified_groups_by_input", []) or []:
+            for group in dict(groups_by_source).values():
+                for transform in getattr(group, "transforms", ()) or ():
+                    cache = getattr(transform, "_concat_branch_diagonal_cache", None)
+                    if cache is None:
+                        continue
+                    cache_id = id(cache)
+                    if int(cache_id) in seen:
+                        continue
+                    seen.add(int(cache_id))
+                    release = getattr(cache, "release", None)
+                    if callable(release):
+                        release()
+
     def _compile_concat_fusion_unified_transforms(self) -> bool:
         if not self._concat_fusion_unified_supported():
             return False
@@ -544,6 +560,7 @@ class Conv2d(LinearTransform):
         from orion.experimental.cir.native_halo_conv2d import (
             NativeHaloConv2DSpec,
             _build_compact_source_conv_transform,
+            _build_compact_source_concat_transforms_single_slot,
             _layout_bottom_beta,
             _layout_top_beta,
             _retune_transform_group_bsgs,
@@ -571,6 +588,11 @@ class Conv2d(LinearTransform):
 
         bias = self._concat_construct_bias(output_attrs)
         self._concat_store_compile_bias(bias)
+        evaluator = getattr(self.scheme, "lt_evaluator", None)
+        single_slot_layer_cache = (
+            callable(getattr(evaluator, "single_slot_layer_cache_enabled", None))
+            and bool(evaluator.single_slot_layer_cache_enabled())
+        )
 
         for input_index, concat_spec in enumerate(self._concat_fusion_specs()):
             channel_start = int(concat_spec["channel_start"])
@@ -635,17 +657,58 @@ class Conv2d(LinearTransform):
                                 ordered.append((int(target_block), transform))
                 return int(source_block), ordered
 
-            raw_workers = __import__("os").environ.get("ORION_CONCAT_FUSION_BUILD_WORKERS", "1")
-            try:
-                requested_workers = int(raw_workers)
-            except (TypeError, ValueError):
-                requested_workers = 1
-            workers = max(1, min(int(source_ct_count), int(requested_workers)))
-            if int(workers) <= 1:
-                built = [build_source(int(source_block)) for source_block in range(int(source_ct_count))]
+            if bool(single_slot_layer_cache):
+                proxy = self._concat_source_proxy(
+                    concat_spec,
+                    weight=branch_weight,
+                    name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
+                )
+
+                def build_diagonals_by_block(proxy=proxy, branch_weight=branch_weight):
+                    diagonals, output_rotations = packing.direct_diagonalize_conv2d(
+                        proxy,
+                        branch_weight,
+                        int(slots),
+                        str(self.scheme.params.get_embedding_method()),
+                        False,
+                        allow_hybrid=False,
+                    )
+                    if int(output_rotations) != 0:
+                        raise RuntimeError(
+                            f"concat-fused Conv2d {getattr(self, 'name', '')} single-slot "
+                            "branch materializer does not support output rotations"
+                        )
+                    return diagonals
+
+                built_by_source = _build_compact_source_concat_transforms_single_slot(
+                    spec=native_spec,
+                    plan=plan,
+                    weight=branch_weight,
+                    level=int(level),
+                    scheme=self.scheme,
+                    source_layout=dict(input_layout),
+                    source_ct_count=int(source_ct_count),
+                    target_ct_count=int(target_ct_count),
+                    group_n1=1,
+                    build_diagonals_by_block=build_diagonals_by_block,
+                    output_materialization=str(output_attrs.get("layout_policy_output_materialization", "") or ""),
+                )
+                built = [
+                    (int(source_block), list(ordered))
+                    for source_block, ordered in sorted(built_by_source.items())
+                ]
             else:
-                with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-concat-fusion") as pool:
-                    built = list(pool.map(build_source, range(int(source_ct_count))))
+                raw_workers = __import__("os").environ.get("ORION_CONCAT_FUSION_BUILD_WORKERS", "1")
+                try:
+                    requested_workers = int(raw_workers)
+                except (TypeError, ValueError):
+                    requested_workers = 1
+                workers = max(1, min(int(source_ct_count), int(requested_workers)))
+                if int(workers) <= 1:
+                    built = [build_source(int(source_block)) for source_block in range(int(source_ct_count))]
+                else:
+                    with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-concat-fusion") as pool:
+                        built = list(pool.map(build_source, range(int(source_ct_count))))
 
             groups_by_source: dict[int, UnifiedTransformGroup] = {}
             targets_by_source: dict[int, tuple[int, ...]] = {}
@@ -816,6 +879,7 @@ class Conv2d(LinearTransform):
         groups_by_input = list(getattr(self, "_concat_unified_groups_by_input", []) or [])
         targets_by_input = list(getattr(self, "_concat_unified_targets_by_input", []) or [])
         if len(parts) != len(groups_by_input):
+            self._concat_release_unified_diagonal_caches()
             self._concat_evict_bias_after_eval(bias_materialized)
             raise RuntimeError(
                 f"concat-fused Conv2d {getattr(self, 'name', '')} expected "
@@ -834,73 +898,76 @@ class Conv2d(LinearTransform):
             lhs, rhs = _align_ciphertexts_for_add(current, partial)
             output_blocks[int(target_index)] = lhs + rhs
 
-        for input_index, source in enumerate(parts):
-            groups_by_source = dict(groups_by_input[int(input_index)])
-            targets_by_source = dict(targets_by_input[int(input_index)])
-            sorted_items = [
-                (int(source_index), group)
-                for source_index, group in sorted(groups_by_source.items())
-                if int(source_index) < len(getattr(source, "ids", ()))
-            ]
-            target_sum_ids = None
-            if bool(fuse_output_rescale) and sorted_items:
-                target_sum_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
-                    [group for _source_index, group in sorted_items],
-                    [int(source.ids[int(source_index)]) for source_index, _group in sorted_items],
-                    [targets_by_source[int(source_index)] for source_index, _group in sorted_items],
-                    int(target_count),
-                    self.scheme.backend,
-                )
-            if target_sum_ids is not None:
-                for target_index, output_id in enumerate(target_sum_ids):
-                    partial = CipherTensor(
-                        self.scheme,
-                        [int(output_id)],
-                        torch.Size([1, int(slots)]),
-                        torch.Size([1, int(slots)]),
+        try:
+            for input_index, source in enumerate(parts):
+                groups_by_source = dict(groups_by_input[int(input_index)])
+                targets_by_source = dict(targets_by_input[int(input_index)])
+                sorted_items = [
+                    (int(source_index), group)
+                    for source_index, group in sorted(groups_by_source.items())
+                    if int(source_index) < len(getattr(source, "ids", ()))
+                ]
+                target_sum_ids = None
+                if bool(fuse_output_rescale) and sorted_items:
+                    target_sum_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
+                        [group for _source_index, group in sorted_items],
+                        [int(source.ids[int(source_index)]) for source_index, _group in sorted_items],
+                        [targets_by_source[int(source_index)] for source_index, _group in sorted_items],
+                        int(target_count),
+                        self.scheme.backend,
                     )
-                    add_partial(int(target_index), partial)
-                continue
-            for source_index, group in sorted_items:
-                output_ids = group.evaluate_unified(int(source.ids[int(source_index)]), self.scheme.backend)
-                for target_index, output_id in zip(targets_by_source[int(source_index)], output_ids):
-                    partial = CipherTensor(
-                        self.scheme,
-                        [int(output_id)],
-                        torch.Size([1, int(slots)]),
-                        torch.Size([1, int(slots)]),
-                    )
-                    if not bool(fuse_output_rescale):
-                        partial = _rescale_cipher_tensor(partial)
-                    add_partial(int(target_index), partial)
+                if target_sum_ids is not None:
+                    for target_index, output_id in enumerate(target_sum_ids):
+                        partial = CipherTensor(
+                            self.scheme,
+                            [int(output_id)],
+                            torch.Size([1, int(slots)]),
+                            torch.Size([1, int(slots)]),
+                        )
+                        add_partial(int(target_index), partial)
+                    continue
+                for source_index, group in sorted_items:
+                    output_ids = group.evaluate_unified(int(source.ids[int(source_index)]), self.scheme.backend)
+                    for target_index, output_id in zip(targets_by_source[int(source_index)], output_ids):
+                        partial = CipherTensor(
+                            self.scheme,
+                            [int(output_id)],
+                            torch.Size([1, int(slots)]),
+                            torch.Size([1, int(slots)]),
+                        )
+                        if not bool(fuse_output_rescale):
+                            partial = _rescale_cipher_tensor(partial)
+                        add_partial(int(target_index), partial)
 
-        if bool(fuse_output_rescale):
+            if bool(fuse_output_rescale):
+                for target_index, block in enumerate(output_blocks):
+                    if block is not None:
+                        output_blocks[int(target_index)] = _rescale_cipher_tensor(block)
+            output_ids: list[int] = []
             for target_index, block in enumerate(output_blocks):
-                if block is not None:
-                    output_blocks[int(target_index)] = _rescale_cipher_tensor(block)
-        output_ids: list[int] = []
-        for target_index, block in enumerate(output_blocks):
-            if block is None:
-                raise RuntimeError(
-                    f"concat-fused Conv2d {getattr(self, 'name', '')} missing output block {int(target_index)}"
-                )
-            output_ids.append(int(block.ids[0]))
-            block.ids = []
-        out = CipherTensor(
-            self.scheme,
-            output_ids,
-            self.output_shape,
-            getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
-        )
-        for i in range(1, int(self.output_rotations) + 1):
-            out += out.roll(int(slots) // (2**i))
-        if self.on_bias_ptxt is not None:
-            out += self.on_bias_ptxt
-        release_owned = getattr(concat_tensor, "release_owned_parts", None)
-        if callable(release_owned):
-            release_owned()
-        self._concat_evict_bias_after_eval(bias_materialized)
-        return out
+                if block is None:
+                    raise RuntimeError(
+                        f"concat-fused Conv2d {getattr(self, 'name', '')} missing output block {int(target_index)}"
+                    )
+                output_ids.append(int(block.ids[0]))
+                block.ids = []
+            out = CipherTensor(
+                self.scheme,
+                output_ids,
+                self.output_shape,
+                getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
+            )
+            for i in range(1, int(self.output_rotations) + 1):
+                out += out.roll(int(slots) // (2**i))
+            if self.on_bias_ptxt is not None:
+                out += self.on_bias_ptxt
+            return out
+        finally:
+            release_owned = getattr(concat_tensor, "release_owned_parts", None)
+            if callable(release_owned):
+                release_owned()
+            self._concat_release_unified_diagonal_caches()
+            self._concat_evict_bias_after_eval(bias_materialized)
 
     def compute_fhe_output_gap(self, **kwargs):
         # Strided convolutions increase the multiplexed gap by a factor 

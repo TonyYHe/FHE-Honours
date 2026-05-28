@@ -16,6 +16,7 @@ from .io_prefetch import (
 from .memory_lifecycle import guard_host_memory, host_memory_info
 from .compile_policy import auto_batch_limit, auto_worker_count
 from orion.backend.python.tensors import CipherTensor
+from orion.core.progress import write_progress_event
 
 
 _ENCODED_HOIST_PAYLOAD_DATASET = "__encoded_hoist_payload__"
@@ -1088,6 +1089,8 @@ class NewEvaluator:
                 "layer_cache_encode_s": 0.0,
                 "layer_cache_key_prepare_s": 0.0,
             }
+        layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
+        write_progress_event("start", phase="diag_encode", layer=layer_name, path="dense")
         payloads = tuple(self._dense_layer_cache_build_payloads(linear_layer))
         if not payloads:
             raise RuntimeError(f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no payloads")
@@ -1132,6 +1135,15 @@ class NewEvaluator:
             + pending.get("layer_cache_evict_s", 0.0)
         )
         linear_layer._dense_layer_cache_pending_timing = pending
+        write_progress_event(
+            "end",
+            phase="diag_encode",
+            layer=layer_name,
+            path="dense",
+            layer_cache_encode_s=float(encode_s),
+            layer_cache_key_prepare_s=float(key_prepare_s),
+            backend_transform_count=int(len(transform_ids)),
+        )
         return {
             "layer_cache_encode_s": float(encode_s),
             "layer_cache_key_prepare_s": float(key_prepare_s),
@@ -1159,6 +1171,14 @@ class NewEvaluator:
         active = dict(getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {}) or {})
         if not active:
             return 0.0
+        layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
+        write_progress_event(
+            "start",
+            phase="evict",
+            layer=layer_name,
+            path="dense",
+            backend_transform_count=int(len(active)),
+        )
         started = time.perf_counter()
         remove_plaintexts = getattr(self.backend, "RemovePlaintextDiagonals", None)
         for transform_id in active.values():
@@ -1172,7 +1192,9 @@ class NewEvaluator:
         linear_layer._dense_layer_cache_active_transform_ids = {}
         if bool(clear_bias) and hasattr(linear_layer, "on_bias_ptxt"):
             linear_layer.on_bias_ptxt = None
-        return float(time.perf_counter() - started)
+        elapsed = float(time.perf_counter() - started)
+        write_progress_event("end", phase="evict", layer=layer_name, path="dense", layer_cache_evict_s=float(elapsed))
+        return float(elapsed)
 
     def finish_dense_layer_cache_runtime(self, linear_layer, evict_s: float) -> None:
         if not getattr(linear_layer, "_dense_layer_cache_deferred", False):
@@ -1406,6 +1428,15 @@ class NewEvaluator:
             for j in range(cols)
             if int(transform_ids[i][j]) >= 0
         ]
+        write_progress_event(
+            "start",
+            phase="eval",
+            layer=str(layer_name),
+            path="dense",
+            row_count=int(rows),
+            col_count=int(cols),
+            backend_transform_count=int(len(work_items)),
+        )
         group_started = time.perf_counter()
         runtime_timing = {
             "read_bundle_s": 0.0,
@@ -1549,6 +1580,7 @@ class NewEvaluator:
             total_s=float(time.perf_counter() - group_started),
         )
         linear_layer._last_runtime_timing = dict(timing_payload)
+        write_progress_event("end", phase="eval", layer=str(layer_name), path="dense", **dict(timing_payload))
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
 
     def _transform_id_matrix(self, transform_ids: dict, *, input_cols: int):

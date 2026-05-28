@@ -782,7 +782,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "layer",
         "groups/transforms",
         "layer cache turnover s",
-        "layer cache encode s",
+        "layer cache diag+encode s",
         "layer cache key prep s",
         "layer cache evict s",
         "LT+accum s",

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from orion.core.progress import write_progress_event
+
 from .module import Module, timer
 
 
@@ -555,9 +557,26 @@ class Bootstrap(Module):
                 f"aborting before bootstrap for debug: "
                 f"{getattr(self, 'bootstrap_debug_name', '')}"
             )
+        progress_name = str(getattr(self, "bootstrap_debug_name", "") or self.__class__.__name__)
+        write_progress_event(
+            "start",
+            phase="bootstrap",
+            layer=progress_name,
+            bootstrap_slots=int(slots),
+            call_index=int(profile_record.get("call_index", 0) or 0),
+        )
         backend_start = time.perf_counter()
         x = x.bootstrap(slots=slots)
-        profile_record["timing_s"]["backend_bootstrap_call"] = float(time.perf_counter() - backend_start)
+        backend_bootstrap_s = float(time.perf_counter() - backend_start)
+        profile_record["timing_s"]["backend_bootstrap_call"] = float(backend_bootstrap_s)
+        write_progress_event(
+            "end",
+            phase="bootstrap",
+            layer=progress_name,
+            bootstrap_slots=int(slots),
+            call_index=int(profile_record.get("call_index", 0) or 0),
+            backend_bootstrap_s=float(backend_bootstrap_s),
+        )
         profile_record["output_from_backend"] = self._profile_cipher_batch_stats(x)
         self._write_bootstrap_debug(phase="after_bootstrap", x=x, slots=slots)
 

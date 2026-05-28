@@ -1240,6 +1240,348 @@ def test_native_halo_compact_source_prunes_zero_blocks_without_dense_pack_speedu
         scheme.delete_scheme()
 
 
+def test_compact_source_single_slot_concat_compile_skips_payload_coalesce(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_conv_transform,
+        _build_compact_source_concat_transforms_single_slot,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(3)
+        spec = NativeHaloConv2DSpec(
+            family_label="concat_compact_source_single_slot",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        stripe = plan.stripes[0]
+        weight = torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32)
+        source_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1}
+        proxy = SimpleNamespace(
+            input_shape=torch.Size((1, spec.c_in, spec.h_in, spec.w_in)),
+            output_shape=torch.Size((1, spec.c_out, spec.h_out, spec.w_out)),
+            fhe_input_shape=torch.Size((1, spec.c_in, spec.h_in, spec.w_in)),
+            fhe_output_shape=torch.Size((1, spec.c_out, spec.h_out, spec.w_out)),
+            input_gap=1,
+            output_gap=1,
+            layout_policy_input_row_offset=0,
+            layout_policy_output_row_offset=0,
+            layout_policy_output_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            layout_policy_output_materialization="",
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+            dilation=(1, 1),
+        )
+        direct_diagonals, direct_rotations = packing.direct_diagonalize_conv2d(
+            proxy,
+            weight,
+            64,
+            "hybrid",
+            False,
+            allow_hybrid=False,
+        )
+        assert int(direct_rotations) == 0
+        concat_built = _build_compact_source_concat_transforms_single_slot(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout=source_layout,
+            source_ct_count=4,
+            target_ct_count=4,
+            group_n1=1,
+            build_diagonals_by_block=lambda direct_diagonals=direct_diagonals: direct_diagonals,
+        )
+        assert concat_built
+        source_block = min(int(value) for value in concat_built)
+        target_block, concat_transform = concat_built[int(source_block)][0]
+
+        original_coalesce = native_halo_conv2d._coalesce_native_rows
+
+        def fail_coalesce(*_args, **_kwargs):
+            raise AssertionError("single-slot metadata compile must not coalesce payload rows")
+
+        monkeypatch.setattr(native_halo_conv2d, "_coalesce_native_rows", fail_coalesce)
+        transform = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=int(source_block),
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout=source_layout,
+            group_n1=1,
+            compact_target_block=int(target_block),
+        )
+        assert transform is not None
+        assert transform.diagonals == {}
+        per_transform_metadata_indices = set(
+            int(value) for value in transform._single_slot_diag_indices_by_block[(0, 0)]
+        )
+        assert per_transform_metadata_indices
+        concat_matches = [
+            candidate
+            for candidate_target, candidate in concat_built.get(int(source_block), ())
+            if int(candidate_target) == int(target_block)
+            and f"_s{int(stripe.index)}_tgt0_compact{int(target_block)}" in str(candidate.name)
+        ]
+        assert concat_matches
+        assert concat_matches[0] is concat_transform
+        concat_metadata_indices = set(
+            int(value) for value in concat_matches[0]._single_slot_diag_indices_by_block[(0, 0)]
+        )
+        assert concat_metadata_indices == set(int(value) for value in direct_diagonals[(int(target_block), int(source_block))])
+        assert set(
+            int(value)
+            for value in concat_matches[0]._single_slot_build_diagonals()[(0, 0)].keys()
+        ) == concat_metadata_indices
+
+        monkeypatch.setattr(native_halo_conv2d, "_coalesce_native_rows", original_coalesce)
+        rebuilt = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=int(source_block),
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout=source_layout,
+            group_n1=1,
+            compact_target_block=int(target_block),
+            force_payload=True,
+        )
+        assert rebuilt is not None
+        assert per_transform_metadata_indices == set(int(value) for value in rebuilt.diagonals[(0, 0)].keys())
+    finally:
+        scheme.delete_scheme()
+
+
+def test_concat_fusion_single_slot_compile_routes_to_branch_metadata_builder(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 2, kernel_size=3, padding=1, bias=True)
+        conv.init_orion_params()
+        conv.name = "concat_route_probe"
+        conv.input_shape = torch.Size((1, 4, 8, 8))
+        conv.output_shape = torch.Size((1, 2, 8, 8))
+        conv.fhe_input_shape = torch.Size((1, 4, 8, 8))
+        conv.fhe_output_shape = torch.Size((1, 2, 8, 8))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.concat_fusion_specs = (
+            {
+                "source": "a",
+                "concat_node": "cat",
+                "channel_start": 0,
+                "channel_end": 2,
+                "channels": 2,
+                "shape": torch.Size((1, 2, 8, 8)),
+                "fhe_shape": torch.Size((1, 2, 8, 8)),
+                "gap": 1,
+            },
+            {
+                "source": "b",
+                "concat_node": "cat",
+                "channel_start": 2,
+                "channel_end": 4,
+                "channels": 2,
+                "shape": torch.Size((1, 2, 8, 8)),
+                "fhe_shape": torch.Size((1, 2, 8, 8)),
+                "gap": 1,
+            },
+        )
+        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1}
+        conv.layout_policy_output_materialization = ""
+        conv.set_level(len(scheme.params.get_logq()) - 1)
+        conv.set_depth(1)
+        original_builder = native_halo_conv2d._build_compact_source_concat_transforms_single_slot
+        calls = []
+
+        def spy_builder(*args, **kwargs):
+            calls.append(dict(kwargs))
+            return original_builder(*args, **kwargs)
+
+        def fail_per_target_builder(*_args, **_kwargs):
+            raise AssertionError("concat single-slot compile should use branch metadata builder")
+
+        monkeypatch.setattr(
+            native_halo_conv2d,
+            "_build_compact_source_concat_transforms_single_slot",
+            spy_builder,
+        )
+        monkeypatch.setattr(
+            native_halo_conv2d,
+            "_build_compact_source_conv_transform",
+            fail_per_target_builder,
+        )
+
+        assert conv._compile_concat_fusion_unified_transforms() is True
+        assert len(calls) == 2
+        assert getattr(conv, "_concat_unified_groups_by_input", [])
+        assert all(groups for groups in conv._concat_unified_groups_by_input)
+        direct_calls = []
+        original_direct = packing.direct_diagonalize_conv2d
+
+        def spy_direct(*args, **kwargs):
+            direct_calls.append(1)
+            return original_direct(*args, **kwargs)
+
+        monkeypatch.setattr(packing, "direct_diagonalize_conv2d", spy_direct)
+        first_groups = conv._concat_unified_groups_by_input[0]
+        source_indices = sorted(int(value) for value in first_groups)
+        assert len(source_indices) >= 2
+        for source_index in source_indices[:2]:
+            first_transform = first_groups[int(source_index)].transforms[0]
+            built = first_transform._single_slot_build_diagonals()
+            assert built
+        assert len(direct_calls) == 1
+        conv._concat_release_unified_diagonal_caches()
+    finally:
+        scheme.delete_scheme()
+
+
+def test_concat_single_slot_metadata_matches_direct_pack_for_nonfused_output_halo(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_concat_transforms_single_slot,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(5)
+        spec = NativeHaloConv2DSpec(
+            family_label="concat_nonfused_output_halo",
+            c_in=2,
+            h_in=8,
+            w_in=8,
+            c_out=2,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            output_top_beta=1,
+            output_bottom_beta=1,
+        )
+        weight = torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32)
+        proxy = SimpleNamespace(
+            input_shape=torch.Size((1, spec.c_in, spec.h_in, spec.w_in)),
+            output_shape=torch.Size((1, spec.c_out, spec.h_out, spec.w_out)),
+            fhe_input_shape=torch.Size((1, spec.c_in, spec.h_in, spec.w_in)),
+            fhe_output_shape=torch.Size((1, spec.c_out, spec.h_out + 2, spec.w_out)),
+            input_gap=1,
+            output_gap=1,
+            layout_policy_input_row_offset=0,
+            layout_policy_output_row_offset=1,
+            layout_policy_output_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+            layout_policy_output_materialization="",
+            kernel_size=(3, 3),
+            stride=(1, 1),
+            padding=(1, 1),
+            dilation=(1, 1),
+        )
+        direct_diagonals, output_rotations = packing.direct_diagonalize_conv2d(
+            proxy,
+            weight,
+            64,
+            "hybrid",
+            False,
+            allow_hybrid=False,
+        )
+        assert int(output_rotations) == 0
+        built = _build_compact_source_concat_transforms_single_slot(
+            spec=spec,
+            plan=native_halo_conv2d_plan(spec, require_native_target_fit=False),
+            weight=weight,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            source_ct_count=2,
+            target_ct_count=3,
+            group_n1=1,
+            build_diagonals_by_block=lambda direct_diagonals=direct_diagonals: direct_diagonals,
+            output_materialization="",
+        )
+
+        assert built
+        for source_block, transforms in built.items():
+            for target_block, transform in transforms:
+                metadata = set(int(value) for value in transform._single_slot_diag_indices_by_block[(0, 0)])
+                assert metadata == set(int(value) for value in direct_diagonals[(int(target_block), int(source_block))])
+    finally:
+        scheme.delete_scheme()
+
+
+def test_concat_unified_eval_releases_diagonal_cache_on_exception() -> None:
+    class FakeCache:
+        def __init__(self) -> None:
+            self.released = 0
+
+        def release(self) -> None:
+            self.released += 1
+
+    class FailingGroup:
+        def __init__(self, cache) -> None:
+            self.transforms = [SimpleNamespace(_concat_branch_diagonal_cache=cache)]
+
+        def evaluate_unified(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(1, 1, kernel_size=1, bias=False)
+        conv.init_orion_params()
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.set_level(len(scheme.params.get_logq()) - 1)
+        cache = FakeCache()
+        conv._concat_unified_groups_by_input = [{0: FailingGroup(cache)}]
+        conv._concat_unified_targets_by_input = [{0: (0,)}]
+        conv._concat_unified_output_ct_count = 1
+        conv.on_bias_ptxt = object()
+        release_state = {"count": 0}
+        concat_tensor = SimpleNamespace(
+            parts=(SimpleNamespace(ids=[123]),),
+            release_owned_parts=lambda: release_state.__setitem__("count", release_state["count"] + 1),
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            conv._evaluate_concat_fusion_unified(concat_tensor)
+
+        assert cache.released == 1
+        assert release_state["count"] == 1
+    finally:
+        scheme.delete_scheme()
+
+
 def test_input_pair_provider_prunes_zero_blocks_without_dense_pack_speedup() -> None:
     from orion.experimental.cir.transition_pool_provider import InputPairConvRuntimeExecutor
 

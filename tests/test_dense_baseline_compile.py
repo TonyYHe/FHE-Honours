@@ -496,7 +496,7 @@ def test_dense_layer_cache_compile_defers_backend_generation(monkeypatch) -> Non
     assert backend.deleted == [700, 701]
 
 
-def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch) -> None:
+def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch, tmp_path) -> None:
     class Backend:
         def __init__(self):
             self.generated_batches = []
@@ -549,6 +549,11 @@ def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch) -> 
             return out
 
     monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    progress_path = tmp_path / "dense_progress.jsonl"
+    state_path = tmp_path / "dense_progress_state.json"
+    monkeypatch.setenv("ORION_PROGRESS_JSONL", str(progress_path))
+    monkeypatch.setenv("ORION_PROGRESS_STATE_JSON", str(state_path))
+    monkeypatch.setenv("ORION_PROGRESS_CONTEXT", json.dumps({"network": "tiny", "mode": "dense"}))
     backend = Backend()
     fake_eval = Evaluator()
     fake_scheme = SimpleNamespace(
@@ -592,6 +597,17 @@ def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch) -> 
     assert evaluator.last_runtime_timing["runtime_fairness_mode"] == "single_slot_layer_cache"
     assert evaluator.last_runtime_timing["layer_cache_encode_s"] >= 0.0
     assert evaluator.last_runtime_timing["layer_cache_evict_s"] >= 0.0
+    rows = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+    phases = [(row["event"], row["phase"], row["layer"]) for row in rows]
+    assert ("start", "diag_encode", "layer_cache_eval") in phases
+    assert ("end", "diag_encode", "layer_cache_eval") in phases
+    assert ("start", "eval", "layer_cache_eval") in phases
+    assert ("end", "eval", "layer_cache_eval") in phases
+    assert ("start", "evict", "layer_cache_eval") in phases
+    assert ("end", "evict", "layer_cache_eval") in phases
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["event"] == "end"
+    assert state["phase"] == "evict"
 
 
 def test_dense_save_load_compile_defaults_to_provider_sized_batches(monkeypatch) -> None:

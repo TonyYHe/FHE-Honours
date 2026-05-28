@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -578,6 +579,40 @@ def test_single_slot_materializes_whole_group_once_and_evicts_once(monkeypatch) 
     assert backend.deleted == [11, 12]
     assert backend.live_plaintext_transforms == set()
     assert group.unified_ids is None
+
+
+def test_single_slot_progress_file_tracks_materialize_eval_and_evict(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "1")
+    progress_path = tmp_path / "progress.jsonl"
+    state_path = tmp_path / "progress_state.json"
+    monkeypatch.setenv("ORION_PROGRESS_JSONL", str(progress_path))
+    monkeypatch.setenv("ORION_PROGRESS_STATE_JSON", str(state_path))
+    monkeypatch.setenv("ORION_PROGRESS_CONTEXT", json.dumps({"network": "tiny", "mode": "provider"}))
+    backend = _SingleSlotTrackingBackend()
+    transform_a = _fake_transform({0: torch.ones(16)}, level=2)
+    transform_b = _fake_transform({1: torch.ones(16) * 2}, level=2)
+    transform_a.name = "dec1a_concat0_a"
+    transform_b.name = "dec1a_concat0_b"
+    group = UnifiedTransformGroup((transform_a, transform_b))
+
+    group.compile_unified(backend)
+    group.evaluate_unified(77, backend)
+
+    rows = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+    phases = [(row["event"], row["phase"]) for row in rows]
+    assert ("start", "diag_encode") in phases
+    assert ("end", "diag_encode") in phases
+    assert ("start", "eval") in phases
+    assert ("end", "eval") in phases
+    assert ("start", "evict") in phases
+    assert ("end", "evict") in phases
+    assert rows[0]["network"] == "tiny"
+    assert rows[0]["mode"] == "provider"
+    assert rows[0]["layer"] == "dec1a_concat0_a"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["event"] == "end"
+    assert state["phase"] == "eval"
 
 
 def test_unified_transform_sources_target_sum_uses_compatible_targets() -> None:

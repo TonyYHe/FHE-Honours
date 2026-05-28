@@ -2561,11 +2561,15 @@ def _run_forward_attempt(
         if bool(trace_forward_memory)
         else None
     )
+    progress_path = out_path.with_name(f"{out_path.stem}.forward{int(attempt_index)}.progress.jsonl")
+    progress_state_path = out_path.with_name(f"{out_path.stem}.forward{int(attempt_index)}.progress_state.json")
     attempt: dict[str, Any] = {
         "attempt_index": int(attempt_index),
         "kind": str(attempt_kind),
         "status": "started",
         "step": "init",
+        "progress_path": str(progress_path),
+        "progress_state_path": str(progress_state_path),
         "device_memory_before_encrypt": _device_memory_snapshot(),
         "live_ciphertexts_before_encrypt": _live_ciphertext_snapshot(),
     }
@@ -2589,6 +2593,20 @@ def _run_forward_attempt(
         )
     x0_ct = None
     out_ct = None
+    progress_env_keys = ("ORION_PROGRESS_JSONL", "ORION_PROGRESS_STATE_JSON", "ORION_PROGRESS_CONTEXT")
+    old_progress_env = {key: os.environ.get(key) for key in progress_env_keys}
+    os.environ["ORION_PROGRESS_JSONL"] = str(progress_path)
+    os.environ["ORION_PROGRESS_STATE_JSON"] = str(progress_state_path)
+    os.environ["ORION_PROGRESS_CONTEXT"] = json.dumps(
+        {
+            "network": str(payload.get("network", "")),
+            "mode": str(mode),
+            "attempt_index": int(attempt_index),
+            "attempt_kind": str(attempt_kind),
+            "result_path": str(out_path),
+        },
+        sort_keys=True,
+    )
     try:
         x0_ct = _attempt_timed(
             payload,
@@ -2767,6 +2785,11 @@ def _run_forward_attempt(
                     release()
                 except Exception:
                     pass
+        for key, value in old_progress_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
         gc.collect()
 
 

@@ -33,6 +33,7 @@ from orion.backend.python.compile_policy import (
     auto_worker_count,
     batch_limit_for_payloads,
 )
+from orion.core.progress import write_progress_event
 
 
 _UNIFIED_GROUP_COUNTER = count(1)
@@ -233,6 +234,26 @@ class UnifiedTransformGroup:
     def _set_compile_profile(self, key: str, value: Any) -> None:
         self.last_compile_profile[str(key)] = value
 
+    def _progress_payload(self, phase: str, **extra: Any) -> dict[str, Any]:
+        names = [
+            str(getattr(transform, "name", ""))
+            for transform in self.transforms[:3]
+            if str(getattr(transform, "name", ""))
+        ]
+        payload: dict[str, Any] = {
+            "phase": str(phase),
+            "storage_key": str(self._storage_key),
+            "transform_count": int(len(self.transforms)),
+        }
+        if names:
+            payload["transform_names"] = names
+            payload["layer"] = str(names[0]).split("_concat_source_", 1)[0]
+        payload.update(extra)
+        return payload
+
+    def _write_progress(self, event: str, phase: str, **extra: Any) -> None:
+        write_progress_event(str(event), **self._progress_payload(str(phase), **extra))
+
     def _diag_indices_for_single_slot_transform(self, transform) -> np.ndarray:
         indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
         if indices_by_block is None:
@@ -415,6 +436,7 @@ class UnifiedTransformGroup:
                 "layer_cache_encode_s": 0.0,
                 "layer_cache_key_prepare_s": 0.0,
             }
+        self._write_progress("start", "diag_encode")
         started = time.perf_counter()
         recipes = self._single_slot_recipes
         if recipes is None:
@@ -492,6 +514,13 @@ class UnifiedTransformGroup:
                 "materialize_profile": dict(self.last_compile_profile),
             },
         )
+        self._write_progress(
+            "end",
+            "diag_encode",
+            layer_cache_encode_s=float(encode_s),
+            layer_cache_key_prepare_s=float(key_prepare_s),
+            backend_transform_count=int(len(self.unified_ids or ())),
+        )
         return {
             "layer_cache_encode_s": float(encode_s),
             "layer_cache_key_prepare_s": float(key_prepare_s),
@@ -500,6 +529,7 @@ class UnifiedTransformGroup:
     def _evict_single_slot_after_eval(self, backend) -> float:
         if not self._single_slot_layer_cache or self.unified_ids is None:
             return 0.0
+        self._write_progress("start", "evict", backend_transform_count=int(len(self.unified_ids or ())))
         started = time.perf_counter()
         ids = [int(value) for value in (self.unified_ids or ())]
         self._io_prefetcher.clear(wait=True)
@@ -537,6 +567,7 @@ class UnifiedTransformGroup:
             evicted_transform_ids=ids,
             timing={"layer_cache_evict_s": float(elapsed)},
         )
+        self._write_progress("end", "evict", layer_cache_evict_s=float(elapsed))
         return float(elapsed)
 
     def _scheme_params(self):
@@ -3187,6 +3218,7 @@ class UnifiedTransformGroup:
             try:
                 self._consume_trim_seconds(backend)
                 self._consume_shared_cache_eval_profile(backend)
+                self._write_progress("start", "eval", backend_transform_count=1)
                 eval_started = time.perf_counter()
                 output = [int(backend.EvaluateLinearTransform(int(self.unified_ids[0]), int(ct_input_id)))]
                 eval_total_s = float(time.perf_counter() - eval_started)
@@ -3211,6 +3243,7 @@ class UnifiedTransformGroup:
                     memory_bounded=False,
                     total_s=float(time.perf_counter() - group_started),
                 )
+                self._write_progress("end", "eval", **dict(runtime_timing))
                 self._record_memory_event("after_eval_single_transform", backend, timing=runtime_timing)
         scheduler = self._shared_saved_io_scheduler()
         prefetch_key = self._saved_io_prefetch_key()
@@ -3264,6 +3297,11 @@ class UnifiedTransformGroup:
             self._record_memory_event("before_eval_group", backend)
             self._consume_trim_seconds(backend)
             self._consume_shared_cache_eval_profile(backend)
+            self._write_progress(
+                "start",
+                "eval",
+                backend_transform_count=int(len(self.unified_ids or ())),
+            )
             eval_started = time.perf_counter()
             output_ids = list(
                 backend.EvaluateLinearTransformsWithSharedCache(
@@ -3309,6 +3347,7 @@ class UnifiedTransformGroup:
                 memory_bounded=False,
                 total_s=float(time.perf_counter() - group_started),
             )
+            self._write_progress("end", "eval", **dict(runtime_timing))
             self._record_memory_event(
                 "after_eval_group_trim",
                 backend,
