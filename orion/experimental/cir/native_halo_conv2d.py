@@ -75,8 +75,38 @@ def _layout_bottom_beta(layout: dict[str, Any], *, default: int = 0) -> int:
     return max(0, int(layout.get("bottom_beta", layout.get("beta", int(default))) or 0))
 
 
-def _spec_has_output_halo(spec: NativeHaloConv2DSpec) -> bool:
+def _layout_physical_top_beta(layout: dict[str, Any], *, default: int = 0) -> int:
+    return max(
+        0,
+        int(
+            layout.get(
+                "physical_top_beta",
+                layout.get("top_beta", layout.get("alpha", int(default))),
+            )
+            or 0
+        ),
+    )
+
+
+def _layout_physical_bottom_beta(layout: dict[str, Any], *, default: int = 0) -> int:
+    return max(
+        0,
+        int(
+            layout.get(
+                "physical_bottom_beta",
+                layout.get("bottom_beta", layout.get("beta", int(default))),
+            )
+            or 0
+        ),
+    )
+
+
+def _spec_has_semantic_output_halo(spec: NativeHaloConv2DSpec) -> bool:
     return bool(int(spec.output_top_beta) > 0 or int(spec.output_bottom_beta) > 0)
+
+
+def _spec_has_physical_output_halo(spec: NativeHaloConv2DSpec) -> bool:
+    return bool(int(spec.output_physical_top_beta) > 0 or int(spec.output_physical_bottom_beta) > 0)
 
 
 def _slot_indices(channel_count: int, height: int, width: int, gap: int) -> torch.Tensor:
@@ -181,17 +211,40 @@ def _materialized_output_source_h(output_h: torch.Tensor | int, *, h_out: int, o
     return min(max(int(value), 0), max(0, int(h_out) - 1))
 
 
+def _spec_physical_output_h(spec: NativeHaloConv2DSpec) -> int:
+    return int(spec.h_out) + max(0, int(spec.output_physical_top_beta or 0)) + max(
+        0,
+        int(spec.output_physical_bottom_beta or 0),
+    )
+
+
+def _spec_physical_output_h_positions(spec: NativeHaloConv2DSpec, output_h: torch.Tensor | int):
+    physical_top = max(0, int(spec.output_physical_top_beta or 0))
+    physical_bottom = max(0, int(spec.output_physical_bottom_beta or 0))
+    if int(physical_top) >= int(spec.output_top_beta) and int(physical_bottom) >= int(spec.output_bottom_beta):
+        return output_h + int(physical_top) if isinstance(output_h, torch.Tensor) else int(output_h) + int(physical_top)
+    return output_h + int(physical_top) if isinstance(output_h, torch.Tensor) else int(output_h) + int(physical_top)
+
+
+def _spec_physical_output_h_valid(spec: NativeHaloConv2DSpec, output_h: torch.Tensor | int):
+    physical_top = max(0, int(spec.output_physical_top_beta or 0))
+    physical_bottom = max(0, int(spec.output_physical_bottom_beta or 0))
+    if isinstance(output_h, torch.Tensor):
+        return (output_h >= -int(physical_top)) & (output_h < int(spec.h_out) + int(physical_bottom))
+    value = int(output_h)
+    return bool(value >= -int(physical_top) and value < int(spec.h_out) + int(physical_bottom))
+
+
 def _heuristic_channel_tile(channel_count: int, gap: int) -> int:
     """Deterministic native-stripe channel tile.
 
-    Use one natural phase group for gapped layouts.  For gap-1 layouts, use a
-    two-channel tile when possible; odd final tiles intentionally leave the
-    second lane empty so every tile keeps the same geometry.
+    Use one natural phase group for gapped layouts.  For gap-1 layouts, keep
+    each channel in its own native stripe tile.
     """
 
     phase = _phase_count(int(gap))
     if int(phase) == 1:
-        return 1 if int(channel_count) <= 1 else 2
+        return 1
     return int(phase)
 
 
@@ -262,6 +315,20 @@ class NativeHaloConv2DSpec:
     input_bottom_beta: int = 0
     output_top_beta: int = 0
     output_bottom_beta: int = 0
+    input_physical_top_beta: int | None = None
+    input_physical_bottom_beta: int | None = None
+    output_physical_top_beta: int | None = None
+    output_physical_bottom_beta: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.input_physical_top_beta is None:
+            object.__setattr__(self, "input_physical_top_beta", int(self.input_top_beta))
+        if self.input_physical_bottom_beta is None:
+            object.__setattr__(self, "input_physical_bottom_beta", int(self.input_bottom_beta))
+        if self.output_physical_top_beta is None:
+            object.__setattr__(self, "output_physical_top_beta", int(self.output_top_beta))
+        if self.output_physical_bottom_beta is None:
+            object.__setattr__(self, "output_physical_bottom_beta", int(self.output_bottom_beta))
 
     @property
     def input_h_min(self) -> int:
@@ -309,6 +376,10 @@ class NativeHaloConv2DSpec:
             "input_bottom_beta": int(self.input_bottom_beta),
             "output_top_beta": int(self.output_top_beta),
             "output_bottom_beta": int(self.output_bottom_beta),
+            "input_physical_top_beta": int(self.input_physical_top_beta or 0),
+            "input_physical_bottom_beta": int(self.input_physical_bottom_beta or 0),
+            "output_physical_top_beta": int(self.output_physical_top_beta or 0),
+            "output_physical_bottom_beta": int(self.output_physical_bottom_beta or 0),
         }
 
 
@@ -368,10 +439,10 @@ class NativeHaloConv2DPlan:
 
     @property
     def output_ct_count(self) -> int:
-        if not _spec_has_output_halo(self.spec):
+        if not _spec_has_physical_output_halo(self.spec):
             return _compact_ct_count(
                 int(self.spec.c_out),
-                int(self.spec.h_out),
+                _spec_physical_output_h(self.spec),
                 int(self.spec.w_out),
                 int(self.spec.gap_out),
                 int(self.spec.slot_count),
@@ -406,7 +477,11 @@ class NativeHaloConv2DPlan:
         return {
             "runtime_layout": "native_halo_stripe_no_ri",
             "conv_dependency": "native_halo_source_tiles",
-            "output_storage_layout": "native_halo_stripe" if _spec_has_output_halo(self.spec) else "tight_compact",
+            "output_storage_layout": (
+                "native_halo_stripe"
+                if _spec_has_physical_output_halo(self.spec)
+                else ("logical_halo_compact" if _spec_has_semantic_output_halo(self.spec) else "tight_compact")
+            ),
             "spec": self.spec.to_dict(),
             "source_channel_tile": int(self.source_channel_tile),
             "target_channel_tile": int(self.target_channel_tile),
@@ -452,6 +527,16 @@ class _BlockDiagonalCache:
                     self._blocks = blocks
         return dict(blocks.get((int(row), int(col)), {}) or {})
 
+    def get_required(self, row: int, col: int, *, context: str = "") -> dict[int, Any]:
+        block = self.get(int(row), int(col))
+        if block:
+            return block
+        detail = f" for {context}" if context else ""
+        raise RuntimeError(
+            f"Native halo Conv2d single-slot diagonal cache missing block "
+            f"(row={int(row)}, col={int(col)}){detail}"
+        )
+
     def release(self) -> None:
         with self._lock:
             self._blocks = None
@@ -482,11 +567,14 @@ def _collect_compact_source_conv_diag_sets(
         if bool(compact_output)
         else torch.arange(int(target_count), dtype=torch.int64)
     )
-    source_top_beta = max(0, int(_layout_top_beta(source_layout, default=spec.input_top_beta) or 0))
-    source_bottom_beta = max(0, int(_layout_bottom_beta(source_layout, default=spec.input_bottom_beta) or 0))
+    source_top_beta = max(0, int(_layout_physical_top_beta(source_layout, default=spec.input_physical_top_beta or 0) or 0))
+    source_bottom_beta = max(
+        0,
+        int(_layout_physical_bottom_beta(source_layout, default=spec.input_physical_bottom_beta or 0) or 0),
+    )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
-    compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+    compact_output_h = _spec_physical_output_h(spec)
     out_h_values = torch.arange(
         int(stripe.target_h_start),
         int(stripe.target_h_end),
@@ -566,9 +654,11 @@ def _collect_compact_source_conv_diag_sets(
                 source_vec = torch.remainder(source_index, int(slots))
 
                 if bool(compact_output):
+                    target_h_slice = out_h_flat[int(start): int(end)]
+                    target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
                     target_index = _idx_chw_gap_channel_positions(
                         target_channels,
-                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
+                        h=_spec_physical_output_h_positions(spec, target_h_slice),
                         w=out_w_flat[int(start): int(end)],
                         height=int(compact_output_h),
                         width=int(spec.w_out),
@@ -583,6 +673,7 @@ def _collect_compact_source_conv_diag_sets(
                     )
                 else:
                     target_local_h = out_h_flat[int(start): int(end)] - int(stripe.target_h_start)
+                    target_h_valid = torch.ones_like(target_local_h, dtype=torch.bool)
                     target_vec = _idx_chw_gap_channel_positions(
                         torch.arange(int(target_count), dtype=torch.int64),
                         h=target_local_h,
@@ -602,6 +693,7 @@ def _collect_compact_source_conv_diag_sets(
                     pair_mask = (
                         source_block_mask[:, None, :]
                         & block_mask[None, :, :]
+                        & target_h_valid[None, None, :]
                         & coeff_nonzero[:, :, None]
                     )
                     if not bool(pair_mask.any().item()):
@@ -628,6 +720,7 @@ def _make_compact_source_conv_single_slot_transform(
     diag_set: set[int],
     compact_target_block: int | None = None,
     diagonal_cache: _BlockDiagonalCache | None = None,
+    release_diagonal_cache_on_materialize: bool = True,
 ) -> Any:
     slots = int(spec.slot_count)
     baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
@@ -652,10 +745,15 @@ def _make_compact_source_conv_single_slot_transform(
         target_index=int(target_index),
     ):
         if diagonal_cache is not None:
-            block = diagonal_cache.get(int(target_index), int(source_block))
-            if block:
-                return {(0, 0): block}
-            return {(0, 0): {int(fallback_diag): torch.zeros((int(slots),), dtype=torch.float32)}}
+            block = diagonal_cache.get_required(
+                int(target_index),
+                int(source_block),
+                context=(
+                    f"{spec.family_label} compact-source source_block={int(source_block)} "
+                    f"target_index={int(target_index)}"
+                ),
+            )
+            return {(0, 0): block}
         rebuilt = _build_compact_source_conv_transform(
             spec=spec,
             plan=plan,
@@ -698,7 +796,12 @@ def _make_compact_source_conv_single_slot_transform(
         giant_shifts=tuple(sorted(int(value) for value in giant)),
         rotation_group_id=f"native_halo:{spec.family_label}:compact_src{int(source_block)}",
         rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
-        _single_slot_release_diagonal_cache=None,
+        _single_slot_diagonal_cache=diagonal_cache,
+        _single_slot_release_diagonal_cache=(
+            diagonal_cache.release
+            if diagonal_cache is not None and bool(release_diagonal_cache_on_materialize)
+            else None
+        ),
         _concat_branch_diagonal_cache=diagonal_cache,
     )
 
@@ -719,11 +822,14 @@ def _build_compact_source_concat_transforms_single_slot(
 ) -> dict[int, list[tuple[int, Any]]]:
     slots = int(spec.slot_count)
     source_channels = torch.arange(int(spec.c_in), dtype=torch.int64)
-    source_top_beta = max(0, int(_layout_top_beta(source_layout, default=spec.input_top_beta) or 0))
-    source_bottom_beta = max(0, int(_layout_bottom_beta(source_layout, default=spec.input_bottom_beta) or 0))
+    source_top_beta = max(0, int(_layout_physical_top_beta(source_layout, default=spec.input_physical_top_beta or 0) or 0))
+    source_bottom_beta = max(
+        0,
+        int(_layout_physical_bottom_beta(source_layout, default=spec.input_physical_bottom_beta or 0) or 0),
+    )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
-    compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+    compact_output_h = _spec_physical_output_h(spec)
     out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
     max_pair_count = int(_native_halo_build_pair_chunk_limit())
     diag_sets: dict[tuple[int, int], set[int]] = {}
@@ -812,9 +918,11 @@ def _build_compact_source_concat_transforms_single_slot(
                             continue
                         source_vec = torch.remainder(source_index, int(slots))
 
+                        target_h_slice = out_h_flat[int(start): int(end)]
+                        target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
                         target_index = _idx_chw_gap_channel_positions(
                             target_channels,
-                            h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
+                            h=_spec_physical_output_h_positions(spec, target_h_slice),
                             w=out_w_flat[int(start): int(end)],
                             height=int(compact_output_h),
                             width=int(spec.w_out),
@@ -824,6 +932,7 @@ def _build_compact_source_concat_transforms_single_slot(
                         target_valid = (
                             (target_blocks >= 0)
                             & (target_blocks < int(target_ct_count))
+                            & target_h_valid
                         )
                         if not bool(target_valid.any().item()):
                             continue
@@ -877,6 +986,7 @@ def _build_compact_source_concat_transforms_single_slot(
             diag_set=set(int(value) for value in diag_set),
             compact_target_block=int(target_block),
             diagonal_cache=diagonal_cache,
+            release_diagonal_cache_on_materialize=False,
         )
         ordered.setdefault(int(source_block), []).append((int(target_block), transform))
     return ordered
@@ -938,6 +1048,10 @@ def native_halo_conv2d_spec_from_module(module: Any, *, output_node_id: str) -> 
         input_bottom_beta=_layout_bottom_beta(input_layout),
         output_top_beta=_layout_top_beta(output_layout),
         output_bottom_beta=_layout_bottom_beta(output_layout),
+        input_physical_top_beta=_layout_physical_top_beta(input_layout),
+        input_physical_bottom_beta=_layout_physical_bottom_beta(input_layout),
+        output_physical_top_beta=_layout_physical_top_beta(output_layout),
+        output_physical_bottom_beta=_layout_physical_bottom_beta(output_layout),
     )
 
 
@@ -1263,8 +1377,14 @@ class NativeHaloRelayoutKernel:
         self.transform_ids: dict[tuple[int, int], int] = {}
 
     def _compact_input_index(self, *, channel: int, h: int, w: int) -> int | None:
-        source_top_beta = _layout_top_beta(self.source_layout, default=self.spec.input_top_beta)
-        source_bottom_beta = _layout_bottom_beta(self.source_layout, default=self.spec.input_bottom_beta)
+        source_top_beta = _layout_physical_top_beta(
+            self.source_layout,
+            default=int(self.spec.input_physical_top_beta or 0),
+        )
+        source_bottom_beta = _layout_physical_bottom_beta(
+            self.source_layout,
+            default=int(self.spec.input_physical_bottom_beta or 0),
+        )
         if int(h) < 0:
             if int(h) < -int(source_top_beta):
                 return None
@@ -1288,11 +1408,13 @@ class NativeHaloRelayoutKernel:
         )
 
     def _compact_output_index(self, *, channel: int, h: int, w: int) -> int:
+        if not bool(_spec_physical_output_h_valid(self.spec, int(h))):
+            return -1
         return _idx_chw_gap(
             int(channel),
-            int(h) + max(0, int(self.spec.output_top_beta)),
+            int(_spec_physical_output_h_positions(self.spec, int(h))),
             int(w),
-            int(self.spec.h_out) + max(0, int(self.spec.output_top_beta)) + max(0, int(self.spec.output_bottom_beta)),
+            _spec_physical_output_h(self.spec),
             int(self.spec.w_out),
             int(self.spec.gap_out),
         )
@@ -1355,6 +1477,13 @@ class NativeHaloRelayoutKernel:
                     for global_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
                         local_h = int(global_h) - int(stripe.target_h_start)
                         for w_index in range(int(self.spec.w_out)):
+                            compact_output_index = self._compact_output_index(
+                                channel=int(channel),
+                                h=int(global_h),
+                                w=int(w_index),
+                            )
+                            if int(compact_output_index) < 0:
+                                continue
                             yield (
                                 self._native_target_index(
                                     stripe=stripe,
@@ -1363,7 +1492,7 @@ class NativeHaloRelayoutKernel:
                                     h=int(local_h),
                                     w=int(w_index),
                                 ),
-                                self._compact_output_index(channel=int(channel), h=int(global_h), w=int(w_index)),
+                                int(compact_output_index),
                             )
 
     def _iter_mappings(self):
@@ -1481,6 +1610,7 @@ def _build_conv_transform(
     scheme: Any,
     group_n1: int,
     compact_target_block: int | None = None,
+    diagonal_cache: _BlockDiagonalCache | None = None,
     force_payload: bool = False,
 ) -> Any | None:
     slots = int(spec.slot_count)
@@ -1587,10 +1717,12 @@ def _build_conv_transform(
                     gap=int(spec.gap_in),
                 )
                 if bool(compact_output):
-                    compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+                    compact_output_h = _spec_physical_output_h(spec)
+                    target_h_slice = out_h_flat[int(start): int(end)]
+                    target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
                     target_index = _idx_chw_gap_channel_positions(
                         target_channels,
-                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
+                        h=_spec_physical_output_h_positions(spec, target_h_slice),
                         w=out_w_flat[int(start): int(end)],
                         height=int(compact_output_h),
                         width=int(spec.w_out),
@@ -1599,7 +1731,7 @@ def _build_conv_transform(
                     target_block_mask = (
                         torch.div(target_index, int(slots), rounding_mode="floor")
                         == int(compact_target_block)
-                    )
+                    ) & target_h_valid
                     if not bool(target_block_mask.any().item()):
                         continue
                     target_vec = torch.remainder(target_index, int(slots))
@@ -1641,20 +1773,10 @@ def _build_conv_transform(
         return None
     baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
     if bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload)):
-        def build_diagonals(
-            *,
-            spec=spec,
-            plan=plan,
-            weight=weight,
-            stripe=stripe,
-            source_group=int(source_group),
-            target_group=int(target_group),
-            level=int(level),
-            scheme=scheme,
-            group_n1=int(group_n1),
-            compact_target_block=compact_target_block,
-        ):
-            rebuilt = _build_conv_transform(
+        cache = diagonal_cache
+        if cache is None:
+            def build_all_blocks(
+                *,
                 spec=spec,
                 plan=plan,
                 weight=weight,
@@ -1665,11 +1787,44 @@ def _build_conv_transform(
                 scheme=scheme,
                 group_n1=int(group_n1),
                 compact_target_block=compact_target_block,
-                force_payload=True,
+                target_index=int(target_index),
+                source_index=int(source_index),
+            ) -> dict[tuple[int, int], dict[int, Any]]:
+                rebuilt = _build_conv_transform(
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    stripe=stripe,
+                    source_group=int(source_group),
+                    target_group=int(target_group),
+                    level=int(level),
+                    scheme=scheme,
+                    group_n1=int(group_n1),
+                    compact_target_block=compact_target_block,
+                    force_payload=True,
+                )
+                if rebuilt is None:
+                    return {}
+                block = dict(getattr(rebuilt, "diagonals", {}).get((0, 0), {}) or {})
+                return {(int(target_index), int(source_index)): block} if block else {}
+
+            cache = _BlockDiagonalCache(build_all_blocks)
+
+        def build_diagonals(
+            *,
+            cache=cache,
+            target_index=int(target_index),
+            source_index=int(source_index),
+        ):
+            block = cache.get_required(
+                int(target_index),
+                int(source_index),
+                context=(
+                    f"{spec.family_label} native-source source_index={int(source_index)} "
+                    f"target_index={int(target_index)}"
+                ),
             )
-            if rebuilt is None:
-                return {}
-            return getattr(rebuilt, "diagonals", {})
+            return {(0, 0): block}
 
         return SimpleNamespace(
             name=(
@@ -1691,6 +1846,8 @@ def _build_conv_transform(
             giant_shifts=tuple(sorted(int(value) for value in giant)),
             rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
             rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+            _single_slot_diagonal_cache=cache,
+            _single_slot_release_diagonal_cache=cache.release,
         )
 
     diag_tensors: dict[int, torch.Tensor] = {}
@@ -1747,7 +1904,7 @@ def _build_conv_transforms_for_compact_output(
         return []
 
     target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
-    compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+    compact_output_h = _spec_physical_output_h(spec)
     key_parts_by_block: dict[int, list[torch.Tensor]] = {}
     value_parts_by_block: dict[int, list[torch.Tensor]] = {}
     source_channels = torch.arange(int(source_count), dtype=torch.int64)
@@ -1828,9 +1985,11 @@ def _build_conv_transforms_for_compact_output(
                     width=int(spec.w_in),
                     gap=int(spec.gap_in),
                 )
+                target_h_slice = out_h_flat[int(start): int(end)]
+                target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
                 compact_slots = _idx_chw_gap_channel_positions(
                     target_channels,
-                    h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
+                    h=_spec_physical_output_h_positions(spec, target_h_slice),
                     w=out_w_flat[int(start): int(end)],
                     height=int(compact_output_h),
                     width=int(spec.w_out),
@@ -1845,7 +2004,7 @@ def _build_conv_transforms_for_compact_output(
                 for target_block in torch.unique(target_blocks).tolist():
                     block = int(target_block)
                     block_mask = target_blocks == int(block)
-                    pair_mask = coeff_nonzero[:, :, None] & block_mask[None, :, :]
+                    pair_mask = coeff_nonzero[:, :, None] & block_mask[None, :, :] & target_h_valid[None, None, :]
                     if not bool(pair_mask.any().item()):
                         continue
                     key_parts_by_block.setdefault(int(block), []).append(flat_keys[pair_mask])
@@ -1853,6 +2012,43 @@ def _build_conv_transforms_for_compact_output(
 
     transforms: list[tuple[int, Any]] = []
     source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
+    single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
+    diagonal_cache: _BlockDiagonalCache | None = None
+    if bool(single_slot_recipe):
+        def build_all_compact_output_blocks(
+            *,
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            group_n1=int(group_n1),
+            source_index=int(source_index),
+        ) -> dict[tuple[int, int], dict[int, Any]]:
+            rebuilt = _build_conv_transforms_for_compact_output(
+                spec=spec,
+                plan=plan,
+                weight=weight,
+                stripe=stripe,
+                source_group=int(source_group),
+                target_group=int(target_group),
+                level=int(level),
+                scheme=scheme,
+                group_n1=int(group_n1),
+                force_payload=True,
+            )
+            blocks: dict[tuple[int, int], dict[int, Any]] = {}
+            for rebuilt_target, rebuilt_transform in rebuilt:
+                block = dict(getattr(rebuilt_transform, "diagonals", {}).get((0, 0), {}) or {})
+                if block:
+                    blocks[(int(rebuilt_target), int(source_index))] = block
+            return blocks
+
+        diagonal_cache = _BlockDiagonalCache(build_all_compact_output_blocks)
+
     for target_block in sorted(key_parts_by_block):
         key_parts = key_parts_by_block[int(target_block)]
         value_parts = value_parts_by_block.get(int(target_block), [])
@@ -1867,36 +2063,24 @@ def _build_conv_transforms_for_compact_output(
         if not diag_set:
             continue
         baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
-        if bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload)):
+        if bool(single_slot_recipe):
             def build_diagonals(
                 *,
                 target_block=int(target_block),
-                spec=spec,
-                plan=plan,
-                weight=weight,
-                stripe=stripe,
-                source_group=int(source_group),
-                target_group=int(target_group),
-                level=int(level),
-                scheme=scheme,
-                group_n1=int(group_n1),
+                source_index=int(source_index),
+                diagonal_cache=diagonal_cache,
             ):
-                rebuilt = _build_conv_transforms_for_compact_output(
-                    spec=spec,
-                    plan=plan,
-                    weight=weight,
-                    stripe=stripe,
-                    source_group=int(source_group),
-                    target_group=int(target_group),
-                    level=int(level),
-                    scheme=scheme,
-                    group_n1=int(group_n1),
-                    force_payload=True,
+                if diagonal_cache is None:
+                    return {}
+                block = diagonal_cache.get_required(
+                    int(target_block),
+                    int(source_index),
+                    context=(
+                        f"{spec.family_label} native-source compact-output "
+                        f"source_index={int(source_index)} target_block={int(target_block)}"
+                    ),
                 )
-                for rebuilt_target, rebuilt_transform in rebuilt:
-                    if int(rebuilt_target) == int(target_block):
-                        return getattr(rebuilt_transform, "diagonals", {})
-                return {}
+                return {(0, 0): block}
 
             transform = SimpleNamespace(
                 name=(
@@ -1917,6 +2101,10 @@ def _build_conv_transforms_for_compact_output(
                 giant_shifts=tuple(sorted(int(value) for value in giant)),
                 rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
                 rotation_cost_owner=bool(int(target_group) == 0 and int(target_block) == 0),
+                _single_slot_diagonal_cache=diagonal_cache,
+                _single_slot_release_diagonal_cache=(
+                    diagonal_cache.release if diagonal_cache is not None else None
+                ),
             )
             transforms.append((int(target_block), transform))
             continue
@@ -1960,8 +2148,14 @@ def _compact_source_index(
     h: int,
     w: int,
 ) -> int | None:
-    source_top_beta = max(0, int(_layout_top_beta(source_layout, default=spec.input_top_beta) or 0))
-    source_bottom_beta = max(0, int(_layout_bottom_beta(source_layout, default=spec.input_bottom_beta) or 0))
+    source_top_beta = max(
+        0,
+        int(_layout_physical_top_beta(source_layout, default=spec.input_physical_top_beta or 0) or 0),
+    )
+    source_bottom_beta = max(
+        0,
+        int(_layout_physical_bottom_beta(source_layout, default=spec.input_physical_bottom_beta or 0) or 0),
+    )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     if int(h) < 0:
         if int(h) < -int(source_top_beta):
@@ -1999,6 +2193,7 @@ def _build_compact_source_conv_transform(
     source_layout: dict[str, Any],
     group_n1: int,
     compact_target_block: int | None = None,
+    diagonal_cache: _BlockDiagonalCache | None = None,
     force_payload: bool = False,
 ) -> Any | None:
     slots = int(spec.slot_count)
@@ -2024,6 +2219,43 @@ def _build_compact_source_conv_transform(
         diag_set = diag_sets_by_target.get(int(target_index), set())
         if not diag_set:
             return None
+        cache = diagonal_cache
+        if cache is None:
+            def build_all_blocks(
+                *,
+                spec=spec,
+                plan=plan,
+                weight=weight,
+                stripe=stripe,
+                source_block=int(source_block),
+                target_group=int(target_group),
+                level=int(level),
+                scheme=scheme,
+                source_layout=dict(source_layout),
+                group_n1=int(group_n1),
+                compact_target_block=compact_target_block,
+                target_index=int(target_index),
+            ) -> dict[tuple[int, int], dict[int, Any]]:
+                rebuilt = _build_compact_source_conv_transform(
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    stripe=stripe,
+                    source_block=int(source_block),
+                    target_group=int(target_group),
+                    level=int(level),
+                    scheme=scheme,
+                    source_layout=dict(source_layout),
+                    group_n1=int(group_n1),
+                    compact_target_block=compact_target_block,
+                    force_payload=True,
+                )
+                if rebuilt is None:
+                    return {}
+                block = dict(getattr(rebuilt, "diagonals", {}).get((0, 0), {}) or {})
+                return {(int(target_index), int(source_block)): block} if block else {}
+
+            cache = _BlockDiagonalCache(build_all_blocks)
         return _make_compact_source_conv_single_slot_transform(
             spec=spec,
             plan=plan,
@@ -2038,6 +2270,7 @@ def _build_compact_source_conv_transform(
             target_index=int(target_index),
             diag_set=set(int(value) for value in diag_set),
             compact_target_block=compact_target_block,
+            diagonal_cache=cache,
         )
     target_start = int(target_group) * int(plan.target_channel_tile)
     target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
@@ -2049,8 +2282,14 @@ def _build_compact_source_conv_transform(
     )
     source_channels = torch.arange(int(spec.c_in), dtype=torch.int64)
     target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
-    source_top_beta = max(0, int(_layout_top_beta(source_layout, default=spec.input_top_beta) or 0))
-    source_bottom_beta = max(0, int(_layout_bottom_beta(source_layout, default=spec.input_bottom_beta) or 0))
+    source_top_beta = max(
+        0,
+        int(_layout_physical_top_beta(source_layout, default=spec.input_physical_top_beta or 0) or 0),
+    )
+    source_bottom_beta = max(
+        0,
+        int(_layout_physical_bottom_beta(source_layout, default=spec.input_physical_bottom_beta or 0) or 0),
+    )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
     key_parts: list[torch.Tensor] = []
@@ -2136,12 +2375,12 @@ def _build_compact_source_conv_transform(
                 source_vec = torch.remainder(source_index, int(slots))
 
                 if bool(compact_output):
-                    compact_output_h = (
-                        int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
-                    )
+                    compact_output_h = _spec_physical_output_h(spec)
+                    target_h_slice = out_h_flat[int(start): int(end)]
+                    target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
                     target_index = _idx_chw_gap_channel_positions(
                         target_channels,
-                        h=out_h_flat[int(start): int(end)] + max(0, int(spec.output_top_beta)),
+                        h=_spec_physical_output_h_positions(spec, target_h_slice),
                         w=out_w_flat[int(start): int(end)],
                         height=int(compact_output_h),
                         width=int(spec.w_out),
@@ -2150,7 +2389,7 @@ def _build_compact_source_conv_transform(
                     target_block_mask = (
                         torch.div(target_index, int(slots), rounding_mode="floor")
                         == int(compact_target_block)
-                    )
+                    ) & target_h_valid
                     target_vec = torch.remainder(target_index, int(slots))
                 else:
                     assert target_slots is not None
@@ -2253,6 +2492,13 @@ def _cached_transform_shell(*, level: int, scheme: Any) -> Any:
     return SimpleNamespace(diagonals={}, level=int(level), scheme=scheme)
 
 
+@dataclass
+class _RuntimeUnifiedTransformGroup:
+    input_index: int
+    group: Any
+    target_indices: tuple[int, ...]
+
+
 class NativeHaloStripeNoRIConvExecutor:
     kernel_kind = "native_halo_stripe_no_ri_conv2d"
     use_ct_pt_hybrid_packing = False
@@ -2273,8 +2519,11 @@ class NativeHaloStripeNoRIConvExecutor:
         self.cols = int(self.native_plan.input_ct_count)
         self.output_shape = getattr(module, "output_shape", None)
         self.fhe_output_shape = getattr(module, "fhe_output_shape", None)
+        self.runtime_groups: list[_RuntimeUnifiedTransformGroup] = []
         self.groups_by_input_index: dict[int, Any] = {}
         self.target_indices_by_input_index: dict[int, tuple[int, ...]] = {}
+        self._compiled_lt_grouping_mode = "shared"
+        self._deferred_single_slot_cache_releases: dict[int, Callable[[], None]] = {}
         self.input_relayout_kernel: NativeHaloRelayoutKernel | None = None
         self.output_relayout_kernel: NativeHaloRelayoutKernel | None = None
         self.bias_vector: torch.Tensor | None = None
@@ -2314,13 +2563,13 @@ class NativeHaloStripeNoRIConvExecutor:
         materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
         if materialization in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
             return False
-        return bool(str(materialization) == "fused_relayout" or not _spec_has_output_halo(spec))
+        return bool(str(materialization) == "fused_relayout" or not _spec_has_physical_output_halo(spec))
 
     def _uses_tight_compact_output(self) -> bool:
         return self._uses_tight_compact_output_for_spec(self.native_plan.spec)
 
     def _compact_output_storage_layout(self) -> str:
-        if _spec_has_output_halo(self.native_plan.spec):
+        if _spec_has_semantic_output_halo(self.native_plan.spec):
             return "logical_halo_compact"
         return "tight_compact"
 
@@ -2336,13 +2585,15 @@ class NativeHaloStripeNoRIConvExecutor:
         return {
             "top_beta": _layout_top_beta(layout),
             "bottom_beta": _layout_bottom_beta(layout),
+            "physical_top_beta": _layout_physical_top_beta(layout),
+            "physical_bottom_beta": _layout_physical_bottom_beta(layout),
             "gap": max(1, int(layout.get("gap", self.native_plan.spec.gap_in) or 1)),
         }
 
     def _compact_source_ct_count(self) -> int:
         spec = self.native_plan.spec
         layout = self._compact_source_layout()
-        height = int(spec.h_in) + int(layout["top_beta"]) + int(layout["bottom_beta"])
+        height = int(spec.h_in) + int(layout["physical_top_beta"]) + int(layout["physical_bottom_beta"])
         return _compact_ct_count(
             int(spec.c_in),
             int(height),
@@ -2353,7 +2604,7 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def _compact_output_ct_count(self) -> int:
         spec = self.native_plan.spec
-        height = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+        height = _spec_physical_output_h(spec)
         return _compact_ct_count(
             int(spec.c_out),
             int(height),
@@ -2380,6 +2631,10 @@ class NativeHaloStripeNoRIConvExecutor:
             input_bottom_beta=_layout_bottom_beta(input_layout),
             output_top_beta=_layout_top_beta(output_layout),
             output_bottom_beta=_layout_bottom_beta(output_layout),
+            input_physical_top_beta=_layout_physical_top_beta(input_layout),
+            input_physical_bottom_beta=_layout_physical_bottom_beta(input_layout),
+            output_physical_top_beta=_layout_physical_top_beta(output_layout),
+            output_physical_bottom_beta=_layout_physical_bottom_beta(output_layout),
         )
 
     def _refresh_runtime_plan(self) -> bool:
@@ -2415,6 +2670,146 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
         self._compile_cache_metadata = dict(metadata or {})
+
+    @staticmethod
+    def _normalise_lt_grouping_mode(value: Any) -> Literal["shared", "individual"]:
+        text = str(value or "").strip().lower().replace("-", "_")
+        if text in {"", "shared", "grouped", "provider_shared"}:
+            return "shared"
+        if text in {
+            "individual",
+            "individual_lt",
+            "per_lt",
+            "per_linear_transform",
+            "disable_shared_rotation",
+            "no_shared_rotation",
+        }:
+            return "individual"
+        raise ValueError(f"unsupported provider LT grouping mode: {value!r}")
+
+    def _lt_grouping_mode(self) -> Literal["shared", "individual"]:
+        for attr in ("layout_policy_provider_lt_grouping_mode", "layout_policy_lt_grouping_mode"):
+            raw = getattr(self.module, attr, None)
+            if raw is not None and str(raw).strip() != "":
+                return self._normalise_lt_grouping_mode(raw)
+        if bool(getattr(self.module, "layout_policy_provider_disable_shared_rotation", False)):
+            return "individual"
+        return "shared"
+
+    def _reset_runtime_groups(self) -> None:
+        self.runtime_groups = []
+        self.groups_by_input_index = {}
+        self.target_indices_by_input_index = {}
+        self._deferred_single_slot_cache_releases = {}
+
+    def _defer_individual_single_slot_cache_release(self, transform: Any) -> None:
+        release_cache = getattr(transform, "_single_slot_release_diagonal_cache", None)
+        if not callable(release_cache):
+            return
+        cache = getattr(transform, "_single_slot_diagonal_cache", None)
+        key_obj = cache if cache is not None else release_cache
+        self._deferred_single_slot_cache_releases[int(id(key_obj))] = release_cache
+        setattr(transform, "_single_slot_release_diagonal_cache", None)
+
+    def _release_deferred_single_slot_diagonal_caches(self) -> None:
+        for release_cache in list(self._deferred_single_slot_cache_releases.values()):
+            try:
+                release_cache()
+            except Exception:
+                pass
+
+    def _add_runtime_group(
+        self,
+        *,
+        input_index: int,
+        group: Any,
+        target_indices: tuple[int, ...] | list[int],
+    ) -> None:
+        targets = tuple(int(value) for value in target_indices)
+        if not targets:
+            return
+        input_index = int(input_index)
+        self.runtime_groups.append(
+            _RuntimeUnifiedTransformGroup(
+                input_index=int(input_index),
+                group=group,
+                target_indices=targets,
+            )
+        )
+        if str(self._compiled_lt_grouping_mode) == "shared":
+            self.groups_by_input_index[int(input_index)] = group
+            self.target_indices_by_input_index[int(input_index)] = targets
+
+    def _runtime_group_metadata_rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "input_index": int(runtime_group.input_index),
+                "storage_key": str(getattr(runtime_group.group, "_storage_key", "")),
+                "target_indices": [int(value) for value in runtime_group.target_indices],
+            }
+            for runtime_group in self.runtime_groups
+        ]
+
+    def _compile_ordered_runtime_groups(
+        self,
+        scheme: Any,
+        *,
+        input_index: int,
+        ordered: list[tuple[int, Any]],
+        retune_shared_group: bool,
+    ) -> None:
+        ordered = sorted(
+            [(int(target_index), transform) for target_index, transform in ordered],
+            key=lambda item: int(item[0]),
+        )
+        if not ordered:
+            return
+        mode = self._compiled_lt_grouping_mode
+        if str(mode) == "individual":
+            for target_index, transform in ordered:
+                retune_started = time.time()
+                _retune_transform_group_bsgs([transform], slots=int(self.slots))
+                self.last_runtime_timing["retune_bsgs_s"] = float(
+                    self.last_runtime_timing.get("retune_bsgs_s", 0.0)
+                ) + float(time.time() - retune_started)
+                self._defer_individual_single_slot_cache_release(transform)
+                group = UnifiedTransformGroup([transform])
+                group_compile_started = time.time()
+                group.compile_unified(scheme.backend)
+                self.last_runtime_timing["group_compile_s"] = float(
+                    self.last_runtime_timing.get("group_compile_s", 0.0)
+                ) + float(time.time() - group_compile_started)
+                self.last_runtime_timing["compiled_group_count"] = float(
+                    self.last_runtime_timing.get("compiled_group_count", 0.0)
+                ) + 1.0
+                self._add_runtime_group(
+                    input_index=int(input_index),
+                    group=group,
+                    target_indices=(int(target_index),),
+                )
+            return
+
+        transforms = [transform for _target_index, transform in ordered]
+        if bool(retune_shared_group):
+            retune_started = time.time()
+            _retune_transform_group_bsgs(transforms, slots=int(self.slots))
+            self.last_runtime_timing["retune_bsgs_s"] = float(
+                self.last_runtime_timing.get("retune_bsgs_s", 0.0)
+            ) + float(time.time() - retune_started)
+        group = UnifiedTransformGroup(transforms)
+        group_compile_started = time.time()
+        group.compile_unified(scheme.backend)
+        self.last_runtime_timing["group_compile_s"] = float(
+            self.last_runtime_timing.get("group_compile_s", 0.0)
+        ) + float(time.time() - group_compile_started)
+        self.last_runtime_timing["compiled_group_count"] = float(
+            self.last_runtime_timing.get("compiled_group_count", 0.0)
+        ) + 1.0
+        self._add_runtime_group(
+            input_index=int(input_index),
+            group=group,
+            target_indices=tuple(int(target_index) for target_index, _transform in ordered),
+        )
 
     def _empty_compile_timing(self) -> dict[str, float]:
         return {
@@ -2475,7 +2870,7 @@ class NativeHaloStripeNoRIConvExecutor:
         start = int(block_index) * int(self.slots)
         stop = int(start) + int(self.slots)
         out = torch.zeros((int(self.slots),), dtype=torch.float32)
-        compact_output_h = int(spec.h_out) + max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+        compact_output_h = _spec_physical_output_h(spec)
         out_h = torch.arange(int(compact_output_h), dtype=torch.int64).repeat_interleave(int(spec.w_out))
         out_w = torch.arange(int(spec.w_out), dtype=torch.int64).repeat(int(compact_output_h))
         channels = torch.arange(int(spec.c_out), dtype=torch.int64)
@@ -2512,14 +2907,24 @@ class NativeHaloStripeNoRIConvExecutor:
         if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
             return False
 
-        group_rows = list(metadata.get("groups_by_input_index", []))
+        requested_mode = self._lt_grouping_mode()
+        stored_mode = self._normalise_lt_grouping_mode(metadata.get("lt_grouping_mode", "shared"))
+        if str(stored_mode) != str(requested_mode):
+            raise RuntimeError(
+                f"Cached native halo Conv2d manifest for {self.output_node_id!r} was compiled with "
+                f"lt_grouping_mode={stored_mode!r}, but this run requested {requested_mode!r}; "
+                "re-save the compile cache for the requested provider LT grouping mode."
+            )
+
+        group_rows = list(metadata.get("runtime_groups") or metadata.get("groups_by_input_index", []))
         if not group_rows:
             raise RuntimeError(
                 f"Cached native halo Conv2d manifest for {self.output_node_id!r} is missing "
-                "groups_by_input_index; re-run with io_mode='save'."
+                "runtime_groups; re-run with io_mode='save'."
             )
 
         self._refresh_runtime_plan()
+        self._compiled_lt_grouping_mode = str(stored_mode)
         self.rows = int(metadata.get("rows", self.rows))
         self.cols = int(metadata.get("cols", self.cols))
         module_bias = getattr(self.module, "on_bias", None)
@@ -2528,8 +2933,7 @@ class NativeHaloStripeNoRIConvExecutor:
         conv_level = int(input_level)
         conv_output_level = max(0, int(input_level - 1))
         self.bias_plaintexts = self._compile_bias_plaintexts_at_level(scheme, level=int(conv_output_level))
-        self.groups_by_input_index = {}
-        self.target_indices_by_input_index = {}
+        self._reset_runtime_groups()
         self.input_relayout_kernel = None
         self.output_relayout_kernel = None
         self.last_runtime_timing = self._empty_compile_timing()
@@ -2552,9 +2956,12 @@ class NativeHaloStripeNoRIConvExecutor:
             )
             group._storage_key = storage_key
             group.compile_unified(scheme.backend)
-            self.groups_by_input_index[int(input_index)] = group
-            self.target_indices_by_input_index[int(input_index)] = target_indices
-        if not self.groups_by_input_index:
+            self._add_runtime_group(
+                input_index=int(input_index),
+                group=group,
+                target_indices=target_indices,
+            )
+        if not self.runtime_groups:
             raise RuntimeError(
                 f"Cached native halo Conv2d manifest for {self.output_node_id!r} did not contain any non-empty "
                 "transform groups; re-run with io_mode='save'."
@@ -2563,7 +2970,7 @@ class NativeHaloStripeNoRIConvExecutor:
         elapsed = float(time.time() - compile_started)
         self.last_runtime_timing["compile_unified_s"] = elapsed
         self.last_runtime_timing["group_compile_s"] = elapsed
-        self.last_runtime_timing["compiled_group_count"] = float(len(self.groups_by_input_index))
+        self.last_runtime_timing["compiled_group_count"] = float(len(self.runtime_groups))
         return True
 
     def _compile_compact_source_layout_diagonals(
@@ -2601,19 +3008,54 @@ class NativeHaloStripeNoRIConvExecutor:
         if int(output_rotations) != 0:
             raise RuntimeError("compact-source provider diagonal generator does not support hybrid output rotations")
 
+        diagonal_cache_by_source: dict[int, _BlockDiagonalCache] = {}
+
+        def source_diagonal_cache(source_index: int) -> _BlockDiagonalCache:
+            source_index = int(source_index)
+            cache = diagonal_cache_by_source.get(int(source_index))
+            if cache is not None:
+                return cache
+
+            def build_all_for_source(
+                *,
+                source_index=source_index,
+            ) -> dict[tuple[int, int], dict[int, Any]]:
+                packed, runtime_output_rotations = packing.direct_diagonalize_conv2d(
+                    self.module,
+                    weight,
+                    int(self.slots),
+                    str(scheme.params.get_embedding_method()),
+                    False,
+                    allow_hybrid=False,
+                )
+                if int(runtime_output_rotations) != 0:
+                    raise RuntimeError(
+                        "compact-source provider diagonal generator does not support hybrid output rotations"
+                    )
+                blocks: dict[tuple[int, int], dict[int, Any]] = {}
+                for (target_block, source_block), block in dict(packed).items():
+                    if int(source_block) != int(source_index):
+                        continue
+                    block_map = dict(block or {})
+                    if block_map:
+                        blocks[(int(target_block), int(source_block))] = block_map
+                return blocks
+
+            cache = _BlockDiagonalCache(build_all_for_source)
+            diagonal_cache_by_source[int(source_index)] = cache
+            return cache
+
         def build_block_diagonals(target_index: int, source_index: int):
-            packed, runtime_output_rotations = packing.direct_diagonalize_conv2d(
-                self.module,
-                weight,
-                int(self.slots),
-                str(scheme.params.get_embedding_method()),
-                False,
-                allow_hybrid=False,
+            cache = source_diagonal_cache(int(source_index))
+            block = cache.get_required(
+                int(target_index),
+                int(source_index),
+                context=(
+                    f"{self.native_plan.spec.family_label} compact-dense "
+                    f"source_index={int(source_index)} target_index={int(target_index)}"
+                ),
             )
-            if int(runtime_output_rotations) != 0:
-                raise RuntimeError("compact-source provider diagonal generator does not support hybrid output rotations")
-            block = dict(packed.get((int(target_index), int(source_index)), {}) or {})
-            return {(0, 0): block} if block else {}
+            return {(0, 0): block}
 
         ordered_by_source: dict[int, list[tuple[int, Any]]] = {}
         for (target_index, source_index), diag_map in sorted(dict(diagonals).items()):
@@ -2663,6 +3105,12 @@ class NativeHaloStripeNoRIConvExecutor:
                 giant_shifts=tuple(sorted(int(value) for value in giant)),
                 rotation_group_id=f"native_halo:{self.native_plan.spec.family_label}:compact_dense_src{int(source_index)}",
                 rotation_cost_owner=bool(int(target_index) == 0),
+                _single_slot_diagonal_cache=(
+                    source_diagonal_cache(int(source_index)) if bool(single_slot) else None
+                ),
+                _single_slot_release_diagonal_cache=(
+                    source_diagonal_cache(int(source_index)).release if bool(single_slot) else None
+                ),
             )
             ordered_by_source.setdefault(int(source_index), []).append((int(target_index), transform))
             self.last_runtime_timing["built_transform_count"] = float(
@@ -2673,25 +3121,11 @@ class NativeHaloStripeNoRIConvExecutor:
             raise RuntimeError("compact-source provider diagonal generator produced no transforms")
 
         for source_index, ordered in sorted(ordered_by_source.items()):
-            ordered.sort(key=lambda item: int(item[0]))
-            transforms = [transform for _target_index, transform in ordered]
-            retune_started = time.time()
-            _retune_transform_group_bsgs(transforms, slots=int(self.slots))
-            self.last_runtime_timing["retune_bsgs_s"] = float(
-                self.last_runtime_timing.get("retune_bsgs_s", 0.0)
-            ) + float(time.time() - retune_started)
-            group = UnifiedTransformGroup(transforms)
-            group_compile_started = time.time()
-            group.compile_unified(scheme.backend)
-            self.last_runtime_timing["group_compile_s"] = float(
-                self.last_runtime_timing.get("group_compile_s", 0.0)
-            ) + float(time.time() - group_compile_started)
-            self.last_runtime_timing["compiled_group_count"] = float(
-                self.last_runtime_timing.get("compiled_group_count", 0.0)
-            ) + 1.0
-            self.groups_by_input_index[int(source_index)] = group
-            self.target_indices_by_input_index[int(source_index)] = tuple(
-                int(target_index) for target_index, _transform in ordered
+            self._compile_ordered_runtime_groups(
+                scheme,
+                input_index=int(source_index),
+                ordered=ordered,
+                retune_shared_group=True,
             )
 
     def _add_bias(self, ct: Any, *, block_index: int) -> Any:
@@ -2709,6 +3143,12 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def compile_cache_metadata(self) -> dict[str, Any]:
         self._refresh_runtime_plan()
+        lt_grouping_mode = (
+            str(self._compiled_lt_grouping_mode)
+            if self.runtime_groups
+            else str(self._lt_grouping_mode())
+        )
+        runtime_group_rows = self._runtime_group_metadata_rows()
         return {
             "kind": type(self).__name__,
             "kernel_kind": self.kernel_kind,
@@ -2736,27 +3176,27 @@ class NativeHaloStripeNoRIConvExecutor:
             "native_cb_shared_rotations": int(self.native_plan.cb_shared_rotations),
             "native_shared_baby_rotations": int(self.native_plan.shared_baby_rotations),
             "native_shared_giant_rotations": int(self.native_plan.shared_giant_rotations),
-            "groups_by_input_index": [
-                {
-                    "input_index": int(input_index),
-                    "storage_key": str(getattr(group, "_storage_key", "")),
-                    "target_indices": [
-                        int(value)
-                        for value in self.target_indices_by_input_index.get(int(input_index), ())
-                    ],
-                }
-                for input_index, group in sorted(self.groups_by_input_index.items())
-            ],
+            "lt_grouping_mode": str(lt_grouping_mode),
+            "provider_lt_grouping_mode": str(lt_grouping_mode),
+            "provider_disable_shared_rotation": bool(str(lt_grouping_mode) == "individual"),
+            "runtime_group_count": int(len(self.runtime_groups)),
+            "runtime_transform_count": int(sum(len(item.target_indices) for item in self.runtime_groups)),
+            "runtime_groups": runtime_group_rows,
+            "groups_by_input_index": runtime_group_rows if str(lt_grouping_mode) == "shared" else [],
         }
 
     def compile(self, scheme: Any) -> None:
         changed = self._refresh_runtime_plan()
         if bool(changed) and (
-            self.groups_by_input_index or self.input_relayout_kernel is not None or self.output_relayout_kernel is not None
+            self.runtime_groups or self.input_relayout_kernel is not None or self.output_relayout_kernel is not None
         ):
             self.cleanup(getattr(scheme, "backend", None))
-        if self.groups_by_input_index:
+        requested_mode = self._lt_grouping_mode()
+        if self.runtime_groups and str(requested_mode) != str(self._compiled_lt_grouping_mode):
+            self.cleanup(getattr(scheme, "backend", None))
+        if self.runtime_groups:
             return
+        self._compiled_lt_grouping_mode = str(requested_mode)
         if self._compile_from_cache_metadata(scheme):
             return
         prepare_started = time.time()
@@ -2782,6 +3222,9 @@ class NativeHaloStripeNoRIConvExecutor:
                 self._compile_compact_source_layout_diagonals(scheme, level=int(conv_level))
                 self.last_runtime_timing["prepare_transforms_s"] = float(time.time() - compile_started)
                 self.last_runtime_timing["compile_unified_s"] = float(time.time() - compile_started)
+                self.input_relayout_kernel = None
+                self.output_relayout_kernel = None
+                self.compile_count += 1
                 return
             for source_block in range(int(self.cols)):
                 ordered: list[tuple[int, Any]] = []
@@ -2813,25 +3256,11 @@ class NativeHaloStripeNoRIConvExecutor:
                             ) + 1.0
                             ordered.append((int(transform.target_index), transform))
                 if ordered:
-                    ordered.sort(key=lambda item: int(item[0]))
-                    transforms = [transform for _target_index, transform in ordered]
-                    retune_started = time.time()
-                    _retune_transform_group_bsgs(transforms, slots=int(self.slots))
-                    self.last_runtime_timing["retune_bsgs_s"] = float(
-                        self.last_runtime_timing.get("retune_bsgs_s", 0.0)
-                    ) + float(time.time() - retune_started)
-                    group = UnifiedTransformGroup(transforms)
-                    group_compile_started = time.time()
-                    group.compile_unified(scheme.backend)
-                    self.last_runtime_timing["group_compile_s"] = float(
-                        self.last_runtime_timing.get("group_compile_s", 0.0)
-                    ) + float(time.time() - group_compile_started)
-                    self.last_runtime_timing["compiled_group_count"] = float(
-                        self.last_runtime_timing.get("compiled_group_count", 0.0)
-                    ) + 1.0
-                    self.groups_by_input_index[int(source_block)] = group
-                    self.target_indices_by_input_index[int(source_block)] = tuple(
-                        int(target_index) for target_index, _transform in ordered
+                    self._compile_ordered_runtime_groups(
+                        scheme,
+                        input_index=int(source_block),
+                        ordered=ordered,
+                        retune_shared_group=True,
                     )
         else:
             for stripe in self.native_plan.stripes:
@@ -2885,19 +3314,11 @@ class NativeHaloStripeNoRIConvExecutor:
                         ordered.append((int(transform.target_index), transform))
                     input_index = int(stripe.index) * int(self.native_plan.source_channel_group_count) + int(source_group)
                     if ordered:
-                        ordered.sort(key=lambda item: int(item[0]))
-                        group = UnifiedTransformGroup([transform for _target_index, transform in ordered])
-                        group_compile_started = time.time()
-                        group.compile_unified(scheme.backend)
-                        self.last_runtime_timing["group_compile_s"] = float(
-                            self.last_runtime_timing.get("group_compile_s", 0.0)
-                        ) + float(time.time() - group_compile_started)
-                        self.last_runtime_timing["compiled_group_count"] = float(
-                            self.last_runtime_timing.get("compiled_group_count", 0.0)
-                        ) + 1.0
-                        self.groups_by_input_index[int(input_index)] = group
-                        self.target_indices_by_input_index[int(input_index)] = tuple(
-                            int(target_index) for target_index, _transform in ordered
+                        self._compile_ordered_runtime_groups(
+                            scheme,
+                            input_index=int(input_index),
+                            ordered=ordered,
+                            retune_shared_group=False,
                         )
                     group_index += 1
 
@@ -2929,19 +3350,22 @@ class NativeHaloStripeNoRIConvExecutor:
         partial_count = 0
         rescale_count = 0
         accumulate_count = 0
-        fuse_output_rescale = bool(_unified_output_fusion_enabled())
-        sorted_groups = sorted(self.groups_by_input_index.items())
+        fuse_output_rescale = bool(_unified_output_fusion_enabled()) and str(self._compiled_lt_grouping_mode) != "individual"
+        sorted_groups = [
+            runtime_group
+            for _index, runtime_group in sorted(
+                enumerate(self.runtime_groups),
+                key=lambda item: (int(item[1].input_index), int(item[0])),
+            )
+        ]
         target_sum_output_ids: list[int] | None = None
         evaluate_started = time.time()
         if fuse_output_rescale and sorted_groups:
             group_started = time.time()
             target_sum_output_ids = UnifiedTransformGroup.evaluate_sources_with_target_sum(
-                [group for _input_index, group in sorted_groups],
-                [int(ids[int(input_index)]) for input_index, _group in sorted_groups],
-                [
-                    self.target_indices_by_input_index[int(input_index)]
-                    for input_index, _group in sorted_groups
-                ],
+                [runtime_group.group for runtime_group in sorted_groups],
+                [int(ids[int(runtime_group.input_index)]) for runtime_group in sorted_groups],
+                [runtime_group.target_indices for runtime_group in sorted_groups],
                 int(self.rows),
                 scheme.backend,
             )
@@ -2954,9 +3378,7 @@ class NativeHaloStripeNoRIConvExecutor:
                     f"outputs for {self.rows} targets"
                 )
             evaluated_group_count = int(len(sorted_groups))
-            partial_count = int(
-                sum(len(self.target_indices_by_input_index[int(input_index)]) for input_index, _group in sorted_groups)
-            )
+            partial_count = int(sum(len(runtime_group.target_indices) for runtime_group in sorted_groups))
             accumulate_count = max(0, int(partial_count) - int(len(target_sum_output_ids)))
             for target_index, output_id in enumerate(target_sum_output_ids):
                 wrap_started = time.time()
@@ -2968,12 +3390,12 @@ class NativeHaloStripeNoRIConvExecutor:
                 )
                 self.last_runtime_timing["partial_wrap_s"] += float(time.time() - wrap_started)
         else:
-            for input_index, group in sorted_groups:
+            for runtime_group in sorted_groups:
                 group_started = time.time()
-                output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
+                output_ids = runtime_group.group.evaluate_unified(int(ids[int(runtime_group.input_index)]), scheme.backend)
                 self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
                 evaluated_group_count += 1
-                for target_index, output_id in zip(self.target_indices_by_input_index[int(input_index)], output_ids):
+                for target_index, output_id in zip(runtime_group.target_indices, output_ids):
                     wrap_started = time.time()
                     partial = CipherTensor(
                         scheme,
@@ -3004,9 +3426,12 @@ class NativeHaloStripeNoRIConvExecutor:
                 output_blocks[int(block_index)] = _rescale_cipher_tensor(block_ct)
                 self.last_runtime_timing["partial_rescale_s"] += float(time.time() - rescale_started)
                 rescale_count += 1
+        if str(self._compiled_lt_grouping_mode) == "individual":
+            self._release_deferred_single_slot_diagonal_caches()
         self.last_runtime_timing["evaluate_unified_s"] = float(time.time() - evaluate_started)
         self.last_runtime_counts = {
             "group_count": int(evaluated_group_count),
+            "runtime_group_count": int(len(sorted_groups)),
             "partial_count": int(partial_count),
             "partial_rescale_count": int(rescale_count),
             "partial_accumulate_count": int(accumulate_count),
@@ -3046,6 +3471,9 @@ class NativeHaloStripeNoRIConvExecutor:
             "native_output_storage_layout": self._compact_output_storage_layout()
             if self._uses_tight_compact_output()
             else "native_halo_stripe",
+            "provider_lt_grouping_mode": str(self._compiled_lt_grouping_mode),
+            "provider_disable_shared_rotation": bool(str(self._compiled_lt_grouping_mode) == "individual"),
+            "runtime_group_count": int(len(self.runtime_groups)),
             "internal_input_relayout": False,
             "internal_output_relayout": False,
         }
@@ -3056,14 +3484,28 @@ class NativeHaloStripeNoRIConvExecutor:
             self.input_relayout_kernel.cleanup(backend)
         if self.output_relayout_kernel is not None:
             self.output_relayout_kernel.cleanup(backend)
+        self._release_deferred_single_slot_diagonal_caches()
         if backend is not None:
             delete = getattr(backend, "DeleteLinearTransform", None)
             if callable(delete):
+                groups: list[Any] = []
+                seen: set[int] = set()
+                for runtime_group in list(self.runtime_groups):
+                    marker = int(id(runtime_group.group))
+                    if marker not in seen:
+                        seen.add(marker)
+                        groups.append(runtime_group.group)
                 for group in list(self.groups_by_input_index.values()):
+                    marker = int(id(group))
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    groups.append(group)
+                for group in groups:
                     for transform_id in list(getattr(group, "unified_ids", []) or []):
                         try:
                             delete(int(transform_id))
                         except Exception:
                             pass
-        self.groups_by_input_index = {}
-        self.target_indices_by_input_index = {}
+        self._reset_runtime_groups()
+        self._compiled_lt_grouping_mode = "shared"

@@ -44,13 +44,22 @@ DEFAULT_DOC = REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md"
 ROW_DIR_NAME = "rows"
 
 DEFAULT_HW = ("192x192", "224x224", "384x288", "384x384")
-DEFAULT_CHANNELS = (32, 64, 128)
+DEFAULT_CHANNELS = (32, 64, 128, 256)
 DEFAULT_VARIANTS = ("orion", "provider_halo1", "provider_halo2")
-PROVIDER_OUTPUT_LAYOUTS = ("native_stripe", "tight_compact")
+VARIANT_CHOICES = (
+    "orion",
+    "provider_halo1",
+    "provider_halo2",
+    "provider_halo1_individual_lt",
+    "provider_halo2_individual_lt",
+)
+PROVIDER_OUTPUT_LAYOUTS = ("tight_compact", "native_stripe")
 VARIANT_LABELS = {
     "orion": "Orion dense",
     "provider_halo1": "provider beta=1",
     "provider_halo2": "provider beta=2",
+    "provider_halo1_individual_lt": "provider beta=1 individual LT",
+    "provider_halo2_individual_lt": "provider beta=2 individual LT",
 }
 
 
@@ -67,7 +76,7 @@ class ConvKernelRow:
 
     @property
     def stage_gap(self) -> int:
-        mapping = {32: 1, 64: 2, 128: 4}
+        mapping = {32: 1, 64: 2, 128: 4, 256: 8}
         try:
             return int(mapping[int(self.channels)])
         except KeyError as exc:
@@ -115,11 +124,19 @@ class ConvKernelRow:
 
     @property
     def halo(self) -> int | None:
-        if str(self.variant) == "provider_halo1":
+        if str(self.variant) in {"provider_halo1", "provider_halo1_individual_lt"}:
             return 1
-        if str(self.variant) == "provider_halo2":
+        if str(self.variant) in {"provider_halo2", "provider_halo2_individual_lt"}:
             return 2
         return None
+
+    @property
+    def provider_lt_grouping_mode(self) -> str:
+        return "individual" if str(self.variant).endswith("_individual_lt") else "shared"
+
+    @property
+    def provider_disable_shared_rotation(self) -> bool:
+        return bool(self.provider_lt_grouping_mode == "individual")
 
     @property
     def row_id(self) -> str:
@@ -279,6 +296,22 @@ def _candidate_results_from_payload(payload: dict[str, Any], source_path: Path) 
                     yield result, str(path_name), f"{source_path}:{network_name}/{node}/{path_name}"
 
 
+def _normalise_provider_lt_grouping_mode(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"", "shared", "grouped", "provider_shared"}:
+        return "shared"
+    if text in {
+        "individual",
+        "individual_lt",
+        "per_lt",
+        "per_linear_transform",
+        "disable_shared_rotation",
+        "no_shared_rotation",
+    }:
+        return "individual"
+    return text
+
+
 def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_label: str) -> dict[str, Any]:
     timing = dict(result.get("runtime_fairness_timing") or {})
     rotation_count = (
@@ -293,6 +326,15 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         input_halo_top = row.halo
     if input_halo_bottom is None:
         input_halo_bottom = row.halo
+    metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
+    provider_lt_grouping_mode = ""
+    if row.path == "provider":
+        provider_lt_grouping_mode = _normalise_provider_lt_grouping_mode(
+            result.get("provider_lt_grouping_mode")
+            or metadata.get("provider_lt_grouping_mode")
+            or metadata.get("lt_grouping_mode")
+            or row.provider_lt_grouping_mode
+        )
     return {
         "status": "ok",
         "created_at_utc": _now_utc(),
@@ -312,6 +354,8 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "variant_label": VARIANT_LABELS[str(row.variant)],
         "path": row.path,
         "provider_requested_input_halo": row.halo,
+        "provider_lt_grouping_mode": provider_lt_grouping_mode,
+        "provider_disable_shared_rotation": bool(provider_lt_grouping_mode == "individual"),
         "input_halo_top": input_halo_top,
         "input_halo_bottom": input_halo_bottom,
         "provider_output_storage_layout": _provider_result_output_layout(result) if row.path == "provider" else "",
@@ -353,16 +397,19 @@ def reuse_existing_rows(
     *,
     force: bool = False,
     clip_provider_boundary_halo: bool = False,
-    provider_output_layout: str = "native_stripe",
+    provider_output_layout: str = "tight_compact",
 ) -> int:
     if not sources:
         return 0
-    row_by_key: dict[tuple[str, int, int, int, int, int | None], ConvKernelRow] = {}
+    row_by_key: dict[tuple[str, int, int, int, int, int | None, str], ConvKernelRow] = {}
     for row in rows:
         halo_key = row.halo
         if row.path == "provider" and bool(clip_provider_boundary_halo):
             halo_key = 0
-        row_by_key[(row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, halo_key)] = row
+        grouping_key = row.provider_lt_grouping_mode if row.path == "provider" else ""
+        row_by_key[
+            (row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, halo_key, grouping_key)
+        ] = row
     reused = 0
     for json_path in _iter_reuse_jsons([Path(value) for value in sources]):
         payload = _read_json(json_path)
@@ -377,7 +424,7 @@ def reuse_existing_rows(
                 continue
             path_kind = _result_path_kind(result, fallback=path_name)
             if path_kind == "dense":
-                key = ("dense", int(channels), int(height), int(width), int(gap), None)
+                key = ("dense", int(channels), int(height), int(width), int(gap), None, "")
             elif path_kind == "provider":
                 top, bottom = _explicit_halo(result)
                 # Older provider JSONs did not record the halo setting; those
@@ -389,7 +436,14 @@ def reuse_existing_rows(
                 expected_layout = "native_halo_stripe" if str(provider_output_layout) == "native_stripe" else "tight_compact"
                 if _provider_result_output_layout(result) != expected_layout:
                     continue
-                key = ("provider", int(channels), int(height), int(width), int(gap), int(top))
+                metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
+                grouping_mode = _normalise_provider_lt_grouping_mode(
+                    result.get("provider_lt_grouping_mode")
+                    or metadata.get("provider_lt_grouping_mode")
+                    or metadata.get("lt_grouping_mode")
+                    or "shared"
+                )
+                key = ("provider", int(channels), int(height), int(width), int(gap), int(top), grouping_mode)
             else:
                 continue
             row = row_by_key.get(key)
@@ -542,7 +596,7 @@ def _apply_provider_input_halo(
 def _apply_provider_output_layout(conv: Conv2d, row: ConvKernelRow, *, output_layout: str) -> str:
     if row.path != "provider":
         return ""
-    layout = str(output_layout or "native_stripe")
+    layout = str(output_layout or "tight_compact")
     if layout == "native_stripe":
         conv.layout_policy_output_materialization = "native_halo_stripe"
         conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0}
@@ -555,6 +609,8 @@ def _apply_provider_output_layout(conv: Conv2d, row: ConvKernelRow, *, output_la
 
 
 def _attach_provider_runtime(conv: Conv2d, row: ConvKernelRow) -> None:
+    conv.layout_policy_provider_lt_grouping_mode = row.provider_lt_grouping_mode
+    conv.layout_policy_provider_disable_shared_rotation = bool(row.provider_disable_shared_rotation)
     executor = HaloLocalConvRuntimeExecutor(
         module=conv,
         output_node_id=str(conv.region_output_id),
@@ -674,22 +730,42 @@ def _run_native_provider_forward(executor: Any, *, source_count: int, seed: int)
 
     output_blocks: list[Any | None] = [None for _ in range(int(delegate.rows))]
     evaluate_started = time.perf_counter()
-    for input_index, group in sorted(dict(delegate.groups_by_input_index).items()):
-        output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
-        target_indices = tuple(int(value) for value in delegate.target_indices_by_input_index[int(input_index)])
-        for target_index, output_id in zip(target_indices, output_ids):
-            partial = CipherTensor(
-                scheme,
-                [int(output_id)],
-                torch.Size([1, int(delegate.slots)]),
-                torch.Size([1, int(delegate.slots)]),
+    try:
+        runtime_groups = [
+            (int(item.input_index), item.group, tuple(int(value) for value in item.target_indices))
+            for _index, item in sorted(
+                enumerate(list(getattr(delegate, "runtime_groups", []) or [])),
+                key=lambda pair: (int(pair[1].input_index), int(pair[0])),
             )
-            partial = _rescale_cipher_tensor(partial)
-            if output_blocks[int(target_index)] is None:
-                output_blocks[int(target_index)] = partial
-            else:
-                lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
-                output_blocks[int(target_index)] = lhs + rhs
+        ]
+        if not runtime_groups:
+            runtime_groups = [
+                (
+                    int(input_index),
+                    group,
+                    tuple(int(value) for value in delegate.target_indices_by_input_index[int(input_index)]),
+                )
+                for input_index, group in sorted(dict(delegate.groups_by_input_index).items())
+            ]
+        for input_index, group, target_indices in runtime_groups:
+            output_ids = group.evaluate_unified(int(ids[int(input_index)]), scheme.backend)
+            for target_index, output_id in zip(target_indices, output_ids):
+                partial = CipherTensor(
+                    scheme,
+                    [int(output_id)],
+                    torch.Size([1, int(delegate.slots)]),
+                    torch.Size([1, int(delegate.slots)]),
+                )
+                partial = _rescale_cipher_tensor(partial)
+                if output_blocks[int(target_index)] is None:
+                    output_blocks[int(target_index)] = partial
+                else:
+                    lhs, rhs = _align_ciphertexts_for_add(output_blocks[int(target_index)], partial)
+                    output_blocks[int(target_index)] = lhs + rhs
+    finally:
+        release_deferred = getattr(delegate, "_release_deferred_single_slot_diagonal_caches", None)
+        if callable(release_deferred):
+            release_deferred()
     delegate.last_runtime_timing["evaluate_unified_s"] = float(time.perf_counter() - evaluate_started)
 
     postprocess_started = time.perf_counter()
@@ -755,7 +831,7 @@ def _run_row(
     repeats: int,
     seed: int,
     clip_provider_boundary_halo: bool = False,
-    provider_output_layout: str = "native_stripe",
+    provider_output_layout: str = "tight_compact",
 ) -> dict[str, Any]:
     started = time.perf_counter()
     if str(backend) != "python":
@@ -795,9 +871,15 @@ def _run_row(
             input_cts = int(dense_cols)
             output_cts = int(dense_rows)
             provider_metadata: dict[str, Any] = {}
+            provider_lt_grouping_mode = ""
         else:
             executor = getattr(conv.region_runtime, "executor")
             provider_metadata = _metadata_for_native_executor(executor)
+            provider_lt_grouping_mode = _normalise_provider_lt_grouping_mode(
+                provider_metadata.get("provider_lt_grouping_mode")
+                or provider_metadata.get("lt_grouping_mode")
+                or row.provider_lt_grouping_mode
+            )
             native_plan = dict(
                 provider_metadata.get("native_halo_conv2d_plan", {})
                 or provider_metadata.get("r34_native_aligned_halo_plan", {})
@@ -851,6 +933,8 @@ def _run_row(
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
             "provider_requested_input_halo": row.halo,
+            "provider_lt_grouping_mode": provider_lt_grouping_mode,
+            "provider_disable_shared_rotation": bool(provider_lt_grouping_mode == "individual"),
             "provider_boundary_halo_clipped": bool(clip_provider_boundary_halo and row.path == "provider"),
             "provider_output_layout": applied_provider_output_layout,
             "input_halo_top": input_halo_top,
@@ -980,6 +1064,13 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
             else:
                 halo_cell = f"{int(row.halo)}/{int(row.halo)}"
         output_layout = _provider_result_output_layout(payload) if isinstance(payload, dict) else ""
+        lt_grouping = ""
+        if row.path == "provider":
+            lt_grouping = (
+                str((payload or {}).get("provider_lt_grouping_mode") or row.provider_lt_grouping_mode)
+                if isinstance(payload, dict)
+                else row.provider_lt_grouping_mode
+            )
         table_rows.append(
             [
                 row.hw,
@@ -992,6 +1083,7 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
                 status,
                 halo_cell,
                 output_layout,
+                lt_grouping,
                 _fmt_int((payload or {}).get("rotation_eval_count") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("lt_accumulate_s") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("hot_run_mean_s") if isinstance(payload, dict) else None),
@@ -1019,6 +1111,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "status",
         "input halo T/B",
         "output layout",
+        "LT grouping",
         "rotations",
         "LT+accumulate s",
         "hot run s",
@@ -1031,6 +1124,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "note",
     ]
     aligns = [
+        "---",
         "---",
         "---",
         "---",
@@ -1078,6 +1172,7 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
         "status",
         "input_halo_tb",
         "output_layout",
+        "lt_grouping",
         "rotations",
         "lt_accumulate_s",
         "hot_run_s",
@@ -1113,7 +1208,9 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
         row,
         clip_boundary_halo=bool(getattr(args, "clip_provider_boundary_halo", False) and row.path == "provider"),
     )
-    provider_output_layout = "native_halo_stripe" if row.path == "provider" and str(args.provider_output_layout) == "native_stripe" else ""
+    provider_output_layout = ""
+    if row.path == "provider":
+        provider_output_layout = "native_halo_stripe" if str(args.provider_output_layout) == "native_stripe" else "tight_compact"
     _write_json(
         path,
         {
@@ -1133,6 +1230,8 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
             "provider_requested_input_halo": row.halo,
+            "provider_lt_grouping_mode": row.provider_lt_grouping_mode if row.path == "provider" else "",
+            "provider_disable_shared_rotation": bool(row.provider_disable_shared_rotation and row.path == "provider"),
             "provider_boundary_halo_clipped": bool(
                 getattr(args, "clip_provider_boundary_halo", False) and row.path == "provider"
             ),
@@ -1171,6 +1270,8 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
             "provider_requested_input_halo": row.halo,
+            "provider_lt_grouping_mode": row.provider_lt_grouping_mode if row.path == "provider" else "",
+            "provider_disable_shared_rotation": bool(row.provider_disable_shared_rotation and row.path == "provider"),
             "provider_output_layout": provider_output_layout,
             "provider_output_storage_layout": provider_output_storage_layout,
             "input_halo_top": input_halo_top,
@@ -1212,10 +1313,17 @@ def run_all(args: argparse.Namespace) -> int:
             "orion": "dense Conv2d path with default resident Lattigo LT",
             "provider_halo1": "native halo provider with requested beta=1",
             "provider_halo2": "native halo provider with requested beta=2",
+            "provider_halo1_individual_lt": (
+                "native halo provider beta=1; BSGS preserved per LT, each LT compiled/evaluated as its own group"
+            ),
+            "provider_halo2_individual_lt": (
+                "native halo provider beta=2; BSGS preserved per LT, each LT compiled/evaluated as its own group"
+            ),
             "u_net_stage_packing": {
                 "Conv 32,32": "logical 32xHorigxWorig, multiplex/input_gap/output_gap=1, packed FHE 32xHorigxWorig",
                 "Conv 64,64": "logical 64x(Horig/2)x(Worig/2), multiplex/input_gap/output_gap=2, 4 channels/group, packed FHE 16xHorigxWorig",
                 "Conv 128,128": "logical 128x(Horig/4)x(Worig/4), multiplex/input_gap/output_gap=4, 16 channels/group, packed FHE 8xHorigxWorig",
+                "Conv 256,256": "logical 256x(Horig/8)x(Worig/8), multiplex/input_gap/output_gap=8, 64 channels/group, packed FHE 4xHorigxWorig",
             },
         },
         "env": {key: str(env.get(key, "")) for key in sorted(_env_snapshot())},
@@ -1367,9 +1475,11 @@ def run_one(args: argparse.Namespace) -> int:
             row,
             clip_boundary_halo=bool(args.clip_provider_boundary_halo and row.path == "provider"),
         )
-        provider_output_layout = (
-            "native_halo_stripe" if row.path == "provider" and str(args.provider_output_layout) == "native_stripe" else ""
-        )
+        provider_output_layout = ""
+        if row.path == "provider":
+            provider_output_layout = (
+                "native_halo_stripe" if str(args.provider_output_layout) == "native_stripe" else "tight_compact"
+            )
         payload = {
             "status": "error",
             "created_at_utc": _now_utc(),
@@ -1388,6 +1498,8 @@ def run_one(args: argparse.Namespace) -> int:
             "variant_label": VARIANT_LABELS[str(row.variant)],
             "path": row.path,
             "provider_requested_input_halo": row.halo,
+            "provider_lt_grouping_mode": row.provider_lt_grouping_mode if row.path == "provider" else "",
+            "provider_disable_shared_rotation": bool(row.provider_disable_shared_rotation and row.path == "provider"),
             "provider_boundary_halo_clipped": bool(args.clip_provider_boundary_halo and row.path == "provider"),
             "provider_output_layout": provider_output_layout,
             "provider_output_storage_layout": provider_output_layout,
@@ -1411,7 +1523,7 @@ def main() -> int:
     parser.add_argument("--backend", choices=("lattigo", "python"), default="lattigo")
     parser.add_argument("--channels", type=int, nargs="+", default=list(DEFAULT_CHANNELS))
     parser.add_argument("--hw", nargs="+", default=list(DEFAULT_HW))
-    parser.add_argument("--variants", nargs="+", choices=tuple(DEFAULT_VARIANTS), default=list(DEFAULT_VARIANTS))
+    parser.add_argument("--variants", nargs="+", choices=tuple(VARIANT_CHOICES), default=list(DEFAULT_VARIANTS))
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260527)
     parser.add_argument("--max-worker-rss-gb", type=float, default=850.0)
@@ -1432,8 +1544,8 @@ def main() -> int:
     parser.add_argument(
         "--provider-output-layout",
         choices=PROVIDER_OUTPUT_LAYOUTS,
-        default="native_stripe",
-        help="Provider output storage layout for kernel rows; native_stripe preserves channel-aligned native stripe output.",
+        default="tight_compact",
+        help="Provider output storage layout for kernel rows; tight_compact is the legacy comparison mode.",
     )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare/reuse rows and update the doc without launching workers.")

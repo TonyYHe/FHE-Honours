@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -475,3 +476,47 @@ def test_conv_transpose2d_dense_path_supports_multi_block_compile_and_eval() -> 
         assert torch.allclose(decoded, reference, atol=1.0e-5, rtol=1.0e-5)
     finally:
         active_scheme.delete_scheme()
+
+
+def test_conv_transpose2d_bias_uses_expanded_fhe_output_shape_without_layout_attr() -> None:
+    layer = ConvTranspose2d(
+        in_channels=16,
+        out_channels=32,
+        kernel_size=2,
+        stride=2,
+        padding=0,
+        bias=True,
+    )
+    layer.init_orion_params()
+    layer.on_bias = torch.ones_like(layer.on_bias)
+    layer.output_shape = torch.Size((1, 32, 192, 192))
+    layer.output_gap = 1
+    layer.fhe_output_shape = torch.Size((1, 32, 196, 192))
+
+    bias = packing.construct_conv_transpose2d_bias(layer)
+
+    assert int(bias.numel()) == int(torch.Size(layer.fhe_output_shape).numel())
+    assert int(math.ceil(float(bias.numel()) / 32768.0)) == 37
+
+
+def test_conv_transpose2d_bias_uses_physical_beta_for_boundary_pruned_layout() -> None:
+    layer = SimpleNamespace(
+        output_shape=torch.Size((1, 2, 4, 4)),
+        fhe_output_shape=torch.Size((1, 2, 4, 4)),
+        output_gap=1,
+        on_bias=torch.tensor([0.5, -1.5], dtype=torch.float32),
+        layout_policy_output_layout={
+            "top_beta": 1,
+            "bottom_beta": 1,
+            "physical_top_beta": 0,
+            "physical_bottom_beta": 0,
+            "gap": 1,
+        },
+    )
+
+    bias = packing.construct_conv_transpose2d_bias(layer)
+
+    decoded = bias.reshape(tuple(int(value) for value in layer.fhe_output_shape))
+    assert int(bias.numel()) == 32
+    assert torch.equal(decoded[0, 0], torch.full((4, 4), 0.5, dtype=torch.float32))
+    assert torch.equal(decoded[0, 1], torch.full((4, 4), -1.5, dtype=torch.float32))

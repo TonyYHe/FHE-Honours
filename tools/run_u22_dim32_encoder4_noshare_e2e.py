@@ -19,63 +19,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.generate_unet22_compile_plan_csv import UNet22PlusOutput
+from orion.models.unet import UNet22Encoder
 
 
-DOC_MARKER = "U22_BASE32_SILU7_STREAMING_PROVIDER_E2E_TABLE"
-SUMMARY_DOC_MARKER = "U22_BASE32_SILU7_NETWORK_SUMMARY_TABLE"
+DOC_MARKER = "U22_BASE32_ENCODER4_NOSHARE_E2E_TABLE"
+SUMMARY_DOC_MARKER = "U22_BASE32_ENCODER4_NOSHARE_SUMMARY_TABLE"
 DEFAULT_RUN_ROOT_BASE = REPO_ROOT / ".tmp" / "results"
-LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_u22_dim32_dense_provider_e2e_matrix.txt"
+LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_u22_dim32_encoder4_noshare_e2e.txt"
 
 CASES: dict[str, dict[str, Any]] = {
-    "192x192": {
-        "dataset": "IBSR BRAIN 2D",
-        "input_shape": (1, 1, 192, 192),
-        "out_channels": 4,
-    },
-    "224x224": {
-        "dataset": "HanCo Hand",
-        "input_shape": (1, 3, 224, 224),
-        "out_channels": 1,
-    },
-    "384x288": {
-        "dataset": "CVC-ClinicDB",
-        "input_shape": (1, 3, 384, 288),
-        "out_channels": 1,
-    },
-    "384x384": {
-        "dataset": "Satellite cloud",
-        "input_shape": (1, 4, 384, 384),
-        "out_channels": 1,
-    },
+    "192x192": {"dataset": "IBSR BRAIN 2D", "input_shape": (1, 1, 192, 192), "out_channels": 256},
+    "224x224": {"dataset": "HanCo Hand", "input_shape": (1, 3, 224, 224), "out_channels": 256},
+    "384x288": {"dataset": "CVC-ClinicDB", "input_shape": (1, 3, 384, 288), "out_channels": 256},
+    "384x384": {"dataset": "Satellite cloud", "input_shape": (1, 4, 384, 384), "out_channels": 256},
 }
 
-LINEAR_LAYERS = [
-    "enc1a",
-    "enc1b",
-    "enc2a",
-    "enc2b",
-    "enc3a",
-    "enc3b",
-    "enc4a",
-    "enc4b",
-    "bottlenecka",
-    "bottleneckb",
-    "up4",
-    "dec4a",
-    "dec4b",
-    "up3",
-    "dec3a",
-    "dec3b",
-    "up2",
-    "dec2a",
-    "dec2b",
-    "up1",
-    "dec1a",
-    "dec1b",
-    "output",
-]
-
+LINEAR_LAYERS = ["enc1a", "enc1b", "enc2a", "enc2b", "enc3a", "enc3b", "enc4a", "enc4b"]
 BOOTSTRAP_OWNER_HINTS = {
     "enc1a_act": "enc1a",
     "enc1b_act": "enc1b",
@@ -88,33 +47,12 @@ BOOTSTRAP_OWNER_HINTS = {
     "pool3": "enc3b",
     "enc4a_act": "enc4a",
     "enc4b_act": "enc4b",
-    "pool4": "enc4b",
-    "bottlenecka_act": "bottlenecka",
-    "bottleneckb_act": "bottleneckb",
-    "up4": "up4",
-    "cat4": "up4",
-    "dec4a_act": "dec4a",
-    "dec4b_act": "dec4b",
-    "up3": "up3",
-    "cat3": "up3",
-    "dec3a_act": "dec3a",
-    "dec3b_act": "dec3b",
-    "up2": "up2",
-    "cat2": "up2",
-    "dec2a_act": "dec2a",
-    "dec2b_act": "dec2b",
-    "up1": "up1",
-    "cat1": "up1",
-    "dec1a_act": "dec1a",
-    "dec1b_act": "dec1b",
 }
 
 PROVIDER_MODES = {
-    "dp": "u22_256_base32_layout_dp",
-    "greedy": "u22_256_base32_layout_greedy",
-    "always": "u22_256_base32_layout_always",
-    "always_fused": "u22_256_base32_layout_always_fused",
     "fixed_max": "u22_256_base32_layout_fixedmax",
+    "always": "u22_256_base32_layout_always",
+    "dp": "u22_256_base32_layout_dp",
 }
 
 CPU_COUNT = max(1, int(os.cpu_count() or 1))
@@ -137,35 +75,16 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_UNIFIED_COMPILE_WORKERS": str(CPU_COUNT),
     "ORION_LATTIGO_COMPILE_WORKERS": str(CPU_COUNT),
     "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": str(CPU_COUNT),
-    "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
-    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
-    "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
     "ORION_CONCAT_FUSION": "1",
+    "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
+    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
+    "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
 }
 
-ENV_TUNING_KEYS = (
-    "GOMAXPROCS",
-    "ORION_COMPILE_MEMORY_RESERVE_GB",
-    "ORION_SINGLE_SLOT_LAYER_CACHE",
-    "ORION_SINGLE_SLOT_ENCODE_WORKERS",
-    "ORION_LT_COMPILE_WORKERS",
-    "ORION_UNIFIED_COMPILE_WORKERS",
-    "ORION_LATTIGO_COMPILE_WORKERS",
-    "ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS",
-    "ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS",
-    "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS",
-    "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS",
-    "ORION_PACK_CONV_WORKERS",
-    "ORION_DIRECT_PACK_WORKERS",
-    "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
-    "ORION_LATTIGO_BOOTSTRAP_WORKERS",
-    "ORION_CONCAT_FUSION",
-)
-
-ENV_SNAPSHOT_KEYS = tuple(sorted(set(ENV_DEFAULTS) | set(ENV_TUNING_KEYS)))
+ENV_SNAPSHOT_KEYS = tuple(sorted(ENV_DEFAULTS))
 
 
 def _safe_case(case: str) -> str:
@@ -173,14 +92,17 @@ def _safe_case(case: str) -> str:
 
 
 def _network_name(case: str) -> str:
-    return f"u23_dim32_{_safe_case(case)}_full"
+    return f"u22_dim32_encoder4_{_safe_case(case)}"
 
 
 def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated = dict(env)
     for key, value in ENV_DEFAULTS.items():
         updated.setdefault(key, value)
-    updated["GOMAXPROCS"] = ENV_DEFAULTS["GOMAXPROCS"]
+    updated["GOMAXPROCS"] = "1"
+    updated["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] = "1"
+    updated["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] = "0"
+    updated["ORION_LATTIGO_UNIFIED_NO_BSGS"] = "0"
     return updated
 
 
@@ -198,34 +120,32 @@ def _register_networks() -> Any:
 
     for case, spec in CASES.items():
         input_shape = tuple(int(v) for v in spec["input_shape"])
-        out_channels = int(spec["out_channels"])
 
         def _builder(
             *,
             activation: str | None = None,
             silu_degree: int = 31,
             _input_shape: tuple[int, int, int, int] = input_shape,
-            _out_channels: int = out_channels,
         ):
-            return UNet22PlusOutput(
+            return UNet22Encoder(
+                dataset="kvasir_polyp_256",
                 in_channels=int(_input_shape[1]),
-                out_channels=int(_out_channels),
                 base_channels=32,
                 activation=str(activation or "silu"),
                 silu_degree=int(silu_degree),
             )
 
         base.NETWORKS[_network_name(case)] = {
-            "label": f"U22+output dim32 {case}",
-            "model": "UNet22PlusOutput",
+            "label": f"U22 encoder4 dim32 {case}",
+            "model": "UNet22Encoder",
             "dataset": str(spec["dataset"]),
             "input_shape": input_shape,
-            "provider_mode": "u22_256_base32_layout_dp",
+            "provider_mode": PROVIDER_MODES["fixed_max"],
             "config": base._r18_config,
             "builder": _builder,
-            "scope": "full",
+            "scope": "encoder4",
             "base_dim": 32,
-            "out_channels": out_channels,
+            "out_channels": int(spec["out_channels"]),
         }
     return base
 
@@ -255,7 +175,7 @@ def _resource_maxrss_bytes() -> int:
 
 def _case_paths(run_root: Path, case: str, mode: str) -> tuple[Path, Path]:
     case_dir = Path(run_root) / _safe_case(case)
-    return case_dir / f"{mode}_e2e.json", case_dir / f"{mode}_e2e.log"
+    return case_dir / f"{mode}_encoder4_e2e.json", case_dir / f"{mode}_encoder4_e2e.log"
 
 
 def _annotate_result(
@@ -284,30 +204,28 @@ def _annotate_result(
         "env": {key: str(env_snapshot.get(key, "")) for key in ENV_SNAPSHOT_KEYS},
     }
     payload["model_variant"] = {
-        "name": "UNet22PlusOutput",
-        "linear_layers": 23,
+        "name": "UNet22Encoder",
+        "linear_layers": len(LINEAR_LAYERS),
+        "layers": list(LINEAR_LAYERS),
         "base_dim": 32,
         "input_shape": [int(v) for v in tuple(spec["input_shape"])],
         "out_channels": int(spec["out_channels"]),
         "dataset": str(spec["dataset"]),
         "activation": "SiLU7",
-        "output_head": "1x1/pad0",
+        "scope": "encoder4_only_no_bottleneck",
+        "sharing": "dense independent LT; provider ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1",
     }
     _write_json(out_path, payload)
 
 
 def run_one(args: argparse.Namespace) -> int:
     os.environ.update(_apply_env_defaults(os.environ))
-    mode = str(args.mode)
-    if mode == "dense":
-        os.environ["ORION_CONCAT_FUSION"] = "1"
-    else:
-        os.environ.setdefault("ORION_CONCAT_FUSION", "1")
     env_snapshot = dict(os.environ)
     base = _register_networks()
+    mode = str(args.mode)
     out_path = Path(args.out)
-    started_at = time.perf_counter()
     provider_mode = _provider_mode(str(args.policy)) if mode == "provider" else ""
+    started_at = time.perf_counter()
     try:
         base._run_one(
             network=_network_name(str(args.case)),
@@ -357,14 +275,10 @@ def _metric(payload: dict[str, Any], path: tuple[str, ...]) -> Any:
 
 def _as_float(value: Any) -> float:
     try:
-        if value is None:
-            return 0.0
-        number = float(value)
+        number = float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
-    if not math.isfinite(number):
-        return 0.0
-    return float(number)
+    return float(number) if math.isfinite(number) else 0.0
 
 
 def _fmt_float(value: Any, digits: int = 1) -> str:
@@ -413,7 +327,17 @@ def _forward_timing(payload: dict[str, Any], key: str) -> float | None:
 
 def _rotation_count(payload: dict[str, Any]) -> int | None:
     report = payload.get("rotation_report_after_forward") or payload.get("rotation_report_after_compile") or {}
-    value = report.get("total_rotation_eval_count_estimate") if isinstance(report, dict) else None
+    if not isinstance(report, dict):
+        return None
+    value = report.get("total_rotation_eval_count_estimate")
+    if value is None:
+        rows = report.get("rows") or []
+        if isinstance(rows, list):
+            value = sum(
+                int((row.get("stats") or {}).get("rotation_eval_count_estimate", 0) or 0)
+                for row in rows
+                if isinstance(row, dict)
+            )
     return None if value is None else int(value)
 
 
@@ -457,30 +381,116 @@ def _empty_layer_stats() -> dict[str, Any]:
     return {
         "row_count": 0,
         "transform_count": 0,
-        "legacy_load_encode_s": 0.0,
-        "layer_cache_turnover_s": 0.0,
+        "compile_group_count": 0,
+        "diagonals": 0,
+        "rotation_estimate": 0,
         "layer_cache_encode_s": 0.0,
         "layer_cache_key_prepare_s": 0.0,
         "layer_cache_evict_s": 0.0,
+        "layer_cache_turnover_s": 0.0,
         "lt_accumulate_s": 0.0,
         "eval_total_s": 0.0,
-        "stream_build_map_s": 0.0,
-        "stream_encode_hoist_s": 0.0,
-        "stream_load_payload_s": 0.0,
-        "stream_eval_s": 0.0,
-        "stream_accumulate_s": 0.0,
-        "cpp_baby_giant_s": 0.0,
     }
 
 
-def _empty_boot_stats() -> dict[str, Any]:
-    return {
-        "module_count": 0,
-        "runtime_call_count": 0,
-        "bootstrap_s": 0.0,
-        "backend_bootstrap_s": 0.0,
-        "nodes": [],
-    }
+def _compile_stats(payload: dict[str, Any], stats: dict[str, dict[str, Any]]) -> None:
+    rows = _metric(payload, ("operator_breakdown_after_compile", "group_rows")) or []
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        layer = _layer_for_row(row)
+        if layer is None:
+            continue
+        profile = row.get("profile") if isinstance(row.get("profile"), dict) else {}
+        entry = stats[layer]
+        entry["compile_group_count"] += 1
+        entry["diagonals"] += int(profile.get("diag_index_count") or profile.get("diag_data_count") or 0)
+        entry["transform_count"] += int(profile.get("transform_count") or 0)
+
+
+def _rotation_stats(payload: dict[str, Any], stats: dict[str, dict[str, Any]]) -> None:
+    report = payload.get("rotation_report_after_forward") or payload.get("rotation_report_after_compile") or {}
+    rows = report.get("rows") if isinstance(report, dict) else []
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        layer = _layer_for_row(row)
+        if layer is None:
+            nodes = [str(node) for node in row.get("nodes", []) or []]
+            layer = next((node for node in nodes if node in LINEAR_LAYERS), None)
+        if layer is None:
+            continue
+        row_stats = row.get("stats") if isinstance(row.get("stats"), dict) else {}
+        stats[layer]["rotation_estimate"] += int(row_stats.get("rotation_eval_count_estimate", 0) or 0)
+        if not stats[layer]["transform_count"] and row_stats.get("transform_count") is not None:
+            stats[layer]["transform_count"] = int(row_stats.get("transform_count") or 0)
+
+
+def _dense_log_diagonal_stats(result_path: Path, stats: dict[str, dict[str, Any]]) -> None:
+    """Recover dense single-slot diagonal counts from the compile log.
+
+    In single-slot mode the dense backend does not keep compile-time group rows in
+    the JSON, but the compile log still emits the packed matrix diagonal count in
+    the same order as the "Packing <layer>:" lines.
+    """
+    if sum(int(value["diagonals"]) for value in stats.values()) > 0:
+        return
+    log_path = result_path.with_suffix(".log")
+    if not log_path.exists():
+        return
+    packing_order: list[str] = []
+    diagonal_counts: list[int] = []
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Packing ") and stripped.endswith(":"):
+            packing_order.append(stripped[len("Packing ") : -1])
+        if "# diagonals =" in stripped:
+            try:
+                diagonal_counts.append(int(stripped.rsplit("=", 1)[1].strip().replace(",", "")))
+            except ValueError:
+                continue
+    for layer, count in zip(packing_order, diagonal_counts, strict=False):
+        if layer in stats:
+            stats[layer]["diagonals"] = int(count)
+
+
+def _forward_stats(payload: dict[str, Any], stats: dict[str, dict[str, Any]]) -> None:
+    rows = _metric(payload, ("operator_breakdown_after_forward", "mvm", "group_rows")) or []
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        layer = _layer_for_row(row)
+        if layer is None:
+            continue
+        timing = row.get("timing") if isinstance(row.get("timing"), dict) else {}
+        layer_cache_encode = _as_float(row.get("lt_layer_cache_encode_s")) or _as_float(timing.get("layer_cache_encode_s"))
+        layer_cache_key_prepare = _as_float(row.get("lt_layer_cache_key_prepare_s")) or _as_float(
+            timing.get("layer_cache_key_prepare_s")
+        )
+        layer_cache_evict = _as_float(row.get("lt_layer_cache_evict_s")) or _as_float(timing.get("layer_cache_evict_s"))
+        layer_cache_turnover = _as_float(row.get("lt_layer_cache_turnover_s")) or (
+            layer_cache_encode + layer_cache_key_prepare + layer_cache_evict
+        )
+        baby_giant = _as_float(timing.get("cpp_baby_step_s")) + _as_float(timing.get("cpp_giant_step_s"))
+        lt_accum = _as_float(timing.get("stream_eval_s")) + _as_float(timing.get("stream_accumulate_s")) + baby_giant
+        if lt_accum <= 0.0:
+            lt_accum = _as_float(row.get("mvm_kernel_s"))
+        entry = stats[layer]
+        entry["row_count"] += 1
+        if row.get("transform_count"):
+            entry["transform_count"] += int(row.get("transform_count") or 0)
+        entry["layer_cache_encode_s"] += layer_cache_encode
+        entry["layer_cache_key_prepare_s"] += layer_cache_key_prepare
+        entry["layer_cache_evict_s"] += layer_cache_evict
+        entry["layer_cache_turnover_s"] += layer_cache_turnover
+        entry["lt_accumulate_s"] += lt_accum
+        entry["eval_total_s"] += _as_float(row.get("mvm_eval_total_s"))
 
 
 def _bootstrap_anchor_name(name: str) -> str:
@@ -502,107 +512,41 @@ def _bootstrap_owner(name: str) -> str | None:
     return None
 
 
-def _bootstrap_stats(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    stats = {layer: _empty_boot_stats() for layer in LINEAR_LAYERS}
-    extra: list[dict[str, Any]] = []
+def _bootstrap_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    stats = {layer: {"count": 0, "s": 0.0, "nodes": []} for layer in LINEAR_LAYERS}
     records: dict[str, dict[str, Any]] = {}
     report = payload.get("bootstrap_report_after_forward") or payload.get("bootstrap_report_after_compile") or {}
     for row in report.get("rows", []) or [] if isinstance(report, dict) else []:
-        row = dict(row)
-        name = str(row.get("name", ""))
-        if not name:
+        if not isinstance(row, dict):
             continue
-        records[name] = {
-            "name": name,
-            "module_count": 1,
-            "runtime_call_count": int(row.get("runtime_call_count", 0) or 0),
-            "bootstrap_s": 0.0,
-            "backend_bootstrap_s": 0.0,
-        }
+        name = str(row.get("name", ""))
+        records[name] = {"name": name, "count": int(row.get("runtime_call_count", 0) or 0), "s": 0.0}
     breakdown_rows = _metric(payload, ("operator_breakdown_after_forward", "bootstrap", "rows")) or []
     if isinstance(breakdown_rows, list):
         for row in breakdown_rows:
             if not isinstance(row, dict):
                 continue
             name = str(row.get("name", ""))
-            if not name:
-                continue
-            record = records.setdefault(
-                name,
-                {
-                    "name": name,
-                    "module_count": 1,
-                    "runtime_call_count": 0,
-                    "bootstrap_s": 0.0,
-                    "backend_bootstrap_s": 0.0,
-                },
-            )
-            record["runtime_call_count"] = int(row.get("runtime_call_count", record.get("runtime_call_count", 0)) or 0)
-            record["bootstrap_s"] = _as_float(row.get("bootstrap_s"))
-            record["backend_bootstrap_s"] = _as_float(row.get("backend_bootstrap_s"))
+            record = records.setdefault(name, {"name": name, "count": 0, "s": 0.0})
+            record["count"] = int(row.get("runtime_call_count", record.get("count", 0)) or 0)
+            record["s"] = _as_float(row.get("bootstrap_s"))
     for record in records.values():
         owner = _bootstrap_owner(str(record.get("name", "")))
-        target = stats.get(owner) if owner is not None else None
-        if target is None:
-            extra.append(dict(record))
+        if owner not in stats:
             continue
-        target["module_count"] += int(record.get("module_count", 0) or 0)
-        target["runtime_call_count"] += int(record.get("runtime_call_count", 0) or 0)
-        target["bootstrap_s"] += _as_float(record.get("bootstrap_s"))
-        target["backend_bootstrap_s"] += _as_float(record.get("backend_bootstrap_s"))
-        target["nodes"].append(_bootstrap_anchor_name(str(record.get("name", ""))))
-    return stats, extra
+        stats[owner]["count"] += int(record.get("count", 0) or 0)
+        stats[owner]["s"] += _as_float(record.get("s"))
+        stats[owner]["nodes"].append(_bootstrap_anchor_name(str(record.get("name", ""))))
+    return stats
 
 
-def _layer_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _layer_stats(payload: dict[str, Any], result_path: Path | None = None) -> dict[str, dict[str, Any]]:
     stats = {layer: _empty_layer_stats() for layer in LINEAR_LAYERS}
-    rows = _metric(payload, ("operator_breakdown_after_forward", "mvm", "group_rows")) or []
-    if not isinstance(rows, list):
-        return stats
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        layer = _layer_for_row(row)
-        if layer is None:
-            continue
-        timing = row.get("timing") if isinstance(row.get("timing"), dict) else {}
-        stream_build = _as_float(timing.get("stream_build_map_s"))
-        stream_encode = _as_float(timing.get("stream_encode_hoist_s"))
-        stream_payload = _as_float(timing.get("stream_load_payload_s"))
-        stream_eval = _as_float(timing.get("stream_eval_s"))
-        stream_accum = _as_float(timing.get("stream_accumulate_s"))
-        baby_giant = _as_float(timing.get("cpp_baby_step_s")) + _as_float(timing.get("cpp_giant_step_s"))
-        layer_cache_encode = _as_float(row.get("lt_layer_cache_encode_s")) or _as_float(
-            timing.get("layer_cache_encode_s")
-        )
-        layer_cache_key_prepare = _as_float(row.get("lt_layer_cache_key_prepare_s")) or _as_float(
-            timing.get("layer_cache_key_prepare_s")
-        )
-        layer_cache_evict = _as_float(row.get("lt_layer_cache_evict_s")) or _as_float(
-            timing.get("layer_cache_evict_s")
-        )
-        layer_cache_turnover = _as_float(row.get("lt_layer_cache_turnover_s")) or (
-            layer_cache_encode + layer_cache_key_prepare + layer_cache_evict
-        )
-        lt_accum = stream_eval + stream_accum + baby_giant
-        if lt_accum <= 0.0:
-            lt_accum = _as_float(row.get("mvm_kernel_s"))
-        entry = stats[layer]
-        entry["row_count"] += 1
-        entry["transform_count"] += int(row.get("transform_count") or 0)
-        entry["stream_build_map_s"] += stream_build
-        entry["stream_encode_hoist_s"] += stream_encode
-        entry["stream_load_payload_s"] += stream_payload
-        entry["stream_eval_s"] += stream_eval
-        entry["stream_accumulate_s"] += stream_accum
-        entry["cpp_baby_giant_s"] += baby_giant
-        entry["legacy_load_encode_s"] += stream_build + stream_encode + stream_payload
-        entry["layer_cache_turnover_s"] += layer_cache_turnover
-        entry["layer_cache_encode_s"] += layer_cache_encode
-        entry["layer_cache_key_prepare_s"] += layer_cache_key_prepare
-        entry["layer_cache_evict_s"] += layer_cache_evict
-        entry["lt_accumulate_s"] += lt_accum
-        entry["eval_total_s"] += _as_float(row.get("mvm_eval_total_s"))
+    _compile_stats(payload, stats)
+    _rotation_stats(payload, stats)
+    _forward_stats(payload, stats)
+    if result_path is not None and str(payload.get("mode", "")) == "dense":
+        _dense_log_diagonal_stats(result_path, stats)
     return stats
 
 
@@ -627,31 +571,15 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
     spec = CASES[str(case)]
     timing = payload.get("timing_s", {}) if isinstance(payload, dict) else {}
     totals = _breakdown_totals(payload or {})
-    encrypt_s = _forward_timing(payload or {}, "encrypt")
     he_forward_s = _forward_timing(payload or {}, "he_forward")
-    decode_s = _forward_timing(payload or {}, "decrypt_decode")
-    hot_s = None
-    if encrypt_s is not None and he_forward_s is not None and decode_s is not None:
-        hot_s = float(encrypt_s + he_forward_s + decode_s)
-    total_legacy_load_encode = None
-    total_layer_cache_turnover = None
-    total_layer_cache_encode = None
-    total_layer_cache_key_prepare = None
-    total_layer_cache_evict = None
-    total_lt_accumulate = None
-    if has_payload:
-        total_legacy_load_encode = _as_float(totals.get("lt_runtime_load_encode_s")) or (
-            _as_float(totals.get("lt_runtime_stream_build_map_s"))
-            + _as_float(totals.get("lt_runtime_stream_encode_hoist_s"))
-            + _as_float(totals.get("lt_runtime_stream_load_payload_s"))
-        )
-        total_layer_cache_encode = _as_float(totals.get("lt_layer_cache_encode_s"))
-        total_layer_cache_key_prepare = _as_float(totals.get("lt_layer_cache_key_prepare_s"))
-        total_layer_cache_evict = _as_float(totals.get("lt_layer_cache_evict_s"))
-        total_layer_cache_turnover = _as_float(totals.get("lt_layer_cache_turnover_s")) or (
-            total_layer_cache_encode + total_layer_cache_key_prepare + total_layer_cache_evict
-        )
-        total_lt_accumulate = _as_float(totals.get("mvm_kernel_s"))
+    boot_stats = _bootstrap_stats(payload or {}) if has_payload else {layer: {"count": 0, "s": 0.0, "nodes": []} for layer in LINEAR_LAYERS}
+    layer_stats = (
+        _layer_stats(payload or {}, result_path)
+        if has_payload
+        else {layer: _empty_layer_stats() for layer in LINEAR_LAYERS}
+    )
+    total_boot_s = sum(_as_float(value["s"]) for value in boot_stats.values())
+    total_lt_s = sum(_as_float(value["lt_accumulate_s"]) for value in layer_stats.values())
     total_row = [
         str(case),
         str(spec["dataset"]),
@@ -659,43 +587,31 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
         str(mode),
         status,
         "TOTAL",
-        _fmt_int(_metric(payload or {}, ("operator_breakdown_after_forward", "mvm", "totals", "group_count"))),
-        _fmt_float(total_layer_cache_turnover),
-        _fmt_float(total_layer_cache_encode),
-        _fmt_float(total_layer_cache_key_prepare),
-        _fmt_float(total_layer_cache_evict),
-        _fmt_float(total_lt_accumulate),
-        _fmt_float(totals.get("mvm_eval_total_s")),
-        _fmt_float(total_legacy_load_encode),
-        _fmt_float(totals.get("lt_runtime_stream_build_map_s")),
-        _fmt_float(totals.get("lt_runtime_stream_encode_hoist_s")),
-        _fmt_float(totals.get("lt_runtime_stream_load_payload_s")),
-        _fmt_float(totals.get("lt_runtime_stream_eval_s")),
-        _fmt_float(totals.get("lt_runtime_stream_accumulate_s")),
-        "",
+        _fmt_int(sum(int(value["compile_group_count"]) for value in layer_stats.values())),
+        _fmt_int(sum(int(value["transform_count"]) for value in layer_stats.values())),
+        _fmt_int(sum(int(value["diagonals"]) for value in layer_stats.values())),
+        _fmt_int(_rotation_count(payload or {})),
+        _fmt_float(sum(_as_float(value["layer_cache_encode_s"]) for value in layer_stats.values())),
+        _fmt_float(sum(_as_float(value["layer_cache_key_prepare_s"]) for value in layer_stats.values())),
+        _fmt_float(sum(_as_float(value["layer_cache_evict_s"]) for value in layer_stats.values())),
+        _fmt_float(sum(_as_float(value["layer_cache_turnover_s"]) for value in layer_stats.values())),
+        _fmt_float(total_lt_s),
+        _fmt_float(sum(_as_float(value["eval_total_s"]) for value in layer_stats.values())),
         _fmt_int(_bootstrap_count(payload or {})),
-        _fmt_float(totals.get("bootstrap_s")),
+        _fmt_float(total_boot_s),
         "",
         _fmt_float(timing.get("compile") if isinstance(timing, dict) else None),
         _fmt_float(he_forward_s),
-        _fmt_float(hot_s),
-        _fmt_int(_rotation_count(payload or {})),
-        _fmt_int(_bootstrap_count(payload or {})),
         _runtime_mode(payload or {}),
         _gib(_metric(payload or {}, ("runner", "maxrss_bytes"))),
         str(result_path),
         _first_error(result_path, payload),
     ]
     rows = [total_row]
-    stats = _layer_stats(payload or {})
-    boot_stats, extra_boot = _bootstrap_stats(payload or {}) if has_payload else (
-        {layer: _empty_boot_stats() for layer in LINEAR_LAYERS},
-        [],
-    )
     for layer in LINEAR_LAYERS:
-        item = stats[layer]
+        item = layer_stats[layer]
         boot_item = boot_stats[layer]
-        has_row = bool(item["row_count"])
+        has_row = bool(item["row_count"] or item["compile_group_count"] or item["rotation_estimate"])
         rows.append(
             [
                 str(case),
@@ -704,69 +620,25 @@ def _case_table_rows(run_root: Path, case: str, mode: str) -> list[list[str]]:
                 str(mode),
                 status if has_row else ("pending" if payload is None else "no-row"),
                 layer,
-                _fmt_int(item["transform_count"] or item["row_count"]) if has_row else "",
-                _fmt_float(item["layer_cache_turnover_s"]) if has_row else "",
+                _fmt_int(item["compile_group_count"]) if has_row else "",
+                _fmt_int(item["transform_count"]) if has_row else "",
+                _fmt_int(item["diagonals"]) if has_row else "",
+                _fmt_int(item["rotation_estimate"]) if has_row else "",
                 _fmt_float(item["layer_cache_encode_s"]) if has_row else "",
                 _fmt_float(item["layer_cache_key_prepare_s"]) if has_row else "",
                 _fmt_float(item["layer_cache_evict_s"]) if has_row else "",
+                _fmt_float(item["layer_cache_turnover_s"]) if has_row else "",
                 _fmt_float(item["lt_accumulate_s"]) if has_row else "",
                 _fmt_float(item["eval_total_s"]) if has_row else "",
-                _fmt_float(item["legacy_load_encode_s"]) if has_row else "",
-                _fmt_float(item["stream_build_map_s"]) if has_row else "",
-                _fmt_float(item["stream_encode_hoist_s"]) if has_row else "",
-                _fmt_float(item["stream_load_payload_s"]) if has_row else "",
-                _fmt_float(item["stream_eval_s"]) if has_row else "",
-                _fmt_float(item["stream_accumulate_s"]) if has_row else "",
-                _fmt_float(item["cpp_baby_giant_s"]) if has_row else "",
-                _fmt_int(boot_item["module_count"]) if boot_item["module_count"] else "",
-                _fmt_float(boot_item["bootstrap_s"]) if boot_item["module_count"] else "",
+                _fmt_int(boot_item["count"]) if boot_item["count"] else "",
+                _fmt_float(boot_item["s"]) if boot_item["count"] else "",
                 ",".join(str(node) for node in boot_item["nodes"][:6]),
                 "",
                 "",
-                "",
-                "",
-                "",
                 _runtime_mode(payload or {}),
                 "",
                 str(result_path),
                 "",
-            ]
-        )
-    for record in extra_boot:
-        rows.append(
-            [
-                str(case),
-                str(spec["dataset"]),
-                f"{int(spec['input_shape'][1])}->{int(spec['out_channels'])}",
-                str(mode),
-                status,
-                f"boot-only:{_bootstrap_anchor_name(str(record.get('name', '')))}",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                _fmt_int(record.get("module_count")),
-                _fmt_float(record.get("bootstrap_s")),
-                _bootstrap_anchor_name(str(record.get("name", ""))),
-                "",
-                "",
-                "",
-                "",
-                "",
-                _runtime_mode(payload or {}),
-                "",
-                str(result_path),
-                "bootstrap attached to a non-linear/non-U22 layer node",
             ]
         )
     return rows
@@ -780,28 +652,21 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "path",
         "status",
         "layer",
-        "groups/transforms",
-        "layer cache turnover s",
-        "layer cache diag+encode s",
-        "layer cache key prep s",
-        "layer cache evict s",
+        "groups",
+        "transforms",
+        "diagonals",
+        "rotations",
+        "diag+encode s",
+        "key prep s",
+        "evict s",
+        "turnover s",
         "LT+accum s",
         "eval total s",
-        "legacy load/encode s",
-        "stream build s",
-        "encode hoist s",
-        "stream load s",
-        "LT eval s",
-        "LT accum s",
-        "baby+giant s",
-        "boot after count",
-        "boot after s",
-        "boot after nodes",
+        "boot count",
+        "boot s",
+        "boot nodes",
         "compile s",
         "HE forward s",
-        "hot E2E s",
-        "rotations",
-        "boots",
         "runtime mode",
         "peak RSS GiB",
         "result file",
@@ -826,14 +691,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "---:",
         "---:",
         "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
+        "---",
         "---:",
         "---:",
         "---",
@@ -852,19 +710,17 @@ def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
     payload = _read_json(result_path)
     payload = payload if isinstance(payload, dict) else {}
     timing = payload.get("timing_s", {}) if isinstance(payload.get("timing_s"), dict) else {}
-    encrypt_s = _forward_timing(payload, "encrypt")
-    he_forward_s = _forward_timing(payload, "he_forward")
-    decode_s = _forward_timing(payload, "decrypt_decode")
-    hot_s = None
-    if encrypt_s is not None and he_forward_s is not None and decode_s is not None:
-        hot_s = float(encrypt_s + he_forward_s + decode_s)
+    boot_stats = _bootstrap_stats(payload)
+    layer_stats = _layer_stats(payload, result_path)
     return {
         "status": str(payload.get("status", "pending" if not payload else "unknown")),
         "compile_s": timing.get("compile") if isinstance(timing, dict) else None,
-        "he_forward_s": he_forward_s,
-        "hot_e2e_s": hot_s,
+        "he_forward_s": _forward_timing(payload, "he_forward"),
+        "layer_compute_s": sum(_as_float(value["lt_accumulate_s"]) for value in layer_stats.values()),
+        "boot_s": sum(_as_float(value["s"]) for value in boot_stats.values()),
         "rotations": _rotation_count(payload),
         "boots": _bootstrap_count(payload),
+        "diagonals": sum(int(value["diagonals"]) for value in layer_stats.values()),
         "peak_rss_gib": _metric(payload, ("runner", "maxrss_bytes")),
         "runtime_mode": _runtime_mode(payload),
         "result_path": str(result_path),
@@ -884,21 +740,23 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
     headers = [
         "input",
         "dataset",
-        "I/O ch",
         "dense status",
         "Halo status",
         "dense HE forward s",
         "Halo HE forward s",
         "dense/Halo HE",
-        "dense hot E2E s",
-        "Halo hot E2E s",
+        "dense layer compute s",
+        "Halo layer compute s",
         "dense rotations",
         "Halo rotations",
+        "dense diagonals",
+        "Halo diagonals",
         "dense boots",
         "Halo boots",
+        "dense boot s",
+        "Halo boot s",
         "dense RSS GiB",
         "Halo RSS GiB",
-        "runtime mode",
         "result files",
         "note",
     ]
@@ -907,7 +765,6 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "---",
         "---",
         "---",
-        "---",
         "---:",
         "---:",
         "---:",
@@ -919,7 +776,10 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "---:",
         "---:",
         "---:",
-        "---",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
         "---",
         "---",
     ]
@@ -933,21 +793,23 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
             [
                 str(case),
                 str(spec["dataset"]),
-                f"{int(spec['input_shape'][1])}->{int(spec['out_channels'])}",
                 str(dense["status"]),
                 str(provider["status"]),
                 _fmt_float(dense["he_forward_s"]),
                 _fmt_float(provider["he_forward_s"]),
                 _fmt_float(_ratio(dense["he_forward_s"], provider["he_forward_s"])),
-                _fmt_float(dense["hot_e2e_s"]),
-                _fmt_float(provider["hot_e2e_s"]),
+                _fmt_float(dense["layer_compute_s"]),
+                _fmt_float(provider["layer_compute_s"]),
                 _fmt_int(dense["rotations"]),
                 _fmt_int(provider["rotations"]),
+                _fmt_int(dense["diagonals"]),
+                _fmt_int(provider["diagonals"]),
                 _fmt_int(dense["boots"]),
                 _fmt_int(provider["boots"]),
+                _fmt_float(dense["boot_s"]),
+                _fmt_float(provider["boot_s"]),
                 _gib(dense["peak_rss_gib"]),
                 _gib(provider["peak_rss_gib"]),
-                str(provider["runtime_mode"] or dense["runtime_mode"]),
                 f"dense:{dense['result_path']}; provider:{provider['result_path']}",
                 "; ".join(notes),
             ]
@@ -962,21 +824,23 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
     headers = [
         "input",
         "dataset",
-        "I/O ch",
         "dense status",
         "Halo status",
         "dense HE forward s",
         "Halo HE forward s",
         "dense/Halo HE",
-        "dense hot E2E s",
-        "Halo hot E2E s",
+        "dense layer compute s",
+        "Halo layer compute s",
         "dense rotations",
         "Halo rotations",
+        "dense diagonals",
+        "Halo diagonals",
         "dense boots",
         "Halo boots",
+        "dense boot s",
+        "Halo boot s",
         "dense RSS GiB",
         "Halo RSS GiB",
-        "runtime mode",
         "result files",
         "note",
     ]
@@ -985,7 +849,6 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "---",
         "---",
         "---",
-        "---",
         "---:",
         "---:",
         "---:",
@@ -997,13 +860,16 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "---:",
         "---:",
         "---:",
-        "---",
+        "---:",
+        "---:",
+        "---:",
+        "---:",
         "---",
         "---",
     ]
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(aligns) + " |"]
     for row in rows:
-        lines.append("| " + " | ".join(_markdown_escape(cell) for cell in _pad_row(row, len(headers))) + " |")
+        lines.append("| " + " | ".join(_markdown_escape(cell) for cell in row) + " |")
     return "\n".join(lines)
 
 
@@ -1019,6 +885,26 @@ def _replace_block(text: str, marker: str, body: str) -> str:
     return f"{left}{start}\n{body}\n{end}{right}"
 
 
+def _ensure_doc_section(text: str) -> str:
+    if f"<!-- {SUMMARY_DOC_MARKER}_START -->" in text and f"<!-- {DOC_MARKER}_START -->" in text:
+        return text
+    section = f"""
+
+## Step 1c: Dim32 Encoder4 No-Sharing E2E
+
+Main E2E comparison for the paper table: U22 encoder Conv2d stages only (`enc1a..enc4b`), no bottleneck and no decoder. Dense uses independent Orion LTs. HaloED provider uses encoder Conv2d provider lowering with native/halo output materialization and `ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1`, so each LT preserves its own BSGS and there is no cross-LT shared-cache evaluation. Single-slot layer cache is used only for memory feasibility; `bootstrap_many` is disabled.
+
+<!-- {SUMMARY_DOC_MARKER}_START -->
+pending
+<!-- {SUMMARY_DOC_MARKER}_END -->
+
+<!-- {DOC_MARKER}_START -->
+pending
+<!-- {DOC_MARKER}_END -->
+"""
+    return text.rstrip() + section + "\n"
+
+
 def _block_body(text: str, marker: str) -> str:
     start = f"<!-- {marker}_START -->"
     end = f"<!-- {marker}_END -->"
@@ -1028,14 +914,14 @@ def _block_body(text: str, marker: str) -> str:
     body, sep, _right = rest.partition(end)
     if not sep:
         return ""
-    return body.strip("\n")
+    return body.strip()
 
 
 def _split_markdown_row(line: str) -> list[str]:
-    stripped = line.strip()
+    stripped = str(line).strip()
     if not stripped.startswith("|") or not stripped.endswith("|"):
         return []
-    return [cell.strip().replace("\\|", "|") for cell in stripped[1:-1].split(" | ")]
+    return [cell.strip().replace("\\|", "|") for cell in stripped.strip("|").split("|")]
 
 
 def _existing_markdown_rows(text: str, marker: str) -> list[list[str]]:
@@ -1059,8 +945,6 @@ def _pad_row(row: list[str], width: int) -> list[str]:
 def _layer_order(layer: str) -> int:
     if str(layer) == "TOTAL":
         return 0
-    if str(layer).startswith("boot-only:"):
-        return 1000
     try:
         return 1 + LINEAR_LAYERS.index(str(layer))
     except ValueError:
@@ -1068,7 +952,7 @@ def _layer_order(layer: str) -> int:
 
 
 def _merge_case_rows(existing: list[list[str]], new_rows: list[list[str]], requested: set[tuple[str, str]]) -> list[list[str]]:
-    width = 32
+    width = 25
     keyed: dict[tuple[str, str, str], list[str]] = {}
     for row in existing:
         row = _pad_row(row, width)
@@ -1110,10 +994,10 @@ def _join_result_file_parts(parts: dict[str, str]) -> str:
 
 
 def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], modes: list[str]) -> list[list[str]]:
-    width = 19
+    width = 21
     by_case = {row[0]: _pad_row(row, width) for row in existing}
-    dense_cols = (3, 5, 8, 10, 12, 14)
-    provider_cols = (4, 6, 9, 11, 13, 15)
+    dense_cols = (2, 4, 7, 9, 11, 13, 15, 17)
+    provider_cols = (3, 5, 8, 10, 12, 14, 16, 18)
     for new_row in new_rows:
         new_row = _pad_row(new_row, width)
         case = str(new_row[0])
@@ -1122,7 +1006,7 @@ def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], mo
             by_case[case] = new_row
             continue
         merged = list(old_row)
-        for index in (0, 1, 2):
+        for index in (0, 1):
             merged[index] = new_row[index]
         if "dense" in modes:
             for index in dense_cols:
@@ -1130,18 +1014,15 @@ def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], mo
         if "provider" in modes:
             for index in provider_cols:
                 merged[index] = new_row[index]
-        ratio = _ratio(merged[5].replace(",", ""), merged[6].replace(",", ""))
-        merged[7] = _fmt_float(ratio)
-        if new_row[16]:
-            merged[16] = new_row[16]
-        files = _result_file_parts(merged[17])
-        new_files = _result_file_parts(new_row[17])
+        merged[6] = _fmt_float(_ratio(merged[4].replace(",", ""), merged[5].replace(",", "")))
+        files = _result_file_parts(merged[19])
+        new_files = _result_file_parts(new_row[19])
         for mode in modes:
             if new_files.get(mode):
                 files[mode] = new_files[mode]
-        merged[17] = _join_result_file_parts(files)
-        if new_row[18]:
-            merged[18] = new_row[18]
+        merged[19] = _join_result_file_parts(files)
+        if new_row[20]:
+            merged[20] = new_row[20]
         by_case[case] = merged
     case_order = {case: index for index, case in enumerate(CASES)}
     return [by_case[key] for key in sorted(by_case, key=lambda case: case_order.get(case, 100))]
@@ -1153,11 +1034,11 @@ def update_doc(doc_path: Path, run_root: Path, cases: list[str], modes: list[str
         for mode in modes:
             rows.extend(_case_table_rows(Path(run_root), str(case), str(mode)))
     text = Path(doc_path).read_text(encoding="utf-8")
+    text = _ensure_doc_section(text)
     requested = {(str(case), str(mode)) for case in cases for mode in modes}
     existing_rows = _existing_markdown_rows(text, DOC_MARKER)
     if existing_rows:
         rows = _merge_case_rows(existing_rows, rows, requested)
-    table = _markdown_table(rows)
     summary_rows = [
         _split_markdown_row(line)
         for line in _network_summary_table(Path(run_root), cases).splitlines()
@@ -1171,11 +1052,8 @@ def update_doc(doc_path: Path, run_root: Path, cases: list[str], modes: list[str
     existing_summary = _existing_markdown_rows(text, SUMMARY_DOC_MARKER)
     if existing_summary:
         summary_data = _merge_summary_rows(existing_summary, summary_data, [str(mode) for mode in modes])
-        summary_table = _network_summary_table_from_rows(summary_data)
-    else:
-        summary_table = _network_summary_table(Path(run_root), cases)
-    text = _replace_block(text, DOC_MARKER, table)
-    text = _replace_block(text, SUMMARY_DOC_MARKER, summary_table)
+    text = _replace_block(text, DOC_MARKER, _markdown_table(rows))
+    text = _replace_block(text, SUMMARY_DOC_MARKER, _network_summary_table_from_rows(summary_data))
     Path(doc_path).write_text(text, encoding="utf-8")
     summary = {
         "run_root": str(run_root),
@@ -1212,13 +1090,12 @@ def run_all(args: argparse.Namespace) -> int:
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "command": " ".join(shlex.quote(part) for part in sys.argv),
         "env": {key: str(env.get(key, "")) for key in ENV_SNAPSHOT_KEYS},
-        "model_variant": "UNet22PlusOutput dim32, 22 body layers plus explicit output layer",
+        "model_variant": "UNet22Encoder dim32, enc1a..enc4b only, no bottleneck",
         "measurement": {
-            "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
-            "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
-            "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_lt": "independent Orion LT; concat fusion is common via ORION_CONCAT_FUSION=1",
+            "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows + rotation_report_after_forward.rows",
+            "sharing": "dense independent LT; provider individual LT evaluation with per-LT BSGS preserved",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
+            "primary_total_time": "HE forward time; layer compute and boot time are also reported separately",
         },
     }
     _write_json(run_root / "manifest.json", manifest)
@@ -1321,18 +1198,16 @@ def run_all(args: argparse.Namespace) -> int:
 
 def _default_run_root() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return DEFAULT_RUN_ROOT_BASE / f"u22_dim32_dense_provider_e2e_matrix_{timestamp}"
+    return DEFAULT_RUN_ROOT_BASE / f"u22_dim32_encoder4_noshare_e2e_{timestamp}"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Run U22+output dim32 dense/provider full-network E2E matrix with per-layer LT timing."
-    )
+    parser = argparse.ArgumentParser(description="Run U22 dim32 encoder-only no-sharing dense/provider E2E matrix.")
     parser.add_argument("--run-root", type=Path, default=_default_run_root())
     parser.add_argument("--doc", type=Path, default=REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md")
     parser.add_argument("--cases", nargs="+", choices=tuple(CASES), default=list(CASES))
     parser.add_argument("--modes", nargs="+", choices=("dense", "provider"), default=["dense", "provider"])
-    parser.add_argument("--policy", choices=tuple(PROVIDER_MODES), default="dp")
+    parser.add_argument("--policy", choices=tuple(PROVIDER_MODES), default="fixed_max")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--forward-runs", type=int, default=1)
     parser.add_argument("--warmup-runs", type=int, default=0)
@@ -1347,7 +1222,7 @@ def main() -> int:
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--case", choices=tuple(CASES), default="192x192", help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("dense", "provider"), default="dense", help=argparse.SUPPRESS)
-    parser.add_argument("--out", type=Path, default=Path("/tmp/u22_dim32_matrix_case.json"), help=argparse.SUPPRESS)
+    parser.add_argument("--out", type=Path, default=Path("/tmp/u22_encoder4_case.json"), help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if bool(args.update_doc_only):

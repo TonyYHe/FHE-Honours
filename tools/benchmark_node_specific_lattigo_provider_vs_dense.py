@@ -1302,6 +1302,10 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
     groups: list[Any] = []
     seen: set[int] = set()
     _append_group(groups, seen, getattr(executor, "group", None))
+    runtime_groups = getattr(executor, "runtime_groups", None)
+    if runtime_groups:
+        for item in list(runtime_groups or []):
+            _append_group(groups, seen, getattr(item, "group", None))
     for attr in ("groups", "groups_by_input_block", "groups_by_input_chunk", "groups_by_pair"):
         value = getattr(executor, attr, None)
         if isinstance(value, dict):
@@ -1609,6 +1613,13 @@ def _provider_rotation_stats(module: Any, *, path_kind: str = "provider") -> dic
     stats["ct_pt_hybrid_packing"] = bool(getattr(executor, "use_ct_pt_hybrid_packing", False))
     stats["tile_family_sharing"] = not bool(getattr(executor, "disable_tile_family_sharing", False))
     stats["bsgs_family_sharing"] = str(path_kind) not in NO_FAMILY_PATHS
+    lt_grouping_mode = str(
+        getattr(executor, "_compiled_lt_grouping_mode", "")
+        or getattr(executor, "lt_grouping_mode", "")
+        or ""
+    )
+    stats["provider_lt_grouping_mode"] = lt_grouping_mode
+    stats["provider_disable_shared_rotation"] = bool(lt_grouping_mode == "individual")
     output_rotations = int(
         getattr(executor, "output_fold_rotations", getattr(executor, "output_rotations", 0)) or 0
     )

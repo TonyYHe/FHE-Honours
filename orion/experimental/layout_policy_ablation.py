@@ -139,13 +139,46 @@ class LayoutState:
     core_slots: int
     stored_slots: int
     tile_count: int
+    physical_top_beta: int | None = None
+    physical_bottom_beta: int | None = None
+    boundary_pruned: bool = False
+
+    def __post_init__(self) -> None:
+        physical_top = int(self.top_beta) if self.physical_top_beta is None else int(self.physical_top_beta)
+        physical_bottom = (
+            int(self.bottom_beta) if self.physical_bottom_beta is None else int(self.physical_bottom_beta)
+        )
+        object.__setattr__(self, "top_beta", int(self.top_beta))
+        object.__setattr__(self, "bottom_beta", int(self.bottom_beta))
+        object.__setattr__(self, "stride", int(self.stride))
+        object.__setattr__(self, "gap", int(self.gap))
+        object.__setattr__(self, "core_slots", int(self.core_slots))
+        object.__setattr__(self, "stored_slots", int(self.stored_slots))
+        object.__setattr__(self, "tile_count", int(self.tile_count))
+        object.__setattr__(self, "physical_top_beta", max(0, int(physical_top)))
+        object.__setattr__(self, "physical_bottom_beta", max(0, int(physical_bottom)))
+        object.__setattr__(
+            self,
+            "boundary_pruned",
+            bool(self.boundary_pruned)
+            or int(physical_top) < int(self.top_beta)
+            or int(physical_bottom) < int(self.bottom_beta),
+        )
 
     @property
     def halo_slots(self) -> int:
         return max(0, int(self.stored_slots) - int(self.core_slots))
 
-    def key(self) -> tuple[int, int, int, int]:
-        return int(self.top_beta), int(self.bottom_beta), int(self.stride), int(self.gap)
+    def key(self) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            int(self.top_beta),
+            int(self.bottom_beta),
+            int(self.stride),
+            int(self.gap),
+            int(self.physical_top_beta or 0),
+            int(self.physical_bottom_beta or 0),
+            int(bool(self.boundary_pruned)),
+        )
 
     def covers(self, other: "LayoutState") -> bool:
         return (
@@ -440,12 +473,23 @@ def _layout_for_shape(
     bottom_beta: int,
     stride: int,
     slots: int,
+    physical_top_beta: int | None = None,
+    physical_bottom_beta: int | None = None,
+    boundary_pruned: bool | None = None,
 ) -> LayoutState:
     _n, channels, height, width = shape
     phase = max(1, int(gap) * int(gap))
     channel_groups = _ceil_div(int(channels), int(phase))
     core_slots = int(channel_groups * int(height) * int(gap) * int(width) * int(gap))
-    stored_h = int(height) * int(gap) + int(top_beta + bottom_beta) * int(gap)
+    if boundary_pruned is None:
+        boundary_pruned = bool(int(top_beta) > 0 or int(bottom_beta) > 0)
+    if physical_top_beta is None:
+        physical_top_beta = 0 if bool(boundary_pruned) else int(top_beta)
+    if physical_bottom_beta is None:
+        physical_bottom_beta = 0 if bool(boundary_pruned) else int(bottom_beta)
+    physical_top_beta = max(0, int(physical_top_beta))
+    physical_bottom_beta = max(0, int(physical_bottom_beta))
+    stored_h = int(height) * int(gap) + int(physical_top_beta + physical_bottom_beta) * int(gap)
     stored_slots = int(channel_groups * int(stored_h) * int(width) * int(gap))
     return LayoutState(
         top_beta=int(top_beta),
@@ -455,7 +499,18 @@ def _layout_for_shape(
         core_slots=int(core_slots),
         stored_slots=int(stored_slots),
         tile_count=max(1, _ceil_div(int(stored_slots), int(slots))),
+        physical_top_beta=int(physical_top_beta),
+        physical_bottom_beta=int(physical_bottom_beta),
+        boundary_pruned=bool(boundary_pruned),
     )
+
+
+def _layout_physical_top_beta(layout: LayoutState) -> int:
+    return max(0, int(layout.physical_top_beta if layout.physical_top_beta is not None else layout.top_beta))
+
+
+def _layout_physical_bottom_beta(layout: LayoutState) -> int:
+    return max(0, int(layout.physical_bottom_beta if layout.physical_bottom_beta is not None else layout.bottom_beta))
 
 
 def _fhe_shape_for_layout(
@@ -466,7 +521,10 @@ def _fhe_shape_for_layout(
     n, channels, height, width = (int(value) for value in shape)
     gap = max(1, int(layout.gap))
     on_channels = _ceil_div(int(channels), int(gap * gap))
-    on_height = int(height * gap + (int(layout.top_beta) + int(layout.bottom_beta)) * gap)
+    on_height = int(
+        height * gap
+        + (_layout_physical_top_beta(layout) + _layout_physical_bottom_beta(layout)) * gap
+    )
     on_width = int(width * gap)
     return int(n), int(on_channels), int(on_height), int(on_width)
 
@@ -739,8 +797,8 @@ def _same_layout(left: LayoutState, right: LayoutState) -> bool:
 
 def _same_physical_layout(left: LayoutState, right: LayoutState) -> bool:
     return (
-        int(left.top_beta) == int(right.top_beta)
-        and int(left.bottom_beta) == int(right.bottom_beta)
+        _layout_physical_top_beta(left) == _layout_physical_top_beta(right)
+        and _layout_physical_bottom_beta(left) == _layout_physical_bottom_beta(right)
         and int(left.gap) == int(right.gap)
         and int(left.tile_count) == int(right.tile_count)
     )
@@ -755,6 +813,9 @@ def _layout_with_stride(layout: LayoutState, stride: int) -> LayoutState:
         core_slots=int(layout.core_slots),
         stored_slots=int(layout.stored_slots),
         tile_count=int(layout.tile_count),
+        physical_top_beta=_layout_physical_top_beta(layout),
+        physical_bottom_beta=_layout_physical_bottom_beta(layout),
+        boundary_pruned=bool(layout.boundary_pruned),
     )
 
 
@@ -945,7 +1006,7 @@ def _edge_row(
         "target": edge.target,
         "op_kind": edge.op_kind,
         "shape": [int(value) for value in edge.shape],
-        "fhe_shape": [int(value) for value in edge.fhe_shape],
+        "fhe_shape": [int(value) for value in _fhe_shape_for_layout(shape=edge.shape, layout=layout)],
         "required_layout": edge.requirement.to_dict(),
         "future_layouts": [layout.to_dict() for layout in tuple(edge.future_layouts)],
         "source_layout": {} if source_layout is None else source_layout.to_dict(),
@@ -998,6 +1059,19 @@ def _layout_one_channel_physical_shape(
     physical_h = int(height) * int(gap) + int(top_beta + bottom_beta) * int(gap)
     physical_w = int(width) * int(gap)
     return max(1, int(physical_h)), max(1, int(physical_w))
+
+
+def _layout_one_channel_physical_shape_for_layout(
+    *,
+    clear_shape: tuple[int, int, int, int],
+    layout: LayoutState,
+) -> tuple[int, int]:
+    return _layout_one_channel_physical_shape(
+        clear_shape=clear_shape,
+        gap=int(layout.gap),
+        top_beta=_layout_physical_top_beta(layout),
+        bottom_beta=_layout_physical_bottom_beta(layout),
+    )
 
 
 def _one_channel_block(slot_index: int, *, slots: int) -> tuple[int, int]:
@@ -1579,11 +1653,9 @@ def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
     if edge.output_shape is None or edge.output_fhe_shape is None:
         return 0
 
-    input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
+    input_phys_h, input_phys_w = _layout_one_channel_physical_shape_for_layout(
         clear_shape=edge.shape,
-        gap=int(layout.gap),
-        top_beta=int(layout.top_beta),
-        bottom_beta=int(layout.bottom_beta),
+        layout=layout,
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -1604,7 +1676,7 @@ def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            top_beta=int(layout.top_beta),
+            top_beta=_layout_physical_top_beta(layout),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1629,11 +1701,9 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
     if edge.output_shape is None or edge.output_fhe_shape is None:
         return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
-    input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
+    input_phys_h, input_phys_w = _layout_one_channel_physical_shape_for_layout(
         clear_shape=edge.shape,
-        gap=int(layout.gap),
-        top_beta=int(layout.top_beta),
-        bottom_beta=int(layout.bottom_beta),
+        layout=layout,
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -1643,7 +1713,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
     output_blocks = max(
         1,
         _ceil_div(
-            int(edge.output_fhe_shape[2]) * int(edge.output_fhe_shape[3]),
+            int(output_phys_h) * int(output_phys_w),
             int(edge.slots),
         ),
     )
@@ -1694,7 +1764,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            top_beta=int(layout.top_beta),
+            top_beta=_layout_physical_top_beta(layout),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1717,7 +1787,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            top_beta=int(layout.top_beta),
+            top_beta=_layout_physical_top_beta(layout),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1740,7 +1810,7 @@ def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotati
             output_phys_w=int(output_phys_w),
             input_gap=int(layout.gap),
             output_gap=int(output_gap),
-            top_beta=int(layout.top_beta),
+            top_beta=_layout_physical_top_beta(layout),
             kernel_h=int(edge.kernel_size[0]),
             kernel_w=int(edge.kernel_size[1]),
             stride_h=int(edge.stride[0]),
@@ -1878,11 +1948,9 @@ def _template_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotation
     if edge.output_shape is None:
         return count_only
 
-    input_phys_h, input_phys_w = _layout_one_channel_physical_shape(
+    input_phys_h, input_phys_w = _layout_one_channel_physical_shape_for_layout(
         clear_shape=edge.shape,
-        gap=int(layout.gap),
-        top_beta=int(layout.top_beta),
-        bottom_beta=int(layout.bottom_beta),
+        layout=layout,
     )
     output_gap = _output_gap_for_edge(edge)
     output_phys_h = max(1, int(edge.output_shape[2]) * int(output_gap))
@@ -1899,7 +1967,7 @@ def _template_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> Rotation
         output_phys_w=int(output_phys_w),
         input_gap=int(layout.gap),
         output_gap=int(output_gap),
-        top_beta=int(layout.top_beta),
+        top_beta=_layout_physical_top_beta(layout),
         kernel_h=int(edge.kernel_size[0]),
         kernel_w=int(edge.kernel_size[1]),
         stride_h=int(edge.stride[0]),
@@ -1984,7 +2052,13 @@ def _lt_rotations(edge: EdgeInfo, layout: LayoutState, *, estimator: str | None 
 
 
 def _relayout_halo_side_count(layout: LayoutState) -> int:
-    return int(max(1, int(layout.tile_count)) * (int(int(layout.top_beta) > 0) + int(int(layout.bottom_beta) > 0)))
+    return int(
+        max(1, int(layout.tile_count))
+        * (
+            int(_layout_physical_top_beta(layout) > 0)
+            + int(_layout_physical_bottom_beta(layout) > 0)
+        )
+    )
 
 
 def _relayout_rotations(layouts: Iterable[LayoutState]) -> int:
@@ -1996,7 +2070,13 @@ def _relayout_mask_mults(layouts: Iterable[LayoutState]) -> int:
 
 
 def _relayout_depth_units(layouts: Iterable[LayoutState]) -> int:
-    return int(sum(1 for layout in layouts if int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0))
+    return int(
+        sum(
+            1
+            for layout in layouts
+            if _layout_physical_top_beta(layout) > 0 or _layout_physical_bottom_beta(layout) > 0
+        )
+    )
 
 
 def _relayout_transition_estimate(
@@ -2022,8 +2102,12 @@ def _relayout_transition_estimate(
             "depth_estimate": int(_relayout_depth_units((target_layout,))),
         }
 
-    source_has_halo = bool(int(source_layout.top_beta) > 0 or int(source_layout.bottom_beta) > 0)
-    target_has_halo = bool(int(target_layout.top_beta) > 0 or int(target_layout.bottom_beta) > 0)
+    source_has_halo = bool(
+        _layout_physical_top_beta(source_layout) > 0 or _layout_physical_bottom_beta(source_layout) > 0
+    )
+    target_has_halo = bool(
+        _layout_physical_top_beta(target_layout) > 0 or _layout_physical_bottom_beta(target_layout) > 0
+    )
     if not source_has_halo and target_has_halo:
         side_count = _relayout_halo_side_count(target_layout)
         return {
@@ -2078,6 +2162,11 @@ def _node_layout_row(
 ) -> dict[str, Any]:
     if physical_layout is None:
         physical_layout = PHYSICAL_LOGICAL_HALO if int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0 else PHYSICAL_COMPACT
+    if shape is not None:
+        fhe_shape = _fhe_shape_for_layout(
+            shape=tuple(int(value) for value in shape),
+            layout=layout,
+        )
     return {
         "node": str(node),
         "shape": [] if shape is None else [int(value) for value in shape],
@@ -2486,6 +2575,10 @@ def _layout_has_halo(layout: LayoutState) -> bool:
     return bool(int(layout.top_beta) > 0 or int(layout.bottom_beta) > 0)
 
 
+def _layout_has_physical_halo(layout: LayoutState) -> bool:
+    return bool(_layout_physical_top_beta(layout) > 0 or _layout_physical_bottom_beta(layout) > 0)
+
+
 def _compact_packing_for_layout(layout: LayoutState) -> str:
     return PHYSICAL_LOGICAL_HALO if _layout_has_halo(layout) else PHYSICAL_COMPACT
 
@@ -2512,13 +2605,9 @@ def _join_input_requires_relayout(
     source_physical: str,
     target_layout: LayoutState,
 ) -> bool:
-    source_packing = str(source_physical or _compact_packing_for_layout(source_layout))
-    target_packing = _compact_packing_for_layout(target_layout)
-    if source_packing != target_packing:
+    if str(source_physical or "") == PHYSICAL_NATIVE_SOURCE_STRIPE:
         return True
-    if source_packing == PHYSICAL_COMPACT:
-        return False
-    return not _same_physical_layout(source_layout, target_layout)
+    return not (source_layout.covers(target_layout) and _same_physical_layout(source_layout, target_layout))
 
 
 def _is_join_module(module: Any | None) -> bool:
@@ -2544,6 +2633,9 @@ def _layout_for_join_output_shape(
         bottom_beta=int(layout.bottom_beta),
         stride=int(layout.stride),
         slots=int(slots),
+        physical_top_beta=_layout_physical_top_beta(layout),
+        physical_bottom_beta=_layout_physical_bottom_beta(layout),
+        boundary_pruned=bool(layout.boundary_pruned),
     )
 
 
@@ -2865,6 +2957,7 @@ def _plan_non_dp_topological(
                     )
                     logical_halo_materialized = bool(
                         str(output_physical) == PHYSICAL_LOGICAL_HALO
+                        and _layout_has_physical_halo(output_layout)
                         and _producer_fused_output_allowed(module)
                     )
                     producer_materialized_halo = bool(producer_fused["enabled"]) or bool(logical_halo_materialized)
@@ -3078,7 +3171,7 @@ class _FrontierState:
 def _frontier_key(
     live: dict[str, LayoutState],
     physical: dict[str, str],
-) -> tuple[tuple[str, tuple[int, int, int, int], str], ...]:
+) -> tuple[tuple[str, tuple[int, ...], str], ...]:
     return tuple(
         sorted(
             (str(node), layout.key(), str(physical.get(str(node), PHYSICAL_COMPACT)))
@@ -3096,8 +3189,8 @@ def _frontier_physical_items(physical: dict[str, str]) -> tuple[tuple[str, str],
 
 
 def _prune_dp_frontier(
-    states: dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState],
-) -> dict[tuple[tuple[str, tuple[int, int, int, int], str], ...], _FrontierState]:
+    states: dict[tuple[tuple[str, tuple[int, ...], str], ...], _FrontierState],
+) -> dict[tuple[tuple[str, tuple[int, ...], str], ...], _FrontierState]:
     if len(states) <= int(DP_FRONTIER_STATE_LIMIT):
         return states
     ranked = sorted(
@@ -3463,6 +3556,10 @@ def _native_conv_output_target_fits(
             input_bottom_beta=int(input_layout.bottom_beta),
             output_top_beta=int(output_layout.top_beta),
             output_bottom_beta=int(output_layout.bottom_beta),
+            input_physical_top_beta=_layout_physical_top_beta(input_layout),
+            input_physical_bottom_beta=_layout_physical_bottom_beta(input_layout),
+            output_physical_top_beta=_layout_physical_top_beta(output_layout),
+            output_physical_bottom_beta=_layout_physical_bottom_beta(output_layout),
         )
         native_halo_conv2d_plan(spec, require_native_target_fit=True)
         return True
@@ -3981,6 +4078,7 @@ def _plan_dp(
                         candidate_storage[str(node)] = str(output_physical)
                         logical_halo_materialized = bool(
                             str(output_physical) == PHYSICAL_LOGICAL_HALO
+                            and _layout_has_physical_halo(output_layout)
                             and _producer_fused_output_allowed(module)
                         )
                         materialized_halo = bool(producer_fused["enabled"]) or bool(logical_halo_materialized)

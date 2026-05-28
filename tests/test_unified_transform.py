@@ -581,6 +581,78 @@ def test_single_slot_materializes_whole_group_once_and_evicts_once(monkeypatch) 
     assert group.unified_ids is None
 
 
+def test_single_slot_releases_shared_diagonal_cache_once(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "1")
+
+    class SharedCache:
+        def __init__(self) -> None:
+            self.blocks = None
+            self.build_calls = 0
+            self.release_calls = 0
+
+        def get_required(self, row: int, col: int, *, context: str = ""):
+            if self.blocks is None:
+                self.build_calls += 1
+                self.blocks = {
+                    (0, 0): {0: torch.ones(16)},
+                    (1, 0): {1: torch.ones(16) * 2},
+                }
+            return dict(self.blocks[(int(row), int(col))])
+
+        def release(self) -> None:
+            self.release_calls += 1
+            self.blocks = None
+
+    cache = SharedCache()
+
+    def cached_transform(row: int, diag: int):
+        transform = _fake_transform({int(diag): torch.ones(16)}, level=2)
+        transform.diagonals = {}
+        transform._single_slot_build_diagonals = (
+            lambda row=int(row), cache=cache: {(0, 0): cache.get_required(int(row), 0)}
+        )
+        transform._single_slot_diagonal_cache = cache
+        transform._single_slot_release_diagonal_cache = cache.release
+        return transform
+
+    group = UnifiedTransformGroup((cached_transform(0, 0), cached_transform(1, 1)))
+    backend = _SingleSlotTrackingBackend()
+
+    group.compile_unified(backend)
+    group.evaluate_unified(77, backend)
+
+    assert cache.build_calls == 1
+    assert cache.release_calls == 1
+    assert backend.generated[0]["num_transforms"] == 2
+
+
+def test_single_slot_releases_shared_diagonal_cache_on_materialize_error(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "1")
+    release_calls = 0
+
+    def release_cache() -> None:
+        nonlocal release_calls
+        release_calls += 1
+
+    transform = _fake_transform({0: torch.ones(16)}, level=2)
+    transform.diagonals = {}
+    transform._single_slot_build_diagonals = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    transform._single_slot_diagonal_cache = object()
+    transform._single_slot_release_diagonal_cache = release_cache
+    group = UnifiedTransformGroup((transform,))
+    backend = _SingleSlotTrackingBackend()
+
+    group.compile_unified(backend)
+    with pytest.raises(RuntimeError, match="boom"):
+        group.evaluate_unified(77, backend)
+
+    assert release_calls == 1
+    assert backend.generated == []
+    assert backend.deleted == []
+
+
 def test_single_slot_progress_file_tracks_materialize_eval_and_evict(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
     monkeypatch.setenv("ORION_SINGLE_SLOT_ENCODE_WORKERS", "1")

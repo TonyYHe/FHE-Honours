@@ -2226,6 +2226,10 @@ def _dense_cols(module: torch.nn.Module) -> int:
 
 def _linear_transform_rotation_stats(module: torch.nn.Module) -> dict[str, Any]:
     transform_ids = dict(getattr(module, "transform_ids", {}) or {})
+    if not transform_ids:
+        cached = getattr(module, "_dense_layer_cache_rotation_stats", None)
+        if isinstance(cached, dict):
+            return dict(cached)
     per_transform: list[dict[str, Any]] = []
     unique_keys: set[int] = set()
     transform_rotation_total = 0
@@ -2277,6 +2281,12 @@ def _linear_transform_rotation_stats(module: torch.nn.Module) -> dict[str, Any]:
 
 
 def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
+    individual_eval = str(os.environ.get("ORION_UNIFIED_LT_INDIVIDUAL_EVAL", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     per_group: list[dict[str, Any]] = []
     unique_keys: set[int] = set()
     transform_rotation_total = 0
@@ -2288,6 +2298,31 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
         ids = [int(value) for value in (getattr(group, "unified_ids", None) or [])]
         group_keys: set[int] = set()
         per_transform: list[dict[str, Any]] = []
+        cached = getattr(group, "_single_slot_rotation_stats", None)
+        if not ids and isinstance(cached, dict):
+            cached_keys = {int(key) for key in cached.get("unique_rotation_keys", []) if int(key) != 0}
+            group_keys.update(cached_keys)
+            unique_keys.update(cached_keys)
+            group_transform_total = int(cached.get("transform_rotation_key_count_total", 0) or 0)
+            group_shared_total = int(
+                cached.get("shared_rotation_eval_count", cached.get("shared_rotation_eval_count_total", 0)) or 0
+            )
+            transform_rotation_total += int(group_transform_total)
+            shared_rotation_total += int(group_shared_total)
+            group_transform_count = int(cached.get("transform_count", 0) or 0)
+            transform_count += int(group_transform_count)
+            per_group.append(
+                {
+                    "group_index": int(group_index),
+                    "transform_count": int(group_transform_count),
+                    "rotation_key_count_total": int(group_transform_total),
+                    "shared_rotation_eval_count": int(group_shared_total),
+                    "unique_rotation_key_count": int(len(cached_keys)),
+                    "per_transform": list(cached.get("per_transform", []) or []),
+                    "source": str(cached.get("source", "planned_single_slot_unified_rotation_keys")),
+                }
+            )
+            continue
         for transform_index, transform_id in enumerate(ids):
             keys = [int(key) for key in scheme.backend.GetLinearTransformRotationKeys(int(transform_id))]
             nonzero_keys = sorted(int(key) for key in keys if int(key) != 0)
@@ -2329,7 +2364,8 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
         "unique_rotation_key_count": int(len(unique_keys)),
         "output_rotations_per_output_ct": 0,
         "output_rotation_eval_count": 0,
-        "rotation_eval_count_estimate": int(shared_rotation_total),
+        "rotation_eval_count_estimate": int(transform_rotation_total if individual_eval else shared_rotation_total),
+        "rotation_eval_count_mode": "independent_transform_bsgs" if individual_eval else "shared_group_bsgs",
         "unique_rotation_keys": sorted(int(key) for key in unique_keys),
         "estimate_device_bytes_total": int(sum(estimate_values)) if estimate_values else None,
         "estimate_device_bytes_max": int(max(estimate_values)) if estimate_values else None,
@@ -2448,7 +2484,7 @@ def _collect_rotation_report(net: torch.nn.Module, *, mode: str) -> dict[str, An
                     }
                 )
             continue
-        if getattr(module, "transform_ids", None):
+        if getattr(module, "transform_ids", None) or getattr(module, "_dense_layer_cache_rotation_stats", None):
             rows.append(
                 {
                     "node": str(name),

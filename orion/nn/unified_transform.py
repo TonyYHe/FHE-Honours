@@ -136,6 +136,10 @@ def _single_slot_layer_cache_enabled() -> bool:
     return bool(_env_bool("ORION_SINGLE_SLOT_LAYER_CACHE"))
 
 
+def _unified_individual_eval_enabled() -> bool:
+    return bool(_env_bool("ORION_UNIFIED_LT_INDIVIDUAL_EVAL"))
+
+
 def _single_slot_encode_workers(item_count: int) -> int:
     raw = os.environ.get("ORION_SINGLE_SLOT_ENCODE_WORKERS")
     try:
@@ -321,9 +325,45 @@ class UnifiedTransformGroup:
         if payloads:
             raise RuntimeError(
                 "ORION_SINGLE_SLOT_LAYER_CACHE requires backend PlanLinearTransformsUnifiedRotationKeys "
-                "for unified/provider groups"
-            )
+            "for unified/provider groups"
+        )
         return ()
+
+    def _single_slot_rotation_stats_from_recipes(self, backend, recipes) -> dict[str, Any]:
+        per_transform: list[dict[str, Any]] = []
+        unique_keys: set[int] = set()
+        transform_rotation_total = 0
+        for transform_index, recipe in enumerate(recipes or ()):
+            planned = self._plan_single_slot_rotation_keys(backend, (recipe,))
+            nonzero_keys = sorted({int(key) for key, _level in planned if int(key) != 0})
+            unique_keys.update(nonzero_keys)
+            transform_rotation_total += int(len(nonzero_keys))
+            transform = recipe[2] if len(recipe) >= 3 else None
+            per_transform.append(
+                {
+                    "transform_index": int(transform_index),
+                    "transform_id": None,
+                    "name": str(getattr(transform, "name", "")),
+                    "rotation_key_count": int(len(nonzero_keys)),
+                }
+            )
+        shared_keys = sorted(
+            {
+                int(key)
+                for key, _level in getattr(self, "_required_keys", ())
+                if int(key) != 0
+            }
+        )
+        return {
+            "source": "planned_single_slot_unified_rotation_keys",
+            "transform_count": int(len(recipes or ())),
+            "transform_rotation_key_count_total": int(transform_rotation_total),
+            "shared_rotation_eval_count": int(len(shared_keys)),
+            "shared_rotation_eval_count_total": int(len(shared_keys)),
+            "unique_rotation_key_count": int(len(unique_keys)),
+            "unique_rotation_keys": sorted(int(key) for key in unique_keys),
+            "per_transform": per_transform,
+        }
 
     def _defer_single_slot_compile(self, backend, *, started_at: float) -> None:
         recipes, has_complex, raw_profile, plan_s = self._prepare_single_slot_recipes()
@@ -348,6 +388,7 @@ class UnifiedTransformGroup:
         self._required_keys = self._plan_single_slot_rotation_keys(backend, recipes)
         self._required_keys_by_transform = {}
         self._add_compile_profile("record_keys_s", time.perf_counter() - plan_keys_started)
+        self._single_slot_rotation_stats = self._single_slot_rotation_stats_from_recipes(backend, recipes)
         rotation_key_started = time.perf_counter()
         self._compile_rotation_keys(backend)
         self._add_compile_profile("rotation_key_compile_s", time.perf_counter() - rotation_key_started)
@@ -430,6 +471,23 @@ class UnifiedTransformGroup:
         del payloads
         self._collect_compile_payloads(backend)
 
+    def _release_single_slot_diagonal_caches(self) -> None:
+        released: set[int] = set()
+        for transform in self.transforms:
+            cache = getattr(transform, "_single_slot_diagonal_cache", None)
+            release_cache = getattr(transform, "_single_slot_release_diagonal_cache", None)
+            if not callable(release_cache):
+                continue
+            key_obj = cache if cache is not None else release_cache
+            key = int(id(key_obj))
+            if key in released:
+                continue
+            released.add(key)
+            try:
+                release_cache()
+            except Exception:
+                pass
+
     def _materialize_single_slot_for_eval(self, backend) -> dict[str, float]:
         if not self._single_slot_layer_cache or self.unified_ids is not None:
             return {
@@ -444,37 +502,33 @@ class UnifiedTransformGroup:
             self._single_slot_recipes = recipes
             self._single_slot_has_complex = bool(has_complex)
         flatten_workers = int(_single_slot_encode_workers(len(self.transforms)))
-        if flatten_workers > 1 and len(self.transforms) > 1:
-            with ThreadPoolExecutor(
-                max_workers=int(flatten_workers),
-                thread_name_prefix="orion-single-slot-materialize",
-            ) as executor:
-                payloads = list(
-                    executor.map(
-                        lambda transform: self._flatten_transform_diagonals(
-                            transform,
-                            has_complex=bool(self._single_slot_has_complex),
-                            require_recipe=True,
-                        ),
-                        self.transforms,
+        try:
+            if flatten_workers > 1 and len(self.transforms) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=int(flatten_workers),
+                    thread_name_prefix="orion-single-slot-materialize",
+                ) as executor:
+                    payloads = list(
+                        executor.map(
+                            lambda transform: self._flatten_transform_diagonals(
+                                transform,
+                                has_complex=bool(self._single_slot_has_complex),
+                                require_recipe=True,
+                            ),
+                            self.transforms,
+                        )
                     )
-                )
-        else:
-            payloads = [
-                self._flatten_transform_diagonals(
-                    transform,
-                    has_complex=bool(self._single_slot_has_complex),
-                    require_recipe=True,
-                )
-                for transform in self.transforms
-            ]
-        for transform in self.transforms:
-            release_cache = getattr(transform, "_single_slot_release_diagonal_cache", None)
-            if callable(release_cache):
-                try:
-                    release_cache()
-                except Exception:
-                    pass
+            else:
+                payloads = [
+                    self._flatten_transform_diagonals(
+                        transform,
+                        has_complex=bool(self._single_slot_has_complex),
+                        require_recipe=True,
+                    )
+                    for transform in self.transforms
+                ]
+        finally:
+            self._release_single_slot_diagonal_caches()
         self.last_compile_profile = self._empty_compile_profile()
         self._record_memory_event("before_single_slot_layer_encode", backend, ())
         self._set_compile_profile("mode", "single_slot_materialize")
@@ -3191,6 +3245,128 @@ class UnifiedTransformGroup:
             raise RuntimeError("EvaluateLinearTransformSourcesWithSharedCacheAdd did not return outputs")
         return [int(value) for value in output_ids]
 
+    def _evaluate_unified_individual(
+        self,
+        ct_input_id: int,
+        backend,
+        *,
+        single_slot_timing: dict[str, float] | None = None,
+    ) -> list[int]:
+        if self.unified_ids is None:
+            raise RuntimeError("UnifiedTransformGroup must be materialized before individual evaluation")
+        transform_ids = [int(value) for value in (self.unified_ids or ())]
+        group_started = time.perf_counter()
+        timing = self._empty_runtime_timing()
+        timing.update(single_slot_timing or {})
+        self._record_memory_event(
+            "before_eval_group_individual",
+            backend,
+            transform_ids,
+            backend_transform_count=int(len(transform_ids)),
+        )
+        bundle = None
+        output_ids: list[int] = []
+        try:
+            if self._should_offload_rotation_keys() or self._offloaded_plaintext_diagonals:
+                self._forward_memory_guard(
+                    backend,
+                    reason=f"before_unified_individual_load:{self._storage_key}",
+                    transform_ids=transform_ids,
+                )
+                bundle = self._read_saved_io_bundle(
+                    backend,
+                    prefetch=False,
+                    transform_ids=transform_ids,
+                    required_keys=self._rotation_key_requests_to_load(
+                        backend,
+                        transform_ids,
+                        self._required_keys_for_transform_ids(transform_ids),
+                    ),
+                    include_plaintexts=True,
+                )
+            load_keys_started = time.perf_counter()
+            self._load_rotation_keys(backend, bundle, transform_ids=transform_ids)
+            timing["load_keys_s"] = float(time.perf_counter() - load_keys_started)
+            load_plaintexts_started = time.perf_counter()
+            self._load_plaintext_diagonals(backend, bundle, transform_ids=transform_ids)
+            timing["load_plaintexts_s"] = float(time.perf_counter() - load_plaintexts_started)
+            self._consume_trim_seconds(backend)
+            self._consume_shared_cache_eval_profile(backend)
+            self._write_progress(
+                "start",
+                "eval",
+                backend_transform_count=int(len(transform_ids)),
+                individual_eval=True,
+            )
+            eval_started = time.perf_counter()
+            for transform_index, transform_id in enumerate(transform_ids):
+                self._write_progress(
+                    "start",
+                    "eval_transform",
+                    backend_transform_count=1,
+                    transform_index=int(transform_index),
+                    transform_id=int(transform_id),
+                    individual_eval=True,
+                )
+                output_ids.append(int(backend.EvaluateLinearTransform(int(transform_id), int(ct_input_id))))
+                self._write_progress(
+                    "end",
+                    "eval_transform",
+                    backend_transform_count=1,
+                    transform_index=int(transform_index),
+                    transform_id=int(transform_id),
+                    individual_eval=True,
+                )
+            eval_total_s = float(time.perf_counter() - eval_started)
+            trim_s = self._consume_trim_seconds(backend)
+            timing["trim_s"] = float(timing.get("trim_s", 0.0) + float(trim_s))
+            for profile_key, profile_value in self._consume_shared_cache_eval_profile(backend).items():
+                timing[profile_key] = float(timing.get(profile_key, 0.0) + float(profile_value))
+            timing["eval_total_s"] = float(eval_total_s)
+            timing["eval_s"] = max(0.0, float(eval_total_s) - float(trim_s))
+        finally:
+            unload_started = time.perf_counter()
+            self._unload_plaintext_diagonals(backend, transform_ids=transform_ids)
+            self._unload_rotation_keys(backend, transform_ids=transform_ids)
+            timing["unload_s"] = float(timing.get("unload_s", 0.0)) + float(
+                time.perf_counter() - unload_started
+            )
+            if bundle is not None:
+                bundle.clear()
+            active_ids = tuple(int(value) for value in transform_ids)
+            evict_s = self._evict_single_slot_after_eval(backend)
+            timing["layer_cache_evict_s"] = float(timing.get("layer_cache_evict_s", 0.0) + float(evict_s))
+            timing["layer_cache_turnover_s"] = float(
+                timing.get("layer_cache_encode_s", 0.0)
+                + timing.get("layer_cache_key_prepare_s", 0.0)
+                + timing.get("layer_cache_evict_s", 0.0)
+            )
+            guard_ids = () if bool(self._single_slot_layer_cache) else active_ids
+            evicted_ids = active_ids if bool(self._single_slot_layer_cache) else ()
+            trim_event = self._forward_memory_guard(
+                backend,
+                reason=f"after_unified_individual_unload:{self._storage_key}",
+                transform_ids=guard_ids,
+                raise_on_low=False,
+            )
+            runtime_timing = self._publish_runtime_timing(
+                backend,
+                timing,
+                memory_bounded=False,
+                total_s=float(time.perf_counter() - group_started),
+            )
+            runtime_timing["individual_eval"] = True
+            self._write_progress("end", "eval", **dict(runtime_timing))
+            self._record_memory_event(
+                "after_eval_group_individual",
+                backend,
+                guard_ids,
+                evicted_transform_ids=evicted_ids,
+                memory_guard=trim_event,
+                timing=runtime_timing,
+            )
+        return [int(value) for value in output_ids]
+
     def evaluate_unified(self, ct_input_id: int, backend) -> list[int]:
         single_slot_timing = {
             "layer_cache_encode_s": 0.0,
@@ -3200,6 +3376,12 @@ class UnifiedTransformGroup:
             single_slot_timing = self._materialize_single_slot_for_eval(backend)
         if not self.is_compiled or self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
+        if _unified_individual_eval_enabled():
+            return self._evaluate_unified_individual(
+                int(ct_input_id),
+                backend,
+                single_slot_timing=single_slot_timing,
+            )
         if self._memory_bounded_eval_enabled(backend):
             chunks = self._memory_bounded_chunks(backend)
             if chunks:

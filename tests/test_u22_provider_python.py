@@ -88,6 +88,67 @@ def _set_compile_level(dag: NetworkDAG) -> None:
             module.set_level(level)
 
 
+def test_conv2d_bias_uses_physical_beta_for_boundary_pruned_layout() -> None:
+    layer = SimpleNamespace(
+        output_shape=torch.Size((1, 2, 4, 4)),
+        fhe_output_shape=torch.Size((1, 2, 4, 4)),
+        output_gap=1,
+        on_bias=torch.tensor([1.0, -2.0], dtype=torch.float32),
+        layout_policy_output_layout={
+            "top_beta": 1,
+            "bottom_beta": 1,
+            "physical_top_beta": 0,
+            "physical_bottom_beta": 0,
+            "gap": 1,
+        },
+    )
+
+    bias = packing.construct_conv2d_bias(layer)
+
+    decoded = bias.reshape(tuple(int(value) for value in layer.fhe_output_shape))
+    assert int(bias.numel()) == 32
+    assert torch.equal(decoded[0, 0], torch.ones((4, 4), dtype=torch.float32))
+    assert torch.equal(decoded[0, 1], torch.full((4, 4), -2.0, dtype=torch.float32))
+
+
+def test_native_output_row_requires_physical_halo() -> None:
+    from orion.experimental.u22_phase1 import _layout_policy_native_output_row
+
+    semantic_only = {
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 2, 4, 4],
+                "selected_layout": {
+                    "top_beta": 1,
+                    "bottom_beta": 1,
+                    "physical_top_beta": 0,
+                    "physical_bottom_beta": 0,
+                    "gap": 1,
+                },
+            }
+        ]
+    }
+    physical = {
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 2, 4, 4],
+                "selected_layout": {
+                    "top_beta": 1,
+                    "bottom_beta": 1,
+                    "physical_top_beta": 1,
+                    "physical_bottom_beta": 0,
+                    "gap": 1,
+                },
+            }
+        ]
+    }
+
+    assert _layout_policy_native_output_row(semantic_only, node="conv") is None
+    assert _layout_policy_native_output_row(physical, node="conv") is not None
+
+
 def _encode_input(module, x: torch.Tensor) -> CipherTensor:
     level = len(scheme.params.get_logq()) - 1
     packed = packing.multiplex(x.unsqueeze(0), int(module.input_gap)).squeeze(0)
@@ -549,9 +610,9 @@ def test_u22_256_no_hybrid_same_shape_metadata_does_not_use_r34_hardcoded_plan()
         assert isinstance(enc1a_base.delegate, NativeHaloStripeNoRIConvExecutor)
         enc1a_metadata = enc1a_executor.compile_cache_metadata()
         enc1a_plan = enc1a_metadata["native_halo_conv2d_plan"]
-        assert enc1a_plan["source_channel_tile"] == 2
-        assert enc1a_plan["target_channel_tile"] == 2
-        assert enc1a_plan["input_ct_count"] == 10
+        assert enc1a_plan["source_channel_tile"] == 1
+        assert enc1a_plan["target_channel_tile"] == 1
+        assert enc1a_plan["input_ct_count"] == 9
         assert enc1a_plan["output_ct_count"] > 0
         assert enc1a_plan["submatrix_program_count"] >= enc1a_plan["sharing_group_count"]
         assert enc1a_plan["sharing_group_count"] > 0
@@ -584,7 +645,7 @@ def test_u22_256_base8_model_input_encodes_native_halo_source_tiles() -> None:
         assert native_input is not None
         assert native_input["node"] == "enc1a"
         assert native_input["native_executor"] == "NativeHaloStripeNoRIConvExecutor"
-        assert int(native_input["plan"].input_ct_count) == 10
+        assert int(native_input["plan"].input_ct_count) == 9
 
         x = torch.randn((1, 3, 256, 256), dtype=torch.float32)
         ct = _encrypt_native_halo_model_input(
@@ -593,8 +654,8 @@ def test_u22_256_base8_model_input_encodes_native_halo_source_tiles() -> None:
             native_input,
         )
         try:
-            assert len(ct.ids) == 10
-            assert tuple(int(value) for value in ct.on_shape) == (10, int(scheme.params.get_slots()))
+            assert len(ct.ids) == 9
+            assert tuple(int(value) for value in ct.on_shape) == (9, int(scheme.params.get_slots()))
         finally:
             ct.release()
     finally:
@@ -798,7 +859,7 @@ def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
         executor = dag.nodes["enc3a"]["module"].region_runtime.executor
         assert isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
         assert isinstance(executor.base_executor, HaloLocalConvRuntimeExecutor)
-        assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
+        assert executor._runtime_lowering_label() == "provider_executable+compact_layout"
         assert executor.compact_source_rows
         assert not executor.native_input_rows
         assert executor.output_relayout_rows == ()
@@ -816,7 +877,7 @@ def test_fixed_max_fused_compact_source_halo_stays_on_native_provider() -> None:
         enc4a = dag.nodes["enc4a"]["module"].region_runtime.executor
         assert isinstance(enc4a, LayoutPolicyProviderRuntimeExecutor)
         assert isinstance(enc4a.base_executor, HaloLocalConvRuntimeExecutor)
-        assert enc4a._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
+        assert enc4a._runtime_lowering_label() == "provider_executable+compact_layout"
     finally:
         scheme.delete_scheme()
 
@@ -1240,6 +1301,115 @@ def test_native_halo_compact_source_prunes_zero_blocks_without_dense_pack_speedu
         scheme.delete_scheme()
 
 
+def test_compact_dense_single_slot_materialize_shares_source_diagonal_pack(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloStripeNoRIConvExecutor,
+        native_halo_conv2d_spec_from_module,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 4, kernel_size=3, padding=1, bias=False)
+        torch.manual_seed(17)
+        conv.weight.data = torch.randn_like(conv.weight.data) / 10.0
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 4, 8, 8))
+        conv.output_shape = torch.Size((1, 4, 8, 8))
+        conv.fhe_input_shape = torch.Size((1, 4, 8, 8))
+        conv.fhe_output_shape = torch.Size((1, 4, 8, 8))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_compact_dense_single_slot_cache"
+        conv.layout_policy_input_physical_layout = "packed_compact"
+        conv.layout_policy_input_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1, "tile_count": 4}
+        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1, "tile_count": 4}
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(1)
+
+        spec = native_halo_conv2d_spec_from_module(conv, output_node_id="conv")
+        assert spec is not None
+        executor = NativeHaloStripeNoRIConvExecutor(module=conv, spec=spec, output_node_id="conv")
+        executor.assigned_level = level
+        executor.assigned_depth = 1
+        executor.compile(scheme)
+        try:
+            source_index = min(int(value) for value in executor.groups_by_input_index)
+            transforms = list(executor.groups_by_input_index[int(source_index)].transforms)
+            assert len(transforms) >= 2
+            direct_calls = 0
+            original_direct = packing.direct_diagonalize_conv2d
+
+            def spy_direct(*args, **kwargs):
+                nonlocal direct_calls
+                direct_calls += 1
+                return original_direct(*args, **kwargs)
+
+            monkeypatch.setattr(packing, "direct_diagonalize_conv2d", spy_direct)
+            first = transforms[0]._single_slot_build_diagonals()
+            second = transforms[1]._single_slot_build_diagonals()
+
+            assert first
+            assert second
+            assert direct_calls == 1
+        finally:
+            executor.cleanup(getattr(scheme, "backend", None))
+    finally:
+        scheme.delete_scheme()
+
+
+def test_compact_source_single_slot_native_output_builds_metadata(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(23)
+        spec = NativeHaloConv2DSpec(
+            family_label="compact_source_native_output_single_slot",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        stripe = plan.stripes[0]
+        weight = torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32) / 10.0
+
+        transform = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            group_n1=1,
+        )
+
+        assert transform is not None
+        assert transform.diagonals == {}
+        assert transform._single_slot_diag_indices_by_block[(0, 0)]
+        assert int(transform.target_index) == int(stripe.index) * int(plan.target_channel_group_count)
+    finally:
+        scheme.delete_scheme()
+
+
 def test_compact_source_single_slot_concat_compile_skips_payload_coalesce(monkeypatch) -> None:
     from orion.experimental.cir import native_halo_conv2d
     from orion.experimental.cir.native_halo_conv2d import (
@@ -1378,6 +1548,7 @@ def test_compact_source_single_slot_concat_compile_skips_payload_coalesce(monkey
 
 def test_concat_fusion_single_slot_compile_routes_to_branch_metadata_builder(monkeypatch) -> None:
     from orion.experimental.cir import native_halo_conv2d
+    from tests.test_unified_transform import _SingleSlotTrackingBackend
 
     monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
     _init_python_scheme(logn=6)
@@ -1453,10 +1624,13 @@ def test_concat_fusion_single_slot_compile_routes_to_branch_metadata_builder(mon
         first_groups = conv._concat_unified_groups_by_input[0]
         source_indices = sorted(int(value) for value in first_groups)
         assert len(source_indices) >= 2
+        backend = _SingleSlotTrackingBackend()
         for source_index in source_indices[:2]:
-            first_transform = first_groups[int(source_index)].transforms[0]
-            built = first_transform._single_slot_build_diagonals()
-            assert built
+            outputs = first_groups[int(source_index)].evaluate_unified(
+                int(source_index) + 100,
+                backend,
+            )
+            assert outputs
         assert len(direct_calls) == 1
         conv._concat_release_unified_diagonal_caches()
     finally:

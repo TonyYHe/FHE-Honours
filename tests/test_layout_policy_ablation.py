@@ -89,9 +89,14 @@ def test_capacity_fill_balances_extra_halo_without_growing_tile_count() -> None:
 
     filled = _fill_beta_to_tile_capacity(required, shape=shape, slots=32768)
 
-    assert int(required.tile_count) == 14
+    assert int(required.tile_count) == 13
+    assert int(required.top_beta) == 1
+    assert int(required.bottom_beta) == 1
+    assert int(required.physical_top_beta) == 0
+    assert int(required.physical_bottom_beta) == 0
+    assert bool(required.boundary_pruned) is True
     assert int(filled.tile_count) == int(required.tile_count)
-    assert (int(filled.top_beta), int(filled.bottom_beta)) == (2, 2)
+    assert (int(filled.top_beta), int(filled.bottom_beta)) == (1, 1)
 
 
 def _init_python_scheme(provider_mode: str) -> None:

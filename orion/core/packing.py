@@ -110,18 +110,45 @@ def construct_conv2d_toeplitz(conv_layer, weight):
     # Support batching
     toeplitz = sp.kron(sp.eye(N, dtype="f"), toeplitz, format="csr")
     return toeplitz
-    
+
+
+def _bias_clear_extent_from_fhe(
+    conv_layer,
+    *,
+    base_h: int,
+    base_w: int,
+    top_beta: int,
+    bottom_beta: int,
+) -> tuple[int, int]:
+    gap = max(1, int(getattr(conv_layer, "output_gap", 1) or 1))
+    layout_h = int(base_h) + max(0, int(top_beta)) + max(0, int(bottom_beta))
+    layout_w = int(base_w)
+    try:
+        _, _on_c, on_h, on_w = [int(value) for value in tuple(conv_layer.fhe_output_shape)]
+    except (TypeError, ValueError):
+        return int(layout_h), int(layout_w)
+    inferred_h = int(math.ceil(max(0, int(on_h)) / float(gap)))
+    inferred_w = int(math.ceil(max(0, int(on_w)) / float(gap)))
+    return max(int(layout_h), int(inferred_h)), max(int(layout_w), int(inferred_w))
+
+
 def construct_conv2d_bias(conv_layer):
     N, Co, Ho, Wo = conv_layer.output_shape 
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
     output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
-    top_beta = _layout_top_beta(output_layout)
-    bottom_beta = _layout_bottom_beta(output_layout)
-    total_h = int(Ho + top_beta + bottom_beta)
+    top_beta = _layout_physical_top_beta(output_layout)
+    bottom_beta = _layout_physical_bottom_beta(output_layout)
+    total_h, total_w = _bias_clear_extent_from_fhe(
+        conv_layer,
+        base_h=int(Ho),
+        base_w=int(Wo),
+        top_beta=int(top_beta),
+        bottom_beta=int(bottom_beta),
+    )
 
     bias = conv_layer.on_bias
-    bias = bias.repeat_interleave(total_h * Wo)
-    bias = bias.reshape(1, Co, total_h, Wo)
+    bias = bias.repeat_interleave(int(total_h) * int(total_w))
+    bias = bias.reshape(1, Co, int(total_h), int(total_w))
     bias_multiplexed = multiplex(bias, conv_layer.output_gap).squeeze(0)
     
     mC, mH, mW = bias_multiplexed.shape
@@ -271,13 +298,19 @@ def construct_conv_transpose2d_bias(conv_layer):
     N, Co, Ho, Wo = conv_layer.output_shape
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
     output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
-    top_beta = _layout_top_beta(output_layout)
-    bottom_beta = _layout_bottom_beta(output_layout)
-    total_h = int(Ho + top_beta + bottom_beta)
+    top_beta = _layout_physical_top_beta(output_layout)
+    bottom_beta = _layout_physical_bottom_beta(output_layout)
+    total_h, total_w = _bias_clear_extent_from_fhe(
+        conv_layer,
+        base_h=int(Ho),
+        base_w=int(Wo),
+        top_beta=int(top_beta),
+        bottom_beta=int(bottom_beta),
+    )
 
     bias = conv_layer.on_bias
-    bias = bias.repeat_interleave(total_h * Wo)
-    bias = bias.reshape(1, Co, total_h, Wo)
+    bias = bias.repeat_interleave(int(total_h) * int(total_w))
+    bias = bias.reshape(1, Co, int(total_h), int(total_w))
     bias_multiplexed = multiplex(bias, conv_layer.output_gap).squeeze(0)
 
     mC, mH, mW = bias_multiplexed.shape
@@ -714,6 +747,32 @@ def _layout_top_beta(layout: dict) -> int:
 
 def _layout_bottom_beta(layout: dict) -> int:
     return max(0, int(layout.get("bottom_beta", layout.get("beta", 0)) or 0))
+
+
+def _layout_physical_top_beta(layout: dict) -> int:
+    return max(
+        0,
+        int(
+            layout.get(
+                "physical_top_beta",
+                layout.get("top_beta", layout.get("alpha", 0)),
+            )
+            or 0
+        ),
+    )
+
+
+def _layout_physical_bottom_beta(layout: dict) -> int:
+    return max(
+        0,
+        int(
+            layout.get(
+                "physical_bottom_beta",
+                layout.get("bottom_beta", layout.get("beta", 0)),
+            )
+            or 0
+        ),
+    )
 
 
 def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
