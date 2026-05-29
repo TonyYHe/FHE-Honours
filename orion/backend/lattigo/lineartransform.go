@@ -71,9 +71,24 @@ type sharedCacheEvalProfile struct {
 	pushS              float64
 }
 
+type linearTransformWrapperProfile struct {
+	totalS             float64
+	retrieveTransformS float64
+	retrieveCipherS    float64
+	ensureKeysS        float64
+	newEvaluatorS      float64
+	validateS          float64
+	evaluateNewS       float64
+	streamingEvaluateS float64
+	pushS              float64
+}
+
 var (
 	sharedCacheEvalProfileMu     sync.Mutex
 	sharedCacheEvalProfileTotals sharedCacheEvalProfile
+	ltWrapperProfileMu           sync.Mutex
+	ltWrapperProfileTotals       linearTransformWrapperProfile
+	ltWrapperProfileEnabled      bool
 )
 
 func accumulateSharedCacheEvalProfile(profile sharedCacheEvalProfile) {
@@ -101,6 +116,26 @@ func resetSharedCacheEvalProfile() {
 	sharedCacheEvalProfileMu.Lock()
 	sharedCacheEvalProfileTotals = sharedCacheEvalProfile{}
 	sharedCacheEvalProfileMu.Unlock()
+}
+
+func recordLTWrapperProfile(update func(*linearTransformWrapperProfile)) {
+	ltWrapperProfileMu.Lock()
+	if ltWrapperProfileEnabled {
+		update(&ltWrapperProfileTotals)
+	}
+	ltWrapperProfileMu.Unlock()
+}
+
+func resetLTWrapperProfile() {
+	ltWrapperProfileMu.Lock()
+	ltWrapperProfileTotals = linearTransformWrapperProfile{}
+	ltWrapperProfileMu.Unlock()
+}
+
+func setLTWrapperProfileEnabled(enabled bool) {
+	ltWrapperProfileMu.Lock()
+	ltWrapperProfileEnabled = enabled
+	ltWrapperProfileMu.Unlock()
 }
 
 func secondsSince(started time.Time) float64 {
@@ -673,6 +708,7 @@ func evaluateStreamingLinearTransformNew(
 	transformID int,
 	state *lattigoStreamingLTState,
 	ctIn *rlwe.Ciphertext,
+	linEvaluator *lintrans.Evaluator,
 ) (*rlwe.Ciphertext, error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -680,7 +716,7 @@ func evaluateStreamingLinearTransformNew(
 	var ctOut *rlwe.Ciphertext
 	for _, keys := range state.chunks {
 		chunk := state.encodeChunk(keys)
-		ctChunk, err := scheme.LinEvaluator.EvaluateNew(ctIn, chunk)
+		ctChunk, err := linEvaluator.EvaluateNew(ctIn, chunk)
 		if err != nil {
 			return nil, err
 		}
@@ -705,6 +741,7 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 	transformIDs []int,
 	transforms []lintrans.LinearTransformation,
 	ctIn *rlwe.Ciphertext,
+	linEvaluator *lintrans.Evaluator,
 ) ([]*rlwe.Ciphertext, error) {
 	profile := sharedCacheEvalProfile{}
 	defer func() {
@@ -743,7 +780,7 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 			plainOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
 		}
 		evalStarted := time.Now()
-		if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, plainTransforms, plainOutputs); err != nil {
+		if err := linEvaluator.EvaluateManyWithSharedCache(ctIn, plainTransforms, plainOutputs); err != nil {
 			return nil, err
 		}
 		profile.giantStepS += secondsSince(evalStarted)
@@ -773,7 +810,7 @@ func evaluateStreamingLinearTransformsWithSharedCacheNew(
 				chunkOutputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, transform.LevelQ)
 			}
 			evalStarted := time.Now()
-			if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, pendingTransforms, chunkOutputs); err != nil {
+			if err := linEvaluator.EvaluateManyWithSharedCache(ctIn, pendingTransforms, chunkOutputs); err != nil {
 				return err
 			}
 			profile.streamEvalS += secondsSince(evalStarted)
@@ -1205,18 +1242,55 @@ func RetrieveLinearTransform(id int) lintrans.LinearTransformation {
 	return ltHeap.Retrieve(id).(lintrans.LinearTransformation)
 }
 
-func ensureLinearTransformRotationKeys(transform lintrans.LinearTransformation) {
+func bumpLinearTransformEvalKeysVersion() {
+	scheme.EvalKeysVersion++
+	scheme.LinEvaluator = nil
+	scheme.LinEvaluatorVersion = 0
+}
+
+func ensureLinearTransformEvalKeysMutable() bool {
+	changed := false
 	if scheme.EvalKeys == nil {
 		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
+		changed = true
 	}
 	if scheme.EvalKeys.GaloisKeys == nil {
 		scheme.EvalKeys.GaloisKeys = make(map[uint64]*rlwe.GaloisKey)
+		changed = true
 	}
+	return changed
+}
+
+func newLinearTransformEvaluatorForEvalKeys() *lintrans.Evaluator {
+	if scheme.Evaluator != nil {
+		return lintrans.NewEvaluator(scheme.Evaluator.WithKey(scheme.EvalKeys))
+	}
+	return lintrans.NewEvaluator(ckks.NewEvaluator(*scheme.Params, scheme.EvalKeys))
+}
+
+func ensureCurrentLinearTransformEvaluator() *lintrans.Evaluator {
+	if scheme.EvalKeys == nil {
+		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
+		bumpLinearTransformEvalKeysVersion()
+	}
+	if scheme.LinEvaluator == nil || scheme.LinEvaluatorVersion != scheme.EvalKeysVersion {
+		scheme.LinEvaluator = newLinearTransformEvaluatorForEvalKeys()
+		scheme.LinEvaluatorVersion = scheme.EvalKeysVersion
+	}
+	return scheme.LinEvaluator
+}
+
+func ensureLinearTransformRotationKeys(transform lintrans.LinearTransformation) {
+	changed := ensureLinearTransformEvalKeysMutable()
 	for _, galEl := range transform.GaloisElements(scheme.Params) {
 		if rotKey, exists := scheme.EvalKeys.GaloisKeys[galEl]; exists && rotKey != nil {
 			continue
 		}
 		scheme.EvalKeys.GaloisKeys[galEl] = scheme.KeyGen.GenGaloisKeyNew(galEl, scheme.SecretKey)
+		changed = true
+	}
+	if changed {
+		bumpLinearTransformEvalKeysVersion()
 	}
 }
 
@@ -1262,11 +1336,13 @@ func validateLinearTransformPlaintextLevels(transformID int, transform lintrans.
 //export EnableLinearTransformEvaluationProfile
 func EnableLinearTransformEvaluationProfile(enabled C.int) {
 	commonlintrans.EnableEvaluationProfile(int(enabled) != 0)
+	setLTWrapperProfileEnabled(int(enabled) != 0)
 }
 
 //export ResetLinearTransformEvaluationProfile
 func ResetLinearTransformEvaluationProfile() {
 	commonlintrans.ResetEvaluationProfile()
+	resetLTWrapperProfile()
 }
 
 //export GetLinearTransformEvaluationProfileCounters
@@ -1284,6 +1360,49 @@ func GetLinearTransformEvaluationProfileCounters() (*C.ulonglong, C.ulong) {
 		uint64(profile.OuterReduceCount),
 	}
 	return SliceToCArray(values, convertUint64ToCULonglong)
+}
+
+//export GetLinearTransformEvaluationProfileSeconds
+func GetLinearTransformEvaluationProfileSeconds() (*C.double, C.ulong) {
+	profile := commonlintrans.GetEvaluationProfile()
+	ltWrapperProfileMu.Lock()
+	wrapperProfile := ltWrapperProfileTotals
+	ltWrapperProfileMu.Unlock()
+	values := []float64{
+		profile.SharedBufferSeconds,
+		profile.DecomposeSeconds,
+		profile.CollectRotationsSeconds,
+		profile.PreRotateSeconds,
+		profile.PreRotateAllocSeconds,
+		profile.PreRotateAutomorphismSeconds,
+		profile.TransformTotalSeconds,
+		profile.TransformSetupSeconds,
+		profile.TransformIndexSeconds,
+		profile.TransformCopyScaleSeconds,
+		profile.TransformMulAccumSeconds,
+		profile.TransformInnerReduceSeconds,
+		profile.TransformGiantModDownSeconds,
+		profile.TransformGiantKeySwitchSeconds,
+		profile.TransformGiantAutoSeconds,
+		profile.TransformOuterReduceSeconds,
+		profile.TransformFinalModDownSeconds,
+		profile.TransformZeroDiagSeconds,
+		profile.EvaluateManyTotalSeconds,
+		profile.EvaluateManySetupSeconds,
+		profile.EvaluateManyDecomposeSeconds,
+		profile.EvaluateManyPreRotateSeconds,
+		profile.EvaluateManyMultiplySeconds,
+		wrapperProfile.totalS,
+		wrapperProfile.retrieveTransformS,
+		wrapperProfile.retrieveCipherS,
+		wrapperProfile.ensureKeysS,
+		wrapperProfile.newEvaluatorS,
+		wrapperProfile.validateS,
+		wrapperProfile.evaluateNewS,
+		wrapperProfile.streamingEvaluateS,
+		wrapperProfile.pushS,
+	}
+	return SliceToCArray(values, convertFloat64ToCDouble)
 }
 
 //export ConsumeSharedCacheEvalProfileSeconds
@@ -1329,8 +1448,7 @@ func GetLiveLinearTransformCount() C.int {
 
 //export NewLinearTransformEvaluator
 func NewLinearTransformEvaluator() {
-	scheme.LinEvaluator = lintrans.NewEvaluator(
-		ckks.NewEvaluator(*scheme.Params, scheme.EvalKeys))
+	ensureCurrentLinearTransformEvaluator()
 }
 
 //export GenerateLinearTransform
@@ -1498,29 +1616,59 @@ func GenerateLinearTransformsBatch(
 
 //export EvaluateLinearTransform
 func EvaluateLinearTransform(transformID, ctxtID C.int) C.int {
+	wrapperStarted := time.Now()
+	started := time.Now()
 	transform := RetrieveLinearTransform(int(transformID))
+	recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+		profile.retrieveTransformS += secondsSince(started)
+	})
+	started = time.Now()
 	ctIn := RetrieveCiphertext(int(ctxtID))
+	recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+		profile.retrieveCipherS += secondsSince(started)
+	})
+	started = time.Now()
 	ensureLinearTransformRotationKeys(transform)
+	recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+		profile.ensureKeysS += secondsSince(started)
+	})
 
-	// Update the linear transform evaluator to have the most
-	// recent set of rotation keys.
-	scheme.LinEvaluator = lintrans.NewEvaluator(
-		scheme.Evaluator.WithKey(scheme.EvalKeys),
-	)
+	started = time.Now()
+	linEvaluator := ensureCurrentLinearTransformEvaluator()
+	recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+		profile.newEvaluatorS += secondsSince(started)
+	})
 
 	var ctOut *rlwe.Ciphertext
 	var err error
 	if streamingState, ok := lookupStreamingLTState(int(transformID)); ok {
-		ctOut, err = evaluateStreamingLinearTransformNew(int(transformID), streamingState, ctIn)
+		started = time.Now()
+		ctOut, err = evaluateStreamingLinearTransformNew(int(transformID), streamingState, ctIn, linEvaluator)
+		recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+			profile.streamingEvaluateS += secondsSince(started)
+		})
 	} else {
+		started = time.Now()
 		validateLinearTransformPlaintextLevels(int(transformID), transform)
-		ctOut, err = scheme.LinEvaluator.EvaluateNew(ctIn, transform)
+		recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+			profile.validateS += secondsSince(started)
+		})
+		started = time.Now()
+		ctOut, err = linEvaluator.EvaluateNew(ctIn, transform)
+		recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+			profile.evaluateNewS += secondsSince(started)
+		})
 	}
 	if err != nil {
 		panic(err)
 	}
 
+	started = time.Now()
 	idx := PushCiphertext(ctOut)
+	recordLTWrapperProfile(func(profile *linearTransformWrapperProfile) {
+		profile.pushS += secondsSince(started)
+		profile.totalS += secondsSince(wrapperStarted)
+	})
 	return C.int(idx)
 }
 
@@ -1597,11 +1745,20 @@ func GetLinearTransformPlaintextLevels(transformID C.int) (*C.int, C.ulong) {
 
 //export GenerateLinearTransformRotationKey
 func GenerateLinearTransformRotationKey(galEl C.int) {
-	if _, exists := scheme.EvalKeys.GaloisKeys[uint64(galEl)]; exists {
+	changed := ensureLinearTransformEvalKeysMutable()
+	key := uint64(galEl)
+	if rotKey, exists := scheme.EvalKeys.GaloisKeys[key]; exists && rotKey != nil {
+		if changed {
+			bumpLinearTransformEvalKeysVersion()
+		}
 		return
 	}
-	rotKey := scheme.KeyGen.GenGaloisKeyNew(uint64(galEl), scheme.SecretKey)
-	scheme.EvalKeys.GaloisKeys[uint64(galEl)] = rotKey
+	rotKey := scheme.KeyGen.GenGaloisKeyNew(key, scheme.SecretKey)
+	scheme.EvalKeys.GaloisKeys[key] = rotKey
+	changed = true
+	if changed {
+		bumpLinearTransformEvalKeysVersion()
+	}
 }
 
 //export GenerateAndSerializeRotationKey
@@ -1632,7 +1789,9 @@ func LoadRotationKey(
 	// Update our global map of evaluation keys to include what
 	// we just loaded. This will eventually get used by the
 	// current linear transform and then deleted from RAM.
+	ensureLinearTransformEvalKeysMutable()
 	scheme.EvalKeys.GaloisKeys[uint64(galEl)] = &rotKey
+	bumpLinearTransformEvalKeysVersion()
 }
 
 //export PredecodeRotationKey
@@ -1665,13 +1824,9 @@ func InstallPredecodedRotationKey(galEl C.ulong) C.int {
 	if !ok || rotKey == nil {
 		return C.int(0)
 	}
-	if scheme.EvalKeys == nil {
-		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
-	}
-	if scheme.EvalKeys.GaloisKeys == nil {
-		scheme.EvalKeys.GaloisKeys = make(map[uint64]*rlwe.GaloisKey)
-	}
+	ensureLinearTransformEvalKeysMutable()
 	scheme.EvalKeys.GaloisKeys[key] = rotKey
+	bumpLinearTransformEvalKeysVersion()
 	return C.int(1)
 }
 
@@ -1830,12 +1985,8 @@ func RemovePlaintextDiagonals(transformID C.int) {
 
 //export RemoveRotationKeys
 func RemoveRotationKeys() {
-	// We'll just update the linear transform evaluator to no longer have
-	// access to the Galois keys it had before. GC should do the rest.
 	scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
-	scheme.LinEvaluator = lintrans.NewEvaluator(scheme.Evaluator.WithKey(
-		scheme.EvalKeys,
-	))
+	bumpLinearTransformEvalKeysVersion()
 }
 
 //export GenerateLinearTransformsUnified
@@ -2085,15 +2236,14 @@ func EvaluateLinearTransformsWithSharedCache(
 	}
 
 	ctIn := RetrieveCiphertext(int(ctxtID))
-	scheme.LinEvaluator = lintrans.NewEvaluator(
-		scheme.Evaluator.WithKey(scheme.EvalKeys),
-	)
+	linEvaluator := ensureCurrentLinearTransformEvaluator()
 
 	if streamingAny {
 		outputs, err := evaluateStreamingLinearTransformsWithSharedCacheNew(
 			transformIDsSlice,
 			transforms,
 			ctIn,
+			linEvaluator,
 		)
 		if err != nil {
 			panic(err)
@@ -2115,7 +2265,7 @@ func EvaluateLinearTransformsWithSharedCache(
 	}
 
 	evalStarted := time.Now()
-	if err := scheme.LinEvaluator.EvaluateManyWithSharedCache(ctIn, transforms, outputs); err != nil {
+	if err := linEvaluator.EvaluateManyWithSharedCache(ctIn, transforms, outputs); err != nil {
 		panic(err)
 	}
 	recordSharedCacheEvalProfile(func(profile *sharedCacheEvalProfile) {
@@ -2199,9 +2349,7 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 		}
 	}
 
-	scheme.LinEvaluator = lintrans.NewEvaluator(
-		scheme.Evaluator.WithKey(scheme.EvalKeys),
-	)
+	linEvaluator := ensureCurrentLinearTransformEvaluator()
 
 	if streamingAny {
 		outputs := make([]*rlwe.Ciphertext, targetCount)
@@ -2210,6 +2358,7 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 				transformIDGroups[sourceIndex],
 				transformGroups[sourceIndex],
 				ctIns[sourceIndex],
+				linEvaluator,
 			)
 			if err != nil {
 				panic(err)
@@ -2255,7 +2404,7 @@ func EvaluateLinearTransformSourcesWithSharedCacheAdd(
 		outputs[i] = rlwe.NewCiphertext(*scheme.Params, 1, scheme.Params.MaxLevel())
 	}
 	evalStarted := time.Now()
-	if err := scheme.LinEvaluator.EvaluateManySourcesWithSharedCacheAdd(
+	if err := linEvaluator.EvaluateManySourcesWithSharedCacheAdd(
 		ctIns,
 		transformGroups,
 		targetGroups,

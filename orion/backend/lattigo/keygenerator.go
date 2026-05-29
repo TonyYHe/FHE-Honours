@@ -32,6 +32,7 @@ func GenerateRelinearizationKey() {
 //export GenerateEvaluationKeys
 func GenerateEvaluationKeys() {
 	scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey)
+	bumpLinearTransformEvalKeysVersion()
 }
 
 //export SerializeSecretKey

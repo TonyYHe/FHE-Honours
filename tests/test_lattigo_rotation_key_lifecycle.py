@@ -80,6 +80,69 @@ def test_lattigo_linear_transform_eval_recovers_missing_rotation_key() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_lattigo_linear_transform_ids_are_not_reused_after_scheme_reset() -> None:
+    _require_lattigo()
+    code = textwrap.dedent(
+        """
+        import orion
+
+        config = {
+            "ckks_params": {
+                "LogN": 6,
+                "LogQ": [45, 35, 45],
+                "LogP": [50],
+                "LogScale": 35,
+                "H": 64,
+                "RingType": "Standard",
+            },
+            "orion": {
+                "margin": 2,
+                "embedding_method": "square",
+                "backend": "lattigo",
+                "fuse_modules": True,
+                "debug": False,
+                "io_mode": "none",
+            },
+        }
+
+        def generate_transform_id(active_scheme):
+            slots = int(active_scheme.params.get_slots())
+            level = len(active_scheme.params.get_logq()) - 1
+            return int(
+                active_scheme.backend.GenerateLinearTransform(
+                    [1],
+                    [1.0] * slots,
+                    level,
+                    2.0,
+                    "none",
+                )
+            )
+
+        first_scheme = orion.init_scheme(config)
+        try:
+            first_id = generate_transform_id(first_scheme)
+        finally:
+            first_scheme.delete_scheme()
+
+        second_scheme = orion.init_scheme(config)
+        try:
+            second_id = generate_transform_id(second_scheme)
+            assert second_id != first_id, (first_id, second_id)
+            assert int(second_scheme.backend.GetLiveLinearTransformCount()) == 1
+        finally:
+            second_scheme.delete_scheme()
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_lattigo_load_mode_reuses_cached_compile_plan(tmp_path) -> None:
     _require_lattigo()
     code = textwrap.dedent(

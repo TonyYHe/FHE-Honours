@@ -81,11 +81,10 @@ func (ha *HeapAllocator) Delete(integer int) {
 	}
 }
 
-// Reset clears the allocator's state, reinitializing its fields.
+// Reset clears live objects without reusing old IDs across scheme lifetimes.
 func (ha *HeapAllocator) Reset() {
-	ha.nextInt = 0
-	ha.freedIntegers = MinHeap{} // Reinitialize the slice
-	heap.Init(&ha.freedIntegers) // Reinitialize the heap properties
+	ha.freedIntegers = MinHeap{}
+	heap.Init(&ha.freedIntegers)
 	ha.InterfaceMap = make(map[int]*interface{})
 }
 

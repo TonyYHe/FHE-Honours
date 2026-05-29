@@ -947,6 +947,7 @@ class LattigoLibrary:
         enable_profile = getattr(self.lib, "EnableLinearTransformEvaluationProfile", None)
         reset_profile = getattr(self.lib, "ResetLinearTransformEvaluationProfile", None)
         get_profile = getattr(self.lib, "GetLinearTransformEvaluationProfileCounters", None)
+        get_profile_seconds = getattr(self.lib, "GetLinearTransformEvaluationProfileSeconds", None)
         if enable_profile is not None and reset_profile is not None and get_profile is not None:
             self.EnableLinearTransformEvaluationProfile = LattigoFunction(
                 enable_profile,
@@ -963,6 +964,12 @@ class LattigoLibrary:
                 argtypes=[],
                 restype=ArrayResultUInt64,
             )
+            if get_profile_seconds is not None:
+                self.GetLinearTransformEvaluationProfileSeconds = LattigoFunction(
+                    get_profile_seconds,
+                    argtypes=[],
+                    restype=ArrayResultDouble,
+                )
 
         consume_shared_cache_profile = getattr(self.lib, "ConsumeSharedCacheEvalProfileSeconds", None)
         if consume_shared_cache_profile is not None:

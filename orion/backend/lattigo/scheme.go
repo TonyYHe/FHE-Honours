@@ -16,19 +16,21 @@ import (
 )
 
 type Scheme struct {
-	Params        *ckks.Parameters
-	KeyGen        *rlwe.KeyGenerator
-	SecretKey     *rlwe.SecretKey
-	PublicKey     *rlwe.PublicKey
-	RelinKey      *rlwe.RelinearizationKey
-	EvalKeys      *rlwe.MemEvaluationKeySet
-	Encoder       *ckks.Encoder
-	Encryptor     *rlwe.Encryptor
-	Decryptor     *rlwe.Decryptor
-	Evaluator     *ckks.Evaluator
-	PolyEvaluator *polynomial.Evaluator
-	LinEvaluator  *lintrans.Evaluator
-	Bootstrapper  *bootstrapping.Evaluator
+	Params              *ckks.Parameters
+	KeyGen              *rlwe.KeyGenerator
+	SecretKey           *rlwe.SecretKey
+	PublicKey           *rlwe.PublicKey
+	RelinKey            *rlwe.RelinearizationKey
+	EvalKeys            *rlwe.MemEvaluationKeySet
+	EvalKeysVersion     uint64
+	Encoder             *ckks.Encoder
+	Encryptor           *rlwe.Encryptor
+	Decryptor           *rlwe.Decryptor
+	Evaluator           *ckks.Evaluator
+	PolyEvaluator       *polynomial.Evaluator
+	LinEvaluator        *lintrans.Evaluator
+	LinEvaluatorVersion uint64
+	Bootstrapper        *bootstrapping.Evaluator
 }
 
 var scheme Scheme
@@ -114,19 +116,21 @@ func NewScheme(
 	keyGen := rlwe.NewKeyGenerator(params)
 
 	scheme = Scheme{
-		Params:        &params,
-		KeyGen:        keyGen,
-		SecretKey:     nil,
-		PublicKey:     nil,
-		RelinKey:      nil,
-		EvalKeys:      nil,
-		Encoder:       nil,
-		Encryptor:     nil,
-		Decryptor:     nil,
-		Evaluator:     nil,
-		PolyEvaluator: nil,
-		LinEvaluator:  nil,
-		Bootstrapper:  nil,
+		Params:              &params,
+		KeyGen:              keyGen,
+		SecretKey:           nil,
+		PublicKey:           nil,
+		RelinKey:            nil,
+		EvalKeys:            nil,
+		EvalKeysVersion:     0,
+		Encoder:             nil,
+		Encryptor:           nil,
+		Decryptor:           nil,
+		Evaluator:           nil,
+		PolyEvaluator:       nil,
+		LinEvaluator:        nil,
+		LinEvaluatorVersion: 0,
+		Bootstrapper:        nil,
 	}
 	ResetOperationCounters()
 	resetSharedCacheEvalProfile()

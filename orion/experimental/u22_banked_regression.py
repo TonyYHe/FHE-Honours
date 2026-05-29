@@ -31,26 +31,26 @@ U22_BANKED_REGRESSION_CASES: dict[str, U22BankedRegressionCase] = {
     "u4_tiny": U22BankedRegressionCase(
         case_name="u4_tiny",
         dataset="tiny",
-        node_name="up4",
-        expected_rotations=46,
+        node_name="dec4a",
+        expected_rotations=58,
         expected_conjugations=0,
-        assumption="Mapped to UNet22(dataset='tiny') decoder node up4 because no repo-local runner/spec for the locked case was present.",
+        assumption="Mapped to current mainline UNet22(dataset='tiny') provider conv node dec4a; ConvTranspose2d uses the common dense path.",
     ),
     "u4_mini": U22BankedRegressionCase(
         case_name="u4_mini",
         dataset="imagenet",
-        node_name="up4",
-        expected_rotations=38,
+        node_name="dec4a",
+        expected_rotations=54,
         expected_conjugations=0,
-        assumption="Mapped to UNet22(dataset='imagenet') up4; rotations use per-UnifiedTransformGroup shared-key union.",
+        assumption="Mapped to current mainline UNet22(dataset='imagenet') provider conv node dec4a; ConvTranspose2d uses the common dense path.",
     ),
     "u3_mini": U22BankedRegressionCase(
         case_name="u3_mini",
         dataset="imagenet",
-        node_name="up3",
-        expected_rotations=22,
+        node_name="dec3a",
+        expected_rotations=38,
         expected_conjugations=0,
-        assumption="Mapped to the smallest available U22 decoder-u3 shape in this repo: UNet22(dataset='imagenet') up3.",
+        assumption="Mapped to current mainline UNet22(dataset='imagenet') provider conv node dec3a; ConvTranspose2d uses the common dense path.",
     ),
 }
 
@@ -103,7 +103,7 @@ def _prepared_dag(*, dataset: str) -> NetworkDAG:
             module.init_orion_params()
         if module is not None and hasattr(module, "update_params"):
             module.update_params()
-    registry = U22CompileRegistry.for_dag(dag)
+    registry = U22CompileRegistry.for_dag(dag, enable_conv_kernels=True)
     attach_audit = registry.attach_to_dag(dag)
     _set_compile_level(dag)
     return dag, attach_audit
@@ -194,6 +194,66 @@ def _rotation_key_stats(groups: list[Any], backend: Any) -> dict[str, Any]:
     }
 
 
+def _executor_chain(executor: Any) -> list[Any]:
+    chain: list[Any] = []
+    seen: set[int] = set()
+    pending = [executor]
+    while pending:
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        pending.append(getattr(current, "base_executor", None))
+        pending.append(getattr(current, "delegate", None))
+    return chain
+
+
+def _executor_groups(executor: Any) -> list[Any]:
+    groups: list[Any] = []
+    seen: set[int] = set()
+
+    def add_group(group: Any) -> None:
+        if group is None or id(group) in seen:
+            return
+        seen.add(id(group))
+        groups.append(group)
+
+    for current in _executor_chain(executor):
+        single_group = getattr(current, "group", None)
+        add_group(single_group)
+        for attr in ("groups", "runtime_groups", "groups_by_pair", "groups_by_input_index"):
+            value = getattr(current, attr, None)
+            if value is None:
+                continue
+            values = value.values() if isinstance(value, dict) else value
+            for item in values:
+                if item is None:
+                    continue
+                if isinstance(item, (list, tuple)):
+                    for entry in item:
+                        add_group(entry)
+                else:
+                    add_group(item)
+    return groups
+
+
+def _executor_kernel_kinds(executor: Any) -> set[str]:
+    return {
+        str(getattr(current, "kernel_kind", ""))
+        for current in _executor_chain(executor)
+        if str(getattr(current, "kernel_kind", ""))
+    }
+
+
+def _executor_runtime_counts(executor: Any) -> dict[str, Any]:
+    for current in _executor_chain(executor):
+        counts = dict(getattr(current, "last_runtime_counts", {}) or {})
+        if counts:
+            return counts
+    return {}
+
+
 def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") -> dict[str, Any]:
     case = U22_BANKED_REGRESSION_CASES[str(case_name)]
     if str(backend) == "lattigo":
@@ -203,7 +263,12 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
     try:
         dag, attach_audit = _prepared_dag(dataset=str(case.dataset))
         module = dag.nodes[str(case.node_name)]["module"]
-        runtime = getattr(module, "region_runtime")
+        runtime = getattr(module, "region_runtime", None)
+        if runtime is None:
+            raise RuntimeError(
+                f"U22 banked regression node {case.node_name!r} did not receive a provider runtime. "
+                f"attach_audit={attach_audit}"
+            )
         module.generate_diagonals(last=False)
         module.compile()
         module.he_mode = True
@@ -211,33 +276,39 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
         torch.manual_seed(abs(hash((str(case.case_name), str(backend)))) % (2**31))
         x = torch.randn(tuple(int(v) for v in module.input_shape[1:]), dtype=torch.float32)
         out = _decode_output(module, module(_encode_input(module, x)))
-        reference = F.conv_transpose2d(
-            x.unsqueeze(0),
-            module.on_weight.detach().to(dtype=torch.float32),
-            module.on_bias.detach().to(dtype=torch.float32) if getattr(module, "on_bias", None) is not None else None,
-            stride=tuple(int(v) for v in module.stride),
-            padding=tuple(int(v) for v in module.padding),
-            output_padding=tuple(int(v) for v in module.output_padding),
-            groups=int(module.groups),
-            dilation=tuple(int(v) for v in module.dilation),
-        )[0]
+        weight = module.on_weight.detach().to(dtype=torch.float32)
+        bias = module.on_bias.detach().to(dtype=torch.float32) if getattr(module, "on_bias", None) is not None else None
+        if type(module).__name__ == "ConvTranspose2d":
+            reference = F.conv_transpose2d(
+                x.unsqueeze(0),
+                weight,
+                bias,
+                stride=tuple(int(v) for v in module.stride),
+                padding=tuple(int(v) for v in module.padding),
+                output_padding=tuple(int(v) for v in module.output_padding),
+                groups=int(module.groups),
+                dilation=tuple(int(v) for v in module.dilation),
+            )[0]
+        else:
+            reference = F.conv2d(
+                x.unsqueeze(0),
+                weight,
+                bias,
+                stride=tuple(int(v) for v in module.stride),
+                padding=tuple(int(v) for v in module.padding),
+                groups=int(module.groups),
+                dilation=tuple(int(v) for v in module.dilation),
+            )[0]
         max_abs = float((out - reference).abs().max().item())
         mae = float((out - reference).abs().mean().item())
 
         executor = getattr(runtime, "executor", None)
-        groups = []
-        single_group = getattr(executor, "group", None)
-        if single_group is not None:
-            groups.append(single_group)
-        groups.extend(list(getattr(executor, "groups", []) or []))
+        groups = _executor_groups(executor)
         rotation_key_stats = _rotation_key_stats(groups, scheme.backend)
         observed_rotations = int(rotation_key_stats["group_union_rotation_count"])
 
         observed_conjugations = 0
-        kernel_kinds = {
-            str(getattr(executor, "kernel_kind", "")),
-            str(getattr(getattr(executor, "delegate", None), "kernel_kind", "")),
-        }
+        kernel_kinds = _executor_kernel_kinds(executor)
         payload = {
             "status": "ok" if max_abs <= 1.0e-4 else "failed",
             "case": str(case.case_name),
@@ -248,6 +319,8 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
             "experimental_kernel": bool(
                 "halo_supported_tconv" in kernel_kinds
                 or "tconv_k2s2_gap_halving_experimental" in kernel_kinds
+                or "halo_local_conv2d" in kernel_kinds
+                or "input_pair_conv_shared_rotations" in kernel_kinds
             ),
             "supports_scheme": bool(runtime.supports_scheme(scheme)),
             "strategy": str(getattr(runtime, "strategy", "")),
@@ -259,7 +332,7 @@ def run_u22_banked_regression_case(case_name: str, *, backend: str = "lattigo") 
                 "conjugations": int(observed_conjugations),
             },
             "rotation_key_stats": rotation_key_stats,
-            "runtime_counts": dict(getattr(executor, "last_runtime_counts", {}) or {}),
+            "runtime_counts": _executor_runtime_counts(executor),
             "expected": {
                 "rotations": int(case.expected_rotations),
                 "conjugations": int(case.expected_conjugations),
