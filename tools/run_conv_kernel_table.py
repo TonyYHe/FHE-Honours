@@ -46,6 +46,12 @@ ROW_DIR_NAME = "rows"
 DEFAULT_HW = ("192x192", "224x224", "384x288", "384x384")
 DEFAULT_CHANNELS = (32, 64, 128, 256)
 DEFAULT_VARIANTS = ("orion", "provider_halo1_individual_lt", "provider_halo2_individual_lt")
+DEFAULT_INPUT_LEVEL = 2
+CONV_KERNEL_DEPTH = 1
+CKKS_PROFILE_ID = "resnet_e2e_logn16_logscale40_h192"
+E2E_LOGQ = (55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40)
+E2E_LOGP = (61, 61, 61)
+E2E_BOOT_LOGP = (61, 61, 61, 61, 61, 61, 61, 61)
 VARIANT_CHOICES = (
     "orion",
     "provider_halo1",
@@ -69,6 +75,7 @@ class ConvKernelRow:
     height: int
     width: int
     variant: str
+    input_level: int = DEFAULT_INPUT_LEVEL
 
     @property
     def hw(self) -> str:
@@ -137,6 +144,10 @@ class ConvKernelRow:
     @property
     def provider_disable_shared_rotation(self) -> bool:
         return bool(self.provider_lt_grouping_mode == "individual")
+
+    @property
+    def expected_output_level(self) -> int:
+        return int(self.input_level) - int(CONV_KERNEL_DEPTH)
 
     @property
     def native_halo_channel_fold_mode(self) -> str:
@@ -375,6 +386,10 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "logical_hw": row.logical_hw,
         "channels": int(row.channels),
         "conv": f"{int(row.channels)},{int(row.channels)}",
+        "input_level": int(row.input_level),
+        "expected_output_level": int(row.expected_output_level),
+        "actual_output_level": result.get("actual_output_level"),
+        "ckks_profile": CKKS_PROFILE_ID,
         "input_gap": int(row.stage_gap),
         "output_gap": int(row.stage_gap),
         "channel_group_size": int(row.channel_group_size),
@@ -432,7 +447,7 @@ def reuse_existing_rows(
 ) -> int:
     if not sources:
         return 0
-    row_by_key: dict[tuple[str, int, int, int, int, int | None, str, str], ConvKernelRow] = {}
+    row_by_key: dict[tuple[str, int, int, int, int, int, int | None, str, str, str], ConvKernelRow] = {}
     for row in rows:
         halo_key = row.halo
         if row.path == "provider" and bool(clip_provider_boundary_halo):
@@ -440,7 +455,18 @@ def reuse_existing_rows(
         grouping_key = row.provider_lt_grouping_mode if row.path == "provider" else ""
         fold_key = row.native_halo_channel_fold_mode if row.path == "provider" else ""
         row_by_key[
-            (row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, halo_key, grouping_key, fold_key)
+            (
+                row.path,
+                row.channels,
+                row.logical_height,
+                row.logical_width,
+                row.stage_gap,
+                row.input_level,
+                halo_key,
+                grouping_key,
+                fold_key,
+                CKKS_PROFILE_ID,
+            )
         ] = row
     reused = 0
     for json_path in _iter_reuse_jsons([Path(value) for value in sources]):
@@ -455,8 +481,26 @@ def reuse_existing_rows(
             except ValueError:
                 continue
             path_kind = _result_path_kind(result, fallback=path_name)
+            try:
+                input_level = int(result.get("input_level"))
+            except (TypeError, ValueError):
+                continue
+            ckks_profile = str(result.get("ckks_profile") or result.get("ckks_profile_id") or "")
+            if ckks_profile != CKKS_PROFILE_ID:
+                continue
             if path_kind == "dense":
-                key = ("dense", int(channels), int(height), int(width), int(gap), None, "", "")
+                key = (
+                    "dense",
+                    int(channels),
+                    int(height),
+                    int(width),
+                    int(gap),
+                    int(input_level),
+                    None,
+                    "",
+                    "",
+                    ckks_profile,
+                )
             elif path_kind == "provider":
                 top, bottom = _explicit_halo(result)
                 # Older provider JSONs did not record the halo setting; those
@@ -476,7 +520,18 @@ def reuse_existing_rows(
                     or "shared"
                 )
                 fold_mode = _provider_channel_fold_mode(result)
-                key = ("provider", int(channels), int(height), int(width), int(gap), int(top), grouping_mode, fold_mode)
+                key = (
+                    "provider",
+                    int(channels),
+                    int(height),
+                    int(width),
+                    int(gap),
+                    int(input_level),
+                    int(top),
+                    grouping_mode,
+                    fold_mode,
+                    ckks_profile,
+                )
             else:
                 continue
             row = row_by_key.get(key)
@@ -543,11 +598,14 @@ def _config(*, backend: str) -> dict[str, Any]:
     return {
         "ckks_params": {
             "LogN": 16,
-            "LogQ": [45, 30, 30, 45],
-            "LogP": [50],
-            "LogScale": 30,
-            "H": 64,
-            "RingType": "Standard",
+            "LogQ": list(E2E_LOGQ),
+            "LogP": list(E2E_LOGP),
+            "LogScale": 40,
+            "H": 192,
+            "RingType": "standard",
+        },
+        "boot_params": {
+            "LogP": list(E2E_BOOT_LOGP),
         },
         "orion": {
             "margin": 2,
@@ -598,7 +656,7 @@ def _make_conv(row: ConvKernelRow, *, seed: int) -> Conv2d:
     conv.fhe_output_shape = torch.Size((1, int(row.fhe_channels), int(row.height), int(row.width)))
     if row.halo is not None:
         conv.layout_policy_input_layout = {"top_beta": int(row.halo), "bottom_beta": int(row.halo)}
-    conv.set_level(len(scheme.params.get_logq()) - 1)
+    conv.set_level(int(row.input_level))
     return conv
 
 
@@ -686,9 +744,9 @@ def _make_cipher_source(
     seed: int,
     shape: torch.Size,
     fhe_shape: torch.Size,
+    level: int,
 ) -> CipherTensor:
     ids: list[int] = []
-    level = len(scheme.params.get_logq()) - 1
     gen = torch.Generator().manual_seed(int(seed))
     slots = int(scheme.params.get_slots())
     for _index in range(int(count)):
@@ -705,6 +763,7 @@ def _make_compact_source(module: Any, *, count: int, seed: int) -> CipherTensor:
         seed=int(seed),
         shape=torch.Size(getattr(module, "input_shape")),
         fhe_shape=torch.Size(getattr(module, "fhe_input_shape")),
+        level=int(module.level),
     )
 
 
@@ -737,6 +796,9 @@ def _run_dense_forward(module: Any, *, source_count: int, seed: int) -> dict[str
     fairness = bench._runtime_fairness_for_module(module, serving_hot_s=float(elapsed))
     counts = _runtime_operation_counts() if bool(counters_enabled) else {}
     output_count = int(len(getattr(out, "ids", []) or []))
+    output_level = None
+    if int(output_count) > 0 and callable(getattr(out, "level", None)):
+        output_level = int(out.level())
     del out
     del source
     return {
@@ -744,17 +806,20 @@ def _run_dense_forward(module: Any, *, source_count: int, seed: int) -> dict[str
         "runtime_fairness_timing": dict(fairness),
         "operation_counts": dict(counts),
         "output_cts": int(output_count),
+        "actual_output_level": output_level,
     }
 
 
 def _run_native_provider_forward(executor: Any, *, source_count: int, seed: int) -> dict[str, Any]:
     delegate = _native_provider_delegate(executor)
     native_shape = torch.Size(delegate.runtime_native_fhe_output_shape())
+    input_level = int(getattr(delegate, "assigned_level", DEFAULT_INPUT_LEVEL))
     source = _make_cipher_source(
         count=int(source_count),
         seed=int(seed),
         shape=torch.Size([int(source_count), int(scheme.params.get_slots())]),
         fhe_shape=torch.Size([int(source_count), int(scheme.params.get_slots())]),
+        level=int(input_level),
     )
     counters_enabled = bench._reset_runtime_operation_counters()
     started = time.perf_counter()
@@ -820,6 +885,9 @@ def _run_native_provider_forward(executor: Any, *, source_count: int, seed: int)
     fairness = _unified_group_runtime_fairness(executor, serving_hot_s=float(elapsed))
     counts = _runtime_operation_counts() if bool(counters_enabled) else {}
     output_count = int(len(getattr(native_output, "ids", []) or []))
+    output_level = None
+    if int(output_count) > 0 and callable(getattr(native_output, "level", None)):
+        output_level = int(native_output.level())
     del native_output
     del source
     return {
@@ -827,6 +895,7 @@ def _run_native_provider_forward(executor: Any, *, source_count: int, seed: int)
         "runtime_fairness_timing": dict(fairness),
         "operation_counts": dict(counts),
         "output_cts": int(output_count),
+        "actual_output_level": output_level,
         "executor_last_runtime_timing": dict(getattr(delegate, "last_runtime_timing", {}) or {}),
     }
 
@@ -949,6 +1018,14 @@ def _run_row(
         first_counts = dict((runs[0].get("operation_counts") if runs else {}) or {})
         timing = dict((runs[0].get("runtime_fairness_timing") if runs else {}) or {})
         rotation_runtime = first_counts.get("rotation")
+        actual_output_level = None if not runs else runs[0].get("actual_output_level")
+        if actual_output_level is None:
+            raise RuntimeError("worker did not record actual output ciphertext level")
+        if int(actual_output_level) != int(row.expected_output_level):
+            raise RuntimeError(
+                f"actual output level {int(actual_output_level)} != expected {int(row.expected_output_level)} "
+                f"for input level {int(row.input_level)}"
+            )
         result = {
             "status": "ok",
             "created_at_utc": _now_utc(),
@@ -958,6 +1035,17 @@ def _run_row(
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_level": int(row.input_level),
+            "expected_output_level": int(row.expected_output_level),
+            "actual_output_level": int(actual_output_level),
+            "ckks_profile": CKKS_PROFILE_ID,
+            "ckks_params": {
+                "LogN": 16,
+                "LogQ": list(E2E_LOGQ),
+                "LogP": list(E2E_LOGP),
+                "LogScale": 40,
+                "H": 192,
+            },
             "input_gap": int(row.stage_gap),
             "output_gap": int(row.stage_gap),
             "channel_group_size": int(row.channel_group_size),
@@ -1027,15 +1115,22 @@ def _env_snapshot() -> dict[str, str]:
         "GOMAXPROCS",
         "MALLOC_ARENA_MAX",
         "ORION_COMPILE_PARALLEL_POLICY",
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS",
         "ORION_LATTIGO_STREAMING_LT",
         "ORION_UNIFIED_STREAM_COMPILE_IO_NONE",
         "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE",
         "ORION_LATTIGO_MEMORY_BOUNDED_EVAL",
         "ORION_SINGLE_SLOT_LAYER_CACHE",
+        "ORION_PACK_CONV_WORKERS",
+        "ORION_DIRECT_PACK_WORKERS",
         "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
         "ORION_LT_COMPILE_WORKERS",
+        "ORION_UNIFIED_COMPILE_WORKERS",
         "ORION_LATTIGO_COMPILE_WORKERS",
         "ORION_DENSE_LT_COMPILE_BATCH_TRANSFORMS",
+        "ORION_UNIFIED_LT_INDIVIDUAL_EVAL",
+        "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS",
+        "ORION_LATTIGO_UNIFIED_NO_BSGS",
     ]
     return {key: str(os.environ.get(key, "")) for key in keys}
 
@@ -1045,15 +1140,24 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     cpu_count = max(1, int(os.cpu_count() or 1))
     updated.setdefault("PYTHONUNBUFFERED", "1")
     updated.setdefault("MALLOC_ARENA_MAX", "2")
-    updated.setdefault("GOMAXPROCS", str(cpu_count))
-    updated.setdefault("ORION_COMPILE_PARALLEL_POLICY", "auto")
+    updated["GOMAXPROCS"] = "1"
+    updated["ORION_COMPILE_PARALLEL_POLICY"] = "manual"
     updated["ORION_LATTIGO_STREAMING_LT"] = "0"
     updated["ORION_UNIFIED_STREAM_COMPILE_IO_NONE"] = "0"
     updated["ORION_LATTIGO_MEMORY_BOUNDED_COMPILE"] = "0"
     updated["ORION_LATTIGO_MEMORY_BOUNDED_EVAL"] = "0"
     updated["ORION_SINGLE_SLOT_LAYER_CACHE"] = "0"
+    updated.setdefault("ORION_SINGLE_SLOT_ENCODE_WORKERS", str(cpu_count))
+    updated.setdefault("ORION_PACK_CONV_WORKERS", str(cpu_count))
+    updated.setdefault("ORION_DIRECT_PACK_WORKERS", str(cpu_count))
+    updated.setdefault("ORION_LT_COMPILE_WORKERS", str(cpu_count))
+    updated.setdefault("ORION_UNIFIED_COMPILE_WORKERS", str(cpu_count))
+    updated.setdefault("ORION_LATTIGO_COMPILE_WORKERS", str(cpu_count))
     updated.setdefault("ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS", str(cpu_count))
     updated.setdefault("ORION_CONCAT_FUSION", "0")
+    updated["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] = "1"
+    updated["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] = "0"
+    updated["ORION_LATTIGO_UNIFIED_NO_BSGS"] = "0"
     return updated
 
 
@@ -1069,6 +1173,7 @@ def _rows_from_args(args: argparse.Namespace) -> list[ConvKernelRow]:
                         height=int(height),
                         width=int(width),
                         variant=str(variant),
+                        input_level=int(args.input_level),
                     )
                 )
     return rows
@@ -1127,6 +1232,9 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
                 row.packed_chw,
                 VARIANT_LABELS[str(row.variant)],
                 status,
+                str(int(row.input_level)),
+                str(int(row.expected_output_level)),
+                _fmt_int((payload or {}).get("actual_output_level") if isinstance(payload, dict) else None),
                 halo_cell,
                 output_layout,
                 channel_fold,
@@ -1156,6 +1264,9 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "packed FHE input",
         "path / beta",
         "status",
+        "input level",
+        "expected output level",
+        "actual output level",
         "input halo T/B",
         "output layout",
         "channel fold",
@@ -1179,6 +1290,9 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "---",
         "---",
         "---",
+        "---:",
+        "---:",
+        "---:",
         "---:",
         "---:",
         "---",
@@ -1219,6 +1333,9 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
         "packed_fhe_input",
         "path_beta",
         "status",
+        "input_level",
+        "expected_output_level",
+        "actual_output_level",
         "input_halo_tb",
         "output_layout",
         "channel_fold",
@@ -1271,6 +1388,9 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_level": int(row.input_level),
+            "expected_output_level": int(row.expected_output_level),
+            "ckks_profile": CKKS_PROFILE_ID,
             "input_gap": int(row.stage_gap),
             "output_gap": int(row.stage_gap),
             "channel_group_size": int(row.channel_group_size),
@@ -1290,6 +1410,13 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "provider_output_storage_layout": provider_output_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "ckks_params": {
+                "LogN": 16,
+                "LogQ": list(E2E_LOGQ),
+                "LogP": list(E2E_LOGP),
+                "LogScale": 40,
+                "H": 192,
+            },
             "kernel": "3x3/pad1/stride1",
             "run_root": str(args.run_root),
             "env": _env_snapshot(),
@@ -1312,6 +1439,9 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_level": int(row.input_level),
+            "expected_output_level": int(row.expected_output_level),
+            "ckks_profile": CKKS_PROFILE_ID,
             "input_gap": int(row.stage_gap),
             "output_gap": int(row.stage_gap),
             "channel_group_size": int(row.channel_group_size),
@@ -1328,6 +1458,13 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "provider_output_storage_layout": provider_output_storage_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "ckks_params": {
+                "LogN": 16,
+                "LogQ": list(E2E_LOGQ),
+                "LogP": list(E2E_LOGP),
+                "LogScale": 40,
+                "H": 192,
+            },
             "failure_kind": str(failure_kind),
             "message": str(message),
             "return_code": None if return_code is None else int(return_code),
@@ -1352,6 +1489,17 @@ def run_all(args: argparse.Namespace) -> int:
         "run_root": str(run_root),
         "doc": str(args.doc),
         "backend": str(args.backend),
+        "ckks_profile": CKKS_PROFILE_ID,
+        "ckks_params": {
+            "LogN": 16,
+            "LogQ": list(E2E_LOGQ),
+            "LogP": list(E2E_LOGP),
+            "LogScale": 40,
+            "H": 192,
+            "RingType": "standard",
+        },
+        "input_level": int(args.input_level),
+        "expected_output_level": int(args.input_level) - int(CONV_KERNEL_DEPTH),
         "channels": [int(value) for value in args.channels],
         "hw": [str(value) for value in args.hw],
         "variants": [str(value) for value in args.variants],
@@ -1362,6 +1510,9 @@ def run_all(args: argparse.Namespace) -> int:
         "measurement": {
             "io_mode": "none",
             "lt_accumulate_s": "resident eval_s / eval_total_s, excluding artifact I/O",
+            "level_policy": "input level 2 is the main kernel benchmark level; Conv2d depth 1 yields output level 1",
+            "runtime_parallelism": "GOMAXPROCS=1 during kernel evaluation; compile and diagonal encode worker pools may use host CPU count",
+            "row_scheduling": "parent runner executes one worker process at a time; no concurrent LT rows",
             "orion": "dense Conv2d path with default resident Lattigo LT",
             "provider_halo1": "legacy native halo provider beta=1 with shared rotation grouping and heuristic channel fold",
             "provider_halo2": "legacy native halo provider beta=2 with shared rotation grouping and heuristic channel fold",
@@ -1438,6 +1589,8 @@ def run_all(args: argparse.Namespace) -> int:
                 str(args.seed),
                 "--out",
                 str(result_path),
+                "--input-level",
+                str(args.input_level),
                 "--provider-output-layout",
                 str(args.provider_output_layout),
             ]
@@ -1541,6 +1694,9 @@ def run_one(args: argparse.Namespace) -> int:
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "input_level": int(row.input_level),
+            "expected_output_level": int(row.expected_output_level),
+            "ckks_profile": CKKS_PROFILE_ID,
             "input_gap": int(row.stage_gap),
             "output_gap": int(row.stage_gap),
             "channel_group_size": int(row.channel_group_size),
@@ -1558,6 +1714,13 @@ def run_one(args: argparse.Namespace) -> int:
             "provider_output_storage_layout": provider_output_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "ckks_params": {
+                "LogN": 16,
+                "LogQ": list(E2E_LOGQ),
+                "LogP": list(E2E_LOGP),
+                "LogScale": 40,
+                "H": 192,
+            },
             "kernel": "3x3/pad1/stride1",
             "error_type": type(exc).__name__,
             "error": str(exc),
@@ -1579,6 +1742,12 @@ def main() -> int:
     parser.add_argument("--variants", nargs="+", choices=tuple(VARIANT_CHOICES), default=list(DEFAULT_VARIANTS))
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260527)
+    parser.add_argument(
+        "--input-level",
+        type=int,
+        default=DEFAULT_INPUT_LEVEL,
+        help="Ciphertext input level for each depth-1 Conv kernel; default 2 yields output level 1.",
+    )
     parser.add_argument("--max-worker-rss-gb", type=float, default=850.0)
     parser.add_argument("--poll-interval-s", type=float, default=2.0)
     parser.add_argument(
@@ -1609,6 +1778,10 @@ def main() -> int:
 
     if any(str(variant).endswith("_individual_lt") for variant in args.variants) and str(args.provider_output_layout) != "native_stripe":
         parser.error("provider *_individual_lt variants require --provider-output-layout native_stripe")
+    if int(args.input_level) < int(CONV_KERNEL_DEPTH):
+        parser.error(f"--input-level must be at least {CONV_KERNEL_DEPTH} for a depth-{CONV_KERNEL_DEPTH} Conv kernel")
+    if int(args.input_level) >= len(E2E_LOGQ):
+        parser.error(f"--input-level must be < {len(E2E_LOGQ)} for {CKKS_PROFILE_ID}")
 
     if bool(args.update_doc_only):
         update_doc(Path(args.doc), Path(args.run_root), _rows_from_args(args))

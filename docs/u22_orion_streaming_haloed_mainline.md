@@ -90,37 +90,68 @@ If a resident row hits the RSS cap or OOMs, record that row as a resident
 feasibility failure; do not silently replace it with a streamed result in this
 table.
 
+Corrected main kernel profile: use the real `resnet`/`e2e` CKKS chain
+(`LogN=16`, `LogQ=[55,40,40,40,40,40,40,40,40,40,40]`,
+`LogP=[61,61,61]`, boot `LogP=[61,61,61,61,61,61,61,61]`,
+`LogScale=40`, `H=192`). The main Conv kernel input level is `2`; a
+depth-1 Conv is expected to output level `1`, and the runner records the
+actual output ciphertext level for every completed row. Runtime LT evaluation
+must run with `GOMAXPROCS=1` and one row worker at a time; compile and diagonal
+encode worker pools may use the host CPU count. The superseded no-share stripe
+run `.tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z`
+used the short kernel chain/max input level and is not main evidence.
+
 Run command on `corg`:
 
 ```bash
 cd ~/orion
+mkdir -p .tmp/run .tmp/logs .tmp/results
+cpu_count="$(nproc)"
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
-run_root=".tmp/results/conv_kernel_table_noshare_stripe_corg_${ts}"
+run_root=".tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_${ts}"
+log=".tmp/logs/conv_kernel_table_noshare_stripe_level2_e2e_corg_${ts}.log"
 {
   echo "run_root=$run_root"
+  echo "log=$log"
   echo "started_at_utc=$(date -u +%FT%TZ)"
-} > .tmp/run/conv_kernel_table_noshare_stripe.latest
-GOMAXPROCS="$(nproc)" \
+  echo "ckks_profile=resnet_e2e_logn16_logscale40_h192"
+  echo "input_level=2"
+  echo "expected_output_level=1"
+} > .tmp/run/conv_kernel_table_noshare_stripe_level2_e2e.latest
+GOMAXPROCS=1 \
+ORION_COMPILE_PARALLEL_POLICY=manual \
 ORION_LATTIGO_STREAMING_LT=0 \
-ORION_COMPILE_PARALLEL_POLICY=auto \
+ORION_LATTIGO_MEMORY_BOUNDED_COMPILE=0 \
+ORION_LATTIGO_MEMORY_BOUNDED_EVAL=0 \
+ORION_SINGLE_SLOT_LAYER_CACHE=0 \
+ORION_SINGLE_SLOT_ENCODE_WORKERS="$cpu_count" \
+ORION_PACK_CONV_WORKERS="$cpu_count" \
+ORION_DIRECT_PACK_WORKERS="$cpu_count" \
+ORION_LT_COMPILE_WORKERS="$cpu_count" \
+ORION_UNIFIED_COMPILE_WORKERS="$cpu_count" \
+ORION_LATTIGO_COMPILE_WORKERS="$cpu_count" \
+ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS="$cpu_count" \
+ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1 \
+ORION_UNIFIED_LT_SHARED_ROTATION_KEYS=0 \
+ORION_LATTIGO_UNIFIED_NO_BSGS=0 \
 PYTHONUNBUFFERED=1 \
 nohup .venv/bin/python tools/run_conv_kernel_table.py \
   --run-root "$run_root" \
   --doc docs/u22_orion_streaming_haloed_mainline.md \
-  --reuse-from .tmp/results/conv_kernel_table_u22stage_corg_20260527T110949Z \
   --max-worker-rss-gb 850 \
   --channels 32 64 128 256 \
   --hw 192x192 224x224 384x288 384x384 \
   --variants orion provider_halo1_individual_lt provider_halo2_individual_lt \
   --provider-output-layout native_stripe \
-  > ".tmp/logs/conv_kernel_table_noshare_stripe_corg_${ts}.log" 2>&1 &
-echo "pid=$!" >> .tmp/run/conv_kernel_table_noshare_stripe.latest
+  --input-level 2 \
+  > "$log" 2>&1 &
+echo "pid=$!" >> .tmp/run/conv_kernel_table_noshare_stripe_level2_e2e.latest
 ```
 
 Refresh locally:
 
 ```bash
-run_root="$(ssh corg 'cd /home/qihan/orion && awk -F= '\''$1=="run_root"{print $2}'\'' .tmp/run/conv_kernel_table_noshare_stripe.latest')"
+run_root="$(ssh corg 'cd /home/qihan/orion && awk -F= '\''$1=="run_root"{print $2}'\'' .tmp/run/conv_kernel_table_noshare_stripe_level2_e2e.latest')"
 base="$(basename "$run_root")"
 mkdir -p ".tmp/results/$base"
 rsync -az --delete --checksum "corg:/home/qihan/orion/$run_root/" ".tmp/results/$base/"
@@ -130,60 +161,61 @@ rsync -az --delete --checksum "corg:/home/qihan/orion/$run_root/" ".tmp/results/
   --channels 32 64 128 256 \
   --hw 192x192 224x224 384x288 384x384 \
   --variants orion provider_halo1_individual_lt provider_halo2_individual_lt \
-  --provider-output-layout native_stripe
+  --provider-output-layout native_stripe \
+  --input-level 2
 ```
 
 <!-- CONV_KERNEL_TABLE_START -->
-| HW | kernel | logical input | multiplex | channels/group | packed FHE input | path / beta | status | input halo T/B | output layout | channel fold | LT grouping | rotations | LT+accumulate s | hot run s | compile s | input ct | output ct | peak RSS GiB | runtime mode | result file | note |
-| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
-| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | Orion dense | ok |  |  |  |  | 15,152 | 648.5 | 653.6 | 42.7 | 36 | 36 | 116.8 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_192x192_orion.json | reused: conv32_192x192_orion.json |
-| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | provider beta=1 no-share stripe | running | 1/1 | native_halo_stripe | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_192x192_provider_halo1_individual_lt.json |  |
-| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_192x192_provider_halo2_individual_lt.json |  |
-| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | Orion dense | ok |  |  |  |  | 22,823 | 1041.0 | 1049.8 | 78.8 | 49 | 49 | 118.5 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_224x224_orion.json | reused: conv32_224x224_orion.json |
-| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_224x224_provider_halo1_individual_lt.json |  |
-| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_224x224_provider_halo2_individual_lt.json |  |
-| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | Orion dense | ok |  |  |  |  | 55,056 | 2819.3 | 2860.5 | 125.3 | 108 | 108 | 249.6 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_384x288_orion.json | reused: conv32_384x288_orion.json |
-| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_384x288_provider_halo1_individual_lt.json |  |
-| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_384x288_provider_halo2_individual_lt.json |  |
-| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | Orion dense | ok |  |  |  |  | 69,888 | 3760.3 | 3831.6 | 159.2 | 144 | 144 | 293.0 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_384x384_orion.json | reused: conv32_384x384_orion.json |
-| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_384x384_provider_halo1_individual_lt.json |  |
-| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv32_384x384_provider_halo2_individual_lt.json |  |
-| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | Orion dense | ok |  |  |  |  | 9,724 | 411.7 | 412.7 | 56.0 | 18 | 18 | 160.5 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_192x192_orion.json | reused: conv64_192x192_orion.json |
-| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_192x192_provider_halo1_individual_lt.json |  |
-| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_192x192_provider_halo2_individual_lt.json |  |
-| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | Orion dense | ok |  |  |  |  | 14,764 | 650.6 | 652.6 | 130.8 | 25 | 25 | 223.9 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_224x224_orion.json | reused: conv64_224x224_orion.json |
-| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_224x224_provider_halo1_individual_lt.json |  |
-| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_224x224_provider_halo2_individual_lt.json |  |
-| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | Orion dense | ok |  |  |  |  | 34,836 | 1466.0 | 1472.5 | 150.6 | 54 | 54 | 386.6 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_384x288_orion.json | reused: conv64_384x288_orion.json |
-| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_384x288_provider_halo1_individual_lt.json |  |
-| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_384x288_provider_halo2_individual_lt.json |  |
-| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | Orion dense | ok |  |  |  |  | 45,888 | 2004.0 | 2015.5 | 195.1 | 72 | 72 | 400.9 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_384x384_orion.json | reused: conv64_384x384_orion.json |
-| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_384x384_provider_halo1_individual_lt.json |  |
-| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv64_384x384_provider_halo2_individual_lt.json |  |
-| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | Orion dense | ok |  |  |  |  | 5,399 | 285.6 | 285.9 | 85.7 | 9 | 9 | 183.4 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_192x192_orion.json | reused: conv128_192x192_orion.json |
-| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_192x192_provider_halo1_individual_lt.json |  |
-| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_192x192_provider_halo2_individual_lt.json |  |
-| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | Orion dense | ok |  |  |  |  | 8,552 | 447.3 | 448.0 | 142.2 | 13 | 13 | 264.2 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_224x224_orion.json | reused: conv128_224x224_orion.json |
-| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_224x224_provider_halo1_individual_lt.json |  |
-| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_224x224_provider_halo2_individual_lt.json |  |
-| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | Orion dense | ok |  |  |  |  | 19,245 | 977.7 | 980.3 | 180.7 | 27 | 27 | 553.1 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_384x288_orion.json | reused: conv128_384x288_orion.json |
-| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_384x288_provider_halo1_individual_lt.json |  |
-| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_384x288_provider_halo2_individual_lt.json |  |
-| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | Orion dense | ok |  |  |  |  | 25,680 | 1108.1 | 1111.0 | 194.3 | 36 | 36 | 654.4 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_384x384_orion.json | reused: conv128_384x384_orion.json |
-| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_384x384_provider_halo1_individual_lt.json |  |
-| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv128_384x384_provider_halo2_individual_lt.json |  |
-| 192x192 | Conv 256,256 | 256x24x24 | 8 | 64 | 4x192x192 | Orion dense | ok |  |  |  |  | 2,928 | 183.5 | 183.6 | 150.3 | 5 | 5 | 196.0 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_192x192_orion.json | reused: conv256_192x192_orion.json |
-| 192x192 | Conv 256,256 | 256x24x24 | 8 | 64 | 4x192x192 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_192x192_provider_halo1_individual_lt.json |  |
-| 192x192 | Conv 256,256 | 256x24x24 | 8 | 64 | 4x192x192 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_192x192_provider_halo2_individual_lt.json |  |
-| 224x224 | Conv 256,256 | 256x28x28 | 8 | 64 | 4x224x224 | Orion dense | ok |  |  |  |  | 4,854 | 335.5 | 335.8 | 164.6 | 7 | 7 | 298.8 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_224x224_orion.json | reused: conv256_224x224_orion.json |
-| 224x224 | Conv 256,256 | 256x28x28 | 8 | 64 | 4x224x224 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_224x224_provider_halo1_individual_lt.json |  |
-| 224x224 | Conv 256,256 | 256x28x28 | 8 | 64 | 4x224x224 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_224x224_provider_halo2_individual_lt.json |  |
-| 384x288 | Conv 256,256 | 256x48x36 | 8 | 64 | 4x384x288 | Orion dense | ok |  |  |  |  | 10,504 | 649.8 | 650.5 | 262.1 | 14 | 14 | 603.3 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_384x288_orion.json | reused: conv256_384x288_orion.json |
-| 384x288 | Conv 256,256 | 256x48x36 | 8 | 64 | 4x384x288 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_384x288_provider_halo1_individual_lt.json |  |
-| 384x288 | Conv 256,256 | 256x48x36 | 8 | 64 | 4x384x288 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_384x288_provider_halo2_individual_lt.json |  |
-| 384x384 | Conv 256,256 | 256x48x48 | 8 | 64 | 4x384x384 | Orion dense | ok |  |  |  |  | 13,524 | 807.0 | 808.1 | 277.6 | 18 | 18 | 707.0 | resident_compute | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_384x384_orion.json | reused: conv256_384x384_orion.json |
-| 384x384 | Conv 256,256 | 256x48x48 | 8 | 64 | 4x384x384 | provider beta=1 no-share stripe | pending | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_384x384_provider_halo1_individual_lt.json |  |
-| 384x384 | Conv 256,256 | 256x48x48 | 8 | 64 | 4x384x384 | provider beta=2 no-share stripe | pending | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_corg_20260529T202528Z/rows/conv256_384x384_provider_halo2_individual_lt.json |  |
+| HW | kernel | logical input | multiplex | channels/group | packed FHE input | path / beta | status | input level | expected output level | actual output level | input halo T/B | output layout | channel fold | LT grouping | rotations | LT+accumulate s | hot run s | compile s | input ct | output ct | peak RSS GiB | runtime mode | result file | note |
+| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | Orion dense | running | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_192x192_orion.json |  |
+| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_192x192_provider_halo1_individual_lt.json |  |
+| 192x192 | Conv 32,32 | 32x192x192 | 1 | 1 | 32x192x192 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_192x192_provider_halo2_individual_lt.json |  |
+| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_224x224_orion.json |  |
+| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_224x224_provider_halo1_individual_lt.json |  |
+| 224x224 | Conv 32,32 | 32x224x224 | 1 | 1 | 32x224x224 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_224x224_provider_halo2_individual_lt.json |  |
+| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_384x288_orion.json |  |
+| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_384x288_provider_halo1_individual_lt.json |  |
+| 384x288 | Conv 32,32 | 32x384x288 | 1 | 1 | 32x384x288 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_384x288_provider_halo2_individual_lt.json |  |
+| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_384x384_orion.json |  |
+| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_384x384_provider_halo1_individual_lt.json |  |
+| 384x384 | Conv 32,32 | 32x384x384 | 1 | 1 | 32x384x384 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv32_384x384_provider_halo2_individual_lt.json |  |
+| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_192x192_orion.json |  |
+| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_192x192_provider_halo1_individual_lt.json |  |
+| 192x192 | Conv 64,64 | 64x96x96 | 2 | 4 | 16x192x192 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_192x192_provider_halo2_individual_lt.json |  |
+| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_224x224_orion.json |  |
+| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_224x224_provider_halo1_individual_lt.json |  |
+| 224x224 | Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_224x224_provider_halo2_individual_lt.json |  |
+| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_384x288_orion.json |  |
+| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_384x288_provider_halo1_individual_lt.json |  |
+| 384x288 | Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_384x288_provider_halo2_individual_lt.json |  |
+| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_384x384_orion.json |  |
+| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_384x384_provider_halo1_individual_lt.json |  |
+| 384x384 | Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv64_384x384_provider_halo2_individual_lt.json |  |
+| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_192x192_orion.json |  |
+| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_192x192_provider_halo1_individual_lt.json |  |
+| 192x192 | Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_192x192_provider_halo2_individual_lt.json |  |
+| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_224x224_orion.json |  |
+| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_224x224_provider_halo1_individual_lt.json |  |
+| 224x224 | Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_224x224_provider_halo2_individual_lt.json |  |
+| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_384x288_orion.json |  |
+| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_384x288_provider_halo1_individual_lt.json |  |
+| 384x288 | Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_384x288_provider_halo2_individual_lt.json |  |
+| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_384x384_orion.json |  |
+| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_384x384_provider_halo1_individual_lt.json |  |
+| 384x384 | Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv128_384x384_provider_halo2_individual_lt.json |  |
+| 192x192 | Conv 256,256 | 256x24x24 | 8 | 64 | 4x192x192 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_192x192_orion.json |  |
+| 192x192 | Conv 256,256 | 256x24x24 | 8 | 64 | 4x192x192 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_192x192_provider_halo1_individual_lt.json |  |
+| 192x192 | Conv 256,256 | 256x24x24 | 8 | 64 | 4x192x192 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_192x192_provider_halo2_individual_lt.json |  |
+| 224x224 | Conv 256,256 | 256x28x28 | 8 | 64 | 4x224x224 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_224x224_orion.json |  |
+| 224x224 | Conv 256,256 | 256x28x28 | 8 | 64 | 4x224x224 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_224x224_provider_halo1_individual_lt.json |  |
+| 224x224 | Conv 256,256 | 256x28x28 | 8 | 64 | 4x224x224 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_224x224_provider_halo2_individual_lt.json |  |
+| 384x288 | Conv 256,256 | 256x48x36 | 8 | 64 | 4x384x288 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_384x288_orion.json |  |
+| 384x288 | Conv 256,256 | 256x48x36 | 8 | 64 | 4x384x288 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_384x288_provider_halo1_individual_lt.json |  |
+| 384x288 | Conv 256,256 | 256x48x36 | 8 | 64 | 4x384x288 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_384x288_provider_halo2_individual_lt.json |  |
+| 384x384 | Conv 256,256 | 256x48x48 | 8 | 64 | 4x384x384 | Orion dense | pending | 2 | 1 |  |  |  |  |  |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_384x384_orion.json |  |
+| 384x384 | Conv 256,256 | 256x48x48 | 8 | 64 | 4x384x384 | provider beta=1 no-share stripe | pending | 2 | 1 |  | 1/1 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_384x384_provider_halo1_individual_lt.json |  |
+| 384x384 | Conv 256,256 | 256x48x48 | 8 | 64 | 4x384x384 | provider beta=2 no-share stripe | pending | 2 | 1 |  | 2/2 |  | per_stripe | individual |  |  |  |  |  |  |  |  | .tmp/results/conv_kernel_table_noshare_stripe_level2_e2e_corg_20260529T221125Z/rows/conv256_384x384_provider_halo2_individual_lt.json |  |
 <!-- CONV_KERNEL_TABLE_END -->
 
 ## Step 1: Dim32 Encoder Baseline
