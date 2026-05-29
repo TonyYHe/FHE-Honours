@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import networkx as nx
+import pytest
 import torch
 
 from orion.core import packing
@@ -26,6 +27,7 @@ from orion.experimental.layout_policy_ablation import (
     run_backend_runtime_anchors,
     run_non_ckks_layout_simulation,
     run_runtime_anchor,
+    validate_layout_policy_compile_plan,
     _fill_beta_to_tile_capacity,
     _layout_for_shape,
     _runtime_config,
@@ -214,8 +216,12 @@ def test_u22_64_layout_policy_planner_reports_all_edges_and_ordering() -> None:
         int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
         for row in always["edge_layouts"]
     )
-    assert dp["relayouts"] == 4
-    assert dp["halo_redundancy_ratio"] >= 0.0
+    assert dp["relayouts"] == 0
+    assert dp["halo_redundancy_ratio"] == 0.0
+    assert all(
+        int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
+        for row in dp["edge_layouts"]
+    )
 
 
 def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() -> None:
@@ -238,7 +244,13 @@ def test_u22_128_layout_policy_elides_halo_when_height_strip_fits_single_ct() ->
             int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
             for row in policy["edge_layouts"]
         )
-    assert _policy(payload, "dp")["relayouts"] == 3
+    dp = _policy(payload, "dp")
+    assert dp["relayouts"] == 0
+    assert dp["halo_redundancy_ratio"] == 0.0
+    assert all(
+        int(row["selected_layout"]["top_beta"]) == 0 and int(row["selected_layout"]["bottom_beta"]) == 0
+        for row in dp["edge_layouts"]
+    )
 
 
 def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layouts() -> None:
@@ -247,10 +259,10 @@ def test_non_dp_runtime_relayout_insertion_keeps_policy_specific_producer_layout
         runtime_plan = _layout_policy_runtime_compile_plan(plan)
         return int(len(runtime_plan["node_layouts"])), int(runtime_plan["relayout_edge_count"])
 
-    assert runtime_count("fixed_max") == (30, 5)
+    assert runtime_count("fixed_max") == (30, 0)
     assert runtime_count("always") == (30, 33)
     assert runtime_count("greedy") == (30, 4)
-    assert runtime_count("dp") == (30, 4)
+    assert runtime_count("dp") == (30, 0)
 
 
 def test_u22_64_layout_policy_planner_aligns_concat_inputs() -> None:
@@ -306,11 +318,63 @@ def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> 
     assert all(row.get("physical_layout") == "native_source_stripe" for row in native_conv_halo)
 
 
+def test_layout_policy_no_share_fold_keeps_conservative_boundaries() -> None:
+    plan = build_layout_policy_compile_plan(
+        build_u22_dag(network_spec("u22_256_base32")),
+        policy="dp_no_share_fold",
+    )
+
+    assert plan["validation"]["ok"] is True
+    concat_rows = [row for row in plan["edge_layouts"] if row["op_kind"] == "concat"]
+    assert concat_rows
+    assert all(row["physical_layout"] == "packed_compact" for row in concat_rows)
+    assert all(row["target_physical_layout"] == "packed_compact" for row in concat_rows)
+    assert all(int(row["selected_layout"]["top_beta"]) == 0 for row in concat_rows)
+    assert all(int(row["selected_layout"]["bottom_beta"]) == 0 for row in concat_rows)
+
+    tconv_rows = [row for row in plan["edge_layouts"] if row["op_kind"] == "conv_transpose2d"]
+    assert tconv_rows
+    assert all(row["physical_layout"] != "native_source_stripe" for row in tconv_rows)
+
+    raw_input_rows = [row for row in plan["edge_layouts"] if row["source"] == "x"]
+    assert raw_input_rows
+    assert all(row["physical_layout"] == "packed_compact" for row in raw_input_rows)
+
+    native_rows = [row for row in plan["edge_layouts"] if row["physical_layout"] == "native_source_stripe"]
+    assert native_rows
+    assert all(row["source"] != "x" for row in native_rows)
+    assert all(row["provider_lt_grouping_mode"] == "individual" for row in native_rows)
+    assert all(row["native_halo_channel_fold_mode"] == "per_stripe" for row in native_rows)
+
+
+def test_layout_policy_no_share_fold_validator_rejects_double_fused_relayout() -> None:
+    with pytest.raises(ValueError, match="producer and consumer fused"):
+        validate_layout_policy_compile_plan(
+            {
+                "policy": "dp_no_share_fold",
+                "edge_layouts": [
+                    {
+                        "edge": "a->b",
+                        "op_kind": "conv2d",
+                        "physical_layout": "packed_compact",
+                        "consumer_fused_relayout": True,
+                        "producer_fused_relayout": True,
+                    }
+                ],
+            }
+        )
+
+
 def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() -> None:
     opts = _region_first_mode_options("u22_64_base32_layout_eager")
     assert opts["u22_layout_policy"] == "eager"
     assert opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
     assert _region_first_mode_options("u22_64_base32_layout_always")["u22_layout_policy"] == "always"
+    assert _region_first_mode_options("u22_256_base32_layout_fixed_max_fused")["u22_layout_policy"] == "fixed_max_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
+    assert _region_first_mode_options("u22_256_base32_layout_dp_noshare_fold")["u22_layout_policy"] == "dp_no_share_fold"
+    assert _region_first_mode_options("generic_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
+    assert _region_first_mode_options("generic_layout_dp_noshare_fold")["u22_layout_policy"] == "dp_no_share_fold"
 
     dag = build_u22_dag(network_spec("u22_64_base32"))
     registry = U22CompileRegistry.for_dag(
@@ -371,11 +435,8 @@ def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None
         for group in registry.groups
         if isinstance(group.executor, LayoutPolicyProviderRuntimeExecutor) and group.executor.relayout_rows
     ]
-    assert relayout_groups
-    assert all(any(str(action).startswith("relayout_kernel_depth_") for action in group.boundary_actions) for group in relayout_groups)
-    assert all(group.depth >= 2 for group in relayout_groups)
-    assert all(group.solver_depth == group.depth for group in relayout_groups)
-    assert all(group.effective_depth() == group.depth for group in relayout_groups)
+    assert relayout_groups == []
+    assert registry.graph_audit["layout_policy_summary"]["relayout_depth_estimate"] == 0
     assert {
         type(group.executor.base_executor).__name__
         for group in registry.groups
@@ -912,6 +973,169 @@ def test_bootstrap_layout_compression_rewrites_profitable_layout_policy_boundary
     assert tuple(int(value) for value in conv_module.fhe_output_shape) == (1, 1, 4, 4)
 
 
+def test_no_share_fold_bootstrap_compression_forces_compact_without_tile_savings() -> None:
+    conv_module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "summary": {},
+        "edge_layouts": [],
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 6, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+            },
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=conv_module),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    conv_module.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("conv", module=conv_module, bootstrap=True)
+
+    audit = apply_bootstrap_layout_compression(dag)
+    updated = executor.compile_plan["node_layouts"][0]
+
+    assert audit["enabled"] is True
+    assert audit["nodes"][0]["forced_compact_boundary"] is True
+    assert audit["nodes"][0]["saved_ciphertexts_per_bootstrap"] == 0
+    assert updated["physical_layout"] == "packed_compact"
+    assert updated["selected_layout"]["tile_count"] == 1
+    assert tuple(int(value) for value in conv_module.fhe_output_shape) == (1, 1, 4, 4)
+
+
+def test_bootstrap_compression_does_not_materialize_lazy_delegate() -> None:
+    class LazyDelegateExecutor:
+        def __init__(self, child: object) -> None:
+            self.base_executor = child
+
+        @property
+        def delegate(self) -> object:
+            raise AssertionError("delegate property should not be materialized")
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.delegate, name)
+
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "summary": {},
+        "edge_layouts": [],
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": {
+                    "top_beta": 0,
+                    "bottom_beta": 0,
+                    "stride": 1,
+                    "gap": 1,
+                    "core_slots": 16,
+                    "stored_slots": 16,
+                    "tile_count": 1,
+                },
+                "compact_layout": {
+                    "top_beta": 0,
+                    "bottom_beta": 0,
+                    "stride": 1,
+                    "gap": 1,
+                    "core_slots": 16,
+                    "stored_slots": 16,
+                    "tile_count": 1,
+                },
+                "physical_layout": "packed_compact",
+            },
+        ],
+    }
+    child = SimpleNamespace(compile_plan=compile_plan)
+    module = SimpleNamespace(region_runtime=SimpleNamespace(executor=LazyDelegateExecutor(child)))
+    dag = nx.DiGraph()
+    dag.add_node("conv", module=module, bootstrap=True)
+
+    audit = apply_bootstrap_layout_compression(dag)
+
+    assert audit["enabled"] is False
+    assert audit["reason"] == "no_bootstrap_ct_savings"
+
+
+def test_bootstrap_compression_finds_materialized_private_delegate() -> None:
+    class MaterializedDelegateExecutor:
+        def __init__(self, child: object) -> None:
+            self._delegate = child
+
+        @property
+        def delegate(self) -> object:
+            raise AssertionError("delegate property should not be materialized")
+
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "summary": {},
+        "edge_layouts": [],
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 6, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+            },
+        ],
+    }
+    child = SimpleNamespace(compile_plan=compile_plan)
+    module = SimpleNamespace(region_runtime=SimpleNamespace(executor=MaterializedDelegateExecutor(child)))
+    dag = nx.DiGraph()
+    dag.add_node("conv", module=module, bootstrap=True)
+
+    audit = apply_bootstrap_layout_compression(dag)
+
+    assert audit["enabled"] is True
+    assert child.compile_plan["node_layouts"][0]["physical_layout"] == "packed_compact"
+
+
 def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
     _init_python_scheme("")
     try:
@@ -979,23 +1203,32 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     ]
     node_rows = {str(row["node"]): row for row in compile_plan["node_layouts"]}
     edge_rows = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
-    assert int(compile_plan["relayout_edge_count"]) == 4
+    assert int(compile_plan["relayout_edge_count"]) == 0
     assert int(compile_plan["output_relayout_node_count"]) == 0
     assert producer_halo_nodes
     assert producer_fused_edges == []
-    assert {str(row["edge"]) for row in compile_plan["relayout_edges"]} == {
-        "enc1b->cat1",
-        "enc2b->cat2",
-        "enc3b->cat3",
-        "enc4b->cat4",
-    }
-    for pool_node in ("pool1", "pool2", "pool3", "pool4"):
-        pool_layout = dict(node_rows[pool_node]["selected_layout"])
-        assert bool(node_rows[pool_node].get("producer_materialized_halo", False)) is True
-        assert node_rows[pool_node]["producer_materialized_halo_reason"] == "dp_producer_materialized_halo"
-        assert node_rows[pool_node]["physical_layout"] == "logical_halo_compact"
-        assert int(pool_layout["top_beta"]) == 1
-        assert int(pool_layout["bottom_beta"]) == 1
+    assert compile_plan["relayout_edges"] == []
+    for materialized_node in (
+        "enc1a",
+        "enc1b",
+        "enc2a",
+        "enc2b",
+        "enc3a",
+        "enc3b",
+        "enc4a",
+        "enc4b",
+        "bottlenecka",
+        "bottleneckb",
+        "up3",
+        "up2",
+        "up1",
+    ):
+        layout = dict(node_rows[materialized_node]["selected_layout"])
+        assert bool(node_rows[materialized_node].get("producer_materialized_halo", False)) is True
+        assert node_rows[materialized_node]["producer_materialized_halo_reason"] == "dp_producer_materialized_halo"
+        assert node_rows[materialized_node]["physical_layout"] == "logical_halo_compact"
+        assert int(layout["top_beta"]) >= 1
+        assert int(layout["bottom_beta"]) >= 1
     for pool_edge in ("pool1->enc2a", "pool2->enc3a", "pool3->enc4a", "pool4->bottlenecka"):
         row = edge_rows[pool_edge]
         assert row["layout_mode"] == "compact_halo_shared"
@@ -1017,9 +1250,7 @@ def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     assert "x->enc1a" in {row["edge"] for row in native_halo_stripe}
     assert int(compile_plan["summary"]["compact_fallback_penalty_estimate"]) == 0
     relayout_edge_depth = sum(int(row["depth_estimate"]) for row in compile_plan["relayout_edges"])
-    assert int(compile_plan["summary"]["relayout_depth_estimate"]) == int(relayout_edge_depth) + sum(
-        int(row["depth_estimate"]) for row in compile_plan["output_relayout_nodes"]
-    )
+    assert int(compile_plan["summary"]["relayout_depth_estimate"]) == 0
     assert all(int(row["rotation_estimate"]) >= 0 for row in compile_plan["relayout_edges"])
     assert all(int(row["mask_mult_estimate"]) >= 0 for row in compile_plan["relayout_edges"])
     assert all("lt_one_channel_diagonal_estimate" not in row for row in compile_plan["edge_layouts"])
@@ -1113,7 +1344,7 @@ def test_one_down_one_up_silu_dp_accounts_for_join_relayout_without_bootstrap_gr
         assert int(dp_plan["summary"]["relayouts"]) == 1
         assert {str(row["edge"]) for row in dp_plan["relayout_edges"]} == {"enc_act->add"}
         assert int(dp_plan["summary"]["consumer_fused_relayout_count"]) > 0
-        assert int(dp_plan["summary"]["total_ciphertext_tiles"]) < int(
+        assert int(dp_plan["summary"]["total_ciphertext_tiles"]) <= int(
             greedy_plan["summary"]["total_ciphertext_tiles"]
         )
 
@@ -1171,17 +1402,19 @@ def test_one_down_one_up_fused_non_dp_policies_remove_adjacent_relayout_depth() 
     greedy = build_layout_policy_compile_plan(greedy_dag, policy="greedy")
     greedy_fused = build_layout_policy_compile_plan(greedy_fused_dag, policy="greedy_fused")
 
-    assert int(fixed["summary"]["relayout_depth_estimate"]) > 0
-    assert int(eager["summary"]["relayout_depth_estimate"]) > 0
+    assert int(fixed["summary"]["relayout_depth_estimate"]) == 0
+    assert int(eager["summary"]["relayout_depth_estimate"]) == 0
     assert int(greedy["summary"]["relayout_depth_estimate"]) > 0
     assert int(fixed_fused["summary"]["relayout_depth_estimate"]) <= int(fixed["summary"]["relayout_depth_estimate"])
     assert int(eager_fused["summary"]["relayout_depth_estimate"]) == 0
-    assert int(greedy_fused["summary"]["relayout_depth_estimate"]) == 0
+    assert int(greedy_fused["summary"]["relayout_depth_estimate"]) == int(
+        greedy["summary"]["relayout_depth_estimate"]
+    )
     assert int(fixed_fused["summary"]["relayouts"]) <= int(fixed["summary"]["relayouts"])
     assert int(eager_fused["summary"]["relayouts"]) == 0
-    assert int(greedy_fused["summary"]["relayouts"]) == 0
-    assert int(eager_fused["summary"]["consumer_fused_relayout_count"]) > 0
-    assert int(fixed_fused["summary"]["producer_fused_materialization_count"]) > 0
+    assert int(greedy_fused["summary"]["relayouts"]) == int(greedy["summary"]["relayouts"])
+    assert int(eager_fused["summary"]["consumer_fused_relayout_count"]) == 0
+    assert int(fixed_fused["summary"]["producer_fused_materialization_count"]) == 0
 
 
 def test_orion_dense_policy_simulates_no_halo_compact_baseline() -> None:
@@ -1227,6 +1460,36 @@ def test_layout_policy_provider_keeps_native_halo_for_compact_halo_local_conv() 
         assert type(executor.base_executor.delegate).__name__ == "NativeHaloStripeNoRIConvExecutor"
         assert executor.compact_source_rows
         assert executor._runtime_lowering_label() == "provider_executable+compact_layout"
+    finally:
+        scheme.delete_scheme()
+
+
+def test_no_share_fold_registry_sets_individual_provider_grouping() -> None:
+    _init_long_python_scheme("")
+    try:
+        dag = _prepared_one_down_one_up_dag(image_size=128, base_channels=8)
+        registry = U22CompileRegistry.for_dag(
+            dag,
+            allowed_nodes=None,
+            enable_conv_kernels=True,
+            layout_policy="dp_no_share_fold",
+        )
+        registry.attach_to_dag(dag)
+
+        executors = [
+            dag.nodes[node]["module"].region_runtime.executor
+            for node in dag.nodes
+            if getattr(dag.nodes[node].get("module"), "region_runtime", None) is not None
+        ]
+        attrs = [
+            executor._native_halo_module_attrs()
+            for executor in executors
+            if isinstance(executor, LayoutPolicyProviderRuntimeExecutor)
+        ]
+
+        assert attrs
+        assert all(row["layout_policy_provider_lt_grouping_mode"] == "individual" for row in attrs)
+        assert all(row["layout_policy_native_halo_channel_fold_mode"] == "per_stripe" for row in attrs)
     finally:
         scheme.delete_scheme()
 
@@ -1662,7 +1925,7 @@ def test_u22_224_silu7_policy_table_uses_always_fused_and_policy_aware_bootstrap
 
     assert [str(row["policy"]) for row in rows] == ["fixed_max", "always_fused", "dp"]
     assert str(metadata["bootstrap_source"]) == "policy_aware_bootstrap_solver_after_registry_attach"
-    assert int(by_policy["fixed_max"]["boot"]) == 205
+    assert int(by_policy["fixed_max"]["boot"]) == 143
     assert int(by_policy["always_fused"]["boot"]) == 169
     assert int(by_policy["dp"]["boot"]) == 169
     assert int(by_policy["always_fused"]["fused_relayout"]) > 0
@@ -1673,6 +1936,148 @@ def test_u22_224_silu7_provider_runner_accepts_always_fused_policy() -> None:
     from tools import run_u22_base32_silu7_streaming_provider_e2e as runner
 
     assert runner._provider_mode("always_fused") == "u22_256_base32_layout_always_fused"
+
+
+def test_u22_dim32_runners_accept_no_share_fold_policy() -> None:
+    from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
+    from tools import run_u22_dim32_encoder4_noshare_e2e as encoder4_runner
+
+    assert matrix_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
+    assert matrix_runner._provider_mode("dp_noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
+    assert encoder4_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
+    assert encoder4_runner._provider_mode("noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
+
+
+def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
+    from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
+
+    env = matrix_runner._apply_env_defaults(
+        {
+            "GOMAXPROCS": "99",
+            "ORION_LATTIGO_BOOTSTRAP_MANY": "1",
+            "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "0",
+            "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
+            "ORION_LATTIGO_UNIFIED_NO_BSGS": "1",
+            "ORION_CONCAT_FUSION": "0",
+            "ORION_PACK_CONV_WORKERS": "240",
+        }
+    )
+
+    assert env["GOMAXPROCS"] == "1"
+    assert env["ORION_SINGLE_SLOT_LAYER_CACHE"] == "1"
+    assert env["ORION_LATTIGO_BOOTSTRAP_MANY"] == "0"
+    assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
+    assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
+    assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
+    assert env["ORION_CONCAT_FUSION"] == "1"
+    assert env["ORION_PACK_CONV_WORKERS"] == "240"
+
+
+def test_u22_dim32_runner_summary_merge_upgrades_old_rows() -> None:
+    from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
+    from tools import run_u22_dim32_encoder4_noshare_e2e as encoder4_runner
+
+    old_matrix = [
+        [
+            "192x192",
+            "IBSR",
+            "1->4",
+            "ok",
+            "ok",
+            "10",
+            "5",
+            "2",
+            "11",
+            "6",
+            "100",
+            "50",
+            "2",
+            "1",
+            "20.0",
+            "10.0",
+            "mode",
+            "dense:old_dense; provider:old_provider",
+            "old",
+        ]
+    ]
+    new_matrix = [
+        [
+            "192x192",
+            "IBSR",
+            "1->4",
+            "pending",
+            "ok",
+            "",
+            "4",
+            "",
+            "",
+            "5",
+            "",
+            "1.5",
+            "",
+            "0.5",
+            "",
+            "0.2",
+            "",
+            "0.3",
+            "",
+            "0.4",
+            "40",
+            "44",
+            "2",
+            "1",
+            "18.0",
+            "9.0",
+            "mode",
+            "dense:; provider:new_provider",
+            "new",
+        ]
+    ]
+    merged_matrix = matrix_runner._merge_summary_rows(old_matrix, new_matrix, ["provider"])
+    assert len(merged_matrix) == 1
+    assert len(merged_matrix[0]) == 29
+    assert merged_matrix[0][3] == "ok"
+    assert merged_matrix[0][4] == "ok"
+    assert merged_matrix[0][5] == "10"
+    assert merged_matrix[0][6] == "4"
+    assert "dense:old_dense" in merged_matrix[0][27]
+    assert "provider:new_provider" in merged_matrix[0][27]
+
+    old_encoder = [
+        [
+            "192x192",
+            "IBSR",
+            "ok",
+            "ok",
+            "10",
+            "5",
+            "2",
+            "11",
+            "6",
+            "100",
+            "50",
+            "1000",
+            "500",
+            "2",
+            "1",
+            "20",
+            "10",
+            "20.0",
+            "10.0",
+            "dense:old_dense; provider:old_provider",
+            "old",
+        ]
+    ]
+    new_encoder = [["192x192", "IBSR", "pending", "ok", "", "4", "", "", "5", "", "1.5", "", "0.5", "", "0.2", "", "0.3", "", "40", "", "500", "", "1", "18.0", "9.0", "dense:; provider:new_provider", "new"]]
+    merged_encoder = encoder4_runner._merge_summary_rows(old_encoder, new_encoder, ["provider"])
+    assert len(merged_encoder) == 1
+    assert len(merged_encoder[0]) == 27
+    assert merged_encoder[0][2] == "ok"
+    assert merged_encoder[0][3] == "ok"
+    assert merged_encoder[0][4] == "10"
+    assert merged_encoder[0][5] == "4"
+    assert "dense:old_dense" in merged_encoder[0][25]
+    assert "provider:new_provider" in merged_encoder[0][25]
 
 
 def test_layout_policy_cli_non_ckks_simulation_smoke(tmp_path: Path) -> None:

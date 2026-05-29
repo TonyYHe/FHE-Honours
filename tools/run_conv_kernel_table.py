@@ -45,7 +45,7 @@ ROW_DIR_NAME = "rows"
 
 DEFAULT_HW = ("192x192", "224x224", "384x288", "384x384")
 DEFAULT_CHANNELS = (32, 64, 128, 256)
-DEFAULT_VARIANTS = ("orion", "provider_halo1", "provider_halo2")
+DEFAULT_VARIANTS = ("orion", "provider_halo1_individual_lt", "provider_halo2_individual_lt")
 VARIANT_CHOICES = (
     "orion",
     "provider_halo1",
@@ -56,10 +56,10 @@ VARIANT_CHOICES = (
 PROVIDER_OUTPUT_LAYOUTS = ("tight_compact", "native_stripe")
 VARIANT_LABELS = {
     "orion": "Orion dense",
-    "provider_halo1": "provider beta=1",
-    "provider_halo2": "provider beta=2",
-    "provider_halo1_individual_lt": "provider beta=1 individual LT",
-    "provider_halo2_individual_lt": "provider beta=2 individual LT",
+    "provider_halo1": "provider beta=1 shared",
+    "provider_halo2": "provider beta=2 shared",
+    "provider_halo1_individual_lt": "provider beta=1 no-share stripe",
+    "provider_halo2_individual_lt": "provider beta=2 no-share stripe",
 }
 
 
@@ -137,6 +137,12 @@ class ConvKernelRow:
     @property
     def provider_disable_shared_rotation(self) -> bool:
         return bool(self.provider_lt_grouping_mode == "individual")
+
+    @property
+    def native_halo_channel_fold_mode(self) -> str:
+        if self.path != "provider":
+            return ""
+        return "per_stripe" if str(self.variant).endswith("_individual_lt") else "heuristic"
 
     @property
     def row_id(self) -> str:
@@ -312,6 +318,30 @@ def _normalise_provider_lt_grouping_mode(value: Any) -> str:
     return text
 
 
+def _normalise_native_halo_channel_fold_mode(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"", "heuristic", "default", "auto"}:
+        return "heuristic"
+    if text in {"per_stripe", "perstripe", "variable", "variable_per_stripe"}:
+        return "per_stripe"
+    return text
+
+
+def _provider_channel_fold_mode(result: dict[str, Any]) -> str:
+    metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
+    native_plan = metadata.get("native_halo_conv2d_plan") if isinstance(metadata.get("native_halo_conv2d_plan"), dict) else {}
+    top_level_native_plan = (
+        result.get("native_halo_conv2d_plan") if isinstance(result.get("native_halo_conv2d_plan"), dict) else {}
+    )
+    return _normalise_native_halo_channel_fold_mode(
+        result.get("native_halo_channel_fold_mode")
+        or result.get("provider_native_halo_channel_fold_mode")
+        or metadata.get("native_halo_channel_fold_mode")
+        or native_plan.get("channel_fold_mode")
+        or top_level_native_plan.get("channel_fold_mode")
+    )
+
+
 def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_label: str) -> dict[str, Any]:
     timing = dict(result.get("runtime_fairness_timing") or {})
     rotation_count = (
@@ -356,6 +386,7 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "provider_requested_input_halo": row.halo,
         "provider_lt_grouping_mode": provider_lt_grouping_mode,
         "provider_disable_shared_rotation": bool(provider_lt_grouping_mode == "individual"),
+        "native_halo_channel_fold_mode": _provider_channel_fold_mode(result) if row.path == "provider" else "",
         "input_halo_top": input_halo_top,
         "input_halo_bottom": input_halo_bottom,
         "provider_output_storage_layout": _provider_result_output_layout(result) if row.path == "provider" else "",
@@ -401,14 +432,15 @@ def reuse_existing_rows(
 ) -> int:
     if not sources:
         return 0
-    row_by_key: dict[tuple[str, int, int, int, int, int | None, str], ConvKernelRow] = {}
+    row_by_key: dict[tuple[str, int, int, int, int, int | None, str, str], ConvKernelRow] = {}
     for row in rows:
         halo_key = row.halo
         if row.path == "provider" and bool(clip_provider_boundary_halo):
             halo_key = 0
         grouping_key = row.provider_lt_grouping_mode if row.path == "provider" else ""
+        fold_key = row.native_halo_channel_fold_mode if row.path == "provider" else ""
         row_by_key[
-            (row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, halo_key, grouping_key)
+            (row.path, row.channels, row.logical_height, row.logical_width, row.stage_gap, halo_key, grouping_key, fold_key)
         ] = row
     reused = 0
     for json_path in _iter_reuse_jsons([Path(value) for value in sources]):
@@ -424,7 +456,7 @@ def reuse_existing_rows(
                 continue
             path_kind = _result_path_kind(result, fallback=path_name)
             if path_kind == "dense":
-                key = ("dense", int(channels), int(height), int(width), int(gap), None, "")
+                key = ("dense", int(channels), int(height), int(width), int(gap), None, "", "")
             elif path_kind == "provider":
                 top, bottom = _explicit_halo(result)
                 # Older provider JSONs did not record the halo setting; those
@@ -443,7 +475,8 @@ def reuse_existing_rows(
                     or metadata.get("lt_grouping_mode")
                     or "shared"
                 )
-                key = ("provider", int(channels), int(height), int(width), int(gap), int(top), grouping_mode)
+                fold_mode = _provider_channel_fold_mode(result)
+                key = ("provider", int(channels), int(height), int(width), int(gap), int(top), grouping_mode, fold_mode)
             else:
                 continue
             row = row_by_key.get(key)
@@ -611,6 +644,7 @@ def _apply_provider_output_layout(conv: Conv2d, row: ConvKernelRow, *, output_la
 def _attach_provider_runtime(conv: Conv2d, row: ConvKernelRow) -> None:
     conv.layout_policy_provider_lt_grouping_mode = row.provider_lt_grouping_mode
     conv.layout_policy_provider_disable_shared_rotation = bool(row.provider_disable_shared_rotation)
+    conv.layout_policy_native_halo_channel_fold_mode = row.native_halo_channel_fold_mode
     executor = HaloLocalConvRuntimeExecutor(
         module=conv,
         output_node_id=str(conv.region_output_id),
@@ -935,6 +969,11 @@ def _run_row(
             "provider_requested_input_halo": row.halo,
             "provider_lt_grouping_mode": provider_lt_grouping_mode,
             "provider_disable_shared_rotation": bool(provider_lt_grouping_mode == "individual"),
+            "native_halo_channel_fold_mode": (
+                str(provider_metadata.get("native_halo_channel_fold_mode") or row.native_halo_channel_fold_mode)
+                if row.path == "provider"
+                else ""
+            ),
             "provider_boundary_halo_clipped": bool(clip_provider_boundary_halo and row.path == "provider"),
             "provider_output_layout": applied_provider_output_layout,
             "input_halo_top": input_halo_top,
@@ -1064,6 +1103,13 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
             else:
                 halo_cell = f"{int(row.halo)}/{int(row.halo)}"
         output_layout = _provider_result_output_layout(payload) if isinstance(payload, dict) else ""
+        channel_fold = ""
+        if row.path == "provider":
+            channel_fold = (
+                str((payload or {}).get("native_halo_channel_fold_mode") or row.native_halo_channel_fold_mode)
+                if isinstance(payload, dict)
+                else row.native_halo_channel_fold_mode
+            )
         lt_grouping = ""
         if row.path == "provider":
             lt_grouping = (
@@ -1083,6 +1129,7 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
                 status,
                 halo_cell,
                 output_layout,
+                channel_fold,
                 lt_grouping,
                 _fmt_int((payload or {}).get("rotation_eval_count") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("lt_accumulate_s") if isinstance(payload, dict) else None),
@@ -1111,6 +1158,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "status",
         "input halo T/B",
         "output layout",
+        "channel fold",
         "LT grouping",
         "rotations",
         "LT+accumulate s",
@@ -1124,6 +1172,7 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "note",
     ]
     aligns = [
+        "---",
         "---",
         "---",
         "---",
@@ -1172,6 +1221,7 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
         "status",
         "input_halo_tb",
         "output_layout",
+        "channel_fold",
         "lt_grouping",
         "rotations",
         "lt_accumulate_s",
@@ -1232,6 +1282,7 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "provider_requested_input_halo": row.halo,
             "provider_lt_grouping_mode": row.provider_lt_grouping_mode if row.path == "provider" else "",
             "provider_disable_shared_rotation": bool(row.provider_disable_shared_rotation and row.path == "provider"),
+            "native_halo_channel_fold_mode": row.native_halo_channel_fold_mode if row.path == "provider" else "",
             "provider_boundary_halo_clipped": bool(
                 getattr(args, "clip_provider_boundary_halo", False) and row.path == "provider"
             ),
@@ -1272,6 +1323,7 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "provider_requested_input_halo": row.halo,
             "provider_lt_grouping_mode": row.provider_lt_grouping_mode if row.path == "provider" else "",
             "provider_disable_shared_rotation": bool(row.provider_disable_shared_rotation and row.path == "provider"),
+            "native_halo_channel_fold_mode": row.native_halo_channel_fold_mode if row.path == "provider" else "",
             "provider_output_layout": provider_output_layout,
             "provider_output_storage_layout": provider_output_storage_layout,
             "input_halo_top": input_halo_top,
@@ -1311,13 +1363,13 @@ def run_all(args: argparse.Namespace) -> int:
             "io_mode": "none",
             "lt_accumulate_s": "resident eval_s / eval_total_s, excluding artifact I/O",
             "orion": "dense Conv2d path with default resident Lattigo LT",
-            "provider_halo1": "native halo provider with requested beta=1",
-            "provider_halo2": "native halo provider with requested beta=2",
+            "provider_halo1": "legacy native halo provider beta=1 with shared rotation grouping and heuristic channel fold",
+            "provider_halo2": "legacy native halo provider beta=2 with shared rotation grouping and heuristic channel fold",
             "provider_halo1_individual_lt": (
-                "native halo provider beta=1; BSGS preserved per LT, each LT compiled/evaluated as its own group"
+                "native halo provider beta=1; no shared rotations; per-stripe native halo channel fold; BSGS preserved within each individual LT"
             ),
             "provider_halo2_individual_lt": (
-                "native halo provider beta=2; BSGS preserved per LT, each LT compiled/evaluated as its own group"
+                "native halo provider beta=2; no shared rotations; per-stripe native halo channel fold; BSGS preserved within each individual LT"
             ),
             "u_net_stage_packing": {
                 "Conv 32,32": "logical 32xHorigxWorig, multiplex/input_gap/output_gap=1, packed FHE 32xHorigxWorig",
@@ -1500,6 +1552,7 @@ def run_one(args: argparse.Namespace) -> int:
             "provider_requested_input_halo": row.halo,
             "provider_lt_grouping_mode": row.provider_lt_grouping_mode if row.path == "provider" else "",
             "provider_disable_shared_rotation": bool(row.provider_disable_shared_rotation and row.path == "provider"),
+            "native_halo_channel_fold_mode": row.native_halo_channel_fold_mode if row.path == "provider" else "",
             "provider_boundary_halo_clipped": bool(args.clip_provider_boundary_halo and row.path == "provider"),
             "provider_output_layout": provider_output_layout,
             "provider_output_storage_layout": provider_output_layout,
@@ -1544,8 +1597,8 @@ def main() -> int:
     parser.add_argument(
         "--provider-output-layout",
         choices=PROVIDER_OUTPUT_LAYOUTS,
-        default="tight_compact",
-        help="Provider output storage layout for kernel rows; tight_compact is the legacy comparison mode.",
+        default="native_stripe",
+        help="Provider output storage layout for kernel rows; native_stripe is the active no-sharing stripe mode.",
     )
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--prepare-only", action="store_true", help="Prepare/reuse rows and update the doc without launching workers.")
@@ -1553,6 +1606,9 @@ def main() -> int:
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--out", type=Path, default=Path("/tmp/conv_kernel_row.json"), help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if any(str(variant).endswith("_individual_lt") for variant in args.variants) and str(args.provider_output_layout) != "native_stripe":
+        parser.error("provider *_individual_lt variants require --provider-output-layout native_stripe")
 
     if bool(args.update_doc_only):
         update_doc(Path(args.doc), Path(args.run_root), _rows_from_args(args))

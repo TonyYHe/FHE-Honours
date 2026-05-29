@@ -160,13 +160,13 @@ def _u22_packed_active_slots(module: Any) -> int:
     return int(groups * h * gap * w * gap)
 
 
-def _u22_same_shape_conv_runtime_supported(module: Any) -> bool:
+def _u22_same_shape_conv_runtime_supported(module: Any, *, slot_count: int | None = None) -> bool:
     # The generic halo-local same-shape materializer currently expects either
     # multi-block output or a single block that already fills the ring. Smaller
     # single-block outputs need Orion's output-fold rotations, which this
     # region executor does not materialize yet.
     output_length = int(_u22_packed_active_slots(module))
-    slot_count = int(_u22_module_slot_count(module))
+    slot_count = int(_u22_module_slot_count(module) if slot_count is None else slot_count)
     return bool(int(output_length) > int(slot_count) or int(_ceil_pow2(output_length)) == int(slot_count))
 
 
@@ -186,8 +186,9 @@ def _u22_same_shape_conv_group(
     *,
     node: str,
     module: Any,
+    slot_count: int | None = None,
 ) -> RegionFirstRuntimeGroup:
-    slot_count = int(_u22_module_slot_count(module))
+    slot_count = int(_u22_module_slot_count(module) if slot_count is None else slot_count)
     executor = HaloLocalConvRuntimeExecutor(
         module=module,
         output_node_id=str(node),
@@ -284,9 +285,30 @@ def _normalize_u22_layout_policy(value: str) -> str:
         return "always_fused"
     if normalized in {"orion", "dense", "orion_dense", "orion-dense", "oriondense", "no_halo", "no-halo", "nohalo"}:
         return "orion_dense"
-    if normalized in {"eager", "greedy", "always", "always_relayout", "always-relayout", "dp"}:
+    if normalized in {
+        "eager",
+        "greedy",
+        "always",
+        "always_relayout",
+        "always-relayout",
+        "dp",
+        "dp_no_share_fold",
+        "dp-no-share-fold",
+        "dp_noshare_fold",
+        "dp-noshare-fold",
+        "noshare_fold",
+        "no-share-fold",
+    }:
         if normalized in {"always_relayout", "always-relayout"}:
             return "always"
+        if normalized in {
+            "dp-no-share-fold",
+            "dp_noshare_fold",
+            "dp-noshare-fold",
+            "noshare_fold",
+            "no-share-fold",
+        }:
+            return "dp_no_share_fold"
         return str(normalized)
     return "dp"
 
@@ -721,6 +743,9 @@ def _layout_policy_native_module_attrs(
     compact_input_rows: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     attrs: dict[str, Any] = {}
+    plan_slots = int(compile_plan.get("slots", 0) or 0)
+    if int(plan_slots) > 0:
+        attrs["layout_policy_slot_count"] = int(plan_slots)
     input_rows = tuple(native_input_rows) if native_input_rows else tuple(compact_input_rows)
     if input_rows:
         row = dict(input_rows[0])
@@ -775,6 +800,9 @@ def _layout_policy_native_module_attrs(
                 _layout_physical_top_beta(output_layout) > 0 or _layout_physical_bottom_beta(output_layout) > 0
             ):
                 attrs["layout_policy_output_materialization"] = "fused_relayout"
+    if str(compile_plan.get("policy", "")) == "dp_no_share_fold":
+        attrs["layout_policy_provider_lt_grouping_mode"] = "individual"
+        attrs["layout_policy_native_halo_channel_fold_mode"] = "per_stripe"
     return attrs
 
 
@@ -783,16 +811,12 @@ def _layout_policy_with_base_executor_attrs(base_executor: Any, attrs: dict[str,
     if not attrs or module is None:
         return callback()
     saved = {name: getattr(module, name, _MISSING) for name in attrs}
-    base_saved = {
-        name: getattr(base_executor, name, _MISSING)
-        for name in attrs
-        if hasattr(base_executor, name)
-    }
+    base_dict = getattr(base_executor, "__dict__", {})
+    base_saved = {name: base_dict.get(name, _MISSING) for name in attrs}
     try:
         for name, value in attrs.items():
             setattr(module, name, value)
-            if name in base_saved:
-                setattr(base_executor, name, value)
+            setattr(base_executor, name, value)
         return callback()
     finally:
         for name, value in saved.items():
@@ -1563,16 +1587,12 @@ class LayoutPolicyProviderRuntimeExecutor:
         if not attrs or module is None:
             return callback()
         saved = {name: getattr(module, name, _MISSING) for name in attrs}
-        base_saved = {
-            name: getattr(self.base_executor, name, _MISSING)
-            for name in attrs
-            if hasattr(self.base_executor, name)
-        }
+        base_dict = getattr(self.base_executor, "__dict__", {})
+        base_saved = {name: base_dict.get(name, _MISSING) for name in attrs}
         try:
             for name, value in attrs.items():
                 setattr(module, name, value)
-                if name in base_saved:
-                    setattr(self.base_executor, name, value)
+                setattr(self.base_executor, name, value)
             return callback()
         finally:
             for name, value in saved.items():
@@ -4096,6 +4116,7 @@ class U22CompileRegistry:
                 "always_fused",
                 "orion_dense",
                 "dp",
+                "dp_no_share_fold",
             }
         ):
             provider_registry = cls.for_dag(

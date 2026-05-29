@@ -111,6 +111,9 @@ BOOTSTRAP_OWNER_HINTS = {
 
 PROVIDER_MODES = {
     "dp": "u22_256_base32_layout_dp",
+    "dp_no_share_fold": "u22_256_base32_layout_dp_no_share_fold",
+    "dp_noshare_fold": "u22_256_base32_layout_dp_no_share_fold",
+    "noshare_fold": "u22_256_base32_layout_dp_no_share_fold",
     "greedy": "u22_256_base32_layout_greedy",
     "always": "u22_256_base32_layout_always",
     "always_fused": "u22_256_base32_layout_always_fused",
@@ -140,9 +143,22 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
-    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
+    "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
+    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
+    "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
+    "ORION_CONCAT_FUSION": "1",
+}
+
+REQUIRED_MAINLINE_ENV: dict[str, str] = {
+    "GOMAXPROCS": "1",
+    "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
+    "ORION_LATTIGO_STREAMING_LT": "0",
+    "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
+    "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
+    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
+    "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_CONCAT_FUSION": "1",
 }
 
@@ -180,7 +196,8 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated = dict(env)
     for key, value in ENV_DEFAULTS.items():
         updated.setdefault(key, value)
-    updated["GOMAXPROCS"] = ENV_DEFAULTS["GOMAXPROCS"]
+    for key, value in REQUIRED_MAINLINE_ENV.items():
+        updated[key] = value
     return updated
 
 
@@ -610,6 +627,26 @@ def _breakdown_totals(payload: dict[str, Any]) -> dict[str, Any]:
     return _metric(payload, ("operator_breakdown_after_forward", "totals")) or {}
 
 
+def _summary_total(totals: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key in totals and totals.get(key) not in (None, ""):
+            return _as_float(totals.get(key))
+    return None
+
+
+def _summary_unattributed(
+    totals: dict[str, Any],
+    he_forward_s: float | None,
+    parts: list[float | None],
+) -> float | None:
+    direct = _summary_total(totals, "unattributed_he_forward_s")
+    if direct is not None:
+        return direct
+    if he_forward_s is None or any(value is None for value in parts):
+        return None
+    return float(he_forward_s) - sum(float(value or 0.0) for value in parts)
+
+
 def _runtime_mode(payload: dict[str, Any]) -> str:
     return str(
         payload.get("runtime_fairness_mode")
@@ -849,8 +886,9 @@ def _markdown_table(rows: list[list[str]]) -> str:
 
 def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
     result_path, _log_path = _case_paths(run_root, case, mode)
-    payload = _read_json(result_path)
-    payload = payload if isinstance(payload, dict) else {}
+    raw_payload = _read_json(result_path)
+    has_payload = isinstance(raw_payload, dict)
+    payload = raw_payload if has_payload else {}
     timing = payload.get("timing_s", {}) if isinstance(payload.get("timing_s"), dict) else {}
     encrypt_s = _forward_timing(payload, "encrypt")
     he_forward_s = _forward_timing(payload, "he_forward")
@@ -858,13 +896,27 @@ def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
     hot_s = None
     if encrypt_s is not None and he_forward_s is not None and decode_s is not None:
         hot_s = float(encrypt_s + he_forward_s + decode_s)
+    totals = _breakdown_totals(payload)
+    mvm_lt_s = _summary_total(totals, "mvm_kernel_s")
+    activation_s = _summary_total(totals, "activation_excluding_bootstrap_s", "activation_s")
+    bootstrap_s = _summary_total(totals, "bootstrap_s")
+    diag_encode_s = _summary_total(totals, "lt_layer_cache_encode_s")
     return {
-        "status": str(payload.get("status", "pending" if not payload else "unknown")),
+        "status": str(payload.get("status", "pending" if not has_payload else "unknown")),
         "compile_s": timing.get("compile") if isinstance(timing, dict) else None,
         "he_forward_s": he_forward_s,
         "hot_e2e_s": hot_s,
-        "rotations": _rotation_count(payload),
-        "boots": _bootstrap_count(payload),
+        "mvm_lt_s": mvm_lt_s,
+        "activation_excl_boot_s": activation_s,
+        "bootstrap_s": bootstrap_s,
+        "diag_encode_s": diag_encode_s,
+        "unattributed_s": _summary_unattributed(
+            totals,
+            he_forward_s,
+            [mvm_lt_s, activation_s, bootstrap_s, diag_encode_s],
+        ),
+        "rotations": _rotation_count(payload) if has_payload else None,
+        "boots": _bootstrap_count(payload) if has_payload else None,
         "peak_rss_gib": _metric(payload, ("runner", "maxrss_bytes")),
         "runtime_mode": _runtime_mode(payload),
         "result_path": str(result_path),
@@ -892,6 +944,16 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "dense/Halo HE",
         "dense hot E2E s",
         "Halo hot E2E s",
+        "dense MVM/LT s (incl pool)",
+        "Halo MVM/LT s (incl pool)",
+        "dense activation excl boot s",
+        "Halo activation excl boot s",
+        "dense bootstrap s",
+        "Halo bootstrap s",
+        "dense diag+encode s",
+        "Halo diag+encode s",
+        "dense unattributed s",
+        "Halo unattributed s",
         "dense rotations",
         "Halo rotations",
         "dense boots",
@@ -902,27 +964,7 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "result files",
         "note",
     ]
-    aligns = [
-        "---",
-        "---",
-        "---",
-        "---",
-        "---",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---",
-        "---",
-        "---",
-    ]
+    aligns = ["---", "---", "---", "---", "---"] + ["---:"] * (len(headers) - 8) + ["---", "---", "---"]
     rows: list[list[str]] = []
     for case in cases:
         spec = CASES[str(case)]
@@ -941,6 +983,16 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
                 _fmt_float(_ratio(dense["he_forward_s"], provider["he_forward_s"])),
                 _fmt_float(dense["hot_e2e_s"]),
                 _fmt_float(provider["hot_e2e_s"]),
+                _fmt_float(dense["mvm_lt_s"]),
+                _fmt_float(provider["mvm_lt_s"]),
+                _fmt_float(dense["activation_excl_boot_s"]),
+                _fmt_float(provider["activation_excl_boot_s"]),
+                _fmt_float(dense["bootstrap_s"]),
+                _fmt_float(provider["bootstrap_s"]),
+                _fmt_float(dense["diag_encode_s"]),
+                _fmt_float(provider["diag_encode_s"]),
+                _fmt_float(dense["unattributed_s"]),
+                _fmt_float(provider["unattributed_s"]),
                 _fmt_int(dense["rotations"]),
                 _fmt_int(provider["rotations"]),
                 _fmt_int(dense["boots"]),
@@ -970,6 +1022,16 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "dense/Halo HE",
         "dense hot E2E s",
         "Halo hot E2E s",
+        "dense MVM/LT s (incl pool)",
+        "Halo MVM/LT s (incl pool)",
+        "dense activation excl boot s",
+        "Halo activation excl boot s",
+        "dense bootstrap s",
+        "Halo bootstrap s",
+        "dense diag+encode s",
+        "Halo diag+encode s",
+        "dense unattributed s",
+        "Halo unattributed s",
         "dense rotations",
         "Halo rotations",
         "dense boots",
@@ -980,27 +1042,7 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "result files",
         "note",
     ]
-    aligns = [
-        "---",
-        "---",
-        "---",
-        "---",
-        "---",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---",
-        "---",
-        "---",
-    ]
+    aligns = ["---", "---", "---", "---", "---"] + ["---:"] * (len(headers) - 8) + ["---", "---", "---"]
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(aligns) + " |"]
     for row in rows:
         lines.append("| " + " | ".join(_markdown_escape(cell) for cell in _pad_row(row, len(headers))) + " |")
@@ -1109,11 +1151,53 @@ def _join_result_file_parts(parts: dict[str, str]) -> str:
     return f"dense:{parts.get('dense', '')}; provider:{parts.get('provider', '')}"
 
 
+def _upgrade_summary_row(row: list[str]) -> list[str] | None:
+    if len(row) == 29:
+        return _pad_row(row, 29)
+    if len(row) == 19:
+        return [
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            row[8],
+            row[9],
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            row[10],
+            row[11],
+            row[12],
+            row[13],
+            row[14],
+            row[15],
+            row[16],
+            row[17],
+            row[18],
+        ]
+    return None
+
+
 def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], modes: list[str]) -> list[list[str]]:
-    width = 19
-    by_case = {row[0]: _pad_row(row, width) for row in existing}
-    dense_cols = (3, 5, 8, 10, 12, 14)
-    provider_cols = (4, 6, 9, 11, 13, 15)
+    width = 29
+    by_case = {}
+    for row in existing:
+        upgraded = _upgrade_summary_row(list(row))
+        if upgraded is not None:
+            by_case[str(upgraded[0])] = upgraded
+    dense_cols = (3, 5, 8, 10, 12, 14, 16, 18, 20, 22, 24)
+    provider_cols = (4, 6, 9, 11, 13, 15, 17, 19, 21, 23, 25)
     for new_row in new_rows:
         new_row = _pad_row(new_row, width)
         case = str(new_row[0])
@@ -1132,16 +1216,16 @@ def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], mo
                 merged[index] = new_row[index]
         ratio = _ratio(merged[5].replace(",", ""), merged[6].replace(",", ""))
         merged[7] = _fmt_float(ratio)
-        if new_row[16]:
-            merged[16] = new_row[16]
-        files = _result_file_parts(merged[17])
-        new_files = _result_file_parts(new_row[17])
+        if new_row[26]:
+            merged[26] = new_row[26]
+        files = _result_file_parts(merged[27])
+        new_files = _result_file_parts(new_row[27])
         for mode in modes:
             if new_files.get(mode):
                 files[mode] = new_files[mode]
-        merged[17] = _join_result_file_parts(files)
-        if new_row[18]:
-            merged[18] = new_row[18]
+        merged[27] = _join_result_file_parts(files)
+        if new_row[28]:
+            merged[28] = new_row[28]
         by_case[case] = merged
     case_order = {case: index for index, case in enumerate(CASES)}
     return [by_case[key] for key in sorted(by_case, key=lambda case: case_order.get(case, 100))]
@@ -1332,7 +1416,7 @@ def main() -> int:
     parser.add_argument("--doc", type=Path, default=REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md")
     parser.add_argument("--cases", nargs="+", choices=tuple(CASES), default=list(CASES))
     parser.add_argument("--modes", nargs="+", choices=("dense", "provider"), default=["dense", "provider"])
-    parser.add_argument("--policy", choices=tuple(PROVIDER_MODES), default="dp")
+    parser.add_argument("--policy", choices=tuple(PROVIDER_MODES), default="dp_no_share_fold")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--forward-runs", type=int, default=1)
     parser.add_argument("--warmup-runs", type=int, default=0)

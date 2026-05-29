@@ -13,9 +13,11 @@ from typing import Any, Callable, Iterable, Sequence
 
 import torch
 
+from orion.core.orion import _PackWorkerScheme
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.models.unet import UNet22
+from orion.nn.module import Module
 from orion.nn.activation import Activation, Chebyshev, Quad, ReLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.pooling import AvgPool2d
@@ -82,6 +84,12 @@ POLICY_ALIASES = {
     "dp": "dp",
     "dp_global": "dp",
     "dp-global": "dp",
+    "dp_no_share_fold": "dp_no_share_fold",
+    "dp-no-share-fold": "dp_no_share_fold",
+    "dp_noshare_fold": "dp_no_share_fold",
+    "dp-noshare-fold": "dp_no_share_fold",
+    "noshare_fold": "dp_no_share_fold",
+    "no-share-fold": "dp_no_share_fold",
 }
 POLICY_LABELS = {
     "fixed_max": "Max-Re-Layout",
@@ -94,6 +102,7 @@ POLICY_LABELS = {
     "always_fused": "Always-Re-Layout+Fusion",
     "orion_dense": "Orion-Dense-No-Halo",
     "dp": "DP-Global",
+    "dp_no_share_fold": "DP-NoShare-Fold",
 }
 PROVIDER_PRESSURE_SUMMARY_KEYS = (
     "provider_region_count",
@@ -277,6 +286,8 @@ class ExecutionCandidate:
     relayout_reason: str = ""
     consumer_fused_relayout: bool = False
     consumer_fused_rotation_estimate: int = 0
+    provider_lt_grouping_mode: str = ""
+    native_halo_channel_fold_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -432,14 +443,22 @@ def network_spec(network: str) -> NetworkSpec:
 
 def build_u22_dag(spec: NetworkSpec) -> NetworkDAG:
     torch.manual_seed(0)
-    model = UNet22(dataset=str(spec.dataset), base_channels=int(spec.base_channels))
-    traced = OrionTracer().trace_model(model)
-    x = torch.randn((1, int(spec.input_channels), int(spec.image_size), int(spec.image_size)), dtype=torch.float32)
-    StatsTracker(traced).propagate(x)
-    dag = NetworkDAG(traced)
-    dag.build_dag()
+    previous_scheme = getattr(Module, "scheme", None)
+    planner_scheme = _PackWorkerScheme(slots=DEFAULT_SLOTS, embedding_method="hybrid")
+    Module.set_scheme(planner_scheme)
+    try:
+        model = UNet22(dataset=str(spec.dataset), base_channels=int(spec.base_channels))
+        traced = OrionTracer().trace_model(model)
+        x = torch.randn((1, int(spec.input_channels), int(spec.image_size), int(spec.image_size)), dtype=torch.float32)
+        StatsTracker(traced).propagate(x)
+        dag = NetworkDAG(traced)
+        dag.build_dag()
+    finally:
+        Module.set_scheme(previous_scheme)
     for node in dag.nodes:
         module = dag.nodes[node]["module"]
+        if module is not None:
+            module.scheme = planner_scheme
         if module is not None and hasattr(module, "init_orion_params"):
             module.init_orion_params()
         if module is not None and hasattr(module, "update_params"):
@@ -3439,6 +3458,8 @@ def _dp_output_layout_candidates(
     global_alpha: int,
     global_beta: int,
     slots: int,
+    force_compact_join: bool = False,
+    tconv_dense_fallback: bool = False,
 ) -> tuple[LayoutState, ...]:
     if not outgoing:
         return ()
@@ -3450,6 +3471,8 @@ def _dp_output_layout_candidates(
             slots=int(slots),
         )
     if _is_join_module(module):
+        if bool(force_compact_join):
+            return (outgoing[0].compact,)
         return _dedupe_layouts(
             _layout_for_join_output_shape(
                 LayoutState(**dict(row["selected_layout"])),
@@ -3459,6 +3482,8 @@ def _dp_output_layout_candidates(
             for row in incoming_rows
         )
     if isinstance(module, ConvTranspose2d):
+        if bool(tconv_dense_fallback):
+            return (outgoing[0].compact,)
         return _tconv_output_layout_candidates(
             module,
             incoming_rows=incoming_rows,
@@ -3561,7 +3586,15 @@ def _native_conv_output_target_fits(
             output_physical_top_beta=_layout_physical_top_beta(output_layout),
             output_physical_bottom_beta=_layout_physical_bottom_beta(output_layout),
         )
-        native_halo_conv2d_plan(spec, require_native_target_fit=True)
+        fold_mode = next(
+            (
+                str(row.get("native_halo_channel_fold_mode", ""))
+                for row in incoming_rows
+                if str(row.get("native_halo_channel_fold_mode", ""))
+            ),
+            "",
+        )
+        native_halo_conv2d_plan(spec, require_native_target_fit=True, channel_fold_mode=fold_mode)
         return True
     except ValueError as exc:
         message = str(exc)
@@ -3691,6 +3724,7 @@ def enumerate_execution_candidates(
     global_alpha: int,
     global_beta: int,
     slots: int,
+    no_share_fold: bool = False,
 ) -> tuple[ExecutionCandidate, ...]:
     """Enumerate input-layout execution choices for one non-Add edge.
 
@@ -3709,19 +3743,33 @@ def enumerate_execution_candidates(
             native_relayout = bool(
                 str(edge.source) != "x" and str(source_physical) != PHYSICAL_NATIVE_SOURCE_STRIPE
             )
-            candidates.append(
-                ExecutionCandidate(
-                    edge=edge,
-                    source_layout=source_layout,
-                    target_layout=selected_layout,
-                    source_physical=str(source_physical),
-                    target_physical=PHYSICAL_NATIVE_SOURCE_STRIPE,
-                    layout_mode="native_halo_stripe",
-                    relayout=bool(native_relayout),
-                    relayout_reason="dp_native_source_stripe_relayout" if bool(native_relayout) else "",
+            if bool(no_share_fold) and str(edge.source) == "x":
+                candidates.append(
+                    ExecutionCandidate(
+                        edge=edge,
+                        source_layout=source_layout,
+                        target_layout=selected_layout,
+                        source_physical=str(source_physical),
+                        target_physical=PHYSICAL_COMPACT,
+                        layout_mode="halo_local",
+                    )
                 )
-            )
-            if _compact_halo_shared_allowed(edge, source_layout, str(source_physical)):
+            else:
+                candidates.append(
+                    ExecutionCandidate(
+                        edge=edge,
+                        source_layout=source_layout,
+                        target_layout=selected_layout,
+                        source_physical=str(source_physical),
+                        target_physical=PHYSICAL_NATIVE_SOURCE_STRIPE,
+                        layout_mode="native_halo_stripe",
+                        relayout=bool(native_relayout),
+                        relayout_reason="dp_native_source_stripe_relayout" if bool(native_relayout) else "",
+                        provider_lt_grouping_mode="individual" if bool(no_share_fold) else "",
+                        native_halo_channel_fold_mode="per_stripe" if bool(no_share_fold) else "",
+                    )
+                )
+            if not bool(no_share_fold) and _compact_halo_shared_allowed(edge, source_layout, str(source_physical)):
                 candidates.append(
                     ExecutionCandidate(
                         edge=edge,
@@ -3758,7 +3806,28 @@ def enumerate_execution_candidates(
     for layout in relayout_candidates:
         if source_layout.covers(layout) and _same_physical_layout(source_layout, layout):
             continue
-        if str(edge.op_kind) == "conv2d" and _compact_align_shared_allowed(
+        if (
+            bool(no_share_fold)
+            and str(edge.op_kind) == "conv2d"
+            and str(edge.source) != "x"
+            and layout.covers(edge.requirement)
+        ):
+            candidates.append(
+                ExecutionCandidate(
+                    edge=edge,
+                    source_layout=source_layout,
+                    target_layout=layout,
+                    source_physical=str(source_physical),
+                    target_physical=PHYSICAL_NATIVE_SOURCE_STRIPE,
+                    layout_mode="native_halo_stripe",
+                    relayout=True,
+                    relayout_reason="dp_native_source_stripe_relayout",
+                    provider_lt_grouping_mode="individual",
+                    native_halo_channel_fold_mode="per_stripe",
+                )
+            )
+            continue
+        if not bool(no_share_fold) and str(edge.op_kind) == "conv2d" and _compact_align_shared_allowed(
             edge,
             source_layout,
             str(source_physical),
@@ -3775,7 +3844,7 @@ def enumerate_execution_candidates(
                 relayout_reason="dp_state_consumer_relayout",
             )
         )
-    if _compact_align_shared_allowed(edge, source_layout, str(source_physical)):
+    if not bool(no_share_fold) and _compact_align_shared_allowed(edge, source_layout, str(source_physical)):
         selected_layout = _layout_with_stride(
             source_layout,
             max(int(source_layout.stride), int(edge.requirement.stride)),
@@ -3832,6 +3901,10 @@ def estimate_candidate_cost(
         planner_rotation_cost=planner_rotation_cost,
         estimator=estimator,
     )
+    if candidate.provider_lt_grouping_mode:
+        row["provider_lt_grouping_mode"] = str(candidate.provider_lt_grouping_mode)
+    if candidate.native_halo_channel_fold_mode:
+        row["native_halo_channel_fold_mode"] = str(candidate.native_halo_channel_fold_mode)
     relayouts = [candidate.target_layout] if bool(candidate.relayout) else []
     return [row], relayouts
 
@@ -3890,6 +3963,7 @@ def _incoming_non_add_options(
     global_beta: int,
     slots: int,
     estimator: str | None = None,
+    no_share_fold: bool = False,
 ) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
     candidates = enumerate_execution_candidates(
         edge,
@@ -3898,6 +3972,7 @@ def _incoming_non_add_options(
         global_alpha=int(global_alpha),
         global_beta=int(global_beta),
         slots=int(slots),
+        no_share_fold=bool(no_share_fold),
     )
     return _estimate_candidate_options(candidates, estimator=estimator)
 
@@ -3906,12 +3981,14 @@ def _incoming_add_options(
     incoming: Sequence[EdgeInfo],
     live: dict[str, LayoutState],
     live_physical: dict[str, str],
+    *,
+    force_compact_join: bool = False,
 ) -> tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...]:
     source_layouts = [live[edge.source] for edge in incoming]
     candidates: list[LayoutState] = []
     if incoming:
         candidates.append(incoming[0].compact)
-    if source_layouts:
+    if source_layouts and not bool(force_compact_join):
         edge = incoming[0]
         candidates.append(
             _layout_for_shape(
@@ -3964,6 +4041,7 @@ def _plan_dp(
     *,
     slots: int,
     estimator: str | None = None,
+    no_share_fold: bool = False,
 ) -> PolicyPlan:
     edges_by_source: dict[str, list[EdgeInfo]] = {}
     edges_by_target: dict[str, list[EdgeInfo]] = {}
@@ -4000,7 +4078,12 @@ def _plan_dp(
             if any(edge.source not in live for edge in incoming):
                 continue
             if incoming and _is_join_module(dag.nodes[node].get("module")):
-                incoming_options = _incoming_add_options(incoming, live, live_physical)
+                incoming_options = _incoming_add_options(
+                    incoming,
+                    live,
+                    live_physical,
+                    force_compact_join=bool(no_share_fold),
+                )
             else:
                 incoming_options_work: tuple[tuple[list[dict[str, Any]], list[LayoutState]], ...] = (([], []),)
                 for edge in incoming:
@@ -4012,6 +4095,7 @@ def _plan_dp(
                         global_beta=int(global_beta),
                         slots=int(slots),
                         estimator=estimator,
+                        no_share_fold=bool(no_share_fold),
                     )
                     combined: list[tuple[list[dict[str, Any]], list[LayoutState]]] = []
                     for prefix_rows, prefix_relayouts in incoming_options_work:
@@ -4040,6 +4124,8 @@ def _plan_dp(
                     global_alpha=int(global_alpha),
                     global_beta=int(global_beta),
                     slots=int(slots),
+                    force_compact_join=bool(no_share_fold),
+                    tconv_dense_fallback=bool(no_share_fold),
                 )
                 if not output_candidates:
                     output_candidates = (None,)
@@ -4081,11 +4167,14 @@ def _plan_dp(
                             and _layout_has_physical_halo(output_layout)
                             and _producer_fused_output_allowed(module)
                         )
-                        materialized_halo = bool(producer_fused["enabled"]) or bool(logical_halo_materialized)
+                        materialized_halo = bool(
+                            str(output_physical) != PHYSICAL_COMPACT
+                            and (bool(producer_fused["enabled"]) or bool(logical_halo_materialized))
+                        )
                         materialized_reason = (
                             "dp_producer_materialized_halo"
-                            if bool(producer_fused["enabled"])
-                            else ("dp_logical_halo_materialized_output" if bool(logical_halo_materialized) else "")
+                            if bool(producer_fused["enabled"]) or bool(logical_halo_materialized)
+                            else ""
                         )
                         output_layout_rows.append(
                             _node_layout_row(
@@ -4158,7 +4247,7 @@ def _plan_dp(
     rows = [{**dict(row), "dp_state_planned": True} for row in best_state.edge_rows]
     rows.sort(key=lambda row: (topo_index.get(str(row["source"]), 10**9), topo_index.get(str(row["target"]), 10**9)))
     return _finalize_policy(
-        policy="dp",
+        policy="dp_no_share_fold" if bool(no_share_fold) else "dp",
         edge_rows=rows,
         relayout_layouts=list(best_state.relayout_layouts),
         node_layouts=list(best_state.node_layouts),
@@ -4230,7 +4319,57 @@ def plan_policy(
         return _plan_orion_dense(dag, edges, slots=int(slots))
     if normalized == "dp":
         return _plan_dp(dag, edges, slots=int(slots), estimator=estimator)
+    if normalized == "dp_no_share_fold":
+        return _plan_dp(dag, edges, slots=int(slots), estimator=estimator, no_share_fold=True)
     raise AssertionError(f"unreachable policy {policy!r}")
+
+
+def validate_layout_policy_compile_plan(compile_plan: dict[str, Any]) -> dict[str, Any]:
+    """Check policy invariants that are easy to lose in DP refactors."""
+
+    policy = str(compile_plan.get("policy", ""))
+    errors: list[str] = []
+    if policy == "dp_no_share_fold":
+        for row in compile_plan.get("edge_layouts", []):
+            edge = str(row.get("edge", ""))
+            op_kind = str(row.get("op_kind", ""))
+            selected = dict(row.get("selected_layout", {}) or {})
+            physical = str(row.get("physical_layout", "") or "")
+            target_physical = str(row.get("target_physical_layout", "") or physical)
+            if op_kind == "concat":
+                if (
+                    int(selected.get("top_beta", 0) or 0) != 0
+                    or int(selected.get("bottom_beta", 0) or 0) != 0
+                    or target_physical != PHYSICAL_COMPACT
+                ):
+                    errors.append(f"{edge}: concat boundary must stay packed compact")
+            if op_kind == "conv_transpose2d" and physical == PHYSICAL_NATIVE_SOURCE_STRIPE:
+                errors.append(f"{edge}: ConvTranspose2d must stay on the dense/compact path")
+            if str(row.get("source", "")) == "x" and physical == PHYSICAL_NATIVE_SOURCE_STRIPE:
+                errors.append(f"{edge}: raw input must stay compact encoded")
+            if bool(row.get("consumer_fused_relayout", False)) and bool(row.get("producer_fused_relayout", False)):
+                errors.append(f"{edge}: producer and consumer fused relayout are both set")
+            if (
+                op_kind == "conv2d"
+                and physical == PHYSICAL_NATIVE_SOURCE_STRIPE
+                and str(row.get("provider_lt_grouping_mode", "")) != "individual"
+            ):
+                errors.append(f"{edge}: native fold candidate must request individual LT grouping")
+            if (
+                op_kind == "conv2d"
+                and physical == PHYSICAL_NATIVE_SOURCE_STRIPE
+                and str(row.get("native_halo_channel_fold_mode", "")) != "per_stripe"
+            ):
+                errors.append(f"{edge}: native fold candidate must request per-stripe channel fold mode")
+    for row in compile_plan.get("node_layouts", []):
+        if (
+            str(row.get("physical_layout", "") or "") == PHYSICAL_COMPACT
+            and bool(row.get("producer_materialized_halo", False))
+        ):
+            errors.append(f"{row.get('node', '')}: packed compact node cannot materialize physical halo")
+    if errors:
+        raise ValueError("invalid layout policy compile plan: " + "; ".join(errors))
+    return {"ok": True, "policy": policy, "error_count": 0}
 
 
 def build_layout_policy_compile_plan(
@@ -4287,7 +4426,7 @@ def build_layout_policy_compile_plan(
         sum(int(row.get("depth_estimate", 0) or 0) for row in relayout_edges)
         + sum(int(row.get("depth_estimate", 0)) for row in output_relayout_nodes)
     )
-    return {
+    compile_plan = {
         "status": "ok",
         "policy": str(plan.policy),
         "policy_label": str(plan.policy_label),
@@ -4303,6 +4442,8 @@ def build_layout_policy_compile_plan(
         "edge_layouts": edge_layouts,
         "node_layouts": node_layouts,
     }
+    compile_plan["validation"] = validate_layout_policy_compile_plan(compile_plan)
+    return compile_plan
 
 
 def build_planner_ablation(

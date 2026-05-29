@@ -161,10 +161,11 @@ def _iter_layout_policy_executors(network_dag: Any) -> list[Any]:
             if id(current) in seen:
                 continue
             seen.add(id(current))
-            if isinstance(getattr(current, "compile_plan", None), dict):
+            current_dict = getattr(current, "__dict__", {})
+            if isinstance(current_dict.get("compile_plan"), dict):
                 executors.append(current)
-            for attr in ("base_executor", "delegate", "executor"):
-                child = getattr(current, attr, None)
+            for attr in ("base_executor", "delegate", "_delegate", "executor"):
+                child = current_dict.get(attr)
                 if child is not None:
                     stack.append(child)
     return executors
@@ -188,6 +189,7 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
     compressed_nodes: set[str] = set()
     audit_nodes: list[dict[str, Any]] = []
     queue: list[str] = []
+    force_compact = str(compile_plan.get("policy", "")) == "dp_no_share_fold"
     for node in sorted(str(value) for value in bootstrap_nodes):
         row = node_rows.get(str(node))
         if row is None:
@@ -196,7 +198,13 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
         compact = _compact_layout_for_row(row)
         current_tiles = max(1, int(selected.get("tile_count", compact.get("tile_count", 1)) or 1))
         compact_tiles = max(1, int(compact.get("tile_count", current_tiles) or 1))
-        if int(current_tiles) <= int(compact_tiles):
+        already_compact = bool(
+            not _layout_has_halo(selected)
+            and str(row.get("physical_layout", PHYSICAL_COMPACT) or PHYSICAL_COMPACT) == PHYSICAL_COMPACT
+        )
+        if bool(already_compact):
+            continue
+        if int(current_tiles) <= int(compact_tiles) and not bool(force_compact):
             continue
         node_rows[str(node)] = _copy_node_with_compact_layout(row)
         compressed_nodes.add(str(node))
@@ -206,7 +214,8 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
                 "node": str(node),
                 "current_tile_count": int(current_tiles),
                 "compact_tile_count": int(compact_tiles),
-                "saved_ciphertexts_per_bootstrap": int(current_tiles - compact_tiles),
+                "saved_ciphertexts_per_bootstrap": int(max(0, int(current_tiles - compact_tiles))),
+                "forced_compact_boundary": bool(force_compact),
                 "current_layout": dict(selected),
                 "compact_layout": dict(compact),
             }

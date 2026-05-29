@@ -638,7 +638,7 @@ class Conv2d(LinearTransform):
             def build_source(source_block: int) -> tuple[int, list[tuple[int, object]]]:
                 ordered: list[tuple[int, object]] = []
                 for stripe in plan.stripes:
-                    for target_group in range(int(plan.target_channel_group_count)):
+                    for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
                         for target_block in range(int(target_ct_count)):
                             transform = _build_compact_source_conv_transform(
                                 spec=native_spec,

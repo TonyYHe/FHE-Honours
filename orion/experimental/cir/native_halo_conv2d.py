@@ -390,6 +390,8 @@ class NativeHaloStripe:
     target_h_end: int
     source_h_start: int
     source_h_end: int
+    source_channel_tile: int = 0
+    target_channel_tile: int = 0
 
     @property
     def source_h(self) -> int:
@@ -409,6 +411,8 @@ class NativeHaloStripe:
             "stored_source_rows": int(self.source_h),
             "target_rows": int(self.target_h),
             "halo_redundant_rows": int(self.source_h - self.target_h),
+            "source_channel_tile": int(self.source_channel_tile or 0),
+            "target_channel_tile": int(self.target_channel_tile or 0),
         }
 
 
@@ -424,18 +428,72 @@ class NativeHaloConv2DPlan:
     group_shared_rotations: tuple[int, ...]
     group_baby_rotations: tuple[int, ...]
     group_giant_rotations: tuple[int, ...]
+    channel_fold_mode: str = "heuristic"
 
     @property
     def source_channel_group_count(self) -> int:
-        return _ceil_div(int(self.spec.c_in), int(self.source_channel_tile))
+        return max(int(value) for value in self.source_channel_group_counts)
 
     @property
     def target_channel_group_count(self) -> int:
-        return _ceil_div(int(self.spec.c_out), int(self.target_channel_tile))
+        return max(int(value) for value in self.target_channel_group_counts)
+
+    def source_tile_for_stripe(self, stripe: NativeHaloStripe) -> int:
+        return int(stripe.source_channel_tile or self.source_channel_tile)
+
+    def target_tile_for_stripe(self, stripe: NativeHaloStripe) -> int:
+        return int(stripe.target_channel_tile or self.target_channel_tile)
+
+    def source_group_count_for_stripe(self, stripe: NativeHaloStripe) -> int:
+        return _ceil_div(int(self.spec.c_in), int(self.source_tile_for_stripe(stripe)))
+
+    def target_group_count_for_stripe(self, stripe: NativeHaloStripe) -> int:
+        return _ceil_div(int(self.spec.c_out), int(self.target_tile_for_stripe(stripe)))
+
+    @property
+    def source_channel_group_counts(self) -> tuple[int, ...]:
+        return tuple(int(self.source_group_count_for_stripe(stripe)) for stripe in self.stripes)
+
+    @property
+    def target_channel_group_counts(self) -> tuple[int, ...]:
+        return tuple(int(self.target_group_count_for_stripe(stripe)) for stripe in self.stripes)
+
+    @property
+    def source_stripe_offsets(self) -> tuple[int, ...]:
+        offsets: list[int] = []
+        total = 0
+        for count in self.source_channel_group_counts:
+            offsets.append(int(total))
+            total += int(count)
+        return tuple(offsets)
+
+    @property
+    def target_stripe_offsets(self) -> tuple[int, ...]:
+        offsets: list[int] = []
+        total = 0
+        for count in self.target_channel_group_counts:
+            offsets.append(int(total))
+            total += int(count)
+        return tuple(offsets)
+
+    def source_block_index(self, stripe: NativeHaloStripe, group: int) -> int:
+        return int(self.source_stripe_offsets[int(stripe.index)] + int(group))
+
+    def target_block_index(self, stripe: NativeHaloStripe, group: int) -> int:
+        return int(self.target_stripe_offsets[int(stripe.index)] + int(group))
+
+    def target_stripe_and_group_for_block(self, block_index: int) -> tuple[NativeHaloStripe, int] | None:
+        block_index = int(block_index)
+        offsets = self.target_stripe_offsets
+        counts = self.target_channel_group_counts
+        for stripe, offset, count in zip(self.stripes, offsets, counts, strict=True):
+            if int(offset) <= int(block_index) < int(offset) + int(count):
+                return stripe, int(block_index - int(offset))
+        return None
 
     @property
     def input_ct_count(self) -> int:
-        return int(len(self.stripes) * int(self.source_channel_group_count))
+        return int(sum(int(value) for value in self.source_channel_group_counts))
 
     @property
     def output_ct_count(self) -> int:
@@ -447,7 +505,7 @@ class NativeHaloConv2DPlan:
                 int(self.spec.gap_out),
                 int(self.spec.slot_count),
             )
-        return int(len(self.stripes) * int(self.target_channel_group_count))
+        return int(sum(int(value) for value in self.target_channel_group_counts))
 
     @property
     def submatrix_program_count(self) -> int:
@@ -477,6 +535,7 @@ class NativeHaloConv2DPlan:
         return {
             "runtime_layout": "native_halo_stripe_no_ri",
             "conv_dependency": "native_halo_source_tiles",
+            "channel_fold_mode": str(self.channel_fold_mode),
             "output_storage_layout": (
                 "native_halo_stripe"
                 if _spec_has_physical_output_halo(self.spec)
@@ -487,6 +546,10 @@ class NativeHaloConv2DPlan:
             "target_channel_tile": int(self.target_channel_tile),
             "source_channel_group_count": int(self.source_channel_group_count),
             "target_channel_group_count": int(self.target_channel_group_count),
+            "source_channel_group_counts": [int(value) for value in self.source_channel_group_counts],
+            "target_channel_group_counts": [int(value) for value in self.target_channel_group_counts],
+            "source_stripe_offsets": [int(value) for value in self.source_stripe_offsets],
+            "target_stripe_offsets": [int(value) for value in self.target_stripe_offsets],
             "stripe_count": int(len(self.stripes)),
             "input_ct_count": int(self.input_ct_count),
             "output_ct_count": int(self.output_ct_count),
@@ -555,12 +618,13 @@ def _collect_compact_source_conv_diag_sets(
     compact_target_block: int | None = None,
 ) -> dict[int, set[int]]:
     slots = int(spec.slot_count)
-    target_start = int(target_group) * int(plan.target_channel_tile)
-    target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
     target_count = int(target_end - target_start)
     if int(target_count) <= 0:
         return {}
-    target_index_key = int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
+    target_index_key = int(plan.target_block_index(stripe, int(target_group)))
     source_channels = torch.arange(int(spec.c_in), dtype=torch.int64)
     target_channels = (
         torch.arange(int(target_start), int(target_end), dtype=torch.int64)
@@ -851,9 +915,10 @@ def _build_compact_source_concat_transforms_single_slot(
             if bool(fuse_output_relayout)
             else out_h_values
         )
-        for target_group in range(int(plan.target_channel_group_count)):
-            target_start = int(target_group) * int(plan.target_channel_tile)
-            target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
+        for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+            target_tile = int(plan.target_tile_for_stripe(stripe))
+            target_start = int(target_group) * int(target_tile)
+            target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
             target_count = int(target_end - target_start)
             if int(target_count) <= 0:
                 continue
@@ -1016,12 +1081,16 @@ def native_halo_conv2d_spec_from_module(module: Any, *, output_node_id: str) -> 
     output_gap = int(getattr(module, "output_gap", input_gap))
     input_layout = dict(getattr(module, "layout_policy_input_layout", {}) or {})
     output_layout = dict(getattr(module, "layout_policy_output_layout", {}) or {})
-    params = getattr(getattr(module, "scheme", None), "params", None)
-    get_slots = getattr(params, "get_slots", None)
-    try:
-        slot_count = int(get_slots()) if callable(get_slots) else int(RING_SLOT_COUNT)
-    except Exception:
-        slot_count = int(RING_SLOT_COUNT)
+    explicit_slot_count = int(getattr(module, "layout_policy_slot_count", 0) or 0)
+    if int(explicit_slot_count) > 0:
+        slot_count = int(explicit_slot_count)
+    else:
+        params = getattr(getattr(module, "scheme", None), "params", None)
+        get_slots = getattr(params, "get_slots", None)
+        try:
+            slot_count = int(get_slots()) if callable(get_slots) else int(RING_SLOT_COUNT)
+        except Exception:
+            slot_count = int(RING_SLOT_COUNT)
     raw_label = str(getattr(module, "name", "") or output_node_id or "conv")
     label = "".join(ch if ch.isalnum() else "_" for ch in raw_label).strip("_") or "conv"
     return NativeHaloConv2DSpec(
@@ -1194,29 +1263,220 @@ def _diag_indices_for_task(
 
 _PLAN_CACHE: dict[tuple[Any, ...], NativeHaloConv2DPlan] = {}
 
+_CACHE_PLAN_GUARD_KEYS = (
+    "spec",
+    "input_ct_count",
+    "output_ct_count",
+    "source_channel_group_count",
+    "target_channel_group_count",
+    "source_channel_group_counts",
+    "target_channel_group_counts",
+    "source_stripe_offsets",
+    "target_stripe_offsets",
+    "stripes",
+)
+
+
+def _cache_plan_guard(plan: dict[str, Any]) -> dict[str, Any]:
+    return {key: plan.get(key) for key in _CACHE_PLAN_GUARD_KEYS}
+
+
+def _normalise_channel_fold_mode(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"", "heuristic", "native", "uniform"}:
+        return "heuristic"
+    if text in {"per_stripe", "perstripe", "variable", "variable_per_stripe"}:
+        return "per_stripe"
+    raise ValueError(f"unsupported native halo channel fold mode: {value!r}")
+
+
+def _channel_tile_candidates(channel_count: int, gap: int) -> tuple[int, ...]:
+    phase = _phase_count(int(gap))
+    max_fold = max(1, _ceil_div(int(channel_count), int(phase)))
+    folds = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, int(max_fold)]
+    tiles = {
+        min(int(channel_count), int(phase) * int(fold))
+        for fold in folds
+        if 1 <= int(fold) <= int(max_fold)
+    }
+    return tuple(sorted(int(tile) for tile in tiles if int(tile) > 0))
+
+
+def _source_h_capacity_for_tile(spec: NativeHaloConv2DSpec, source_tile: int) -> int:
+    source_groups_per_tile = _ceil_div(int(source_tile), _phase_count(int(spec.gap_in)))
+    denom = int(source_groups_per_tile) * int(spec.w_in) * _phase_count(int(spec.gap_in))
+    input_total_h = int(spec.input_h_max) - int(spec.input_h_min)
+    return min(int(input_total_h), max(1, int(spec.slot_count) // max(1, int(denom))))
+
+
+def _with_stripe_channel_tiles(
+    stripe: NativeHaloStripe,
+    *,
+    source_tile: int,
+    target_tile: int,
+    source_h_start: int | None = None,
+    source_h_end: int | None = None,
+) -> NativeHaloStripe:
+    return NativeHaloStripe(
+        index=int(stripe.index),
+        target_h_start=int(stripe.target_h_start),
+        target_h_end=int(stripe.target_h_end),
+        source_h_start=int(stripe.source_h_start if source_h_start is None else source_h_start),
+        source_h_end=int(stripe.source_h_end if source_h_end is None else source_h_end),
+        source_channel_tile=int(source_tile),
+        target_channel_tile=int(target_tile),
+    )
+
+
+def _per_stripe_fold_stripes(
+    spec: NativeHaloConv2DSpec,
+    *,
+    base_source_tile: int,
+    base_target_tile: int,
+) -> tuple[NativeHaloStripe, ...]:
+    base_source_h = _source_h_capacity_for_tile(spec, int(base_source_tile))
+    target_stripes = _stripes_for_source_h(spec, source_h=int(base_source_h))
+    source_tiles = _channel_tile_candidates(int(spec.c_in), int(spec.gap_in))
+    target_tiles = _channel_tile_candidates(int(spec.c_out), int(spec.gap_out))
+    diag_cache: dict[tuple[int, int, int, int, int], set[int]] = {}
+    bsgs_cache: dict[tuple[int, ...], int] = {}
+    selected: list[NativeHaloStripe] = []
+    for target_stripe in target_stripes:
+        req0, req1 = _source_h_range_for_target(
+            target_h_start=int(target_stripe.target_h_start),
+            target_h_end=int(target_stripe.target_h_end),
+            input_h_min=int(spec.input_h_min),
+            input_h_max=int(spec.input_h_max),
+            kernel=int(spec.kernel),
+            stride=int(spec.stride),
+            pad=int(spec.pad),
+            dilation=int(spec.dilation),
+        )
+        req_h = int(req1 - req0)
+        candidate_specs: list[tuple[tuple[int, int, int, int], int, int, NativeHaloStripe]] = []
+        best: tuple[tuple[int, int, int, int], NativeHaloStripe] | None = None
+        for source_tile in source_tiles:
+            source_h_capacity = _source_h_capacity_for_tile(spec, int(source_tile))
+            if int(req_h) <= 0 or int(req_h) > int(source_h_capacity):
+                continue
+            for target_tile in target_tiles:
+                candidate = _with_stripe_channel_tiles(
+                    target_stripe,
+                    source_tile=int(source_tile),
+                    target_tile=int(target_tile),
+                    source_h_start=int(req0),
+                    source_h_end=int(req1),
+                )
+                if _packed_active_slots(int(source_tile), int(candidate.source_h), int(spec.w_in), int(spec.gap_in)) > int(spec.slot_count):
+                    continue
+                if _packed_active_slots(int(target_tile), int(candidate.target_h), int(spec.w_out), int(spec.gap_out)) > int(spec.slot_count):
+                    continue
+                source_group_count = _ceil_div(int(spec.c_in), int(source_tile))
+                target_group_count = _ceil_div(int(spec.c_out), int(target_tile))
+                programs = int(source_group_count) * int(target_group_count)
+                candidate_specs.append(
+                    (
+                        (
+                            int(programs),
+                            int(source_group_count + target_group_count),
+                            -int(source_tile),
+                            -int(target_tile),
+                        ),
+                        int(source_group_count),
+                        int(target_group_count),
+                        candidate,
+                    )
+                )
+        for _approx_score, source_group_count, target_group_count, candidate in sorted(candidate_specs, key=lambda item: item[0])[:32]:
+            source_tile = int(candidate.source_channel_tile)
+            target_tile = int(candidate.target_channel_tile)
+            rotations = 0
+            programs = 0
+            for source_group in range(int(source_group_count)):
+                source_start = int(source_group) * int(source_tile)
+                source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+                source_count = int(source_end - source_start)
+                for target_group in range(int(target_group_count)):
+                    target_start = int(target_group) * int(target_tile)
+                    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
+                    target_count = int(target_end - target_start)
+                    key = (
+                        int(candidate.target_h),
+                        int(candidate.source_h),
+                        int(candidate.source_h_start),
+                        int(source_count),
+                        int(target_count),
+                    )
+                    if key not in diag_cache:
+                        diag_cache[key] = _diag_indices_for_task(
+                            spec,
+                            candidate,
+                            source_channel_count=int(source_count),
+                            target_channel_count=int(target_count),
+                        )
+                    diag_indices = diag_cache[key]
+                    bkey = tuple(sorted(int(value) for value in diag_indices))
+                    if bkey not in bsgs_cache:
+                        _n1, cost, _baby, _giant = _native_best_common_bsgs((diag_indices,), slots=int(spec.slot_count))
+                        bsgs_cache[bkey] = int(cost)
+                    rotations += int(bsgs_cache[bkey])
+                    programs += 1
+            score = (
+                int(rotations),
+                int(source_group_count + target_group_count),
+                int(programs),
+                -int(source_tile),
+            )
+            if best is None or score < best[0]:
+                best = (score, candidate)
+        if best is None:
+            selected.append(
+                _with_stripe_channel_tiles(
+                    target_stripe,
+                    source_tile=int(base_source_tile),
+                    target_tile=int(base_target_tile),
+                )
+            )
+        else:
+            selected.append(best[1])
+    return tuple(selected)
+
 
 def native_halo_conv2d_plan(
     spec: NativeHaloConv2DSpec,
     *,
     require_native_target_fit: bool = True,
+    channel_fold_mode: str | None = None,
 ) -> NativeHaloConv2DPlan:
-    key = (tuple(spec.to_dict().items()), bool(require_native_target_fit))
+    fold_mode = _normalise_channel_fold_mode(channel_fold_mode)
+    key = (tuple(spec.to_dict().items()), bool(require_native_target_fit), str(fold_mode))
     cached = _PLAN_CACHE.get(key)
     if cached is not None:
         return cached
 
     source_tile = _heuristic_channel_tile(int(spec.c_in), int(spec.gap_in))
     target_tile = _heuristic_channel_tile(int(spec.c_out), int(spec.gap_out))
-    source_groups_per_tile = _ceil_div(int(source_tile), _phase_count(int(spec.gap_in)))
-    denom = int(source_groups_per_tile) * int(spec.w_in) * _phase_count(int(spec.gap_in))
-    input_total_h = int(spec.input_h_max) - int(spec.input_h_min)
-    source_h = min(int(input_total_h), max(1, int(spec.slot_count) // max(1, int(denom))))
+    source_h = _source_h_capacity_for_tile(spec, int(source_tile))
     if _packed_active_slots(int(source_tile), int(source_h), int(spec.w_in), int(spec.gap_in)) > int(spec.slot_count):
         raise ValueError(f"native halo source tile does not fit {spec.family_label}")
-    stripes = _stripes_for_source_h(spec, source_h=int(source_h))
+    if str(fold_mode) == "per_stripe":
+        stripes = _per_stripe_fold_stripes(
+            spec,
+            base_source_tile=int(source_tile),
+            base_target_tile=int(target_tile),
+        )
+    else:
+        stripes = tuple(
+            _with_stripe_channel_tiles(
+                stripe,
+                source_tile=int(source_tile),
+                target_tile=int(target_tile),
+            )
+            for stripe in _stripes_for_source_h(spec, source_h=int(source_h))
+        )
     if bool(require_native_target_fit) and any(
         _packed_active_slots(
-            int(target_tile),
+            int(target_tile if not int(stripe.target_channel_tile or 0) else stripe.target_channel_tile),
             int(stripe.target_h),
             int(spec.w_out),
             int(spec.gap_out),
@@ -1225,8 +1485,6 @@ def native_halo_conv2d_plan(
         for stripe in stripes
     ):
         raise ValueError(f"native halo target tile does not fit {spec.family_label}")
-    source_group_count = _ceil_div(int(spec.c_in), int(source_tile))
-    target_group_count = _ceil_div(int(spec.c_out), int(target_tile))
     diag_cache: dict[tuple[int, int, int], set[int]] = {}
     program_diags: list[int] = []
     program_rots: list[int] = []
@@ -1235,13 +1493,17 @@ def native_halo_conv2d_plan(
     group_baby: list[int] = []
     group_giant: list[int] = []
     for stripe in stripes:
+        stripe_source_tile = int(stripe.source_channel_tile or source_tile)
+        stripe_target_tile = int(stripe.target_channel_tile or target_tile)
+        source_group_count = _ceil_div(int(spec.c_in), int(stripe_source_tile))
+        target_group_count = _ceil_div(int(spec.c_out), int(stripe_target_tile))
         for source_group in range(int(source_group_count)):
-            source_start = int(source_group) * int(source_tile)
-            source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+            source_start = int(source_group) * int(stripe_source_tile)
+            source_end = min(int(spec.c_in), int(source_start) + int(stripe_source_tile))
             entries: list[set[int]] = []
             for target_group in range(int(target_group_count)):
-                target_start = int(target_group) * int(target_tile)
-                target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
+                target_start = int(target_group) * int(stripe_target_tile)
+                target_end = min(int(spec.c_out), int(target_start) + int(stripe_target_tile))
                 diag_key = (
                     int(stripe.index),
                     int(source_end - source_start),
@@ -1282,6 +1544,7 @@ def native_halo_conv2d_plan(
         group_shared_rotations=tuple(group_rots),
         group_baby_rotations=tuple(group_baby),
         group_giant_rotations=tuple(group_giant),
+        channel_fold_mode=str(fold_mode),
     )
     _PLAN_CACHE[key] = plan
     return plan
@@ -1323,10 +1586,11 @@ def native_halo_source_plaintext_blocks_from_nchw(
     slots = int(spec.slot_count)
     blocks: list[torch.Tensor] = []
     for stripe in plan.stripes:
-        for group in range(int(plan.source_channel_group_count)):
+        source_tile = int(plan.source_tile_for_stripe(stripe))
+        for group in range(int(plan.source_group_count_for_stripe(stripe))):
             block = torch.zeros((int(slots),), dtype=torch.float32)
-            channel_start = int(group) * int(plan.source_channel_tile)
-            channel_end = min(int(spec.c_in), int(channel_start) + int(plan.source_channel_tile))
+            channel_start = int(group) * int(source_tile)
+            channel_end = min(int(spec.c_in), int(channel_start) + int(source_tile))
             for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
                 for local_h in range(int(stripe.source_h)):
                     global_h = int(stripe.source_h_start) + int(local_h)
@@ -1420,7 +1684,7 @@ class NativeHaloRelayoutKernel:
         )
 
     def _native_source_index(self, *, stripe: NativeHaloStripe, group: int, channel: int, h: int, w: int) -> int:
-        block = int(stripe.index) * int(self.plan.source_channel_group_count) + int(group)
+        block = int(self.plan.source_block_index(stripe, int(group)))
         return int(block) * int(self.spec.slot_count) + _idx_chw_gap(
             int(channel),
             int(h),
@@ -1431,7 +1695,7 @@ class NativeHaloRelayoutKernel:
         )
 
     def _native_target_index(self, *, stripe: NativeHaloStripe, group: int, channel: int, h: int, w: int) -> int:
-        block = int(stripe.index) * int(self.plan.target_channel_group_count) + int(group)
+        block = int(self.plan.target_block_index(stripe, int(group)))
         return int(block) * int(self.spec.slot_count) + _idx_chw_gap(
             int(channel),
             int(h),
@@ -1443,9 +1707,10 @@ class NativeHaloRelayoutKernel:
 
     def _iter_compact_to_native(self):
         for stripe in self.plan.stripes:
-            for group in range(int(self.plan.source_channel_group_count)):
-                channel_start = int(group) * int(self.plan.source_channel_tile)
-                channel_end = min(int(self.spec.c_in), int(channel_start) + int(self.plan.source_channel_tile))
+            source_tile = int(self.plan.source_tile_for_stripe(stripe))
+            for group in range(int(self.plan.source_group_count_for_stripe(stripe))):
+                channel_start = int(group) * int(source_tile)
+                channel_end = min(int(self.spec.c_in), int(channel_start) + int(source_tile))
                 for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
                     for global_h in range(int(stripe.source_h_start), int(stripe.source_h_end)):
                         local_h = int(global_h) - int(stripe.source_h_start)
@@ -1470,9 +1735,10 @@ class NativeHaloRelayoutKernel:
 
     def _iter_native_to_compact(self):
         for stripe in self.plan.stripes:
-            for group in range(int(self.plan.target_channel_group_count)):
-                channel_start = int(group) * int(self.plan.target_channel_tile)
-                channel_end = min(int(self.spec.c_out), int(channel_start) + int(self.plan.target_channel_tile))
+            target_tile = int(self.plan.target_tile_for_stripe(stripe))
+            for group in range(int(self.plan.target_group_count_for_stripe(stripe))):
+                channel_start = int(group) * int(target_tile)
+                channel_end = min(int(self.spec.c_out), int(channel_start) + int(target_tile))
                 for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
                     for global_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
                         local_h = int(global_h) - int(stripe.target_h_start)
@@ -1615,10 +1881,12 @@ def _build_conv_transform(
 ) -> Any | None:
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
-    source_start = int(source_group) * int(plan.source_channel_tile)
-    source_end = min(int(spec.c_in), int(source_start) + int(plan.source_channel_tile))
-    target_start = int(target_group) * int(plan.target_channel_tile)
-    target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
+    source_tile = int(plan.source_tile_for_stripe(stripe))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    source_start = int(source_group) * int(source_tile)
+    source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
     source_count = int(source_end - source_start)
     target_count = int(target_end - target_start)
     key_parts: list[torch.Tensor] = []
@@ -1765,9 +2033,9 @@ def _build_conv_transform(
     target_index = (
         int(compact_target_block)
         if bool(compact_output)
-        else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
+        else int(plan.target_block_index(stripe, int(target_group)))
     )
-    source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
+    source_index = int(plan.source_block_index(stripe, int(source_group)))
     diag_set = set(int(value) for value in torch.unique_consecutive(diag_indices).tolist())
     if not diag_set:
         return None
@@ -1894,10 +2162,12 @@ def _build_conv_transforms_for_compact_output(
     force_payload: bool = False,
 ) -> list[tuple[int, Any]]:
     slots = int(spec.slot_count)
-    source_start = int(source_group) * int(plan.source_channel_tile)
-    source_end = min(int(spec.c_in), int(source_start) + int(plan.source_channel_tile))
-    target_start = int(target_group) * int(plan.target_channel_tile)
-    target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
+    source_tile = int(plan.source_tile_for_stripe(stripe))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    source_start = int(source_group) * int(source_tile)
+    source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
     source_count = int(source_end - source_start)
     target_count = int(target_end - target_start)
     if source_count <= 0 or target_count <= 0:
@@ -2011,7 +2281,7 @@ def _build_conv_transforms_for_compact_output(
                     value_parts_by_block.setdefault(int(block), []).append(flat_values[pair_mask])
 
     transforms: list[tuple[int, Any]] = []
-    source_index = int(stripe.index) * int(plan.source_channel_group_count) + int(source_group)
+    source_index = int(plan.source_block_index(stripe, int(source_group)))
     single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
     diagonal_cache: _BlockDiagonalCache | None = None
     if bool(single_slot_recipe):
@@ -2214,7 +2484,7 @@ def _build_compact_source_conv_transform(
         target_index = (
             int(compact_target_block)
             if bool(compact_output)
-            else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
+            else int(plan.target_block_index(stripe, int(target_group)))
         )
         diag_set = diag_sets_by_target.get(int(target_index), set())
         if not diag_set:
@@ -2272,8 +2542,9 @@ def _build_compact_source_conv_transform(
             compact_target_block=compact_target_block,
             diagonal_cache=cache,
         )
-    target_start = int(target_group) * int(plan.target_channel_tile)
-    target_end = min(int(spec.c_out), int(target_start) + int(plan.target_channel_tile))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
     target_count = int(target_end - target_start)
     target_slots = (
         None
@@ -2427,7 +2698,7 @@ def _build_compact_source_conv_transform(
     target_index = (
         int(compact_target_block)
         if bool(compact_output)
-        else int(stripe.index) * int(plan.target_channel_group_count) + int(target_group)
+        else int(plan.target_block_index(stripe, int(target_group)))
     )
     diag_set = set(int(value) for value in torch.unique_consecutive(diag_indices).tolist())
     if not diag_set:
@@ -2510,9 +2781,11 @@ class NativeHaloStripeNoRIConvExecutor:
         self.spec = spec
         self.output_node_id = str(output_node_id)
         self._native_plan_require_target_fit = not self._uses_tight_compact_output_for_spec(spec)
+        fold_mode = self._channel_fold_mode()
         self.native_plan = native_halo_conv2d_plan(
             spec,
             require_native_target_fit=bool(self._native_plan_require_target_fit),
+            channel_fold_mode=str(fold_mode),
         )
         self.slots = int(spec.slot_count)
         self.rows = int(self.native_plan.output_ct_count)
@@ -2614,7 +2887,7 @@ class NativeHaloStripeNoRIConvExecutor:
         )
 
     def _native_stripe_output_ct_count(self) -> int:
-        return int(len(self.native_plan.stripes) * int(self.native_plan.target_channel_group_count))
+        return int(self.native_plan.output_ct_count)
 
     def runtime_native_fhe_output_shape(self) -> torch.Size:
         if self._uses_tight_compact_output():
@@ -2640,14 +2913,17 @@ class NativeHaloStripeNoRIConvExecutor:
     def _refresh_runtime_plan(self) -> bool:
         runtime_spec = self._runtime_spec()
         require_native_target_fit = not self._uses_tight_compact_output_for_spec(runtime_spec)
+        fold_mode = self._channel_fold_mode()
         changed = (
             tuple(runtime_spec.to_dict().items()) != tuple(self.native_plan.spec.to_dict().items())
             or bool(require_native_target_fit) != bool(self._native_plan_require_target_fit)
+            or str(fold_mode) != str(self.native_plan.channel_fold_mode)
         )
         if bool(changed):
             self.native_plan = native_halo_conv2d_plan(
                 runtime_spec,
                 require_native_target_fit=bool(require_native_target_fit),
+                channel_fold_mode=str(fold_mode),
             )
             self._native_plan_require_target_fit = bool(require_native_target_fit)
         self.slots = int(self.native_plan.spec.slot_count)
@@ -2683,6 +2959,7 @@ class NativeHaloStripeNoRIConvExecutor:
             "per_linear_transform",
             "disable_shared_rotation",
             "no_shared_rotation",
+            "no_share",
         }:
             return "individual"
         raise ValueError(f"unsupported provider LT grouping mode: {value!r}")
@@ -2695,6 +2972,11 @@ class NativeHaloStripeNoRIConvExecutor:
         if bool(getattr(self.module, "layout_policy_provider_disable_shared_rotation", False)):
             return "individual"
         return "shared"
+
+    def _channel_fold_mode(self) -> str:
+        return _normalise_channel_fold_mode(
+            getattr(self.module, "layout_policy_native_halo_channel_fold_mode", "")
+        )
 
     def _reset_runtime_groups(self) -> None:
         self.runtime_groups = []
@@ -2836,14 +3118,13 @@ class NativeHaloStripeNoRIConvExecutor:
             return None
         if self._uses_tight_compact_output():
             return self._compact_bias_chunk(block_index=int(block_index))
-        target_group_count = int(self.native_plan.target_channel_group_count)
-        stripe_index = int(block_index) // int(target_group_count)
-        target_group = int(block_index) % int(target_group_count)
-        if int(stripe_index) >= len(self.native_plan.stripes):
+        stripe_group = self.native_plan.target_stripe_and_group_for_block(int(block_index))
+        if stripe_group is None:
             return None
-        stripe = self.native_plan.stripes[int(stripe_index)]
-        channel_start = int(target_group) * int(self.native_plan.target_channel_tile)
-        channel_end = min(int(self.spec.c_out), int(channel_start) + int(self.native_plan.target_channel_tile))
+        stripe, target_group = stripe_group
+        target_tile = int(self.native_plan.target_tile_for_stripe(stripe))
+        channel_start = int(target_group) * int(target_tile)
+        channel_end = min(int(self.spec.c_out), int(channel_start) + int(target_tile))
         out = torch.zeros((int(self.slots),), dtype=torch.float32)
         for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
             bias_value = float(self.bias_vector[int(channel)])
@@ -2915,6 +3196,29 @@ class NativeHaloStripeNoRIConvExecutor:
                 f"lt_grouping_mode={stored_mode!r}, but this run requested {requested_mode!r}; "
                 "re-save the compile cache for the requested provider LT grouping mode."
             )
+        stored_plan = dict(metadata.get("native_halo_conv2d_plan", {}) or {})
+        if not stored_plan:
+            raise RuntimeError(
+                f"Cached native halo Conv2d manifest for {self.output_node_id!r} is missing "
+                "native_halo_conv2d_plan; re-run with io_mode='save'."
+            )
+        stored_fold_mode = _normalise_channel_fold_mode(
+            stored_plan.get("channel_fold_mode", metadata.get("native_halo_channel_fold_mode", "heuristic"))
+        )
+        requested_fold_mode = self._channel_fold_mode()
+        if str(stored_fold_mode) != str(requested_fold_mode):
+            raise RuntimeError(
+                f"Cached native halo Conv2d manifest for {self.output_node_id!r} was compiled with "
+                f"channel_fold_mode={stored_fold_mode!r}, but this run requested {requested_fold_mode!r}; "
+                "re-save the compile cache for the requested native halo channel fold mode."
+            )
+        self._refresh_runtime_plan()
+        current_plan = self.native_plan.to_dict()
+        if _cache_plan_guard(stored_plan) != _cache_plan_guard(current_plan):
+            raise RuntimeError(
+                f"Cached native halo Conv2d manifest for {self.output_node_id!r} does not match the "
+                "current native halo plan structure; re-save the compile cache for this shape/layout."
+            )
 
         group_rows = list(metadata.get("runtime_groups") or metadata.get("groups_by_input_index", []))
         if not group_rows:
@@ -2923,7 +3227,6 @@ class NativeHaloStripeNoRIConvExecutor:
                 "runtime_groups; re-run with io_mode='save'."
             )
 
-        self._refresh_runtime_plan()
         self._compiled_lt_grouping_mode = str(stored_mode)
         self.rows = int(metadata.get("rows", self.rows))
         self.cols = int(metadata.get("cols", self.cols))
@@ -3160,6 +3463,7 @@ class NativeHaloStripeNoRIConvExecutor:
             "same_shape_runtime_layout": "native_halo_stripe_no_ri_io",
             "native_internal_runtime_layout": "native_halo_stripe_no_ri",
             "native_halo_conv2d_plan": self.native_plan.to_dict(),
+            "native_halo_channel_fold_mode": str(self.native_plan.channel_fold_mode),
             "input_physical_layout": self._input_physical_layout(),
             "runtime_input_ct_count": int(self.cols),
             "runtime_output_ct_count": int(self.rows),
@@ -3229,7 +3533,7 @@ class NativeHaloStripeNoRIConvExecutor:
             for source_block in range(int(self.cols)):
                 ordered: list[tuple[int, Any]] = []
                 for stripe in self.native_plan.stripes:
-                    for target_group in range(int(self.native_plan.target_channel_group_count)):
+                    for target_group in range(int(self.native_plan.target_group_count_for_stripe(stripe))):
                         target_blocks = range(int(self.rows)) if bool(compact_output) else (None,)
                         for target_block in target_blocks:
                             build_started = time.time()
@@ -3264,10 +3568,10 @@ class NativeHaloStripeNoRIConvExecutor:
                     )
         else:
             for stripe in self.native_plan.stripes:
-                for source_group in range(int(self.native_plan.source_channel_group_count)):
+                for source_group in range(int(self.native_plan.source_group_count_for_stripe(stripe))):
                     ordered: list[tuple[int, Any]] = []
                     group_n1 = int(self.native_plan.group_n1s[int(group_index)])
-                    for target_group in range(int(self.native_plan.target_channel_group_count)):
+                    for target_group in range(int(self.native_plan.target_group_count_for_stripe(stripe))):
                         if bool(compact_output):
                             build_started = time.time()
                             transforms = _build_conv_transforms_for_compact_output(
@@ -3312,7 +3616,7 @@ class NativeHaloStripeNoRIConvExecutor:
                             self.last_runtime_timing.get("built_transform_count", 0.0)
                         ) + 1.0
                         ordered.append((int(transform.target_index), transform))
-                    input_index = int(stripe.index) * int(self.native_plan.source_channel_group_count) + int(source_group)
+                    input_index = int(self.native_plan.source_block_index(stripe, int(source_group)))
                     if ordered:
                         self._compile_ordered_runtime_groups(
                             scheme,

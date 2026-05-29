@@ -337,6 +337,8 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
     )
     layout_policy_generic_modes = {
         "generic_layout_dp",
+        "generic_layout_dp_no_share_fold",
+        "generic_layout_dp_noshare_fold",
         "vgg_imgnet_layout_dp",
         "r18_imgnet_layout_dp",
     }
@@ -344,6 +346,8 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
     u22_allowed_nodes = None
     u22_conv_kernels = bool(u22_mode_base is not None or is_layout_policy_generic)
     u22_layout_policy = "dp" if bool(u22_mode_base is not None or is_layout_policy_generic) else ""
+    if normalized in {"generic_layout_dp_no_share_fold", "generic_layout_dp_noshare_fold"}:
+        u22_layout_policy = "dp_no_share_fold"
     if u22_mode_base is not None and normalized != str(u22_mode_base):
         suffix = normalized[len(str(u22_mode_base)) + 1 :]
         allowed: list[str] = []
@@ -371,12 +375,25 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                 continue
             if token == "layout" and int(index + 1) < len(tokens):
                 raw_policy = str(tokens[int(index + 1)])
+                consumed = 2
+                remaining = "_".join(str(value) for value in tokens[int(index + 1) :])
+                for multi_token_policy in (
+                    "dp_no_share_fold",
+                    "dp_noshare_fold",
+                    "no_share_fold",
+                    "noshare_fold",
+                ):
+                    if remaining == multi_token_policy or remaining.startswith(f"{multi_token_policy}_"):
+                        raw_policy = str(multi_token_policy)
+                        consumed = 1 + len(multi_token_policy.split("_"))
+                        break
                 if raw_policy == "fixed" and int(index + 2) < len(tokens) and str(tokens[int(index + 2)]) == "max":
                     raw_policy = "fixedmax"
-                    index += 1
-                if int(index + 2) < len(tokens) and str(tokens[int(index + 2)]) == "fused":
+                    consumed += 1
+                fused_index = int(index + consumed)
+                if fused_index < len(tokens) and str(tokens[fused_index]) == "fused":
                     raw_policy = f"{raw_policy}_fused"
-                    index += 1
+                    consumed += 1
                 policy_aliases = {
                     "fixed": "fixed_max",
                     "fixedmax": "fixed_max",
@@ -395,10 +412,15 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                     "nohalo": "orion_dense",
                     "no_halo": "orion_dense",
                     "dp": "dp",
+                    "dp_no_share_fold": "dp_no_share_fold",
+                    "dp_noshare_fold": "dp_no_share_fold",
+                    "no_share_fold": "dp_no_share_fold",
+                    "noshare_fold": "dp_no_share_fold",
+                    "nosharefold": "dp_no_share_fold",
                 }
                 if raw_policy in policy_aliases:
                     u22_layout_policy = str(policy_aliases[raw_policy])
-                    index += 2
+                    index += int(consumed)
                     continue
             if token in {"fixedmax", "eager", "greedy", "always", "dp", "fused"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
                 index += 1

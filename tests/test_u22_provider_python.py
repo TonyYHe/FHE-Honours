@@ -291,7 +291,19 @@ def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join() -> None
             plan_rows[(str(spec["source"]), str(spec["concat_node"]))]
             for spec in conv.concat_fusion_specs
         ]
-        assert any(bool(row.get("relayout", False)) for row in concat_rows)
+        assert concat_rows
+        assert all(not bool(row.get("relayout", False)) for row in concat_rows)
+        assert all(str(row.get("target_physical_layout", "")) == "packed_compact" for row in concat_rows)
+        assert len(
+            {
+                (
+                    int(dict(row["selected_layout"])["top_beta"]),
+                    int(dict(row["selected_layout"])["bottom_beta"]),
+                    int(dict(row["selected_layout"])["gap"]),
+                )
+                for row in concat_rows
+            }
+        ) == 1
 
         level = len(scheme.params.get_logq()) - 1
         parts = []
@@ -803,6 +815,62 @@ def test_native_physical_relayout_honors_source_layout_offsets() -> None:
             kernel.cleanup(getattr(scheme, "backend", None))
     finally:
         scheme.delete_scheme()
+
+
+def test_native_halo_per_stripe_fold_reduces_tail_ct_and_keeps_offsets() -> None:
+    from orion.experimental.cir.native_halo_conv2d import NativeHaloConv2DSpec, native_halo_conv2d_plan
+
+    spec = NativeHaloConv2DSpec(
+        family_label="per_stripe_fold_dec1a_shape",
+        c_in=128,
+        h_in=256,
+        w_in=256,
+        c_out=64,
+        h_out=256,
+        w_out=256,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32768,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        input_physical_top_beta=1,
+        input_physical_bottom_beta=1,
+        output_physical_top_beta=1,
+        output_physical_bottom_beta=1,
+    )
+
+    heuristic = native_halo_conv2d_plan(spec, require_native_target_fit=False, channel_fold_mode="heuristic")
+    folded = native_halo_conv2d_plan(spec, require_native_target_fit=False, channel_fold_mode="per_stripe")
+
+    assert folded.channel_fold_mode == "per_stripe"
+    assert folded.input_ct_count < heuristic.input_ct_count
+    assert folded.output_ct_count < heuristic.output_ct_count
+    assert folded.c_only_rotations < heuristic.c_only_rotations
+    assert sum(folded.source_channel_group_counts) == folded.input_ct_count
+    assert sum(folded.target_channel_group_counts) == folded.output_ct_count
+    assert folded.source_stripe_offsets[0] == 0
+    assert folded.target_stripe_offsets[0] == 0
+    assert folded.source_stripe_offsets[-1] + folded.source_channel_group_counts[-1] == folded.input_ct_count
+    assert folded.target_stripe_offsets[-1] + folded.target_channel_group_counts[-1] == folded.output_ct_count
+    assert any(
+        int(stripe.source_channel_tile) != int(folded.source_channel_tile)
+        or int(stripe.target_channel_tile) != int(folded.target_channel_tile)
+        for stripe in folded.stripes
+    )
+
+    for stripe in folded.stripes:
+        for target_group in range(int(folded.target_group_count_for_stripe(stripe))):
+            block_index = folded.target_block_index(stripe, target_group)
+            mapped = folded.target_stripe_and_group_for_block(block_index)
+            assert mapped is not None
+            mapped_stripe, mapped_group = mapped
+            assert int(mapped_stripe.index) == int(stripe.index)
+            assert int(mapped_group) == int(target_group)
 
 
 def test_u22_256_base8_routes_flat_halo_producers_to_native_compact_source() -> None:
@@ -1492,7 +1560,7 @@ def test_compact_source_single_slot_native_output_builds_metadata(monkeypatch) -
         assert transform is not None
         assert transform.diagonals == {}
         assert transform._single_slot_diag_indices_by_block[(0, 0)]
-        assert int(transform.target_index) == int(stripe.index) * int(plan.target_channel_group_count)
+        assert int(transform.target_index) == int(plan.target_block_index(stripe, 0))
     finally:
         scheme.delete_scheme()
 
@@ -2011,11 +2079,13 @@ def test_native_halo_executor_loads_cached_manifest_groups(monkeypatch) -> None:
         spec=spec,
         output_node_id="conv",
     )
+    plan_manifest = executor.native_plan.to_dict()
     executor.assigned_level = 3
     executor.load_compile_cache_metadata(
         {
             "rows": 2,
             "cols": 2,
+            "native_halo_conv2d_plan": plan_manifest,
             "groups_by_input_index": [
                 {"input_index": 0, "storage_key": "group_10", "target_indices": [0, 1]},
                 {"input_index": 1, "storage_key": "group_11", "target_indices": [1]},
@@ -2055,6 +2125,226 @@ def test_native_halo_executor_loads_cached_manifest_groups(monkeypatch) -> None:
     assert executor.target_indices_by_input_index[1] == (1,)
     assert executor.last_runtime_timing["built_transform_count"] == 0.0
     assert executor.last_runtime_timing["compiled_group_count"] == 2.0
+
+
+def test_native_halo_executor_rejects_missing_plan_manifest(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((2, 2, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 2, 4, 4]),
+        output_shape=torch.Size([1, 2, 4, 4]),
+        fhe_input_shape=torch.Size([1, 2, 4, 4]),
+        fhe_output_shape=torch.Size([1, 2, 4, 4]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={},
+        layout_policy_output_layout={},
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="test_missing_native_halo_plan_manifest",
+        c_in=2,
+        h_in=4,
+        w_in=4,
+        c_out=2,
+        h_out=4,
+        w_out=4,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=16,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    executor.load_compile_cache_metadata(
+        {
+            "rows": 2,
+            "cols": 2,
+            "groups_by_input_index": [
+                {"input_index": 0, "storage_key": "group_10", "target_indices": [0, 1]},
+            ],
+        }
+    )
+
+    def _unexpected_compile_unified(self, _backend):
+        raise AssertionError("missing plan manifest should fail before cached groups compile")
+
+    monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _unexpected_compile_unified)
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_io_mode=lambda: "load",
+            get_logq=lambda: [45, 30, 30, 45],
+            get_default_scale=lambda: 1 << 30,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="missing native_halo_conv2d_plan"):
+        executor.compile(fake_scheme)
+
+
+def test_native_halo_executor_records_and_guards_channel_fold_mode(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((64, 128, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 128, 256, 256]),
+        output_shape=torch.Size([1, 64, 256, 256]),
+        fhe_input_shape=torch.Size([1, 128, 256, 256]),
+        fhe_output_shape=torch.Size([1, 64, 256, 256]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+        layout_policy_output_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+        layout_policy_native_halo_channel_fold_mode="per_stripe",
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="test_per_stripe_manifest_guard",
+        c_in=128,
+        h_in=256,
+        w_in=256,
+        c_out=64,
+        h_out=256,
+        w_out=256,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32768,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        input_physical_top_beta=1,
+        input_physical_bottom_beta=1,
+        output_physical_top_beta=1,
+        output_physical_bottom_beta=1,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+
+    metadata = executor.compile_cache_metadata()
+    assert metadata["native_halo_channel_fold_mode"] == "per_stripe"
+    assert metadata["native_halo_conv2d_plan"]["channel_fold_mode"] == "per_stripe"
+    assert executor.native_plan.channel_fold_mode == "per_stripe"
+
+    executor.load_compile_cache_metadata(
+        {
+            "lt_grouping_mode": "shared",
+            "native_halo_conv2d_plan": {"channel_fold_mode": "heuristic"},
+            "runtime_groups": [{"input_index": 0, "storage_key": "group_10", "target_indices": [0]}],
+        }
+    )
+
+    def _unexpected_compile_unified(self, _backend):
+        raise AssertionError("fold-mode mismatch should fail before cached groups compile")
+
+    monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _unexpected_compile_unified)
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_io_mode=lambda: "load",
+            get_logq=lambda: [45, 30, 30, 45],
+            get_default_scale=lambda: 1 << 30,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="channel_fold_mode"):
+        executor.compile(fake_scheme)
+
+
+def test_native_halo_executor_rejects_stale_same_mode_plan_metadata(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((64, 128, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 128, 256, 256]),
+        output_shape=torch.Size([1, 64, 256, 256]),
+        fhe_input_shape=torch.Size([1, 128, 256, 256]),
+        fhe_output_shape=torch.Size([1, 64, 256, 256]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+        layout_policy_output_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+        layout_policy_native_halo_channel_fold_mode="per_stripe",
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="test_per_stripe_stale_manifest_guard",
+        c_in=128,
+        h_in=256,
+        w_in=256,
+        c_out=64,
+        h_out=256,
+        w_out=256,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32768,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        input_physical_top_beta=1,
+        input_physical_bottom_beta=1,
+        output_physical_top_beta=1,
+        output_physical_bottom_beta=1,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    stale_plan = dict(executor.native_plan.to_dict())
+    stale_plan["input_ct_count"] = int(stale_plan["input_ct_count"]) + 1
+    executor.load_compile_cache_metadata(
+        {
+            "lt_grouping_mode": "shared",
+            "native_halo_conv2d_plan": stale_plan,
+            "runtime_groups": [{"input_index": 0, "storage_key": "group_10", "target_indices": [0]}],
+        }
+    )
+
+    def _unexpected_compile_unified(self, _backend):
+        raise AssertionError("stale plan should fail before cached groups compile")
+
+    monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _unexpected_compile_unified)
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_io_mode=lambda: "load",
+            get_logq=lambda: [45, 30, 30, 45],
+            get_default_scale=lambda: 1 << 30,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="plan structure"):
+        executor.compile(fake_scheme)
 
 
 def test_compact_source_conv_does_not_consume_global_padding_halo_rows() -> None:
@@ -2163,17 +2453,27 @@ def test_node_specific_benchmark_u22_provider_helper_uses_full_default_provider_
         assert graph["layout_policy"] == "dp"
         assert graph["layout_policy_edge_layout_count"] == 34
         expected_halo_edges = {
-            "u22_64_base32": 12,
-            "u22_256_base32": 30,
+            "u22_64_base32": 0,
+            "u22_256_base32": 31,
         }[str(network)]
         expected_relayouts = {
-            "u22_64_base32": 4,
-            "u22_256_base32": 4,
+            "u22_64_base32": 0,
+            "u22_256_base32": 0,
+        }[str(network)]
+        expected_producer_materialized = {
+            "u22_64_base32": 0,
+            "u22_256_base32": 13,
+        }[str(network)]
+        expected_consumer_fused = {
+            "u22_64_base32": 0,
+            "u22_256_base32": 17,
         }[str(network)]
         assert len(halo_edges) == expected_halo_edges
         assert int(graph["layout_policy_relayout_edge_count"]) == expected_relayouts
         assert int(graph["layout_policy_output_relayout_node_count"]) == 0
         assert int(graph["layout_policy_summary"]["relayout_depth_estimate"]) == expected_relayouts
+        assert int(graph["layout_policy_summary"]["producer_fused_materialization_count"]) == expected_producer_materialized
+        assert int(graph["layout_policy_summary"]["consumer_fused_relayout_count"]) == expected_consumer_fused
     finally:
         bench._cleanup_scheme()
 

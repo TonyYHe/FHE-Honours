@@ -53,6 +53,9 @@ PROVIDER_MODES = {
     "fixed_max": "u22_256_base32_layout_fixedmax",
     "always": "u22_256_base32_layout_always",
     "dp": "u22_256_base32_layout_dp",
+    "dp_no_share_fold": "u22_256_base32_layout_dp_no_share_fold",
+    "dp_noshare_fold": "u22_256_base32_layout_dp_no_share_fold",
+    "noshare_fold": "u22_256_base32_layout_dp_no_share_fold",
 }
 
 CPU_COUNT = max(1, int(os.cpu_count() or 1))
@@ -554,6 +557,26 @@ def _breakdown_totals(payload: dict[str, Any]) -> dict[str, Any]:
     return _metric(payload, ("operator_breakdown_after_forward", "totals")) or {}
 
 
+def _summary_total(totals: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key in totals and totals.get(key) not in (None, ""):
+            return _as_float(totals.get(key))
+    return None
+
+
+def _summary_unattributed(
+    totals: dict[str, Any],
+    he_forward_s: float | None,
+    parts: list[float | None],
+) -> float | None:
+    direct = _summary_total(totals, "unattributed_he_forward_s")
+    if direct is not None:
+        return direct
+    if he_forward_s is None or any(value is None for value in parts):
+        return None
+    return float(he_forward_s) - sum(float(value or 0.0) for value in parts)
+
+
 def _runtime_mode(payload: dict[str, Any]) -> str:
     return str(
         payload.get("runtime_fairness_mode")
@@ -707,20 +730,42 @@ def _markdown_table(rows: list[list[str]]) -> str:
 
 def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
     result_path, _log_path = _case_paths(run_root, case, mode)
-    payload = _read_json(result_path)
-    payload = payload if isinstance(payload, dict) else {}
+    raw_payload = _read_json(result_path)
+    has_payload = isinstance(raw_payload, dict)
+    payload = raw_payload if has_payload else {}
     timing = payload.get("timing_s", {}) if isinstance(payload.get("timing_s"), dict) else {}
     boot_stats = _bootstrap_stats(payload)
-    layer_stats = _layer_stats(payload, result_path)
+    layer_stats = (
+        _layer_stats(payload, result_path)
+        if has_payload
+        else {layer: _empty_layer_stats() for layer in LINEAR_LAYERS}
+    )
+    totals = _breakdown_totals(payload)
+    he_forward_s = _forward_timing(payload, "he_forward")
+    mvm_lt_s = _summary_total(totals, "mvm_kernel_s")
+    activation_s = _summary_total(totals, "activation_excluding_bootstrap_s", "activation_s")
+    bootstrap_s = _summary_total(totals, "bootstrap_s")
+    diag_encode_s = _summary_total(totals, "lt_layer_cache_encode_s")
+    if bootstrap_s is None and payload:
+        bootstrap_s = sum(_as_float(value["s"]) for value in boot_stats.values())
+    if mvm_lt_s is None and payload:
+        mvm_lt_s = sum(_as_float(value["lt_accumulate_s"]) for value in layer_stats.values())
     return {
-        "status": str(payload.get("status", "pending" if not payload else "unknown")),
+        "status": str(payload.get("status", "pending" if not has_payload else "unknown")),
         "compile_s": timing.get("compile") if isinstance(timing, dict) else None,
-        "he_forward_s": _forward_timing(payload, "he_forward"),
-        "layer_compute_s": sum(_as_float(value["lt_accumulate_s"]) for value in layer_stats.values()),
-        "boot_s": sum(_as_float(value["s"]) for value in boot_stats.values()),
-        "rotations": _rotation_count(payload),
-        "boots": _bootstrap_count(payload),
-        "diagonals": sum(int(value["diagonals"]) for value in layer_stats.values()),
+        "he_forward_s": he_forward_s,
+        "mvm_lt_s": mvm_lt_s,
+        "activation_excl_boot_s": activation_s,
+        "bootstrap_s": bootstrap_s,
+        "diag_encode_s": diag_encode_s,
+        "unattributed_s": _summary_unattributed(
+            totals,
+            he_forward_s,
+            [mvm_lt_s, activation_s, bootstrap_s, diag_encode_s],
+        ),
+        "rotations": _rotation_count(payload) if has_payload else None,
+        "boots": _bootstrap_count(payload) if has_payload else None,
+        "diagonals": sum(int(value["diagonals"]) for value in layer_stats.values()) if has_payload else None,
         "peak_rss_gib": _metric(payload, ("runner", "maxrss_bytes")),
         "runtime_mode": _runtime_mode(payload),
         "result_path": str(result_path),
@@ -745,44 +790,28 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "dense HE forward s",
         "Halo HE forward s",
         "dense/Halo HE",
-        "dense layer compute s",
-        "Halo layer compute s",
+        "dense MVM/LT s (incl pool)",
+        "Halo MVM/LT s (incl pool)",
+        "dense activation excl boot s",
+        "Halo activation excl boot s",
+        "dense bootstrap s",
+        "Halo bootstrap s",
+        "dense diag+encode s",
+        "Halo diag+encode s",
+        "dense unattributed s",
+        "Halo unattributed s",
         "dense rotations",
         "Halo rotations",
         "dense diagonals",
         "Halo diagonals",
         "dense boots",
         "Halo boots",
-        "dense boot s",
-        "Halo boot s",
         "dense RSS GiB",
         "Halo RSS GiB",
         "result files",
         "note",
     ]
-    aligns = [
-        "---",
-        "---",
-        "---",
-        "---",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---",
-        "---",
-    ]
+    aligns = ["---", "---", "---", "---"] + ["---:"] * (len(headers) - 6) + ["---", "---"]
     rows: list[list[str]] = []
     for case in cases:
         spec = CASES[str(case)]
@@ -798,16 +827,22 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
                 _fmt_float(dense["he_forward_s"]),
                 _fmt_float(provider["he_forward_s"]),
                 _fmt_float(_ratio(dense["he_forward_s"], provider["he_forward_s"])),
-                _fmt_float(dense["layer_compute_s"]),
-                _fmt_float(provider["layer_compute_s"]),
+                _fmt_float(dense["mvm_lt_s"]),
+                _fmt_float(provider["mvm_lt_s"]),
+                _fmt_float(dense["activation_excl_boot_s"]),
+                _fmt_float(provider["activation_excl_boot_s"]),
+                _fmt_float(dense["bootstrap_s"]),
+                _fmt_float(provider["bootstrap_s"]),
+                _fmt_float(dense["diag_encode_s"]),
+                _fmt_float(provider["diag_encode_s"]),
+                _fmt_float(dense["unattributed_s"]),
+                _fmt_float(provider["unattributed_s"]),
                 _fmt_int(dense["rotations"]),
                 _fmt_int(provider["rotations"]),
                 _fmt_int(dense["diagonals"]),
                 _fmt_int(provider["diagonals"]),
                 _fmt_int(dense["boots"]),
                 _fmt_int(provider["boots"]),
-                _fmt_float(dense["boot_s"]),
-                _fmt_float(provider["boot_s"]),
                 _gib(dense["peak_rss_gib"]),
                 _gib(provider["peak_rss_gib"]),
                 f"dense:{dense['result_path']}; provider:{provider['result_path']}",
@@ -829,47 +864,31 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "dense HE forward s",
         "Halo HE forward s",
         "dense/Halo HE",
-        "dense layer compute s",
-        "Halo layer compute s",
+        "dense MVM/LT s (incl pool)",
+        "Halo MVM/LT s (incl pool)",
+        "dense activation excl boot s",
+        "Halo activation excl boot s",
+        "dense bootstrap s",
+        "Halo bootstrap s",
+        "dense diag+encode s",
+        "Halo diag+encode s",
+        "dense unattributed s",
+        "Halo unattributed s",
         "dense rotations",
         "Halo rotations",
         "dense diagonals",
         "Halo diagonals",
         "dense boots",
         "Halo boots",
-        "dense boot s",
-        "Halo boot s",
         "dense RSS GiB",
         "Halo RSS GiB",
         "result files",
         "note",
     ]
-    aligns = [
-        "---",
-        "---",
-        "---",
-        "---",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---:",
-        "---",
-        "---",
-    ]
+    aligns = ["---", "---", "---", "---"] + ["---:"] * (len(headers) - 6) + ["---", "---"]
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(aligns) + " |"]
     for row in rows:
-        lines.append("| " + " | ".join(_markdown_escape(cell) for cell in row) + " |")
+        lines.append("| " + " | ".join(_markdown_escape(cell) for cell in _pad_row(row, len(headers))) + " |")
     return "\n".join(lines)
 
 
@@ -993,11 +1012,51 @@ def _join_result_file_parts(parts: dict[str, str]) -> str:
     return f"dense:{parts.get('dense', '')}; provider:{parts.get('provider', '')}"
 
 
+def _upgrade_summary_row(row: list[str]) -> list[str] | None:
+    if len(row) == 27:
+        return _pad_row(row, 27)
+    if len(row) == 21:
+        return [
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            row[8],
+            "",
+            "",
+            row[15],
+            row[16],
+            "",
+            "",
+            "",
+            "",
+            row[9],
+            row[10],
+            row[11],
+            row[12],
+            row[13],
+            row[14],
+            row[17],
+            row[18],
+            row[19],
+            row[20],
+        ]
+    return None
+
+
 def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], modes: list[str]) -> list[list[str]]:
-    width = 21
-    by_case = {row[0]: _pad_row(row, width) for row in existing}
-    dense_cols = (2, 4, 7, 9, 11, 13, 15, 17)
-    provider_cols = (3, 5, 8, 10, 12, 14, 16, 18)
+    width = 27
+    by_case = {}
+    for row in existing:
+        upgraded = _upgrade_summary_row(list(row))
+        if upgraded is not None:
+            by_case[str(upgraded[0])] = upgraded
+    dense_cols = (2, 4, 7, 9, 11, 13, 15, 17, 19, 21, 23)
+    provider_cols = (3, 5, 8, 10, 12, 14, 16, 18, 20, 22, 24)
     for new_row in new_rows:
         new_row = _pad_row(new_row, width)
         case = str(new_row[0])
@@ -1015,14 +1074,14 @@ def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], mo
             for index in provider_cols:
                 merged[index] = new_row[index]
         merged[6] = _fmt_float(_ratio(merged[4].replace(",", ""), merged[5].replace(",", "")))
-        files = _result_file_parts(merged[19])
-        new_files = _result_file_parts(new_row[19])
+        files = _result_file_parts(merged[25])
+        new_files = _result_file_parts(new_row[25])
         for mode in modes:
             if new_files.get(mode):
                 files[mode] = new_files[mode]
-        merged[19] = _join_result_file_parts(files)
-        if new_row[20]:
-            merged[20] = new_row[20]
+        merged[25] = _join_result_file_parts(files)
+        if new_row[26]:
+            merged[26] = new_row[26]
         by_case[case] = merged
     case_order = {case: index for index, case in enumerate(CASES)}
     return [by_case[key] for key in sorted(by_case, key=lambda case: case_order.get(case, 100))]
