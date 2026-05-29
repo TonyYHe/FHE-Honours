@@ -153,6 +153,21 @@ def test_conv2d_single_slot_diagonal_indices_match_full_pack() -> None:
     assert indices == _diag_indices(direct)
 
 
+def test_conv2d_single_slot_block_recipe_matches_full_block() -> None:
+    torch.manual_seed(0)
+    layer = Conv2d(2, 3, kernel_size=3, padding=1, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=64, embedding_method="square")
+    _configure_conv2d(layer, torch.randn(1, 2, 3, 3), input_gap=1)
+
+    full, _rotations = packing.pack_conv2d(layer, last=False)
+    block_key = sorted(full.keys())[0]
+    block = packing.pack_conv2d_blocks(layer, last=False, blocks=[block_key])
+
+    assert set(block) == {block_key}
+    _assert_diagonals_close(block, {block_key: full[block_key]})
+
+
 def test_conv2d_single_slot_generate_diagonals_installs_recipe_without_payload(monkeypatch) -> None:
     torch.manual_seed(0)
     layer = Conv2d(2, 3, kernel_size=3, padding=1, bias=False)
@@ -171,10 +186,14 @@ def test_conv2d_single_slot_generate_diagonals_installs_recipe_without_payload(m
     assert layer.diagonals == {}
     assert layer._dense_layer_cache_diag_indices_by_block
     assert callable(layer._dense_layer_cache_build_diagonals)
+    assert callable(layer._dense_layer_cache_build_block_diagonals)
 
     monkeypatch.setattr(packing, "pack_conv2d", original_pack)
     rebuilt = layer._dense_layer_cache_build_diagonals()
     assert _diag_indices(rebuilt) == layer._dense_layer_cache_diag_indices_by_block
+    block_key = sorted(layer._dense_layer_cache_diag_indices_by_block)[0]
+    block = layer._dense_layer_cache_build_block_diagonals([block_key])
+    assert set(block) == {block_key}
 
 
 def test_conv2d_pack_keeps_zero_blocks_for_dense_baseline() -> None:
@@ -276,6 +295,21 @@ def test_conv_transpose2d_single_slot_diagonal_indices_match_full_pack() -> None
     assert indices == _diag_indices(direct)
 
 
+def test_conv_transpose2d_single_slot_block_recipe_matches_full_block() -> None:
+    torch.manual_seed(1)
+    layer = ConvTranspose2d(2, 3, kernel_size=2, stride=2, padding=0, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=128, embedding_method="hybrid")
+    _configure_tconv2d(layer, torch.randn(1, 2, 2, 2), input_gap=1)
+
+    full, _rotations = packing.pack_conv_transpose2d(layer, last=False)
+    block_key = sorted(full.keys())[0]
+    block = packing.pack_conv_transpose2d_blocks(layer, last=False, blocks=[block_key])
+
+    assert set(block) == {block_key}
+    _assert_diagonals_close(block, {block_key: full[block_key]})
+
+
 def test_conv_transpose2d_single_slot_generate_diagonals_installs_recipe_without_payload(monkeypatch) -> None:
     torch.manual_seed(1)
     layer = ConvTranspose2d(2, 3, kernel_size=2, stride=2, padding=0, bias=False)
@@ -294,10 +328,14 @@ def test_conv_transpose2d_single_slot_generate_diagonals_installs_recipe_without
     assert layer.diagonals == {}
     assert layer._dense_layer_cache_diag_indices_by_block
     assert callable(layer._dense_layer_cache_build_diagonals)
+    assert callable(layer._dense_layer_cache_build_block_diagonals)
 
     monkeypatch.setattr(packing, "pack_conv_transpose2d", original_pack)
     rebuilt = layer._dense_layer_cache_build_diagonals()
     assert _diag_indices(rebuilt) == layer._dense_layer_cache_diag_indices_by_block
+    block_key = sorted(layer._dense_layer_cache_diag_indices_by_block)[0]
+    block = layer._dense_layer_cache_build_block_diagonals([block_key])
+    assert set(block) == {block_key}
 
 
 def test_dense_compile_batches_independent_transforms_without_unified_api() -> None:
@@ -608,6 +646,209 @@ def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch, tmp
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["event"] == "end"
     assert state["phase"] == "evict"
+
+
+@pytest.mark.parametrize(
+    ("granularity", "group_size", "expected_batches"),
+    [
+        ("lt", None, [[910], [911]]),
+        ("group", "2", [[910, 911]]),
+    ],
+)
+def test_dense_layer_cache_lt_group_granularity_never_builds_full_layer(
+    monkeypatch,
+    tmp_path,
+    granularity: str,
+    group_size: str | None,
+    expected_batches: list[list[int]],
+) -> None:
+    class Backend:
+        def __init__(self):
+            self.next_id = 910
+            self.generated_batches = []
+            self.generated_keys = []
+            self.evaluated = []
+            self.deleted = []
+            self.removed = []
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
+            return [int(v) + 3000 for v in diag_idxs]
+
+        def GenerateLinearTransformRotationKey(self, key):
+            self.generated_keys.append(int(key))
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            ids = list(range(self.next_id, self.next_id + int(num_transforms)))
+            self.next_id += int(num_transforms)
+            self.generated_batches.append(ids)
+            return ids
+
+        def EvaluateLinearTransform(self, transform_id, ciphertext_id):
+            self.evaluated.append((int(transform_id), int(ciphertext_id)))
+            return int(transform_id) + int(ciphertext_id)
+
+        def RemovePlaintextDiagonals(self, transform_id):
+            self.removed.append(int(transform_id))
+
+        def DeleteLinearTransform(self, transform_id):
+            self.deleted.append(int(transform_id))
+
+        def DeleteCiphertext(self, _ciphertext_id):
+            return None
+
+    class Evaluator:
+        def __init__(self):
+            self.adds = []
+            self.rescales = []
+
+        def add_ciphertext(self, left, right, _in_place=False):
+            out = int(left) + int(right) + 100
+            self.adds.append((int(left), int(right), out))
+            return out
+
+        def rescale(self, value, in_place=False):
+            out = int(value) + 1000
+            self.rescales.append((int(value), bool(in_place), out))
+            return out
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GRANULARITY", granularity)
+    if group_size is not None:
+        monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS", group_size)
+    progress_path = tmp_path / f"dense_progress_{granularity}.jsonl"
+    monkeypatch.setenv("ORION_PROGRESS_JSONL", str(progress_path))
+    backend = Backend()
+    fake_eval = Evaluator()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=fake_eval,
+        encoder=SimpleNamespace(encode=lambda value, level: object()),
+        encryptor=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    requested_blocks = []
+
+    def build_full_layer():
+        raise AssertionError("lt/group granularity must not build the full layer")
+
+    def build_blocks(blocks):
+        normalized = tuple((int(row), int(col)) for row, col in blocks)
+        requested_blocks.append(normalized)
+        return {
+            (int(row), int(col)): {int(col): np.asarray([float(col + 1), 0.0, 0.0, 0.0], dtype=np.float32)}
+            for row, col in normalized
+        }
+
+    layer = SimpleNamespace(
+        name=f"layer_cache_{granularity}",
+        diagonals={},
+        _dense_layer_cache_diag_indices_by_block={(0, 0): (0,), (0, 1): (1,)},
+        _dense_layer_cache_build_diagonals=build_full_layer,
+        _dense_layer_cache_build_block_diagonals=build_blocks,
+        level=2,
+        depth=1,
+        bsgs_ratio=2,
+        get_io_mode=lambda: "none",
+        output_shape=torch.Size((1, 1, 1, 1)),
+        fhe_output_shape=torch.Size((1, 1, 1, 1)),
+    )
+    evaluator.generate_transforms(layer)
+    x = CipherTensor(fake_scheme, [5, 7], layer.output_shape, layer.fhe_output_shape)
+
+    out = evaluator.evaluate_transforms(layer, x)
+
+    assert out.ids == [int(fake_eval.rescales[0][2])]
+    assert backend.generated_batches == expected_batches
+    assert backend.evaluated == [(910, 5), (911, 7)]
+    assert fake_eval.rescales == [(1933, False, 2933)]
+    assert backend.generated_keys == [3000, 3001]
+    assert backend.removed == [910, 911]
+    assert backend.deleted == [910, 911]
+    assert layer.transform_ids == {}
+    assert layer._dense_layer_cache_active_transform_ids == {}
+    if granularity == "lt":
+        assert requested_blocks == [((0, 0),), ((0, 1),)]
+    else:
+        assert requested_blocks == [((0, 0), (0, 1))]
+    assert evaluator.last_runtime_timing["runtime_fairness_mode"] == "single_slot_layer_cache"
+    assert evaluator.last_runtime_timing["dense_layer_cache_granularity"] == granularity
+    assert evaluator.last_runtime_timing["layer_cache_encode_s"] >= 0.0
+    assert evaluator.last_runtime_timing["layer_cache_evict_s"] >= 0.0
+    rows = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
+    assert any(row.get("phase") == "diag_encode" and row.get("backend_transform_count") for row in rows)
+    assert any(row.get("phase") == "evict" and row.get("backend_transform_count") for row in rows)
+
+
+def test_dense_layer_cache_lt_granularity_cleans_up_after_eval_error(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.deleted = []
+            self.removed = []
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
+            return [int(v) + 4000 for v in diag_idxs]
+
+        def GenerateLinearTransformRotationKey(self, _key):
+            return None
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            return list(range(1000, 1000 + int(num_transforms)))
+
+        def EvaluateLinearTransform(self, _transform_id, _ciphertext_id):
+            raise RuntimeError("boom")
+
+        def RemovePlaintextDiagonals(self, transform_id):
+            self.removed.append(int(transform_id))
+
+        def DeleteLinearTransform(self, transform_id):
+            self.deleted.append(int(transform_id))
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GRANULARITY", "lt")
+    backend = Backend()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=SimpleNamespace(rescale=lambda value, in_place=False: value),
+        encoder=SimpleNamespace(encode=lambda value, level: object()),
+        encryptor=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    layer = SimpleNamespace(
+        name="layer_cache_error_cleanup",
+        diagonals={},
+        _dense_layer_cache_diag_indices_by_block={(0, 0): (0,)},
+        _dense_layer_cache_build_diagonals=lambda: (_ for _ in ()).throw(AssertionError("full build forbidden")),
+        _dense_layer_cache_build_block_diagonals=lambda blocks: {
+            (int(row), int(col)): {0: np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
+            for row, col in blocks
+        },
+        level=2,
+        depth=1,
+        bsgs_ratio=2,
+        get_io_mode=lambda: "none",
+        output_shape=torch.Size((1, 1, 1, 1)),
+        fhe_output_shape=torch.Size((1, 1, 1, 1)),
+    )
+    evaluator.generate_transforms(layer)
+    x = CipherTensor(fake_scheme, [5], layer.output_shape, layer.fhe_output_shape)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        evaluator.evaluate_transforms(layer, x)
+
+    assert backend.removed == [1000]
+    assert backend.deleted == [1000]
+    assert layer.transform_ids == {}
+    assert layer._dense_layer_cache_active_transform_ids == {}
 
 
 def test_dense_save_load_compile_defaults_to_provider_sized_batches(monkeypatch) -> None:

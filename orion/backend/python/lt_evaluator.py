@@ -34,6 +34,7 @@ _DENSE_RESERVED_PLAINTEXT_DATASETS = _DENSE_COARSE_DIAG_DATASETS | {
     _ENCODED_HOIST_PAYLOAD_DATASET,
 }
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
+_DENSE_LAYER_CACHE_GRANULARITIES = {"layer", "lt", "group"}
 
 
 _COMPILE_PROFILE_KEYS = (
@@ -565,6 +566,27 @@ class NewEvaluator:
             return False
         return self.io_mode == "none"
 
+    def dense_layer_cache_granularity(self) -> str:
+        raw_value = os.environ.get("ORION_DENSE_LAYER_CACHE_GRANULARITY", "layer")
+        granularity = str(raw_value).strip().lower().replace("-", "_")
+        if granularity == "block":
+            granularity = "lt"
+        if granularity not in _DENSE_LAYER_CACHE_GRANULARITIES:
+            raise ValueError(
+                "ORION_DENSE_LAYER_CACHE_GRANULARITY must be one of "
+                f"{sorted(_DENSE_LAYER_CACHE_GRANULARITIES)}, got {raw_value!r}"
+            )
+        return str(granularity)
+
+    def dense_layer_cache_group_size(self) -> int:
+        raw_value = os.environ.get("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS")
+        if raw_value is None:
+            raw_value = os.environ.get("ORION_DENSE_LAYER_CACHE_GROUP_SIZE", "1")
+        try:
+            return max(1, int(raw_value))
+        except (TypeError, ValueError):
+            return 1
+
     def dense_layer_cache_enabled_for(self, linear_layer) -> bool:
         if not self.single_slot_layer_cache_enabled():
             return False
@@ -660,6 +682,7 @@ class NewEvaluator:
             for (row, col), values in dict(diag_indices_by_block).items()
         }
         linear_layer._dense_layer_cache_diag_indices_by_block = dict(diag_indices_by_block)
+        linear_layer._dense_layer_cache_granularity = self.dense_layer_cache_granularity()
         self._add_profile("diag_generate_s", time.perf_counter() - plan_started)
 
         key_requests: dict[int, int | None] = {}
@@ -1080,6 +1103,11 @@ class NewEvaluator:
         return results
 
     def dense_layer_cache_needs_materialize(self, linear_layer) -> bool:
+        if (
+            getattr(linear_layer, "_dense_layer_cache_deferred", False)
+            and self.dense_layer_cache_granularity() != "layer"
+        ):
+            return False
         return bool(
             getattr(linear_layer, "_dense_layer_cache_deferred", False)
             and not getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {})
@@ -1118,6 +1146,112 @@ class NewEvaluator:
                 ordered[index] = future.result()
             self._add_profile("wait_s", time.perf_counter() - wait_started)
         return list(ordered)
+
+    def _dense_layer_cache_build_payloads_for_blocks(self, linear_layer, blocks):
+        build_blocks = getattr(linear_layer, "_dense_layer_cache_build_block_diagonals", None)
+        if not callable(build_blocks):
+            raise RuntimeError(
+                f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} "
+                "requires a block payload recipe for ORION_DENSE_LAYER_CACHE_GRANULARITY=lt/group"
+            )
+        requested = tuple((int(row), int(col)) for row, col in blocks)
+        if not requested:
+            return []
+        diagonals = build_blocks(requested)
+        diag_indices_by_block = dict(getattr(linear_layer, "_dense_layer_cache_diag_indices_by_block", {}) or {})
+        items = []
+        for row, col in requested:
+            source = dict(dict(diagonals or {}).get((int(row), int(col)), {}) or {})
+            if not source:
+                slots = int(getattr(self.params, "get_slots", lambda: 0)() or 0)
+                source = {0: np.zeros((int(slots),), dtype=np.float32)}
+            if (int(row), int(col)) in diag_indices_by_block:
+                expected = {int(value) for value in diag_indices_by_block[(int(row), int(col))]}
+                source = {int(index): value for index, value in source.items() if int(index) in expected}
+                if not source:
+                    slots = int(getattr(self.params, "get_slots", lambda: 0)() or 0)
+                    source = {0: np.zeros((int(slots),), dtype=np.float32)}
+            items.append(((int(row), int(col)), source))
+
+        workers = self._lt_worker_count(len(items))
+        if workers <= 1:
+            return [self._build_block_payload(item) for item in items]
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="orion-dense-layer-cache-block-materialize") as pool:
+            for index, item in enumerate(items):
+                futures.append((index, pool.submit(self._build_block_payload, item)))
+            ordered = [None] * len(futures)
+            wait_started = time.perf_counter()
+            for index, future in futures:
+                ordered[index] = future.result()
+            self._add_profile("wait_s", time.perf_counter() - wait_started)
+        return list(ordered)
+
+    def _materialize_dense_layer_cache_blocks(self, linear_layer, blocks) -> tuple[dict[tuple[int, int], int], dict[str, float]]:
+        requested = tuple((int(row), int(col)) for row, col in blocks)
+        if not requested:
+            return {}, {"layer_cache_encode_s": 0.0, "layer_cache_key_prepare_s": 0.0}
+        layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
+        memory_before = host_memory_info()
+        write_progress_event(
+            "start",
+            phase="diag_encode",
+            layer=layer_name,
+            path="dense",
+            layer_cache_granularity=str(self.dense_layer_cache_granularity()),
+            backend_transform_count=int(len(requested)),
+            block_rows=[int(row) for row, _col in requested],
+            block_cols=[int(col) for _row, col in requested],
+            host_available_bytes_before=None if memory_before is None else int(memory_before.get("available_bytes", 0)),
+        )
+        payloads = None
+        started = time.perf_counter()
+        try:
+            payloads = tuple(self._dense_layer_cache_build_payloads_for_blocks(linear_layer, requested))
+            batch_results = self._generate_transforms_from_payloads_batch(
+                payloads,
+                level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
+                bsgs_ratio=float(getattr(linear_layer, "_dense_layer_cache_bsgs_ratio", linear_layer.bsgs_ratio)),
+                io_mode="none",
+                add_compile_profile=False,
+            )
+        finally:
+            if payloads is not None:
+                del payloads
+            gc.collect()
+        transform_ids = {
+            (int(row), int(col)): int(transform_id)
+            for row, col, _diag_idxs, transform_id in batch_results
+        }
+        active = dict(getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {}) or {})
+        active.update(transform_ids)
+        linear_layer.transform_ids = dict(active)
+        linear_layer._dense_layer_cache_active_transform_ids = dict(active)
+        encode_s = float(time.perf_counter() - started)
+        key_started = time.perf_counter()
+        # Rotation keys are planned/generated at compile time. Runtime only
+        # binds freshly materialized plaintext transforms to resident keys.
+        key_prepare_s = float(time.perf_counter() - key_started)
+        write_progress_event(
+            "end",
+            phase="diag_encode",
+            layer=layer_name,
+            path="dense",
+            layer_cache_granularity=str(self.dense_layer_cache_granularity()),
+            layer_cache_encode_s=float(encode_s),
+            layer_cache_key_prepare_s=float(key_prepare_s),
+            backend_transform_count=int(len(transform_ids)),
+            host_available_bytes_after=(
+                None
+                if (memory_after := host_memory_info()) is None
+                else int(memory_after.get("available_bytes", 0))
+            ),
+        )
+        return transform_ids, {
+            "layer_cache_encode_s": float(encode_s),
+            "layer_cache_key_prepare_s": float(key_prepare_s),
+        }
 
     def materialize_dense_layer_cache(self, linear_layer) -> dict[str, float]:
         if not self.dense_layer_cache_needs_materialize(linear_layer):
@@ -1230,6 +1364,57 @@ class NewEvaluator:
             linear_layer.on_bias_ptxt = None
         elapsed = float(time.perf_counter() - started)
         write_progress_event("end", phase="evict", layer=layer_name, path="dense", layer_cache_evict_s=float(elapsed))
+        return float(elapsed)
+
+    def _evict_dense_layer_cache_transform_ids(self, linear_layer, transform_ids: dict[tuple[int, int], int]) -> float:
+        active = {
+            (int(row), int(col)): int(transform_id)
+            for (row, col), transform_id in dict(transform_ids or {}).items()
+        }
+        if not active:
+            return 0.0
+        layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
+        memory_before = host_memory_info()
+        write_progress_event(
+            "start",
+            phase="evict",
+            layer=layer_name,
+            path="dense",
+            layer_cache_granularity=str(self.dense_layer_cache_granularity()),
+            backend_transform_count=int(len(active)),
+            block_rows=[int(row) for row, _col in active.keys()],
+            block_cols=[int(col) for _row, col in active.keys()],
+            host_available_bytes_before=None if memory_before is None else int(memory_before.get("available_bytes", 0)),
+        )
+        started = time.perf_counter()
+        remove_plaintexts = getattr(self.backend, "RemovePlaintextDiagonals", None)
+        for transform_id in active.values():
+            try:
+                if callable(remove_plaintexts):
+                    remove_plaintexts(int(transform_id))
+                self.backend.DeleteLinearTransform(int(transform_id))
+            except Exception:
+                pass
+        current = dict(getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {}) or {})
+        for block in active:
+            current.pop((int(block[0]), int(block[1])), None)
+        linear_layer._dense_layer_cache_active_transform_ids = dict(current)
+        linear_layer.transform_ids = dict(current)
+        elapsed = float(time.perf_counter() - started)
+        write_progress_event(
+            "end",
+            phase="evict",
+            layer=layer_name,
+            path="dense",
+            layer_cache_granularity=str(self.dense_layer_cache_granularity()),
+            layer_cache_evict_s=float(elapsed),
+            backend_transform_count=int(len(active)),
+            host_available_bytes_after=(
+                None
+                if (memory_after := host_memory_info()) is None
+                else int(memory_after.get("available_bytes", 0))
+            ),
+        )
         return float(elapsed)
 
     def finish_dense_layer_cache_runtime(self, linear_layer, evict_s: float) -> None:
@@ -1433,11 +1618,31 @@ class NewEvaluator:
         fhe_out_shape = linear_layer.fhe_output_shape 
         skip_post_rescale = bool(getattr(self.backend, "lt_outputs_are_rescaled", False))
         allow_sparse_output_rows = bool(getattr(linear_layer, "allow_sparse_output_rows", False))
+        dense_cache_deferred = bool(getattr(linear_layer, "_dense_layer_cache_deferred", False))
+        dense_cache_granularity = self.dense_layer_cache_granularity() if dense_cache_deferred else "resident"
 
-        rows, cols, transform_ids = self._transform_id_matrix(
-            getattr(linear_layer, "transform_ids", {}) or {},
-            input_cols=len(in_ctensor),
-        )
+        if bool(dense_cache_deferred) and dense_cache_granularity != "layer":
+            diag_indices_by_block = dict(getattr(linear_layer, "_dense_layer_cache_diag_indices_by_block", {}) or {})
+            if not callable(getattr(linear_layer, "_dense_layer_cache_build_block_diagonals", None)):
+                raise RuntimeError(
+                    f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} "
+                    "requires a block payload recipe for ORION_DENSE_LAYER_CACHE_GRANULARITY=lt/group"
+                )
+            if not diag_indices_by_block:
+                raise RuntimeError(
+                    f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no block metadata"
+                )
+            rows = max(int(row) for row, _col in diag_indices_by_block.keys()) + 1
+            cols = int(len(in_ctensor))
+            transform_ids = np.full((int(rows), int(cols)), -1, dtype=int)
+            for row, col in diag_indices_by_block.keys():
+                if int(col) < int(cols):
+                    transform_ids[int(row)][int(col)] = -2
+        else:
+            rows, cols, transform_ids = self._transform_id_matrix(
+                getattr(linear_layer, "transform_ids", {}) or {},
+                input_cols=len(in_ctensor),
+            )
         expected_output_rows = getattr(linear_layer, "expected_output_rows", None)
         if expected_output_rows is not None:
             expected_output_rows = int(expected_output_rows)
@@ -1462,7 +1667,7 @@ class NewEvaluator:
             (int(i), int(j), int(transform_ids[i][j]))
             for i in range(rows)
             for j in range(cols)
-            if int(transform_ids[i][j]) >= 0
+            if int(transform_ids[i][j]) >= 0 or int(transform_ids[i][j]) == -2
         ]
         write_progress_event(
             "start",
@@ -1472,6 +1677,7 @@ class NewEvaluator:
             row_count=int(rows),
             col_count=int(cols),
             backend_transform_count=int(len(work_items)),
+            layer_cache_granularity=str(dense_cache_granularity),
         )
         group_started = time.perf_counter()
         runtime_timing = {
@@ -1489,6 +1695,20 @@ class NewEvaluator:
         }
         for key, value in self._consume_dense_layer_cache_pending_timing(linear_layer).items():
             runtime_timing[key] = float(runtime_timing.get(key, 0.0) + float(value))
+        if bool(dense_cache_deferred) and dense_cache_granularity != "layer":
+            bias = getattr(linear_layer, "_dense_layer_cache_bias", None)
+            if bias is not None and getattr(linear_layer, "on_bias_ptxt", None) is None:
+                bias_started = time.perf_counter()
+                linear_layer.on_bias_ptxt = self.scheme.encoder.encode(
+                    bias,
+                    int(linear_layer.level) - int(linear_layer.depth),
+                )
+                runtime_timing["layer_cache_encode_s"] += float(time.perf_counter() - bias_started)
+                runtime_timing["layer_cache_turnover_s"] = float(
+                    runtime_timing.get("layer_cache_encode_s", 0.0)
+                    + runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                    + runtime_timing.get("layer_cache_evict_s", 0.0)
+                )
         prefetch_sequence, use_global_prefetch_sequence = self._transform_prefetch_sequence(
             layer_name,
             work_items,
@@ -1507,84 +1727,160 @@ class NewEvaluator:
             )
         work_index = 0
         cts_out = []
+        materialized_group: dict[tuple[int, int], int] = {}
+
+        def add_cache_timing(timing: dict[str, float]) -> None:
+            runtime_timing["layer_cache_encode_s"] += float(timing.get("layer_cache_encode_s", 0.0))
+            runtime_timing["layer_cache_key_prepare_s"] += float(timing.get("layer_cache_key_prepare_s", 0.0))
+            runtime_timing["layer_cache_turnover_s"] = float(
+                runtime_timing.get("layer_cache_encode_s", 0.0)
+                + runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                + runtime_timing.get("layer_cache_evict_s", 0.0)
+            )
+
+        def evict_materialized_group() -> None:
+            nonlocal materialized_group
+            if not materialized_group:
+                return
+            evict_s = self._evict_dense_layer_cache_transform_ids(linear_layer, materialized_group)
+            runtime_timing["layer_cache_evict_s"] += float(evict_s)
+            runtime_timing["layer_cache_turnover_s"] = float(
+                runtime_timing.get("layer_cache_encode_s", 0.0)
+                + runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                + runtime_timing.get("layer_cache_evict_s", 0.0)
+            )
+            materialized_group = {}
+
+        def materialize_group_for(blocks) -> None:
+            nonlocal materialized_group
+            evict_materialized_group()
+            if not blocks:
+                return
+            block_ids, timing = self._materialize_dense_layer_cache_blocks(linear_layer, blocks)
+            materialized_group = dict(block_ids)
+            add_cache_timing(timing)
+
+        group_size = 1
+        if dense_cache_granularity == "group":
+            group_size = self.dense_layer_cache_group_size()
+
         for i in range(rows):
             ct_out = None
+            eval_blocks: list[tuple[int, int, int]] = []
             for j in range(cols):
                 t_id = transform_ids[i][j]
-                if int(t_id) < 0:
+                if int(t_id) == -2:
+                    eval_blocks.append((int(i), int(j), -2))
+                elif int(t_id) < 0:
                     continue
+                else:
+                    eval_blocks.append((int(i), int(j), int(t_id)))
 
-                bundle = None
-                if self.io_mode != "none":
-                    current_key = self._transform_io_key(layer_name, int(i), int(j), int(t_id))
-                    self._forward_memory_guard(
-                        reason=f"before_lt_block_load:{layer_name}:{int(i)}:{int(j)}",
-                        needed_bytes=self._estimate_transform_device_bytes(
-                            layer_name,
-                            int(i),
-                            int(j),
-                            int(t_id),
-                        ),
-                    )
-                    read_started = time.perf_counter()
-                    bundle = self._transform_io_prefetcher.consume(current_key)
-                    if bundle is None:
-                        bundle = self._read_transform_io_bundle(
-                            layer_name,
-                            int(i),
-                            int(j),
-                            int(t_id),
-                            prefetch=False,
-                        )
-                    runtime_timing["read_bundle_s"] += float(time.perf_counter() - read_started)
-                    load_keys_started = time.perf_counter()
-                    self.load_rotation_keys(t_id, bundle=bundle)
-                    runtime_timing["load_keys_s"] += float(time.perf_counter() - load_keys_started)
-                    load_plaintexts_started = time.perf_counter()
-                    self.load_plaintext_diagonals(layer_name, i, j, t_id, bundle=bundle)
-                    self.ensure_plaintext_diagonals_loaded(
-                        layer_name,
-                        i,
-                        j,
-                        t_id,
-                        expected_level=int(linear_layer.level),
-                    )
-                    runtime_timing["load_plaintexts_s"] += float(time.perf_counter() - load_plaintexts_started)
-                    current_index = self._transform_sequence_index(
-                        current_key,
-                        fallback=work_index,
-                        use_global_sequence=use_global_prefetch_sequence,
-                    )
-                    self._fill_transform_io_prefetch_window(
-                        prefetch_sequence,
-                        int(current_index + 1),
-                        scratch_reserve_bytes=self._estimate_transform_scratch_reserve_bytes(t_id),
-                    )
+            block_index = 0
+            while block_index < len(eval_blocks):
+                if int(eval_blocks[block_index][2]) == -2:
+                    pending = [eval_blocks[block_index]]
+                    block_index += 1
+                    while (
+                        dense_cache_granularity == "group"
+                        and block_index < len(eval_blocks)
+                        and int(eval_blocks[block_index][2]) == -2
+                        and len(pending) < int(group_size)
+                    ):
+                        pending.append(eval_blocks[block_index])
+                        block_index += 1
+                    materialize_group_for([(row, col) for row, col, _tid in pending])
+                    current_blocks = [
+                        (int(row), int(col), int(materialized_group[(int(row), int(col))]))
+                        for row, col, _tid in pending
+                    ]
+                else:
+                    current_blocks = [eval_blocks[block_index]]
+                    block_index += 1
 
-                self._consume_shared_cache_eval_profile()
-                eval_started = time.perf_counter()
-                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
-                eval_elapsed = float(time.perf_counter() - eval_started)
-                self._add_backend_eval_profile(runtime_timing)
-                runtime_timing["eval_total_s"] += float(eval_elapsed)
-                runtime_timing["eval_s"] += float(eval_elapsed)
-                ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+                try:
+                    for block_i, block_j, t_id in current_blocks:
+                        i = int(block_i)
+                        j = int(block_j)
+                        t_id = int(t_id)
 
-                # Accumulate results across a row of blocks
-                ct_out = ct if ct_out is None else ct_out + ct
-                    
-                if self.io_mode != "none":
-                    unload_started = time.perf_counter()
-                    self.remove_rotation_keys(t_id)
-                    self.remove_plaintext_diagonals(t_id)
-                    if bundle is not None:
-                        bundle.clear()
-                    runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
-                    self._forward_memory_guard(
-                        reason=f"after_lt_block_unload:{layer_name}:{int(i)}:{int(j)}",
-                        raise_on_low=False,
-                    )
-                work_index += 1
+                        bundle = None
+                        if self.io_mode != "none":
+                            current_key = self._transform_io_key(layer_name, int(i), int(j), int(t_id))
+                            self._forward_memory_guard(
+                                reason=f"before_lt_block_load:{layer_name}:{int(i)}:{int(j)}",
+                                needed_bytes=self._estimate_transform_device_bytes(
+                                    layer_name,
+                                    int(i),
+                                    int(j),
+                                    int(t_id),
+                                ),
+                            )
+                            read_started = time.perf_counter()
+                            bundle = self._transform_io_prefetcher.consume(current_key)
+                            if bundle is None:
+                                bundle = self._read_transform_io_bundle(
+                                    layer_name,
+                                    int(i),
+                                    int(j),
+                                    int(t_id),
+                                    prefetch=False,
+                                )
+                            runtime_timing["read_bundle_s"] += float(time.perf_counter() - read_started)
+                            load_keys_started = time.perf_counter()
+                            self.load_rotation_keys(t_id, bundle=bundle)
+                            runtime_timing["load_keys_s"] += float(time.perf_counter() - load_keys_started)
+                            load_plaintexts_started = time.perf_counter()
+                            self.load_plaintext_diagonals(layer_name, i, j, t_id, bundle=bundle)
+                            self.ensure_plaintext_diagonals_loaded(
+                                layer_name,
+                                i,
+                                j,
+                                t_id,
+                                expected_level=int(linear_layer.level),
+                            )
+                            runtime_timing["load_plaintexts_s"] += float(time.perf_counter() - load_plaintexts_started)
+                            current_index = self._transform_sequence_index(
+                                current_key,
+                                fallback=work_index,
+                                use_global_sequence=use_global_prefetch_sequence,
+                            )
+                            self._fill_transform_io_prefetch_window(
+                                prefetch_sequence,
+                                int(current_index + 1),
+                                scratch_reserve_bytes=self._estimate_transform_scratch_reserve_bytes(t_id),
+                            )
+
+                        self._consume_shared_cache_eval_profile()
+                        eval_started = time.perf_counter()
+                        res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j])
+                        eval_elapsed = float(time.perf_counter() - eval_started)
+                        self._add_backend_eval_profile(runtime_timing)
+                        runtime_timing["eval_total_s"] += float(eval_elapsed)
+                        runtime_timing["eval_s"] += float(eval_elapsed)
+                        ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+
+                        # Accumulate results across a row of blocks; rescale only after the row is complete.
+                        ct_out = ct if ct_out is None else ct_out + ct
+
+                        if self.io_mode != "none":
+                            unload_started = time.perf_counter()
+                            self.remove_rotation_keys(t_id)
+                            self.remove_plaintext_diagonals(t_id)
+                            if bundle is not None:
+                                bundle.clear()
+                            runtime_timing["unload_s"] += float(time.perf_counter() - unload_started)
+                            self._forward_memory_guard(
+                                reason=f"after_lt_block_unload:{layer_name}:{int(i)}:{int(j)}",
+                                raise_on_low=False,
+                            )
+                        work_index += 1
+
+                        if dense_cache_granularity == "lt":
+                            evict_materialized_group()
+                finally:
+                    if dense_cache_granularity in {"lt", "group"}:
+                        evict_materialized_group()
 
             if ct_out is None:
                 if bool(allow_sparse_output_rows):
@@ -1599,6 +1895,9 @@ class NewEvaluator:
             else:
                 ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
                 cts_out.append(ct_out_rescaled)
+            if dense_cache_granularity == "group":
+                evict_materialized_group()
+        evict_materialized_group()
         if bool(allow_sparse_output_rows) and any(ct_id is None for ct_id in cts_out):
             reference_id = next((int(ct_id) for ct_id in cts_out if ct_id is not None), None)
             if reference_id is None:
@@ -1612,9 +1911,11 @@ class NewEvaluator:
 
         timing_payload = self._publish_runtime_timing(
             runtime_timing,
-            transform_ids=[int(transform_id) for _row, _col, transform_id in work_items],
+            transform_ids=[int(transform_id) for _row, _col, transform_id in work_items if int(transform_id) >= 0],
             total_s=float(time.perf_counter() - group_started),
         )
+        if bool(dense_cache_deferred):
+            timing_payload["dense_layer_cache_granularity"] = str(dense_cache_granularity)
         linear_layer._last_runtime_timing = dict(timing_payload)
         write_progress_event("end", phase="eval", layer=str(layer_name), path="dense", **dict(timing_payload))
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)

@@ -95,15 +95,23 @@ class LinearTransform(Module):
         self.diagonals = {}
         return True
 
-    def _install_single_slot_payload_recipe(self, *, diag_indices_by_block, build_diagonals) -> None:
+    def _install_single_slot_payload_recipe(
+        self,
+        *,
+        diag_indices_by_block,
+        build_diagonals,
+        build_block_diagonals=None,
+    ) -> None:
         indices = {
             (int(row), int(col)): tuple(int(value) for value in values)
             for (row, col), values in dict(diag_indices_by_block).items()
         }
         self._dense_layer_cache_diag_indices_by_block = indices
         self._dense_layer_cache_build_diagonals = build_diagonals
+        self._dense_layer_cache_build_block_diagonals = build_block_diagonals
         self._single_slot_diag_indices_by_block = indices
         self._single_slot_build_diagonals = build_diagonals
+        self._single_slot_build_block_diagonals = build_block_diagonals
         self.diagonals = {}
 
     def compile(self):
@@ -130,6 +138,12 @@ class LinearTransform(Module):
             if bool(layer_cache_active):
                 evict_s = self.scheme.lt_evaluator.evict_dense_layer_cache(self, clear_bias=True)
                 self.scheme.lt_evaluator.finish_dense_layer_cache_runtime(self, evict_s)
+            elif (
+                getattr(self, "_dense_layer_cache_deferred", False)
+                and self.scheme.lt_evaluator.dense_layer_cache_granularity() != "layer"
+                and hasattr(self, "on_bias_ptxt")
+            ):
+                self.on_bias_ptxt = None
 
 
 class Linear(LinearTransform):    
@@ -1011,6 +1025,9 @@ class Conv2d(LinearTransform):
             self._install_single_slot_payload_recipe(
                 diag_indices_by_block=diag_indices,
                 build_diagonals=lambda self=self, last=bool(last): packing.pack_conv2d(self, bool(last))[0],
+                build_block_diagonals=(
+                    lambda blocks, self=self, last=bool(last): packing.pack_conv2d_blocks(self, bool(last), blocks)
+                ),
             )
             return
         # Generate Toeplitz diagonals and determine the number of output
@@ -1185,6 +1202,9 @@ class ConvTranspose2d(LinearTransform):
             self._install_single_slot_payload_recipe(
                 diag_indices_by_block=diag_indices,
                 build_diagonals=lambda self=self, last=bool(last): packing.pack_conv_transpose2d(self, bool(last))[0],
+                build_block_diagonals=(
+                    lambda blocks, self=self, last=bool(last): packing.pack_conv_transpose2d_blocks(self, bool(last), blocks)
+                ),
             )
             return
         self.diagonals, self.output_rotations = packing.pack_conv_transpose2d(self, last)

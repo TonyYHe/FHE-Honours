@@ -34,6 +34,27 @@ def pack_conv2d(conv_layer: nn.Module, last: bool):
     
     return diagonals, output_rotations
 
+
+def pack_conv2d_blocks(conv_layer: nn.Module, last: bool, blocks):
+    slots = conv_layer.scheme.params.get_slots()
+    embed_method = conv_layer.scheme.params.get_embedding_method()
+
+    weight = conv_layer.on_weight
+    if conv_layer.groups > 1:
+        weight = resolve_grouped_conv(conv_layer)
+
+    return direct_diagonalize_conv2d(
+        conv_layer,
+        weight,
+        slots,
+        embed_method,
+        last,
+        allowed_blocks={
+            (int(row), int(col))
+            for row, col in blocks
+        },
+    )[0]
+
 def construct_conv2d_toeplitz(conv_layer, weight):
     N, on_Ci, on_Hi, on_Wi = conv_layer.fhe_input_shape
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
@@ -171,6 +192,22 @@ def pack_conv_transpose2d(conv_layer: nn.Module, last: bool):
     )
 
     return diagonals, output_rotations
+
+
+def pack_conv_transpose2d_blocks(conv_layer: nn.Module, last: bool, blocks):
+    slots = conv_layer.scheme.params.get_slots()
+    embed_method = conv_layer.scheme.params.get_embedding_method()
+
+    return direct_diagonalize_conv_transpose2d(
+        conv_layer,
+        slots,
+        embed_method,
+        last,
+        allowed_blocks={
+            (int(row), int(col))
+            for row, col in blocks
+        },
+    )[0]
 
 
 def _diagonal_has_nonzero(diag) -> bool:
@@ -331,6 +368,7 @@ class _DirectDiagonalAccumulator:
         *,
         allow_hybrid: bool = True,
         verbose: bool = True,
+        allowed_blocks: set[tuple[int, int]] | None = None,
     ) -> None:
         self.matrix_height = int(matrix_shape[0])
         self.matrix_width = int(matrix_shape[1])
@@ -353,6 +391,14 @@ class _DirectDiagonalAccumulator:
         else:
             self.block_height = self.num_slots
             self.output_rotations = 0
+        self.allowed_blocks = (
+            {
+                (int(row), int(col))
+                for row, col in allowed_blocks
+            }
+            if allowed_blocks is not None
+            else None
+        )
 
         self.resized_shape = (
             self.num_block_rows * self.block_height,
@@ -362,6 +408,14 @@ class _DirectDiagonalAccumulator:
             print(f"├── resized matrix shape: {self.resized_shape}")
             print(f"├── # output rotations: {self.output_rotations}")
         self.diagonals_by_block: dict[tuple[int, int], dict[int, np.ndarray]] = {}
+
+    def _allowed_entry_mask(self, block_rows: np.ndarray, block_cols: np.ndarray) -> np.ndarray | None:
+        if self.allowed_blocks is None:
+            return None
+        allowed = np.zeros(np.asarray(block_rows).shape, dtype=bool)
+        for row, col in self.allowed_blocks:
+            allowed |= (block_rows == int(row)) & (block_cols == int(col))
+        return allowed
 
     def add_entries(self, rows, cols, values) -> None:
         rows = np.asarray(rows, dtype=np.int64).reshape(-1)
@@ -397,6 +451,16 @@ class _DirectDiagonalAccumulator:
             local_cols = cols - block_cols * self.num_slots
             diag_idxs = (local_cols - local_rows) % self.block_height
             positions = (local_cols - diag_idxs) % self.num_slots
+
+        allowed_mask = self._allowed_entry_mask(block_rows, block_cols)
+        if allowed_mask is not None:
+            if not bool(np.any(allowed_mask)):
+                return
+            block_rows = block_rows[allowed_mask]
+            block_cols = block_cols[allowed_mask]
+            diag_idxs = diag_idxs[allowed_mask]
+            positions = positions[allowed_mask]
+            values = values[allowed_mask]
 
         order = np.lexsort((diag_idxs, block_cols, block_rows))
         block_rows = block_rows[order]
@@ -461,8 +525,18 @@ class _DirectDiagonalAccumulator:
             diag_idxs = (local_cols - local_rows) % self.block_height
             positions = (local_cols - diag_idxs) % self.num_slots
 
-        if rows.size <= 1:
-            bounds = np.array([int(rows.size)], dtype=np.int64)
+        allowed_mask = self._allowed_entry_mask(block_rows, block_cols)
+        if allowed_mask is not None:
+            if not bool(np.any(allowed_mask)):
+                return
+            block_rows = block_rows[allowed_mask]
+            block_cols = block_cols[allowed_mask]
+            diag_idxs = diag_idxs[allowed_mask]
+            positions = positions[allowed_mask]
+
+        entry_count = int(block_rows.size)
+        if entry_count <= 1:
+            bounds = np.array([int(entry_count)], dtype=np.int64)
         else:
             change = (
                 (block_rows[1:] != block_rows[:-1])
@@ -472,7 +546,7 @@ class _DirectDiagonalAccumulator:
             bounds = np.concatenate(
                 (
                     np.flatnonzero(change).astype(np.int64) + 1,
-                    np.array([int(rows.size)], dtype=np.int64),
+                    np.array([int(entry_count)], dtype=np.int64),
                 )
             )
 
@@ -502,19 +576,30 @@ class _DirectDiagonalAccumulator:
     def finish(self, start_time: float) -> tuple[dict[tuple[int, int], dict[int, np.ndarray]], int]:
         out: dict[tuple[int, int], dict[int, np.ndarray]] = {}
         total_diagonals = 0
-        for block_row in range(self.num_block_rows):
-            for block_col in range(self.num_block_cols):
-                block = self.diagonals_by_block.get((int(block_row), int(block_col)), {})
-                if not block:
-                    out[(int(block_row), int(block_col))] = {
-                        0: np.zeros((int(self.num_slots),), dtype=np.float32)
-                    }
-                    continue
-                total_diagonals += len(block)
+        if self.allowed_blocks is None:
+            block_keys = [
+                (int(block_row), int(block_col))
+                for block_row in range(self.num_block_rows)
+                for block_col in range(self.num_block_cols)
+            ]
+        else:
+            block_keys = sorted(
+                (int(row), int(col))
+                for row, col in self.allowed_blocks
+                if 0 <= int(row) < int(self.num_block_rows) and 0 <= int(col) < int(self.num_block_cols)
+            )
+        for block_row, block_col in block_keys:
+            block = self.diagonals_by_block.get((int(block_row), int(block_col)), {})
+            if not block:
                 out[(int(block_row), int(block_col))] = {
-                    int(diag_idx): np.ascontiguousarray(block[int(diag_idx)], dtype=np.float32)
-                    for diag_idx in sorted(int(value) for value in block.keys())
+                    0: np.zeros((int(self.num_slots),), dtype=np.float32)
                 }
+                continue
+            total_diagonals += len(block)
+            out[(int(block_row), int(block_col))] = {
+                int(diag_idx): np.ascontiguousarray(block[int(diag_idx)], dtype=np.float32)
+                for diag_idx in sorted(int(value) for value in block.keys())
+            }
         elapsed_time = time.time() - start_time
         print(f"├── time to pack (s): {elapsed_time:.2f}")
         print(f"├── # diagonals = {total_diagonals}")
@@ -830,6 +915,7 @@ def direct_diagonalize_conv2d(
     is_last_layer: bool,
     *,
     allow_hybrid: bool = True,
+    allowed_blocks: set[tuple[int, int]] | None = None,
 ):
     start_time = time.time()
     matrix_shape = (
@@ -842,6 +928,7 @@ def direct_diagonalize_conv2d(
         str(embed_method),
         bool(is_last_layer),
         allow_hybrid=bool(allow_hybrid),
+        allowed_blocks=allowed_blocks,
     )
 
     n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
@@ -915,6 +1002,7 @@ def direct_diagonalize_conv2d(
                     bool(is_last_layer),
                     allow_hybrid=bool(allow_hybrid),
                     verbose=False,
+                    allowed_blocks=allowed_blocks,
                 )
                 futures.append(executor.submit(fill_accumulator, local, int(oc_start), int(oc_end)))
             for future in futures:
@@ -963,6 +1051,7 @@ def direct_diagonalize_conv_transpose2d(
     is_last_layer: bool,
     *,
     allow_hybrid: bool = True,
+    allowed_blocks: set[tuple[int, int]] | None = None,
 ):
     start_time = time.time()
     matrix_shape = (
@@ -975,6 +1064,7 @@ def direct_diagonalize_conv_transpose2d(
         str(embed_method),
         bool(is_last_layer),
         allow_hybrid=bool(allow_hybrid),
+        allowed_blocks=allowed_blocks,
     )
 
     n_batch, ci, _, _ = [int(value) for value in conv_layer.input_shape]
@@ -1056,6 +1146,7 @@ def direct_diagonalize_conv_transpose2d(
                     bool(is_last_layer),
                     allow_hybrid=bool(allow_hybrid),
                     verbose=False,
+                    allowed_blocks=allowed_blocks,
                 )
                 futures.append(executor.submit(fill_accumulator, local, int(ic_start), int(ic_end)))
             for future in futures:
