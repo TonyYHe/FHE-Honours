@@ -662,6 +662,93 @@ def test_u22_256_base8_model_input_encodes_native_halo_source_tiles() -> None:
         scheme.delete_scheme()
 
 
+def test_layout_policy_plaintext_halo_input_uses_physical_betas() -> None:
+    from tools.run_lattigo_e2e_compare import _layout_policy_plaintext_halo_input
+
+    x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+    boundary_pruned_row = {
+        "selected_layout": {
+            "top_beta": 30,
+            "bottom_beta": 30,
+            "physical_top_beta": 0,
+            "physical_bottom_beta": 0,
+            "gap": 1,
+            "boundary_pruned": True,
+        }
+    }
+
+    compact = _layout_policy_plaintext_halo_input(x, boundary_pruned_row)
+
+    assert tuple(compact.shape) == tuple(x.shape)
+    assert torch.equal(compact, x)
+
+    physical_halo_row = {
+        "selected_layout": {
+            "top_beta": 30,
+            "bottom_beta": 30,
+            "physical_top_beta": 1,
+            "physical_bottom_beta": 2,
+            "gap": 1,
+            "boundary_pruned": True,
+        }
+    }
+
+    halo = _layout_policy_plaintext_halo_input(x, physical_halo_row)
+
+    assert tuple(halo.shape) == (1, 1, 7, 4)
+    assert torch.equal(halo[:, :, 0, :], x[:, :, 0, :])
+    assert torch.equal(halo[:, :, 1:5, :], x)
+    assert torch.equal(halo[:, :, 5, :], x[:, :, -1, :])
+    assert torch.equal(halo[:, :, 6, :], x[:, :, -1, :])
+
+
+def test_layout_policy_input_row_ignores_pruned_semantic_halo() -> None:
+    from tools.run_lattigo_e2e_compare import _layout_policy_input_layout_row
+
+    sentinel = object()
+    old_audit = getattr(scheme, "region_first_attach_audit", sentinel)
+    try:
+        scheme.region_first_attach_audit = {
+            "graph_audit": {
+                "layout_policy_node_layouts": [
+                    {
+                        "node": "x",
+                        "selected_layout": {
+                            "top_beta": 30,
+                            "bottom_beta": 30,
+                            "physical_top_beta": 0,
+                            "physical_bottom_beta": 0,
+                            "gap": 1,
+                            "boundary_pruned": True,
+                        },
+                    }
+                ]
+            }
+        }
+        assert _layout_policy_input_layout_row() is None
+
+        scheme.region_first_attach_audit["graph_audit"]["layout_policy_node_layouts"][0]["selected_layout"][
+            "gap"
+        ] = 2
+        assert _layout_policy_input_layout_row() is not None
+
+        scheme.region_first_attach_audit["graph_audit"]["layout_policy_node_layouts"][0]["selected_layout"][
+            "gap"
+        ] = 1
+        scheme.region_first_attach_audit["graph_audit"]["layout_policy_node_layouts"][0]["selected_layout"][
+            "physical_top_beta"
+        ] = 1
+        assert _layout_policy_input_layout_row() is not None
+    finally:
+        if old_audit is sentinel:
+            try:
+                delattr(scheme, "region_first_attach_audit")
+            except AttributeError:
+                pass
+        else:
+            scheme.region_first_attach_audit = old_audit
+
+
 def test_native_physical_relayout_honors_source_layout_offsets() -> None:
     from orion.experimental.cir.native_halo_conv2d import (
         NativeHaloConv2DSpec,

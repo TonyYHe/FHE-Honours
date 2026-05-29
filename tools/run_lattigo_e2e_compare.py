@@ -48,6 +48,20 @@ def _layout_bottom_beta(layout: dict[str, Any]) -> int:
     return max(0, int(layout.get("bottom_beta", layout.get("beta", 0)) or 0))
 
 
+def _layout_physical_top_beta(layout: dict[str, Any]) -> int:
+    return max(
+        0,
+        int(layout.get("physical_top_beta", layout.get("top_beta", layout.get("alpha", 0))) or 0),
+    )
+
+
+def _layout_physical_bottom_beta(layout: dict[str, Any]) -> int:
+    return max(
+        0,
+        int(layout.get("physical_bottom_beta", layout.get("bottom_beta", layout.get("beta", 0))) or 0),
+    )
+
+
 def _layout_policy_input_layout_row() -> dict[str, Any] | None:
     audit = dict(getattr(scheme, "region_first_attach_audit", {}) or {})
     graph = dict(audit.get("graph_audit", {}) or {})
@@ -55,7 +69,12 @@ def _layout_policy_input_layout_row() -> dict[str, Any] | None:
         if str(dict(row).get("node", "")) != "x":
             continue
         layout = dict(dict(row).get("selected_layout", {}) or {})
-        if _layout_top_beta(layout) <= 0 and _layout_bottom_beta(layout) <= 0:
+        gap = max(1, int(layout.get("gap", 1) or 1))
+        if (
+            _layout_physical_top_beta(layout) <= 0
+            and _layout_physical_bottom_beta(layout) <= 0
+            and int(gap) == 1
+        ):
             return None
         return dict(row)
     return None
@@ -64,8 +83,8 @@ def _layout_policy_input_layout_row() -> dict[str, Any] | None:
 def _layout_policy_plaintext_halo_input(x: torch.Tensor, row: dict[str, Any]) -> torch.Tensor:
     layout = dict(row.get("selected_layout", {}) or {})
     gap = max(1, int(layout.get("gap", 1)))
-    top_beta = _layout_top_beta(layout)
-    bottom_beta = _layout_bottom_beta(layout)
+    top_beta = _layout_physical_top_beta(layout)
+    bottom_beta = _layout_physical_bottom_beta(layout)
     compact = packing.multiplex(x, int(gap)).detach().cpu().to(dtype=torch.float32)
     if compact.dim() != 4:
         raise ValueError(f"layout-policy input halo expects NCHW input, got {tuple(compact.shape)}")
@@ -583,6 +602,13 @@ def _encrypt_model_input(
             "kind": "flat_halo_plaintext",
             "input_ct_count": int(len(getattr(ct, "ids", ()) or ())),
             "layout": dict(row.get("selected_layout", {}) or {}),
+            "selected_layout": dict(row.get("selected_layout", {}) or {}),
+            "materialized_layout": {
+                "top_beta": _layout_physical_top_beta(dict(row.get("selected_layout", {}) or {})),
+                "bottom_beta": _layout_physical_bottom_beta(dict(row.get("selected_layout", {}) or {})),
+                "gap": max(1, int(dict(row.get("selected_layout", {}) or {}).get("gap", 1) or 1)),
+                "source": "physical",
+            },
         }
     return ct
 
