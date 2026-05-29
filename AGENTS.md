@@ -64,9 +64,8 @@ rsync -az --checksum 'corg:/home/qihan/orion/.tmp/results/u22_exact_base64_dense
 
 Do not treat older kernel-rewrite campaign instructions as the default workflow
 for this mainline. In particular, do not start with old banked regression,
-kernel-change-verification, worker handoff, R18/R34 stage probes, or bootstrap
-handoff microbench workflows unless the current task explicitly modifies those
-kernel/provider code paths.
+worker handoff, R18/R34 stage probes, or bootstrap handoff microbench workflows
+unless the current task explicitly modifies those kernel/provider code paths.
 
 For ordinary mainline work, prefer:
 
@@ -75,8 +74,8 @@ For ordinary mainline work, prefer:
 - Recording result JSON paths and peak RSS / compile / compute timings.
 
 If you actually change backend kernels, provider executors, slot mapping, or
-planner internals, then run the relevant targeted verification for that code
-change. Keep that separate from the U22 experiment bookkeeping.
+planner internals, then choose an up-to-date targeted verification path for
+that code change. Keep that separate from the U22 experiment bookkeeping.
 
 ## Reporting Rules
 
