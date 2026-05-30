@@ -40,6 +40,8 @@ _DENSE_LAYER_CACHE_GRANULARITIES = {"layer", "lt", "group"}
 _COMPILE_PROFILE_KEYS = (
     "read_s",
     "diag_generate_s",
+    "diag_builder_build_s",
+    "diag_builder_shadow_s",
     "encode_s",
     "decode_s",
     "serialize_s",
@@ -227,6 +229,19 @@ class NewEvaluator:
     def _add_profile(self, key: str, seconds: float) -> None:
         if key in self.compile_load_profile:
             self.compile_load_profile[key] += float(seconds)
+
+    def _record_diag_builder_metadata(self, linear_layer, metadata: dict[str, object] | None) -> None:
+        if not isinstance(metadata, dict) or not metadata:
+            return
+        existing = dict(getattr(linear_layer, "_diag_builder_metadata", {}) or {})
+        for key, value in metadata.items():
+            if key in {"diag_builder_build_s", "diag_builder_shadow_s", "diag_builder_payload_count"}:
+                existing[key] = float(existing.get(key, 0.0) or 0.0) + float(value or 0.0)
+            else:
+                existing[key] = value
+        linear_layer._diag_builder_metadata = dict(existing)
+        self._add_profile("diag_builder_build_s", float(metadata.get("diag_builder_build_s", 0.0) or 0.0))
+        self._add_profile("diag_builder_shadow_s", float(metadata.get("diag_builder_shadow_s", 0.0) or 0.0))
 
     def _forward_memory_guard(
         self,
@@ -754,6 +769,7 @@ class NewEvaluator:
         diagonals = linear_layer.diagonals 
         level = linear_layer.level
         bsgs_ratio = linear_layer.bsgs_ratio
+        self._record_diag_builder_metadata(linear_layer, getattr(linear_layer, "_last_diag_builder_metadata", None))
         reuse_saved_plaintexts = bool(getattr(linear_layer, "_compile_cache_reuse_saved_plaintexts", False))
         effective_io_mode = "load" if reuse_saved_plaintexts else self.io_mode
         if self.io_mode == "save":
@@ -784,6 +800,19 @@ class NewEvaluator:
                 level=int(level),
                 bsgs_ratio=float(bsgs_ratio),
             )
+
+        prebuilt_payloads = getattr(linear_layer, "_dense_prebuilt_payloads", None)
+        if prebuilt_payloads is not None and str(effective_io_mode) == "none":
+            batch_ids = self._generate_transforms_from_payloads_batch(
+                prebuilt_payloads,
+                level=int(level),
+                bsgs_ratio=float(bsgs_ratio),
+                io_mode=str(effective_io_mode),
+                add_compile_profile=True,
+            )
+            finish_compiled_batch(batch_ids)
+            linear_layer._dense_prebuilt_payloads = None
+            return lintransf_ids
 
         batch_ids = self._generate_transforms_batch(
             diagonals,
@@ -1148,6 +1177,22 @@ class NewEvaluator:
         return list(ordered)
 
     def _dense_layer_cache_build_payloads_for_blocks(self, linear_layer, blocks):
+        build_payloads = getattr(linear_layer, "_dense_layer_cache_build_block_payloads", None)
+        if callable(build_payloads):
+            payload_started = time.perf_counter()
+            payloads = list(build_payloads(tuple((int(row), int(col)) for row, col in blocks)))
+            self._add_profile("diag_generate_s", time.perf_counter() - payload_started)
+            self._record_diag_builder_metadata(linear_layer, getattr(linear_layer, "_last_diag_builder_metadata", None))
+            if payloads:
+                return [
+                    (
+                        int(row),
+                        int(col),
+                        np.ascontiguousarray(diag_idxs, dtype=np.int32),
+                        np.ascontiguousarray(diag_data, dtype=np.float32),
+                    )
+                    for row, col, diag_idxs, diag_data in payloads
+                ]
         build_blocks = getattr(linear_layer, "_dense_layer_cache_build_block_diagonals", None)
         if not callable(build_blocks):
             raise RuntimeError(
@@ -1261,7 +1306,10 @@ class NewEvaluator:
             }
         layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
         write_progress_event("start", phase="diag_encode", layer=layer_name, path="dense")
+        payload_started = time.perf_counter()
         payloads = tuple(self._dense_layer_cache_build_payloads(linear_layer))
+        self._add_profile("diag_generate_s", time.perf_counter() - payload_started)
+        self._record_diag_builder_metadata(linear_layer, getattr(linear_layer, "_last_diag_builder_metadata", None))
         if not payloads:
             raise RuntimeError(f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no payloads")
         started = time.perf_counter()

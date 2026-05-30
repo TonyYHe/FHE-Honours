@@ -39,6 +39,7 @@ def main() -> None:
         str(args.cxx),
         "-std=c++17",
         "-O3",
+        "-fopenmp",
         "-shared",
         "-fPIC",
         str(source),

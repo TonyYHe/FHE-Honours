@@ -101,6 +101,7 @@ class LinearTransform(Module):
         diag_indices_by_block,
         build_diagonals,
         build_block_diagonals=None,
+        build_block_payloads=None,
     ) -> None:
         indices = {
             (int(row), int(col)): tuple(int(value) for value in values)
@@ -109,9 +110,11 @@ class LinearTransform(Module):
         self._dense_layer_cache_diag_indices_by_block = indices
         self._dense_layer_cache_build_diagonals = build_diagonals
         self._dense_layer_cache_build_block_diagonals = build_block_diagonals
+        self._dense_layer_cache_build_block_payloads = build_block_payloads
         self._single_slot_diag_indices_by_block = indices
         self._single_slot_build_diagonals = build_diagonals
         self._single_slot_build_block_diagonals = build_block_diagonals
+        self._single_slot_build_block_payloads = build_block_payloads
         self.diagonals = {}
 
     def compile(self):
@@ -318,7 +321,13 @@ class Conv2d(LinearTransform):
             self._concat_layout_top_beta(output_layout) > 0
             or self._concat_layout_bottom_beta(output_layout) > 0
         )
-        if bool(output_has_halo) and str(output_attrs.get("layout_policy_output_materialization", "") or "") != "fused_relayout":
+        materialization = str(output_attrs.get("layout_policy_output_materialization", "") or "")
+        if bool(output_has_halo) and materialization not in {
+            "fused_relayout",
+            "native_halo_stripe",
+            "native_stripe",
+            "channel_aligned_native_stripe",
+        }:
             return False
         kernel_h, kernel_w = (int(value) for value in self.kernel_size)
         stride_h, stride_w = (int(value) for value in self.stride)
@@ -1027,6 +1036,9 @@ class Conv2d(LinearTransform):
                 build_diagonals=lambda self=self, last=bool(last): packing.pack_conv2d(self, bool(last))[0],
                 build_block_diagonals=(
                     lambda blocks, self=self, last=bool(last): packing.pack_conv2d_blocks(self, bool(last), blocks)
+                ),
+                build_block_payloads=(
+                    lambda blocks, self=self, last=bool(last): packing.build_conv2d_block_payloads(self, bool(last), blocks)
                 ),
             )
             return

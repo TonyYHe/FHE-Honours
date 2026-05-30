@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -873,6 +874,561 @@ def test_native_halo_per_stripe_fold_reduces_tail_ct_and_keeps_offsets() -> None
             assert int(mapped_group) == int(target_group)
 
 
+def test_native_stripe_output_rows_cover_target_block_offsets_without_output_halo() -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        NativeHaloStripeNoRIConvExecutor,
+    )
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((1, 1, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 1, 4, 8]),
+        output_shape=torch.Size([1, 1, 4, 8]),
+        fhe_input_shape=torch.Size([1, 1, 4, 8]),
+        fhe_output_shape=torch.Size([1, 1, 4, 8]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+        layout_policy_output_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+        layout_policy_output_materialization="native_halo_stripe",
+        layout_policy_native_halo_channel_fold_mode="per_stripe",
+    )
+    spec = NativeHaloConv2DSpec(
+        family_label="native_stripe_rows_cover_targets_without_output_halo",
+        c_in=1,
+        h_in=4,
+        w_in=8,
+        c_out=1,
+        h_out=4,
+        w_out=8,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=0,
+        output_bottom_beta=0,
+        input_physical_top_beta=1,
+        input_physical_bottom_beta=1,
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    executor = NativeHaloStripeNoRIConvExecutor(module=module, spec=spec, output_node_id="conv")
+    plan = executor.native_plan
+    native_target_count = sum(int(value) for value in plan.target_channel_group_counts)
+    max_target_index = max(
+        int(plan.target_block_index(stripe, target_group))
+        for stripe in plan.stripes
+        for target_group in range(int(plan.target_group_count_for_stripe(stripe)))
+    )
+
+    assert int(plan.output_ct_count) == 1
+    assert int(native_target_count) == 2
+    assert int(max_target_index) == int(native_target_count) - 1
+    assert int(executor.rows) == int(native_target_count)
+    assert tuple(int(value) for value in executor.runtime_native_fhe_output_shape()) == (int(native_target_count), 32)
+
+    metadata = executor.compile_cache_metadata()
+    assert int(metadata["runtime_output_ct_count"]) == int(native_target_count)
+    assert int(metadata["native_halo_conv2d_plan"]["output_ct_count"]) == 1
+    assert metadata["runtime_output_storage_layout"] == "native_halo_stripe"
+
+
+def test_provider_diag_builder_records_fail_closed_native_source_fallback(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_diag_builder_native_source_fallback",
+            c_in=1,
+            h_in=4,
+            w_in=4,
+            c_out=1,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=1,
+            output_bottom_beta=1,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        transform = _build_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=torch.ones((1, 1, 3, 3), dtype=torch.float32),
+            stripe=plan.stripes[0],
+            source_group=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            group_n1=1,
+        )
+
+        assert transform is not None
+        metadata = getattr(transform, "_diag_builder_metadata", {})
+        assert metadata["diag_builder_kind"].endswith(":native_source")
+        assert metadata["diag_builder_source"] == "python_fallback"
+        assert metadata["diag_builder_fallback_count"] == 1.0
+        assert "unsupported" in metadata["diag_builder_fallback_reason"]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_strict_rejects_disabled_native_source(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_diag_builder_strict_disabled",
+            c_in=1,
+            h_in=4,
+            w_in=4,
+            c_out=1,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=1,
+            output_bottom_beta=1,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        with pytest.raises(RuntimeError, match="unsupported by C\\+\\+ diag builder env gate"):
+            _build_conv_transform(
+                spec=spec,
+                plan=plan,
+                weight=torch.ones((1, 1, 3, 3), dtype=torch.float32),
+                stripe=plan.stripes[0],
+                source_group=0,
+                target_group=0,
+                level=len(scheme.params.get_logq()) - 1,
+                scheme=scheme,
+                group_n1=1,
+            )
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_native_source_cpp_shadow_matches_python(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(31)
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_diag_builder_native_source_cpp_shadow",
+            c_in=2,
+            h_in=4,
+            w_in=4,
+            c_out=2,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=1,
+            output_bottom_beta=1,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        transform = _build_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn((2, 2, 3, 3), dtype=torch.float32),
+            stripe=plan.stripes[0],
+            source_group=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            group_n1=1,
+        )
+
+        assert transform is not None
+        metadata = getattr(transform, "_diag_builder_metadata", {})
+        assert metadata["diag_builder_source"] == "cpp_shadow"
+        assert metadata["diag_builder_shadow_ok"] is True
+        assert metadata["diag_builder_payload_count"] == 1.0
+        assert metadata["diag_builder_fallback_reason"] == ""
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_native_source_cpp_use_builds_payload_without_python_coalesce(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_SHADOW", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_diag_builder_native_source_cpp_use",
+            c_in=2,
+            h_in=4,
+            w_in=4,
+            c_out=2,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=1,
+            output_bottom_beta=1,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+
+        def _fail_python_coalesce(*_args, **_kwargs):
+            raise AssertionError("C++ provider use path should not build Python payload")
+
+        monkeypatch.setattr(native_halo_conv2d, "_coalesce_native_rows", _fail_python_coalesce)
+        transform = _build_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn((2, 2, 3, 3), dtype=torch.float32),
+            stripe=plan.stripes[0],
+            source_group=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            group_n1=1,
+        )
+        assert transform is not None
+        metadata = getattr(transform, "_diag_builder_metadata", {})
+        assert metadata["diag_builder_source"] == "cpp"
+        assert metadata["diag_builder_payload_count"] == 1.0
+        assert transform.diagonals[(0, 0)]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_compact_output_cpp_shadow_matches_python(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transforms_for_compact_output,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(32)
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_diag_builder_compact_output_cpp_shadow",
+            c_in=2,
+            h_in=4,
+            w_in=4,
+            c_out=2,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=32,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=0,
+            output_bottom_beta=0,
+            output_physical_top_beta=0,
+            output_physical_bottom_beta=0,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        transforms = _build_conv_transforms_for_compact_output(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn((2, 2, 3, 3), dtype=torch.float32),
+            stripe=plan.stripes[0],
+            source_group=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            group_n1=1,
+        )
+
+        assert transforms
+        for _target_index, transform in transforms:
+            metadata = getattr(transform, "_diag_builder_metadata", {})
+            assert metadata["diag_builder_source"] == "cpp_shadow"
+            assert metadata["diag_builder_shadow_ok"] is True
+            assert metadata["diag_builder_fallback_reason"] == ""
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_compact_output_cpp_use_builds_payload_without_python_coalesce(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transforms_for_compact_output,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_SHADOW", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_diag_builder_compact_output_cpp_use",
+            c_in=2,
+            h_in=4,
+            w_in=4,
+            c_out=2,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=32,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=0,
+            output_bottom_beta=0,
+            output_physical_top_beta=0,
+            output_physical_bottom_beta=0,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+
+        def _fail_python_coalesce(*_args, **_kwargs):
+            raise AssertionError("C++ provider compact-output use path should not build Python payload")
+
+        monkeypatch.setattr(native_halo_conv2d, "_coalesce_native_rows", _fail_python_coalesce)
+        transforms = _build_conv_transforms_for_compact_output(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn((2, 2, 3, 3), dtype=torch.float32),
+            stripe=plan.stripes[0],
+            source_group=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            group_n1=1,
+        )
+
+        assert transforms
+        for _target_index, transform in transforms:
+            metadata = getattr(transform, "_diag_builder_metadata", {})
+            assert metadata["diag_builder_source"] == "cpp"
+            assert metadata["diag_builder_fallback_reason"] == ""
+            assert transform.diagonals[(0, 0)]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_native_stripe_cache_load_rejects_out_of_range_targets(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((1, 1, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 1, 4, 8]),
+        output_shape=torch.Size([1, 1, 4, 8]),
+        fhe_input_shape=torch.Size([1, 1, 4, 8]),
+        fhe_output_shape=torch.Size([1, 1, 4, 8]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={"top_beta": 1, "bottom_beta": 1, "gap": 1},
+        layout_policy_output_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+        layout_policy_output_materialization="native_halo_stripe",
+        layout_policy_native_halo_channel_fold_mode="per_stripe",
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="native_stripe_cache_load_stale_rows",
+        c_in=1,
+        h_in=4,
+        w_in=8,
+        c_out=1,
+        h_out=4,
+        w_out=8,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=0,
+        output_bottom_beta=0,
+        input_physical_top_beta=1,
+        input_physical_bottom_beta=1,
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    assert int(executor.native_plan.output_ct_count) == 1
+    assert int(executor.rows) == 2
+    executor.assigned_level = 3
+    executor.load_compile_cache_metadata(
+        {
+            "rows": 1,
+            "cols": int(executor.cols),
+            "native_halo_conv2d_plan": executor.native_plan.to_dict(),
+            "runtime_groups": [{"input_index": 0, "storage_key": "group_10", "target_indices": [0, 2]}],
+        }
+    )
+
+    def _fake_compile_unified(self, _backend):
+        self.unified_ids = [int(1000 + index) for index in range(len(self.transforms))]
+        self.is_compiled = True
+
+    monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _fake_compile_unified)
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_io_mode=lambda: "load",
+            get_logq=lambda: [45, 30, 30, 45],
+            get_default_scale=lambda: 1 << 30,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="target_index=2 outside"):
+        executor.compile(fake_scheme)
+
+
+def test_native_halo_executor_rejects_cached_manifest_missing_target(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((2, 2, 3, 3), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 2, 4, 4]),
+        output_shape=torch.Size([1, 2, 4, 4]),
+        fhe_input_shape=torch.Size([1, 2, 4, 4]),
+        fhe_output_shape=torch.Size([1, 2, 4, 4]),
+        stride=(1, 1),
+        padding=(1, 1),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={},
+        layout_policy_output_layout={},
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="test_cached_native_halo_missing_target",
+        c_in=2,
+        h_in=4,
+        w_in=4,
+        c_out=2,
+        h_out=4,
+        w_out=4,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=16,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    executor.assigned_level = 3
+    executor.load_compile_cache_metadata(
+        {
+            "rows": int(executor.rows),
+            "cols": int(executor.cols),
+            "native_halo_conv2d_plan": executor.native_plan.to_dict(),
+            "runtime_groups": [{"input_index": 0, "storage_key": "group_10", "target_indices": [0]}],
+        }
+    )
+
+    def _fake_compile_unified(self, _backend):
+        self.unified_ids = [int(1000 + index) for index in range(len(self.transforms))]
+        self.is_compiled = True
+
+    monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _fake_compile_unified)
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_io_mode=lambda: "load",
+            get_logq=lambda: [45, 30, 30, 45],
+            get_default_scale=lambda: 1 << 30,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="does not cover output target"):
+        executor.compile(fake_scheme)
+
+
 def test_u22_256_base8_routes_flat_halo_producers_to_native_compact_source() -> None:
     from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
     from orion.experimental.cir.native_halo_conv2d import NativeHaloStripeNoRIConvExecutor
@@ -1565,6 +2121,233 @@ def test_compact_source_single_slot_native_output_builds_metadata(monkeypatch) -
         scheme.delete_scheme()
 
 
+def test_provider_diag_builder_compact_source_cpp_shadow_matches_python(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(26)
+        spec = NativeHaloConv2DSpec(
+            family_label="compact_source_cpp_shadow",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        stripe = plan.stripes[0]
+        transform = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32) / 10.0,
+            stripe=stripe,
+            source_block=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            group_n1=1,
+        )
+
+        assert transform is not None
+        metadata = getattr(transform, "_diag_builder_metadata", {})
+        assert metadata["diag_builder_source"] == "cpp_shadow"
+        assert metadata["diag_builder_shadow_ok"] is True
+        assert metadata["diag_builder_fallback_reason"] == ""
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_compact_source_cpp_use_builds_payload_without_python_coalesce(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_SHADOW", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="compact_source_cpp_use",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        stripe = plan.stripes[0]
+
+        def _fail_python_coalesce(*_args, **_kwargs):
+            raise AssertionError("C++ compact-source use path should not build Python payload")
+
+        monkeypatch.setattr(native_halo_conv2d, "_coalesce_native_rows", _fail_python_coalesce)
+        transform = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32) / 10.0,
+            stripe=stripe,
+            source_block=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            group_n1=1,
+        )
+
+        assert transform is not None
+        metadata = getattr(transform, "_diag_builder_metadata", {})
+        assert metadata["diag_builder_source"] == "cpp"
+        assert metadata["diag_builder_fallback_reason"] == ""
+        assert transform.diagonals[(0, 0)]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_compact_source_compact_output_cpp_shadow_matches_python(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(27)
+        spec = NativeHaloConv2DSpec(
+            family_label="compact_source_compact_output_cpp_shadow",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            output_top_beta=1,
+            output_bottom_beta=1,
+            output_physical_top_beta=1,
+            output_physical_bottom_beta=1,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        stripe = plan.stripes[0]
+        transform = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32) / 10.0,
+            stripe=stripe,
+            source_block=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"physical_top_beta": 1, "physical_bottom_beta": 1, "gap": 1},
+            group_n1=1,
+            compact_target_block=0,
+        )
+
+        assert transform is not None
+        metadata = getattr(transform, "_diag_builder_metadata", {})
+        assert metadata["diag_builder_source"] == "cpp_shadow"
+        assert metadata["diag_builder_shadow_ok"] is True
+        assert metadata["diag_builder_fallback_reason"] == ""
+    finally:
+        scheme.delete_scheme()
+
+
+def test_compact_source_single_slot_nonempty_rebuild_must_not_silently_zero(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_conv_transform,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(25)
+        spec = NativeHaloConv2DSpec(
+            family_label="compact_source_single_slot_rebuild_guard",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        stripe = plan.stripes[0]
+        weight = torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32) / 10.0
+        transform = _build_compact_source_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            group_n1=1,
+        )
+        assert transform is not None
+        assert transform._single_slot_diag_indices_by_block[(0, 0)]
+        transform._single_slot_diagonal_cache = None
+
+        def _missing_rebuild(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(native_halo_conv2d, "_build_compact_source_conv_transform", _missing_rebuild)
+        with pytest.raises(RuntimeError, match="returned no transform"):
+            transform._single_slot_build_diagonals()
+    finally:
+        scheme.delete_scheme()
+
+
 def test_compact_source_single_slot_concat_compile_skips_payload_coalesce(monkeypatch) -> None:
     from orion.experimental.cir import native_halo_conv2d
     from orion.experimental.cir.native_halo_conv2d import (
@@ -1865,6 +2648,51 @@ def test_concat_single_slot_metadata_matches_direct_pack_for_nonfused_output_hal
             for target_block, transform in transforms:
                 metadata = set(int(value) for value in transform._single_slot_diag_indices_by_block[(0, 0)])
                 assert metadata == set(int(value) for value in direct_diagonals[(int(target_block), int(source_block))])
+    finally:
+        scheme.delete_scheme()
+
+
+def test_concat_fusion_unified_supported_for_native_stripe_output_halo(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(2, 2, kernel_size=3, padding=1, bias=False)
+        conv.init_orion_params()
+        conv.name = "concat_native_stripe_probe"
+        conv.input_shape = torch.Size((1, 2, 8, 8))
+        conv.output_shape = torch.Size((1, 2, 8, 8))
+        conv.fhe_input_shape = torch.Size((1, 2, 8, 8))
+        conv.fhe_output_shape = torch.Size((1, 2, 10, 8))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.concat_fusion_specs = (
+            {
+                "source": "a",
+                "concat_node": "cat",
+                "channel_start": 0,
+                "channel_end": 1,
+                "channels": 1,
+                "shape": torch.Size((1, 1, 8, 8)),
+                "fhe_shape": torch.Size((1, 1, 10, 8)),
+                "gap": 1,
+            },
+            {
+                "source": "b",
+                "concat_node": "cat",
+                "channel_start": 1,
+                "channel_end": 2,
+                "channels": 1,
+                "shape": torch.Size((1, 1, 8, 8)),
+                "fhe_shape": torch.Size((1, 1, 10, 8)),
+                "gap": 1,
+            },
+        )
+        conv.layout_policy_output_layout = {"top_beta": 1, "bottom_beta": 1, "gap": 1}
+        conv.layout_policy_output_materialization = "native_halo_stripe"
+        conv.set_level(len(scheme.params.get_logq()) - 1)
+
+        assert conv._concat_fusion_unified_supported() is True
+        assert conv._generate_concat_fusion_diagonals(last=False) is True
     finally:
         scheme.delete_scheme()
 
@@ -2270,6 +3098,182 @@ def test_native_halo_executor_records_and_guards_channel_fold_mode(monkeypatch) 
 
     with pytest.raises(RuntimeError, match="channel_fold_mode"):
         executor.compile(fake_scheme)
+
+
+def test_native_halo_per_stripe_beta2_preserves_surplus_input_and_output_halo() -> None:
+    from orion.experimental.cir.native_halo_conv2d import NativeHaloConv2DSpec, native_halo_conv2d_plan
+
+    beta1 = NativeHaloConv2DSpec(
+        family_label="per_stripe_beta1_kernel_table_semantics",
+        c_in=32,
+        h_in=192,
+        w_in=192,
+        c_out=32,
+        h_out=192,
+        w_out=192,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32768,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=0,
+        output_bottom_beta=0,
+        input_physical_top_beta=1,
+        input_physical_bottom_beta=1,
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    beta2 = NativeHaloConv2DSpec(
+        family_label="per_stripe_beta2_kernel_table_semantics",
+        c_in=32,
+        h_in=192,
+        w_in=192,
+        c_out=32,
+        h_out=192,
+        w_out=192,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=32768,
+        input_top_beta=2,
+        input_bottom_beta=2,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        input_physical_top_beta=2,
+        input_physical_bottom_beta=2,
+        output_physical_top_beta=1,
+        output_physical_bottom_beta=1,
+    )
+
+    plan1 = native_halo_conv2d_plan(beta1, channel_fold_mode="per_stripe")
+    plan2 = native_halo_conv2d_plan(beta2, channel_fold_mode="per_stripe")
+
+    assert plan1.stripes[0].source_h_start == -1
+    assert plan2.stripes[0].source_h_start == -2
+    assert plan2.stripes[-1].source_h_end == 194
+    assert plan2.stripes[0].target_h_start == -1
+    assert plan2.stripes[-1].target_h_end == 193
+    assert plan2.output_ct_count > plan1.output_ct_count
+    assert plan2.c_only_rotations != plan1.c_only_rotations
+
+
+def test_native_halo_beta2_materializes_surplus_physical_input_halo() -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        native_halo_conv2d_plan,
+        native_halo_source_plaintext_blocks_from_nchw,
+    )
+
+    spec = NativeHaloConv2DSpec(
+        family_label="beta2_materializes_surplus_physical_input_halo",
+        c_in=1,
+        h_in=4,
+        w_in=4,
+        c_out=1,
+        h_out=4,
+        w_out=4,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=64,
+        input_top_beta=2,
+        input_bottom_beta=2,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        input_physical_top_beta=2,
+        input_physical_bottom_beta=2,
+        output_physical_top_beta=1,
+        output_physical_bottom_beta=1,
+    )
+    plan = native_halo_conv2d_plan(spec, channel_fold_mode="per_stripe")
+    x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+
+    block = native_halo_source_plaintext_blocks_from_nchw(x, plan)[0]
+    stripe = plan.stripes[0]
+    materialized_rows = block[: int(stripe.source_h) * int(spec.w_in)].reshape(int(stripe.source_h), int(spec.w_in))
+
+    assert stripe.source_h_start == -2
+    assert stripe.source_h_end == 6
+    assert torch.equal(materialized_rows[:2], torch.zeros((2, 4), dtype=torch.float32))
+    assert torch.equal(materialized_rows[2:6], x.reshape(4, 4))
+    assert torch.equal(materialized_rows[6:], torch.zeros((2, 4), dtype=torch.float32))
+
+
+def test_conv_kernel_table_native_stripe_beta2_requests_output_halo() -> None:
+    from tools.run_conv_kernel_table import ConvKernelRow, _apply_provider_output_layout
+
+    beta1 = ConvKernelRow(
+        channels=32,
+        height=192,
+        width=192,
+        variant="provider_halo1_individual_lt",
+        input_level=2,
+    )
+    beta2 = ConvKernelRow(
+        channels=32,
+        height=192,
+        width=192,
+        variant="provider_halo2_individual_lt",
+        input_level=2,
+    )
+    conv1 = SimpleNamespace(layout_policy_output_materialization="", layout_policy_output_layout={})
+    conv2 = SimpleNamespace(layout_policy_output_materialization="", layout_policy_output_layout={})
+
+    assert _apply_provider_output_layout(conv1, beta1, output_layout="native_stripe") == "native_halo_stripe"
+    assert _apply_provider_output_layout(conv2, beta2, output_layout="native_stripe") == "native_halo_stripe"
+
+    assert conv1.layout_policy_output_layout == {"top_beta": 0, "bottom_beta": 0}
+    assert conv2.layout_policy_output_layout == {"top_beta": 1, "bottom_beta": 1}
+
+
+def test_conv_kernel_table_rejects_stale_native_stripe_beta2_reuse(tmp_path) -> None:
+    from tools.run_conv_kernel_table import ConvKernelRow, reuse_existing_rows
+
+    row = ConvKernelRow(
+        channels=32,
+        height=192,
+        width=192,
+        variant="provider_halo2_individual_lt",
+        input_level=2,
+    )
+    stale = {
+        "status": "ok",
+        "backend": "lattigo",
+        "path": "provider",
+        "input_level": 2,
+        "ckks_profile": "e2e",
+        "input_halo_top": 2,
+        "input_halo_bottom": 2,
+        "output_halo_top": 0,
+        "output_halo_bottom": 0,
+        "provider_output_storage_layout": "native_halo_stripe",
+        "provider_lt_grouping_mode": "individual",
+        "native_halo_channel_fold_mode": "per_stripe",
+        "module": {
+            "input_shape": [1, 32, 192, 192],
+            "fhe_input_shape": [1, 32, 192, 192],
+            "input_gap": 1,
+        },
+    }
+    source = tmp_path / "stale_beta2.json"
+    source.write_text(json.dumps(stale), encoding="utf-8")
+
+    reused = reuse_existing_rows(
+        tmp_path / "run",
+        [row],
+        [source],
+        provider_output_layout="native_stripe",
+    )
+
+    assert reused == 0
+    assert not (tmp_path / "run" / "rows" / f"{row.row_id}.json").exists()
 
 
 def test_native_halo_executor_rejects_stale_same_mode_plan_metadata(monkeypatch) -> None:

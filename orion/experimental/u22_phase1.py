@@ -1529,6 +1529,29 @@ class LayoutPolicyProviderRuntimeExecutor:
     def _backend_name(self, scheme: Any | None) -> str:
         return str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
 
+    def _validate_scheme_slots(self, scheme: Any) -> None:
+        planned_slots = int(self.compile_plan.get("slots", 0) or 0)
+        if int(planned_slots) <= 0:
+            return
+        params = getattr(scheme, "params", None)
+        get_slots = getattr(params, "get_slots", None)
+        if not callable(get_slots):
+            return
+        try:
+            runtime_slots = int(get_slots())
+        except Exception:
+            return
+        backend = self._backend_name(scheme)
+        if backend not in {"lattigo", "clear_lattigo"}:
+            return
+        if int(runtime_slots) != int(planned_slots):
+            raise RuntimeError(
+                "layout-policy provider compile plan was built for "
+                f"{int(planned_slots)} slots, but backend {backend!r} has "
+                f"{int(runtime_slots)} slots. Rebuild the layout plan for this "
+                "scheme or use the canonical LogN=16 provider configuration."
+            )
+
     def _runtime_lowering_label(self) -> str:
         if bool(self.native_halo_input):
             return "provider_executable+native_halo_layout"
@@ -1651,6 +1674,7 @@ class LayoutPolicyProviderRuntimeExecutor:
             return
         if not self.supports_scheme(scheme):
             raise RuntimeError("layout-policy provider executor received an unsupported backend")
+        self._validate_scheme_slots(scheme)
         current_level = int(self.assigned_level) if self.assigned_level is not None else int(len(scheme.params.get_logq()) - 1)
         native_physical_relayout_depth = int(len(self.native_physical_relayout_rows))
         input_relayout_depth = int(

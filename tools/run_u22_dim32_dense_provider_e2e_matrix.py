@@ -128,8 +128,6 @@ ENV_DEFAULTS: dict[str, str] = {
     "GOMAXPROCS": "1",
     "ORION_COMPILE_PARALLEL_POLICY": "manual",
     "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
-    "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
-    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "1",
     "ORION_SINGLE_SLOT_ENCODE_WORKERS": str(CPU_COUNT),
     "ORION_LATTIGO_STREAMING_LT": "0",
     "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "0",
@@ -156,13 +154,22 @@ ENV_DEFAULTS: dict[str, str] = {
 REQUIRED_MAINLINE_ENV: dict[str, str] = {
     "GOMAXPROCS": "1",
     "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
-    "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
     "ORION_LATTIGO_STREAMING_LT": "0",
     "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
     "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_CONCAT_FUSION": "1",
+}
+
+DENSE_MODE_ENV: dict[str, str] = {
+    "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
+    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "1",
+}
+
+PROVIDER_MODE_ENV: dict[str, str] = {
+    "ORION_DENSE_LAYER_CACHE_GRANULARITY": "layer",
+    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "1",
 }
 
 ENV_TUNING_KEYS = (
@@ -203,6 +210,15 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
         updated.setdefault(key, value)
     for key, value in REQUIRED_MAINLINE_ENV.items():
         updated[key] = value
+    return updated
+
+
+def _apply_mode_env(env: dict[str, str], mode: str) -> dict[str, str]:
+    updated = dict(env)
+    if str(mode) == "provider":
+        updated.update(PROVIDER_MODE_ENV)
+    else:
+        updated.update(DENSE_MODE_ENV)
     return updated
 
 
@@ -319,8 +335,8 @@ def _annotate_result(
 
 
 def run_one(args: argparse.Namespace) -> int:
-    os.environ.update(_apply_env_defaults(os.environ))
     mode = str(args.mode)
+    os.environ.update(_apply_mode_env(_apply_env_defaults(os.environ), mode))
     if mode == "dense":
         os.environ["ORION_CONCAT_FUSION"] = "1"
     else:
@@ -1325,6 +1341,9 @@ def run_all(args: argparse.Namespace) -> int:
     try:
         for case in cases:
             for mode in modes:
+                env = _apply_mode_env(_apply_env_defaults(os.environ), mode)
+                env["TMPDIR"] = str(run_root / "tmp")
+                env.setdefault("XDG_CACHE_HOME", str(run_root / "xdg-cache"))
                 out_path, log_path = _case_paths(run_root, case, mode)
                 if _status_ok(out_path) and not bool(args.force):
                     print(f"[{datetime.now().isoformat(timespec='seconds')}] skip {case} {mode}: {out_path}", flush=True)

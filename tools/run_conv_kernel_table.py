@@ -274,6 +274,23 @@ def _explicit_halo(result: dict[str, Any]) -> tuple[int | None, int | None]:
         return None, None
 
 
+def _explicit_output_halo(result: dict[str, Any]) -> tuple[int | None, int | None]:
+    top = result.get("output_halo_top")
+    bottom = result.get("output_halo_bottom")
+    if top is None or bottom is None:
+        metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
+        native_plan = metadata.get("native_halo_conv2d_plan") if isinstance(metadata.get("native_halo_conv2d_plan"), dict) else {}
+        spec = native_plan.get("spec") if isinstance(native_plan.get("spec"), dict) else {}
+        top = spec.get("output_top_beta")
+        bottom = spec.get("output_bottom_beta")
+    if top is None or bottom is None:
+        return None, None
+    try:
+        return int(top), int(bottom)
+    except (TypeError, ValueError):
+        return None, None
+
+
 def _is_streaming_result(result: dict[str, Any]) -> bool:
     env = result.get("env") if isinstance(result.get("env"), dict) else {}
     raw = str(env.get("ORION_LATTIGO_STREAMING_LT", "") or "").strip().lower()
@@ -367,6 +384,12 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         input_halo_top = row.halo
     if input_halo_bottom is None:
         input_halo_bottom = row.halo
+    output_halo_top, output_halo_bottom = _explicit_output_halo(result)
+    if row.path == "provider" and (output_halo_top is None or output_halo_bottom is None):
+        output_halo_top, output_halo_bottom = _expected_provider_output_halo(
+            row,
+            output_layout=_provider_result_output_layout(result),
+        )
     metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
     provider_lt_grouping_mode = ""
     if row.path == "provider":
@@ -404,11 +427,20 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "native_halo_channel_fold_mode": _provider_channel_fold_mode(result) if row.path == "provider" else "",
         "input_halo_top": input_halo_top,
         "input_halo_bottom": input_halo_bottom,
+        "output_halo_top": output_halo_top if row.path == "provider" else None,
+        "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
         "provider_output_storage_layout": _provider_result_output_layout(result) if row.path == "provider" else "",
         "kernel": "3x3/pad1/stride1",
         "compile_s": float(result.get("compile_s") or 0.0),
         "generate_diagonals_s": float(result.get("generate_diagonals_s") or 0.0),
         "compile_backend_s": float(result.get("compile_backend_s") or 0.0),
+        "compile_load_profile": dict(result.get("compile_load_profile") or {}),
+        "diag_builder_kind": str(result.get("diag_builder_kind") or ""),
+        "diag_builder_source": str(result.get("diag_builder_source") or ""),
+        "diag_builder_build_s": float(result.get("diag_builder_build_s") or 0.0),
+        "diag_builder_shadow_s": float(result.get("diag_builder_shadow_s") or 0.0),
+        "diag_builder_payload_count": int(float(result.get("diag_builder_payload_count") or 0.0)),
+        "diag_builder_fallback_reason": str(result.get("diag_builder_fallback_reason") or ""),
         "run_count": int(result.get("run_count") or len(result.get("hot_run_s", []) or []) or 1),
         "hot_run_s": [float(value) for value in (result.get("hot_run_s") or [])],
         "hot_run_mean_s": float(result.get("hot_run_mean_s") or result.get("serving_hot_s") or 0.0),
@@ -434,6 +466,25 @@ def _provider_result_output_layout(result: dict[str, Any]) -> str:
         or result.get("runtime_output_storage_layout")
         or ""
     )
+
+
+def _provider_output_halo_mismatch(
+    row: ConvKernelRow,
+    result: dict[str, Any],
+    *,
+    provider_output_layout: str,
+) -> tuple[int, int, int, int] | None:
+    if row.path != "provider":
+        return None
+    expected_top, expected_bottom = _expected_provider_output_halo(row, output_layout=str(provider_output_layout))
+    actual_top, actual_bottom = _explicit_output_halo(result)
+    if actual_top is None or actual_bottom is None:
+        actual_top = actual_bottom = 0
+    expected = (int(expected_top or 0), int(expected_bottom or 0))
+    actual = (int(actual_top), int(actual_bottom))
+    if actual != expected:
+        return int(actual[0]), int(actual[1]), int(expected[0]), int(expected[1])
+    return None
 
 
 def reuse_existing_rows(
@@ -511,6 +562,42 @@ def reuse_existing_rows(
                     continue
                 expected_layout = "native_halo_stripe" if str(provider_output_layout) == "native_stripe" else "tight_compact"
                 if _provider_result_output_layout(result) != expected_layout:
+                    continue
+                row_probe = row_by_key.get(
+                    (
+                        "provider",
+                        int(channels),
+                        int(height),
+                        int(width),
+                        int(gap),
+                        int(input_level),
+                        int(top),
+                        _normalise_provider_lt_grouping_mode(
+                            result.get("provider_lt_grouping_mode")
+                            or (
+                                result.get("provider_metadata", {}).get("provider_lt_grouping_mode")
+                                if isinstance(result.get("provider_metadata"), dict)
+                                else ""
+                            )
+                            or (
+                                result.get("provider_metadata", {}).get("lt_grouping_mode")
+                                if isinstance(result.get("provider_metadata"), dict)
+                                else ""
+                            )
+                            or "shared"
+                        ),
+                        _provider_channel_fold_mode(result),
+                        ckks_profile,
+                    )
+                )
+                if row_probe is None:
+                    continue
+                output_mismatch = _provider_output_halo_mismatch(
+                    row_probe,
+                    result,
+                    provider_output_layout=str(provider_output_layout),
+                )
+                if output_mismatch is not None:
                     continue
                 metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
                 grouping_mode = _normalise_provider_lt_grouping_mode(
@@ -672,6 +759,18 @@ def _effective_provider_input_halo(
     return int(row.halo), int(row.halo)
 
 
+def _expected_provider_output_halo(row: ConvKernelRow, *, output_layout: str) -> tuple[int | None, int | None]:
+    if row.path != "provider":
+        return None, None
+    layout = str(output_layout or "tight_compact")
+    if layout in {"native_stripe", "native_halo_stripe"}:
+        halo = max(0, int(row.halo or 0) - 1)
+        return int(halo), int(halo)
+    if layout == "tight_compact":
+        return 0, 0
+    return None, None
+
+
 def _apply_provider_input_halo(
     conv: Conv2d,
     row: ConvKernelRow,
@@ -689,8 +788,9 @@ def _apply_provider_output_layout(conv: Conv2d, row: ConvKernelRow, *, output_la
         return ""
     layout = str(output_layout or "tight_compact")
     if layout == "native_stripe":
+        output_top, output_bottom = _expected_provider_output_halo(row, output_layout=layout)
         conv.layout_policy_output_materialization = "native_halo_stripe"
-        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0}
+        conv.layout_policy_output_layout = {"top_beta": int(output_top or 0), "bottom_beta": int(output_bottom or 0)}
         return "native_halo_stripe"
     if layout == "tight_compact":
         conv.layout_policy_output_materialization = "fused_relayout"
@@ -953,6 +1053,10 @@ def _run_row(
             row,
             output_layout=str(provider_output_layout),
         )
+        output_halo_top, output_halo_bottom = _expected_provider_output_halo(
+            row,
+            output_layout=str(provider_output_layout),
+        )
         if row.path == "provider":
             _attach_provider_runtime(conv, row)
         with _capture_stdout() as buffer:
@@ -963,6 +1067,7 @@ def _run_row(
             conv.compile()
             compile_backend_s = float(time.perf_counter() - compile_started)
             compile_stdout = buffer.getvalue()
+        compile_load_profile = dict(getattr(scheme.lt_evaluator, "get_compile_load_profile", lambda: {})() or {})
 
         slots = int(scheme.params.get_slots())
         compact_input_cts = _ct_count_from_shape(conv.fhe_input_shape, slots=int(slots))
@@ -974,10 +1079,16 @@ def _run_row(
             input_cts = int(dense_cols)
             output_cts = int(dense_rows)
             provider_metadata: dict[str, Any] = {}
+            provider_diag_builder_metadata: dict[str, Any] = {}
             provider_lt_grouping_mode = ""
         else:
             executor = getattr(conv.region_runtime, "executor")
             provider_metadata = _metadata_for_native_executor(executor)
+            provider_diag_builder_metadata = {
+                key: value
+                for key, value in dict(getattr(executor, "last_runtime_timing", {}) or {}).items()
+                if str(key).startswith("diag_builder_")
+            }
             provider_lt_grouping_mode = _normalise_provider_lt_grouping_mode(
                 provider_metadata.get("provider_lt_grouping_mode")
                 or provider_metadata.get("lt_grouping_mode")
@@ -1001,6 +1112,9 @@ def _run_row(
                 or native_plan.get("output_storage_layout")
                 or ""
             )
+        diag_builder_metadata = dict(getattr(conv, "_diag_builder_metadata", {}) or {})
+        if row.path == "provider":
+            diag_builder_metadata.update(provider_diag_builder_metadata)
 
         runs: list[dict[str, Any]] = []
         for index in range(int(repeats)):
@@ -1066,10 +1180,39 @@ def _run_row(
             "provider_output_layout": applied_provider_output_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "output_halo_top": output_halo_top if row.path == "provider" else None,
+            "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
             "kernel": "3x3/pad1/stride1",
             "compile_s": float(generate_diagonals_s + compile_backend_s),
             "generate_diagonals_s": float(generate_diagonals_s),
             "compile_backend_s": float(compile_backend_s),
+            "compile_load_profile": dict(compile_load_profile),
+            "diag_builder_kind": str(
+                diag_builder_metadata.get("diag_builder_kind")
+                or compile_load_profile.get("diag_builder_kind")
+                or ""
+            ),
+            "diag_builder_source": str(
+                diag_builder_metadata.get("diag_builder_source")
+                or ""
+            ),
+            "diag_builder_build_s": float(
+                diag_builder_metadata.get("diag_builder_build_s")
+                or compile_load_profile.get("diag_builder_build_s")
+                or 0.0
+            ),
+            "diag_builder_shadow_s": float(
+                diag_builder_metadata.get("diag_builder_shadow_s")
+                or compile_load_profile.get("diag_builder_shadow_s")
+                or 0.0
+            ),
+            "diag_builder_payload_count": int(
+                float(diag_builder_metadata.get("diag_builder_payload_count") or 0.0)
+            ),
+            "diag_builder_fallback_reason": str(
+                diag_builder_metadata.get("diag_builder_fallback_reason")
+                or ""
+            ),
             "run_count": int(repeats),
             "hot_run_s": [float(item.get("elapsed_s") or 0.0) for item in runs],
             "hot_run_mean_s": (
@@ -1131,6 +1274,14 @@ def _env_snapshot() -> dict[str, str]:
         "ORION_UNIFIED_LT_INDIVIDUAL_EVAL",
         "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS",
         "ORION_LATTIGO_UNIFIED_NO_BSGS",
+        "ORION_CPP_DIAG_BUILDER",
+        "ORION_CPP_DIAG_BUILDER_DENSE",
+        "ORION_CPP_DIAG_BUILDER_PROVIDER",
+        "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE",
+        "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE",
+        "ORION_CPP_DIAG_BUILDER_STRICT",
+        "ORION_CPP_DIAG_BUILDER_SHADOW",
+        "ORION_DIAG_BUILDER_LIB",
     ]
     return {key: str(os.environ.get(key, "")) for key in keys}
 
@@ -1179,15 +1330,29 @@ def _rows_from_args(args: argparse.Namespace) -> list[ConvKernelRow]:
     return rows
 
 
-def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]:
+def _table_payload(
+    run_root: Path,
+    rows: list[ConvKernelRow],
+    *,
+    provider_output_layout: str = "tight_compact",
+) -> list[list[str]]:
     table_rows: list[list[str]] = []
     for row in rows:
         result_path = _row_path(Path(run_root), row)
         payload = _read_json(result_path)
         status = "pending" if payload is None else str(payload.get("status", "unknown"))
         note = ""
+        output_mismatch = (
+            _provider_output_halo_mismatch(row, payload, provider_output_layout=str(provider_output_layout))
+            if isinstance(payload, dict)
+            else None
+        )
+        if output_mismatch is not None:
+            actual_top, actual_bottom, expected_top, expected_bottom = output_mismatch
+            status = "stale"
+            note = f"output halo {actual_top}/{actual_bottom}; expected {expected_top}/{expected_bottom}"
         if isinstance(payload, dict) and status != "ok":
-            note = str(payload.get("failure_kind") or payload.get("error") or payload.get("message") or "")[:120]
+            note = note or str(payload.get("failure_kind") or payload.get("error") or payload.get("message") or "")[:120]
         elif isinstance(payload, dict) and payload.get("reused_from"):
             source = str(payload.get("reused_from"))
             source_file, _sep, source_detail = source.partition(":")
@@ -1243,6 +1408,8 @@ def _table_payload(run_root: Path, rows: list[ConvKernelRow]) -> list[list[str]]
                 _fmt_float((payload or {}).get("lt_accumulate_s") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("hot_run_mean_s") if isinstance(payload, dict) else None),
                 _fmt_float((payload or {}).get("compile_s") if isinstance(payload, dict) else None),
+                _fmt_float((payload or {}).get("diag_builder_build_s") if isinstance(payload, dict) else None),
+                _fmt_float((payload or {}).get("diag_builder_shadow_s") if isinstance(payload, dict) else None),
                 _fmt_int((payload or {}).get("input_cts") if isinstance(payload, dict) else None),
                 _fmt_int((payload or {}).get("output_cts") if isinstance(payload, dict) else None),
                 _gib_from_bytes((payload or {}).get("maxrss_bytes") if isinstance(payload, dict) else None),
@@ -1275,6 +1442,8 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "LT+accumulate s",
         "hot run s",
         "compile s",
+        "diag build s",
+        "diag shadow s",
         "input ct",
         "output ct",
         "peak RSS GiB",
@@ -1305,6 +1474,8 @@ def _markdown_table(rows: list[list[str]]) -> str:
         "---:",
         "---:",
         "---:",
+        "---:",
+        "---:",
         "---",
         "---",
         "---",
@@ -1315,13 +1486,24 @@ def _markdown_table(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def update_doc(doc_path: Path, run_root: Path, rows: list[ConvKernelRow]) -> None:
-    table = _markdown_table(_table_payload(Path(run_root), rows))
+def update_doc(
+    doc_path: Path,
+    run_root: Path,
+    rows: list[ConvKernelRow],
+    *,
+    provider_output_layout: str = "tight_compact",
+) -> None:
+    table = _markdown_table(_table_payload(Path(run_root), rows, provider_output_layout=str(provider_output_layout)))
     text = Path(doc_path).read_text(encoding="utf-8")
     Path(doc_path).write_text(_replace_block(text, DOC_MARKER, table), encoding="utf-8")
 
 
-def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
+def _write_summary_csv(
+    run_root: Path,
+    rows: list[ConvKernelRow],
+    *,
+    provider_output_layout: str = "tight_compact",
+) -> None:
     csv_path = Path(run_root) / "conv_kernel_table.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     headers = [
@@ -1344,6 +1526,8 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
         "lt_accumulate_s",
         "hot_run_s",
         "compile_s",
+        "diag_build_s",
+        "diag_shadow_s",
         "input_ct",
         "output_ct",
         "peak_rss_gib",
@@ -1354,7 +1538,7 @@ def _write_summary_csv(run_root: Path, rows: list[ConvKernelRow]) -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(headers)
-        writer.writerows(_table_payload(Path(run_root), rows))
+        writer.writerows(_table_payload(Path(run_root), rows, provider_output_layout=str(provider_output_layout)))
 
 
 def _process_rss_bytes(pid: int) -> int | None:
@@ -1376,8 +1560,13 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
         clip_boundary_halo=bool(getattr(args, "clip_provider_boundary_halo", False) and row.path == "provider"),
     )
     provider_output_layout = ""
+    output_halo_top, output_halo_bottom = None, None
     if row.path == "provider":
         provider_output_layout = "native_halo_stripe" if str(args.provider_output_layout) == "native_stripe" else "tight_compact"
+        output_halo_top, output_halo_bottom = _expected_provider_output_halo(
+            row,
+            output_layout=str(args.provider_output_layout),
+        )
     _write_json(
         path,
         {
@@ -1410,6 +1599,8 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "provider_output_storage_layout": provider_output_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "output_halo_top": output_halo_top,
+            "output_halo_bottom": output_halo_bottom,
             "ckks_params": {
                 "LogN": 16,
                 "LogQ": list(E2E_LOGQ),
@@ -1430,6 +1621,13 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
     input_halo_bottom = payload.get("input_halo_bottom", row.halo)
     provider_output_layout = payload.get("provider_output_layout", "")
     provider_output_storage_layout = payload.get("provider_output_storage_layout", provider_output_layout)
+    output_halo_top = payload.get("output_halo_top")
+    output_halo_bottom = payload.get("output_halo_bottom")
+    if row.path == "provider" and (output_halo_top is None or output_halo_bottom is None):
+        output_halo_top, output_halo_bottom = _expected_provider_output_halo(
+            row,
+            output_layout=str(provider_output_layout or provider_output_storage_layout),
+        )
     payload.update(
         {
             "status": "error",
@@ -1458,6 +1656,8 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "provider_output_storage_layout": provider_output_storage_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "output_halo_top": output_halo_top if row.path == "provider" else None,
+            "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
             "ckks_params": {
                 "LogN": 16,
                 "LogQ": list(E2E_LOGQ),
@@ -1543,8 +1743,8 @@ def run_all(args: argparse.Namespace) -> int:
     if reused_count:
         manifest["reused_rows"] = int(reused_count)
         _write_json(run_root / "manifest.json", manifest)
-    update_doc(Path(args.doc), run_root, rows)
-    _write_summary_csv(run_root, rows)
+    update_doc(Path(args.doc), run_root, rows, provider_output_layout=str(args.provider_output_layout))
+    _write_summary_csv(run_root, rows, provider_output_layout=str(args.provider_output_layout))
     if bool(getattr(args, "prepare_only", False)):
         manifest["status"] = "prepared"
         manifest["prepared_at_utc"] = _now_utc()
@@ -1566,11 +1766,31 @@ def run_all(args: argparse.Namespace) -> int:
             if not bool(args.force):
                 payload = _read_json(result_path)
                 if isinstance(payload, dict) and payload.get("status") == "ok":
-                    print(f"[{datetime.now().isoformat(timespec='seconds')}] skip {row.row_id}", flush=True)
-                    continue
+                    if row.path == "provider":
+                        expected_output_top, expected_output_bottom = _expected_provider_output_halo(
+                            row,
+                            output_layout=str(args.provider_output_layout),
+                        )
+                        output_top, output_bottom = _explicit_output_halo(payload)
+                        if output_top is None or output_bottom is None:
+                            output_top = output_bottom = 0
+                        if (int(output_top), int(output_bottom)) != (
+                            int(expected_output_top or 0),
+                            int(expected_output_bottom or 0),
+                        ):
+                            print(
+                                f"[{datetime.now().isoformat(timespec='seconds')}] stale output halo; rerun {row.row_id}",
+                                flush=True,
+                            )
+                        else:
+                            print(f"[{datetime.now().isoformat(timespec='seconds')}] skip {row.row_id}", flush=True)
+                            continue
+                    else:
+                        print(f"[{datetime.now().isoformat(timespec='seconds')}] skip {row.row_id}", flush=True)
+                        continue
             _write_running_placeholder(result_path, row, args)
-            update_doc(Path(args.doc), run_root, rows)
-            _write_summary_csv(run_root, rows)
+            update_doc(Path(args.doc), run_root, rows, provider_output_layout=str(args.provider_output_layout))
+            _write_summary_csv(run_root, rows, provider_output_layout=str(args.provider_output_layout))
             command = [
                 sys.executable,
                 str(Path(__file__).resolve()),
@@ -1646,8 +1866,8 @@ def run_all(args: argparse.Namespace) -> int:
                     message=tail[-2000:],
                     return_code=return_code,
                 )
-            update_doc(Path(args.doc), run_root, rows)
-            _write_summary_csv(run_root, rows)
+            update_doc(Path(args.doc), run_root, rows, provider_output_layout=str(args.provider_output_layout))
+            _write_summary_csv(run_root, rows, provider_output_layout=str(args.provider_output_layout))
             if int(return_code) != 0 and bool(args.fail_fast):
                 manifest["status"] = "error"
                 manifest["finished_at_utc"] = _now_utc()
@@ -1656,8 +1876,8 @@ def run_all(args: argparse.Namespace) -> int:
         manifest["status"] = "finished"
         manifest["finished_at_utc"] = _now_utc()
         _write_json(run_root / "manifest.json", manifest)
-        update_doc(Path(args.doc), run_root, rows)
-        _write_summary_csv(run_root, rows)
+        update_doc(Path(args.doc), run_root, rows, provider_output_layout=str(args.provider_output_layout))
+        _write_summary_csv(run_root, rows, provider_output_layout=str(args.provider_output_layout))
         return 0
     finally:
         signal.signal(signal.SIGINT, old_int)
@@ -1784,8 +2004,8 @@ def main() -> int:
         parser.error(f"--input-level must be < {len(E2E_LOGQ)} for {CKKS_PROFILE_ID}")
 
     if bool(args.update_doc_only):
-        update_doc(Path(args.doc), Path(args.run_root), _rows_from_args(args))
-        _write_summary_csv(Path(args.run_root), _rows_from_args(args))
+        update_doc(Path(args.doc), Path(args.run_root), _rows_from_args(args), provider_output_layout=str(args.provider_output_layout))
+        _write_summary_csv(Path(args.run_root), _rows_from_args(args), provider_output_layout=str(args.provider_output_layout))
         return 0
     if bool(args.run_one):
         os.environ.update(_apply_env_defaults(os.environ))

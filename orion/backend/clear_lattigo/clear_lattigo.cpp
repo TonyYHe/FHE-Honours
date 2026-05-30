@@ -107,6 +107,31 @@ uint64_t ModulusProxyFromLog(int log_value) {
 
 int MaxLevel() { return std::max(0, static_cast<int>(g_scheme.logq.size()) - 1); }
 
+int EnvInt(const char *name, int fallback) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return fallback;
+  }
+  char *end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (end == raw || value <= 0) {
+    return fallback;
+  }
+  return static_cast<int>(std::min<long>(value, 1024));
+}
+
+int ClearEvalThreadCount() {
+  const int explicit_threads = EnvInt("ORION_CLEAR_LATTIGO_EVAL_THREADS", 0);
+  if (explicit_threads > 0) {
+    return explicit_threads;
+  }
+  return EnvInt("OMP_NUM_THREADS", 1);
+}
+
+int ClearEvalParallelMinSlots() {
+  return EnvInt("ORION_CLEAR_LATTIGO_PARALLEL_MIN_SLOTS", 4096);
+}
+
 TensorState &Plaintext(int id) {
   auto it = g_scheme.plaintexts.find(id);
   if (it == g_scheme.plaintexts.end()) {
@@ -373,20 +398,26 @@ std::vector<Complex> EvaluateLinearTransformValues(const LinearTransformState &t
   if (slots <= 0 || input.values.empty()) {
     return output;
   }
-  for (std::size_t d = 0; d < transform.diag_indices.size(); ++d) {
-    const int diag_idx = transform.diag_indices[d];
-    if (d >= transform.diagonals.size() || transform.diagonals[d].empty()) {
-      continue;
-    }
-    const std::vector<Complex> &diag = transform.diagonals[d];
-    for (int j = 0; j < slots; ++j) {
-      int src = (j + diag_idx) % static_cast<int>(input.values.size());
+  const int input_size = static_cast<int>(input.values.size());
+  const int thread_count = ClearEvalThreadCount();
+  const int min_parallel_slots = ClearEvalParallelMinSlots();
+  #pragma omp parallel for schedule(static) if(thread_count > 1 && slots >= min_parallel_slots) num_threads(thread_count)
+  for (int j = 0; j < slots; ++j) {
+    Complex acc{0.0, 0.0};
+    for (std::size_t d = 0; d < transform.diag_indices.size(); ++d) {
+      if (d >= transform.diagonals.size() || transform.diagonals[d].empty()) {
+        continue;
+      }
+      const int diag_idx = transform.diag_indices[d];
+      const std::vector<Complex> &diag = transform.diagonals[d];
+      int src = (j + diag_idx) % input_size;
       if (src < 0) {
-        src += static_cast<int>(input.values.size());
+        src += input_size;
       }
       const Complex coeff = diag[static_cast<std::size_t>(j) % diag.size()];
-      output[static_cast<std::size_t>(j)] += coeff * input.values[static_cast<std::size_t>(src)];
+      acc += coeff * input.values[static_cast<std::size_t>(src)];
     }
+    output[static_cast<std::size_t>(j)] = acc;
   }
   return output;
 }

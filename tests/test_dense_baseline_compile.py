@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import h5py
@@ -153,6 +154,33 @@ def test_conv2d_single_slot_diagonal_indices_match_full_pack() -> None:
     assert indices == _diag_indices(direct)
 
 
+def test_cpp_dense_conv2d_index_builder_matches_python_metadata(monkeypatch) -> None:
+    torch.manual_seed(6)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    layer = Conv2d(4, 4, kernel_size=3, padding=1, groups=2, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=64, embedding_method="hybrid")
+    _configure_conv2d(layer, torch.randn(1, 4, 4, 5), input_gap=2)
+    layer.layout_policy_input_row_offset = 1
+    layer.layout_policy_output_row_offset = 2
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "0")
+    expected, expected_rotations = packing.pack_conv2d_diagonal_indices(layer, last=False)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    actual, actual_rotations = packing.pack_conv2d_diagonal_indices(layer, last=False)
+
+    assert int(actual_rotations) == int(expected_rotations)
+    assert actual == expected
+    metadata = getattr(layer, "_last_diag_builder_metadata", {})
+    assert metadata["diag_builder_kind"] == "cpp_dense_conv2d:index_only"
+    assert metadata["diag_builder_source"] == "cpp"
+    assert metadata["diag_builder_shadow_ok"] is True
+    assert metadata["diag_builder_payload_count"] == len(expected)
+
+
 def test_conv2d_single_slot_block_recipe_matches_full_block() -> None:
     torch.manual_seed(0)
     layer = Conv2d(2, 3, kernel_size=3, padding=1, bias=False)
@@ -213,6 +241,71 @@ def test_conv2d_pack_keeps_zero_blocks_for_dense_baseline() -> None:
         (0, 0),
         (1, 0),
     }
+
+
+@pytest.mark.parametrize("embedding_method", ["square", "hybrid"])
+def test_cpp_dense_conv2d_payload_builder_matches_python_pack(monkeypatch, embedding_method: str) -> None:
+    torch.manual_seed(4)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    layer = Conv2d(4, 4, kernel_size=3, stride=1, padding=1, groups=2, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=64, embedding_method=embedding_method)
+    _configure_conv2d(layer, torch.randn(1, 4, 4, 5), input_gap=2)
+    layer.layout_policy_input_row_offset = 1
+    layer.layout_policy_output_row_offset = 2
+    original_env = {
+        key: os.environ.get(key)
+        for key in (
+            "ORION_CPP_DIAG_BUILDER",
+            "ORION_CPP_DIAG_BUILDER_DENSE",
+            "ORION_CPP_DIAG_BUILDER_SHADOW",
+            "ORION_CPP_DIAG_BUILDER_STRICT",
+        )
+    }
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "0")
+    python_diagonals, python_rotations = packing.pack_conv2d(layer, last=False)
+    for key, value in original_env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    cpp_diagonals, cpp_rotations = packing.pack_conv2d(layer, last=False)
+
+    assert int(cpp_rotations) == int(python_rotations)
+    _assert_diagonals_close(cpp_diagonals, python_diagonals)
+    metadata = getattr(layer, "_last_diag_builder_metadata", {})
+    assert metadata["diag_builder_source"] == "cpp"
+    assert metadata["diag_builder_shadow_ok"] is True
+    assert metadata["diag_builder_payload_count"] == len(python_diagonals)
+
+
+def test_cpp_dense_conv2d_block_payload_builder_matches_python_block(monkeypatch) -> None:
+    torch.manual_seed(5)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    layer = Conv2d(2, 3, kernel_size=3, padding=1, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=32, embedding_method="square")
+    _configure_conv2d(layer, torch.randn(1, 2, 3, 4), input_gap=1)
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "0")
+    full, _rotations = packing.pack_conv2d(layer, last=False)
+    block_keys = tuple(sorted(full.keys())[:2])
+    expected = packing.pack_conv2d_blocks(layer, last=False, blocks=block_keys)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    actual = packing.pack_conv2d_blocks(layer, last=False, blocks=block_keys)
+    payloads = packing.build_conv2d_block_payloads(layer, last=False, blocks=block_keys)
+
+    assert set(actual) == set(block_keys)
+    _assert_diagonals_close(actual, expected)
+    assert [(row, col) for row, col, _idx, _data in payloads] == list(block_keys)
+    assert getattr(layer, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
 
 
 def test_conv_transpose2d_pack_keeps_zero_blocks_for_dense_baseline() -> None:
@@ -382,6 +475,8 @@ def test_dense_compile_batches_independent_transforms_without_unified_api() -> N
     assert {
         "read_s",
         "diag_generate_s",
+        "diag_builder_build_s",
+        "diag_builder_shadow_s",
         "encode_s",
         "decode_s",
         "serialize_s",
@@ -393,6 +488,56 @@ def test_dense_compile_batches_independent_transforms_without_unified_api() -> N
     }.issubset(profile)
     assert profile["diag_generate_s"] >= 0.0
     assert profile["encode_s"] >= 0.0
+
+
+def test_dense_compile_consumes_prebuilt_cpp_payloads(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.batch_called = False
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            self.batch_called = True
+            assert int(num_transforms) == 1
+            return [909]
+
+        def GenerateLinearTransform(self, *_args):
+            raise AssertionError("prebuilt payloads should use batch generation")
+
+        def GetLinearTransformRotationKeys(self, _transform_id):
+            return []
+
+    backend = Backend()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    layer = SimpleNamespace(
+        name="prebuilt",
+        diagonals={(0, 0): {0: [1.0, 0.0, 0.0, 0.0]}},
+        _dense_prebuilt_payloads=((0, 0, np.asarray([0], dtype=np.int32), np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)),),
+        _last_diag_builder_metadata={
+            "diag_builder_kind": "cpp_dense_conv2d",
+            "diag_builder_source": "cpp",
+            "diag_builder_build_s": 0.125,
+            "diag_builder_payload_count": 1,
+        },
+        level=2,
+        bsgs_ratio=2,
+    )
+
+    transform_ids = evaluator.generate_transforms(layer)
+
+    assert backend.batch_called is True
+    assert transform_ids == {(0, 0): 909}
+    assert layer._dense_prebuilt_payloads is None
+    profile = evaluator.get_compile_load_profile()
+    assert profile["diag_builder_build_s"] == pytest.approx(0.125)
+    assert layer._diag_builder_metadata["diag_builder_source"] == "cpp"
 
 
 def test_dense_compile_batches_are_memory_bounded(monkeypatch) -> None:

@@ -847,6 +847,26 @@ def test_layout_policy_provider_runtime_shape_reflects_fused_output_halo_without
     assert executor._runtime_lowering_label() == "provider_executable+native_halo_output_layout"
 
 
+def test_layout_policy_provider_rejects_lattigo_slot_mismatch() -> None:
+    module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
+    base_executor = SimpleNamespace(module=module)
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="conv",
+        compile_plan={"policy": "dp", "slots": 32768, "edge_layouts": []},
+    )
+    fake_scheme = SimpleNamespace(
+        params=SimpleNamespace(
+            get_backend=lambda: "lattigo",
+            get_slots=lambda: 4096,
+        ),
+        backend=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="32768 slots.*4096 slots"):
+        executor.compile(fake_scheme)
+
+
 def test_bootstrap_layout_compression_rewrites_profitable_layout_policy_boundary() -> None:
     conv_module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
     act_module = type("SiLU", (), {})()

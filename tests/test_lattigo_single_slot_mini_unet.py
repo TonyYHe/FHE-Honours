@@ -33,6 +33,7 @@ class MiniConcatUNet(on.Module):
 
 
 def _config(*, provider: bool) -> dict:
+    logn = 16 if bool(provider) else 13
     orion_config = {
         "margin": 2,
         "embedding_method": "square",
@@ -45,7 +46,7 @@ def _config(*, provider: bool) -> dict:
         orion_config["experimental_region_first"] = "generic_layout_dp"
     return {
         "ckks_params": {
-            "LogN": 13,
+            "LogN": int(logn),
             "LogQ": [45, 35, 35, 35, 35, 35, 35, 45],
             "LogP": [50],
             "LogScale": 35,

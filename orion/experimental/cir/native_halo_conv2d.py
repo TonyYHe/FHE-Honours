@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable, Literal
+import os
 import threading
 import time
 
+import numpy as np
 import torch
 
 from orion.backend.python.tensors import CipherTensor
@@ -23,6 +25,46 @@ from .r34_orion_same_shape import (
     _rescale_cipher_tensor,
     _unified_output_fusion_enabled,
 )
+
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
+_CPP_DIAG_BUILDER_FALLBACK = object()
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(str(name))
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _provider_diag_builder_enabled() -> bool:
+    return bool(_env_enabled("ORION_CPP_DIAG_BUILDER") and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER", True))
+
+
+def _provider_diag_builder_strict() -> bool:
+    return bool(_env_enabled("ORION_CPP_DIAG_BUILDER_STRICT"))
+
+
+def _provider_diag_builder_shadow() -> bool:
+    return bool(_env_enabled("ORION_CPP_DIAG_BUILDER_SHADOW"))
+
+
+def _record_provider_diag_builder_metadata(target: Any, metadata: dict[str, Any] | None) -> None:
+    if not isinstance(metadata, dict) or not metadata:
+        return
+    timing = getattr(target, "last_runtime_timing", None)
+    if not isinstance(timing, dict):
+        return
+    for key, value in metadata.items():
+        if key in {
+            "diag_builder_build_s",
+            "diag_builder_shadow_s",
+            "diag_builder_payload_count",
+            "diag_builder_fallback_count",
+        }:
+            timing[str(key)] = float(timing.get(str(key), 0.0) or 0.0) + float(value or 0.0)
+        else:
+            timing[str(key)] = value
 
 
 def _ceil_div(left: int, right: int) -> int:
@@ -292,6 +334,21 @@ def _extend_h_range_to_length(
         left = min(int(start - lower), int(extra))
         start -= int(left)
     return int(start), int(end)
+
+
+def _source_h_range_with_physical_input_halo(
+    spec: NativeHaloConv2DSpec,
+    *,
+    required_start: int,
+    required_end: int,
+) -> tuple[int, int]:
+    start = int(required_start)
+    end = int(required_end)
+    if int(start) <= 0:
+        start = min(int(start), -max(0, int(spec.input_physical_top_beta or 0)))
+    if int(end) >= int(spec.h_in):
+        end = max(int(end), int(spec.h_in) + max(0, int(spec.input_physical_bottom_beta or 0)))
+    return max(int(spec.input_h_min), int(start)), min(int(spec.input_h_max), int(end))
 
 
 @dataclass(frozen=True)
@@ -605,6 +662,368 @@ class _BlockDiagonalCache:
             self._blocks = None
 
 
+def _diag_tensors_to_payload(diag_tensors: dict[int, Any], *, slots: int) -> tuple[np.ndarray, np.ndarray]:
+    indices = np.asarray(sorted(int(index) for index in dict(diag_tensors or {}).keys()), dtype=np.int32)
+    chunks: list[np.ndarray] = []
+    for index in indices.tolist():
+        value = dict(diag_tensors)[int(index)]
+        if isinstance(value, torch.Tensor):
+            chunks.append(value.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1))
+        else:
+            chunks.append(np.asarray(value, dtype=np.float32).reshape(-1))
+    data = (
+        np.ascontiguousarray(np.concatenate(chunks), dtype=np.float32)
+        if chunks
+        else np.zeros((0,), dtype=np.float32)
+    )
+    expected = int(indices.size) * int(slots)
+    if int(data.size) != int(expected):
+        raise RuntimeError(f"provider diag payload length {int(data.size)} != expected {int(expected)}")
+    return indices, data
+
+
+def _payload_to_diag_tensors(diag_indices: np.ndarray, diag_data: np.ndarray, *, slots: int) -> dict[int, torch.Tensor]:
+    out: dict[int, torch.Tensor] = {}
+    indices = np.asarray(diag_indices, dtype=np.int32).reshape(-1)
+    data = np.asarray(diag_data, dtype=np.float32).reshape(-1)
+    for offset, index in enumerate(indices.tolist()):
+        start = int(offset) * int(slots)
+        end = int(start) + int(slots)
+        out[int(index)] = torch.as_tensor(np.ascontiguousarray(data[start:end], dtype=np.float32))
+    return out
+
+
+def _provider_payload_transform(
+    *,
+    name: str,
+    diag_indices: np.ndarray,
+    diag_data: np.ndarray,
+    metadata: dict[str, Any],
+    slots: int,
+    level: int,
+    scheme: Any,
+    target_index: int,
+    input_id: str,
+    group_n1: int,
+    rotation_group_id: str,
+    rotation_cost_owner: bool,
+) -> Any:
+    diag_tensors = _payload_to_diag_tensors(diag_indices, diag_data, slots=int(slots))
+    if not diag_tensors:
+        return None
+    diag_set = set(int(value) for value in diag_tensors)
+    baby, giant = _bsgs_rotation_sets(set(diag_set), slots=int(slots), n1=int(group_n1))
+    payload = SimpleNamespace(
+        name=str(name),
+        diagonals={(0, 0): {int(index): diag for index, diag in sorted(diag_tensors.items())}},
+        level=int(level),
+        scheme=scheme,
+        fhe_output_shape=torch.Size([1, int(slots)]),
+        output_shape=torch.Size([1, int(slots)]),
+        target_index=int(target_index),
+        input_id=str(input_id),
+        selected_n1=int(group_n1),
+        baby_shifts=tuple(sorted(int(value) for value in baby)),
+        giant_shifts=tuple(sorted(int(value) for value in giant)),
+        rotation_group_id=str(rotation_group_id),
+        rotation_cost_owner=bool(rotation_cost_owner),
+    )
+    setattr(payload, "_diag_builder_metadata", dict(metadata))
+    return payload
+
+
+def _cpp_provider_native_source_transform(
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    stripe: NativeHaloStripe,
+    source_group: int,
+    target_group: int,
+    level: int,
+    scheme: Any,
+    group_n1: int,
+    compact_target_block: int | None = None,
+    path: str = "native_source",
+    env_gate: str = "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE",
+) -> Any | None | object:
+    if not _provider_diag_builder_enabled():
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if not _env_enabled(str(env_gate)):
+        if _provider_diag_builder_strict():
+            raise RuntimeError(f"provider {path} subpath unsupported by C++ diag builder env gate")
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if _provider_diag_builder_shadow():
+        return _CPP_DIAG_BUILDER_FALLBACK
+
+    started = time.time()
+    try:
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        built = diag_builder.build_provider_native_source_conv2d_payload(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            compact_target_block=compact_target_block,
+        )
+    except Exception:
+        if _provider_diag_builder_strict():
+            raise
+        return _CPP_DIAG_BUILDER_FALLBACK
+
+    if built is None:
+        return None
+    diag_indices, diag_data, metadata = built
+    metadata = dict(metadata)
+    metadata["diag_builder_kind"] = f"provider_native_halo_conv2d:{path}"
+    metadata["diag_builder_source"] = "cpp"
+    metadata["diag_builder_build_s"] = float(metadata.get("diag_builder_build_s", 0.0) or 0.0)
+    metadata["diag_builder_shadow_s"] = 0.0
+    metadata["diag_builder_fallback_count"] = 0.0
+    metadata["diag_builder_fallback_reason"] = ""
+    metadata.setdefault("diag_builder_payload_count", 1.0)
+    source_index = int(plan.source_block_index(stripe, int(source_group)))
+    target_index = (
+        int(compact_target_block)
+        if compact_target_block is not None
+        else int(plan.target_block_index(stripe, int(target_group)))
+    )
+    name = (
+        f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+        f"_tgt{int(target_group)}"
+        + ("" if compact_target_block is None else f"_compact{int(compact_target_block)}")
+    )
+    transform = _provider_payload_transform(
+        name=name,
+        diag_indices=diag_indices,
+        diag_data=diag_data,
+        metadata=metadata,
+        slots=int(spec.slot_count),
+        level=int(level),
+        scheme=scheme,
+        target_index=int(target_index),
+        input_id=f"native_source_tile_{int(source_index)}",
+        group_n1=int(group_n1),
+        rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+        rotation_cost_owner=bool(
+            int(target_group) == 0
+            and (compact_target_block is None or int(compact_target_block) == 0)
+        ),
+    )
+    if transform is None and _provider_diag_builder_strict():
+        raise RuntimeError("provider C++ diag builder produced empty payload for non-empty native-source transform")
+    if transform is not None:
+        elapsed = float(time.time() - started)
+        transform._diag_builder_metadata["diag_builder_build_s"] = float(
+            transform._diag_builder_metadata.get("diag_builder_build_s", elapsed) or elapsed
+        )
+    return transform
+
+
+def _shadow_provider_payload(
+    *,
+    transform: Any,
+    slots: int,
+    build_cpp_payload: Callable[[], tuple[np.ndarray, np.ndarray] | None],
+    path: str,
+) -> Any | None:
+    if transform is None:
+        return None
+    if not _provider_diag_builder_enabled():
+        return transform
+    started = time.time()
+    try:
+        cpp_payload = build_cpp_payload()
+    except Exception as exc:
+        if _provider_diag_builder_strict():
+            raise
+        setattr(
+            transform,
+            "_diag_builder_metadata",
+            {
+                "diag_builder_kind": f"provider_native_halo_conv2d:{path}",
+                "diag_builder_source": "python_fallback",
+                "diag_builder_build_s": float(time.time() - started),
+                "diag_builder_payload_count": 0.0,
+                "diag_builder_fallback_count": 1.0,
+                "diag_builder_fallback_reason": str(exc),
+            },
+        )
+        return transform
+    build_s = float(time.time() - started)
+    if cpp_payload is None:
+        if _provider_diag_builder_strict():
+            raise RuntimeError("provider subpath unsupported by C++ diag builder")
+        setattr(
+            transform,
+            "_diag_builder_metadata",
+            {
+                "diag_builder_kind": f"provider_native_halo_conv2d:{path}",
+                "diag_builder_source": "python_fallback",
+                "diag_builder_build_s": float(build_s),
+                "diag_builder_payload_count": 0.0,
+                "diag_builder_fallback_count": 1.0,
+                "diag_builder_fallback_reason": "provider subpath unsupported by C++ diag builder",
+            },
+        )
+        return transform
+    diag_indices, diag_data = cpp_payload
+    py_block = dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
+    py_indices, py_data = _diag_tensors_to_payload(py_block, slots=int(slots))
+    ok = bool(
+        np.array_equal(np.asarray(diag_indices, dtype=np.int32), py_indices)
+        and np.allclose(np.asarray(diag_data, dtype=np.float32), py_data, atol=1.0e-6, rtol=1.0e-6)
+    )
+    metadata = {
+        "diag_builder_kind": f"provider_native_halo_conv2d:{path}",
+        "diag_builder_source": "cpp_shadow",
+        "diag_builder_build_s": float(build_s),
+        "diag_builder_shadow_s": 0.0,
+        "diag_builder_payload_count": 1.0,
+        "diag_builder_fallback_count": 0.0 if ok else 1.0,
+        "diag_builder_shadow_ok": bool(ok),
+        "diag_builder_fallback_reason": "" if ok else "provider C++ payload mismatch",
+    }
+    setattr(transform, "_diag_builder_metadata", metadata)
+    if not ok and _provider_diag_builder_strict():
+        raise RuntimeError(str(metadata["diag_builder_fallback_reason"]))
+    return transform
+
+
+def _cpp_provider_compact_source_transform(
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    stripe: NativeHaloStripe,
+    source_block: int,
+    target_group: int,
+    level: int,
+    scheme: Any,
+    source_layout: dict[str, Any],
+    group_n1: int,
+    compact_target_block: int | None = None,
+) -> Any | None | object:
+    if not _provider_diag_builder_enabled():
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE"):
+        if _provider_diag_builder_strict():
+            raise RuntimeError("provider compact_source subpath unsupported by C++ diag builder env gate")
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if _provider_diag_builder_shadow():
+        return _CPP_DIAG_BUILDER_FALLBACK
+
+    started = time.time()
+    try:
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        built = diag_builder.build_provider_compact_source_conv2d_payload(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=int(source_block),
+            target_group=int(target_group),
+            source_layout=dict(source_layout),
+            compact_target_block=compact_target_block,
+        )
+    except Exception:
+        if _provider_diag_builder_strict():
+            raise
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if built is None:
+        return None
+    diag_indices, diag_data, metadata = built
+    metadata = dict(metadata)
+    metadata["diag_builder_kind"] = "provider_native_halo_conv2d:compact_source"
+    metadata["diag_builder_source"] = "cpp"
+    metadata["diag_builder_build_s"] = float(metadata.get("diag_builder_build_s", 0.0) or 0.0)
+    metadata["diag_builder_shadow_s"] = 0.0
+    metadata["diag_builder_fallback_count"] = 0.0
+    metadata["diag_builder_fallback_reason"] = ""
+    metadata.setdefault("diag_builder_payload_count", 1.0)
+    compact_output = compact_target_block is not None
+    target_index = (
+        int(compact_target_block)
+        if bool(compact_output)
+        else int(plan.target_block_index(stripe, int(target_group)))
+    )
+    name = (
+        f"native_halo_{spec.family_label}_compactsrc{int(source_block)}"
+        f"_s{int(stripe.index)}_tgt{int(target_group)}"
+        + ("" if not bool(compact_output) else f"_compact{int(compact_target_block)}")
+    )
+    transform = _provider_payload_transform(
+        name=name,
+        diag_indices=diag_indices,
+        diag_data=diag_data,
+        metadata=metadata,
+        slots=int(spec.slot_count),
+        level=int(level),
+        scheme=scheme,
+        target_index=int(target_index),
+        input_id=f"compact_source_block_{int(source_block)}",
+        group_n1=int(group_n1),
+        rotation_group_id=f"native_halo:{spec.family_label}:compact_src{int(source_block)}",
+        rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+    )
+    if transform is None and _provider_diag_builder_strict():
+        raise RuntimeError("provider C++ diag builder produced empty payload for non-empty compact-source transform")
+    if transform is not None:
+        elapsed = float(time.time() - started)
+        transform._diag_builder_metadata["diag_builder_build_s"] = float(
+            transform._diag_builder_metadata.get("diag_builder_build_s", elapsed) or elapsed
+        )
+    return transform
+
+
+def _build_compact_source_conv_payload_shadow(
+    transform: Any | None,
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    stripe: NativeHaloStripe,
+    source_block: int,
+    target_group: int,
+    source_layout: dict[str, Any],
+    compact_target_block: int | None,
+) -> Any | None:
+    if transform is None:
+        return None
+    slots = int(transform.fhe_output_shape[-1])
+
+    def build_cpp_payload():
+        if not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE"):
+            return None
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        built = diag_builder.build_provider_compact_source_conv2d_payload(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=int(source_block),
+            target_group=int(target_group),
+            source_layout=dict(source_layout),
+            compact_target_block=compact_target_block,
+        )
+        if built is None:
+            return None
+        diag_indices, diag_data, _metadata = built
+        return diag_indices, diag_data
+
+    return _shadow_provider_payload(
+        transform=transform,
+        slots=int(slots),
+        build_cpp_payload=build_cpp_payload,
+        path="compact_source",
+    )
+
+
 def _collect_compact_source_conv_diag_sets(
     *,
     spec: NativeHaloConv2DSpec,
@@ -833,9 +1252,19 @@ def _make_compact_source_conv_single_slot_transform(
             force_payload=True,
         )
         if rebuilt is None:
+            if diag_set:
+                raise RuntimeError(
+                    f"{spec.family_label} compact-source single-slot payload rebuild returned no transform "
+                    f"for source_block={int(source_block)} target_index={int(target_index)}"
+                )
             return {(0, 0): {int(fallback_diag): torch.zeros((int(slots),), dtype=torch.float32)}}
         diagonals = getattr(rebuilt, "diagonals", {})
         if not diagonals:
+            if diag_set:
+                raise RuntimeError(
+                    f"{spec.family_label} compact-source single-slot payload rebuild returned empty diagonals "
+                    f"for source_block={int(source_block)} target_index={int(target_index)}"
+                )
             return {(0, 0): {int(fallback_diag): torch.zeros((int(slots),), dtype=torch.float32)}}
         return diagonals
 
@@ -1147,6 +1576,11 @@ def _target_h_end_for_source_h(
             pad=int(spec.pad),
             dilation=int(spec.dilation),
         )
+        req0, req1 = _source_h_range_with_physical_input_halo(
+            spec,
+            required_start=int(req0),
+            required_end=int(req1),
+        )
         if int(req1 - req0) <= int(source_h):
             best = int(mid)
             lo = int(mid) + 1
@@ -1170,6 +1604,11 @@ def _stripes_for_source_h(spec: NativeHaloConv2DSpec, *, source_h: int) -> tuple
             stride=int(spec.stride),
             pad=int(spec.pad),
             dilation=int(spec.dilation),
+        )
+        req0, req1 = _source_h_range_with_physical_input_halo(
+            spec,
+            required_start=int(req0),
+            required_end=int(req1),
         )
         sh0, sh1 = _extend_h_range_to_length(
             required_start=int(req0),
@@ -1351,6 +1790,11 @@ def _per_stripe_fold_stripes(
             stride=int(spec.stride),
             pad=int(spec.pad),
             dilation=int(spec.dilation),
+        )
+        req0, req1 = _source_h_range_with_physical_input_halo(
+            spec,
+            required_start=int(req0),
+            required_end=int(req1),
         )
         req_h = int(req1 - req0)
         candidate_specs: list[tuple[tuple[int, int, int, int], int, int, NativeHaloStripe]] = []
@@ -1881,6 +2325,28 @@ def _build_conv_transform(
 ) -> Any | None:
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
+    single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
+    if not bool(single_slot_recipe):
+        cpp_transform = _cpp_provider_native_source_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            group_n1=int(group_n1),
+            compact_target_block=compact_target_block,
+            path="native_source_compact_output" if bool(compact_output) else "native_source",
+            env_gate=(
+                "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT"
+                if bool(compact_output)
+                else "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE"
+            ),
+        )
+        if cpp_transform is not _CPP_DIAG_BUILDER_FALLBACK:
+            return cpp_transform
     source_tile = int(plan.source_tile_for_stripe(stripe))
     target_tile = int(plan.target_tile_for_stripe(stripe))
     source_start = int(source_group) * int(source_tile)
@@ -2040,7 +2506,7 @@ def _build_conv_transform(
     if not diag_set:
         return None
     baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
-    if bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload)):
+    if bool(single_slot_recipe):
         cache = diagonal_cache
         if cache is None:
             def build_all_blocks(
@@ -2127,7 +2593,7 @@ def _build_conv_transform(
         diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
         diag_tensors[int(diag_value)] = diag
         start = int(end)
-    return SimpleNamespace(
+    transform = SimpleNamespace(
         name=(
             f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
             f"_tgt{int(target_group)}"
@@ -2145,6 +2611,58 @@ def _build_conv_transform(
         giant_shifts=tuple(sorted(int(value) for value in giant)),
         rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
         rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+    )
+    return _build_conv_transform_payload_shadow(
+        transform,
+        spec=spec,
+        plan=plan,
+        weight=weight,
+        stripe=stripe,
+        source_group=int(source_group),
+        target_group=int(target_group),
+        compact_target_block=compact_target_block,
+    )
+
+
+def _build_conv_transform_payload_shadow(
+    transform: Any | None,
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    stripe: NativeHaloStripe,
+    source_group: int,
+    target_group: int,
+    compact_target_block: int | None,
+) -> Any | None:
+    if transform is None:
+        return None
+    slots = int(transform.fhe_output_shape[-1])
+
+    def build_cpp_payload(transform=transform, slots=int(slots)):
+        if not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE"):
+            return None
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        built = diag_builder.build_provider_native_source_conv2d_payload(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            compact_target_block=compact_target_block,
+        )
+        if built is None:
+            return None
+        diag_indices, diag_data, _metadata = built
+        return diag_indices, diag_data
+
+    return _shadow_provider_payload(
+        transform=transform,
+        slots=int(slots),
+        build_cpp_payload=build_cpp_payload,
+        path="native_source",
     )
 
 
@@ -2172,6 +2690,35 @@ def _build_conv_transforms_for_compact_output(
     target_count = int(target_end - target_start)
     if source_count <= 0 or target_count <= 0:
         return []
+    single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
+    if (
+        _provider_diag_builder_enabled()
+        and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT")
+        and not _provider_diag_builder_shadow()
+        and not bool(single_slot_recipe)
+    ):
+        transforms: list[tuple[int, Any]] = []
+        for target_block in range(int(_compact_ct_count(int(spec.c_out), _spec_physical_output_h(spec), int(spec.w_out), int(spec.gap_out), int(slots)))):
+            built = _cpp_provider_native_source_transform(
+                spec=spec,
+                plan=plan,
+                weight=weight,
+                stripe=stripe,
+                source_group=int(source_group),
+                target_group=int(target_group),
+                level=int(level),
+                scheme=scheme,
+                group_n1=int(group_n1),
+                compact_target_block=int(target_block),
+                path="native_source_compact_output",
+                env_gate="ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT",
+            )
+            if built is _CPP_DIAG_BUILDER_FALLBACK:
+                break
+            if built is not None:
+                transforms.append((int(target_block), built))
+        else:
+            return transforms
 
     target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
     compact_output_h = _spec_physical_output_h(spec)
@@ -2282,7 +2829,6 @@ def _build_conv_transforms_for_compact_output(
 
     transforms: list[tuple[int, Any]] = []
     source_index = int(plan.source_block_index(stripe, int(source_group)))
-    single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
     diagonal_cache: _BlockDiagonalCache | None = None
     if bool(single_slot_recipe):
         def build_all_compact_output_blocks(
@@ -2406,8 +2952,62 @@ def _build_conv_transforms_for_compact_output(
             rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
             rotation_cost_owner=bool(int(target_group) == 0 and int(target_block) == 0),
         )
-        transforms.append((int(target_block), transform))
+        transforms.append(
+            (
+                int(target_block),
+                _build_conv_compact_output_payload_shadow(
+                    transform,
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    stripe=stripe,
+                    source_group=int(source_group),
+                    target_group=int(target_group),
+                ),
+            )
+        )
     return transforms
+
+
+def _build_conv_compact_output_payload_shadow(
+    transform: Any | None,
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    stripe: NativeHaloStripe,
+    source_group: int,
+    target_group: int,
+) -> Any | None:
+    if transform is None:
+        return None
+    slots = int(transform.fhe_output_shape[-1])
+
+    def build_cpp_payload(transform=transform, slots=int(slots)):
+        if not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT"):
+            return None
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        built = diag_builder.build_provider_native_source_conv2d_payload(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            compact_target_block=int(transform.target_index),
+        )
+        if built is None:
+            return None
+        diag_indices, diag_data, _metadata = built
+        return diag_indices, diag_data
+
+    return _shadow_provider_payload(
+        transform=transform,
+        slots=int(slots),
+        build_cpp_payload=build_cpp_payload,
+        path="native_source_compact_output",
+    )
 
 
 def _compact_source_index(
@@ -2469,6 +3069,22 @@ def _build_compact_source_conv_transform(
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
     single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
+    if not bool(single_slot_recipe):
+        cpp_transform = _cpp_provider_compact_source_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_block=int(source_block),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            source_layout=dict(source_layout),
+            group_n1=int(group_n1),
+            compact_target_block=compact_target_block,
+        )
+        if cpp_transform is not _CPP_DIAG_BUILDER_FALLBACK:
+            return cpp_transform
     if bool(single_slot_recipe):
         diag_sets_by_target = _collect_compact_source_conv_diag_sets(
             spec=spec,
@@ -2521,9 +3137,17 @@ def _build_compact_source_conv_transform(
                     force_payload=True,
                 )
                 if rebuilt is None:
-                    return {}
+                    raise RuntimeError(
+                        f"{spec.family_label} compact-source single-slot payload rebuild returned no transform "
+                        f"for source_block={int(source_block)} target_index={int(target_index)}"
+                    )
                 block = dict(getattr(rebuilt, "diagonals", {}).get((0, 0), {}) or {})
-                return {(int(target_index), int(source_block)): block} if block else {}
+                if not block:
+                    raise RuntimeError(
+                        f"{spec.family_label} compact-source single-slot payload rebuild returned empty diagonals "
+                        f"for source_block={int(source_block)} target_index={int(target_index)}"
+                    )
+                return {(int(target_index), int(source_block)): block}
 
             cache = _BlockDiagonalCache(build_all_blocks)
         return _make_compact_source_conv_single_slot_transform(
@@ -2713,7 +3337,7 @@ def _build_compact_source_conv_transform(
         diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
         diag_tensors[int(diag_value)] = diag
         start = int(end)
-    return SimpleNamespace(
+    transform = SimpleNamespace(
         name=(
             f"native_halo_{spec.family_label}_compactsrc{int(source_block)}"
             f"_s{int(stripe.index)}_tgt{int(target_group)}"
@@ -2731,6 +3355,17 @@ def _build_compact_source_conv_transform(
         giant_shifts=tuple(sorted(int(value) for value in giant)),
         rotation_group_id=f"native_halo:{spec.family_label}:compact_src{int(source_block)}",
         rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+    )
+    return _build_compact_source_conv_payload_shadow(
+        transform,
+        spec=spec,
+        plan=plan,
+        weight=weight,
+        stripe=stripe,
+        source_block=int(source_block),
+        target_group=int(target_group),
+        source_layout=dict(source_layout),
+        compact_target_block=compact_target_block,
     )
 
 
@@ -2788,7 +3423,7 @@ class NativeHaloStripeNoRIConvExecutor:
             channel_fold_mode=str(fold_mode),
         )
         self.slots = int(spec.slot_count)
-        self.rows = int(self.native_plan.output_ct_count)
+        self.rows = int(self._runtime_output_ct_count())
         self.cols = int(self.native_plan.input_ct_count)
         self.output_shape = getattr(module, "output_shape", None)
         self.fhe_output_shape = getattr(module, "fhe_output_shape", None)
@@ -2812,6 +3447,10 @@ class NativeHaloStripeNoRIConvExecutor:
             "build_transform_s": 0.0,
             "retune_bsgs_s": 0.0,
             "group_compile_s": 0.0,
+            "diag_builder_build_s": 0.0,
+            "diag_builder_shadow_s": 0.0,
+            "diag_builder_payload_count": 0.0,
+            "diag_builder_fallback_count": 0.0,
             "built_transform_count": 0.0,
             "compiled_group_count": 0.0,
             "evaluate_unified_s": 0.0,
@@ -2887,7 +3526,14 @@ class NativeHaloStripeNoRIConvExecutor:
         )
 
     def _native_stripe_output_ct_count(self) -> int:
-        return int(self.native_plan.output_ct_count)
+        return int(sum(int(value) for value in self.native_plan.target_channel_group_counts))
+
+    def _runtime_output_ct_count(self) -> int:
+        return int(
+            self._compact_output_ct_count()
+            if self._uses_tight_compact_output()
+            else self._native_stripe_output_ct_count()
+        )
 
     def runtime_native_fhe_output_shape(self) -> torch.Size:
         if self._uses_tight_compact_output():
@@ -2927,11 +3573,7 @@ class NativeHaloStripeNoRIConvExecutor:
             )
             self._native_plan_require_target_fit = bool(require_native_target_fit)
         self.slots = int(self.native_plan.spec.slot_count)
-        self.rows = int(
-            self._compact_output_ct_count()
-            if self._uses_tight_compact_output()
-            else self._native_stripe_output_ct_count()
-        )
+        self.rows = int(self._runtime_output_ct_count())
         self.cols = int(self._compact_source_ct_count() if self._uses_compact_source_input() else self.native_plan.input_ct_count)
         self.output_shape = getattr(self.module, "output_shape", self.output_shape)
         self.fhe_output_shape = getattr(self.module, "fhe_output_shape", self.fhe_output_shape)
@@ -3022,6 +3664,45 @@ class NativeHaloStripeNoRIConvExecutor:
             self.groups_by_input_index[int(input_index)] = group
             self.target_indices_by_input_index[int(input_index)] = targets
 
+    def _validate_runtime_group_coverage(self, *, context: str) -> None:
+        expected_inputs = int(self.cols)
+        expected_targets = int(self.rows)
+        if expected_inputs < 0 or expected_targets < 0:
+            raise RuntimeError(
+                f"Native halo Conv2d {self.output_node_id!r} has invalid runtime dimensions "
+                f"cols={expected_inputs} rows={expected_targets} while validating {context}."
+            )
+        covered_targets: set[int] = set()
+        for runtime_group in self.runtime_groups:
+            input_index = int(runtime_group.input_index)
+            if input_index < 0 or input_index >= int(expected_inputs):
+                raise RuntimeError(
+                    f"Native halo Conv2d {self.output_node_id!r} {context} has input_index={input_index} "
+                    f"outside [0, {int(expected_inputs)})."
+                )
+            target_indices = tuple(int(value) for value in runtime_group.target_indices)
+            if not target_indices:
+                raise RuntimeError(
+                    f"Native halo Conv2d {self.output_node_id!r} {context} has an empty target set "
+                    f"for input_index={input_index}."
+                )
+            for target_index in target_indices:
+                if target_index < 0 or target_index >= int(expected_targets):
+                    raise RuntimeError(
+                        f"Native halo Conv2d {self.output_node_id!r} {context} has target_index={target_index} "
+                        f"outside [0, {int(expected_targets)})."
+                    )
+                covered_targets.add(int(target_index))
+        required_targets = set(range(int(expected_targets)))
+        missing = sorted(required_targets.difference(covered_targets))
+        if missing:
+            preview = ", ".join(str(value) for value in missing[:8])
+            suffix = "" if len(missing) <= 8 else f", ... (+{len(missing) - 8})"
+            raise RuntimeError(
+                f"Native halo Conv2d {self.output_node_id!r} {context} does not cover output target(s) "
+                f"{preview}{suffix}; re-save the provider compile cache for this shape/layout."
+            )
+
     def _runtime_group_metadata_rows(self) -> list[dict[str, Any]]:
         return [
             {
@@ -3058,6 +3739,7 @@ class NativeHaloStripeNoRIConvExecutor:
                 group = UnifiedTransformGroup([transform])
                 group_compile_started = time.time()
                 group.compile_unified(scheme.backend)
+                _record_provider_diag_builder_metadata(self, getattr(transform, "_diag_builder_metadata", None))
                 self.last_runtime_timing["group_compile_s"] = float(
                     self.last_runtime_timing.get("group_compile_s", 0.0)
                 ) + float(time.time() - group_compile_started)
@@ -3081,6 +3763,8 @@ class NativeHaloStripeNoRIConvExecutor:
         group = UnifiedTransformGroup(transforms)
         group_compile_started = time.time()
         group.compile_unified(scheme.backend)
+        for transform in transforms:
+            _record_provider_diag_builder_metadata(self, getattr(transform, "_diag_builder_metadata", None))
         self.last_runtime_timing["group_compile_s"] = float(
             self.last_runtime_timing.get("group_compile_s", 0.0)
         ) + float(time.time() - group_compile_started)
@@ -3126,22 +3810,28 @@ class NativeHaloStripeNoRIConvExecutor:
         channel_start = int(target_group) * int(target_tile)
         channel_end = min(int(self.spec.c_out), int(channel_start) + int(target_tile))
         out = torch.zeros((int(self.slots),), dtype=torch.float32)
-        for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
-            bias_value = float(self.bias_vector[int(channel)])
-            if bias_value == 0.0:
-                continue
-            for out_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
-                local_h = int(out_h) - int(stripe.target_h_start)
-                for out_w in range(int(self.spec.w_out)):
-                    slot = _idx_chw_gap(
-                        int(local_channel),
-                        int(local_h),
-                        int(out_w),
-                        int(stripe.target_h),
-                        int(self.spec.w_out),
-                        int(self.spec.gap_out),
-                    )
-                    out[int(slot)] = float(bias_value)
+        if int(channel_end) <= int(channel_start):
+            return out
+        active_target_h = int(stripe.target_h_end) - int(stripe.target_h_start)
+        if int(active_target_h) <= 0:
+            return out
+        local_channels = torch.arange(int(channel_end - channel_start), dtype=torch.int64)
+        out_h = torch.arange(int(active_target_h), dtype=torch.int64).repeat_interleave(int(self.spec.w_out))
+        out_w = torch.arange(int(self.spec.w_out), dtype=torch.int64).repeat(int(active_target_h))
+        flat_index = _idx_chw_gap_channel_positions(
+            local_channels,
+            h=out_h,
+            w=out_w,
+            height=int(stripe.target_h),
+            width=int(self.spec.w_out),
+            gap=int(self.spec.gap_out),
+        )
+        values = (
+            self.bias_vector.detach().to(dtype=torch.float32)[int(channel_start): int(channel_end), None]
+            .expand_as(flat_index)
+            .reshape(-1)
+        )
+        out.index_copy_(0, flat_index.reshape(-1).to(dtype=torch.int64), values)
         return out
 
     def _compact_bias_chunk(self, *, block_index: int) -> torch.Tensor | None:
@@ -3228,7 +3918,7 @@ class NativeHaloStripeNoRIConvExecutor:
             )
 
         self._compiled_lt_grouping_mode = str(stored_mode)
-        self.rows = int(metadata.get("rows", self.rows))
+        self.rows = int(self._runtime_output_ct_count())
         self.cols = int(metadata.get("cols", self.cols))
         module_bias = getattr(self.module, "on_bias", None)
         self.bias_vector = None if module_bias is None else module_bias.detach().to(dtype=torch.float32)
@@ -3269,6 +3959,7 @@ class NativeHaloStripeNoRIConvExecutor:
                 f"Cached native halo Conv2d manifest for {self.output_node_id!r} did not contain any non-empty "
                 "transform groups; re-run with io_mode='save'."
             )
+        self._validate_runtime_group_coverage(context="cached compile metadata")
         self.compile_count += 1
         elapsed = float(time.time() - compile_started)
         self.last_runtime_timing["compile_unified_s"] = elapsed
