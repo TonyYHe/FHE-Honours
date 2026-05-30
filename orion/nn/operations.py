@@ -81,6 +81,10 @@ class ConcatCipherTensor:
                 release()
         self.owned_parts = ()
 
+    def map_parts(self, fn):
+        parts = tuple(fn(int(index), part) for index, part in enumerate(self.parts))
+        return ConcatCipherTensor(self.module, parts, owned_parts=parts)
+
     def __len__(self):
         return len(self.materialize())
 
@@ -121,6 +125,7 @@ class Concat(Module):
         self.concat_input_fhe_shapes = ()
         self.concat_input_gaps = ()
         self.transform_ids_by_input = []
+        self.transform_sources_by_input = []
         self._compiled_backend = None
 
     def extra_repr(self):
@@ -232,6 +237,87 @@ class Concat(Module):
                 self._add_diagonal_entries(diagonals, source, output, slots=int(slots))
         return diagonals
 
+    def _diag_indices_by_block(self, diagonals):
+        return {
+            (int(row), int(col)): tuple(sorted(int(index) for index in dict(diags).keys()))
+            for (row, col), diags in dict(diagonals or {}).items()
+        }
+
+    def _diagonals_for_input_blocks(self, input_index: int, *, slots: int, blocks):
+        requested = {
+            (int(row), int(col))
+            for row, col in tuple(blocks or ())
+        }
+        if not requested:
+            return {}
+        input_shape = self.concat_input_shapes[int(input_index)]
+        input_fhe_shape = self.concat_input_fhe_shapes[int(input_index)]
+        output_fhe_shape = self.fhe_output_shape
+        input_gap = int(self.concat_input_gaps[int(input_index)])
+        output_gap = int(self.output_gap)
+        if int(input_gap) != int(output_gap):
+            raise ValueError("Concat materialization requires all inputs to share the same FHE gap")
+        channel_offset = sum(int(shape[1]) for shape in self.concat_input_shapes[: int(input_index)])
+        n, channels, height, width = (int(value) for value in input_shape)
+        input_block = int(input_fhe_shape[1] * input_fhe_shape[2] * input_fhe_shape[3])
+        output_block = int(output_fhe_shape[1] * output_fhe_shape[2] * output_fhe_shape[3])
+        row_grid, col_grid = np.meshgrid(
+            np.arange(int(height), dtype=np.int64),
+            np.arange(int(width), dtype=np.int64),
+            indexing="ij",
+        )
+        rows = row_grid.reshape(-1)
+        cols = col_grid.reshape(-1)
+        diagonals = {}
+        for batch in range(int(n)):
+            for channel in range(int(channels)):
+                source = self._flat_index(
+                    int(channel),
+                    rows,
+                    cols,
+                    gap=int(input_gap),
+                    height=int(input_fhe_shape[2]),
+                    width=int(input_fhe_shape[3]),
+                ) + int(batch) * int(input_block)
+                output = self._flat_index(
+                    int(channel_offset + channel),
+                    rows,
+                    cols,
+                    gap=int(output_gap),
+                    height=int(output_fhe_shape[2]),
+                    width=int(output_fhe_shape[3]),
+                ) + int(batch) * int(output_block)
+                source_blocks = source // int(slots)
+                output_blocks = output // int(slots)
+                mask = np.zeros(output.shape, dtype=bool)
+                for row, col in requested:
+                    mask |= (output_blocks == int(row)) & (source_blocks == int(col))
+                if bool(np.any(mask)):
+                    self._add_diagonal_entries(diagonals, source[mask], output[mask], slots=int(slots))
+        return diagonals
+
+    def _install_materialize_single_slot_recipe(self, proxy, input_index: int, *, slots: int, diagonals) -> None:
+        diag_indices_by_block = self._diag_indices_by_block(diagonals)
+        build_diagonals = (
+            lambda input_index=int(input_index), slots=int(slots): self._diagonals_for_input(
+                int(input_index),
+                slots=int(slots),
+            )
+        )
+        build_block_diagonals = (
+            lambda blocks, input_index=int(input_index), slots=int(slots): self._diagonals_for_input_blocks(
+                int(input_index),
+                slots=int(slots),
+                blocks=blocks,
+            )
+        )
+        proxy._dense_layer_cache_diag_indices_by_block = dict(diag_indices_by_block)
+        proxy._dense_layer_cache_build_diagonals = build_diagonals
+        proxy._dense_layer_cache_build_block_diagonals = build_block_diagonals
+        proxy._single_slot_diag_indices_by_block = dict(diag_indices_by_block)
+        proxy._single_slot_build_diagonals = build_diagonals
+        proxy._single_slot_build_block_diagonals = build_block_diagonals
+
     def _ensure_materialize_transforms(self, scheme):
         if self.transform_ids_by_input and self._compiled_backend is getattr(scheme, "backend", None):
             return
@@ -242,6 +328,7 @@ class Concat(Module):
         slots = int(scheme.params.get_slots())
         expected_output_rows = int(math.ceil(int(np.prod(tuple(int(v) for v in self.fhe_output_shape))) / int(slots)))
         self.transform_ids_by_input = []
+        self.transform_sources_by_input = []
         for input_index in range(len(self.concat_input_shapes)):
             diagonals = self._diagonals_for_input(int(input_index), slots=int(slots))
             proxy = SimpleNamespace(
@@ -255,7 +342,19 @@ class Concat(Module):
                 allow_sparse_output_rows=True,
                 expected_output_rows=int(expected_output_rows),
             )
-            self.transform_ids_by_input.append(dict(scheme.lt_evaluator.generate_transforms(proxy)))
+            if scheme.lt_evaluator.single_slot_layer_cache_enabled():
+                self._install_materialize_single_slot_recipe(
+                    proxy,
+                    int(input_index),
+                    slots=int(slots),
+                    diagonals=diagonals,
+                )
+            transform_ids = dict(scheme.lt_evaluator.generate_transforms(proxy))
+            proxy.transform_ids = dict(transform_ids)
+            if not scheme.lt_evaluator.single_slot_layer_cache_enabled():
+                proxy.diagonals = {}
+            self.transform_ids_by_input.append(transform_ids)
+            self.transform_sources_by_input.append(proxy)
         self._compiled_backend = getattr(scheme, "backend", None)
 
     def materialize(self, parts):
@@ -266,20 +365,8 @@ class Concat(Module):
         self._ensure_materialize_transforms(scheme)
         out = None
         for input_index, source in enumerate(parts):
-            proxy = SimpleNamespace(
-                name=f"{getattr(self, 'name', 'concat')}_materialize_{int(input_index)}",
-                transform_ids=dict(self.transform_ids_by_input[int(input_index)]),
-                level=int(self.level) if self.level is not None else int(len(scheme.params.get_logq()) - 1),
-                output_shape=self.output_shape,
-                fhe_output_shape=self.fhe_output_shape,
-                allow_sparse_output_rows=True,
-                expected_output_rows=int(
-                    math.ceil(
-                        int(np.prod(tuple(int(v) for v in self.fhe_output_shape)))
-                        / int(scheme.params.get_slots())
-                    )
-                ),
-            )
+            proxy = self.transform_sources_by_input[int(input_index)]
+            proxy.transform_ids = dict(self.transform_ids_by_input[int(input_index)])
             partial = scheme.lt_evaluator.evaluate_transforms(proxy, source)
             if out is None:
                 out = partial
@@ -298,7 +385,16 @@ class Concat(Module):
                         delete(int(value))
                     except Exception:
                         pass
+            for proxy in self.transform_sources_by_input:
+                for value in dict(getattr(proxy, "_dense_layer_cache_active_transform_ids", {}) or {}).values():
+                    try:
+                        delete(int(value))
+                    except Exception:
+                        pass
+                proxy.transform_ids = {}
+                proxy._dense_layer_cache_active_transform_ids = {}
         self.transform_ids_by_input = []
+        self.transform_sources_by_input = []
         self._compiled_backend = None
 
     def forward(self, *xs):
@@ -423,6 +519,182 @@ class Bootstrap(Module):
             "slots": int(x.slots()) if hasattr(x, "slots") else None,
         }
 
+    def _is_concat_cipher_tensor(self, x) -> bool:
+        return bool(type(x).__name__ == "ConcatCipherTensor" and hasattr(x, "parts"))
+
+    def _get_part_prescale_ptxt(self, part, *, level: int, slots: int):
+        cache = getattr(self, "_prescale_part_ptxt_cache", None)
+        if cache is None:
+            cache = {}
+            self._prescale_part_ptxt_cache = cache
+        ids = tuple(int(value) for value in getattr(part, "ids", ()) or ())
+        on_shape = torch.Size(getattr(part, "on_shape", ()))
+        block_count = max(1, int(len(ids)))
+        key = (int(level), int(slots), block_count, tuple(int(value) for value in on_shape))
+        if key not in cache:
+            elements = int(on_shape.numel())
+            vec = torch.zeros((int(block_count) * int(slots),), dtype=torch.float32)
+            vec[: min(int(elements), int(vec.numel()))] = float(self.prescale)
+            ql = self.scheme.encoder.get_moduli_chain()[int(level)]
+            cache[key] = self.scheme.encoder.encode(vec, level=int(level), scale=ql)
+        return cache[key]
+
+    def _bootstrap_cipher_tensor(
+        self,
+        x,
+        *,
+        profile_record: dict,
+        progress_name: str,
+        record_debug: bool,
+        preprocess_in_place: bool = True,
+        prescale_ptxt=None,
+    ):
+        preprocess_start = time.perf_counter()
+        add_shift_s = 0.0
+        prescale_mul_s = 0.0
+        original_input = x
+        if not bool(getattr(self, "preprocess_fused", False)):
+            if self.constant != 0:
+                step_start = time.perf_counter()
+                x = x + self.constant if not bool(preprocess_in_place) else x.__iadd__(self.constant)
+                add_shift_s = float(time.perf_counter() - step_start)
+            step_start = time.perf_counter()
+            ptxt = prescale_ptxt if prescale_ptxt is not None else self._get_prescale_ptxt(x.level())
+            if bool(preprocess_in_place):
+                x = x.__imul__(ptxt)
+            else:
+                previous = x
+                x = x * ptxt
+                if previous is not original_input:
+                    release = getattr(previous, "release", None)
+                    if callable(release):
+                        release()
+            prescale_mul_s = float(time.perf_counter() - step_start)
+        profile_record["timing_s"]["preprocess_total"] = float(time.perf_counter() - preprocess_start)
+        profile_record["timing_s"]["preprocess_add_shift"] = float(add_shift_s)
+        profile_record["timing_s"]["preprocess_prescale_mul"] = float(prescale_mul_s)
+
+        slots = int(min(x.slots(), self.bootstrap_slots))
+        profile_record["runtime_slots"] = int(slots)
+        profile_record["input_to_backend"] = self._profile_cipher_batch_stats(x)
+        if bool(record_debug):
+            self._write_bootstrap_debug(phase="before_bootstrap", x=x, slots=slots)
+        if os.environ.get("ORION_ABORT_BEFORE_BOOTSTRAP", "0") != "0":
+            raise RuntimeError(
+                f"aborting before bootstrap for debug: "
+                f"{getattr(self, 'bootstrap_debug_name', '')}"
+            )
+        write_progress_event(
+            "start",
+            phase="bootstrap",
+            layer=progress_name,
+            bootstrap_slots=int(slots),
+            call_index=int(profile_record.get("call_index", 0) or 0),
+        )
+        backend_start = time.perf_counter()
+        bootstrap_input = x
+        x = x.bootstrap(slots=slots)
+        if not bool(preprocess_in_place) and bootstrap_input is not original_input:
+            release = getattr(bootstrap_input, "release", None)
+            if callable(release):
+                release()
+        backend_bootstrap_s = float(time.perf_counter() - backend_start)
+        profile_record["timing_s"]["backend_bootstrap_call"] = float(
+            profile_record["timing_s"].get("backend_bootstrap_call", 0.0) + backend_bootstrap_s
+        )
+        write_progress_event(
+            "end",
+            phase="bootstrap",
+            layer=progress_name,
+            bootstrap_slots=int(slots),
+            call_index=int(profile_record.get("call_index", 0) or 0),
+            backend_bootstrap_s=float(backend_bootstrap_s),
+        )
+        profile_record["output_from_backend"] = self._profile_cipher_batch_stats(x)
+        if bool(record_debug):
+            self._write_bootstrap_debug(phase="after_bootstrap", x=x, slots=slots)
+
+        postprocess_start = time.perf_counter()
+        postscale_mul_s = 0.0
+        post_shift_s = 0.0
+        if self.postscale != 1:
+            step_start = time.perf_counter()
+            x *= self.postscale
+            postscale_mul_s = float(time.perf_counter() - step_start)
+        if self.constant != 0:
+            step_start = time.perf_counter()
+            x -= self.constant
+            post_shift_s = float(time.perf_counter() - step_start)
+        profile_record["timing_s"]["postprocess_total"] = float(time.perf_counter() - postprocess_start)
+        profile_record["timing_s"]["postprocess_postscale_mul"] = float(postscale_mul_s)
+        profile_record["timing_s"]["postprocess_sub_shift"] = float(post_shift_s)
+        profile_record["output_after_postprocess"] = self._profile_cipher_batch_stats(x)
+        return x
+
+    def _bootstrap_concat_cipher_tensor(self, x, *, profile_record: dict, total_start: float):
+        parts = tuple(getattr(x, "parts", ()) or ())
+        if not parts:
+            raise ValueError("Cannot bootstrap an empty ConcatCipherTensor")
+        progress_base = str(getattr(self, "bootstrap_debug_name", "") or self.__class__.__name__)
+        profile_record["lazy_concat"] = True
+        profile_record["lazy_concat_part_count"] = int(len(parts))
+        part_records = []
+
+        def transform_part(index: int, part):
+            part_record = self._new_bootstrap_runtime_record()
+            part_record["parent_call_index"] = int(profile_record.get("call_index", 0) or 0)
+            part_record["lazy_concat_part_index"] = int(index)
+            part_record["input_before_preprocess"] = self._profile_cipher_batch_stats(part)
+            part_slots = int(min(part.slots(), self.bootstrap_slots))
+            prescale_ptxt = None
+            if not bool(getattr(self, "preprocess_fused", False)):
+                prescale_ptxt = self._get_part_prescale_ptxt(
+                    part,
+                    level=int(part.level()),
+                    slots=int(part_slots),
+                )
+            result = self._bootstrap_cipher_tensor(
+                part,
+                profile_record=part_record,
+                progress_name=f"{progress_base}.part{int(index)}",
+                record_debug=False,
+                preprocess_in_place=False,
+                prescale_ptxt=prescale_ptxt,
+            )
+            part_timing = dict(part_record.get("timing_s", {}) or {})
+            part_record["timing_s"]["forward_total_inner"] = float(
+                float(part_timing.get("preprocess_total", 0.0) or 0.0)
+                + float(part_timing.get("backend_bootstrap_call", 0.0) or 0.0)
+                + float(part_timing.get("postprocess_total", 0.0) or 0.0)
+            )
+            part_records.append(part_record)
+            return result
+
+        out = x.map_parts(transform_part)
+        release_owned = getattr(x, "release_owned_parts", None)
+        if callable(release_owned):
+            release_owned()
+        profile_record["parts"] = part_records
+        for key in (
+            "preprocess_total",
+            "preprocess_add_shift",
+            "preprocess_prescale_mul",
+            "backend_bootstrap_call",
+            "postprocess_total",
+            "postprocess_postscale_mul",
+            "postprocess_sub_shift",
+        ):
+            profile_record["timing_s"][key] = float(
+                sum(float(record.get("timing_s", {}).get(key, 0.0) or 0.0) for record in part_records)
+            )
+        profile_record["runtime_slots"] = [int(record.get("runtime_slots", 0) or 0) for record in part_records]
+        profile_record["output_after_postprocess"] = {
+            "lazy_concat_part_count": int(len(parts)),
+            "parts": [record.get("output_after_postprocess", {}) for record in part_records],
+        }
+        profile_record["timing_s"]["forward_total_inner"] = float(time.perf_counter() - total_start)
+        return out
+
     def _profile_value_summary(self, values):
         values = list(values)
         if not values:
@@ -526,77 +798,17 @@ class Bootstrap(Module):
 
         total_start = time.perf_counter()
         profile_record = self._new_bootstrap_runtime_record()
-        profile_record["input_before_preprocess"] = self._profile_cipher_batch_stats(x)
-        
-        # Shift and scale into range [-1, 1]. Important caveat -- here we first
-        # shift, then scale. This lets us zero out unused slots and enables
-        # sparse bootstrapping (i.e., where slots < N/2). Full-slot producers
-        # that can absorb this affine set preprocess_fused and arrive here
-        # already scaled, saving the plaintext-multiply level.
-        preprocess_start = time.perf_counter()
-        add_shift_s = 0.0
-        prescale_mul_s = 0.0
-        if not bool(getattr(self, "preprocess_fused", False)):
-            if self.constant != 0:
-                step_start = time.perf_counter()
-                x += self.constant
-                add_shift_s = float(time.perf_counter() - step_start)
-            step_start = time.perf_counter()
-            x *= self._get_prescale_ptxt(x.level())
-            prescale_mul_s = float(time.perf_counter() - step_start)
-        profile_record["timing_s"]["preprocess_total"] = float(time.perf_counter() - preprocess_start)
-        profile_record["timing_s"]["preprocess_add_shift"] = float(add_shift_s)
-        profile_record["timing_s"]["preprocess_prescale_mul"] = float(prescale_mul_s)
- 
-        slots = int(min(x.slots(), self.bootstrap_slots))
-        profile_record["runtime_slots"] = int(slots)
-        profile_record["input_to_backend"] = self._profile_cipher_batch_stats(x)
-        self._write_bootstrap_debug(phase="before_bootstrap", x=x, slots=slots)
-        if os.environ.get("ORION_ABORT_BEFORE_BOOTSTRAP", "0") != "0":
-            raise RuntimeError(
-                f"aborting before bootstrap for debug: "
-                f"{getattr(self, 'bootstrap_debug_name', '')}"
+        if self._is_concat_cipher_tensor(x):
+            out = self._bootstrap_concat_cipher_tensor(x, profile_record=profile_record, total_start=total_start)
+        else:
+            profile_record["input_before_preprocess"] = self._profile_cipher_batch_stats(x)
+            out = self._bootstrap_cipher_tensor(
+                x,
+                profile_record=profile_record,
+                progress_name=str(getattr(self, "bootstrap_debug_name", "") or self.__class__.__name__),
+                record_debug=True,
             )
-        progress_name = str(getattr(self, "bootstrap_debug_name", "") or self.__class__.__name__)
-        write_progress_event(
-            "start",
-            phase="bootstrap",
-            layer=progress_name,
-            bootstrap_slots=int(slots),
-            call_index=int(profile_record.get("call_index", 0) or 0),
-        )
-        backend_start = time.perf_counter()
-        x = x.bootstrap(slots=slots)
-        backend_bootstrap_s = float(time.perf_counter() - backend_start)
-        profile_record["timing_s"]["backend_bootstrap_call"] = float(backend_bootstrap_s)
-        write_progress_event(
-            "end",
-            phase="bootstrap",
-            layer=progress_name,
-            bootstrap_slots=int(slots),
-            call_index=int(profile_record.get("call_index", 0) or 0),
-            backend_bootstrap_s=float(backend_bootstrap_s),
-        )
-        profile_record["output_from_backend"] = self._profile_cipher_batch_stats(x)
-        self._write_bootstrap_debug(phase="after_bootstrap", x=x, slots=slots)
-
-        # Scale and shift back to the original range
-        postprocess_start = time.perf_counter()
-        postscale_mul_s = 0.0
-        post_shift_s = 0.0
-        if self.postscale != 1:
-            step_start = time.perf_counter()
-            x *= self.postscale 
-            postscale_mul_s = float(time.perf_counter() - step_start)
-        if self.constant != 0:
-            step_start = time.perf_counter()
-            x -= self.constant
-            post_shift_s = float(time.perf_counter() - step_start)
-        profile_record["timing_s"]["postprocess_total"] = float(time.perf_counter() - postprocess_start)
-        profile_record["timing_s"]["postprocess_postscale_mul"] = float(postscale_mul_s)
-        profile_record["timing_s"]["postprocess_sub_shift"] = float(post_shift_s)
-        profile_record["timing_s"]["forward_total_inner"] = float(time.perf_counter() - total_start)
-        profile_record["output_after_postprocess"] = self._profile_cipher_batch_stats(x)
+            profile_record["timing_s"]["forward_total_inner"] = float(time.perf_counter() - total_start)
         self._bootstrap_runtime_profile.append(profile_record)
 
-        return x
+        return out

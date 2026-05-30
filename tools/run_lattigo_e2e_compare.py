@@ -26,6 +26,7 @@ from orion.models.resnet import ResNet18, ResNet20, ResNet32, ResNet34, ResNet50
 from orion.models.ternaus import TernausVGGUNet
 from orion.models.unet import UNet22, UNet22Encoder
 from orion.models.vgg import VGG
+from orion.nn.activation import Chebyshev
 from orion.nn.linear import LinearTransform
 from orion.nn.module import Module
 from orion.nn.operations import Bootstrap
@@ -1503,6 +1504,8 @@ def _layer_mae_target_names(net: torch.nn.Module) -> list[str]:
             continue
         if isinstance(module, Bootstrap):
             continue
+        if bool(getattr(module, "fused", False)):
+            continue
         names.append(str(name))
     return names
 
@@ -1537,10 +1540,103 @@ def _install_layer_mae_clear_capture(
     return outputs, remove
 
 
+def _layer_mae_module_by_name(net: torch.nn.Module) -> dict[str, torch.nn.Module]:
+    return {str(name): module for name, module in net.named_modules() if str(name)}
+
+
+def _layer_mae_fused_reference_transforms(
+    net: torch.nn.Module,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "source": "post_compile_network_dag",
+        "status": "started",
+        "error": "",
+    }
+    traced = getattr(getattr(net, "scheme", None), "traced", None)
+    if traced is None:
+        diagnostics["status"] = "no_traced_graph"
+        return {}, diagnostics
+    try:
+        from orion.core.network_dag import NetworkDAG
+
+        dag = NetworkDAG(traced)
+        dag.build_dag()
+    except Exception as exc:
+        diagnostics["status"] = "dag_build_failed"
+        diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        return {}, diagnostics
+
+    transforms: dict[str, dict[str, Any]] = {}
+    module_paths = _layer_mae_module_by_name(net)
+    module_name_by_id = {id(module): str(name) for name, module in module_paths.items()}
+    for node in list(dag.nodes):
+        module = dag.nodes[node].get("module")
+        if not isinstance(module, Chebyshev) or not bool(getattr(module, "fused", False)):
+            continue
+        prescale = float(getattr(module, "prescale", 1.0))
+        constant = float(getattr(module, "constant", 0.0))
+        if prescale == 1.0 and constant == 0.0:
+            continue
+        for predecessor in dag.predecessors(node):
+            predecessor_module = dag.nodes[predecessor].get("module")
+            producer = predecessor_module
+            producer_node = predecessor
+            if not isinstance(producer, LinearTransform) and bool(getattr(predecessor_module, "fused", False)):
+                linear_predecessors = [
+                    parent
+                    for parent in dag.predecessors(predecessor)
+                    if isinstance(dag.nodes[parent].get("module"), LinearTransform)
+                ]
+                if len(linear_predecessors) == 1:
+                    producer_node = linear_predecessors[0]
+                    producer = dag.nodes[producer_node].get("module")
+            if not isinstance(producer, LinearTransform):
+                continue
+            predecessor_name = str(module_name_by_id.get(id(producer), str(producer_node)))
+            consumer_name = str(module_name_by_id.get(id(module), str(node)))
+            transforms[str(predecessor_name)] = {
+                "kind": "producer_fused_chebyshev_prescale",
+                "consumer": str(consumer_name),
+                "consumer_class": type(module).__name__,
+                "producer_dag_node": str(producer_node),
+                "consumer_dag_node": str(node),
+                "via_fused_predecessor_dag_node": "" if str(producer_node) == str(predecessor) else str(predecessor),
+                "via_fused_predecessor_class": (
+                    "" if str(producer_node) == str(predecessor) else type(predecessor_module).__name__
+                ),
+                "prescale": float(prescale),
+                "constant": float(constant),
+            }
+    diagnostics["status"] = "ok"
+    diagnostics["transform_count"] = int(len(transforms))
+    return transforms, diagnostics
+
+
+def _layer_mae_adjust_clear_outputs_after_compile(
+    net: torch.nn.Module,
+    clear_outputs: dict[str, torch.Tensor] | None,
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]], dict[str, Any]]:
+    outputs = dict(clear_outputs or {})
+    transforms, diagnostics = _layer_mae_fused_reference_transforms(net)
+    applied: dict[str, dict[str, Any]] = {}
+    for module_name, transform in sorted(transforms.items()):
+        reference = outputs.get(str(module_name))
+        if reference is None:
+            continue
+        prescale = float(transform.get("prescale", 1.0))
+        constant = float(transform.get("constant", 0.0))
+        outputs[str(module_name)] = _layer_mae_tensor(reference) * float(prescale) + float(constant)
+        applied[str(module_name)] = dict(transform)
+    diagnostics["applied_count"] = int(len(applied))
+    diagnostics["unapplied_modules"] = sorted(str(name) for name in set(transforms) - set(applied))
+    return outputs, applied, diagnostics
+
+
 def _install_layer_mae_he_capture(
     net: torch.nn.Module,
     *,
     clear_outputs: dict[str, torch.Tensor],
+    reference_transforms: dict[str, dict[str, Any]] | None = None,
     names: set[str],
     jsonl_path: Path,
 ) -> tuple[list[dict[str, Any]], Callable[[], None]]:
@@ -1549,6 +1645,8 @@ def _install_layer_mae_he_capture(
     if jsonl_path.exists():
         jsonl_path.unlink()
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    module_by_name = _layer_mae_module_by_name(net)
+    reference_transforms = dict(reference_transforms or {})
 
     def append_row(row: dict[str, Any]) -> None:
         rows.append(row)
@@ -1636,9 +1734,21 @@ def _install_layer_mae_he_capture(
                 row.update(decode_info)
                 row["actual"] = _layer_mae_tensor_summary(decoded)
                 reference = clear_outputs.get(str(module_name))
+                reference_transform = dict(reference_transforms.get(str(module_name), {}) or {})
+                if reference_transform:
+                    row["reference_transform"] = reference_transform
                 if reference is None:
-                    row["status"] = "missing_clear_reference"
-                    row["skip_reason"] = "missing_clear_reference"
+                    if reference_transform and str(reference_transform.get("consumer", "")) in clear_outputs:
+                        consumer = str(reference_transform.get("consumer", ""))
+                        row["status"] = "skipped"
+                        row["skip_reason"] = "producer_fused_reference_covered_by_consumer"
+                        row["reference"] = _layer_mae_tensor_summary(clear_outputs[str(consumer)])
+                    elif bool(getattr(module_by_name.get(str(module_name)), "fused", False)):
+                        row["status"] = "skipped"
+                        row["skip_reason"] = "fused_module_no_clear_reference"
+                    else:
+                        row["status"] = "missing_clear_reference"
+                        row["skip_reason"] = "missing_clear_reference"
                 else:
                     row["reference"] = _layer_mae_tensor_summary(reference)
                     row["metrics_vs_clear"] = _layer_mae_metric(reference, decoded)
@@ -1676,7 +1786,11 @@ def _install_layer_mae_he_capture(
 def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] | None = None) -> dict[str, Any]:
     ok_rows = [row for row in rows if str(row.get("status")) == "ok" and isinstance(row.get("metrics_vs_clear"), dict)]
     skipped_rows = [row for row in rows if str(row.get("status")) != "ok"]
-    allowed_skip_reasons = {"lazy_concat_not_materialized"}
+    allowed_skip_reasons = {
+        "fused_module_no_clear_reference",
+        "lazy_concat_not_materialized",
+        "producer_fused_reference_covered_by_consumer",
+    }
     unexpected_rows = [
         row
         for row in skipped_rows
@@ -1684,6 +1798,14 @@ def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] |
     ]
     observed = {str(row.get("module_path", "")) for row in rows if str(row.get("module_path", ""))}
     missing_he_modules = sorted(str(name) for name in set(expected_names or set()) - observed)
+    reference_transform_rows = [
+        {
+            "module_path": str(row.get("module_path", "")),
+            **dict(row.get("reference_transform", {}) or {}),
+        }
+        for row in rows
+        if isinstance(row.get("reference_transform"), dict) and bool(row.get("reference_transform"))
+    ]
     values = [
         float(row["metrics_vs_clear"]["mae"])
         for row in ok_rows
@@ -1714,6 +1836,8 @@ def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] |
         "unexpected_count": int(len(unexpected_rows)),
         "missing_he_count": int(len(missing_he_modules)),
         "missing_he_modules": missing_he_modules,
+        "reference_transform_count": int(len(reference_transform_rows)),
+        "reference_transforms": reference_transform_rows,
         "overall_ok": bool(not unexpected_rows and not missing_he_modules and first_nonfinite is None),
         "max_mae": max(values) if values else None,
         "max_abs": max(max_values) if max_values else None,
@@ -3164,6 +3288,7 @@ def _run_forward_attempt(
     operator_breakdown: bool,
     layer_mae: bool,
     layer_mae_clear_outputs: dict[str, torch.Tensor] | None,
+    layer_mae_reference_transforms: dict[str, dict[str, Any]] | None,
     record_primary: bool,
 ) -> dict[str, Any]:
     memory_trace_path = (
@@ -3211,6 +3336,7 @@ def _run_forward_attempt(
         layer_mae_rows, remove_layer_mae = _install_layer_mae_he_capture(
             net,
             clear_outputs=dict(layer_mae_clear_outputs or {}),
+            reference_transforms=dict(layer_mae_reference_transforms or {}),
             names=expected_layer_mae_names,
             jsonl_path=layer_mae_path,
         )
@@ -3553,6 +3679,7 @@ def _run_one(
         net.eval()
         x0 = torch.randn(tuple(int(v) for v in spec["input_shape"]), dtype=torch.float32)
         layer_mae_clear_outputs: dict[str, torch.Tensor] | None = None
+        layer_mae_reference_transforms: dict[str, dict[str, Any]] = {}
         remove_layer_mae_clear = None
         if bool(layer_mae):
             layer_mae_names = set(_layer_mae_target_names(net))
@@ -3560,6 +3687,7 @@ def _run_one(
                 net,
                 layer_mae_names,
             )
+            payload["layer_mae_target_modules_initial"] = sorted(layer_mae_names)
             payload["layer_mae_target_modules"] = sorted(layer_mae_names)
         with torch.no_grad():
             try:
@@ -3588,6 +3716,29 @@ def _run_one(
         get_compile_load_profile = getattr(getattr(scheme, "lt_evaluator", None), "get_compile_load_profile", None)
         if callable(get_compile_load_profile):
             payload["compile_load_profile_after_compile"] = get_compile_load_profile()
+        if bool(layer_mae):
+            adjusted_outputs, reference_transforms, reference_transform_diagnostics = _layer_mae_adjust_clear_outputs_after_compile(
+                net,
+                layer_mae_clear_outputs,
+            )
+            post_compile_layer_mae_names = set(_layer_mae_target_names(net))
+            layer_mae_clear_outputs = {
+                str(name): value
+                for name, value in dict(adjusted_outputs or {}).items()
+                if str(name) in post_compile_layer_mae_names
+            }
+            layer_mae_reference_transforms = dict(reference_transforms)
+            payload["layer_mae_target_modules_after_compile"] = sorted(post_compile_layer_mae_names)
+            payload["layer_mae_target_modules"] = sorted(post_compile_layer_mae_names)
+            payload["layer_mae_target_modules_removed_after_compile"] = sorted(
+                str(name) for name in set(layer_mae_names) - post_compile_layer_mae_names
+            )
+            payload["layer_mae_reference_transform_count"] = int(len(layer_mae_reference_transforms))
+            payload["layer_mae_reference_transforms"] = dict(layer_mae_reference_transforms)
+            payload["layer_mae_reference_transform_diagnostics"] = dict(reference_transform_diagnostics)
+            payload["layer_mae_clear_output_count_after_reference_alignment"] = int(
+                len(layer_mae_clear_outputs or {})
+            )
         try:
             payload["operator_breakdown_after_compile"] = _collect_compile_operator_breakdown(
                 net,
@@ -3642,6 +3793,7 @@ def _run_one(
                 operator_breakdown=bool(operator_breakdown),
                 layer_mae=bool(layer_mae),
                 layer_mae_clear_outputs=layer_mae_clear_outputs,
+                layer_mae_reference_transforms=layer_mae_reference_transforms,
                 record_primary=bool(int(attempt_index) == int(first_measured_index)),
             )
         ok_attempts = [

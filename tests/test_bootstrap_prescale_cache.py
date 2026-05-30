@@ -6,7 +6,9 @@ import torch
 
 from orion.core.auto_bootstrap import BootstrapPlacer
 from orion.nn.activation import Chebyshev
+from orion.nn.linear import Conv2d
 from orion.nn.operations import Bootstrap
+from tools.run_lattigo_e2e_compare import _layer_mae_target_names
 
 
 class _DummyEncoder:
@@ -38,6 +40,20 @@ def test_bootstrap_prescale_plaintexts_are_cached_per_runtime_level() -> None:
     higher_level = bootstrap._get_prescale_ptxt(2)
     assert higher_level.level == 2
     assert encoder.calls == [(1, 202, 64), (2, 303, 64)]
+
+
+def test_layer_mae_targets_exclude_modules_fused_after_compile() -> None:
+    net = torch.nn.Sequential()
+    conv = Conv2d(1, 1, kernel_size=1)
+    act = Chebyshev(degree=1, fn=lambda x: x)
+    net.add_module("conv", conv)
+    net.add_module("act", act)
+
+    assert _layer_mae_target_names(net) == ["conv", "act"]
+
+    act.fused = True
+
+    assert _layer_mae_target_names(net) == ["conv"]
 
 
 def test_bootstrap_placer_uses_runtime_materialized_output_shape() -> None:

@@ -17,7 +17,7 @@ from orion.backend.python.tensors import CipherTensor
 from orion.models.unet import MiniUNet
 from orion.nn.linear import ConvTranspose2d
 from orion.nn.module import Module
-from orion.nn.operations import Concat
+from orion.nn.operations import Bootstrap, Concat, ConcatCipherTensor
 
 
 PYTHON_BACKEND_CONFIG = {
@@ -400,6 +400,107 @@ def test_concat_materialization_fallback_matches_channel_cat_on_python_backend()
             torch.cat([left, right], dim=1),
             atol=1.0e-5,
         )
+    finally:
+        active_scheme.delete_scheme()
+
+
+def test_concat_materialization_fallback_supports_single_slot_group_cache(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GRANULARITY", "group")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS", "2")
+    active_scheme = orion.init_scheme(_python_backend_config())
+    Module.set_scheme(active_scheme)
+    Module.set_margin(active_scheme.params.get_margin())
+    try:
+        slots = int(active_scheme.params.get_slots())
+        height = 16
+        width = 16
+        values_per_channel = int(height * width)
+        left_channels = max(1, (int(slots) + int(values_per_channel) - 1) // int(values_per_channel))
+        right_channels = 1
+        concat = Concat(dim=1)
+        concat.name = "concat_materialize_single_slot_toy"
+        concat.set_level(len(active_scheme.params.get_logq()) - 1)
+        concat.configure_from_stats(
+            input_shapes=[
+                torch.Size((1, left_channels, height, width)),
+                torch.Size((1, right_channels, height, width)),
+            ],
+            input_fhe_shapes=[
+                torch.Size((1, left_channels, height, width)),
+                torch.Size((1, right_channels, height, width)),
+            ],
+            input_gaps=[1, 1],
+            output_shape=torch.Size((1, left_channels + right_channels, height, width)),
+            fhe_output_shape=torch.Size((1, left_channels + right_channels, height, width)),
+            output_gap=1,
+        )
+        concat.he_mode = True
+        level = len(active_scheme.params.get_logq()) - 1
+        left = torch.arange(
+            left_channels * height * width,
+            dtype=torch.float32,
+        ).reshape(1, left_channels, height, width)
+        right = (
+            torch.arange(right_channels * height * width, dtype=torch.float32)
+            .reshape(1, right_channels, height, width)
+            + 10.0
+        )
+        left_ct = active_scheme.encrypt(active_scheme.encode(left, level))
+        right_ct = active_scheme.encrypt(active_scheme.encode(right, level))
+
+        out_ct = concat(left_ct, right_ct).materialize()
+        out = out_ct.decrypt().decode().to(dtype=torch.float32)
+
+        assert torch.allclose(
+            out.reshape(1, left_channels + right_channels, height, width),
+            torch.cat([left, right], dim=1),
+            atol=1.0e-5,
+        )
+        assert int(active_scheme.backend.GetLiveLinearTransformCount()) == 0
+    finally:
+        active_scheme.delete_scheme()
+
+
+def test_bootstrap_preserves_lazy_concat_without_materialization(monkeypatch) -> None:
+    active_scheme = orion.init_scheme(_python_backend_config())
+    try:
+        level = len(active_scheme.params.get_logq()) - 2
+        left = torch.arange(64, dtype=torch.float32).reshape(1, 1, 8, 8)
+        right = (torch.arange(64, dtype=torch.float32) + 100.0).reshape(1, 1, 8, 8)
+        left_ct = active_scheme.encrypt(active_scheme.encode(left, level))
+        right_ct = active_scheme.encrypt(active_scheme.encode(right, level))
+        concat = Concat(dim=1)
+        concat.name = "lazy_concat_bootstrap_toy"
+        concat.configure_from_stats(
+            input_shapes=[left.shape, right.shape],
+            input_fhe_shapes=[left.shape, right.shape],
+            input_gaps=[1, 1],
+            output_shape=torch.Size((1, 2, 8, 8)),
+            fhe_output_shape=torch.Size((1, 2, 8, 8)),
+            output_gap=1,
+        )
+        concat.he_mode = True
+        lazy = concat(left_ct, right_ct)
+
+        def fail_materialize(_parts):
+            raise AssertionError("bootstrap must preserve lazy concat")
+
+        monkeypatch.setattr(concat, "materialize", fail_materialize)
+        bootstrap = Bootstrap(torch.tensor(-1.0), torch.tensor(1.0), input_level=level)
+        bootstrap.scheme = active_scheme
+        bootstrap.margin = 1.0
+        bootstrap.fhe_input_shape = concat.fhe_output_shape
+        bootstrap.fit()
+        bootstrap.compile()
+        bootstrap.he_mode = True
+
+        out = bootstrap(lazy)
+
+        assert isinstance(out, ConcatCipherTensor)
+        assert len(out.parts) == 2
+        assert all(len(part.ids) == 1 for part in out.parts)
+        assert getattr(bootstrap, "_bootstrap_runtime_profile")[-1]["lazy_concat_part_count"] == 2
     finally:
         active_scheme.delete_scheme()
 
