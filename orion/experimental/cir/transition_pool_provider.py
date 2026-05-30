@@ -558,6 +558,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_group_reject_reasons = []
         prepare_started = time.perf_counter()
         diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
+        diag_builder_metadata = dict(getattr(self.module, "_last_diag_builder_metadata", {}) or {})
         diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         single_slot = bool(_single_slot_layer_cache_enabled(scheme))
         runtime_block_builder, release_runtime_cache = (
@@ -599,6 +600,11 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         }
         diagonals.clear()
         self.last_runtime_timing["prepare_transforms_s"] = float(time.perf_counter() - prepare_started)
+        for key, value in diag_builder_metadata.items():
+            if key in {"diag_builder_build_s", "diag_builder_shadow_s", "diag_builder_payload_count"}:
+                self.last_runtime_timing[str(key)] = float(self.last_runtime_timing.get(str(key), 0.0) or 0.0) + float(value or 0.0)
+            else:
+                self.last_runtime_timing[str(key)] = value
 
         compile_started = time.perf_counter()
         precreated_groups = {}

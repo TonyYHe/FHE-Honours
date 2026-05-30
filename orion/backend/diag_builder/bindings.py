@@ -204,6 +204,10 @@ def load_library() -> ctypes.CDLL | None:
                 ctypes.c_int,
             ]
             lib.OrionBuildDenseConv2D.restype = _CPayloadBatch
+            dense_tconv = getattr(lib, "OrionBuildDenseConvTranspose2D", None)
+            if dense_tconv is not None:
+                dense_tconv.argtypes = list(lib.OrionBuildDenseConv2D.argtypes)
+                dense_tconv.restype = _CPayloadBatch
             dense_index = getattr(lib, "OrionBuildDenseConv2DIndexOnly", None)
             if dense_index is not None:
                 dense_index.argtypes = [
@@ -234,6 +238,10 @@ def load_library() -> ctypes.CDLL | None:
                     ctypes.c_int,
                 ]
                 dense_index.restype = _CPayloadBatch
+            dense_tconv_index = getattr(lib, "OrionBuildDenseConvTranspose2DIndexOnly", None)
+            if dense_tconv_index is not None and dense_index is not None:
+                dense_tconv_index.argtypes = list(dense_index.argtypes)
+                dense_tconv_index.restype = _CPayloadBatch
             lib.OrionFreeDiagPayloadBatch.argtypes = [_CPayloadBatch]
             lib.OrionFreeDiagPayloadBatch.restype = None
             provider_native = getattr(lib, "OrionBuildProviderNativeSourceConv2D", None)
@@ -324,6 +332,34 @@ def _copy_payloads(batch: _CPayloadBatch) -> list[DenseConv2DPayload]:
     return payloads
 
 
+def _dense_conv2d_weight(conv_layer: Any) -> torch.Tensor:
+    weight = getattr(conv_layer, "on_weight").detach().cpu().to(dtype=torch.float32)
+    if int(getattr(conv_layer, "groups", 1) or 1) > 1:
+        from orion.core import packing
+
+        weight = packing.resolve_grouped_conv(conv_layer).detach().cpu().to(dtype=torch.float32)
+    return weight
+
+
+def _dense_conv_transpose2d_weight(conv_layer: Any) -> torch.Tensor:
+    weight = getattr(conv_layer, "on_weight").detach().cpu().to(dtype=torch.float32)
+    groups = int(getattr(conv_layer, "groups", 1) or 1)
+    if groups <= 1:
+        return weight
+    ci = int(getattr(conv_layer, "in_channels"))
+    co = int(getattr(conv_layer, "out_channels"))
+    ci_per_group = int(ci // groups)
+    co_per_group = int(co // groups)
+    expanded = torch.zeros((ci, co, int(weight.shape[2]), int(weight.shape[3])), dtype=torch.float32)
+    for group in range(groups):
+        ic_start = int(group) * int(ci_per_group)
+        ic_end = min(int(ci), int(ic_start) + int(ci_per_group))
+        oc_start = int(group) * int(co_per_group)
+        oc_end = min(int(co), int(oc_start) + int(co_per_group))
+        expanded[ic_start:ic_end, oc_start:oc_end, :, :] = weight[ic_start:ic_end, : int(oc_end - oc_start), :, :]
+    return expanded
+
+
 def _cpp_dense_conv2d_payloads(
     conv_layer: Any,
     *,
@@ -334,12 +370,57 @@ def _cpp_dense_conv2d_payloads(
     lib = load_library()
     if lib is None:
         raise RuntimeError(load_error() or "diag_builder shared library unavailable")
-    params = conv_layer.scheme.params
-    weight = getattr(conv_layer, "on_weight").detach().cpu().to(dtype=torch.float32)
-    if int(getattr(conv_layer, "groups", 1) or 1) > 1:
-        from orion.core import packing
+    build = getattr(lib, "OrionBuildDenseConv2D")
+    return _cpp_dense_layer_payloads(
+        conv_layer,
+        lib=lib,
+        build=build,
+        last=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        blocks=blocks,
+        fallback_kind="cpp_dense_conv2d",
+        transposed=False,
+    )
 
-        weight = packing.resolve_grouped_conv(conv_layer).detach().cpu().to(dtype=torch.float32)
+
+def _cpp_dense_conv_transpose2d_payloads(
+    conv_layer: Any,
+    *,
+    last: bool,
+    allow_hybrid: bool,
+    blocks: Iterable[tuple[int, int]] | None,
+) -> tuple[list[DenseConv2DPayload], int, dict[str, Any]]:
+    lib = load_library()
+    if lib is None:
+        raise RuntimeError(load_error() or "diag_builder shared library unavailable")
+    build = getattr(lib, "OrionBuildDenseConvTranspose2D", None)
+    if not callable(build):
+        raise RuntimeError("diag_builder shared library does not export dense ConvTranspose2d builder")
+    return _cpp_dense_layer_payloads(
+        conv_layer,
+        lib=lib,
+        build=build,
+        last=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        blocks=blocks,
+        fallback_kind="cpp_dense_conv_transpose2d",
+        transposed=True,
+    )
+
+
+def _cpp_dense_layer_payloads(
+    conv_layer: Any,
+    *,
+    lib: ctypes.CDLL,
+    build: Any,
+    last: bool,
+    allow_hybrid: bool,
+    blocks: Iterable[tuple[int, int]] | None,
+    fallback_kind: str,
+    transposed: bool,
+) -> tuple[list[DenseConv2DPayload], int, dict[str, Any]]:
+    params = conv_layer.scheme.params
+    weight = _dense_conv_transpose2d_weight(conv_layer) if bool(transposed) else _dense_conv2d_weight(conv_layer)
     weight_np = np.ascontiguousarray(weight.numpy().reshape(-1), dtype=np.float32)
     input_shape = _int_array(_shape4(conv_layer.input_shape))
     output_shape = _int_array(_shape4(conv_layer.output_shape))
@@ -354,7 +435,7 @@ def _cpp_dense_conv2d_payloads(
     dil_h, dil_w = (int(value) for value in tuple(conv_layer.dilation))
 
     started = time.perf_counter()
-    batch = lib.OrionBuildDenseConv2D(
+    batch = build(
         int(params.get_slots()),
         str(params.get_embedding_method()).encode("utf-8"),
         int(bool(last)),
@@ -391,7 +472,7 @@ def _cpp_dense_conv2d_payloads(
             raise RuntimeError(fallback_reason)
         payloads = _copy_payloads(batch)
         metadata = {
-            "diag_builder_kind": _decode_c_string(batch.builder_kind) or "cpp_dense_conv2d",
+            "diag_builder_kind": _decode_c_string(batch.builder_kind) or str(fallback_kind),
             "diag_builder_source": "cpp",
             "diag_builder_build_s": float(build_s),
             "diag_builder_payload_count": int(len(payloads)),
@@ -402,13 +483,9 @@ def _cpp_dense_conv2d_payloads(
         lib.OrionFreeDiagPayloadBatch(batch)
 
 
-def _dense_conv2d_c_args(conv_layer: Any, *, last: bool, allow_hybrid: bool):
+def _dense_conv2d_c_args(conv_layer: Any, *, last: bool, allow_hybrid: bool, transposed: bool = False):
     params = conv_layer.scheme.params
-    weight = getattr(conv_layer, "on_weight").detach().cpu().to(dtype=torch.float32)
-    if int(getattr(conv_layer, "groups", 1) or 1) > 1:
-        from orion.core import packing
-
-        weight = packing.resolve_grouped_conv(conv_layer).detach().cpu().to(dtype=torch.float32)
+    weight = _dense_conv_transpose2d_weight(conv_layer) if bool(transposed) else _dense_conv2d_weight(conv_layer)
     weight_np = np.ascontiguousarray(weight.numpy().reshape(-1), dtype=np.float32)
     input_shape = _int_array(_shape4(conv_layer.input_shape))
     output_shape = _int_array(_shape4(conv_layer.output_shape))
@@ -460,7 +537,51 @@ def _cpp_dense_conv2d_index_only(
     build = getattr(lib, "OrionBuildDenseConv2DIndexOnly", None)
     if not callable(build):
         raise RuntimeError("diag_builder shared library does not export dense Conv2d index-only builder")
-    args = _dense_conv2d_c_args(conv_layer, last=bool(last), allow_hybrid=bool(allow_hybrid))
+    return _cpp_dense_layer_index_only(
+        conv_layer,
+        lib=lib,
+        build=build,
+        last=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        fallback_kind="cpp_dense_conv2d:index_only",
+        transposed=False,
+    )
+
+
+def _cpp_dense_conv_transpose2d_index_only(
+    conv_layer: Any,
+    *,
+    last: bool,
+    allow_hybrid: bool,
+) -> tuple[dict[tuple[int, int], tuple[int, ...]], int, dict[str, Any]]:
+    lib = load_library()
+    if lib is None:
+        raise RuntimeError(load_error() or "diag_builder shared library unavailable")
+    build = getattr(lib, "OrionBuildDenseConvTranspose2DIndexOnly", None)
+    if not callable(build):
+        raise RuntimeError("diag_builder shared library does not export dense ConvTranspose2d index-only builder")
+    return _cpp_dense_layer_index_only(
+        conv_layer,
+        lib=lib,
+        build=build,
+        last=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        fallback_kind="cpp_dense_conv_transpose2d:index_only",
+        transposed=True,
+    )
+
+
+def _cpp_dense_layer_index_only(
+    conv_layer: Any,
+    *,
+    lib: ctypes.CDLL,
+    build: Any,
+    last: bool,
+    allow_hybrid: bool,
+    fallback_kind: str,
+    transposed: bool,
+) -> tuple[dict[tuple[int, int], tuple[int, ...]], int, dict[str, Any]]:
+    args = _dense_conv2d_c_args(conv_layer, last=bool(last), allow_hybrid=bool(allow_hybrid), transposed=bool(transposed))
     (
         slots,
         embed_method,
@@ -526,7 +647,7 @@ def _cpp_dense_conv2d_index_only(
             for payload in payloads
         }
         metadata = {
-            "diag_builder_kind": _decode_c_string(batch.builder_kind) or "cpp_dense_conv2d:index_only",
+            "diag_builder_kind": _decode_c_string(batch.builder_kind) or str(fallback_kind),
             "diag_builder_source": "cpp",
             "diag_builder_build_s": float(build_s),
             "diag_builder_payload_count": int(len(payloads)),
@@ -574,6 +695,43 @@ def build_dense_conv2d_payloads_if_enabled(
         return None
 
 
+def build_dense_conv_transpose2d_payloads(
+    conv_layer: Any,
+    *,
+    last: bool,
+    allow_hybrid: bool = True,
+    blocks: Iterable[tuple[int, int]] | None = None,
+) -> tuple[list[DenseConv2DPayload], int, dict[str, Any]]:
+    return _cpp_dense_conv_transpose2d_payloads(
+        conv_layer,
+        last=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        blocks=blocks,
+    )
+
+
+def build_dense_conv_transpose2d_payloads_if_enabled(
+    conv_layer: Any,
+    *,
+    last: bool,
+    allow_hybrid: bool = True,
+    blocks: Iterable[tuple[int, int]] | None = None,
+) -> tuple[list[DenseConv2DPayload], int, dict[str, Any]] | None:
+    if not dense_builder_enabled():
+        return None
+    try:
+        return build_dense_conv_transpose2d_payloads(
+            conv_layer,
+            last=bool(last),
+            allow_hybrid=bool(allow_hybrid),
+            blocks=blocks,
+        )
+    except Exception:
+        if strict_enabled():
+            raise
+        return None
+
+
 def build_dense_conv2d_index_only(
     conv_layer: Any,
     *,
@@ -581,6 +739,19 @@ def build_dense_conv2d_index_only(
     allow_hybrid: bool = True,
 ) -> tuple[dict[tuple[int, int], tuple[int, ...]], int, dict[str, Any]]:
     return _cpp_dense_conv2d_index_only(
+        conv_layer,
+        last=bool(last),
+        allow_hybrid=bool(allow_hybrid),
+    )
+
+
+def build_dense_conv_transpose2d_index_only(
+    conv_layer: Any,
+    *,
+    last: bool,
+    allow_hybrid: bool = True,
+) -> tuple[dict[tuple[int, int], tuple[int, ...]], int, dict[str, Any]]:
+    return _cpp_dense_conv_transpose2d_index_only(
         conv_layer,
         last=bool(last),
         allow_hybrid=bool(allow_hybrid),

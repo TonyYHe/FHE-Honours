@@ -1217,6 +1217,9 @@ class ConvTranspose2d(LinearTransform):
                 build_block_diagonals=(
                     lambda blocks, self=self, last=bool(last): packing.pack_conv_transpose2d_blocks(self, bool(last), blocks)
                 ),
+                build_block_payloads=(
+                    lambda blocks, self=self, last=bool(last): packing.build_conv_transpose2d_block_payloads(self, bool(last), blocks)
+                ),
             )
             return
         self.diagonals, self.output_rotations = packing.pack_conv_transpose2d(self, last)

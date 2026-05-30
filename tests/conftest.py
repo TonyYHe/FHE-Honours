@@ -10,16 +10,20 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DIAG_BUILDER_LIB = ROOT / "orion" / "backend" / "diag_builder" / "diag_builder-linux.so"
+DIAG_BUILDER_SOURCE = ROOT / "orion" / "backend" / "diag_builder" / "diag_builder.cpp"
 
 
 @pytest.fixture(autouse=True)
 def _build_diag_builder_when_enabled(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     enabled = str(os.environ.get("ORION_CPP_DIAG_BUILDER", "")).strip().lower()
     name = str(getattr(getattr(request, "node", None), "name", "") or "")
-    needs_builder = "diag_builder" in name or "cpp_dense_conv2d" in name
+    needs_builder = "diag_builder" in name or "cpp_dense_conv2d" in name or "cpp_dense_conv_transpose2d" in name
     if enabled not in {"1", "true", "yes", "on"} and not bool(needs_builder):
         return
-    if not DIAG_BUILDER_LIB.exists():
+    if (
+        not DIAG_BUILDER_LIB.exists()
+        or DIAG_BUILDER_LIB.stat().st_mtime < DIAG_BUILDER_SOURCE.stat().st_mtime
+    ):
         subprocess.run(
             [sys.executable, str(ROOT / "tools" / "build_diag_builder.py")],
             cwd=str(ROOT),

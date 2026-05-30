@@ -7,6 +7,9 @@ existing Lattigo and clear-Lattigo bindings already consume.
 
 from .bindings import (
     DenseConv2DPayload,
+    build_dense_conv_transpose2d_index_only,
+    build_dense_conv_transpose2d_payloads,
+    build_dense_conv_transpose2d_payloads_if_enabled,
     build_dense_conv2d_index_only,
     build_dense_conv2d_payloads,
     build_dense_conv2d_payloads_if_enabled,
@@ -18,6 +21,9 @@ from .bindings import (
 
 __all__ = [
     "DenseConv2DPayload",
+    "build_dense_conv_transpose2d_index_only",
+    "build_dense_conv_transpose2d_payloads",
+    "build_dense_conv_transpose2d_payloads_if_enabled",
     "build_dense_conv2d_index_only",
     "build_dense_conv2d_payloads",
     "build_dense_conv2d_payloads_if_enabled",

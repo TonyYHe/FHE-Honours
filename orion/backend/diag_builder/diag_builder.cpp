@@ -104,7 +104,8 @@ struct OrionProviderCompactSourceSpec {
 
 namespace {
 
-constexpr const char *kBuilderKind = "cpp_dense_conv2d";
+constexpr const char *kDenseConv2DBuilderKind = "cpp_dense_conv2d";
+constexpr const char *kDenseConvTranspose2DBuilderKind = "cpp_dense_conv_transpose2d";
 
 std::string g_last_error;
 
@@ -394,7 +395,7 @@ std::vector<std::pair<int, int>> RequestedBlocks(const int *block_rows, const in
   return blocks;
 }
 
-void ValidateSpec(const DenseSpec &spec, int weight_len) {
+void ValidateDenseConv2DSpec(const DenseSpec &spec, int weight_len) {
   if (spec.slots <= 0) {
     throw std::invalid_argument("slots must be positive");
   }
@@ -409,6 +410,24 @@ void ValidateSpec(const DenseSpec &spec, int weight_len) {
       spec.kernel_h * spec.kernel_w;
   if (expected_weight != weight_len) {
     throw std::invalid_argument("weight length does not match dense Conv2d spec");
+  }
+}
+
+void ValidateDenseConvTranspose2DSpec(const DenseSpec &spec, int weight_len) {
+  if (spec.slots <= 0) {
+    throw std::invalid_argument("slots must be positive");
+  }
+  if (spec.input_gap <= 0 || spec.output_gap <= 0) {
+    throw std::invalid_argument("gaps must be positive");
+  }
+  if (spec.kernel_h <= 0 || spec.kernel_w <= 0) {
+    throw std::invalid_argument("kernel must be positive");
+  }
+  const int64_t expected_weight =
+      static_cast<int64_t>(spec.input_shape[1]) * static_cast<int64_t>(spec.output_shape[1]) *
+      spec.kernel_h * spec.kernel_w;
+  if (expected_weight != weight_len) {
+    throw std::invalid_argument("weight length does not match dense ConvTranspose2d spec");
   }
 }
 
@@ -489,8 +508,76 @@ void FillDenseConv2D(const DenseSpec &spec, const float *weight, TAccumulator &a
   }
 }
 
+template <typename TAccumulator>
+void FillDenseConvTranspose2D(const DenseSpec &spec, const float *weight, TAccumulator &acc) {
+  const int n_batch = spec.input_shape[0];
+  const int ci = spec.input_shape[1];
+  const int hi = spec.input_shape[2];
+  const int wi = spec.input_shape[3];
+  const int co = spec.output_shape[1];
+  const int ho = spec.output_shape[2];
+  const int wo = spec.output_shape[3];
+  const int on_ci = spec.fhe_input_shape[1];
+  const int on_hi = spec.fhe_input_shape[2];
+  const int on_wi = spec.fhe_input_shape[3];
+  const int on_co = spec.fhe_output_shape[1];
+  const int on_ho = spec.fhe_output_shape[2];
+  const int on_wo = spec.fhe_output_shape[3];
+  const int64_t input_block_size = static_cast<int64_t>(on_ci) * on_hi * on_wi;
+  const int64_t output_block_size = static_cast<int64_t>(on_co) * on_ho * on_wo;
+
+  for (int ic = 0; ic < ci; ++ic) {
+    for (int oc = 0; oc < co; ++oc) {
+      for (int kh = 0; kh < spec.kernel_h; ++kh) {
+        for (int kw = 0; kw < spec.kernel_w; ++kw) {
+          const int64_t weight_index =
+              (((static_cast<int64_t>(ic) * co + oc) * spec.kernel_h + kh) * spec.kernel_w + kw);
+          const float coeff = weight[weight_index];
+          if (coeff == 0.0f) {
+            continue;
+          }
+          for (int ih = 0; ih < hi; ++ih) {
+            const int64_t oh = static_cast<int64_t>(ih) * spec.stride_h - spec.pad_h + static_cast<int64_t>(kh) * spec.dilation_h;
+            if (oh < 0 || oh >= ho) {
+              continue;
+            }
+            for (int iw = 0; iw < wi; ++iw) {
+              const int64_t ow = static_cast<int64_t>(iw) * spec.stride_w - spec.pad_w + static_cast<int64_t>(kw) * spec.dilation_w;
+              if (ow < 0 || ow >= wo) {
+                continue;
+              }
+              const int64_t local_row = PackedFlatIndex(
+                  oc,
+                  oh,
+                  ow,
+                  spec.output_gap,
+                  on_ho,
+                  on_wo,
+                  spec.output_row_offset);
+              const int64_t local_col = PackedFlatIndex(
+                  ic,
+                  ih,
+                  iw,
+                  spec.input_gap,
+                  on_hi,
+                  on_wi,
+                  spec.input_row_offset);
+              for (int batch = 0; batch < n_batch; ++batch) {
+                acc.AddEntry(
+                    local_row + static_cast<int64_t>(batch) * output_block_size,
+                    local_col + static_cast<int64_t>(batch) * input_block_size,
+                    coeff);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float *weight, int weight_len, const std::vector<std::pair<int, int>> &blocks) {
-  ValidateSpec(spec, weight_len);
+  ValidateDenseConv2DSpec(spec, weight_len);
   Accumulator acc = MakeAccumulator(spec, blocks);
   FillDenseConv2D(spec, weight, acc);
 
@@ -510,7 +597,7 @@ OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float 
   }
   std::sort(block_keys.begin(), block_keys.end());
 
-  OrionDiagPayloadBatch out{nullptr, 0, acc.output_rotations, kBuilderKind, nullptr};
+  OrionDiagPayloadBatch out{nullptr, 0, acc.output_rotations, kDenseConv2DBuilderKind, nullptr};
   if (block_keys.empty()) {
     return out;
   }
@@ -550,7 +637,7 @@ OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float 
 }
 
 OrionDiagPayloadBatch BuildDenseIndexBatch(const DenseSpec &spec, const float *weight, int weight_len) {
-  ValidateSpec(spec, weight_len);
+  ValidateDenseConv2DSpec(spec, weight_len);
   IndexAccumulator acc = MakeIndexAccumulator(spec);
   FillDenseConv2D(spec, weight, acc);
 
@@ -600,9 +687,120 @@ OrionDiagPayloadBatch BuildDenseIndexBatch(const DenseSpec &spec, const float *w
   return out;
 }
 
-OrionDiagPayloadBatch ErrorBatch(const std::string &message) {
+OrionDiagPayloadBatch BuildDenseConvTransposePayloadBatch(const DenseSpec &spec, const float *weight, int weight_len, const std::vector<std::pair<int, int>> &blocks) {
+  ValidateDenseConvTranspose2DSpec(spec, weight_len);
+  Accumulator acc = MakeAccumulator(spec, blocks);
+  FillDenseConvTranspose2D(spec, weight, acc);
+
+  std::vector<std::pair<int, int>> block_keys;
+  if (blocks.empty()) {
+    for (int row = 0; row < acc.num_block_rows; ++row) {
+      for (int col = 0; col < acc.num_block_cols; ++col) {
+        block_keys.emplace_back(row, col);
+      }
+    }
+  } else {
+    for (const auto &block : blocks) {
+      if (block.first >= 0 && block.first < acc.num_block_rows && block.second >= 0 && block.second < acc.num_block_cols) {
+        block_keys.push_back(block);
+      }
+    }
+  }
+  std::sort(block_keys.begin(), block_keys.end());
+
+  OrionDiagPayloadBatch out{nullptr, 0, acc.output_rotations, kDenseConvTranspose2DBuilderKind, nullptr};
+  if (block_keys.empty()) {
+    return out;
+  }
+  out.payloads = AllocArray<OrionDiagPayload>(block_keys.size());
+  out.len = static_cast<unsigned long>(block_keys.size());
+  for (std::size_t i = 0; i < block_keys.size(); ++i) {
+    const auto &block_key = block_keys[i];
+    const auto block_it = acc.diagonals.find(block_key);
+    const bool empty = block_it == acc.diagonals.end() || block_it->second.empty();
+    const int diag_count = empty ? 1 : static_cast<int>(block_it->second.size());
+    OrionDiagPayload payload{};
+    payload.row = block_key.first;
+    payload.col = block_key.second;
+    payload.level = 0;
+    payload.task_id = nullptr;
+    payload.diag_indices = AllocArray<int>(static_cast<std::size_t>(diag_count));
+    payload.diag_indices_len = static_cast<unsigned long>(diag_count);
+    payload.diag_data = AllocArray<float>(static_cast<std::size_t>(diag_count) * static_cast<std::size_t>(spec.slots));
+    payload.diag_data_len = static_cast<unsigned long>(diag_count * spec.slots);
+    if (empty) {
+      payload.diag_indices[0] = 0;
+      std::fill(payload.diag_data, payload.diag_data + spec.slots, 0.0f);
+    } else {
+      int offset = 0;
+      for (const auto &diag : block_it->second) {
+        payload.diag_indices[offset] = diag.first;
+        std::memcpy(
+            payload.diag_data + static_cast<std::size_t>(offset) * spec.slots,
+            diag.second.data(),
+            sizeof(float) * static_cast<std::size_t>(spec.slots));
+        ++offset;
+      }
+    }
+    out.payloads[i] = payload;
+  }
+  return out;
+}
+
+OrionDiagPayloadBatch BuildDenseConvTransposeIndexBatch(const DenseSpec &spec, const float *weight, int weight_len) {
+  ValidateDenseConvTranspose2DSpec(spec, weight_len);
+  IndexAccumulator acc = MakeIndexAccumulator(spec);
+  FillDenseConvTranspose2D(spec, weight, acc);
+
+  std::vector<std::pair<int, int>> block_keys;
+  for (int row = 0; row < acc.num_block_rows; ++row) {
+    for (int col = 0; col < acc.num_block_cols; ++col) {
+      block_keys.emplace_back(row, col);
+    }
+  }
+
+  OrionDiagPayloadBatch out{nullptr, 0, acc.output_rotations, "cpp_dense_conv_transpose2d:index_only", nullptr};
+  if (block_keys.empty()) {
+    return out;
+  }
+  out.payloads = AllocArray<OrionDiagPayload>(block_keys.size());
+  out.len = static_cast<unsigned long>(block_keys.size());
+  for (std::size_t i = 0; i < block_keys.size(); ++i) {
+    const auto &block_key = block_keys[i];
+    const auto block_it = acc.indices.find(block_key);
+    const bool empty = block_it == acc.indices.end() || block_it->second.empty();
+    std::vector<int> sorted_indices;
+    if (!empty) {
+      sorted_indices = block_it->second;
+      std::sort(sorted_indices.begin(), sorted_indices.end());
+    }
+    const int diag_count = empty ? 1 : static_cast<int>(sorted_indices.size());
+    OrionDiagPayload payload{};
+    payload.row = block_key.first;
+    payload.col = block_key.second;
+    payload.level = 0;
+    payload.task_id = nullptr;
+    payload.diag_indices = AllocArray<int>(static_cast<std::size_t>(diag_count));
+    payload.diag_indices_len = static_cast<unsigned long>(diag_count);
+    payload.diag_data = nullptr;
+    payload.diag_data_len = 0;
+    if (empty) {
+      payload.diag_indices[0] = 0;
+    } else {
+      int offset = 0;
+      for (const int diag : sorted_indices) {
+        payload.diag_indices[offset] = int(diag);
+        ++offset;
+      }
+    }
+    out.payloads[i] = payload;
+  }
+  return out;
+}
+
+OrionDiagPayloadBatch ErrorBatch(const std::string &message, const char *builder_kind = kDenseConv2DBuilderKind) {
   g_last_error = message;
-  OrionDiagPayloadBatch out{nullptr, 0, 0, kBuilderKind, g_last_error.c_str()};
+  OrionDiagPayloadBatch out{nullptr, 0, 0, builder_kind, g_last_error.c_str()};
   return out;
 }
 
@@ -887,7 +1085,7 @@ OrionDiagPayloadBatch BuildProviderCompactSourcePayload(
 
 extern "C" {
 
-const char *OrionDiagBuilderVersion() { return "dense_conv2d_v1"; }
+const char *OrionDiagBuilderVersion() { return "dense_conv2d_conv_transpose2d_v1"; }
 
 const char *OrionDiagBuilderLastError() { return g_last_error.c_str(); }
 
@@ -1021,6 +1219,139 @@ OrionDiagPayloadBatch OrionBuildDenseConv2DIndexOnly(
     return ErrorBatch(exc.what());
   } catch (...) {
     return ErrorBatch("unknown C++ dense Conv2d index builder error");
+  }
+}
+
+OrionDiagPayloadBatch OrionBuildDenseConvTranspose2D(
+    int slots,
+    const char *embed_method,
+    int is_last_layer,
+    int allow_hybrid,
+    const int *input_shape,
+    const int *output_shape,
+    const int *fhe_input_shape,
+    const int *fhe_output_shape,
+    int input_gap,
+    int output_gap,
+    int input_row_offset,
+    int output_row_offset,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dilation_h,
+    int dilation_w,
+    int output_top_beta,
+    int output_bottom_beta,
+    int fuse_output_relayout,
+    const float *weight,
+    int weight_len,
+    const int *block_rows,
+    const int *block_cols,
+    int block_count) {
+  try {
+    g_last_error.clear();
+    if (input_shape == nullptr || output_shape == nullptr || fhe_input_shape == nullptr || fhe_output_shape == nullptr || weight == nullptr) {
+      return ErrorBatch("null dense ConvTranspose2d argument", kDenseConvTranspose2DBuilderKind);
+    }
+    DenseSpec spec;
+    spec.slots = int(slots);
+    spec.embed_method = embed_method == nullptr ? "" : std::string(embed_method);
+    spec.is_last_layer = bool(is_last_layer);
+    spec.allow_hybrid = bool(allow_hybrid);
+    for (int i = 0; i < 4; ++i) {
+      spec.input_shape[i] = input_shape[i];
+      spec.output_shape[i] = output_shape[i];
+      spec.fhe_input_shape[i] = fhe_input_shape[i];
+      spec.fhe_output_shape[i] = fhe_output_shape[i];
+    }
+    spec.input_gap = input_gap;
+    spec.output_gap = output_gap;
+    spec.input_row_offset = std::max(0, input_row_offset);
+    spec.output_row_offset = std::max(0, output_row_offset);
+    spec.kernel_h = kernel_h;
+    spec.kernel_w = kernel_w;
+    spec.stride_h = stride_h;
+    spec.stride_w = stride_w;
+    spec.pad_h = pad_h;
+    spec.pad_w = pad_w;
+    spec.dilation_h = dilation_h;
+    spec.dilation_w = dilation_w;
+    spec.output_top_beta = std::max(0, output_top_beta);
+    spec.output_bottom_beta = std::max(0, output_bottom_beta);
+    spec.fuse_output_relayout = bool(fuse_output_relayout);
+    return BuildDenseConvTransposePayloadBatch(spec, weight, weight_len, RequestedBlocks(block_rows, block_cols, block_count));
+  } catch (const std::exception &exc) {
+    return ErrorBatch(exc.what(), kDenseConvTranspose2DBuilderKind);
+  } catch (...) {
+    return ErrorBatch("unknown C++ dense ConvTranspose2d builder error", kDenseConvTranspose2DBuilderKind);
+  }
+}
+
+OrionDiagPayloadBatch OrionBuildDenseConvTranspose2DIndexOnly(
+    int slots,
+    const char *embed_method,
+    int is_last_layer,
+    int allow_hybrid,
+    const int *input_shape,
+    const int *output_shape,
+    const int *fhe_input_shape,
+    const int *fhe_output_shape,
+    int input_gap,
+    int output_gap,
+    int input_row_offset,
+    int output_row_offset,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dilation_h,
+    int dilation_w,
+    int output_top_beta,
+    int output_bottom_beta,
+    int fuse_output_relayout,
+    const float *weight,
+    int weight_len) {
+  try {
+    g_last_error.clear();
+    if (input_shape == nullptr || output_shape == nullptr || fhe_input_shape == nullptr || fhe_output_shape == nullptr || weight == nullptr) {
+      return ErrorBatch("null dense ConvTranspose2d index argument", "cpp_dense_conv_transpose2d:index_only");
+    }
+    DenseSpec spec;
+    spec.slots = int(slots);
+    spec.embed_method = embed_method == nullptr ? "" : std::string(embed_method);
+    spec.is_last_layer = bool(is_last_layer);
+    spec.allow_hybrid = bool(allow_hybrid);
+    for (int i = 0; i < 4; ++i) {
+      spec.input_shape[i] = input_shape[i];
+      spec.output_shape[i] = output_shape[i];
+      spec.fhe_input_shape[i] = fhe_input_shape[i];
+      spec.fhe_output_shape[i] = fhe_output_shape[i];
+    }
+    spec.input_gap = input_gap;
+    spec.output_gap = output_gap;
+    spec.input_row_offset = std::max(0, input_row_offset);
+    spec.output_row_offset = std::max(0, output_row_offset);
+    spec.kernel_h = kernel_h;
+    spec.kernel_w = kernel_w;
+    spec.stride_h = stride_h;
+    spec.stride_w = stride_w;
+    spec.pad_h = pad_h;
+    spec.pad_w = pad_w;
+    spec.dilation_h = dilation_h;
+    spec.dilation_w = dilation_w;
+    spec.output_top_beta = std::max(0, output_top_beta);
+    spec.output_bottom_beta = std::max(0, output_bottom_beta);
+    spec.fuse_output_relayout = bool(fuse_output_relayout);
+    return BuildDenseConvTransposeIndexBatch(spec, weight, weight_len);
+  } catch (const std::exception &exc) {
+    return ErrorBatch(exc.what(), "cpp_dense_conv_transpose2d:index_only");
+  } catch (...) {
+    return ErrorBatch("unknown C++ dense ConvTranspose2d index builder error", "cpp_dense_conv_transpose2d:index_only");
   }
 }
 

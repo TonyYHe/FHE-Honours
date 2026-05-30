@@ -1192,6 +1192,41 @@ def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
         scheme.delete_scheme()
 
 
+def test_input_pair_pool_provider_records_cpp_diag_builder_attribution(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    _init_python_scheme("")
+    try:
+        pool = AvgPool2d(kernel_size=2, stride=2, padding=0)
+        pool.init_orion_params()
+        pool.input_shape = torch.Size((1, 2, 4, 4))
+        pool.output_shape = torch.Size((1, 2, 2, 2))
+        pool.fhe_input_shape = torch.Size((1, 2, 4, 4))
+        pool.fhe_output_shape = torch.Size((1, 2, 4, 4))
+        pool.input_gap = 1
+        pool.output_gap = 2
+        pool.update_params()
+        pool.set_level(len(scheme.params.get_logq()) - 1)
+
+        executor = InputPairConvRuntimeExecutor(
+            module=pool,
+            output_node_id="pool_cppdiag_attr",
+            use_ct_pt_hybrid_packing=False,
+        )
+        executor.compile(scheme)
+        timing = dict(executor.last_runtime_timing)
+
+        assert timing["diag_builder_kind"] == "cpp_dense_conv2d"
+        assert timing["diag_builder_source"] == "cpp"
+        assert timing["diag_builder_build_s"] > 0.0
+        assert timing["diag_builder_payload_count"] > 0.0
+        assert getattr(pool, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
+    finally:
+        scheme.delete_scheme()
+
+
 def test_layout_policy_dp_costs_explicit_beta_growth_paths() -> None:
     dag = build_u22_dag(network_spec("u22_256_base32"))
     compile_plan = build_layout_policy_compile_plan(dag, policy="dp")

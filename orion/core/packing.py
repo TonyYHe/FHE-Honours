@@ -300,6 +300,133 @@ def _try_build_cpp_dense_conv2d_payloads(conv_layer, last: bool, *, allow_hybrid
         }
         return None
 
+
+def _try_build_cpp_dense_conv_transpose2d_indices(conv_layer, last: bool, *, allow_hybrid: bool):
+    if not _env_enabled("ORION_CPP_DIAG_BUILDER") or not _env_enabled("ORION_CPP_DIAG_BUILDER_DENSE", True):
+        return None
+    if str(getattr(conv_layer, "get_io_mode", lambda: "none")()) != "none":
+        return None
+    try:
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        indices, output_rotations, metadata = diag_builder.build_dense_conv_transpose2d_index_only(
+            conv_layer,
+            last=bool(last),
+            allow_hybrid=bool(allow_hybrid),
+        )
+        if _env_enabled("ORION_CPP_DIAG_BUILDER_SHADOW"):
+            shadow_started = time.perf_counter()
+            slots = int(conv_layer.scheme.params.get_slots())
+            embed_method = str(conv_layer.scheme.params.get_embedding_method())
+            python_indices = estimate_direct_conv_transpose2d_diagonal_count(
+                conv_layer,
+                int(slots),
+                str(embed_method),
+                bool(last),
+                allow_hybrid=bool(allow_hybrid),
+                return_indices=True,
+            )
+            python_rotations = _packed_output_rotations(
+                matrix_height=int(torch.Size(conv_layer.fhe_output_shape).numel()),
+                num_slots=int(slots),
+                embed_method=str(embed_method),
+                is_last_layer=bool(last),
+                allow_hybrid=bool(allow_hybrid),
+            )
+            metadata["diag_builder_shadow_s"] = float(time.perf_counter() - shadow_started)
+            normalized_cpp = {
+                (int(row), int(col)): tuple(int(value) for value in values)
+                for (row, col), values in dict(indices).items()
+            }
+            normalized_py = {
+                (int(row), int(col)): tuple(int(value) for value in values)
+                for (row, col), values in dict(python_indices).items()
+            }
+            ok = bool(normalized_cpp == normalized_py and int(output_rotations) == int(python_rotations))
+            metadata["diag_builder_shadow_ok"] = bool(ok)
+            if not ok:
+                if normalized_cpp.keys() != normalized_py.keys():
+                    reason = "index block-key mismatch"
+                elif int(output_rotations) != int(python_rotations):
+                    reason = f"output rotations mismatch cpp={int(output_rotations)} python={int(python_rotations)}"
+                else:
+                    reason = "diag index metadata mismatch"
+                metadata["diag_builder_fallback_reason"] = str(reason)
+                conv_layer._last_diag_builder_metadata = dict(metadata)
+                if _env_enabled("ORION_CPP_DIAG_BUILDER_STRICT"):
+                    raise RuntimeError(str(reason))
+                return None
+        return indices, int(output_rotations), dict(metadata)
+    except Exception as exc:
+        if _env_enabled("ORION_CPP_DIAG_BUILDER_STRICT"):
+            raise
+        conv_layer._last_diag_builder_metadata = {
+            "diag_builder_kind": "cpp_dense_conv_transpose2d:index_only",
+            "diag_builder_source": "python_fallback",
+            "diag_builder_build_s": 0.0,
+            "diag_builder_payload_count": 0,
+            "diag_builder_fallback_reason": str(exc),
+        }
+        return None
+
+
+def _try_build_cpp_dense_conv_transpose2d_payloads(conv_layer, last: bool, *, allow_hybrid: bool, blocks):
+    if not _env_enabled("ORION_CPP_DIAG_BUILDER") or not _env_enabled("ORION_CPP_DIAG_BUILDER_DENSE", True):
+        return None
+    if str(getattr(conv_layer, "get_io_mode", lambda: "none")()) != "none":
+        return None
+    try:
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        payloads, output_rotations, metadata = diag_builder.build_dense_conv_transpose2d_payloads(
+            conv_layer,
+            last=bool(last),
+            allow_hybrid=bool(allow_hybrid),
+            blocks=blocks,
+        )
+        if _env_enabled("ORION_CPP_DIAG_BUILDER_SHADOW"):
+            shadow_started = time.perf_counter()
+            slots = int(conv_layer.scheme.params.get_slots())
+            python_diagonals, python_rotations = direct_diagonalize_conv_transpose2d(
+                conv_layer,
+                slots,
+                str(conv_layer.scheme.params.get_embedding_method()),
+                bool(last),
+                allow_hybrid=bool(allow_hybrid),
+                allowed_blocks=(
+                    {
+                        (int(row), int(col))
+                        for row, col in tuple(blocks or ())
+                    }
+                    if blocks is not None
+                    else None
+                ),
+            )
+            metadata["diag_builder_shadow_s"] = float(time.perf_counter() - shadow_started)
+            ok, reason = _payloads_match_diagonals(payloads, python_diagonals, slots)
+            metadata["diag_builder_shadow_ok"] = bool(ok)
+            if int(python_rotations) != int(output_rotations):
+                ok = False
+                reason = f"output rotations mismatch cpp={int(output_rotations)} python={int(python_rotations)}"
+            if not bool(ok):
+                metadata["diag_builder_fallback_reason"] = str(reason)
+                conv_layer._last_diag_builder_metadata = dict(metadata)
+                if _env_enabled("ORION_CPP_DIAG_BUILDER_STRICT"):
+                    raise RuntimeError(str(reason))
+                return None
+        return payloads, int(output_rotations), dict(metadata)
+    except Exception as exc:
+        if _env_enabled("ORION_CPP_DIAG_BUILDER_STRICT"):
+            raise
+        conv_layer._last_diag_builder_metadata = {
+            "diag_builder_kind": "cpp_dense_conv_transpose2d",
+            "diag_builder_source": "python_fallback",
+            "diag_builder_build_s": 0.0,
+            "diag_builder_payload_count": 0,
+            "diag_builder_fallback_reason": str(exc),
+        }
+        return None
+
 def construct_conv2d_toeplitz(conv_layer, weight):
     N, on_Ci, on_Hi, on_Wi = conv_layer.fhe_input_shape
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
@@ -425,7 +552,19 @@ def construct_conv2d_bias(conv_layer):
     return bias_vector
 
 
-def pack_conv_transpose2d(conv_layer: nn.Module, last: bool):
+def pack_conv_transpose2d(conv_layer: nn.Module, last: bool, *, allow_hybrid: bool = True):
+    cpp_payload = _try_build_cpp_dense_conv_transpose2d_payloads(
+        conv_layer,
+        bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        blocks=None,
+    )
+    if cpp_payload is not None:
+        payloads, output_rotations, metadata = cpp_payload
+        conv_layer._dense_prebuilt_payloads = _payloads_to_block_payloads(payloads)
+        conv_layer._last_diag_builder_metadata = dict(metadata)
+        return _payloads_to_diagonals(payloads, int(conv_layer.scheme.params.get_slots())), int(output_rotations)
+
     slots = conv_layer.scheme.params.get_slots()
     embed_method = conv_layer.scheme.params.get_embedding_method()
 
@@ -434,12 +573,25 @@ def pack_conv_transpose2d(conv_layer: nn.Module, last: bool):
         slots,
         embed_method,
         last,
+        allow_hybrid=bool(allow_hybrid),
     )
 
     return diagonals, output_rotations
 
 
-def pack_conv_transpose2d_blocks(conv_layer: nn.Module, last: bool, blocks):
+def pack_conv_transpose2d_blocks(conv_layer: nn.Module, last: bool, blocks, *, allow_hybrid: bool = True):
+    requested_blocks = tuple((int(row), int(col)) for row, col in blocks)
+    cpp_payload = _try_build_cpp_dense_conv_transpose2d_payloads(
+        conv_layer,
+        bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        blocks=requested_blocks,
+    )
+    if cpp_payload is not None:
+        payloads, _output_rotations, metadata = cpp_payload
+        conv_layer._last_diag_builder_metadata = dict(metadata)
+        return _payloads_to_diagonals(payloads, int(conv_layer.scheme.params.get_slots()))
+
     slots = conv_layer.scheme.params.get_slots()
     embed_method = conv_layer.scheme.params.get_embedding_method()
 
@@ -448,11 +600,28 @@ def pack_conv_transpose2d_blocks(conv_layer: nn.Module, last: bool, blocks):
         slots,
         embed_method,
         last,
+        allow_hybrid=bool(allow_hybrid),
         allowed_blocks={
             (int(row), int(col))
             for row, col in blocks
         },
     )[0]
+
+
+def build_conv_transpose2d_block_payloads(conv_layer: nn.Module, last: bool, blocks, *, allow_hybrid: bool = True):
+    requested_blocks = tuple((int(row), int(col)) for row, col in blocks)
+    cpp_payload = _try_build_cpp_dense_conv_transpose2d_payloads(
+        conv_layer,
+        bool(last),
+        allow_hybrid=bool(allow_hybrid),
+        blocks=requested_blocks,
+    )
+    if cpp_payload is not None:
+        payloads, _output_rotations, metadata = cpp_payload
+        conv_layer._last_diag_builder_metadata = dict(metadata)
+        return _payloads_to_block_payloads(payloads)
+    diagonals = pack_conv_transpose2d_blocks(conv_layer, bool(last), requested_blocks, allow_hybrid=bool(allow_hybrid))
+    return _diagonals_to_block_payloads(diagonals)
 
 
 def _diagonal_has_nonzero(diag) -> bool:
@@ -1722,6 +1891,12 @@ def pack_conv2d_diagonal_indices(conv_layer: nn.Module, last: bool, *, allow_hyb
 
 
 def pack_conv_transpose2d_diagonal_indices(conv_layer: nn.Module, last: bool, *, allow_hybrid: bool = True):
+    cpp_indices = _try_build_cpp_dense_conv_transpose2d_indices(conv_layer, bool(last), allow_hybrid=bool(allow_hybrid))
+    if cpp_indices is not None:
+        indices, output_rotations, metadata = cpp_indices
+        conv_layer._last_diag_builder_metadata = dict(metadata)
+        return indices, int(output_rotations)
+
     slots = int(conv_layer.scheme.params.get_slots())
     embed_method = str(conv_layer.scheme.params.get_embedding_method())
     indices = estimate_direct_conv_transpose2d_diagonal_count(
