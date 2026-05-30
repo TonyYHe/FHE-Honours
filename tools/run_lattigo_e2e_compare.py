@@ -348,11 +348,6 @@ def _executor_runtime_core_signature(
         for key in (
             "group_eval_s",
             "evaluate_unified_s",
-            "partial_wrap_s",
-            "partial_rescale_s",
-            "relayout_s",
-            "accumulate_s",
-            "partial_accumulate_s",
             "postprocess_s",
             "bias_s",
             "output_fold_s",
@@ -367,9 +362,28 @@ def _executor_runtime_core_signature(
     return (str(module_name), str(node), timing_part)
 
 
+def _merge_numeric_max(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in dict(incoming).items():
+        if value is None:
+            continue
+        try:
+            incoming_float = float(value)
+        except (TypeError, ValueError):
+            if key not in merged:
+                merged[key] = value
+            continue
+        try:
+            existing_float = float(merged.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            existing_float = 0.0
+        merged[key] = max(float(existing_float), float(incoming_float))
+    return merged
+
+
 def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> dict[str, Any]:
     timings: list[dict[str, Any]] = []
-    seen_executor_timings: set[tuple[Any, ...]] = set()
+    executor_timings_by_signature: dict[tuple[Any, ...], dict[str, Any]] = {}
     for _module_name, module in net.named_modules():
         layer_timing = getattr(module, "_last_runtime_timing", None)
         if isinstance(layer_timing, dict):
@@ -388,16 +402,20 @@ def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> 
                     node=node,
                     timing=executor_timing,
                 )
-                if signature in seen_executor_timings:
-                    continue
-                seen_executor_timings.add(signature)
                 enriched = dict(executor_timing)
                 enriched.update(_executor_runtime_overhead_components(executor_timing))
-                timings.append(enriched)
+                if signature in executor_timings_by_signature:
+                    executor_timings_by_signature[signature] = _merge_numeric_max(
+                        executor_timings_by_signature[signature],
+                        enriched,
+                    )
+                else:
+                    executor_timings_by_signature[signature] = enriched
         for group in _executor_unified_groups(executor):
             timing = getattr(group, "last_runtime_timing", None)
             if isinstance(timing, dict):
                 timings.append(dict(timing))
+    timings.extend(dict(timing) for timing in executor_timings_by_signature.values())
     evaluator_timing = getattr(getattr(scheme, "lt_evaluator", None), "last_runtime_timing", None)
     if isinstance(evaluator_timing, dict) and not timings:
         timings.append(dict(evaluator_timing))
@@ -2755,9 +2773,8 @@ def _executor_timing_signature(
 
 def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
     group_rows: list[dict[str, Any]] = []
-    executor_rows: list[dict[str, Any]] = []
+    executor_timing_rows: dict[tuple[Any, ...], dict[str, Any]] = {}
     seen_groups: set[int] = set()
-    seen_executor_timings: set[tuple[Any, ...]] = set()
     totals = {
         "group_count": 0,
         "executor_count": 0,
@@ -2939,39 +2956,50 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
                 timing=executor_timing,
                 counts=counts,
             )
-            if signature not in seen_executor_timings:
-                seen_executor_timings.add(signature)
-                executor_group_eval_wall = _executor_group_eval_wall_s(executor_timing)
-                executor_evaluate_unified = _timing_float(executor_timing, "evaluate_unified_s")
-                executor_components = _executor_runtime_overhead_components(executor_timing)
-                executor_wrap = executor_components["executor_wrap_s"]
-                executor_postprocess = executor_components["executor_postprocess_s"]
-                executor_rescale = executor_components["executor_rescale_s"]
-                executor_accumulate = executor_components["executor_accumulate_s"]
-                executor_overhead = executor_components["executor_overhead_s"]
-                executor_rows.append(
+            executor_group_eval_wall = _executor_group_eval_wall_s(executor_timing)
+            executor_evaluate_unified = _timing_float(executor_timing, "evaluate_unified_s")
+            executor_components = _executor_runtime_overhead_components(executor_timing)
+            row_update = {
+                "module_path": str(module_name),
+                "node": node,
+                "executor": type(executor).__name__,
+                "executor_group_eval_wall_s": float(executor_group_eval_wall),
+                "executor_evaluate_unified_s": float(executor_evaluate_unified),
+                "executor_wrap_s": float(executor_components["executor_wrap_s"]),
+                "executor_postprocess_s": float(executor_components["executor_postprocess_s"]),
+                "executor_rescale_s": float(executor_components["executor_rescale_s"]),
+                "executor_accumulate_s": float(executor_components["executor_accumulate_s"]),
+                "executor_overhead_s": float(executor_components["executor_overhead_s"]),
+                "timing": executor_timing,
+                "counts": counts,
+            }
+            if signature in executor_timing_rows:
+                existing = executor_timing_rows[signature]
+                merged_timing = _merge_numeric_max(dict(existing.get("timing", {}) or {}), executor_timing)
+                merged_counts = _merge_numeric_max(dict(existing.get("counts", {}) or {}), counts)
+                merged_components = _executor_runtime_overhead_components(merged_timing)
+                existing.update(
                     {
-                        "module_path": str(module_name),
-                        "node": node,
-                        "executor": type(executor).__name__,
-                        "executor_group_eval_wall_s": float(executor_group_eval_wall),
-                        "executor_evaluate_unified_s": float(executor_evaluate_unified),
-                        "executor_wrap_s": float(executor_wrap),
-                        "executor_postprocess_s": float(executor_postprocess),
-                        "executor_rescale_s": float(executor_rescale),
-                        "executor_accumulate_s": float(executor_accumulate),
-                        "executor_overhead_s": float(executor_overhead),
-                        "timing": executor_timing,
-                        "counts": counts,
+                        "executor": f"{existing.get('executor', type(executor).__name__)}+{type(executor).__name__}",
+                        "executor_group_eval_wall_s": max(
+                            float(existing.get("executor_group_eval_wall_s", 0.0) or 0.0),
+                            float(_executor_group_eval_wall_s(merged_timing)),
+                        ),
+                        "executor_evaluate_unified_s": max(
+                            float(existing.get("executor_evaluate_unified_s", 0.0) or 0.0),
+                            float(_timing_float(merged_timing, "evaluate_unified_s")),
+                        ),
+                        "executor_wrap_s": float(merged_components["executor_wrap_s"]),
+                        "executor_postprocess_s": float(merged_components["executor_postprocess_s"]),
+                        "executor_rescale_s": float(merged_components["executor_rescale_s"]),
+                        "executor_accumulate_s": float(merged_components["executor_accumulate_s"]),
+                        "executor_overhead_s": float(merged_components["executor_overhead_s"]),
+                        "timing": merged_timing,
+                        "counts": merged_counts,
                     }
                 )
-                totals["executor_count"] += 1
-                totals["executor_group_eval_wall_s"] += float(executor_group_eval_wall)
-                totals["executor_evaluate_unified_s"] += float(executor_evaluate_unified)
-                totals["executor_wrap_s"] += float(executor_wrap)
-                totals["executor_postprocess_s"] += float(executor_postprocess)
-                totals["executor_rescale_s"] += float(executor_rescale)
-                totals["executor_accumulate_s"] += float(executor_accumulate)
+            else:
+                executor_timing_rows[signature] = row_update
         for group in _iter_unified_groups(executor):
             if id(group) in seen_groups:
                 continue
@@ -2988,6 +3016,16 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
                 timing=timing,
             )
     group_rows.sort(key=lambda item: float(item.get("mvm_eval_total_s", 0.0)), reverse=True)
+    executor_rows = list(executor_timing_rows.values())
+    executor_rows.sort(key=lambda item: float(item.get("executor_overhead_s", 0.0)), reverse=True)
+    totals["executor_count"] = int(len(executor_rows))
+    for row in executor_rows:
+        totals["executor_group_eval_wall_s"] += float(row.get("executor_group_eval_wall_s", 0.0) or 0.0)
+        totals["executor_evaluate_unified_s"] += float(row.get("executor_evaluate_unified_s", 0.0) or 0.0)
+        totals["executor_wrap_s"] += float(row.get("executor_wrap_s", 0.0) or 0.0)
+        totals["executor_postprocess_s"] += float(row.get("executor_postprocess_s", 0.0) or 0.0)
+        totals["executor_rescale_s"] += float(row.get("executor_rescale_s", 0.0) or 0.0)
+        totals["executor_accumulate_s"] += float(row.get("executor_accumulate_s", 0.0) or 0.0)
     return {
         "totals": totals,
         "top_groups": group_rows[:60],
