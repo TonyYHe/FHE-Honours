@@ -360,6 +360,7 @@ def run_one(args: argparse.Namespace) -> int:
             profile_lt=bool(args.profile_lt),
             trace_forward_memory=bool(args.trace_forward_memory),
             operator_breakdown=bool(args.operator_breakdown),
+            layer_mae=bool(args.layer_mae),
             provider_mode_override=provider_mode if mode == "provider" else None,
             io_mode="none",
             io_dir=None,
@@ -1403,6 +1404,8 @@ def run_all(args: argparse.Namespace) -> int:
                     command.append("--trace-forward-memory")
                 if bool(args.operator_breakdown):
                     command.append("--operator-breakdown")
+                if bool(args.layer_mae):
+                    command.append("--layer-mae")
                 print(f"[{datetime.now().isoformat(timespec='seconds')}] start {case} {mode}", flush=True)
                 print(" ".join(shlex.quote(part) for part in command), flush=True)
                 with log_path.open("w", encoding="utf-8") as log_file:
@@ -1451,6 +1454,7 @@ def main() -> int:
     parser.add_argument("--operator-breakdown", dest="operator_breakdown", action="store_true")
     parser.add_argument("--no-operator-breakdown", dest="operator_breakdown", action="store_false")
     parser.set_defaults(operator_breakdown=True)
+    parser.add_argument("--layer-mae", action="store_true")
     parser.add_argument("--update-doc-only", action="store_true")
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--case", choices=tuple(CASES), default="192x192", help=argparse.SUPPRESS)

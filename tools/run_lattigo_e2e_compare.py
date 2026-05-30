@@ -62,6 +62,18 @@ def _layout_physical_bottom_beta(layout: dict[str, Any]) -> int:
     )
 
 
+def _explicit_layout_physical_top_beta(layout: dict[str, Any]) -> int:
+    if "physical_top_beta" not in layout:
+        return 0
+    return max(0, int(layout.get("physical_top_beta", 0) or 0))
+
+
+def _explicit_layout_physical_bottom_beta(layout: dict[str, Any]) -> int:
+    if "physical_bottom_beta" not in layout:
+        return 0
+    return max(0, int(layout.get("physical_bottom_beta", 0) or 0))
+
+
 def _layout_policy_input_layout_row() -> dict[str, Any] | None:
     audit = dict(getattr(scheme, "region_first_attach_audit", {}) or {})
     graph = dict(audit.get("graph_audit", {}) or {})
@@ -1197,13 +1209,547 @@ def _align(reference: torch.Tensor, actual: torch.Tensor) -> tuple[torch.Tensor,
     return left, right
 
 
-def _metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, float]:
-    left, right = _align(reference, actual)
-    diff = right - left
+def _metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, Any]:
+    return _layer_mae_metric(reference, actual)
+
+
+def _layer_mae_tensor(value: torch.Tensor) -> torch.Tensor:
+    result = value.detach().cpu()
+    if torch.is_complex(result):
+        result = result.real
+    return result.to(dtype=torch.float32)
+
+
+def _layer_mae_tensor_summary(value: torch.Tensor) -> dict[str, Any]:
+    result = _layer_mae_tensor(value)
+    if int(result.numel()) <= 0:
+        return {
+            "shape": [int(v) for v in tuple(result.shape)],
+            "numel": 0,
+            "checksum": 0.0,
+            "l2": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "shape": [int(v) for v in tuple(result.shape)],
+        "numel": int(result.numel()),
+        "checksum": float(result.sum().item()),
+        "l2": float(torch.linalg.vector_norm(result).item()),
+        "min": float(result.min().item()),
+        "max": float(result.max().item()),
+    }
+
+
+def _layer_mae_metric(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, Any]:
+    left = _layer_mae_tensor(reference)
+    right = _layer_mae_tensor(actual)
+    original_right_shape = tuple(right.shape)
+    shape_match = tuple(left.shape) == tuple(right.shape)
+    numel_match = int(left.numel()) == int(right.numel())
+    reshaped_for_diagnostic = False
+    if not shape_match and bool(numel_match):
+        right = right.reshape(tuple(left.shape))
+        reshaped_for_diagnostic = True
+    left_flat = left.reshape(-1)
+    right_flat = right.reshape(-1)
+    compare_count = min(int(left_flat.numel()), int(right_flat.numel()))
+    if compare_count <= 0:
+        return {
+            "mae": None,
+            "max_abs": None,
+            "rmse": None,
+            "checksum_delta": None,
+            "shape_match": bool(shape_match),
+            "numel_match": bool(numel_match),
+            "reshaped_for_diagnostic": bool(reshaped_for_diagnostic),
+            "compare_count": 0,
+            "reference_shape": [int(v) for v in tuple(left.shape)],
+            "actual_shape": [int(v) for v in tuple(original_right_shape)],
+            "compare_actual_shape": [int(v) for v in tuple(right.shape)],
+        }
+    diff = right_flat[:compare_count] - left_flat[:compare_count]
     return {
         "mae": float(diff.abs().mean().item()),
         "max_abs": float(diff.abs().max().item()),
         "rmse": float(torch.sqrt(torch.mean(diff.pow(2))).item()),
+        "checksum_delta": float(diff.sum().item()),
+        "shape_match": bool(shape_match),
+        "numel_match": bool(numel_match),
+        "reshaped_for_diagnostic": bool(reshaped_for_diagnostic),
+        "compare_count": int(compare_count),
+        "reference_shape": [int(v) for v in tuple(left.shape)],
+        "actual_shape": [int(v) for v in tuple(original_right_shape)],
+        "compare_actual_shape": [int(v) for v in tuple(right.shape)],
+    }
+
+
+def _layer_mae_infer_gap(*, logical_shape: Any, on_shape: Any) -> int:
+    logical = tuple(int(v) for v in tuple(logical_shape or ()))
+    physical = tuple(int(v) for v in tuple(on_shape or ()))
+    if len(logical) != 4 or len(physical) != 4:
+        return 1
+    channels = max(1, int(logical[1]))
+    width = max(1, int(logical[3]))
+    physical_channels = max(1, int(physical[1]))
+    physical_width = max(1, int(physical[3]))
+    candidates = []
+    for gap in (1, 2, 4, 8, 16):
+        if int(width * gap) != int(physical_width):
+            continue
+        if int(math.ceil(float(channels) / float(gap * gap))) > int(physical_channels):
+            continue
+        candidates.append(int(gap))
+    return int(max(candidates) if candidates else 1)
+
+
+def _layer_mae_demultiplex(
+    decoded: torch.Tensor,
+    *,
+    logical_shape: Any,
+    on_shape: Any,
+    gap: int | None,
+    output_layout: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    logical = tuple(int(v) for v in tuple(logical_shape or ()))
+    physical = tuple(int(v) for v in tuple(on_shape or tuple(decoded.shape)))
+    result = _layer_mae_tensor(decoded)
+    if physical and int(torch.Size(physical).numel()) == int(result.numel()):
+        result = result.reshape(physical)
+    if len(logical) == 4 and len(tuple(result.shape)) == 4:
+        actual_gap = int(gap) if gap is not None and int(gap) > 0 else _layer_mae_infer_gap(
+            logical_shape=logical,
+            on_shape=tuple(result.shape),
+        )
+        layout = dict(output_layout or {})
+        top_rows = int(_explicit_layout_physical_top_beta(layout) * int(actual_gap))
+        bottom_rows = int(_explicit_layout_physical_bottom_beta(layout) * int(actual_gap))
+        if (top_rows > 0 or bottom_rows > 0) and int(result.shape[2]) > int(top_rows + bottom_rows):
+            end = int(result.shape[2]) - int(bottom_rows) if bottom_rows > 0 else int(result.shape[2])
+            result = result[:, :, int(top_rows) : int(end), :]
+        return packing._demultiplex(
+            result,
+            int(actual_gap),
+            int(logical[1]),
+            int(logical[2]),
+            int(logical[3]),
+        )
+    if logical and int(torch.Size(logical).numel()) == int(result.numel()):
+        return result.reshape(logical)
+    return result
+
+
+def _layer_mae_native_halo_executor(module: torch.nn.Module) -> Any | None:
+    runtime = getattr(module, "region_runtime", None)
+    executor = getattr(runtime, "executor", None) if runtime is not None else None
+    if executor is None:
+        return None
+    base = getattr(executor, "base_executor", executor)
+    if not bool(getattr(base, "native_halo_output_capable", False)):
+        return None
+    if getattr(base, "native_plan", None) is None:
+        return None
+    if not callable(getattr(base, "_uses_tight_compact_output", None)):
+        return None
+    if bool(base._uses_tight_compact_output()):
+        return None
+    return base
+
+
+def _layer_mae_decode_native_halo_output(decoded: torch.Tensor, executor: Any) -> torch.Tensor:
+    plan = executor.native_plan
+    spec = plan.spec
+    values = _layer_mae_tensor(decoded).reshape(-1)
+    result = torch.zeros(
+        (1, int(spec.c_out), int(spec.h_out), int(spec.w_out)),
+        dtype=torch.float32,
+    )
+    gap = max(1, int(spec.gap_out))
+    phases = int(gap * gap)
+    for stripe in plan.stripes:
+        target_tile = int(plan.target_tile_for_stripe(stripe))
+        for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+            block_index = int(plan.target_block_index(stripe, int(target_group)))
+            block_base = int(block_index) * int(spec.slot_count)
+            channel_start = int(target_group) * int(target_tile)
+            channel_end = min(int(spec.c_out), int(channel_start) + int(target_tile))
+            packed_w = int(spec.w_out) * int(gap)
+            group_block = int(stripe.target_h) * int(gap) * int(packed_w)
+            for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
+                group = int(local_channel) // int(phases)
+                phase = int(local_channel) % int(phases)
+                phase_h = int(phase) // int(gap)
+                phase_w = int(phase) % int(gap)
+                for global_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
+                    if int(global_h) < 0 or int(global_h) >= int(spec.h_out):
+                        continue
+                    local_h = int(global_h) - int(stripe.target_h_start)
+                    for w_index in range(int(spec.w_out)):
+                        slot = (
+                            int(block_base)
+                            + int(group) * int(group_block)
+                            + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                            + int(w_index) * int(gap)
+                            + int(phase_w)
+                        )
+                        if int(slot) < int(values.numel()):
+                            result[0, int(channel), int(global_h), int(w_index)] = values[int(slot)]
+    return result
+
+
+def _layer_mae_decode_cipher_output(module: torch.nn.Module, value: CipherTensor) -> torch.Tensor:
+    plain = value.decrypt()
+    try:
+        decoded = plain.decode()
+    finally:
+        release = getattr(plain, "release", None)
+        if callable(release):
+            release()
+    logical_shape = getattr(module, "output_shape", getattr(value, "shape", tuple(decoded.shape)))
+    on_shape = getattr(module, "fhe_output_shape", getattr(value, "on_shape", tuple(decoded.shape)))
+    gap = getattr(module, "output_gap", None)
+    native_executor = _layer_mae_native_halo_executor(module)
+    if native_executor is not None:
+        return _layer_mae_decode_native_halo_output(decoded, native_executor)
+    return _layer_mae_demultiplex(
+        decoded,
+        logical_shape=logical_shape,
+        on_shape=on_shape,
+        gap=gap,
+        output_layout=dict(getattr(module, "layout_policy_output_layout", {}) or {}),
+    )
+
+
+def _layer_mae_decode_cipher_tensor(value: CipherTensor) -> torch.Tensor:
+    plain = value.decrypt()
+    try:
+        decoded = plain.decode()
+    finally:
+        release = getattr(plain, "release", None)
+        if callable(release):
+            release()
+    return _layer_mae_demultiplex(
+        decoded,
+        logical_shape=getattr(value, "shape", tuple(decoded.shape)),
+        on_shape=getattr(value, "on_shape", tuple(decoded.shape)),
+        gap=None,
+    )
+
+
+def _layer_mae_decode_concat_output(module: torch.nn.Module, value: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+    if type(value).__name__ != "ConcatCipherTensor" or not hasattr(value, "parts"):
+        raise TypeError(f"expected ConcatCipherTensor, got {type(value).__name__}")
+    parts = tuple(getattr(value, "parts", ()) or ())
+    decoded_parts = []
+    part_summaries = []
+    for index, part in enumerate(parts):
+        if not isinstance(part, CipherTensor):
+            raise TypeError(f"concat part {int(index)} is {type(part).__name__}, expected CipherTensor")
+        decoded = _layer_mae_decode_cipher_tensor(part)
+        decoded_parts.append(decoded)
+        part_summaries.append(
+            {
+                "index": int(index),
+                "shape": [int(v) for v in tuple(getattr(part, "shape", ()))],
+                "on_shape": [int(v) for v in tuple(getattr(part, "on_shape", ()))],
+                "decoded": _layer_mae_tensor_summary(decoded),
+            }
+        )
+    dim = int(getattr(module, "dim", 1))
+    result = torch.cat(tuple(decoded_parts), dim=int(dim))
+    return result, {
+        "part_count": int(len(parts)),
+        "parts": part_summaries,
+        "decode_kind": "concat_parts_no_materialize",
+    }
+
+
+def _layer_mae_final_module(net: torch.nn.Module) -> tuple[str, torch.nn.Module] | None:
+    candidates = [(name, module) for name, module in net.named_modules() if name and isinstance(module, Module)]
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
+def _layer_mae_decode_model_output(net: torch.nn.Module, output: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+    final = _layer_mae_final_module(net)
+    if isinstance(output, CipherTensor) and final is not None:
+        module_name, module = final
+        return _layer_mae_decode_cipher_output(module, output), {
+            "decode_kind": "module_aware_cipher_tensor",
+            "module_path": str(module_name),
+            "class": type(module).__name__,
+        }
+    if isinstance(output, CipherTensor):
+        plain = output.decrypt()
+        try:
+            decoded = plain.decode()
+        finally:
+            release = getattr(plain, "release", None)
+            if callable(release):
+                release()
+        return _layer_mae_tensor(decoded), {"decode_kind": "generic_cipher_tensor"}
+    if type(output).__name__ == "ConcatCipherTensor" and hasattr(output, "parts"):
+        raise RuntimeError("final model output is a lazy ConcatCipherTensor; direct final MAE is not supported")
+    if isinstance(output, torch.Tensor):
+        return _layer_mae_tensor(output), {"decode_kind": "torch_tensor"}
+    raise TypeError(f"unsupported model output type for final decode: {type(output).__name__}")
+
+
+def _layer_mae_target_names(net: torch.nn.Module) -> list[str]:
+    names: list[str] = []
+    for name, module in net.named_modules():
+        if not name or not isinstance(module, Module):
+            continue
+        if isinstance(module, Bootstrap):
+            continue
+        names.append(str(name))
+    return names
+
+
+def _install_layer_mae_clear_capture(
+    net: torch.nn.Module,
+    names: set[str],
+) -> tuple[dict[str, torch.Tensor], Callable[[], None]]:
+    outputs: dict[str, torch.Tensor] = {}
+    handles: list[Any] = []
+
+    def make_hook(module_name: str):
+        @_dynamo_disable
+        def hook(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            if isinstance(output, torch.Tensor):
+                outputs[str(module_name)] = _layer_mae_tensor(output)
+
+        return hook
+
+    for name, module in net.named_modules():
+        if str(name) not in names:
+            continue
+        handles.append(module.register_forward_hook(make_hook(str(name))))
+
+    def remove() -> None:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+
+    return outputs, remove
+
+
+def _install_layer_mae_he_capture(
+    net: torch.nn.Module,
+    *,
+    clear_outputs: dict[str, torch.Tensor],
+    names: set[str],
+    jsonl_path: Path,
+) -> tuple[list[dict[str, Any]], Callable[[], None]]:
+    rows: list[dict[str, Any]] = []
+    handles: list[Any] = []
+    if jsonl_path.exists():
+        jsonl_path.unlink()
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append_row(row: dict[str, Any]) -> None:
+        rows.append(row)
+        with jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+        metrics = row.get("metrics_vs_clear")
+        if isinstance(metrics, dict):
+            print(
+                "[layer-mae] "
+                f"node={row.get('module_path')} "
+                f"type={row.get('class')} "
+                f"status={row.get('status')} "
+                f"mae={metrics.get('mae')} "
+                f"max_abs={metrics.get('max_abs')} "
+                f"rmse={metrics.get('rmse')} "
+                f"shape_match={metrics.get('shape_match')}",
+                flush=True,
+            )
+        else:
+            print(
+                "[layer-mae] "
+                f"node={row.get('module_path')} "
+                f"type={row.get('class')} "
+                f"status={row.get('status')} "
+                f"reason={row.get('skip_reason', '')} "
+                f"error={row.get('error', '')}",
+                flush=True,
+            )
+
+    def make_hook(module_name: str):
+        @_dynamo_disable
+        def hook(module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            started = time.perf_counter()
+            runtime = getattr(module, "region_runtime", None)
+            row: dict[str, Any] = {
+                "module_path": str(module_name),
+                "class": type(module).__name__,
+                "category": _module_category(module),
+                "status": "started",
+                "level": None if getattr(module, "level", None) is None else int(getattr(module, "level")),
+                "depth": None if getattr(module, "depth", None) is None else int(getattr(module, "depth")),
+                "output_shape": _json_shape(getattr(module, "output_shape", ())),
+                "fhe_output_shape": _json_shape(getattr(module, "fhe_output_shape", ())),
+                "output_gap": None if getattr(module, "output_gap", None) is None else int(getattr(module, "output_gap")),
+                "has_bootstrapper_child": bool(isinstance(getattr(module, "bootstrapper", None), Bootstrap)),
+                "bootstrapper_path": (
+                    f"{module_name}.bootstrapper" if isinstance(getattr(module, "bootstrapper", None), Bootstrap) else ""
+                ),
+                "region_runtime": bool(runtime is not None),
+                "region_stage": str(getattr(runtime, "stage", "")) if runtime is not None else "",
+                "region_strategy": str(getattr(runtime, "strategy", "")) if runtime is not None else "",
+                "region_executable": bool(getattr(runtime, "executable", False)) if runtime is not None else False,
+            }
+            try:
+                decode_info: dict[str, Any] = {}
+                if type(output).__name__ == "ConcatCipherTensor" and hasattr(output, "parts"):
+                    row["status"] = "skipped"
+                    row["skip_reason"] = "lazy_concat_not_materialized"
+                    row["decode_kind"] = "lazy_concat_not_materialized"
+                    row["ciphertext_count"] = int(
+                        sum(len(getattr(part, "ids", ()) or ()) for part in tuple(getattr(output, "parts", ()) or ()))
+                    )
+                    row["decode_s"] = float(time.perf_counter() - started)
+                    append_row(row)
+                    return
+                elif isinstance(output, CipherTensor):
+                    native_executor = _layer_mae_native_halo_executor(module)
+                    decoded = _layer_mae_decode_cipher_output(module, output)
+                    row["ciphertext_count"] = int(len(getattr(output, "ids", ()) or ()))
+                    row["cipher_shape"] = _json_shape(getattr(output, "shape", ()))
+                    row["cipher_on_shape"] = _json_shape(getattr(output, "on_shape", ()))
+                    decode_info = {
+                        "decode_kind": "native_halo_stripe" if native_executor is not None else "cipher_tensor",
+                    }
+                elif isinstance(output, torch.Tensor):
+                    decoded = _layer_mae_tensor(output)
+                    row["ciphertext_count"] = 0
+                    decode_info = {"decode_kind": "torch_tensor"}
+                else:
+                    row["status"] = "skipped"
+                    row["skip_reason"] = f"unsupported_output_type:{type(output).__name__}"
+                    row["decode_s"] = float(time.perf_counter() - started)
+                    append_row(row)
+                    return
+                row.update(decode_info)
+                row["actual"] = _layer_mae_tensor_summary(decoded)
+                reference = clear_outputs.get(str(module_name))
+                if reference is None:
+                    row["status"] = "missing_clear_reference"
+                    row["skip_reason"] = "missing_clear_reference"
+                else:
+                    row["reference"] = _layer_mae_tensor_summary(reference)
+                    row["metrics_vs_clear"] = _layer_mae_metric(reference, decoded)
+                    metrics = dict(row["metrics_vs_clear"])
+                    if not bool(metrics.get("shape_match", False)):
+                        row["status"] = "shape_mismatch"
+                        row["skip_reason"] = "shape_mismatch"
+                    else:
+                        row["status"] = "ok"
+            except BaseException as exc:
+                row["status"] = "failed"
+                row["error_type"] = type(exc).__name__
+                row["error"] = str(exc)
+                row["traceback"] = traceback.format_exc(limit=20)
+            row["decode_s"] = float(time.perf_counter() - started)
+            append_row(row)
+
+        return hook
+
+    for name, module in net.named_modules():
+        if str(name) not in names:
+            continue
+        handles.append(module.register_forward_hook(make_hook(str(name))))
+
+    def remove() -> None:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+
+    return rows, remove
+
+
+def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] | None = None) -> dict[str, Any]:
+    ok_rows = [row for row in rows if str(row.get("status")) == "ok" and isinstance(row.get("metrics_vs_clear"), dict)]
+    skipped_rows = [row for row in rows if str(row.get("status")) != "ok"]
+    allowed_skip_reasons = {"lazy_concat_not_materialized"}
+    unexpected_rows = [
+        row
+        for row in skipped_rows
+        if str(row.get("skip_reason", "")) not in allowed_skip_reasons
+    ]
+    observed = {str(row.get("module_path", "")) for row in rows if str(row.get("module_path", ""))}
+    missing_he_modules = sorted(str(name) for name in set(expected_names or set()) - observed)
+    values = [
+        float(row["metrics_vs_clear"]["mae"])
+        for row in ok_rows
+        if row.get("metrics_vs_clear", {}).get("mae") is not None
+    ]
+    max_values = [
+        float(row["metrics_vs_clear"]["max_abs"])
+        for row in ok_rows
+        if row.get("metrics_vs_clear", {}).get("max_abs") is not None
+    ]
+    worst_by_mae = sorted(
+        ok_rows,
+        key=lambda row: float(row.get("metrics_vs_clear", {}).get("mae") or -1.0),
+        reverse=True,
+    )[:20]
+    first_nonfinite = next(
+        (
+            row
+            for row in ok_rows
+            if not math.isfinite(float(row.get("metrics_vs_clear", {}).get("mae") or 0.0))
+        ),
+        None,
+    )
+    return {
+        "row_count": int(len(rows)),
+        "ok_count": int(len(ok_rows)),
+        "skipped_count": int(len(skipped_rows)),
+        "unexpected_count": int(len(unexpected_rows)),
+        "missing_he_count": int(len(missing_he_modules)),
+        "missing_he_modules": missing_he_modules,
+        "overall_ok": bool(not unexpected_rows and not missing_he_modules and first_nonfinite is None),
+        "max_mae": max(values) if values else None,
+        "max_abs": max(max_values) if max_values else None,
+        "total_decode_s": float(sum(float(row.get("decode_s", 0.0) or 0.0) for row in rows)),
+        "first_nonfinite": None if first_nonfinite is None else str(first_nonfinite.get("module_path", "")),
+        "skipped_rows": [
+            {
+                "module_path": str(row.get("module_path", "")),
+                "class": str(row.get("class", "")),
+                "status": str(row.get("status", "")),
+                "skip_reason": str(row.get("skip_reason", "")),
+                "error": str(row.get("error", "")),
+            }
+            for row in skipped_rows
+        ],
+        "unexpected_rows": [
+            {
+                "module_path": str(row.get("module_path", "")),
+                "class": str(row.get("class", "")),
+                "status": str(row.get("status", "")),
+                "skip_reason": str(row.get("skip_reason", "")),
+                "error": str(row.get("error", "")),
+            }
+            for row in unexpected_rows
+        ],
+        "worst_by_mae": [
+            {
+                "module_path": str(row.get("module_path", "")),
+                "class": str(row.get("class", "")),
+                "mae": row.get("metrics_vs_clear", {}).get("mae"),
+                "max_abs": row.get("metrics_vs_clear", {}).get("max_abs"),
+                "rmse": row.get("metrics_vs_clear", {}).get("rmse"),
+                "shape_match": row.get("metrics_vs_clear", {}).get("shape_match"),
+            }
+            for row in worst_by_mae
+        ],
     }
 
 
@@ -2616,6 +3162,8 @@ def _run_forward_attempt(
     profile_lt: bool,
     trace_forward_memory: bool,
     operator_breakdown: bool,
+    layer_mae: bool,
+    layer_mae_clear_outputs: dict[str, torch.Tensor] | None,
     record_primary: bool,
 ) -> dict[str, Any]:
     memory_trace_path = (
@@ -2644,6 +3192,9 @@ def _run_forward_attempt(
     remove_profile = None
     activation_breakdown_snapshot = None
     remove_activation_breakdown = None
+    layer_mae_rows: list[dict[str, Any]] | None = None
+    remove_layer_mae = None
+    layer_mae_overall_ok: bool | None = None
     if bool(profile_modules) or memory_trace_path is not None:
         profile_snapshot, remove_profile = _install_he_module_profiler(
             net,
@@ -2652,6 +3203,20 @@ def _run_forward_attempt(
     if bool(operator_breakdown):
         activation_breakdown_snapshot, remove_activation_breakdown = (
             _install_activation_breakdown_profiler(net)
+        )
+    if bool(layer_mae):
+        layer_mae_path = out_path.with_name(f"{out_path.stem}.forward{int(attempt_index)}.layer_mae.jsonl")
+        attempt["layer_mae_path"] = str(layer_mae_path)
+        expected_layer_mae_names = set((layer_mae_clear_outputs or {}).keys())
+        layer_mae_rows, remove_layer_mae = _install_layer_mae_he_capture(
+            net,
+            clear_outputs=dict(layer_mae_clear_outputs or {}),
+            names=expected_layer_mae_names,
+            jsonl_path=layer_mae_path,
+        )
+        attempt["layer_mae_timing_note"] = (
+            "layer MAE decodes module outputs inside the timed HE forward; use this run for correctness, "
+            "not speed comparisons"
         )
     x0_ct = None
     out_ct = None
@@ -2749,6 +3314,25 @@ def _run_forward_attempt(
                 _write(payload, out_path)
             if remove_activation_breakdown is not None:
                 remove_activation_breakdown()
+            if remove_layer_mae is not None:
+                remove_layer_mae()
+                remove_layer_mae = None
+            if layer_mae_rows is not None:
+                layer_mae_summary = _layer_mae_summary(layer_mae_rows, expected_names=expected_layer_mae_names)
+                layer_mae_overall_ok = bool(layer_mae_summary.get("overall_ok", False))
+                attempt["layer_mae_after_forward"] = {
+                    "enabled": True,
+                    "jsonl_path": str(attempt.get("layer_mae_path", "")),
+                    "timing_note": str(attempt.get("layer_mae_timing_note", "")),
+                    "summary": layer_mae_summary,
+                    "rows": list(layer_mae_rows),
+                }
+                attempt["layer_mae_overall_ok"] = bool(layer_mae_overall_ok)
+                if bool(record_primary):
+                    payload["layer_mae_after_forward"] = attempt["layer_mae_after_forward"]
+                    payload["layer_mae_overall_ok"] = bool(layer_mae_overall_ok)
+                    payload["layer_mae_timing_note"] = str(attempt.get("layer_mae_timing_note", ""))
+                _write(payload, out_path)
         attempt["device_memory_after_he_forward"] = _device_memory_snapshot()
         attempt["live_ciphertexts_after_he_forward"] = _live_ciphertext_snapshot()
         runtime_fairness = _collect_runtime_fairness(
@@ -2784,33 +3368,42 @@ def _run_forward_attempt(
             payload["trim_s"] = runtime_fairness.get("trim_s")
             payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
         _write(payload, out_path)
-        decoded = _attempt_timed(
+        decoded, decode_info = _attempt_timed(
             payload,
             out_path,
             attempt,
             int(attempt_index),
             "decrypt_decode",
-            lambda: out_ct.decrypt().decode(),
+            lambda: _layer_mae_decode_model_output(net, out_ct),
             record_primary_timing=bool(record_primary),
         )
-        decoded = decoded.detach().cpu()
-        if torch.is_complex(decoded):
-            decoded = decoded.real
-        decoded = decoded.to(dtype=torch.float32)
+        decoded = _layer_mae_tensor(decoded)
         attempt["input_ciphertext_count"] = int(len(x0_ct.ids))
         attempt["output_ciphertext_count"] = int(len(out_ct.ids))
+        attempt["final_decode_info"] = dict(decode_info)
         attempt["decoded"] = _tensor_payload(decoded)
         attempt["mae_vs_clear"] = _metrics(clear, decoded)
+        if not bool(attempt["mae_vs_clear"].get("shape_match", False)):
+            attempt["final_decode_info"]["status"] = "shape_mismatch"
+            attempt["final_decode_info"]["skip_reason"] = "shape_mismatch"
         attempt["region_audit_after_forward"] = _collect_region_audit(net)
         attempt["bootstrap_report_after_forward"] = _collect_bootstrap_report(net)
         attempt["rotation_report_after_forward"] = _collect_rotation_report(net, mode=mode)
         attempt["device_memory_after_decrypt_decode"] = _device_memory_snapshot()
         attempt["live_ciphertexts_after_decrypt_decode"] = _live_ciphertext_snapshot()
-        attempt["status"] = "ok"
+        final_shape_ok = bool(attempt["mae_vs_clear"].get("shape_match", False))
+        layer_mae_ok = True if layer_mae_overall_ok is None else bool(layer_mae_overall_ok)
+        if not bool(final_shape_ok):
+            attempt["status"] = "final_shape_mismatch"
+        elif not bool(layer_mae_ok):
+            attempt["status"] = "layer_mae_failed"
+        else:
+            attempt["status"] = "ok"
         attempt["step"] = "done"
         if bool(record_primary):
             payload["input_ciphertext_count"] = int(attempt["input_ciphertext_count"])
             payload["output_ciphertext_count"] = int(attempt["output_ciphertext_count"])
+            payload["final_decode_info"] = dict(attempt["final_decode_info"])
             payload["decoded"] = attempt["decoded"]
             payload["mae_vs_clear"] = attempt["mae_vs_clear"]
             payload["region_audit_after_forward"] = attempt["region_audit_after_forward"]
@@ -2838,6 +3431,11 @@ def _run_forward_attempt(
         if remove_activation_breakdown is not None:
             try:
                 remove_activation_breakdown()
+            except Exception:
+                pass
+        if remove_layer_mae is not None:
+            try:
+                remove_layer_mae()
             except Exception:
                 pass
         for tensor in (out_ct, x0_ct):
@@ -2869,6 +3467,7 @@ def _run_one(
     profile_lt: bool = False,
     trace_forward_memory: bool = False,
     operator_breakdown: bool = False,
+    layer_mae: bool = False,
     provider_mode_override: str | None = None,
     io_mode: str = "none",
     io_dir: Path | None = None,
@@ -2933,6 +3532,7 @@ def _run_one(
         "profile_lt": bool(profile_lt),
         "trace_forward_memory": bool(trace_forward_memory),
         "operator_breakdown": bool(operator_breakdown),
+        "layer_mae": bool(layer_mae),
         "bootstrap_many_enabled": os.environ.get("ORION_LATTIGO_BOOTSTRAP_MANY", "0") != "0",
         "saved_io_prewarm_mode": _saved_io_prewarm_mode(),
         "saved_io_prewarm_max_units": _saved_io_prewarm_max_units(),
@@ -2952,9 +3552,24 @@ def _run_one(
         net = spec["builder"](activation=activation, silu_degree=int(silu_degree))
         net.eval()
         x0 = torch.randn(tuple(int(v) for v in spec["input_shape"]), dtype=torch.float32)
+        layer_mae_clear_outputs: dict[str, torch.Tensor] | None = None
+        remove_layer_mae_clear = None
+        if bool(layer_mae):
+            layer_mae_names = set(_layer_mae_target_names(net))
+            layer_mae_clear_outputs, remove_layer_mae_clear = _install_layer_mae_clear_capture(
+                net,
+                layer_mae_names,
+            )
+            payload["layer_mae_target_modules"] = sorted(layer_mae_names)
         with torch.no_grad():
-            clear = _timed(payload, out_path, "clear_forward", lambda: net(x0))
+            try:
+                clear = _timed(payload, out_path, "clear_forward", lambda: net(x0))
+            finally:
+                if remove_layer_mae_clear is not None:
+                    remove_layer_mae_clear()
         payload["clear"] = _tensor_payload(clear)
+        if bool(layer_mae):
+            payload["layer_mae_clear_output_count"] = int(len(layer_mae_clear_outputs or {}))
         _write(payload, out_path)
 
         _timed(payload, out_path, "init_scheme", lambda: scheme.init_scheme(config))
@@ -3025,6 +3640,8 @@ def _run_one(
                 profile_lt=bool(profile_lt),
                 trace_forward_memory=bool(trace_forward_memory),
                 operator_breakdown=bool(operator_breakdown),
+                layer_mae=bool(layer_mae),
+                layer_mae_clear_outputs=layer_mae_clear_outputs,
                 record_primary=bool(int(attempt_index) == int(first_measured_index)),
             )
         ok_attempts = [
@@ -3041,6 +3658,24 @@ def _run_one(
         ]
         payload["warmup_ok_count"] = int(len(warmup_attempts))
         payload["measured_forward_ok_count"] = int(len(measured_attempts))
+        failed_attempts = [
+            attempt
+            for attempt in payload.get("forward_attempts", [])
+            if str(attempt.get("status")) != "ok"
+        ]
+        payload["forward_failed_count"] = int(len(failed_attempts))
+        if failed_attempts:
+            payload["forward_failed_attempts"] = [
+                {
+                    "attempt_index": int(attempt.get("attempt_index", -1)),
+                    "kind": str(attempt.get("kind", "")),
+                    "status": str(attempt.get("status", "")),
+                    "error": str(attempt.get("error", "")),
+                    "mae_vs_clear": attempt.get("mae_vs_clear"),
+                    "final_decode_info": attempt.get("final_decode_info"),
+                }
+                for attempt in failed_attempts
+            ]
         if measured_attempts:
             payload["forward_mean_timing_s"] = {
                 key: float(
@@ -3063,7 +3698,7 @@ def _run_one(
             payload["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
             payload["trim_s"] = runtime_fairness.get("trim_s")
             payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
-        payload["status"] = "ok"
+        payload["status"] = "ok" if payload.get("measured_forward_ok_count", 0) > 0 else "failed_forward"
         payload["step"] = "done"
         payload["phase"] = "done"
         _write(payload, out_path)
@@ -3351,6 +3986,11 @@ def main() -> int:
         action="store_true",
         help="Collect streaming-safe MVM/activation/bootstrap/load breakdowns.",
     )
+    parser.add_argument(
+        "--layer-mae",
+        action="store_true",
+        help="Decode each instrumented module output during HE forward and compare MAE to clear reference.",
+    )
     parser.add_argument("--provider-mode", type=str, default=None)
     parser.add_argument("--io-mode", choices=("none", "save", "load"), default="none")
     parser.add_argument("--io-dir", type=Path, default=None)
@@ -3386,6 +4026,7 @@ def main() -> int:
         profile_lt=bool(args.profile_lt),
         trace_forward_memory=bool(args.trace_forward_memory),
         operator_breakdown=bool(args.operator_breakdown),
+        layer_mae=bool(args.layer_mae),
         provider_mode_override=args.provider_mode,
         io_mode=str(args.io_mode),
         io_dir=args.io_dir,
