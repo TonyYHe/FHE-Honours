@@ -155,6 +155,69 @@ int64_t PackedFlatIndex(
   return (static_cast<int64_t>(packed_channel) * height + packed_row) * width + packed_col;
 }
 
+int64_t FloorDiv(int64_t value, int64_t divisor) {
+  if (divisor <= 0) {
+    throw std::invalid_argument("invalid divisor");
+  }
+  int64_t quotient = value / divisor;
+  const int64_t remainder = value % divisor;
+  if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
+    --quotient;
+  }
+  return quotient;
+}
+
+int64_t PositiveMod(int64_t value, int64_t divisor) {
+  if (divisor <= 0) {
+    throw std::invalid_argument("invalid divisor");
+  }
+  int64_t result = value % divisor;
+  if (result < 0) {
+    result += divisor;
+  }
+  return result;
+}
+
+struct PackedCoords {
+  int channel = 0;
+  int64_t row = 0;
+  int64_t col = 0;
+};
+
+bool UnpackPackedFlatIndex(
+    int64_t index,
+    int gap,
+    int height,
+    int width,
+    int row_offset,
+    int channel_limit,
+    int64_t row_min,
+    int64_t row_max,
+    int64_t col_min,
+    int64_t col_max,
+    PackedCoords &coords) {
+  if (index < 0 || gap <= 0 || height <= 0 || width <= 0 || channel_limit <= 0) {
+    return false;
+  }
+  const int64_t packed_col = index % width;
+  const int64_t packed_hw = index / width;
+  const int64_t packed_row = packed_hw % height;
+  const int64_t packed_channel = packed_hw / height;
+  const int64_t row_phase = packed_row - row_offset;
+  const int64_t phase_h = PositiveMod(row_phase, gap);
+  const int64_t phase_w = packed_col % gap;
+  const int64_t channel = packed_channel * static_cast<int64_t>(gap) * gap + phase_h * gap + phase_w;
+  const int64_t row = FloorDiv(row_phase, gap);
+  const int64_t col = packed_col / gap;
+  if (channel < 0 || channel >= channel_limit || row < row_min || row >= row_max || col < col_min || col >= col_max) {
+    return false;
+  }
+  coords.channel = static_cast<int>(channel);
+  coords.row = row;
+  coords.col = col;
+  return true;
+}
+
 int64_t GapChannelPosition(
     int channel,
     int64_t h,
@@ -239,7 +302,7 @@ struct Accumulator {
     if (!restrict_blocks) {
       return true;
     }
-    return std::find(requested_blocks.begin(), requested_blocks.end(), std::make_pair(row, col)) != requested_blocks.end();
+    return std::binary_search(requested_blocks.begin(), requested_blocks.end(), std::make_pair(row, col));
   }
 
   void AddEntry(int64_t row, int64_t col, float value) {
@@ -287,6 +350,14 @@ struct Accumulator {
       it = block.emplace(diag_idx, std::vector<float>(static_cast<std::size_t>(slots), 0.0f)).first;
     }
     it->second[static_cast<std::size_t>(position)] += value;
+  }
+};
+
+struct RequestedBlockFilter {
+  std::map<int, std::vector<int>> cols_by_row;
+
+  static bool ContainsCol(const std::vector<int> &cols, int col) {
+    return std::binary_search(cols.begin(), cols.end(), col);
   }
 };
 
@@ -393,6 +464,74 @@ std::vector<std::pair<int, int>> RequestedBlocks(const int *block_rows, const in
   std::sort(blocks.begin(), blocks.end());
   blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
   return blocks;
+}
+
+std::vector<std::pair<int, int>> ValidBlockKeys(
+    int num_block_rows,
+    int num_block_cols,
+    const std::vector<std::pair<int, int>> &blocks) {
+  std::vector<std::pair<int, int>> block_keys;
+  if (blocks.empty()) {
+    for (int row = 0; row < num_block_rows; ++row) {
+      for (int col = 0; col < num_block_cols; ++col) {
+        block_keys.emplace_back(row, col);
+      }
+    }
+  } else {
+    for (const auto &block : blocks) {
+      if (block.first >= 0 && block.first < num_block_rows && block.second >= 0 && block.second < num_block_cols) {
+        block_keys.push_back(block);
+      }
+    }
+  }
+  std::sort(block_keys.begin(), block_keys.end());
+  block_keys.erase(std::unique(block_keys.begin(), block_keys.end()), block_keys.end());
+  return block_keys;
+}
+
+RequestedBlockFilter MakeRequestedBlockFilter(
+    int num_block_rows,
+    int num_block_cols,
+    const std::vector<std::pair<int, int>> &blocks) {
+  RequestedBlockFilter filter;
+  for (const auto &block : ValidBlockKeys(num_block_rows, num_block_cols, blocks)) {
+    filter.cols_by_row[block.first].push_back(block.second);
+  }
+  for (auto &entry : filter.cols_by_row) {
+    std::sort(entry.second.begin(), entry.second.end());
+    entry.second.erase(std::unique(entry.second.begin(), entry.second.end()), entry.second.end());
+  }
+  return filter;
+}
+
+int InputBlockColFor(const Accumulator &acc, int64_t col) {
+  if (col < 0 || col >= acc.matrix_width) {
+    return -1;
+  }
+  return static_cast<int>(col / acc.slots);
+}
+
+std::pair<int64_t, int64_t> OutputBlockRowRange(const Accumulator &acc, int block_row) {
+  if (block_row < 0 || block_row >= acc.num_block_rows) {
+    return std::make_pair<int64_t, int64_t>(0, 0);
+  }
+  if (acc.block_height == acc.slots) {
+    const int64_t start = static_cast<int64_t>(block_row) * acc.slots;
+    const int64_t end = std::min(acc.matrix_height, start + acc.slots);
+    return std::make_pair(start, end);
+  }
+  if (block_row != 0) {
+    return std::make_pair<int64_t, int64_t>(0, 0);
+  }
+  return std::make_pair(static_cast<int64_t>(0), acc.matrix_height);
+}
+
+bool RequestedColsContainEntry(
+    const Accumulator &acc,
+    const std::vector<int> &requested_cols,
+    int64_t col) {
+  const int block_col = InputBlockColFor(acc, col);
+  return block_col >= 0 && RequestedBlockFilter::ContainsCol(requested_cols, block_col);
 }
 
 void ValidateDenseConv2DSpec(const DenseSpec &spec, int weight_len) {
@@ -508,6 +647,101 @@ void FillDenseConv2D(const DenseSpec &spec, const float *weight, TAccumulator &a
   }
 }
 
+void FillDenseConv2DRequestedBlocks(
+    const DenseSpec &spec,
+    const float *weight,
+    Accumulator &acc,
+    const RequestedBlockFilter &filter) {
+  const int n_batch = spec.input_shape[0];
+  const int ci = spec.input_shape[1];
+  const int hi = spec.input_shape[2];
+  const int wi = spec.input_shape[3];
+  const int co = spec.output_shape[1];
+  const int ho = spec.output_shape[2];
+  const int wo = spec.output_shape[3];
+  const int on_ci = spec.fhe_input_shape[1];
+  const int on_hi = spec.fhe_input_shape[2];
+  const int on_wi = spec.fhe_input_shape[3];
+  const int on_co = spec.fhe_output_shape[1];
+  const int on_ho = spec.fhe_output_shape[2];
+  const int on_wo = spec.fhe_output_shape[3];
+  const int64_t input_block_size = static_cast<int64_t>(on_ci) * on_hi * on_wi;
+  const int64_t output_block_size = static_cast<int64_t>(on_co) * on_ho * on_wo;
+
+  for (const auto &row_entry : filter.cols_by_row) {
+    const int block_row = row_entry.first;
+    const std::vector<int> &requested_cols = row_entry.second;
+    const auto row_range = OutputBlockRowRange(acc, block_row);
+    if (row_range.first >= row_range.second || requested_cols.empty()) {
+      continue;
+    }
+    for (int64_t row = row_range.first; row < row_range.second; ++row) {
+      const int batch = static_cast<int>(row / output_block_size);
+      if (batch < 0 || batch >= n_batch) {
+        continue;
+      }
+      const int64_t local_row = row - static_cast<int64_t>(batch) * output_block_size;
+      PackedCoords output{};
+      if (!UnpackPackedFlatIndex(
+              local_row,
+              spec.output_gap,
+              on_ho,
+              on_wo,
+              spec.output_row_offset,
+              co,
+              -spec.output_top_beta,
+              static_cast<int64_t>(ho) + spec.output_bottom_beta,
+              0,
+              wo,
+              output)) {
+        continue;
+      }
+      int64_t op_oh = output.row;
+      if (spec.fuse_output_relayout) {
+        if (op_oh < 0) {
+          op_oh += spec.output_top_beta;
+        } else if (op_oh >= ho) {
+          op_oh -= spec.output_bottom_beta;
+        }
+        op_oh = std::min<int64_t>(std::max<int64_t>(op_oh, 0), std::max(0, ho - 1));
+      }
+      for (int ic = 0; ic < ci; ++ic) {
+        for (int kh = 0; kh < spec.kernel_h; ++kh) {
+          const int64_t ih = op_oh * spec.stride_h - spec.pad_h + static_cast<int64_t>(kh) * spec.dilation_h;
+          if (ih < 0 || ih >= hi) {
+            continue;
+          }
+          for (int kw = 0; kw < spec.kernel_w; ++kw) {
+            const int64_t iw_value = output.col * spec.stride_w - spec.pad_w + static_cast<int64_t>(kw) * spec.dilation_w;
+            if (iw_value < 0 || iw_value >= wi) {
+              continue;
+            }
+            const int64_t weight_index =
+                (((static_cast<int64_t>(output.channel) * ci + ic) * spec.kernel_h + kh) * spec.kernel_w + kw);
+            const float coeff = weight[weight_index];
+            if (coeff == 0.0f) {
+              continue;
+            }
+            const int64_t local_col = PackedFlatIndex(
+                ic,
+                ih,
+                iw_value,
+                spec.input_gap,
+                on_hi,
+                on_wi,
+                spec.input_row_offset);
+            const int64_t col = local_col + static_cast<int64_t>(batch) * input_block_size;
+            if (!RequestedColsContainEntry(acc, requested_cols, col)) {
+              continue;
+            }
+            acc.AddEntry(row, col, coeff);
+          }
+        }
+      }
+    }
+  }
+}
+
 template <typename TAccumulator>
 void FillDenseConvTranspose2D(const DenseSpec &spec, const float *weight, TAccumulator &acc) {
   const int n_batch = spec.input_shape[0];
@@ -576,26 +810,109 @@ void FillDenseConvTranspose2D(const DenseSpec &spec, const float *weight, TAccum
   }
 }
 
-OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float *weight, int weight_len, const std::vector<std::pair<int, int>> &blocks) {
-  ValidateDenseConv2DSpec(spec, weight_len);
-  Accumulator acc = MakeAccumulator(spec, blocks);
-  FillDenseConv2D(spec, weight, acc);
+void FillDenseConvTranspose2DRequestedBlocks(
+    const DenseSpec &spec,
+    const float *weight,
+    Accumulator &acc,
+    const RequestedBlockFilter &filter) {
+  const int n_batch = spec.input_shape[0];
+  const int ci = spec.input_shape[1];
+  const int hi = spec.input_shape[2];
+  const int wi = spec.input_shape[3];
+  const int co = spec.output_shape[1];
+  const int ho = spec.output_shape[2];
+  const int wo = spec.output_shape[3];
+  const int on_ci = spec.fhe_input_shape[1];
+  const int on_hi = spec.fhe_input_shape[2];
+  const int on_wi = spec.fhe_input_shape[3];
+  const int on_co = spec.fhe_output_shape[1];
+  const int on_ho = spec.fhe_output_shape[2];
+  const int on_wo = spec.fhe_output_shape[3];
+  const int64_t input_block_size = static_cast<int64_t>(on_ci) * on_hi * on_wi;
+  const int64_t output_block_size = static_cast<int64_t>(on_co) * on_ho * on_wo;
 
-  std::vector<std::pair<int, int>> block_keys;
-  if (blocks.empty()) {
-    for (int row = 0; row < acc.num_block_rows; ++row) {
-      for (int col = 0; col < acc.num_block_cols; ++col) {
-        block_keys.emplace_back(row, col);
-      }
+  for (const auto &row_entry : filter.cols_by_row) {
+    const int block_row = row_entry.first;
+    const std::vector<int> &requested_cols = row_entry.second;
+    const auto row_range = OutputBlockRowRange(acc, block_row);
+    if (row_range.first >= row_range.second || requested_cols.empty()) {
+      continue;
     }
-  } else {
-    for (const auto &block : blocks) {
-      if (block.first >= 0 && block.first < acc.num_block_rows && block.second >= 0 && block.second < acc.num_block_cols) {
-        block_keys.push_back(block);
+    for (int64_t row = row_range.first; row < row_range.second; ++row) {
+      const int batch = static_cast<int>(row / output_block_size);
+      if (batch < 0 || batch >= n_batch) {
+        continue;
+      }
+      const int64_t local_row = row - static_cast<int64_t>(batch) * output_block_size;
+      PackedCoords output{};
+      if (!UnpackPackedFlatIndex(
+              local_row,
+              spec.output_gap,
+              on_ho,
+              on_wo,
+              spec.output_row_offset,
+              co,
+              0,
+              ho,
+              0,
+              wo,
+              output)) {
+        continue;
+      }
+      for (int ic = 0; ic < ci; ++ic) {
+        for (int kh = 0; kh < spec.kernel_h; ++kh) {
+          const int64_t numer_h = output.row + spec.pad_h - static_cast<int64_t>(kh) * spec.dilation_h;
+          if (numer_h % spec.stride_h != 0) {
+            continue;
+          }
+          const int64_t ih = numer_h / spec.stride_h;
+          if (ih < 0 || ih >= hi) {
+            continue;
+          }
+          for (int kw = 0; kw < spec.kernel_w; ++kw) {
+            const int64_t numer_w = output.col + spec.pad_w - static_cast<int64_t>(kw) * spec.dilation_w;
+            if (numer_w % spec.stride_w != 0) {
+              continue;
+            }
+            const int64_t iw_value = numer_w / spec.stride_w;
+            if (iw_value < 0 || iw_value >= wi) {
+              continue;
+            }
+            const int64_t weight_index =
+                (((static_cast<int64_t>(ic) * co + output.channel) * spec.kernel_h + kh) * spec.kernel_w + kw);
+            const float coeff = weight[weight_index];
+            if (coeff == 0.0f) {
+              continue;
+            }
+            const int64_t local_col = PackedFlatIndex(
+                ic,
+                ih,
+                iw_value,
+                spec.input_gap,
+                on_hi,
+                on_wi,
+                spec.input_row_offset);
+            const int64_t col = local_col + static_cast<int64_t>(batch) * input_block_size;
+            if (!RequestedColsContainEntry(acc, requested_cols, col)) {
+              continue;
+            }
+            acc.AddEntry(row, col, coeff);
+          }
+        }
       }
     }
   }
-  std::sort(block_keys.begin(), block_keys.end());
+}
+
+OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float *weight, int weight_len, const std::vector<std::pair<int, int>> &blocks) {
+  ValidateDenseConv2DSpec(spec, weight_len);
+  Accumulator acc = MakeAccumulator(spec, blocks);
+  if (blocks.empty()) {
+    FillDenseConv2D(spec, weight, acc);
+  } else {
+    FillDenseConv2DRequestedBlocks(spec, weight, acc, MakeRequestedBlockFilter(acc.num_block_rows, acc.num_block_cols, blocks));
+  }
+  std::vector<std::pair<int, int>> block_keys = ValidBlockKeys(acc.num_block_rows, acc.num_block_cols, blocks);
 
   OrionDiagPayloadBatch out{nullptr, 0, acc.output_rotations, kDenseConv2DBuilderKind, nullptr};
   if (block_keys.empty()) {
@@ -690,23 +1007,12 @@ OrionDiagPayloadBatch BuildDenseIndexBatch(const DenseSpec &spec, const float *w
 OrionDiagPayloadBatch BuildDenseConvTransposePayloadBatch(const DenseSpec &spec, const float *weight, int weight_len, const std::vector<std::pair<int, int>> &blocks) {
   ValidateDenseConvTranspose2DSpec(spec, weight_len);
   Accumulator acc = MakeAccumulator(spec, blocks);
-  FillDenseConvTranspose2D(spec, weight, acc);
-
-  std::vector<std::pair<int, int>> block_keys;
   if (blocks.empty()) {
-    for (int row = 0; row < acc.num_block_rows; ++row) {
-      for (int col = 0; col < acc.num_block_cols; ++col) {
-        block_keys.emplace_back(row, col);
-      }
-    }
+    FillDenseConvTranspose2D(spec, weight, acc);
   } else {
-    for (const auto &block : blocks) {
-      if (block.first >= 0 && block.first < acc.num_block_rows && block.second >= 0 && block.second < acc.num_block_cols) {
-        block_keys.push_back(block);
-      }
-    }
+    FillDenseConvTranspose2DRequestedBlocks(spec, weight, acc, MakeRequestedBlockFilter(acc.num_block_rows, acc.num_block_cols, blocks));
   }
-  std::sort(block_keys.begin(), block_keys.end());
+  std::vector<std::pair<int, int>> block_keys = ValidBlockKeys(acc.num_block_rows, acc.num_block_cols, blocks);
 
   OrionDiagPayloadBatch out{nullptr, 0, acc.output_rotations, kDenseConvTranspose2DBuilderKind, nullptr};
   if (block_keys.empty()) {
