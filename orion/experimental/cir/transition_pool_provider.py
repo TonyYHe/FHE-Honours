@@ -384,7 +384,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         if scheme is None:
             return False
         backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-        return backend in {"python", "lattigo", "cheddar"}
+        return backend in {"python", "lattigo", "clear_lattigo", "cheddar"}
 
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
@@ -885,7 +885,7 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
         if scheme is None:
             return False
         backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-        return backend in {"python", "lattigo", "cheddar"}
+        return backend in {"python", "lattigo", "clear_lattigo", "cheddar"}
 
     def _level(self, scheme: Any) -> int:
         return int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1

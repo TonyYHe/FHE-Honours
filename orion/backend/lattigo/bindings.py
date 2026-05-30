@@ -120,7 +120,8 @@ class LattigoFunction:
 
 class LattigoLibrary:
     """A class to manage loading and interfacing with Lattigo."""
-    def __init__(self):
+    def __init__(self, *, force_clear_backend: bool = False):
+        self.force_clear_backend = bool(force_clear_backend)
         self.lib = self._load_library()
         self.load_plaintext_diagonals_requires_payload = True
         self.saved_io_prefetch_requires_device_memory = False
@@ -154,6 +155,33 @@ class LattigoLibrary:
     def _load_library(self):
         try:
             # Determine library name based on platform
+            use_clear = self.force_clear_backend or _read_env_bool(
+                ("ORION_LATTIGO_CLEAR_BACKEND", "ORION_CLEAR_LATTIGO_BACKEND"),
+                False,
+            )
+            if use_clear:
+                override = os.environ.get("ORION_CLEAR_LATTIGO_LIBRARY_PATH", "").strip()
+                if override:
+                    return ctypes.CDLL(override)
+                if platform.system() == "Linux":
+                    lib_name = "clear_lattigo-linux.so"
+                elif platform.system() == "Darwin":
+                    if platform.machine().lower() in ("arm64", "aarch64"):
+                        lib_name = "clear_lattigo-mac-arm64.dylib"
+                    else:
+                        lib_name = "clear_lattigo-mac.dylib"
+                elif platform.system() == "Windows":
+                    lib_name = "clear_lattigo-windows.dll"
+                else:
+                    raise RuntimeError("Unsupported platform")
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                clear_dir = os.path.join(os.path.dirname(current_dir), "clear_lattigo")
+                lib_path = os.path.join(clear_dir, lib_name)
+                return ctypes.CDLL(lib_path)
+
+            override = os.environ.get("ORION_LATTIGO_LIBRARY_PATH", "").strip()
+            if override:
+                return ctypes.CDLL(override)
             if platform.system() == "Linux":
                 lib_name = "lattigo-linux.so"
             elif platform.system() == "Darwin":  # macOS
@@ -1170,6 +1198,13 @@ class LattigoLibrary:
             argtypes=None,
             restype=None
         )
+
+
+class ClearLattigoLibrary(LattigoLibrary):
+    """Lattigo ABI loader for the non-CKKS cleartext shared library."""
+
+    def __init__(self):
+        super().__init__(force_clear_backend=True)
 
 
 class ArrayResultInt(ctypes.Structure):

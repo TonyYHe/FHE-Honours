@@ -551,6 +551,10 @@ class Scheme:
             py_lattigo = lgo.LattigoLibrary()
             py_lattigo.setup_bindings(params)
             return py_lattigo
+        elif backend == "clear_lattigo":
+            py_clear_lattigo = lgo.ClearLattigoLibrary()
+            py_clear_lattigo.setup_bindings(params)
+            return py_clear_lattigo
         elif backend == "cheddar":
             from orion.backend.cheddar import bindings as cgo
 
@@ -563,7 +567,7 @@ class Scheme:
             raise ValueError(f"Backend {backend} not yet supported.")
         else:
             raise ValueError(
-                f"Invalid {backend}. Supported backends are: lattigo, cheddar, python."
+                f"Invalid {backend}. Supported backends are: lattigo, clear_lattigo, cheddar, python."
             )
 
     def encode(self, tensor, level=None, scale=None):

@@ -1269,7 +1269,7 @@ class LayoutPolicyEncryptedModuleRuntimeExecutor:
         if scheme is None:
             return False
         backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-        return bool(backend in {"python", "lattigo"})
+        return bool(backend in {"python", "lattigo", "clear_lattigo"})
 
     def _backend_name(self, scheme: Any | None) -> str:
         return str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
@@ -1522,9 +1522,9 @@ class LayoutPolicyProviderRuntimeExecutor:
             return True
         if bool(self.native_halo_input):
             backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-            return bool(backend in {"python", "lattigo"})
+            return bool(backend in {"python", "lattigo", "clear_lattigo"})
         backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-        return bool(backend in {"python", "lattigo"})
+        return bool(backend in {"python", "lattigo", "clear_lattigo"})
 
     def _backend_name(self, scheme: Any | None) -> str:
         return str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
@@ -1989,7 +1989,7 @@ class LayoutPolicyAddRuntimeExecutor:
         if scheme is None:
             return False
         backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-        return bool(backend in {"python", "lattigo"})
+        return bool(backend in {"python", "lattigo", "clear_lattigo"})
 
     def _backend_name(self, scheme: Any | None) -> str:
         return str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
@@ -3102,7 +3102,7 @@ class TconvK2S2PythonRuntimeExecutor:
         if scheme is None:
             return False
         backend = str(getattr(getattr(scheme, "params", None), "get_backend", lambda: "")())
-        if backend not in {"python", "lattigo", "cheddar"}:
+        if backend not in {"python", "lattigo", "clear_lattigo", "cheddar"}:
             return False
         slots = int(scheme.params.get_slots())
         return int(slots) > 0
