@@ -134,7 +134,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "0",
     "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "0",
     "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
-    "ORION_LATTIGO_CLEAR_BACKEND": "1",
+    "ORION_LATTIGO_CLEAR_BACKEND": "0",
     "ORION_CPP_DIAG_BUILDER": "1",
     "ORION_CPP_DIAG_BUILDER_DENSE": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER": "1",
@@ -163,7 +163,7 @@ REQUIRED_MAINLINE_ENV: dict[str, str] = {
     "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
     "ORION_LATTIGO_STREAMING_LT": "0",
     "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
-    "ORION_LATTIGO_CLEAR_BACKEND": "1",
+    "ORION_LATTIGO_CLEAR_BACKEND": "0",
     "ORION_CPP_DIAG_BUILDER": "1",
     "ORION_CPP_DIAG_BUILDER_DENSE": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER": "1",
@@ -619,12 +619,11 @@ def _layer_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     rows = _metric(payload, ("operator_breakdown_after_forward", "mvm", "group_rows")) or []
     if not isinstance(rows, list):
         return stats
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
+
+    def add_row(row: dict[str, Any]) -> None:
         layer = _layer_for_row(row)
         if layer is None:
-            continue
+            return
         timing = row.get("timing") if isinstance(row.get("timing"), dict) else {}
         stream_build = _as_float(timing.get("stream_build_map_s"))
         stream_encode = _as_float(timing.get("stream_encode_hoist_s"))
@@ -663,6 +662,11 @@ def _layer_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         entry["layer_cache_evict_s"] += layer_cache_evict
         entry["lt_accumulate_s"] += lt_accum
         entry["eval_total_s"] += _as_float(row.get("mvm_eval_total_s"))
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        add_row(row)
     return stats
 
 
@@ -682,7 +686,79 @@ def _summary_unattributed(
     he_forward_s: float | None,
     parts: list[float | None],
 ) -> float | None:
-    direct = _summary_total(totals, "unattributed_he_forward_s")
+    direct = _summary_total(totals, "wall_unattributed_he_forward_s", "unattributed_he_forward_s")
+    if direct is not None:
+        return direct
+    if he_forward_s is None or any(value is None for value in parts):
+        return None
+    return float(he_forward_s) - sum(float(value or 0.0) for value in parts)
+
+
+def _summary_sum(*values: float | None) -> float | None:
+    if any(value is None for value in values):
+        return None
+    return float(sum(float(value or 0.0) for value in values))
+
+
+def _cell_float(cell: str) -> float | None:
+    value = str(cell or "").strip().replace(",", "")
+    if not value:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return float(number)
+
+
+def _summary_layer_cache_turnover(totals: dict[str, Any]) -> float | None:
+    direct = _summary_total(totals, "wall_layer_cache_turnover_s", "lt_layer_cache_turnover_s")
+    if direct is not None:
+        return direct
+    parts = [
+        _summary_total(totals, "lt_layer_cache_encode_s"),
+        _summary_total(totals, "lt_layer_cache_key_prepare_s"),
+        _summary_total(totals, "lt_layer_cache_evict_s"),
+    ]
+    return _summary_sum(*parts)
+
+
+def _summary_runtime_load_trim(totals: dict[str, Any]) -> float | None:
+    direct = _summary_total(totals, "wall_runtime_load_trim_s")
+    if direct is not None:
+        return direct
+    load_encode = _summary_total(totals, "lt_runtime_load_encode_s")
+    trim_unload = _summary_total(totals, "lt_runtime_trim_unload_s")
+    return _summary_sum(load_encode, trim_unload)
+
+
+def _summary_executor_overhead(totals: dict[str, Any]) -> float | None:
+    direct = _summary_total(totals, "wall_executor_overhead_s")
+    if direct is not None:
+        return direct
+    return _summary_sum(
+        _summary_total(totals, "executor_wrap_s") or 0.0,
+        _summary_total(totals, "executor_postprocess_s"),
+        _summary_total(totals, "executor_rescale_s"),
+        _summary_total(totals, "executor_accumulate_s"),
+    )
+
+
+def _summary_linear_wrapper(totals: dict[str, Any]) -> float | None:
+    direct = _summary_total(totals, "wall_linear_wrapper_postprocess_s")
+    if direct is not None:
+        return direct
+    return _summary_total(totals, "linear_wrapper_postprocess_s")
+
+
+def _summary_wall_residual(
+    totals: dict[str, Any],
+    he_forward_s: float | None,
+    parts: list[float | None],
+) -> float | None:
+    direct = _summary_total(totals, "wall_unattributed_he_forward_s")
     if direct is not None:
         return direct
     if he_forward_s is None or any(value is None for value in parts):
@@ -943,7 +1019,25 @@ def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
     mvm_lt_s = _summary_total(totals, "mvm_kernel_s")
     activation_s = _summary_total(totals, "activation_excluding_bootstrap_s", "activation_s")
     bootstrap_s = _summary_total(totals, "bootstrap_s")
+    compute_s = _summary_total(totals, "compute_mvm_activation_bootstrap_s", "compute_accounted_s")
+    if compute_s is None:
+        compute_s = _summary_sum(mvm_lt_s, activation_s, bootstrap_s)
     diag_encode_s = _summary_total(totals, "lt_layer_cache_encode_s")
+    layer_cache_turnover_s = _summary_layer_cache_turnover(totals)
+    executor_overhead_s = _summary_executor_overhead(totals)
+    linear_wrapper_s = _summary_linear_wrapper(totals)
+    runtime_load_trim_s = _summary_runtime_load_trim(totals)
+    wall_residual_s = _summary_wall_residual(
+        totals,
+        he_forward_s,
+        [
+            compute_s,
+            layer_cache_turnover_s,
+            linear_wrapper_s,
+            executor_overhead_s,
+            runtime_load_trim_s,
+        ],
+    )
     return {
         "status": str(payload.get("status", "pending" if not has_payload else "unknown")),
         "compile_s": timing.get("compile") if isinstance(timing, dict) else None,
@@ -952,7 +1046,13 @@ def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
         "mvm_lt_s": mvm_lt_s,
         "activation_excl_boot_s": activation_s,
         "bootstrap_s": bootstrap_s,
+        "compute_mvm_activation_bootstrap_s": compute_s,
         "diag_encode_s": diag_encode_s,
+        "layer_cache_turnover_s": layer_cache_turnover_s,
+        "linear_wrapper_s": linear_wrapper_s,
+        "executor_overhead_s": executor_overhead_s,
+        "runtime_load_trim_s": runtime_load_trim_s,
+        "wall_residual_s": wall_residual_s,
         "unattributed_s": _summary_unattributed(
             totals,
             he_forward_s,
@@ -993,10 +1093,20 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "Halo activation excl boot s",
         "dense bootstrap s",
         "Halo bootstrap s",
+        "dense MVM+act+boot s",
+        "Halo MVM+act+boot s",
         "dense diag+encode s",
         "Halo diag+encode s",
-        "dense unattributed s",
-        "Halo unattributed s",
+        "dense layer-cache turnover s",
+        "Halo layer-cache turnover s",
+        "dense linear wrapper s",
+        "Halo linear wrapper s",
+        "dense executor overhead s",
+        "Halo executor overhead s",
+        "dense load/trim s",
+        "Halo load/trim s",
+        "dense wall residual s",
+        "Halo wall residual s",
         "dense rotations",
         "Halo rotations",
         "dense boots",
@@ -1032,10 +1142,20 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
                 _fmt_float(provider["activation_excl_boot_s"]),
                 _fmt_float(dense["bootstrap_s"]),
                 _fmt_float(provider["bootstrap_s"]),
+                _fmt_float(dense["compute_mvm_activation_bootstrap_s"]),
+                _fmt_float(provider["compute_mvm_activation_bootstrap_s"]),
                 _fmt_float(dense["diag_encode_s"]),
                 _fmt_float(provider["diag_encode_s"]),
-                _fmt_float(dense["unattributed_s"]),
-                _fmt_float(provider["unattributed_s"]),
+                _fmt_float(dense["layer_cache_turnover_s"]),
+                _fmt_float(provider["layer_cache_turnover_s"]),
+                _fmt_float(dense["linear_wrapper_s"]),
+                _fmt_float(provider["linear_wrapper_s"]),
+                _fmt_float(dense["executor_overhead_s"]),
+                _fmt_float(provider["executor_overhead_s"]),
+                _fmt_float(dense["runtime_load_trim_s"]),
+                _fmt_float(provider["runtime_load_trim_s"]),
+                _fmt_float(dense["wall_residual_s"]),
+                _fmt_float(provider["wall_residual_s"]),
                 _fmt_int(dense["rotations"]),
                 _fmt_int(provider["rotations"]),
                 _fmt_int(dense["boots"]),
@@ -1071,10 +1191,20 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "Halo activation excl boot s",
         "dense bootstrap s",
         "Halo bootstrap s",
+        "dense MVM+act+boot s",
+        "Halo MVM+act+boot s",
         "dense diag+encode s",
         "Halo diag+encode s",
-        "dense unattributed s",
-        "Halo unattributed s",
+        "dense layer-cache turnover s",
+        "Halo layer-cache turnover s",
+        "dense linear wrapper s",
+        "Halo linear wrapper s",
+        "dense executor overhead s",
+        "Halo executor overhead s",
+        "dense load/trim s",
+        "Halo load/trim s",
+        "dense wall residual s",
+        "Halo wall residual s",
         "dense rotations",
         "Halo rotations",
         "dense boots",
@@ -1195,8 +1325,66 @@ def _join_result_file_parts(parts: dict[str, str]) -> str:
 
 
 def _upgrade_summary_row(row: list[str]) -> list[str] | None:
+    if len(row) == 39:
+        return _pad_row(row, 39)
+    if len(row) == 37:
+        return _pad_row(row[:22] + ["", ""] + row[22:], 39)
     if len(row) == 29:
-        return _pad_row(row, 29)
+        dense_compute = _fmt_float(
+            _summary_sum(
+                _cell_float(row[10]),
+                _cell_float(row[12]),
+                _cell_float(row[14]),
+            )
+        )
+        provider_compute = _fmt_float(
+            _summary_sum(
+                _cell_float(row[11]),
+                _cell_float(row[13]),
+                _cell_float(row[15]),
+            )
+        )
+        return [
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            row[8],
+            row[9],
+            row[10],
+            row[11],
+            row[12],
+            row[13],
+            row[14],
+            row[15],
+            dense_compute,
+            provider_compute,
+            row[16],
+            row[17],
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            row[20],
+            row[21],
+            row[22],
+            row[23],
+            row[24],
+            row[25],
+            row[26],
+            row[27],
+            row[28],
+        ]
     if len(row) == 19:
         return [
             row[0],
@@ -1209,6 +1397,16 @@ def _upgrade_summary_row(row: list[str]) -> list[str] | None:
             row[7],
             row[8],
             row[9],
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
             "",
             "",
             "",
@@ -1233,14 +1431,14 @@ def _upgrade_summary_row(row: list[str]) -> list[str] | None:
 
 
 def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], modes: list[str]) -> list[list[str]]:
-    width = 29
+    width = 39
     by_case = {}
     for row in existing:
         upgraded = _upgrade_summary_row(list(row))
         if upgraded is not None:
             by_case[str(upgraded[0])] = upgraded
-    dense_cols = (3, 5, 8, 10, 12, 14, 16, 18, 20, 22, 24)
-    provider_cols = (4, 6, 9, 11, 13, 15, 17, 19, 21, 23, 25)
+    dense_cols = (3, 5, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34)
+    provider_cols = (4, 6, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35)
     for new_row in new_rows:
         new_row = _pad_row(new_row, width)
         case = str(new_row[0])
@@ -1259,16 +1457,16 @@ def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], mo
                 merged[index] = new_row[index]
         ratio = _ratio(merged[5].replace(",", ""), merged[6].replace(",", ""))
         merged[7] = _fmt_float(ratio)
-        if new_row[26]:
-            merged[26] = new_row[26]
-        files = _result_file_parts(merged[27])
-        new_files = _result_file_parts(new_row[27])
+        if new_row[36]:
+            merged[36] = new_row[36]
+        files = _result_file_parts(merged[37])
+        new_files = _result_file_parts(new_row[37])
         for mode in modes:
             if new_files.get(mode):
                 files[mode] = new_files[mode]
-        merged[27] = _join_result_file_parts(files)
-        if new_row[28]:
-            merged[28] = new_row[28]
+        merged[37] = _join_result_file_parts(files)
+        if new_row[38]:
+            merged[38] = new_row[38]
         by_case[case] = merged
     case_order = {case: index for index, case in enumerate(CASES)}
     return [by_case[key] for key in sorted(by_case, key=lambda case: case_order.get(case, 100))]

@@ -75,6 +75,11 @@ _RUNTIME_TIMING_KEYS = (
     "stream_accumulate_s",
     "cpp_push_s",
     "cpp_trim_s",
+    "linear_wrapper_accumulate_s",
+    "linear_wrapper_rescale_s",
+    "linear_wrapper_bias_s",
+    "linear_wrapper_output_rotation_s",
+    "linear_wrapper_postprocess_s",
 )
 
 
@@ -1477,6 +1482,7 @@ class NewEvaluator:
             + payload.get("layer_cache_key_prepare_s", 0.0)
             + payload.get("layer_cache_evict_s", 0.0)
         )
+        payload["serving_hot_s"] = float(payload.get("serving_hot_s", 0.0) + float(evict_s))
         payload["runtime_fairness_mode"] = "single_slot_layer_cache"
         payload["artifact_load_s"] = float(
             float(payload.get("load_keys_s", 0.0))
@@ -1740,6 +1746,9 @@ class NewEvaluator:
             "eval_total_s": 0.0,
             "unload_s": 0.0,
             "trim_s": 0.0,
+            "linear_wrapper_accumulate_s": 0.0,
+            "linear_wrapper_rescale_s": 0.0,
+            "linear_wrapper_postprocess_s": 0.0,
         }
         for key, value in self._consume_dense_layer_cache_pending_timing(linear_layer).items():
             runtime_timing[key] = float(runtime_timing.get(key, 0.0) + float(value))
@@ -1909,7 +1918,14 @@ class NewEvaluator:
                         ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
 
                         # Accumulate results across a row of blocks; rescale only after the row is complete.
-                        ct_out = ct if ct_out is None else ct_out + ct
+                        if ct_out is None:
+                            ct_out = ct
+                        else:
+                            accumulate_started = time.perf_counter()
+                            ct_out = ct_out + ct
+                            runtime_timing["linear_wrapper_accumulate_s"] += float(
+                                time.perf_counter() - accumulate_started
+                            )
 
                         if self.io_mode != "none":
                             unload_started = time.perf_counter()
@@ -1941,7 +1957,11 @@ class NewEvaluator:
                 cts_out.append(int(ct_out.ids[0]))
                 ct_out.ids = []
             else:
+                rescale_started = time.perf_counter()
                 ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
+                runtime_timing["linear_wrapper_rescale_s"] += float(
+                    time.perf_counter() - rescale_started
+                )
                 cts_out.append(ct_out_rescaled)
             if dense_cache_granularity == "group":
                 evict_materialized_group()

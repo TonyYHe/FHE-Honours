@@ -134,8 +134,13 @@ def _walk_executor_objects(root: Any):
             continue
         seen.add(id(current))
         yield current
-        for attr in ("base_executor", "delegate", "executor"):
-            child = getattr(current, attr, None)
+        for attr in ("base_executor", "_delegate", "delegate", "executor"):
+            child = None
+            current_dict = getattr(current, "__dict__", {})
+            if isinstance(current_dict, dict) and attr in current_dict:
+                child = current_dict.get(attr)
+            if child is None:
+                child = getattr(current, attr, None)
             if child is not None:
                 stack.append(child)
 
@@ -168,6 +173,16 @@ _RUNTIME_FAIRNESS_NUMERIC_KEYS = (
     "stream_accumulate_s",
     "cpp_push_s",
     "cpp_trim_s",
+    "linear_wrapper_accumulate_s",
+    "linear_wrapper_rescale_s",
+    "linear_wrapper_bias_s",
+    "linear_wrapper_output_rotation_s",
+    "linear_wrapper_postprocess_s",
+    "executor_wrap_s",
+    "executor_postprocess_s",
+    "executor_rescale_s",
+    "executor_accumulate_s",
+    "executor_overhead_s",
 )
 
 
@@ -193,6 +208,10 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
             for child in list(value):
                 emit_value(child)
             return
+        nested_group = getattr(value, "group", None)
+        if nested_group is not None and not hasattr(value, "last_runtime_timing"):
+            emit_value(nested_group)
+            return
         _append_runtime_group(groups, seen, value)
 
     for candidate in _walk_executor_objects(executor):
@@ -204,6 +223,7 @@ def _executor_unified_groups(executor: Any) -> list[Any]:
             "groups_by_pair",
             "groups_by_input_index",
             "groups_by_source",
+            "runtime_groups",
             "_concat_unified_groups_by_input",
         ):
             emit_value(getattr(candidate, attr, None))
@@ -266,8 +286,90 @@ def _aggregate_runtime_fairness(timings: list[dict[str, Any]], *, serving_hot_s:
     return payload
 
 
+def _executor_runtime_overhead_components(timing: dict[str, Any]) -> dict[str, float]:
+    executor_wrap = _timing_float(timing, "partial_wrap_s")
+    executor_rescale = float(
+        _timing_float(timing, "partial_rescale_s")
+        + _timing_float(timing, "relayout_s")
+    )
+    executor_accumulate = float(
+        _timing_float(timing, "accumulate_s")
+        + _timing_float(timing, "partial_accumulate_s")
+    )
+    executor_postprocess_children = float(
+        _timing_float(timing, "bias_s")
+        + _timing_float(timing, "output_fold_s")
+        + _timing_float(timing, "branch_extract_s")
+        + _timing_float(timing, "output_relayout_s")
+    )
+    executor_prepostprocess_children = float(
+        _timing_float(timing, "projection_s")
+        + _timing_float(timing, "input_pack_s")
+        + _timing_float(timing, "real_extract_s")
+        + _timing_float(timing, "input_relayout_s")
+    )
+    postprocess_s = float(_timing_float(timing, "postprocess_s"))
+    covered_rescale = (
+        float(executor_rescale)
+        if executor_rescale > 0.0
+        and executor_postprocess_children + executor_rescale <= postprocess_s + 1e-9
+        else 0.0
+    )
+    covered_accumulate = (
+        float(executor_accumulate)
+        if executor_accumulate > 0.0
+        and executor_postprocess_children + covered_rescale + executor_accumulate <= postprocess_s + 1e-9
+        else 0.0
+    )
+    postprocess_exclusive = max(
+        float(executor_postprocess_children),
+        float(postprocess_s - covered_rescale - covered_accumulate),
+    )
+    executor_postprocess = float(executor_prepostprocess_children + postprocess_exclusive)
+    return {
+        "executor_wrap_s": float(executor_wrap),
+        "executor_postprocess_s": float(executor_postprocess),
+        "executor_rescale_s": float(executor_rescale),
+        "executor_accumulate_s": float(executor_accumulate),
+        "executor_overhead_s": float(
+            executor_wrap + executor_postprocess + executor_rescale + executor_accumulate
+        ),
+    }
+
+
+def _executor_runtime_core_signature(
+    *,
+    module_name: str,
+    node: str,
+    timing: dict[str, Any],
+) -> tuple[Any, ...]:
+    timing_part = tuple(
+        (key, round(_timing_float(timing, key), 12))
+        for key in (
+            "group_eval_s",
+            "evaluate_unified_s",
+            "partial_wrap_s",
+            "partial_rescale_s",
+            "relayout_s",
+            "accumulate_s",
+            "partial_accumulate_s",
+            "postprocess_s",
+            "bias_s",
+            "output_fold_s",
+            "projection_s",
+            "input_pack_s",
+            "real_extract_s",
+            "branch_extract_s",
+            "input_relayout_s",
+            "output_relayout_s",
+        )
+    )
+    return (str(module_name), str(node), timing_part)
+
+
 def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> dict[str, Any]:
     timings: list[dict[str, Any]] = []
+    seen_executor_timings: set[tuple[Any, ...]] = set()
     for _module_name, module in net.named_modules():
         layer_timing = getattr(module, "_last_runtime_timing", None)
         if isinstance(layer_timing, dict):
@@ -277,6 +379,21 @@ def _collect_runtime_fairness(net: torch.nn.Module, *, serving_hot_s: float) -> 
             if isinstance(timing, dict):
                 timings.append(dict(timing))
         executor = getattr(getattr(module, "region_runtime", None), "executor", None)
+        for candidate in _walk_executor_objects(executor):
+            executor_timing = getattr(candidate, "last_runtime_timing", None)
+            if isinstance(executor_timing, dict):
+                node = str(getattr(module, "region_output_id", _module_name))
+                signature = _executor_runtime_core_signature(
+                    module_name=str(_module_name),
+                    node=node,
+                    timing=executor_timing,
+                )
+                if signature in seen_executor_timings:
+                    continue
+                seen_executor_timings.add(signature)
+                enriched = dict(executor_timing)
+                enriched.update(_executor_runtime_overhead_components(executor_timing))
+                timings.append(enriched)
         for group in _executor_unified_groups(executor):
             timing = getattr(group, "last_runtime_timing", None)
             if isinstance(timing, dict):
@@ -1981,6 +2098,8 @@ def _module_category(module: Module) -> str:
         return "linear_transform"
     if cls_name in {"Add"}:
         return "add"
+    if cls_name in {"Concat"}:
+        return "concat"
     if cls_name in {"Mult"}:
         return "multiply"
     if cls_name in {"Flatten"}:
@@ -2379,6 +2498,10 @@ def _iter_unified_groups(executor: Any):
             if isinstance(item, (dict, list, tuple, set)):
                 yield from emit(item)
                 continue
+            nested_group = getattr(item, "group", None)
+            if nested_group is not None and not hasattr(item, "last_runtime_timing"):
+                yield from emit(nested_group)
+                continue
             if item is None or not hasattr(item, "last_runtime_timing"):
                 continue
             if id(item) in seen:
@@ -2395,6 +2518,7 @@ def _iter_unified_groups(executor: Any):
         "groups_by_input_chunk",
         "groups_by_input_index",
         "groups_by_source",
+        "runtime_groups",
         "_concat_unified_groups_by_input",
     ):
         yield from emit(getattr(executor, attr, None))
@@ -2578,6 +2702,8 @@ def _collect_compile_operator_breakdown(
 
 
 def _group_mvm_kernel_s(timing: dict[str, Any]) -> float:
+    if str(timing.get("runtime_fairness_mode", "") or "") == "linear_wrapper_only":
+        return 0.0
     kernel = (
         _timing_float(timing, "stream_eval_s")
         + _timing_float(timing, "stream_accumulate_s")
@@ -2604,14 +2730,41 @@ def _group_load_encode_s(timing: dict[str, Any]) -> float:
     )
 
 
+def _executor_group_eval_wall_s(timing: dict[str, Any]) -> float:
+    # Native provider group_eval_s wraps UnifiedTransformGroup.evaluate_unified().
+    # In single-slot mode that call also includes materialize/encode/evict wall
+    # time, so it is diagnostic wall time only.  MVM is collected from the
+    # groups' own eval_s/stream_* timing via _iter_unified_groups().
+    return float(_timing_float(timing, "group_eval_s"))
+
+
+def _executor_timing_signature(
+    *,
+    module_name: str,
+    node: str,
+    timing: dict[str, Any],
+    counts: dict[str, Any],
+) -> tuple[Any, ...]:
+    del counts
+    return _executor_runtime_core_signature(
+        module_name=str(module_name),
+        node=str(node),
+        timing=timing,
+    )
+
+
 def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
     group_rows: list[dict[str, Any]] = []
     executor_rows: list[dict[str, Any]] = []
     seen_groups: set[int] = set()
+    seen_executor_timings: set[tuple[Any, ...]] = set()
     totals = {
         "group_count": 0,
+        "executor_count": 0,
         "mvm_kernel_s": 0.0,
         "mvm_eval_total_s": 0.0,
+        "executor_group_eval_wall_s": 0.0,
+        "executor_evaluate_unified_s": 0.0,
         "lt_runtime_load_encode_s": 0.0,
         "lt_layer_cache_turnover_s": 0.0,
         "lt_layer_cache_encode_s": 0.0,
@@ -2626,6 +2779,12 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
         "lt_runtime_stream_eval_s": 0.0,
         "lt_runtime_stream_accumulate_s": 0.0,
         "lt_runtime_trim_unload_s": 0.0,
+        "linear_wrapper_accumulate_s": 0.0,
+        "linear_wrapper_rescale_s": 0.0,
+        "linear_wrapper_bias_s": 0.0,
+        "linear_wrapper_output_rotation_s": 0.0,
+        "linear_wrapper_postprocess_s": 0.0,
+        "executor_wrap_s": 0.0,
         "executor_postprocess_s": 0.0,
         "executor_rescale_s": 0.0,
         "executor_accumulate_s": 0.0,
@@ -2641,13 +2800,12 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
         timing: dict[str, Any],
     ) -> None:
         serving = _timing_float(timing, "serving_hot_s")
+        wrapper_only = str(timing.get("runtime_fairness_mode", "") or "") == "linear_wrapper_only"
         eval_total = (
             _timing_float(timing, "eval_total_s")
             or _timing_float(timing, "eval_s")
-            or serving
+            or (0.0 if wrapper_only else serving)
         )
-        if serving <= 0.0 and eval_total <= 0.0:
-            return
         mvm_kernel = _group_mvm_kernel_s(timing)
         load_encode = _group_load_encode_s(timing)
         trim_unload = float(
@@ -2663,6 +2821,28 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
                 + _timing_float(timing, "layer_cache_evict_s")
             )
         )
+        linear_wrapper_accumulate = _timing_float(timing, "linear_wrapper_accumulate_s")
+        linear_wrapper_rescale = _timing_float(timing, "linear_wrapper_rescale_s")
+        linear_wrapper_bias = _timing_float(timing, "linear_wrapper_bias_s")
+        linear_wrapper_output_rotation = _timing_float(timing, "linear_wrapper_output_rotation_s")
+        linear_wrapper_postprocess = float(
+            _timing_float(timing, "linear_wrapper_postprocess_s")
+            or (
+                linear_wrapper_accumulate
+                + linear_wrapper_rescale
+                + linear_wrapper_bias
+                + linear_wrapper_output_rotation
+            )
+        )
+        if (
+            serving <= 0.0
+            and eval_total <= 0.0
+            and load_encode <= 0.0
+            and trim_unload <= 0.0
+            and layer_cache_turnover <= 0.0
+            and linear_wrapper_postprocess <= 0.0
+        ):
+            return
         row = {
             "module_path": str(module_name),
             "node": str(getattr(module, "region_output_id", module_name)),
@@ -2678,6 +2858,11 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
             "lt_layer_cache_key_prepare_s": _timing_float(timing, "layer_cache_key_prepare_s"),
             "lt_layer_cache_evict_s": _timing_float(timing, "layer_cache_evict_s"),
             "lt_runtime_trim_unload_s": float(trim_unload),
+            "linear_wrapper_accumulate_s": float(linear_wrapper_accumulate),
+            "linear_wrapper_rescale_s": float(linear_wrapper_rescale),
+            "linear_wrapper_bias_s": float(linear_wrapper_bias),
+            "linear_wrapper_output_rotation_s": float(linear_wrapper_output_rotation),
+            "linear_wrapper_postprocess_s": float(linear_wrapper_postprocess),
             "timing": dict(timing),
         }
         group_rows.append(row)
@@ -2698,6 +2883,11 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
         totals["lt_runtime_stream_eval_s"] += _timing_float(timing, "stream_eval_s")
         totals["lt_runtime_stream_accumulate_s"] += _timing_float(timing, "stream_accumulate_s")
         totals["lt_runtime_trim_unload_s"] += float(trim_unload)
+        totals["linear_wrapper_accumulate_s"] += float(linear_wrapper_accumulate)
+        totals["linear_wrapper_rescale_s"] += float(linear_wrapper_rescale)
+        totals["linear_wrapper_bias_s"] += float(linear_wrapper_bias)
+        totals["linear_wrapper_output_rotation_s"] += float(linear_wrapper_output_rotation)
+        totals["linear_wrapper_postprocess_s"] += float(linear_wrapper_postprocess)
 
     for module_name, module in net.named_modules():
         layer_timing = dict(getattr(module, "_last_runtime_timing", {}) or {})
@@ -2709,6 +2899,18 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
                 storage_key="",
                 transform_count=0,
                 timing=layer_timing,
+            )
+        for proxy_index, proxy in enumerate(list(getattr(module, "_concat_transform_sources_by_input", []) or [])):
+            proxy_timing = dict(getattr(proxy, "_last_runtime_timing", {}) or {})
+            if not proxy_timing:
+                continue
+            add_timing_row(
+                module_name=str(module_name),
+                module=module,
+                executor_label=f"{type(module).__name__}.concat_source[{int(proxy_index)}]",
+                storage_key=str(getattr(proxy, "name", "")),
+                transform_count=int(len(getattr(proxy, "transform_ids", {}) or {})),
+                timing=proxy_timing,
             )
         for group in _iter_unified_groups(module):
             if id(group) in seen_groups:
@@ -2729,31 +2931,47 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
     for module_name, module, executor in _iter_runtime_executors(net):
         executor_timing = dict(getattr(executor, "last_runtime_timing", {}) or {})
         if executor_timing:
-            executor_rows.append(
-                {
-                    "module_path": str(module_name),
-                    "node": str(getattr(module, "region_output_id", module_name)),
-                    "executor": type(executor).__name__,
-                    "timing": executor_timing,
-                    "counts": dict(getattr(executor, "last_runtime_counts", {}) or {}),
-                }
+            node = str(getattr(module, "region_output_id", module_name))
+            counts = dict(getattr(executor, "last_runtime_counts", {}) or {})
+            signature = _executor_timing_signature(
+                module_name=str(module_name),
+                node=node,
+                timing=executor_timing,
+                counts=counts,
             )
-            totals["executor_postprocess_s"] += float(
-                _timing_float(executor_timing, "postprocess_s")
-                + _timing_float(executor_timing, "bias_s")
-                + _timing_float(executor_timing, "output_fold_s")
-                + _timing_float(executor_timing, "projection_s")
-                + _timing_float(executor_timing, "input_pack_s")
-                + _timing_float(executor_timing, "real_extract_s")
-            )
-            totals["executor_rescale_s"] += float(
-                _timing_float(executor_timing, "partial_rescale_s")
-                + _timing_float(executor_timing, "relayout_s")
-            )
-            totals["executor_accumulate_s"] += float(
-                _timing_float(executor_timing, "accumulate_s")
-                + _timing_float(executor_timing, "partial_accumulate_s")
-            )
+            if signature not in seen_executor_timings:
+                seen_executor_timings.add(signature)
+                executor_group_eval_wall = _executor_group_eval_wall_s(executor_timing)
+                executor_evaluate_unified = _timing_float(executor_timing, "evaluate_unified_s")
+                executor_components = _executor_runtime_overhead_components(executor_timing)
+                executor_wrap = executor_components["executor_wrap_s"]
+                executor_postprocess = executor_components["executor_postprocess_s"]
+                executor_rescale = executor_components["executor_rescale_s"]
+                executor_accumulate = executor_components["executor_accumulate_s"]
+                executor_overhead = executor_components["executor_overhead_s"]
+                executor_rows.append(
+                    {
+                        "module_path": str(module_name),
+                        "node": node,
+                        "executor": type(executor).__name__,
+                        "executor_group_eval_wall_s": float(executor_group_eval_wall),
+                        "executor_evaluate_unified_s": float(executor_evaluate_unified),
+                        "executor_wrap_s": float(executor_wrap),
+                        "executor_postprocess_s": float(executor_postprocess),
+                        "executor_rescale_s": float(executor_rescale),
+                        "executor_accumulate_s": float(executor_accumulate),
+                        "executor_overhead_s": float(executor_overhead),
+                        "timing": executor_timing,
+                        "counts": counts,
+                    }
+                )
+                totals["executor_count"] += 1
+                totals["executor_group_eval_wall_s"] += float(executor_group_eval_wall)
+                totals["executor_evaluate_unified_s"] += float(executor_evaluate_unified)
+                totals["executor_wrap_s"] += float(executor_wrap)
+                totals["executor_postprocess_s"] += float(executor_postprocess)
+                totals["executor_rescale_s"] += float(executor_rescale)
+                totals["executor_accumulate_s"] += float(executor_accumulate)
         for group in _iter_unified_groups(executor):
             if id(group) in seen_groups:
                 continue
@@ -2778,16 +2996,199 @@ def _collect_mvm_runtime_breakdown(net: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def _collect_he_module_wall_breakdown(
+    module_profile: dict[str, Any] | None,
+    *,
+    activation: dict[str, Any],
+    bootstrap: dict[str, Any],
+    mvm: dict[str, Any],
+) -> dict[str, Any]:
+    profile = dict(module_profile or {})
+    profile_rows = list(profile.get("primary_adjusted_rows", []) or [])
+    if not profile_rows:
+        profile_rows = [
+            row
+            for row in list(profile.get("rows", []) or [])
+            if not bool(row.get("is_bootstrapper_child", False))
+        ]
+    known_by_module: dict[str, dict[str, float]] = {}
+
+    def known_entry(module_path: str) -> dict[str, float]:
+        return known_by_module.setdefault(
+            str(module_path),
+            {
+                "mvm_kernel_s": 0.0,
+                "activation_s": 0.0,
+                "bootstrap_s": 0.0,
+                "layer_cache_turnover_s": 0.0,
+                "executor_overhead_s": 0.0,
+                "linear_wrapper_postprocess_s": 0.0,
+                "runtime_load_trim_s": 0.0,
+            },
+        )
+
+    for row in list(mvm.get("group_rows", []) or []):
+        if not isinstance(row, dict):
+            continue
+        entry = known_entry(str(row.get("module_path", "")))
+        entry["mvm_kernel_s"] += float(row.get("mvm_kernel_s", 0.0) or 0.0)
+        entry["layer_cache_turnover_s"] += float(row.get("lt_layer_cache_turnover_s", 0.0) or 0.0)
+        entry["linear_wrapper_postprocess_s"] += float(row.get("linear_wrapper_postprocess_s", 0.0) or 0.0)
+        entry["runtime_load_trim_s"] += float(row.get("lt_runtime_load_encode_s", 0.0) or 0.0) + float(
+            row.get("lt_runtime_trim_unload_s", 0.0) or 0.0
+        )
+    for row in list(mvm.get("executor_rows", []) or []):
+        if not isinstance(row, dict):
+            continue
+        entry = known_entry(str(row.get("module_path", "")))
+        entry["mvm_kernel_s"] += float(row.get("mvm_kernel_s", 0.0) or 0.0)
+        entry["executor_overhead_s"] += float(row.get("executor_overhead_s", 0.0) or 0.0)
+    for row in list(activation.get("rows", []) or []):
+        if not isinstance(row, dict):
+            continue
+        entry = known_entry(str(row.get("module_path", "")))
+        entry["activation_s"] += float(row.get("activation_excluding_bootstrap_s", 0.0) or 0.0)
+    for row in list(bootstrap.get("rows", []) or []):
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name", ""))
+        module_path = name[: -len(".bootstrapper")] if name.endswith(".bootstrapper") else name
+        entry = known_entry(module_path)
+        entry["bootstrap_s"] += float(row.get("bootstrap_s", 0.0) or 0.0)
+
+    rows: list[dict[str, Any]] = []
+    totals_by_category: dict[str, dict[str, Any]] = {}
+    totals = {
+        "module_wall_s": 0.0,
+        "mvm_kernel_s": 0.0,
+        "activation_s": 0.0,
+        "bootstrap_s": 0.0,
+        "layer_cache_turnover_s": 0.0,
+        "executor_overhead_s": 0.0,
+        "linear_wrapper_postprocess_s": 0.0,
+        "runtime_load_trim_s": 0.0,
+        "residual_after_known_subtimers_s": 0.0,
+        "call_count": 0,
+        "module_count": 0,
+    }
+    for profile_row in profile_rows:
+        if not isinstance(profile_row, dict):
+            continue
+        module_path = str(profile_row.get("module_path", ""))
+        if not module_path:
+            continue
+        module_wall = float(profile_row.get("elapsed_s", 0.0) or 0.0)
+        if module_wall <= 0.0:
+            continue
+        known = known_by_module.get(module_path, {})
+        mvm_kernel = float(known.get("mvm_kernel_s", 0.0) or 0.0)
+        activation_s = float(known.get("activation_s", 0.0) or 0.0)
+        bootstrap_s = float(known.get("bootstrap_s", 0.0) or 0.0)
+        layer_cache_turnover = float(known.get("layer_cache_turnover_s", 0.0) or 0.0)
+        executor_overhead = float(known.get("executor_overhead_s", 0.0) or 0.0)
+        linear_wrapper_postprocess = float(known.get("linear_wrapper_postprocess_s", 0.0) or 0.0)
+        runtime_load_trim = float(known.get("runtime_load_trim_s", 0.0) or 0.0)
+        known = float(
+            mvm_kernel
+            + activation_s
+            + bootstrap_s
+            + layer_cache_turnover
+            + executor_overhead
+            + linear_wrapper_postprocess
+            + runtime_load_trim
+        )
+        residual = float(module_wall - known)
+        category = str(profile_row.get("category", "other"))
+        call_count = int(profile_row.get("call_count", 0) or 0)
+        row = {
+            "module_path": str(module_path),
+            "class": str(profile_row.get("class", "")),
+            "category": str(category),
+            "call_count": int(call_count),
+            "module_wall_s": float(module_wall),
+            "mvm_kernel_s": float(mvm_kernel),
+            "activation_s": float(activation_s),
+            "bootstrap_s": float(bootstrap_s),
+            "layer_cache_turnover_s": float(layer_cache_turnover),
+            "executor_overhead_s": float(executor_overhead),
+            "linear_wrapper_postprocess_s": float(linear_wrapper_postprocess),
+            "runtime_load_trim_s": float(runtime_load_trim),
+            "known_subtimers_s": float(known),
+            "residual_after_known_subtimers_s": float(residual),
+        }
+        rows.append(row)
+        totals["module_wall_s"] += float(module_wall)
+        totals["mvm_kernel_s"] += float(mvm_kernel)
+        totals["activation_s"] += float(activation_s)
+        totals["bootstrap_s"] += float(bootstrap_s)
+        totals["layer_cache_turnover_s"] += float(layer_cache_turnover)
+        totals["executor_overhead_s"] += float(executor_overhead)
+        totals["linear_wrapper_postprocess_s"] += float(linear_wrapper_postprocess)
+        totals["runtime_load_trim_s"] += float(runtime_load_trim)
+        totals["residual_after_known_subtimers_s"] += float(residual)
+        totals["call_count"] += int(call_count)
+        totals["module_count"] += 1
+        category_totals = totals_by_category.setdefault(
+            str(category),
+            {
+                "module_wall_s": 0.0,
+                "mvm_kernel_s": 0.0,
+                "activation_s": 0.0,
+                "bootstrap_s": 0.0,
+                "layer_cache_turnover_s": 0.0,
+                "executor_overhead_s": 0.0,
+                "linear_wrapper_postprocess_s": 0.0,
+                "runtime_load_trim_s": 0.0,
+                "residual_after_known_subtimers_s": 0.0,
+                "call_count": 0,
+                "module_count": 0,
+            },
+        )
+        for key in (
+            "module_wall_s",
+            "mvm_kernel_s",
+            "activation_s",
+            "bootstrap_s",
+            "layer_cache_turnover_s",
+            "executor_overhead_s",
+            "linear_wrapper_postprocess_s",
+            "runtime_load_trim_s",
+            "residual_after_known_subtimers_s",
+        ):
+            category_totals[key] = float(category_totals[key]) + float(row[key])
+        category_totals["call_count"] = int(category_totals["call_count"]) + int(call_count)
+        category_totals["module_count"] = int(category_totals["module_count"]) + 1
+    rows.sort(key=lambda item: float(item.get("residual_after_known_subtimers_s", 0.0)), reverse=True)
+    return {
+        "enabled": bool(profile.get("enabled", False)),
+        "notes": [
+            "This hook times each Orion Module during HE forward and subtracts known MVM, activation, bootstrap, layer-cache, executor, and runtime load/trim subtimers.",
+            "Residual by module identifies where remaining he_forward wall time lives; it is diagnostic wall-time, not an additive compute comparison metric.",
+        ],
+        "totals": totals,
+        "totals_by_category": totals_by_category,
+        "top_residual_rows": rows[:40],
+        "rows": sorted(rows, key=lambda item: str(item["module_path"])),
+    }
+
+
 def _collect_forward_operator_breakdown(
     net: torch.nn.Module,
     *,
     he_forward_s: float | None,
     activation_profile: dict[str, Any] | None,
+    module_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     bootstrap_report = _collect_bootstrap_report(net)
     bootstrap = _collect_bootstrap_runtime_breakdown(bootstrap_report)
     activation = _collect_activation_runtime_breakdown(activation_profile, bootstrap)
     mvm = _collect_mvm_runtime_breakdown(net)
+    module_wall = _collect_he_module_wall_breakdown(
+        module_profile,
+        activation=activation,
+        bootstrap=bootstrap,
+        mvm=mvm,
+    )
     he_forward_value = None if he_forward_s is None else float(he_forward_s)
     totals = {
         "he_forward_s": he_forward_value,
@@ -2808,30 +3209,80 @@ def _collect_forward_operator_breakdown(
         "lt_runtime_stream_eval_s": float(mvm["totals"].get("lt_runtime_stream_eval_s", 0.0)),
         "lt_runtime_stream_accumulate_s": float(mvm["totals"].get("lt_runtime_stream_accumulate_s", 0.0)),
         "lt_runtime_trim_unload_s": float(mvm["totals"].get("lt_runtime_trim_unload_s", 0.0)),
+        "linear_wrapper_accumulate_s": float(mvm["totals"].get("linear_wrapper_accumulate_s", 0.0)),
+        "linear_wrapper_rescale_s": float(mvm["totals"].get("linear_wrapper_rescale_s", 0.0)),
+        "linear_wrapper_bias_s": float(mvm["totals"].get("linear_wrapper_bias_s", 0.0)),
+        "linear_wrapper_output_rotation_s": float(mvm["totals"].get("linear_wrapper_output_rotation_s", 0.0)),
+        "linear_wrapper_postprocess_s": float(mvm["totals"].get("linear_wrapper_postprocess_s", 0.0)),
+        "executor_wrap_s": float(mvm["totals"].get("executor_wrap_s", 0.0)),
         "executor_postprocess_s": float(mvm["totals"].get("executor_postprocess_s", 0.0)),
         "executor_rescale_s": float(mvm["totals"].get("executor_rescale_s", 0.0)),
         "executor_accumulate_s": float(mvm["totals"].get("executor_accumulate_s", 0.0)),
+        "executor_group_eval_wall_s": float(mvm["totals"].get("executor_group_eval_wall_s", 0.0)),
+        "executor_evaluate_unified_s": float(mvm["totals"].get("executor_evaluate_unified_s", 0.0)),
     }
-    accounted = float(
+    compute_accounted = float(
+        totals["mvm_kernel_s"]
+        + totals["activation_s"]
+        + totals["bootstrap_s"]
+    )
+    runtime_load_trim = float(
+        totals["lt_runtime_load_encode_s"] + totals["lt_runtime_trim_unload_s"]
+    )
+    executor_overhead = float(
+        totals["executor_wrap_s"]
+        + totals["executor_postprocess_s"]
+        + totals["executor_rescale_s"]
+        + totals["executor_accumulate_s"]
+    )
+    layer_cache_turnover = float(totals["lt_layer_cache_turnover_s"])
+    linear_wrapper_postprocess = float(totals["linear_wrapper_postprocess_s"])
+    wall_aux_accounted = float(
+        layer_cache_turnover
+        + runtime_load_trim
+        + linear_wrapper_postprocess
+        + executor_overhead
+    )
+    wall_accounted = float(compute_accounted + wall_aux_accounted)
+    totals["compute_mvm_activation_bootstrap_s"] = float(compute_accounted)
+    totals["compute_accounted_s"] = float(compute_accounted)
+    totals["he_forward_minus_compute_s"] = (
+        None if he_forward_value is None else float(he_forward_value - compute_accounted)
+    )
+    totals["wall_layer_cache_turnover_s"] = float(layer_cache_turnover)
+    totals["wall_runtime_load_trim_s"] = float(runtime_load_trim)
+    totals["wall_executor_overhead_s"] = float(executor_overhead)
+    totals["wall_linear_wrapper_postprocess_s"] = float(linear_wrapper_postprocess)
+    totals["wall_aux_accounted_s"] = float(wall_aux_accounted)
+    totals["wall_accounted_s"] = float(wall_accounted)
+    wall_residual = None if he_forward_value is None else float(he_forward_value - wall_accounted)
+    totals["wall_unattributed_he_forward_s"] = wall_residual
+    totals["unattributed_he_forward_s"] = wall_residual
+    legacy_accounted = float(
         totals["mvm_kernel_s"]
         + totals["activation_s"]
         + totals["bootstrap_s"]
         + totals["lt_runtime_load_encode_s"]
         + totals["lt_runtime_trim_unload_s"]
-        + totals["executor_postprocess_s"]
-        + totals["executor_rescale_s"]
-        + totals["executor_accumulate_s"]
+        + totals["linear_wrapper_postprocess_s"]
+        + executor_overhead
     )
-    totals["accounted_s"] = float(accounted)
-    totals["unattributed_he_forward_s"] = (
-        None if he_forward_value is None else float(he_forward_value - accounted)
+    totals["legacy_accounted_without_layer_cache_s"] = float(legacy_accounted)
+    totals["legacy_unattributed_without_layer_cache_s"] = (
+        None if he_forward_value is None else float(he_forward_value - legacy_accounted)
     )
     return {
         "notes": [
-            "MVM is collected from UnifiedTransformGroup runtime timing and is streaming-safe.",
+            "MVM is collected from UnifiedTransformGroup runtime timing and is streaming-safe, including provider runtime groups.",
             "mvm_kernel_s uses stream_eval+stream_accumulate or baby+giant-step counters, with eval_s as fallback.",
+            "Provider executor group_eval_s/evaluate_unified_s are inclusive wall diagnostics only; they are not used as MVM.",
+            "linear_wrapper_postprocess_s is exclusive non-MVM LinearTransform wrapper work: dense/common row accumulation/rescale/bias/output rotation.",
+            "wall_executor_overhead_s is exclusive provider executor wrapper work: wrap/postprocess/rescale/accumulate outside MVM.",
             "lt_runtime_load_encode_s includes runtime artifact read/key/plaintext load plus legacy chunk-stream build-map/encode/load-payload time.",
             "Single-slot layer-cache turnover is reported separately as lt_layer_cache_turnover_s.",
+            "compute_mvm_activation_bootstrap_s is the strict compute-comparison sum: MVM kernel + activation excluding bootstrap + bootstrap.",
+            "wall_aux_accounted_s adds layer-cache turnover, runtime load/trim, linear wrapper work, and provider executor overhead that occur inside he_forward_s but are not MVM+activation+bootstrap compute.",
+            "unattributed_he_forward_s and wall_unattributed_he_forward_s are the residual after compute plus wall auxiliary accounting.",
             "Activation is a targeted activation-only wall-time hook; direct bootstrap child time is subtracted.",
             "Bootstrap uses Bootstrap._bootstrap_runtime_profile and does not require broad module profiling.",
         ],
@@ -2839,6 +3290,7 @@ def _collect_forward_operator_breakdown(
         "mvm": mvm,
         "activation": activation,
         "bootstrap": bootstrap,
+        "module_wall": module_wall,
     }
 
 
@@ -3320,7 +3772,7 @@ def _run_forward_attempt(
     layer_mae_rows: list[dict[str, Any]] | None = None
     remove_layer_mae = None
     layer_mae_overall_ok: bool | None = None
-    if bool(profile_modules) or memory_trace_path is not None:
+    if bool(profile_modules) or bool(operator_breakdown) or memory_trace_path is not None:
         profile_snapshot, remove_profile = _install_he_module_profiler(
             net,
             memory_trace_path=memory_trace_path,
@@ -3428,6 +3880,7 @@ def _run_forward_attempt(
                         net,
                         he_forward_s=float(attempt.get("timing_s", {}).get("he_forward", 0.0)),
                         activation_profile=activation_profile,
+                        module_profile=snapshot if profile_snapshot is not None else None,
                     )
                     if bool(record_primary):
                         payload["operator_breakdown_after_forward"] = attempt[

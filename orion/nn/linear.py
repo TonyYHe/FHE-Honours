@@ -1,6 +1,7 @@
 import sys
 import math
 import os
+import time
 from types import SimpleNamespace
 from abc import abstractmethod
 
@@ -120,6 +121,43 @@ class LinearTransform(Module):
     def compile(self):
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
+    def _publish_linear_wrapper_timing(
+        self,
+        timing: dict,
+        *,
+        accumulate_s: float = 0.0,
+        rescale_s: float = 0.0,
+        bias_s: float = 0.0,
+        output_rotation_s: float = 0.0,
+        serving_extra_s: float | None = None,
+    ) -> dict:
+        timing = dict(timing or {})
+        timing["linear_wrapper_accumulate_s"] = float(
+            timing.get("linear_wrapper_accumulate_s", 0.0) + float(accumulate_s)
+        )
+        timing["linear_wrapper_rescale_s"] = float(
+            timing.get("linear_wrapper_rescale_s", 0.0) + float(rescale_s)
+        )
+        timing["linear_wrapper_bias_s"] = float(timing.get("linear_wrapper_bias_s", 0.0) + float(bias_s))
+        timing["linear_wrapper_output_rotation_s"] = float(
+            timing.get("linear_wrapper_output_rotation_s", 0.0) + float(output_rotation_s)
+        )
+        timing["linear_wrapper_postprocess_s"] = float(
+            timing.get("linear_wrapper_accumulate_s", 0.0)
+            + timing.get("linear_wrapper_rescale_s", 0.0)
+            + timing.get("linear_wrapper_bias_s", 0.0)
+            + timing.get("linear_wrapper_output_rotation_s", 0.0)
+        )
+        if serving_extra_s is None:
+            serving_extra_s = float(accumulate_s) + float(rescale_s) + float(bias_s) + float(output_rotation_s)
+        timing["serving_hot_s"] = float(timing.get("serving_hot_s", 0.0) + float(serving_extra_s))
+        runtime_fairness_mode = str(timing.get("runtime_fairness_mode", "") or "")
+        if not runtime_fairness_mode:
+            timing["runtime_fairness_mode"] = "linear_wrapper_only"
+        self._last_runtime_timing = dict(timing)
+        self.scheme.lt_evaluator.last_runtime_timing = dict(timing)
+        return timing
+
     @timer
     def evaluate_transforms(self, x):
         layer_cache_active = False
@@ -128,14 +166,26 @@ class LinearTransform(Module):
             layer_cache_active = True
         try:
             out = self.scheme.lt_evaluator.evaluate_transforms(self, x)
+            timing = dict(getattr(self, "_last_runtime_timing", {}) or {})
 
             # Hybrid method's output rotations
             slots = self.scheme.params.get_slots()
-            for i in range(1, self.output_rotations+1):
+            output_rotation_started = time.perf_counter()
+            for i in range(1, self.output_rotations + 1):
                 out += out.roll(slots // (2**i))
+            output_rotation_s = float(time.perf_counter() - output_rotation_started)
 
+            bias_s = 0.0
             if self.on_bias_ptxt is not None:
+                bias_started = time.perf_counter()
                 out += self.on_bias_ptxt
+                bias_s = float(time.perf_counter() - bias_started)
+            self._publish_linear_wrapper_timing(
+                timing,
+                bias_s=float(bias_s),
+                output_rotation_s=float(output_rotation_s),
+                serving_extra_s=float(bias_s + output_rotation_s),
+            )
             return out
         finally:
             if bool(layer_cache_active):
@@ -865,22 +915,36 @@ class Conv2d(LinearTransform):
                     f"{len(transform_sources)} inputs, got {len(parts)}"
                 )
             out = None
+            concat_accumulate_s = 0.0
             for input_index, source in enumerate(parts):
                 proxy = transform_sources[int(input_index)]
                 partial = self.scheme.lt_evaluator.evaluate_transforms(proxy, source)
                 if out is None:
                     out = partial
                 else:
+                    accumulate_started = time.perf_counter()
                     if bool(getattr(out.scheme.backend, "align_addition_scales", False)):
                         scale = max(1, int(out.scale()))
                         out.set_scale(int(scale))
                         partial.set_scale(int(scale))
                     out = out + partial
+                    concat_accumulate_s += float(time.perf_counter() - accumulate_started)
             slots = self.scheme.params.get_slots()
+            output_rotation_started = time.perf_counter()
             for i in range(1, int(self.output_rotations) + 1):
                 out += out.roll(slots // (2**i))
+            output_rotation_s = float(time.perf_counter() - output_rotation_started)
+            bias_s = 0.0
             if self.on_bias_ptxt is not None:
+                bias_started = time.perf_counter()
                 out += self.on_bias_ptxt
+                bias_s = float(time.perf_counter() - bias_started)
+            self._publish_linear_wrapper_timing(
+                {},
+                accumulate_s=float(concat_accumulate_s),
+                bias_s=float(bias_s),
+                output_rotation_s=float(output_rotation_s),
+            )
             return out
         finally:
             self._concat_evict_bias_after_eval(bias_materialized)
@@ -912,14 +976,21 @@ class Conv2d(LinearTransform):
         target_count = int(getattr(self, "_concat_unified_output_ct_count", self._concat_output_ct_count()))
         output_blocks: list[object | None] = [None for _ in range(int(target_count))]
         fuse_output_rescale = bool(_unified_output_fusion_enabled())
+        wrapper_accumulate_s = 0.0
+        wrapper_rescale_s = 0.0
+        wrapper_bias_s = 0.0
+        wrapper_output_rotation_s = 0.0
 
         def add_partial(target_index: int, partial):
+            nonlocal wrapper_accumulate_s
             current = output_blocks[int(target_index)]
             if current is None:
                 output_blocks[int(target_index)] = partial
                 return
+            accumulate_started = time.perf_counter()
             lhs, rhs = _align_ciphertexts_for_add(current, partial)
             output_blocks[int(target_index)] = lhs + rhs
+            wrapper_accumulate_s += float(time.perf_counter() - accumulate_started)
 
         try:
             for input_index, source in enumerate(parts):
@@ -959,13 +1030,17 @@ class Conv2d(LinearTransform):
                             torch.Size([1, int(slots)]),
                         )
                         if not bool(fuse_output_rescale):
+                            rescale_started = time.perf_counter()
                             partial = _rescale_cipher_tensor(partial)
+                            wrapper_rescale_s += float(time.perf_counter() - rescale_started)
                         add_partial(int(target_index), partial)
 
             if bool(fuse_output_rescale):
                 for target_index, block in enumerate(output_blocks):
                     if block is not None:
+                        rescale_started = time.perf_counter()
                         output_blocks[int(target_index)] = _rescale_cipher_tensor(block)
+                        wrapper_rescale_s += float(time.perf_counter() - rescale_started)
             output_ids: list[int] = []
             for target_index, block in enumerate(output_blocks):
                 if block is None:
@@ -980,10 +1055,21 @@ class Conv2d(LinearTransform):
                 self.output_shape,
                 getattr(self, "_concat_fusion_fhe_output_shape", self.fhe_output_shape),
             )
+            output_rotation_started = time.perf_counter()
             for i in range(1, int(self.output_rotations) + 1):
                 out += out.roll(int(slots) // (2**i))
+            wrapper_output_rotation_s += float(time.perf_counter() - output_rotation_started)
             if self.on_bias_ptxt is not None:
+                bias_started = time.perf_counter()
                 out += self.on_bias_ptxt
+                wrapper_bias_s += float(time.perf_counter() - bias_started)
+            self._publish_linear_wrapper_timing(
+                {},
+                accumulate_s=float(wrapper_accumulate_s),
+                rescale_s=float(wrapper_rescale_s),
+                bias_s=float(wrapper_bias_s),
+                output_rotation_s=float(wrapper_output_rotation_s),
+            )
             return out
         finally:
             release_owned = getattr(concat_tensor, "release_owned_parts", None)
