@@ -13,6 +13,9 @@ import torch
 from orion.core import packing
 from orion.core.bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement
+from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement_candidate
+from orion.core.bootstrap_layout_compression import enumerate_bootstrap_aware_layout_refinement_candidates
+from orion.core.bootstrap_layout_compression import restore_layout_policy_compile_plan
 from orion.core.orion import _region_first_mode_options
 from orion.core.orion import scheme
 from orion.core.network_dag import NetworkDAG
@@ -1570,6 +1573,118 @@ def test_bootstrap_aware_refinement_finds_non_adjacent_interval_relayout() -> No
     assert updated_edge["physical_layout"] == "logical_halo_compact"
     assert updated_edge["boot_refinement_reason"] == "boot_interval_native_physical_relayout"
     assert bool(updated_edge["boot_refined_compact_source"]) is True
+
+
+def test_bootstrap_aware_refinement_enumerates_without_applying_and_restores() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 8,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "a->b",
+                "source": "a",
+                "target": "b",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(halo),
+                "selected_layout": dict(halo),
+                "target_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "logical_halo_compact",
+                "target_physical_layout": "native_source_stripe",
+                "relayout": False,
+                "relayout_reason": "native_halo_physical_source_stripe_relayout",
+                "relayout_depth_estimate": 0,
+            },
+            {
+                "edge": "b->c",
+                "source": "b",
+                "target": "c",
+                "op_kind": "silu",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(halo),
+                "selected_layout": dict(halo),
+                "target_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "logical_halo_compact",
+                "source_physical_layout": "logical_halo_compact",
+                "target_physical_layout": "logical_halo_compact",
+                "relayout": False,
+            },
+        ],
+        "node_layouts": [],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(depth=2)),
+        output_node_id="b",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][0]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    module_b = SimpleNamespace(
+        depth=2,
+        solver_depth=2,
+        region_runtime=SimpleNamespace(executor=executor),
+        set_depth=lambda value: setattr(module_b, "depth", int(value)),
+    )
+
+    dag = nx.DiGraph()
+    dag.add_node("a", module=SimpleNamespace(depth=1))
+    dag.add_node("b", module=module_b)
+    dag.add_node("c", module=SimpleNamespace(depth=1))
+    dag.add_node("d", module=SimpleNamespace(depth=1))
+    dag.add_edge("a", "b")
+    dag.add_edge("b", "c")
+    dag.add_edge("c", "d")
+    first_pass_audit = {
+        "bootstrap_count": 1,
+        "boot_edges": [{"source": "c", "target": "d"}],
+    }
+
+    original_plan = dict(executor.compile_plan)
+    enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(dag, first_pass_audit)
+
+    assert enumeration["enabled"] is True
+    assert enumeration["candidate_count"] == 1
+    assert executor.compile_plan == original_plan
+
+    candidate = dict(enumeration["candidates"][0])
+    audit = apply_bootstrap_aware_layout_refinement_candidate(
+        dag,
+        candidate,
+        first_pass_audit=first_pass_audit,
+    )
+
+    assert audit["enabled"] is True
+    assert executor.compile_plan["edge_layouts"][0]["physical_layout"] == "logical_halo_compact"
+    restore_layout_policy_compile_plan(
+        dag,
+        enumeration["previous_compile_plan"],
+        depth_snapshot=enumeration["previous_depths"],
+    )
+    assert executor.compile_plan == original_plan
+    assert module_b.depth == 2
 
 
 def test_bootstrap_aware_refinement_prefers_interval_beta_lift() -> None:

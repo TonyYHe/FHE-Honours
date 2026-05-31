@@ -929,79 +929,27 @@ def _try_apply_beta_lift_candidate(
     return None
 
 
-def apply_bootstrap_aware_layout_refinement(
-    network_dag: Any,
-    first_pass_audit: dict[str, Any],
-) -> dict[str, Any]:
-    """Fuse selected no-share relayouts after a bootstrap solve.
-
-    The DP layout policy remains rotation-only.  This pass only rewrites
-    executable provider boundaries that lie inside a first-pass no-boot
-    interval feeding a bootstrap.  A relayout's depth contribution is interval
-    pressure, not edge-adjacent pressure: any true relayout between the previous
-    bootstrap boundary and the current bootstrap boundary consumes the same
-    level budget.
-    """
-
-    compile_plan = _layout_policy_compile_plan_for_dag(network_dag)
-    if not isinstance(compile_plan, dict):
-        return {"enabled": False, "reason": "no_layout_policy_executors"}
-    if str(compile_plan.get("policy", "")) != "dp_no_share_fold":
-        return {"enabled": False, "reason": "policy_not_dp_no_share_fold"}
-
-    boot_edges = _bootstrap_edge_set(first_pass_audit)
-    if not boot_edges:
-        return {"enabled": False, "reason": "no_first_pass_boot_edges"}
-    intervals = _bootstrap_upstream_intervals(network_dag, first_pass_audit)
-    if not intervals:
-        return {"enabled": False, "reason": "no_bootstrap_intervals"}
-
-    previous_depths = _snapshot_layout_policy_depths(network_dag)
-    actual_native_physical_edges = _actual_native_edge_ids(network_dag)
-
-    for interval in intervals:
-        beta_lift = _try_apply_beta_lift_candidate(
-            network_dag,
-            compile_plan,
-            interval,
-            actual_native_edges=actual_native_physical_edges,
-        )
-        if beta_lift is None:
-            continue
-        updated_plan = dict(beta_lift["plan"])
-        for binding in _iter_layout_policy_bindings(network_dag):
-            executor = binding["executor"]
-            update = getattr(executor, "update_layout_policy_compile_plan", None)
-            if callable(update):
-                update(updated_plan)
-            else:
-                executor.compile_plan = dict(updated_plan)
-        depth_updates = _refresh_layout_policy_depths(
-            network_dag,
-            previous_depths=previous_depths,
-        )
-        true_relayout_count = int(
-            sum(_executor_relayout_depth(binding["executor"]) for binding in _iter_layout_policy_bindings(network_dag))
-        )
-        accepted = [dict(row) for row in beta_lift.get("accepted", [])]
-        audit = {
-            "enabled": True,
-            "policy": str(updated_plan.get("policy", "")),
-            "strategy": "producer_beta_lift",
-            "first_pass_bootstrap_count": int(first_pass_audit.get("bootstrap_count", 0) or 0),
-            "accepted": accepted,
-            "rejected": list(beta_lift.get("rejected", [])),
-            "accepted_count": int(sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)),
-            "rotation_delta": 0,
-            "depth_updates": depth_updates,
-            "true_relayout_kernel_depth_after": int(true_relayout_count),
-            "boot_interval_count": int(len(intervals)),
-            "previous_compile_plan": compile_plan,
-            "previous_depths": previous_depths,
+def _boot_interval_audit_rows(intervals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "boot_edge": {
+                "source": str(interval.get("boot_edge", ("", ""))[0]),
+                "target": str(interval.get("boot_edge", ("", ""))[1]),
+            },
+            "node_count": int(len(interval.get("nodes", set()) or set())),
+            "edge_count": int(len(interval.get("edges", set()) or set())),
         }
-        network_dag.bootstrap_layout_refinement_audit = dict(audit)
-        return audit
+        for interval in intervals
+    ]
 
+
+def _native_physical_relayout_refinement_candidate(
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> dict[str, Any]:
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     edge_layouts: list[dict[str, Any]] = []
@@ -1088,6 +1036,152 @@ def apply_bootstrap_aware_layout_refinement(
         "accepted": accepted,
         "rejected": rejected,
     }
+    return {
+        "enabled": True,
+        "kind": "native_physical_relayout",
+        "strategy": "native_physical_relayout",
+        "plan": updated_plan,
+        "accepted": accepted,
+        "rejected": rejected,
+        "accepted_count": int(len(accepted)),
+        "native_physical_relayout_edge_count": int(len(actual_native_physical_edges)),
+        "boot_interval_count": int(len(intervals)),
+    }
+
+
+def enumerate_bootstrap_aware_layout_refinement_candidates(
+    network_dag: Any,
+    first_pass_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Build boot-aware relayout refinement candidates without applying them.
+
+    The DP layout policy remains rotation-only.  This pass only rewrites
+    executable provider boundaries that lie inside a first-pass no-boot
+    interval feeding a bootstrap.  A relayout's depth contribution is interval
+    pressure, not edge-adjacent pressure: any true relayout between the previous
+    bootstrap boundary and the current bootstrap boundary consumes the same
+    level budget.
+    """
+
+    compile_plan = _layout_policy_compile_plan_for_dag(network_dag)
+    if not isinstance(compile_plan, dict):
+        return {"enabled": False, "reason": "no_layout_policy_executors"}
+    if str(compile_plan.get("policy", "")) != "dp_no_share_fold":
+        return {"enabled": False, "reason": "policy_not_dp_no_share_fold"}
+
+    boot_edges = _bootstrap_edge_set(first_pass_audit)
+    if not boot_edges:
+        return {"enabled": False, "reason": "no_first_pass_boot_edges"}
+    intervals = _bootstrap_upstream_intervals(network_dag, first_pass_audit)
+    if not intervals:
+        return {"enabled": False, "reason": "no_bootstrap_intervals"}
+
+    previous_depths = _snapshot_layout_policy_depths(network_dag)
+    actual_native_physical_edges = _actual_native_edge_ids(network_dag)
+    boot_interval_rows = _boot_interval_audit_rows(intervals)
+
+    candidates: list[dict[str, Any]] = []
+    for interval in intervals:
+        beta_lift = _try_apply_beta_lift_candidate(
+            network_dag,
+            compile_plan,
+            interval,
+            actual_native_edges=actual_native_physical_edges,
+        )
+        if beta_lift is None:
+            continue
+        accepted = [dict(row) for row in beta_lift.get("accepted", [])]
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_beta_lift_{len(candidates) + 1}",
+                "kind": "producer_beta_lift",
+                "strategy": "producer_beta_lift",
+                "plan": dict(beta_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(beta_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": 0,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
+
+    native_candidate = _native_physical_relayout_refinement_candidate(
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    )
+    fallback_rejected = list(native_candidate.get("rejected", []))
+    if bool(native_candidate.get("enabled", False)):
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_native_relayout_{len(candidates) + 1}",
+                "kind": str(native_candidate.get("kind", "native_physical_relayout")),
+                "strategy": str(native_candidate.get("strategy", "native_physical_relayout")),
+                "plan": dict(native_candidate["plan"]),
+                "accepted": list(native_candidate.get("accepted", [])),
+                "rejected": fallback_rejected,
+                "accepted_count": int(native_candidate.get("accepted_count", 0) or 0),
+                "rotation_delta": 0,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
+
+    if not candidates:
+        return {
+            "enabled": False,
+            "reason": str(native_candidate.get("reason", "no_supported_boot_interval_native_physical_relayout")),
+            "rejected": fallback_rejected,
+            "native_physical_relayout_edge_count": int(len(actual_native_physical_edges)),
+            "boot_interval_count": int(len(intervals)),
+            "boot_intervals": boot_interval_rows,
+            "previous_compile_plan": compile_plan,
+            "previous_depths": previous_depths,
+        }
+
+    return {
+        "enabled": True,
+        "policy": str(compile_plan.get("policy", "")),
+        "first_pass_bootstrap_count": int(first_pass_audit.get("bootstrap_count", 0) or 0),
+        "candidate_count": int(len(candidates)),
+        "candidates": candidates,
+        "rejected": fallback_rejected,
+        "native_physical_relayout_edge_count": int(len(actual_native_physical_edges)),
+        "boot_interval_count": int(len(intervals)),
+        "boot_intervals": boot_interval_rows,
+        "previous_compile_plan": compile_plan,
+        "previous_depths": previous_depths,
+    }
+
+
+def apply_bootstrap_aware_layout_refinement_candidate(
+    network_dag: Any,
+    candidate: dict[str, Any],
+    *,
+    first_pass_audit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply one enumerated boot-aware refinement candidate."""
+
+    updated_plan = dict(candidate.get("plan", {}) or {})
+    if not isinstance(updated_plan, dict) or not updated_plan:
+        return {
+            "enabled": False,
+            "reason": "candidate_missing_plan",
+            "candidate_id": str(candidate.get("candidate_id", "")),
+        }
+    compile_plan = _layout_policy_compile_plan_for_dag(network_dag)
+    if not isinstance(compile_plan, dict):
+        return {
+            "enabled": False,
+            "reason": "no_layout_policy_executors",
+            "candidate_id": str(candidate.get("candidate_id", "")),
+        }
+    previous_depths = _snapshot_layout_policy_depths(network_dag)
+    true_relayout_count_before = int(sum(int(row.get("relayout_depth", 0) or 0) for row in previous_depths))
 
     for binding in _iter_layout_policy_bindings(network_dag):
         executor = binding["executor"]
@@ -1100,36 +1194,64 @@ def apply_bootstrap_aware_layout_refinement(
         network_dag,
         previous_depths=previous_depths,
     )
-    true_relayout_count = int(
+    true_relayout_count_after = int(
         sum(_executor_relayout_depth(binding["executor"]) for binding in _iter_layout_policy_bindings(network_dag))
     )
+    accepted = [dict(row) for row in candidate.get("accepted", [])]
     audit = {
         "enabled": True,
         "policy": str(updated_plan.get("policy", "")),
-        "first_pass_bootstrap_count": int(first_pass_audit.get("bootstrap_count", 0) or 0),
+        "candidate_id": str(candidate.get("candidate_id", "")),
+        "kind": str(candidate.get("kind", candidate.get("strategy", ""))),
+        "strategy": str(candidate.get("strategy", candidate.get("kind", ""))),
+        "first_pass_bootstrap_count": int((first_pass_audit or {}).get("bootstrap_count", 0) or 0),
         "accepted": accepted,
-        "rejected": rejected,
-        "accepted_count": int(len(accepted)),
-        "rotation_delta": 0,
+        "rejected": list(candidate.get("rejected", [])),
+        "accepted_count": int(candidate.get("accepted_count", len(accepted)) or 0),
+        "rotation_delta": int(candidate.get("rotation_delta", 0) or 0),
         "depth_updates": depth_updates,
-        "true_relayout_kernel_depth_after": int(true_relayout_count),
-        "boot_interval_count": int(len(intervals)),
-        "boot_intervals": [
-            {
-                "boot_edge": {
-                    "source": str(interval.get("boot_edge", ("", ""))[0]),
-                    "target": str(interval.get("boot_edge", ("", ""))[1]),
-                },
-                "node_count": int(len(interval.get("nodes", set()) or set())),
-                "edge_count": int(len(interval.get("edges", set()) or set())),
-            }
-            for interval in intervals
-        ],
+        "true_relayout_kernel_depth_before": int(true_relayout_count_before),
+        "true_relayout_kernel_depth_after": int(true_relayout_count_after),
+        "boot_interval_count": int(candidate.get("boot_interval_count", 0) or 0),
+        "boot_intervals": list(candidate.get("boot_intervals", [])),
         "previous_compile_plan": compile_plan,
         "previous_depths": previous_depths,
     }
     network_dag.bootstrap_layout_refinement_audit = dict(audit)
     return audit
+
+
+def apply_bootstrap_aware_layout_refinement(
+    network_dag: Any,
+    first_pass_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Compatibility wrapper that applies the first enumerated candidate."""
+
+    enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(
+        network_dag,
+        first_pass_audit,
+    )
+    if not bool(enumeration.get("enabled", False)):
+        network_dag.bootstrap_layout_refinement_audit = dict(enumeration)
+        return enumeration
+    candidates = list(enumeration.get("candidates", []) or [])
+    if not candidates:
+        audit = {
+            **dict(enumeration),
+            "enabled": False,
+            "reason": "no_supported_boot_interval_native_physical_relayout",
+        }
+        network_dag.bootstrap_layout_refinement_audit = dict(audit)
+        return audit
+    audit = apply_bootstrap_aware_layout_refinement_candidate(
+        network_dag,
+        dict(candidates[0]),
+        first_pass_audit=first_pass_audit,
+    )
+    return {
+        **dict(audit),
+        "candidate_count": int(enumeration.get("candidate_count", len(candidates)) or len(candidates)),
+    }
 
 
 def _layout_preserving_module(network_dag: Any, node: str) -> bool:

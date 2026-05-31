@@ -40,9 +40,10 @@ from .auto_bootstrap import collect_bootstrap_solver_audit
 from .auto_bootstrap import reset_bootstrap_solver_assignments
 from .auto_bootstrap import snapshot_bootstrap_solver_assignments
 from .bootstrap_layout_compression import (
-    apply_bootstrap_aware_layout_refinement,
+    apply_bootstrap_aware_layout_refinement_candidate,
     apply_bootstrap_layout_compression,
     bootstrap_aware_layout_refinement_applicable,
+    enumerate_bootstrap_aware_layout_refinement_candidates,
     restore_layout_policy_compile_plan,
 )
 
@@ -965,20 +966,145 @@ class Scheme:
                 rollback_audit: dict[str, Any] | None = None
                 stopped_reason = "max_rounds_reached"
                 for round_index in range(int(max_refinement_rounds)):
-                    refinement_audit = apply_bootstrap_aware_layout_refinement(
+                    candidate_audit = enumerate_bootstrap_aware_layout_refinement_candidates(
                         network_dag,
                         current_audit,
                     )
                     round_audit = {
-                        **dict(refinement_audit),
+                        **dict(candidate_audit),
                         "round": int(round_index + 1),
                         "input_bootstrap_count": int(current_audit.get("bootstrap_count", 0) or 0),
                     }
-                    if not bool(refinement_audit.get("enabled", False)):
+                    if not bool(candidate_audit.get("enabled", False)):
                         refinement_rounds.append(round_audit)
-                        stopped_reason = str(refinement_audit.get("reason", "no_candidates"))
+                        stopped_reason = str(candidate_audit.get("reason", "no_candidates"))
                         break
 
+                    candidates = [dict(row) for row in candidate_audit.get("candidates", [])]
+                    accepted_compile_plan = dict(candidate_audit["previous_compile_plan"])
+                    accepted_depths = list(candidate_audit.get("previous_depths", []))
+                    current_boot_count = int(current_audit.get("bootstrap_count", 0) or 0)
+                    current_relayout_depth = int(
+                        sum(int(row.get("relayout_depth", 0) or 0) for row in accepted_depths)
+                    )
+                    trials: list[dict[str, Any]] = []
+                    best_trial: dict[str, Any] | None = None
+                    best_score: tuple[int, int, int, int, int, int, int, str] | None = None
+                    for candidate in candidates:
+                        try:
+                            trial_apply_audit = apply_bootstrap_aware_layout_refinement_candidate(
+                                network_dag,
+                                candidate,
+                                first_pass_audit=current_audit,
+                            )
+                            reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                            trial_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                            trial_input_level, trial_bootstraps, trial_slots = trial_solver._solve_once(
+                                apply_layout_compression=False
+                            )
+                            trial_final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                            trial_relayout_depth = int(
+                                trial_apply_audit.get(
+                                    "true_relayout_kernel_depth_after",
+                                    current_relayout_depth,
+                                )
+                                or 0
+                            )
+                            trial_boot_count = int(trial_final_audit.get("bootstrap_count", trial_bootstraps) or 0)
+                            boot_delta = int(trial_boot_count - current_boot_count)
+                            depth_delta = int(trial_relayout_depth - current_relayout_depth)
+                            bootstrap_ct_count = int(
+                                sum(
+                                    int(row.get("bootstrap_ct_count", 0) or 0)
+                                    for row in trial_final_audit.get("boot_edges", [])
+                                )
+                            )
+                            bootstrap_slots_total = int(
+                                sum(
+                                    int(row.get("bootstrapper_slots", 0) or 0)
+                                    for row in trial_final_audit.get("boot_edges", [])
+                                )
+                            )
+                            accepted_count_for_score = int(trial_apply_audit.get("accepted_count", 0) or 0)
+                            acceptable = bool(int(boot_delta) <= 0 and int(depth_delta) < 0)
+                            trial_audit = {
+                                **dict(trial_apply_audit),
+                                "accepted": bool(acceptable),
+                                "trial_input_level": int(trial_input_level),
+                                "trial_bootstrap_count": int(trial_boot_count),
+                                "trial_bootstrapper_slots": [int(value) for value in trial_slots],
+                                "boot_delta": int(boot_delta),
+                                "relayout_depth_delta": int(depth_delta),
+                                "trial_boot_edges": list(trial_final_audit.get("boot_edges", [])),
+                            }
+                            trials.append(trial_audit)
+                            if bool(acceptable):
+                                score = (
+                                    int(boot_delta),
+                                    int(depth_delta),
+                                    int(bootstrap_ct_count),
+                                    int(bootstrap_slots_total),
+                                    -int(accepted_count_for_score),
+                                    int(candidate.get("rotation_delta", 0) or 0),
+                                    int(len(trials)),
+                                    str(candidate.get("candidate_id", "")),
+                                )
+                                if best_score is None or score < best_score:
+                                    best_score = score
+                                    best_trial = {
+                                        "candidate": dict(candidate),
+                                        "trial_audit": dict(trial_audit),
+                                        "final_audit": dict(trial_final_audit),
+                                        "input_level": int(trial_input_level),
+                                        "bootstrap_count": int(trial_boot_count),
+                                        "bootstrapper_slots": [int(value) for value in trial_slots],
+                                    }
+                        except Exception as exc:
+                            trials.append(
+                                {
+                                    "candidate_id": str(candidate.get("candidate_id", "")),
+                                    "kind": str(candidate.get("kind", candidate.get("strategy", ""))),
+                                    "accepted": False,
+                                    "rejected": True,
+                                    "reject_reason": "trial_solve_error",
+                                    "error": str(exc),
+                                }
+                            )
+                        finally:
+                            restore_layout_policy_compile_plan(
+                                network_dag,
+                                accepted_compile_plan,
+                                depth_snapshot=accepted_depths,
+                            )
+                            reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+
+                    if best_trial is None:
+                        reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                        restore_layout_policy_compile_plan(
+                            network_dag,
+                            accepted_compile_plan,
+                            depth_snapshot=accepted_depths,
+                        )
+                        stable_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                        input_level, num_bootstraps, bootstrapper_slots = stable_solver._solve_once(
+                            apply_layout_compression=False
+                        )
+                        rollback_audit = {
+                            **dict(round_audit),
+                            "enabled": False,
+                            "rolled_back": True,
+                            "rollback_reason": "no_candidate_improved_boot_safe_relayout_depth",
+                            "trials": trials,
+                        }
+                        refinement_rounds.append(dict(rollback_audit))
+                        stopped_reason = "no_candidate_improved_boot_safe_relayout_depth"
+                        break
+
+                    refinement_audit = apply_bootstrap_aware_layout_refinement_candidate(
+                        network_dag,
+                        dict(best_trial["candidate"]),
+                        first_pass_audit=current_audit,
+                    )
                     reset_bootstrap_solver_assignments(network_dag, level_snapshot)
                     second_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
                     input_level, num_bootstraps, bootstrapper_slots = second_solver._solve_once(
@@ -987,14 +1113,17 @@ class Scheme:
                     final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
                     round_audit = {
                         **round_audit,
+                        **dict(refinement_audit),
+                        "candidate_count": int(candidate_audit.get("candidate_count", len(candidates)) or len(candidates)),
+                        "trials": trials,
                         "final_bootstrap_count": int(final_audit["bootstrap_count"]),
                         "final_boot_edges": list(final_audit.get("boot_edges", [])),
                     }
                     if int(final_audit["bootstrap_count"]) > int(current_audit["bootstrap_count"]):
                         restore_layout_policy_compile_plan(
                             network_dag,
-                            refinement_audit["previous_compile_plan"],
-                            depth_snapshot=refinement_audit.get("previous_depths", []),
+                            accepted_compile_plan,
+                            depth_snapshot=accepted_depths,
                         )
                         reset_bootstrap_solver_assignments(network_dag, level_snapshot)
                         rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
