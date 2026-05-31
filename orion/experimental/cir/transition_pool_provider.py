@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -21,6 +21,9 @@ from orion.experimental.cir.hybrid_schedule import (
     optimize_hybrid_pair_layout,
 )
 from orion.nn.unified_transform import UnifiedTransformGroup
+
+
+_MISSING_ATTR = object()
 
 
 def _delete_ciphertext_ids(scheme: Any, ids: list[int]) -> None:
@@ -59,6 +62,106 @@ def _primary_diag_indices(transform: Any | None) -> tuple[int, ...]:
 
 def _diag_key_stub(diag_indices: Any) -> dict[int, torch.Tensor]:
     return {int(index): torch.empty((0,), dtype=torch.float32) for index in diag_indices}
+
+
+def _layout_physical_beta(layout: dict[str, Any], primary: str, fallback: str, alias: str) -> int:
+    return max(0, int(layout.get(primary, layout.get(fallback, layout.get(alias, 0))) or 0))
+
+
+def _compact_physical_output_fhe_shape(module: Any) -> torch.Size | None:
+    layout = dict(getattr(module, "layout_policy_output_layout", {}) or {})
+    if "physical_top_beta" not in layout or "physical_bottom_beta" not in layout:
+        return None
+    n_batch, channels, height, width = [int(value) for value in getattr(module, "output_shape")]
+    gap = max(1, int(getattr(module, "output_gap", layout.get("gap", 1)) or 1))
+    physical_top = _layout_physical_beta(layout, "physical_top_beta", "top_beta", "alpha")
+    physical_bottom = _layout_physical_beta(layout, "physical_bottom_beta", "bottom_beta", "beta")
+    phase_count = max(1, int(gap) * int(gap))
+    on_channels = int(math.ceil(int(channels) / int(phase_count)))
+    return torch.Size(
+        (
+            int(n_batch),
+            int(on_channels),
+            int(height + physical_top + physical_bottom) * int(gap),
+            int(width) * int(gap),
+        )
+    )
+
+
+def _compact_physical_output_module_attrs(module: Any) -> dict[str, Any] | None:
+    layout = dict(getattr(module, "layout_policy_output_layout", {}) or {})
+    if "physical_top_beta" not in layout or "physical_bottom_beta" not in layout:
+        return None
+    shape = _compact_physical_output_fhe_shape(module)
+    if shape is None:
+        return None
+    gap = max(1, int(getattr(module, "output_gap", layout.get("gap", 1)) or 1))
+    physical_top = _layout_physical_beta(layout, "physical_top_beta", "top_beta", "alpha")
+    physical_bottom = _layout_physical_beta(layout, "physical_bottom_beta", "bottom_beta", "beta")
+    physical_layout = {
+        **layout,
+        "top_beta": int(physical_top),
+        "bottom_beta": int(physical_bottom),
+        "physical_top_beta": int(physical_top),
+        "physical_bottom_beta": int(physical_bottom),
+        "gap": int(gap),
+        "boundary_pruned": False,
+    }
+    physical_layout.pop("alpha", None)
+    physical_layout.pop("beta", None)
+    return {
+        "fhe_output_shape": shape,
+        "layout_policy_output_layout": physical_layout,
+        "layout_policy_output_row_offset": int(physical_top) * int(gap),
+        "layout_policy_output_materialization": (
+            "fused_relayout"
+            if (
+                str(getattr(module, "layout_policy_output_materialization", "") or "") == "fused_relayout"
+                and int(physical_top + physical_bottom) > 0
+            )
+            else ""
+        ),
+    }
+
+
+def _with_compact_physical_output_module_attrs(module: Any, callback: Callable[[], Any]) -> Any:
+    attrs = _compact_physical_output_module_attrs(module)
+    if not attrs:
+        return callback()
+    saved = {name: getattr(module, name, _MISSING_ATTR) for name in attrs}
+    try:
+        for name, value in attrs.items():
+            setattr(module, name, value)
+        return callback()
+    finally:
+        for name, value in saved.items():
+            if value is _MISSING_ATTR:
+                try:
+                    delattr(module, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(module, name, value)
+
+
+def _compact_physical_output_cache_token(module: Any) -> dict[str, Any] | None:
+    attrs = _compact_physical_output_module_attrs(module)
+    if not attrs:
+        return None
+    layout = dict(attrs["layout_policy_output_layout"])
+    return {
+        "version": 1,
+        "fhe_output_shape": [int(value) for value in attrs["fhe_output_shape"]],
+        "layout": {
+            "top_beta": int(layout.get("top_beta", 0) or 0),
+            "bottom_beta": int(layout.get("bottom_beta", 0) or 0),
+            "physical_top_beta": int(layout.get("physical_top_beta", 0) or 0),
+            "physical_bottom_beta": int(layout.get("physical_bottom_beta", 0) or 0),
+            "gap": int(layout.get("gap", getattr(module, "output_gap", 1)) or 1),
+        },
+        "row_offset": int(attrs["layout_policy_output_row_offset"]),
+        "materialization": str(attrs["layout_policy_output_materialization"]),
+    }
 
 
 def _release_single_slot_cache(transform: Any | None) -> None:
@@ -137,7 +240,10 @@ def _conv2d_block_runtime_recipe(module: Any):
     def packed_diagonals():
         packed = cache.get("diagonals")
         if packed is None:
-            packed, _output_rotations = packing.pack_conv2d(module, last=False)
+            packed, _output_rotations = _with_compact_physical_output_module_attrs(
+                module,
+                lambda: packing.pack_conv2d(module, last=False),
+            )
             packed = packing.prune_zero_diagonal_blocks(packed, preserve_empty_rows=True)
             cache["diagonals"] = packed
         return packed
@@ -398,7 +504,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.output_node_id = str(output_node_id)
         self.use_ct_pt_hybrid_packing = bool(use_ct_pt_hybrid_packing)
         self.output_shape = getattr(module, "output_shape")
-        self.fhe_output_shape = getattr(module, "fhe_output_shape")
+        self.fhe_output_shape = _compact_physical_output_fhe_shape(module) or getattr(module, "fhe_output_shape")
         self.groups_by_pair: list[Any] = []
         self.row_indices_by_pair: list[tuple[int, ...]] = []
         self.input_block_pairs: list[tuple[int, int | None]] = []
@@ -447,7 +553,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self._compile_cache_metadata = dict(metadata or {})
 
     def compile_cache_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "kind": self.kernel_kind,
             "rows": int(self.rows),
             "cols": int(self.cols),
@@ -481,10 +587,20 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                 for index, group in enumerate(self.groups_by_pair)
             ],
         }
+        token = _compact_physical_output_cache_token(self.module)
+        if token is not None:
+            metadata["physical_output_pack"] = token
+        return metadata
 
     def _compile_from_cache_metadata(self, scheme: Any) -> bool:
         metadata = dict(self._compile_cache_metadata or {})
         if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
+            return False
+        expected_physical_pack = _compact_physical_output_cache_token(self.module)
+        if expected_physical_pack is None:
+            if "physical_output_pack" in metadata:
+                return False
+        elif metadata.get("physical_output_pack") != expected_physical_pack:
             return False
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         self.rows = int(metadata.get("rows", 0))
@@ -504,7 +620,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_pair_layout_reject_reasons = [
             str(value) for value in metadata.get("hybrid_pair_layout_reject_reasons", [])
         ]
-        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        self.bias_vector = _with_compact_physical_output_module_attrs(
+            self.module,
+            lambda: packing.construct_conv2d_bias(self.module),
+        ).to(dtype=torch.float32)
         level = int(self._level(scheme))
         compile_started = time.perf_counter()
         for group_meta in list(metadata.get("groups", [])):
@@ -584,7 +703,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.rows = int(rows)
         self.cols = int(cols)
         self.output_rotations = 0
-        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        self.bias_vector = _with_compact_physical_output_module_attrs(
+            self.module,
+            lambda: packing.construct_conv2d_bias(self.module),
+        ).to(dtype=torch.float32)
         for group, row_indices, pair, is_complex, _compiled in pending:
             self.groups_by_pair.append(group)
             self.row_indices_by_pair.append(row_indices)
@@ -611,7 +733,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_pair_layout_reject_reasons = []
         self.hybrid_group_reject_reasons = []
         prepare_started = time.perf_counter()
-        diagonals, output_rotations = packing.pack_conv2d(self.module, last=False)
+        diagonals, output_rotations = _with_compact_physical_output_module_attrs(
+            self.module,
+            lambda: packing.pack_conv2d(self.module, last=False),
+        )
         diag_builder_metadata = dict(getattr(self.module, "_last_diag_builder_metadata", {}) or {})
         diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         single_slot = bool(_single_slot_layer_cache_enabled(scheme))
@@ -624,7 +749,10 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.rows = 0 if not keys else max(row for row, _col in keys) + 1
         self.cols = 0 if not keys else max(col for _row, col in keys) + 1
         self.output_rotations = int(output_rotations)
-        self.bias_vector = packing.construct_conv2d_bias(self.module).to(dtype=torch.float32)
+        self.bias_vector = _with_compact_physical_output_module_attrs(
+            self.module,
+            lambda: packing.construct_conv2d_bias(self.module),
+        ).to(dtype=torch.float32)
         slots = int(scheme.params.get_slots())
         level = int(self._level(scheme))
         transforms_by_row_col: dict[tuple[int, int], Any] = {
@@ -949,7 +1077,7 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
         self._conv_bias_plaintext_cache: dict[tuple[int, int], Any] = {}
         self._shortcut_bias_plaintext_cache: dict[tuple[int, int], Any] = {}
         self.output_shape = getattr(conv_module, "output_shape")
-        self.fhe_output_shape = getattr(conv_module, "fhe_output_shape")
+        self.fhe_output_shape = _compact_physical_output_fhe_shape(conv_module) or getattr(conv_module, "fhe_output_shape")
         self.compile_count = 0
         self.assigned_level: int | None = None
         self.assigned_depth: int | None = None
@@ -976,7 +1104,7 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
         self._compile_cache_metadata = dict(metadata or {})
 
     def compile_cache_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "kind": self.kernel_kind,
             "rows": int(self.rows),
             "cols": int(self.cols),
@@ -990,17 +1118,39 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 for index, group in enumerate(self.groups_by_input)
             ],
         }
+        conv_token = _compact_physical_output_cache_token(self.conv_module)
+        shortcut_token = _compact_physical_output_cache_token(self.shortcut_module)
+        if conv_token is not None or shortcut_token is not None:
+            metadata["physical_output_pack"] = {
+                "conv": conv_token,
+                "shortcut": shortcut_token,
+            }
+        return metadata
 
     def _compile_from_cache_metadata(self, scheme: Any) -> bool:
         metadata = dict(self._compile_cache_metadata or {})
         if str(getattr(scheme.params, "get_io_mode", lambda: "none")()).lower() != "load" or not metadata:
             return False
+        conv_token = _compact_physical_output_cache_token(self.conv_module)
+        shortcut_token = _compact_physical_output_cache_token(self.shortcut_module)
+        if conv_token is not None or shortcut_token is not None:
+            expected = {"conv": conv_token, "shortcut": shortcut_token}
+            if metadata.get("physical_output_pack") != expected:
+                return False
+        elif "physical_output_pack" in metadata:
+            return False
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         self.rows = int(metadata.get("rows", 0))
         self.cols = int(metadata.get("cols", 0))
         self.output_rotations = int(metadata.get("output_rotations", 0))
-        self.conv_bias_vector = packing.construct_conv2d_bias(self.conv_module).to(dtype=torch.float32)
-        self.shortcut_bias_vector = packing.construct_conv2d_bias(self.shortcut_module).to(dtype=torch.float32)
+        self.conv_bias_vector = _with_compact_physical_output_module_attrs(
+            self.conv_module,
+            lambda: packing.construct_conv2d_bias(self.conv_module),
+        ).to(dtype=torch.float32)
+        self.shortcut_bias_vector = _with_compact_physical_output_module_attrs(
+            self.shortcut_module,
+            lambda: packing.construct_conv2d_bias(self.shortcut_module),
+        ).to(dtype=torch.float32)
         level = int(self._level(scheme))
         compile_started = time.perf_counter()
         groups = sorted(list(metadata.get("groups", [])), key=lambda item: int(item.get("input_index", 0)))
@@ -1024,8 +1174,14 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             return
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         prepare_started = time.perf_counter()
-        conv_diags, conv_output_rotations = packing.pack_conv2d(self.conv_module, last=False)
-        shortcut_diags, shortcut_output_rotations = packing.pack_conv2d(self.shortcut_module, last=False)
+        conv_diags, conv_output_rotations = _with_compact_physical_output_module_attrs(
+            self.conv_module,
+            lambda: packing.pack_conv2d(self.conv_module, last=False),
+        )
+        shortcut_diags, shortcut_output_rotations = _with_compact_physical_output_module_attrs(
+            self.shortcut_module,
+            lambda: packing.pack_conv2d(self.shortcut_module, last=False),
+        )
         single_slot = bool(_single_slot_layer_cache_enabled(scheme))
         conv_runtime_block_builder, conv_release_runtime_cache = (
             _conv2d_block_runtime_recipe(self.conv_module)
@@ -1100,8 +1256,14 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
         }
         conv_diags.clear()
         shortcut_diags.clear()
-        self.conv_bias_vector = packing.construct_conv2d_bias(self.conv_module).to(dtype=torch.float32)
-        self.shortcut_bias_vector = packing.construct_conv2d_bias(self.shortcut_module).to(dtype=torch.float32)
+        self.conv_bias_vector = _with_compact_physical_output_module_attrs(
+            self.conv_module,
+            lambda: packing.construct_conv2d_bias(self.conv_module),
+        ).to(dtype=torch.float32)
+        self.shortcut_bias_vector = _with_compact_physical_output_module_attrs(
+            self.shortcut_module,
+            lambda: packing.construct_conv2d_bias(self.shortcut_module),
+        ).to(dtype=torch.float32)
         self.last_runtime_timing["prepare_transforms_s"] = float(time.perf_counter() - prepare_started)
 
         compile_started = time.perf_counter()

@@ -71,7 +71,7 @@ from orion.core.auto_bootstrap import snapshot_bootstrap_solver_assignments
 from orion.nn.activation import SiLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
-from orion.nn.operations import Add, Concat
+from orion.nn.operations import Add, Bootstrap, Concat
 from orion.nn.pooling import AvgPool2d
 
 
@@ -3274,6 +3274,68 @@ def test_bootstrap_aware_refinement_rejects_beta_lift_non_conv_native_edge() -> 
     assert audit["reason"] == "no_supported_boot_interval_native_physical_relayout"
 
 
+@pytest.mark.parametrize("single_slot", [False, True])
+def test_input_pair_pool_provider_uses_physical_compact_output_for_pruned_halo(
+    monkeypatch: pytest.MonkeyPatch,
+    single_slot: bool,
+) -> None:
+    if single_slot:
+        monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    else:
+        monkeypatch.delenv("ORION_SINGLE_SLOT_LAYER_CACHE", raising=False)
+    _init_python_scheme("")
+    try:
+        pool = AvgPool2d(kernel_size=2, stride=2, padding=0)
+        pool.init_orion_params()
+        pool.input_shape = torch.Size((1, 8, 8, 8))
+        pool.output_shape = torch.Size((1, 8, 4, 4))
+        pool.fhe_input_shape = torch.Size((1, 8, 8, 8))
+        pool.fhe_output_shape = torch.Size((1, 2, 12, 8))
+        pool.input_gap = 1
+        pool.output_gap = 2
+        pool.layout_policy_output_layout = {
+            "top_beta": 1,
+            "bottom_beta": 1,
+            "physical_top_beta": 0,
+            "physical_bottom_beta": 0,
+            "gap": 2,
+            "boundary_pruned": True,
+        }
+        pool.layout_policy_output_row_offset = 2
+        pool.layout_policy_output_materialization = "fused_relayout"
+        pool.update_params()
+        pool.on_bias = torch.linspace(-0.125, 0.125, steps=8, dtype=torch.float32)
+        pool.set_level(len(scheme.params.get_logq()) - 1)
+
+        executor = InputPairConvRuntimeExecutor(
+            module=pool,
+            output_node_id="pool_pruned_physical",
+            use_ct_pt_hybrid_packing=False,
+        )
+        x = torch.arange(512, dtype=torch.float32).reshape(1, 8, 8, 8) / 37.0 - 4.0
+        out = executor(scheme.encrypt(scheme.encode(x, pool.level)))["pool_pruned_physical"]
+        decoded = out.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+        observed = packing._demultiplex(decoded.to(dtype=torch.float32), 2, 8, 4, 4)
+        expected = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+        expected = expected + pool.on_bias.detach().reshape(1, 8, 1, 1)
+        metadata = executor.compile_cache_metadata()
+
+        assert tuple(int(value) for value in out.on_shape) == (1, 2, 8, 8)
+        assert metadata["physical_output_pack"]["fhe_output_shape"] == [1, 2, 8, 8]
+        assert metadata["physical_output_pack"]["row_offset"] == 0
+        assert metadata["physical_output_pack"]["materialization"] == ""
+        assert tuple(int(value) for value in pool.fhe_output_shape) == (1, 2, 12, 8)
+        assert pool.layout_policy_output_layout["top_beta"] == 1
+        assert pool.layout_policy_output_layout["physical_top_beta"] == 0
+        assert pool.layout_policy_output_materialization == "fused_relayout"
+        assert int(pool.layout_policy_output_row_offset) == 2
+        assert float((observed - expected).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
 def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
     _init_python_scheme("")
     try:
@@ -3306,6 +3368,71 @@ def test_input_pair_pool_provider_fuses_output_beta_relayout() -> None:
 
         assert tuple(int(value) for value in out.on_shape) == (1, 1, 3, 2)
         assert float((observed - expected).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_input_pair_pool_provider_bootstrap_affine_fusion_roundtrips() -> None:
+    _init_python_scheme("")
+    try:
+        pool = AvgPool2d(kernel_size=2, stride=2, padding=0)
+        pool.init_orion_params()
+        pool.input_shape = torch.Size((1, 8, 8, 8))
+        pool.output_shape = torch.Size((1, 8, 4, 4))
+        pool.fhe_input_shape = torch.Size((1, 8, 8, 8))
+        pool.fhe_output_shape = torch.Size((1, 2, 8, 8))
+        pool.input_gap = 1
+        pool.output_gap = 2
+        pool.update_params()
+        pool.set_level(len(scheme.params.get_logq()) - 1)
+        pool.set_depth(1)
+
+        base = InputPairConvRuntimeExecutor(
+            module=pool,
+            output_node_id="pool_boot_fused",
+            use_ct_pt_hybrid_packing=False,
+        )
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=base,
+            output_node_id="pool_boot_fused",
+            compile_plan={"policy": "dp_no_share_fold", "edge_layouts": []},
+        )
+        constant = -0.08674037456512451
+        executor._bootstrap_prescale_fusion = {"scale": 1.0, "bias": constant}
+
+        bootstrapper = Bootstrap(torch.tensor(-1.0), torch.tensor(1.0), int(pool.level) - 1)
+        bootstrapper.scheme = scheme
+        bootstrapper.margin = 1.0
+        bootstrapper.he_mode = True
+        bootstrapper.fhe_input_shape = torch.Size((1, 2, 8, 8))
+        bootstrapper.fit()
+        bootstrapper.constant = float(constant)
+        bootstrapper.prescale = 1.0
+        bootstrapper.postscale = 1.0
+        bootstrapper.compile()
+        bootstrapper.preprocess_fused = True
+        bootstrapper.preprocess_fusion_kind = "producer_affine"
+
+        torch.manual_seed(31)
+        x = torch.randn((1, 8, 8, 8), dtype=torch.float32)
+        out = executor(scheme.encrypt(scheme.encode(x, pool.level)))["pool_boot_fused"]
+        pre_bootstrap = packing._demultiplex(
+            out.decrypt().decode().detach().cpu().to(dtype=torch.float32),
+            2,
+            8,
+            4,
+            4,
+        )
+        booted = bootstrapper(out)
+        decoded = booted.decrypt().decode().detach().cpu().to(dtype=torch.float32)
+        observed = packing._demultiplex(decoded, 2, 8, 4, 4)
+        expected = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+
+        assert executor.last_runtime_io["bootstrap_prescale_fused"] is True
+        assert float(base.bias_vector.abs().max().item()) > 0.0
+        assert float((pre_bootstrap - (expected + float(constant))).abs().max().item()) <= 1.0e-4
+        assert bootstrapper._bootstrap_runtime_profile[-1]["preprocess_fused"] is True
+        assert float((observed - expected).abs().max().item()) <= 1.0e-4
     finally:
         scheme.delete_scheme()
 

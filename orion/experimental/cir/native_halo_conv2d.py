@@ -37,6 +37,7 @@ _COMPACT_OUTPUT_DIAG_SET_CACHE: dict[tuple[Any, ...], tuple[tuple[int, tuple[int
 _PER_STRIPE_FOLD_STRIPES_CACHE: dict[tuple[Any, ...], tuple["NativeHaloStripe", ...]] = {}
 _NATIVE_BSGS_CACHE_MAX_ENTRIES = 20000
 _NATIVE_DIAG_CACHE_MAX_ENTRIES = 50000
+_MISSING_ATTR = object()
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -255,6 +256,19 @@ def _packed_active_slots(channel_count: int, height: int, width: int, gap: int) 
 def _compact_ct_count(channel_count: int, height: int, width: int, gap: int, slots: int) -> int:
     active_slots = _packed_active_slots(int(channel_count), int(height), int(width), int(gap))
     return max(1, _ceil_div(int(active_slots), int(slots)))
+
+
+def _compact_output_fhe_shape_for_spec(spec: "NativeHaloConv2DSpec") -> torch.Size:
+    gap = max(1, int(spec.gap_out))
+    on_channels = _ceil_div(int(spec.c_out), _phase_count(int(gap)))
+    return torch.Size(
+        (
+            1,
+            int(on_channels),
+            int(_spec_physical_output_h(spec)) * int(gap),
+            int(spec.w_out) * int(gap),
+        )
+    )
 
 
 def _layout_top_beta(layout: dict[str, Any], *, default: int = 0) -> int:
@@ -1482,6 +1496,18 @@ def _provider_payload_transform(
     return payload
 
 
+def _single_slot_diag_indices_from_transform(transform: Any) -> tuple[int, ...]:
+    indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
+    values: set[int] = set()
+    if indices_by_block is not None:
+        for diag_indices in dict(indices_by_block or {}).values():
+            values.update(int(value) for value in diag_indices)
+    if not values:
+        for _block_key, block in dict(getattr(transform, "diagonals", {}) or {}).items():
+            values.update(int(value) for value in dict(block or {}).keys())
+    return tuple(sorted(int(value) for value in values))
+
+
 def _make_provider_native_source_transform_from_payload(
     *,
     spec: NativeHaloConv2DSpec,
@@ -1626,8 +1652,10 @@ def _build_conv_transform_batch(
     if not target_groups:
         return []
     workers = _provider_diag_build_workers(len(target_groups))
+    single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme))
     if (
-        int(workers) <= 1
+        bool(single_slot_recipe)
+        or int(workers) <= 1
         or not _provider_diag_builder_enabled()
         or not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE")
         or _provider_diag_builder_shadow()
@@ -3460,7 +3488,62 @@ def _build_conv_transform(
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
     single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
-    if not bool(single_slot_recipe):
+    target_index = (
+        int(compact_target_block)
+        if bool(compact_output)
+        else int(plan.target_block_index(stripe, int(target_group)))
+    )
+    source_index = int(plan.source_block_index(stripe, int(source_group)))
+
+    def build_all_native_source_blocks(
+        *,
+        spec=spec,
+        plan=plan,
+        weight=weight,
+        weight_np=weight_np,
+        stripe=stripe,
+        source_group=int(source_group),
+        target_group=int(target_group),
+        level=int(level),
+        scheme=scheme,
+        group_n1=int(group_n1),
+        compact_target_block=compact_target_block,
+        target_index=int(target_index),
+        source_index=int(source_index),
+    ) -> dict[tuple[int, int], dict[int, Any]]:
+        rebuilt = _build_conv_transform(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            weight_np=weight_np,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            group_n1=int(group_n1),
+            compact_target_block=compact_target_block,
+            force_payload=True,
+        )
+        if rebuilt is None:
+            return {}
+        block = _transform_payload_block(
+            rebuilt,
+            slots=int(slots),
+            context=(
+                f"{spec.family_label} native-source single-slot payload rebuild "
+                f"source_index={int(source_index)} target_index={int(target_index)}"
+            ),
+        )
+        return {(int(target_index), int(source_index)): block} if block else {}
+
+    single_slot_cpp_metadata_enabled = (
+        _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA")
+        if bool(compact_output)
+        else _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA")
+    )
+    cpp_transform = _CPP_DIAG_BUILDER_FALLBACK
+    if not bool(single_slot_recipe) or bool(single_slot_cpp_metadata_enabled):
         cpp_transform = _cpp_provider_native_source_transform(
             spec=spec,
             plan=plan,
@@ -3480,8 +3563,64 @@ def _build_conv_transform(
                 else "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE"
             ),
         )
-        if cpp_transform is not _CPP_DIAG_BUILDER_FALLBACK:
-            return cpp_transform
+    if cpp_transform is not _CPP_DIAG_BUILDER_FALLBACK:
+        if cpp_transform is None:
+            return None
+        if bool(single_slot_recipe):
+            diag_indices = _single_slot_diag_indices_from_transform(cpp_transform)
+            if not diag_indices:
+                return None
+            cache = diagonal_cache or _BlockDiagonalCache(build_all_native_source_blocks)
+
+            def build_diagonals(
+                *,
+                cache=cache,
+                target_index=int(target_index),
+                source_index=int(source_index),
+            ):
+                block = cache.get_required(
+                    int(target_index),
+                    int(source_index),
+                    context=(
+                        f"{spec.family_label} native-source source_index={int(source_index)} "
+                        f"target_index={int(target_index)}"
+                    ),
+                )
+                return {(0, 0): block}
+
+            baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_indices), slots=int(slots), n1=int(group_n1))
+            metadata = dict(getattr(cpp_transform, "_diag_builder_metadata", {}) or {})
+            metadata["diag_builder_single_slot_metadata_only"] = True
+            transform = SimpleNamespace(
+                name=(
+                    f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+                    f"_tgt{int(target_group)}"
+                    + ("" if not bool(compact_output) else f"_compact{int(compact_target_block)}")
+                ),
+                diagonals={},
+                _single_slot_diag_indices_by_block={(0, 0): tuple(int(value) for value in diag_indices)},
+                _single_slot_build_diagonals=build_diagonals,
+                level=int(level),
+                scheme=scheme,
+                fhe_output_shape=torch.Size([1, int(slots)]),
+                output_shape=torch.Size([1, int(slots)]),
+                target_index=int(target_index),
+                input_id=f"native_source_tile_{int(source_index)}",
+                selected_n1=int(group_n1),
+                baby_shifts=tuple(sorted(int(value) for value in baby)),
+                giant_shifts=tuple(sorted(int(value) for value in giant)),
+                rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+                rotation_cost_owner=bool(
+                    int(target_group) == 0
+                    and (not bool(compact_output) or int(compact_target_block) == 0)
+                ),
+                _single_slot_diagonal_cache=cache,
+                _single_slot_release_diagonal_cache=cache.release,
+            )
+            setattr(transform, "_diag_builder_metadata", metadata)
+            del cpp_transform
+            return transform
+        return cpp_transform
     source_tile = int(plan.source_tile_for_stripe(stripe))
     target_tile = int(plan.target_tile_for_stripe(stripe))
     source_start = int(source_group) * int(source_tile)
@@ -3631,12 +3770,6 @@ def _build_conv_transform(
         return None
     diag_indices = torch.div(keys, int(slots), rounding_mode="floor").to(dtype=torch.int64)
     output_slots = torch.remainder(keys, int(slots)).to(dtype=torch.int64)
-    target_index = (
-        int(compact_target_block)
-        if bool(compact_output)
-        else int(plan.target_block_index(stripe, int(target_group)))
-    )
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
     diag_set = set(int(value) for value in torch.unique_consecutive(diag_indices).tolist())
     if not diag_set:
         return None
@@ -3644,47 +3777,7 @@ def _build_conv_transform(
     if bool(single_slot_recipe):
         cache = diagonal_cache
         if cache is None:
-            def build_all_blocks(
-                *,
-                spec=spec,
-                plan=plan,
-                weight=weight,
-                stripe=stripe,
-                source_group=int(source_group),
-                target_group=int(target_group),
-                level=int(level),
-                scheme=scheme,
-                group_n1=int(group_n1),
-                compact_target_block=compact_target_block,
-                target_index=int(target_index),
-                source_index=int(source_index),
-            ) -> dict[tuple[int, int], dict[int, Any]]:
-                rebuilt = _build_conv_transform(
-                    spec=spec,
-                    plan=plan,
-                    weight=weight,
-                    stripe=stripe,
-                    source_group=int(source_group),
-                    target_group=int(target_group),
-                    level=int(level),
-                    scheme=scheme,
-                    group_n1=int(group_n1),
-                    compact_target_block=compact_target_block,
-                    force_payload=True,
-                )
-                if rebuilt is None:
-                    return {}
-                block = _transform_payload_block(
-                    rebuilt,
-                    slots=int(slots),
-                    context=(
-                        f"{spec.family_label} native-source single-slot payload rebuild "
-                        f"source_index={int(source_index)} target_index={int(target_index)}"
-                    ),
-                )
-                return {(int(target_index), int(source_index)): block} if block else {}
-
-            cache = _BlockDiagonalCache(build_all_blocks)
+            cache = _BlockDiagonalCache(build_all_native_source_blocks)
 
         def build_diagonals(
             *,
@@ -3833,13 +3926,58 @@ def _build_conv_transforms_for_compact_output(
     if source_count <= 0 or target_count <= 0:
         return []
     single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
+    source_index = int(plan.source_block_index(stripe, int(source_group)))
+
+    def build_all_compact_output_blocks(
+        *,
+        spec=spec,
+        plan=plan,
+        weight=weight,
+        stripe=stripe,
+        source_group=int(source_group),
+        target_group=int(target_group),
+        level=int(level),
+        scheme=scheme,
+        group_n1=int(group_n1),
+        source_index=int(source_index),
+    ) -> dict[tuple[int, int], dict[int, Any]]:
+        rebuilt = _build_conv_transforms_for_compact_output(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            level=int(level),
+            scheme=scheme,
+            group_n1=int(group_n1),
+            force_payload=True,
+        )
+        blocks: dict[tuple[int, int], dict[int, Any]] = {}
+        for rebuilt_target, rebuilt_transform in rebuilt:
+            block = _transform_payload_block(
+                rebuilt_transform,
+                slots=int(slots),
+                context=(
+                    f"{spec.family_label} native-source compact-output single-slot payload rebuild "
+                    f"source_index={int(source_index)} target_block={int(rebuilt_target)}"
+                ),
+            )
+            if block:
+                blocks[(int(rebuilt_target), int(source_index))] = block
+        return blocks
+
     if (
         _provider_diag_builder_enabled()
         and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT")
         and not _provider_diag_builder_shadow()
-        and not bool(single_slot_recipe)
+        and (
+            not bool(single_slot_recipe)
+            or _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA")
+        )
     ):
         transforms: list[tuple[int, Any]] = []
+        diagonal_cache = _BlockDiagonalCache(build_all_compact_output_blocks) if bool(single_slot_recipe) else None
         for target_block in range(int(_compact_ct_count(int(spec.c_out), _spec_physical_output_h(spec), int(spec.w_out), int(spec.gap_out), int(slots)))):
             built = _cpp_provider_native_source_transform(
                 spec=spec,
@@ -3858,6 +3996,77 @@ def _build_conv_transforms_for_compact_output(
             if built is _CPP_DIAG_BUILDER_FALLBACK:
                 break
             if built is not None:
+                if bool(single_slot_recipe):
+                    diag_indices_by_block = dict(getattr(built, "_single_slot_diag_indices_by_block", {}) or {})
+                    diag_indices = tuple(
+                        sorted(
+                            set(
+                                int(value)
+                                for value in diag_indices_by_block.get((0, 0), ())
+                            )
+                        )
+                    )
+                    if not diag_indices:
+                        diag_indices = tuple(
+                            sorted(
+                                int(value)
+                                for value in dict(
+                                    (dict(getattr(built, "diagonals", {}) or {}).get((0, 0), {}) or {})
+                                ).keys()
+                            )
+                        )
+                    if not diag_indices:
+                        continue
+                    baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_indices), slots=int(slots), n1=int(group_n1))
+
+                    def build_diagonals(
+                        *,
+                        target_block=int(target_block),
+                        source_index=int(source_index),
+                        diagonal_cache=diagonal_cache,
+                    ):
+                        if diagonal_cache is None:
+                            return {}
+                        block = diagonal_cache.get_required(
+                            int(target_block),
+                            int(source_index),
+                            context=(
+                                f"{spec.family_label} native-source compact-output "
+                                f"source_index={int(source_index)} target_block={int(target_block)}"
+                            ),
+                        )
+                        return {(0, 0): block}
+
+                    transform = SimpleNamespace(
+                        name=(
+                            f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+                            f"_tgt{int(target_group)}_compact{int(target_block)}"
+                        ),
+                        diagonals={},
+                        _single_slot_diag_indices_by_block={(0, 0): diag_indices},
+                        _single_slot_build_diagonals=build_diagonals,
+                        level=int(level),
+                        scheme=scheme,
+                        fhe_output_shape=torch.Size([1, int(slots)]),
+                        output_shape=torch.Size([1, int(slots)]),
+                        target_index=int(target_block),
+                        input_id=f"native_source_tile_{int(source_index)}",
+                        selected_n1=int(group_n1),
+                        baby_shifts=tuple(sorted(int(value) for value in baby)),
+                        giant_shifts=tuple(sorted(int(value) for value in giant)),
+                        rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+                        rotation_cost_owner=bool(int(target_group) == 0 and int(target_block) == 0),
+                        _single_slot_diagonal_cache=diagonal_cache,
+                        _single_slot_release_diagonal_cache=(
+                            diagonal_cache.release if diagonal_cache is not None else None
+                        ),
+                    )
+                    metadata = dict(getattr(built, "_diag_builder_metadata", {}) or {})
+                    metadata["diag_builder_single_slot_metadata_only"] = True
+                    setattr(transform, "_diag_builder_metadata", metadata)
+                    transforms.append((int(target_block), transform))
+                    del built
+                    continue
                 transforms.append((int(target_block), built))
         else:
             return transforms
@@ -3970,48 +4179,8 @@ def _build_conv_transforms_for_compact_output(
                     value_parts_by_block.setdefault(int(block), []).append(flat_values[pair_mask])
 
     transforms: list[tuple[int, Any]] = []
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
     diagonal_cache: _BlockDiagonalCache | None = None
     if bool(single_slot_recipe):
-        def build_all_compact_output_blocks(
-            *,
-            spec=spec,
-            plan=plan,
-            weight=weight,
-            stripe=stripe,
-            source_group=int(source_group),
-            target_group=int(target_group),
-            level=int(level),
-            scheme=scheme,
-            group_n1=int(group_n1),
-            source_index=int(source_index),
-        ) -> dict[tuple[int, int], dict[int, Any]]:
-            rebuilt = _build_conv_transforms_for_compact_output(
-                spec=spec,
-                plan=plan,
-                weight=weight,
-                stripe=stripe,
-                source_group=int(source_group),
-                target_group=int(target_group),
-                level=int(level),
-                scheme=scheme,
-                group_n1=int(group_n1),
-                force_payload=True,
-            )
-            blocks: dict[tuple[int, int], dict[int, Any]] = {}
-            for rebuilt_target, rebuilt_transform in rebuilt:
-                block = _transform_payload_block(
-                    rebuilt_transform,
-                    slots=int(slots),
-                    context=(
-                        f"{spec.family_label} native-source compact-output single-slot payload rebuild "
-                        f"source_index={int(source_index)} target_block={int(rebuilt_target)}"
-                    ),
-                )
-                if block:
-                    blocks[(int(rebuilt_target), int(source_index))] = block
-            return blocks
-
         diagonal_cache = _BlockDiagonalCache(build_all_compact_output_blocks)
 
     for target_block in sorted(key_parts_by_block):
@@ -4694,8 +4863,7 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def runtime_native_fhe_output_shape(self) -> torch.Size:
         if self._uses_tight_compact_output():
-            if self.fhe_output_shape is not None:
-                return torch.Size(self.fhe_output_shape)
+            return _compact_output_fhe_shape_for_spec(self.native_plan.spec)
         return torch.Size([int(self.rows), int(self.slots)])
 
     def _runtime_spec(self) -> NativeHaloConv2DSpec:
@@ -5131,6 +5299,56 @@ class NativeHaloStripeNoRIConvExecutor:
         self.last_runtime_timing["compiled_group_count"] = float(len(self.runtime_groups))
         return True
 
+    def _compact_physical_output_module_attrs(self) -> dict[str, Any]:
+        spec = self.native_plan.spec
+        gap = max(1, int(spec.gap_out))
+        physical_top = max(0, int(spec.output_physical_top_beta or 0))
+        physical_bottom = max(0, int(spec.output_physical_bottom_beta or 0))
+        existing = dict(getattr(self.module, "layout_policy_output_layout", {}) or {})
+        layout = {
+            **existing,
+            "top_beta": int(physical_top),
+            "bottom_beta": int(physical_bottom),
+            "physical_top_beta": int(physical_top),
+            "physical_bottom_beta": int(physical_bottom),
+            "gap": int(gap),
+            "boundary_pruned": False,
+        }
+        layout.pop("alpha", None)
+        layout.pop("beta", None)
+        return {
+            "fhe_output_shape": _compact_output_fhe_shape_for_spec(spec),
+            "layout_policy_output_layout": layout,
+            "layout_policy_output_row_offset": int(physical_top * gap),
+            "layout_policy_output_materialization": (
+                "fused_relayout"
+                if (
+                    str(getattr(self.module, "layout_policy_output_materialization", "") or "") == "fused_relayout"
+                    and int(physical_top + physical_bottom) > 0
+                )
+                else ""
+            ),
+        }
+
+    def _with_compact_physical_output_module_attrs(self, callback: Callable[[], Any]) -> Any:
+        if not self._uses_tight_compact_output():
+            return callback()
+        attrs = self._compact_physical_output_module_attrs()
+        saved = {name: getattr(self.module, name, _MISSING_ATTR) for name in attrs}
+        try:
+            for name, value in attrs.items():
+                setattr(self.module, name, value)
+            return callback()
+        finally:
+            for name, value in saved.items():
+                if value is _MISSING_ATTR:
+                    try:
+                        delattr(self.module, name)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(self.module, name, value)
+
     def _compile_compact_source_layout_diagonals(
         self,
         scheme: Any,
@@ -5145,19 +5363,23 @@ class NativeHaloStripeNoRIConvExecutor:
             weight = packing.resolve_grouped_conv(self.module)
         single_slot = bool(_single_slot_layer_cache_enabled_for_scheme(scheme))
         if bool(single_slot):
-            diagonals, output_rotations = packing.pack_conv2d_diagonal_indices(
-                self.module,
-                False,
-                allow_hybrid=False,
+            diagonals, output_rotations = self._with_compact_physical_output_module_attrs(
+                lambda: packing.pack_conv2d_diagonal_indices(
+                    self.module,
+                    False,
+                    allow_hybrid=False,
+                )
             )
         else:
-            diagonals, output_rotations = packing.direct_diagonalize_conv2d(
-                self.module,
-                weight,
-                int(self.slots),
-                str(scheme.params.get_embedding_method()),
-                False,
-                allow_hybrid=False,
+            diagonals, output_rotations = self._with_compact_physical_output_module_attrs(
+                lambda: packing.direct_diagonalize_conv2d(
+                    self.module,
+                    weight,
+                    int(self.slots),
+                    str(scheme.params.get_embedding_method()),
+                    False,
+                    allow_hybrid=False,
+                )
             )
             diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         self.last_runtime_timing["build_transform_s"] = float(
@@ -5166,10 +5388,38 @@ class NativeHaloStripeNoRIConvExecutor:
         if int(output_rotations) != 0:
             raise RuntimeError("compact-source provider diagonal generator does not support hybrid output rotations")
 
+        shared_payload_cache: _BlockDiagonalCache | None = None
+        if bool(single_slot) and _env_enabled("ORION_SINGLE_SLOT_COMPACT_SOURCE_SHARED_PAYLOAD_CACHE"):
+            def build_all_compact_source_blocks() -> dict[tuple[int, int], dict[int, Any]]:
+                packed, runtime_output_rotations = self._with_compact_physical_output_module_attrs(
+                    lambda: packing.direct_diagonalize_conv2d(
+                        self.module,
+                        weight,
+                        int(self.slots),
+                        str(scheme.params.get_embedding_method()),
+                        False,
+                        allow_hybrid=False,
+                    )
+                )
+                if int(runtime_output_rotations) != 0:
+                    raise RuntimeError(
+                        "compact-source provider diagonal generator does not support hybrid output rotations"
+                    )
+                blocks: dict[tuple[int, int], dict[int, Any]] = {}
+                for (target_block, source_block), block in dict(packed).items():
+                    block_map = dict(block or {})
+                    if block_map:
+                        blocks[(int(target_block), int(source_block))] = block_map
+                return blocks
+
+            shared_payload_cache = _BlockDiagonalCache(build_all_compact_source_blocks)
+
         diagonal_cache_by_source: dict[int, _BlockDiagonalCache] = {}
 
         def source_diagonal_cache(source_index: int) -> _BlockDiagonalCache:
             source_index = int(source_index)
+            if shared_payload_cache is not None:
+                return shared_payload_cache
             cache = diagonal_cache_by_source.get(int(source_index))
             if cache is not None:
                 return cache
@@ -5178,23 +5428,24 @@ class NativeHaloStripeNoRIConvExecutor:
                 *,
                 source_index=source_index,
             ) -> dict[tuple[int, int], dict[int, Any]]:
-                packed, runtime_output_rotations = packing.direct_diagonalize_conv2d(
-                    self.module,
-                    weight,
-                    int(self.slots),
-                    str(scheme.params.get_embedding_method()),
-                    False,
-                    allow_hybrid=False,
+                requested_blocks = tuple(
+                    (int(target_index), int(source_index))
+                    for target_index in range(int(self.rows))
                 )
-                if int(runtime_output_rotations) != 0:
-                    raise RuntimeError(
-                        "compact-source provider diagonal generator does not support hybrid output rotations"
+                packed = self._with_compact_physical_output_module_attrs(
+                    lambda: packing.pack_conv2d_blocks(
+                        self.module,
+                        False,
+                        requested_blocks,
+                        allow_hybrid=False,
                     )
+                )
                 blocks: dict[tuple[int, int], dict[int, Any]] = {}
-                for (target_block, source_block), block in dict(packed).items():
-                    if int(source_block) != int(source_index):
-                        continue
+                for target_block, source_block in requested_blocks:
+                    block = dict(packed).get((int(target_block), int(source_block)), {})
                     block_map = dict(block or {})
+                    if not block_map:
+                        block_map = {0: torch.zeros((int(self.slots),), dtype=torch.float32)}
                     if block_map:
                         blocks[(int(target_block), int(source_block))] = block_map
                 return blocks

@@ -424,6 +424,33 @@ class Conv2d(LinearTransform):
     def _concat_layout_bottom_beta(self, layout: dict) -> int:
         return max(0, int(dict(layout).get("bottom_beta", dict(layout).get("beta", 0)) or 0))
 
+    def _concat_layout_physical_top_beta(self, layout: dict) -> int:
+        values = dict(layout)
+        return max(0, int(values.get("physical_top_beta", values.get("top_beta", values.get("alpha", 0))) or 0))
+
+    def _concat_layout_physical_bottom_beta(self, layout: dict) -> int:
+        values = dict(layout)
+        return max(0, int(values.get("physical_bottom_beta", values.get("bottom_beta", values.get("beta", 0))) or 0))
+
+    def _concat_has_explicit_physical_beta(self, layout: dict) -> bool:
+        values = dict(layout)
+        return "physical_top_beta" in values and "physical_bottom_beta" in values
+
+    def _concat_effective_physical_layout(self, layout: dict) -> dict:
+        values = dict(layout)
+        if not self._concat_has_explicit_physical_beta(values):
+            return values
+        physical_top = self._concat_layout_physical_top_beta(values)
+        physical_bottom = self._concat_layout_physical_bottom_beta(values)
+        values.pop("alpha", None)
+        values.pop("beta", None)
+        values["top_beta"] = int(physical_top)
+        values["bottom_beta"] = int(physical_bottom)
+        values["physical_top_beta"] = int(physical_top)
+        values["physical_bottom_beta"] = int(physical_bottom)
+        values["boundary_pruned"] = False
+        return values
+
     def _concat_layout_policy_module_attrs(self) -> dict:
         runtime = getattr(self, "region_runtime", None)
         executor = getattr(runtime, "executor", None)
@@ -532,23 +559,32 @@ class Conv2d(LinearTransform):
         )
         output_layout = dict(lifted_output_layout or module_layout or attrs.get("layout_policy_output_layout", {}) or {})
         output_gap = max(1, int(output_layout.get("gap", getattr(self, "output_gap", 1)) or 1))
-        output_top_beta = self._concat_layout_top_beta(output_layout)
-        output_bottom_beta = self._concat_layout_bottom_beta(output_layout)
+        effective_output_layout = self._concat_effective_physical_layout(output_layout)
+        shape_top_beta = self._concat_layout_top_beta(effective_output_layout)
+        shape_bottom_beta = self._concat_layout_bottom_beta(effective_output_layout)
         if lifted_output_layout:
-            output_row_offset = int(output_top_beta * output_gap)
+            output_row_offset = int(shape_top_beta * output_gap)
         else:
             output_row_offset = getattr(self, "layout_policy_output_row_offset", None)
         if output_row_offset is None:
-            output_row_offset = attrs.get("layout_policy_output_row_offset", int(output_top_beta * output_gap))
+            output_row_offset = attrs.get("layout_policy_output_row_offset", int(shape_top_beta * output_gap))
         output_materialization = getattr(self, "layout_policy_output_materialization", None)
         if output_materialization is None:
             output_materialization = attrs.get("layout_policy_output_materialization", "")
         if lifted_output_layout:
             output_materialization = "fused_relayout"
+        if (
+            self._concat_has_explicit_physical_beta(output_layout)
+            and str(output_materialization or "") == "fused_relayout"
+            and int(shape_top_beta + shape_bottom_beta) == 0
+        ):
+            output_materialization = ""
         result = {
-            "layout_policy_output_layout": dict(output_layout),
+            "layout_policy_output_layout": dict(effective_output_layout),
             "layout_policy_output_row_offset": int(output_row_offset or 0),
             "layout_policy_output_materialization": str(output_materialization or ""),
+            "_semantic_output_top_beta": self._concat_layout_top_beta(output_layout),
+            "_semantic_output_bottom_beta": self._concat_layout_bottom_beta(output_layout),
         }
         if lifted_output_layout:
             n, channels, height, width = (int(value) for value in self.output_shape)
@@ -557,7 +593,7 @@ class Conv2d(LinearTransform):
                 (
                     int(n),
                     int(on_channels),
-                    int(height * output_gap + (output_top_beta + output_bottom_beta) * output_gap),
+                    int(height * output_gap + (shape_top_beta + shape_bottom_beta) * output_gap),
                     int(width * output_gap),
                 )
             )
@@ -605,8 +641,9 @@ class Conv2d(LinearTransform):
             return torch.Size(spec["fhe_shape"])
         n, channels, height, width = (int(value) for value in spec["shape"])
         gap = max(1, int(dict(layout).get("gap", int(spec["gap"])) or int(spec["gap"])))
-        top_beta = self._concat_layout_top_beta(layout)
-        bottom_beta = self._concat_layout_bottom_beta(layout)
+        effective_layout = self._concat_effective_physical_layout(layout)
+        top_beta = self._concat_layout_top_beta(effective_layout)
+        bottom_beta = self._concat_layout_bottom_beta(effective_layout)
         on_channels = int(math.ceil(int(channels) / float(gap * gap)))
         return torch.Size(
             (
@@ -624,7 +661,7 @@ class Conv2d(LinearTransform):
         output_layout_attrs = dict(output_attrs)
         output_layout_attrs.pop("fhe_output_shape", None)
         input_gap = max(1, int(dict(input_layout).get("gap", int(spec["gap"])) or int(spec["gap"])))
-        input_top_beta = self._concat_layout_top_beta(input_layout)
+        input_top_beta = self._concat_layout_physical_top_beta(input_layout)
         return SimpleNamespace(
             name=str(name),
             scheme=self.scheme,
@@ -705,6 +742,8 @@ class Conv2d(LinearTransform):
             _build_compact_source_conv_transform,
             _build_compact_source_concat_transforms_single_slot,
             _layout_bottom_beta,
+            _layout_physical_bottom_beta,
+            _layout_physical_top_beta,
             _layout_top_beta,
             _retune_transform_group_bsgs,
             native_halo_conv2d_plan,
@@ -717,8 +756,10 @@ class Conv2d(LinearTransform):
         effective_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
         target_ct_count = int(self._concat_output_ct_count())
         output_layout = dict(output_attrs.get("layout_policy_output_layout", {}) or {})
-        output_top_beta = int(_layout_top_beta(output_layout))
-        output_bottom_beta = int(_layout_bottom_beta(output_layout))
+        output_top_beta = int(output_attrs.get("_semantic_output_top_beta", _layout_top_beta(output_layout)) or 0)
+        output_bottom_beta = int(output_attrs.get("_semantic_output_bottom_beta", _layout_bottom_beta(output_layout)) or 0)
+        output_physical_top_beta = int(_layout_physical_top_beta(output_layout))
+        output_physical_bottom_beta = int(_layout_physical_bottom_beta(output_layout))
 
         self._concat_unified_groups_by_input = []
         self._concat_unified_targets_by_input = []
@@ -747,6 +788,8 @@ class Conv2d(LinearTransform):
             input_gap = max(1, int(dict(input_layout).get("gap", int(concat_spec["gap"])) or int(concat_spec["gap"])))
             input_top_beta = int(_layout_top_beta(input_layout))
             input_bottom_beta = int(_layout_bottom_beta(input_layout))
+            input_physical_top_beta = int(_layout_physical_top_beta(input_layout))
+            input_physical_bottom_beta = int(_layout_physical_bottom_beta(input_layout))
             source_fhe_shape = self._concat_source_fhe_shape(concat_spec, input_layout)
             source_ct_count = max(1, int(math.ceil(int(torch.Size(source_fhe_shape).numel()) / float(slots))))
             n, channels, height, width = (int(value) for value in concat_spec["shape"])
@@ -777,6 +820,10 @@ class Conv2d(LinearTransform):
                 input_bottom_beta=int(input_bottom_beta),
                 output_top_beta=int(output_top_beta),
                 output_bottom_beta=int(output_bottom_beta),
+                input_physical_top_beta=int(input_physical_top_beta),
+                input_physical_bottom_beta=int(input_physical_bottom_beta),
+                output_physical_top_beta=int(output_physical_top_beta),
+                output_physical_bottom_beta=int(output_physical_bottom_beta),
             )
             plan = native_halo_conv2d_plan(native_spec, require_native_target_fit=False)
 

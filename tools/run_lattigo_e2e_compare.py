@@ -1507,10 +1507,55 @@ def _layer_mae_native_halo_executor(module: torch.nn.Module) -> Any | None:
     return base
 
 
+def _layer_mae_native_halo_expected_ct_count(executor: Any) -> int:
+    plan = executor.native_plan
+    max_block_index = -1
+    for stripe in plan.stripes:
+        for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+            max_block_index = max(
+                int(max_block_index),
+                int(plan.target_block_index(stripe, int(target_group))),
+            )
+    return int(max_block_index + 1)
+
+
+def _layer_mae_output_relayout_present(module: Any, executor: Any | None = None) -> bool:
+    runtime = getattr(module, "region_runtime", None)
+    wrapper = getattr(runtime, "executor", None) if runtime is not None else None
+    for owner in (wrapper, executor):
+        if owner is None:
+            continue
+        if getattr(owner, "output_relayout_kernel", None) is not None:
+            return True
+        if tuple(getattr(owner, "output_relayout_rows", ()) or ()):
+            return True
+        if tuple(getattr(owner, "output_relayout_kernels", ()) or ()):
+            return True
+    return False
+
+
+def _layer_mae_should_decode_native_halo_output(executor: Any | None, value: CipherTensor) -> bool:
+    if executor is None:
+        return False
+    module = getattr(executor, "module", None)
+    materialization = str(getattr(module, "layout_policy_output_materialization", "") or "")
+    if materialization and materialization not in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+        return False
+    if _layer_mae_output_relayout_present(module, executor):
+        return False
+    return int(len(getattr(value, "ids", ()) or ())) == int(_layer_mae_native_halo_expected_ct_count(executor))
+
+
 def _layer_mae_decode_native_halo_output(decoded: torch.Tensor, executor: Any) -> torch.Tensor:
     plan = executor.native_plan
     spec = plan.spec
     values = _layer_mae_tensor(decoded).reshape(-1)
+    expected_values = int(_layer_mae_native_halo_expected_ct_count(executor)) * int(spec.slot_count)
+    if int(values.numel()) < int(expected_values):
+        raise RuntimeError(
+            "native halo stripe decode expected at least "
+            f"{int(expected_values)} slots, got {int(values.numel())}"
+        )
     result = torch.zeros(
         (1, int(spec.c_out), int(spec.h_out), int(spec.w_out)),
         dtype=torch.float32,
@@ -1543,25 +1588,140 @@ def _layer_mae_decode_native_halo_output(decoded: torch.Tensor, executor: Any) -
                             + int(w_index) * int(gap)
                             + int(phase_w)
                         )
-                        if int(slot) < int(values.numel()):
-                            result[0, int(channel), int(global_h), int(w_index)] = values[int(slot)]
+                        if int(slot) >= int(values.numel()):
+                            raise RuntimeError(
+                                "native halo stripe decode target slot out of range: "
+                                f"slot={int(slot)} values={int(values.numel())}"
+                            )
+                        result[0, int(channel), int(global_h), int(w_index)] = values[int(slot)]
     return result
 
 
-def _layer_mae_decode_cipher_output(module: torch.nn.Module, value: CipherTensor) -> torch.Tensor:
-    plain = value.decrypt()
+def _layer_mae_decode_plain_raw(plain: Any) -> torch.Tensor:
+    values: list[float] = []
+    backend = getattr(plain, "backend", None)
+    decode = getattr(backend, "Decode", None)
+    if not callable(decode):
+        return _layer_mae_tensor(plain.decode()).reshape(-1)
+    for plaintext_id in getattr(plain, "ids", ()) or ():
+        values.extend(decode(int(plaintext_id)))
+    return torch.tensor(values, dtype=torch.float32)
+
+
+def _layer_mae_shape_numel(shape: Any) -> int | None:
+    if shape is None:
+        return None
     try:
-        decoded = plain.decode()
+        return int(torch.Size(tuple(int(v) for v in tuple(shape))).numel())
+    except Exception:
+        return None
+
+
+def _layer_mae_select_decode_on_shape(
+    module: torch.nn.Module,
+    value: CipherTensor,
+    decoded: Any,
+    *,
+    plain_on_shape: Any = None,
+    decode_info: dict[str, Any] | None = None,
+) -> Any:
+    decoded_numel = int(_layer_mae_tensor(decoded).numel())
+    candidates = (
+        ("cipher_on_shape", getattr(value, "on_shape", None)),
+        ("plain_on_shape", plain_on_shape),
+        ("module_fhe_output_shape", getattr(module, "fhe_output_shape", None)),
+        ("decoded_shape", tuple(getattr(decoded, "shape", ()) or ())),
+    )
+    fallback = getattr(module, "fhe_output_shape", getattr(value, "on_shape", tuple(getattr(decoded, "shape", ()))))
+    for source, shape in candidates:
+        if shape is None:
+            continue
+        if _layer_mae_shape_numel(shape) == int(decoded_numel):
+            if decode_info is not None:
+                decode_info["decode_on_shape_source"] = str(source)
+            return shape
+    if decode_info is not None:
+        decode_info["decode_on_shape_source"] = "module_fhe_output_shape_fallback"
+    return fallback
+
+
+def _layer_mae_try_decode_stale_compact_raw(
+    module: torch.nn.Module,
+    value: CipherTensor,
+    plain: Any,
+) -> torch.Tensor | None:
+    backend = getattr(plain, "backend", None)
+    if not callable(getattr(backend, "Decode", None)):
+        return None
+    logical_shape = tuple(int(v) for v in tuple(getattr(module, "output_shape", getattr(value, "shape", ())) or ()))
+    if len(logical_shape) != 4:
+        return None
+    if int(getattr(module, "output_gap", 1) or 1) != 1:
+        return None
+    if _layer_mae_output_relayout_present(module, None):
+        return None
+    logical_numel = int(torch.Size(logical_shape).numel())
+    raw = _layer_mae_decode_plain_raw(plain).reshape(-1)
+    if int(raw.numel()) != int(logical_numel):
+        return None
+    stale_numels = [
+        _layer_mae_shape_numel(getattr(plain, "on_shape", None)),
+        _layer_mae_shape_numel(getattr(value, "on_shape", None)),
+        _layer_mae_shape_numel(getattr(module, "fhe_output_shape", None)),
+    ]
+    if not any(numel is not None and int(numel) != int(raw.numel()) for numel in stale_numels):
+        return None
+    return raw.reshape(logical_shape)
+
+
+def _layer_mae_decode_cipher_output(
+    module: torch.nn.Module,
+    value: CipherTensor,
+    *,
+    decode_info: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    plain = value.decrypt()
+    plain_on_shape = None
+    try:
+        plain_on_shape = getattr(plain, "on_shape", None)
+        if decode_info is not None:
+            decode_info["plain_on_shape"] = _json_shape(plain_on_shape)
+            decode_info["plaintext_count"] = int(len(getattr(plain, "ids", ()) or ()))
+        native_executor = _layer_mae_native_halo_executor(module)
+        if _layer_mae_should_decode_native_halo_output(native_executor, value):
+            raw_decoded = _layer_mae_decode_plain_raw(plain)
+            if decode_info is not None:
+                decode_info["decode_kind"] = "native_halo_stripe"
+                decode_info["raw_decoded_slot_count"] = int(raw_decoded.numel())
+            return _layer_mae_decode_native_halo_output(raw_decoded, native_executor)
+        try:
+            decoded = plain.decode()
+            if decode_info is not None:
+                decode_info["decoded_shape"] = _json_shape(getattr(decoded, "shape", ()))
+                decode_info["decoded_numel"] = int(_layer_mae_tensor(decoded).numel())
+        except RuntimeError:
+            stale_compact = _layer_mae_try_decode_stale_compact_raw(module, value, plain)
+            if stale_compact is None:
+                raise
+            if decode_info is not None:
+                decode_info["decode_kind"] = "stale_compact_raw"
+                decode_info["decoded_shape"] = _json_shape(getattr(stale_compact, "shape", ()))
+                decode_info["decoded_numel"] = int(_layer_mae_tensor(stale_compact).numel())
+                decode_info["raw_decoded_slot_count"] = int(_layer_mae_tensor(stale_compact).numel())
+            return stale_compact
     finally:
         release = getattr(plain, "release", None)
         if callable(release):
             release()
     logical_shape = getattr(module, "output_shape", getattr(value, "shape", tuple(decoded.shape)))
-    on_shape = getattr(module, "fhe_output_shape", getattr(value, "on_shape", tuple(decoded.shape)))
+    on_shape = _layer_mae_select_decode_on_shape(
+        module,
+        value,
+        decoded,
+        plain_on_shape=plain_on_shape,
+        decode_info=decode_info,
+    )
     gap = getattr(module, "output_gap", None)
-    native_executor = _layer_mae_native_halo_executor(module)
-    if native_executor is not None:
-        return _layer_mae_decode_native_halo_output(decoded, native_executor)
     return _layer_mae_demultiplex(
         decoded,
         logical_shape=logical_shape,
@@ -1654,7 +1814,7 @@ def _layer_mae_target_names(net: torch.nn.Module) -> list[str]:
             continue
         if isinstance(module, Bootstrap):
             continue
-        if bool(getattr(module, "fused", False)):
+        if bool(getattr(module, "fused", False)) and not isinstance(module, Chebyshev):
             continue
         names.append(str(name))
     return names
@@ -1982,6 +2142,15 @@ def _install_layer_mae_he_capture(
                 "output_shape": _json_shape(getattr(module, "output_shape", ())),
                 "fhe_output_shape": _json_shape(getattr(module, "fhe_output_shape", ())),
                 "output_gap": None if getattr(module, "output_gap", None) is None else int(getattr(module, "output_gap")),
+                "layout_policy_output_layout": dict(getattr(module, "layout_policy_output_layout", {}) or {}),
+                "layout_policy_output_materialization": str(
+                    getattr(module, "layout_policy_output_materialization", "") or ""
+                ),
+                "layout_policy_output_row_offset": (
+                    None
+                    if getattr(module, "layout_policy_output_row_offset", None) is None
+                    else int(getattr(module, "layout_policy_output_row_offset"))
+                ),
                 "has_bootstrapper_child": bool(isinstance(getattr(module, "bootstrapper", None), Bootstrap)),
                 "bootstrapper_path": (
                     f"{module_name}.bootstrapper" if isinstance(getattr(module, "bootstrapper", None), Bootstrap) else ""
@@ -2005,13 +2174,12 @@ def _install_layer_mae_he_capture(
                     return
                 elif isinstance(output, CipherTensor):
                     native_executor = _layer_mae_native_halo_executor(module)
-                    decoded = _layer_mae_decode_cipher_output(module, output)
+                    native_decode = _layer_mae_should_decode_native_halo_output(native_executor, output)
+                    decoded = _layer_mae_decode_cipher_output(module, output, decode_info=decode_info)
                     row["ciphertext_count"] = int(len(getattr(output, "ids", ()) or ()))
                     row["cipher_shape"] = _json_shape(getattr(output, "shape", ()))
                     row["cipher_on_shape"] = _json_shape(getattr(output, "on_shape", ()))
-                    decode_info = {
-                        "decode_kind": "native_halo_stripe" if native_executor is not None else "cipher_tensor",
-                    }
+                    decode_info.setdefault("decode_kind", "native_halo_stripe" if bool(native_decode) else "cipher_tensor")
                 elif isinstance(output, torch.Tensor):
                     decoded = _layer_mae_tensor(output)
                     row["ciphertext_count"] = 0
@@ -2028,6 +2196,9 @@ def _install_layer_mae_he_capture(
                 reference_transform = dict(reference_transforms.get(str(module_name), {}) or {})
                 if reference_transform:
                     row["reference_transform"] = reference_transform
+                    if reference is not None:
+                        row["producer_fused_reference"] = _layer_mae_tensor_summary(reference)
+                        row["producer_fused_metrics_vs_clear"] = _layer_mae_metric(reference, decoded)
                     consumer = str(reference_transform.get("consumer", ""))
                     row["status"] = "skipped"
                     row["skip_reason"] = "producer_fused_reference_covered_by_consumer"
