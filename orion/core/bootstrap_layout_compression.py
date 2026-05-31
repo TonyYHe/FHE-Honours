@@ -21,6 +21,7 @@ _LAYOUT_PRESERVING_MODULES = {
     "Sigmoid",
     "Softplus",
 }
+_MISSING = object()
 
 
 def _ceil_div(left: int, right: int) -> int:
@@ -301,11 +302,94 @@ def _snapshot_layout_policy_depths(network_dag: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _layout_policy_module_layout_snapshot(network_dag: Any, nodes: set[str] | None = None) -> list[dict[str, Any]]:
+    selected_nodes = None if nodes is None else {str(node) for node in nodes}
+    rows: list[dict[str, Any]] = []
+    for node in network_dag.nodes:
+        node = str(node)
+        if selected_nodes is not None and node not in selected_nodes:
+            continue
+        module = network_dag.nodes[node].get("module")
+        if module is None:
+            continue
+        rows.append(
+            {
+                "node": str(node),
+                "module": module,
+                "fhe_output_shape": getattr(module, "fhe_output_shape", _MISSING),
+                "layout_policy_output_layout": getattr(module, "layout_policy_output_layout", _MISSING),
+                "layout_policy_output_row_offset": getattr(module, "layout_policy_output_row_offset", _MISSING),
+                "layout_policy_output_materialization": getattr(
+                    module,
+                    "layout_policy_output_materialization",
+                    _MISSING,
+                ),
+            }
+        )
+    return rows
+
+
+def _restore_layout_policy_module_layout_snapshot(snapshot: list[dict[str, Any]]) -> None:
+    for row in snapshot:
+        module = row.get("module")
+        if module is None:
+            continue
+        for attr in (
+            "fhe_output_shape",
+            "layout_policy_output_layout",
+            "layout_policy_output_row_offset",
+            "layout_policy_output_materialization",
+        ):
+            value = row.get(attr, _MISSING)
+            if value is _MISSING:
+                try:
+                    delattr(module, attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(module, attr, value)
+
+
+def _apply_layout_policy_module_output_layouts(network_dag: Any, compile_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    changed_nodes: set[str] = set()
+    for row in compile_plan.get("node_layouts", []):
+        node = str(row.get("node", ""))
+        if not node or node not in network_dag.nodes:
+            continue
+        layout = dict(row.get("selected_layout", {}) or {})
+        if not _layout_has_halo(layout):
+            continue
+        module = network_dag.nodes[node].get("module")
+        if module is None:
+            continue
+        changed_nodes.add(str(node))
+    snapshot = _layout_policy_module_layout_snapshot(network_dag, changed_nodes)
+    for row in compile_plan.get("node_layouts", []):
+        node = str(row.get("node", ""))
+        if node not in changed_nodes:
+            continue
+        module = network_dag.nodes[node].get("module")
+        if module is None:
+            continue
+        layout = dict(row.get("selected_layout", {}) or {})
+        shape = _fhe_shape_for_layout(dict(row), layout)
+        if shape is not None:
+            module.fhe_output_shape = shape
+        gap = max(1, int(layout.get("gap", 1) or 1))
+        top_beta = _layout_top_beta(layout)
+        module.layout_policy_output_layout = dict(layout)
+        module.layout_policy_output_row_offset = int(top_beta * gap)
+        if bool(row.get("producer_materialized_halo", False)) or _layout_has_halo(layout):
+            module.layout_policy_output_materialization = "fused_relayout"
+    return snapshot
+
+
 def restore_layout_policy_compile_plan(
     network_dag: Any,
     compile_plan: dict[str, Any],
     *,
     depth_snapshot: list[dict[str, Any]] | None = None,
+    module_layout_snapshot: list[dict[str, Any]] | None = None,
 ) -> None:
     for binding in _iter_layout_policy_bindings(network_dag):
         executor = binding["executor"]
@@ -324,6 +408,8 @@ def restore_layout_policy_compile_plan(
                 runtime.solver_depth = int(row["runtime_solver_depth"])
         if module is not None and row.get("module_depth") is not None:
             module.depth = int(row["module_depth"])
+    if module_layout_snapshot is not None:
+        _restore_layout_policy_module_layout_snapshot(module_layout_snapshot)
 
 
 def _refresh_layout_policy_depths(
@@ -1278,6 +1364,211 @@ def _concat_output_beta_lift_refinement_candidates(
     return candidates
 
 
+def _single_successor(network_dag: Any, node: str, expected: str) -> bool:
+    try:
+        successors = [str(value) for value in network_dag.successors(str(node))]
+    except Exception:
+        return False
+    return successors == [str(expected)]
+
+
+def _single_predecessor(network_dag: Any, node: str) -> str | None:
+    try:
+        predecessors = [str(value) for value in network_dag.predecessors(str(node))]
+    except Exception:
+        return None
+    if len(predecessors) != 1:
+        return None
+    return str(predecessors[0])
+
+
+def _native_conv_row_beta_lift_supported(row: dict[str, Any]) -> bool:
+    if str(row.get("op_kind", "")) != "conv2d":
+        return False
+    if str(row.get("source", "")) == "x":
+        return False
+    if str(row.get("physical_layout", "")) != "native_source_stripe":
+        return False
+    selected = dict(row.get("selected_layout", {}) or {})
+    required = dict(row.get("required_layout", selected) or selected)
+    if not _layout_has_halo(selected):
+        return False
+    if not _layout_covers(selected, required):
+        return False
+    return int(selected.get("gap", 1) or 1) == int(required.get("gap", selected.get("gap", 1)) or 1)
+
+
+def _boot_boundary_beta_lift_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in compile_plan.get("edge_layouts", [])}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    candidates: list[dict[str, Any]] = []
+    for row in compile_plan.get("edge_layouts", []):
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        if edge_id not in actual_native_physical_edges:
+            continue
+        if not _native_conv_row_beta_lift_supported(current):
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[target].get("module")).__name__ != "Conv2d":
+            continue
+
+        direct_boot_edge = (source, target) in boot_edges
+        interval_matches = _candidate_interval_matches(
+            row=current,
+            intervals=intervals,
+            boot_edges=boot_edges,
+        )
+        selected = dict(current.get("selected_layout", {}) or {})
+        producer = source
+        producer_reason = "boot_boundary_beta_lift"
+        carried_edge_ids: list[str] = []
+        carried_edges: list[dict[str, Any]] = []
+        source_module = network_dag.nodes[source].get("module")
+        kind = "boot_boundary_beta_lift"
+        source_boot_edge: tuple[str, str] | None = (source, target) if direct_boot_edge else None
+
+        if type(source_module).__name__ in {"AvgPool2d", "Conv2d"}:
+            if not direct_boot_edge:
+                continue
+            if not _single_successor(network_dag, source, target):
+                continue
+            if node_rows_by_node.get(producer) is None:
+                continue
+            kind = "boot_boundary_pool_direct_beta_lift" if type(source_module).__name__ == "AvgPool2d" else kind
+        elif _layout_preserving_module(network_dag, source):
+            predecessor = _single_predecessor(network_dag, source)
+            if predecessor is None or predecessor not in network_dag.nodes:
+                continue
+            predecessor_module = network_dag.nodes[predecessor].get("module")
+            if type(predecessor_module).__name__ != "Conv2d":
+                continue
+            if not _single_successor(network_dag, predecessor, source):
+                continue
+            if not _single_successor(network_dag, source, target):
+                continue
+            producer = str(predecessor)
+            source_boot_edge = (producer, source) if (producer, source) in boot_edges else source_boot_edge
+            if source_boot_edge is None and not interval_matches:
+                continue
+            producer_row = node_rows_by_node.get(producer)
+            source_node_row = node_rows_by_node.get(source)
+            activation_edge_id = f"{producer}->{source}"
+            activation_edge = edge_rows_by_edge.get(activation_edge_id)
+            if producer_row is None or source_node_row is None or activation_edge is None:
+                continue
+            carried_edge_ids.append(activation_edge_id)
+            kind = "boot_boundary_activation_beta_lift"
+        else:
+            continue
+
+        if source_boot_edge is None and interval_matches:
+            source_boot_edge = tuple(interval_matches[0].get("boot_edge", ("", "")))  # type: ignore[arg-type]
+        if source_boot_edge is None:
+            continue
+
+        updated_edge_rows: list[dict[str, Any]] = []
+        for candidate_row in compile_plan.get("edge_layouts", []):
+            candidate_edge_id = str(candidate_row.get("edge", ""))
+            if candidate_edge_id == edge_id:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=selected,
+                    target_layout=selected,
+                    reason=producer_reason,
+                )
+                updated["boot_boundary_beta_lift"] = True
+                updated["boot_boundary_beta_lift_source"] = str(producer)
+                updated_edge_rows.append(updated)
+            elif candidate_edge_id in carried_edge_ids:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=selected,
+                    target_layout=selected,
+                    reason="boot_boundary_activation_beta_lift",
+                )
+                carried_edges.append(
+                    {
+                        "edge": str(candidate_edge_id),
+                        "source": str(candidate_row.get("source", "")),
+                        "target": str(candidate_row.get("target", "")),
+                        "op_kind": str(candidate_row.get("op_kind", "")),
+                        "physical_layout": str(updated.get("physical_layout", "")),
+                    }
+                )
+                updated_edge_rows.append(updated)
+            else:
+                updated_edge_rows.append(dict(candidate_row))
+
+        updated_node_rows: list[dict[str, Any]] = []
+        lift_nodes = {str(producer)}
+        if carried_edge_ids:
+            lift_nodes.add(str(source))
+        for candidate_node in compile_plan.get("node_layouts", []):
+            if str(candidate_node.get("node", "")) not in lift_nodes:
+                updated_node_rows.append(dict(candidate_node))
+                continue
+            updated_node_rows.append(
+                _rewrite_node_as_beta_lift_producer(
+                    dict(candidate_node),
+                    layout=selected,
+                    reason=producer_reason,
+                )
+            )
+
+        updated_plan = _refresh_layout_policy_plan_summary(
+            {
+                **dict(compile_plan),
+                "edge_layouts": updated_edge_rows,
+                "node_layouts": updated_node_rows,
+            }
+        )
+        summary = dict(updated_plan.get("summary", {}) or {})
+        summary["boot_refined_boot_boundary_beta_lift_count"] = (
+            int(summary.get("boot_refined_boot_boundary_beta_lift_count", 0) or 0) + 1
+        )
+        updated_plan["summary"] = summary
+        boot_source, boot_target = source_boot_edge
+        candidates.append(
+            {
+                "kind": str(kind),
+                "strategy": str(kind),
+                "plan": updated_plan,
+                "accepted": [
+                    {
+                        "kind": str(kind),
+                        "producer": str(producer),
+                        "boot_edge": {"source": str(boot_source), "target": str(boot_target)},
+                        "producer_layout": dict(selected),
+                        "covered_edges": [
+                            {
+                                "edge": str(edge_id),
+                                "source": str(source),
+                                "target": str(target),
+                                "old_physical_layout": str(current.get("physical_layout", "")),
+                                "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                            }
+                        ],
+                        "carried_edges": carried_edges,
+                        "covered_edge_count": 1,
+                    }
+                ],
+                "rejected": [],
+            }
+        )
+    return candidates
+
+
 def enumerate_bootstrap_aware_layout_refinement_candidates(
     network_dag: Any,
     first_pass_audit: dict[str, Any],
@@ -1364,6 +1655,32 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "boot_intervals": boot_interval_rows,
             }
         )
+    for boot_lift in _boot_boundary_beta_lift_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    ):
+        accepted = [dict(row) for row in boot_lift.get("accepted", [])]
+        candidate_kind = str(boot_lift.get("kind", "boot_boundary_beta_lift"))
+        candidate_strategy = str(boot_lift.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_boot_boundary_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(boot_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(boot_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": 0,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
 
     native_candidate = _native_physical_relayout_refinement_candidate(
         compile_plan,
@@ -1439,6 +1756,7 @@ def apply_bootstrap_aware_layout_refinement_candidate(
         }
     previous_depths = _snapshot_layout_policy_depths(network_dag)
     true_relayout_count_before = int(sum(int(row.get("relayout_depth", 0) or 0) for row in previous_depths))
+    previous_module_layouts = _apply_layout_policy_module_output_layouts(network_dag, updated_plan)
 
     for binding in _iter_layout_policy_bindings(network_dag):
         executor = binding["executor"]
@@ -1473,8 +1791,11 @@ def apply_bootstrap_aware_layout_refinement_candidate(
         "boot_intervals": list(candidate.get("boot_intervals", [])),
         "previous_compile_plan": compile_plan,
         "previous_depths": previous_depths,
+        "_previous_module_layouts": previous_module_layouts,
     }
-    network_dag.bootstrap_layout_refinement_audit = dict(audit)
+    network_dag.bootstrap_layout_refinement_audit = {
+        key: value for key, value in dict(audit).items() if key != "_previous_module_layouts"
+    }
     return audit
 
 

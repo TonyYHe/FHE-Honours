@@ -961,7 +961,7 @@ class Scheme:
                 refinement_rounds: list[dict[str, Any]] = []
                 max_refinement_rounds = max(
                     1,
-                    int(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS", "4") or 4),
+                    int(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS", "16") or 16),
                 )
                 rollback_audit: dict[str, Any] | None = None
                 stopped_reason = "max_rounds_reached"
@@ -991,12 +991,19 @@ class Scheme:
                     best_trial: dict[str, Any] | None = None
                     best_score: tuple[int, int, int, int, int, int, int, str] | None = None
                     for candidate in candidates:
+                        trial_module_layout_snapshot = None
                         try:
                             trial_apply_audit = apply_bootstrap_aware_layout_refinement_candidate(
                                 network_dag,
                                 candidate,
                                 first_pass_audit=current_audit,
                             )
+                            trial_module_layout_snapshot = trial_apply_audit.get("_previous_module_layouts")
+                            trial_apply_audit = {
+                                key: value
+                                for key, value in dict(trial_apply_audit).items()
+                                if key != "_previous_module_layouts"
+                            }
                             reset_bootstrap_solver_assignments(network_dag, level_snapshot)
                             trial_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
                             trial_input_level, trial_bootstraps, trial_slots = trial_solver._solve_once(
@@ -1075,6 +1082,7 @@ class Scheme:
                                 network_dag,
                                 accepted_compile_plan,
                                 depth_snapshot=accepted_depths,
+                                module_layout_snapshot=trial_module_layout_snapshot,
                             )
                             reset_bootstrap_solver_assignments(network_dag, level_snapshot)
 
@@ -1105,6 +1113,12 @@ class Scheme:
                         dict(best_trial["candidate"]),
                         first_pass_audit=current_audit,
                     )
+                    refinement_module_layout_snapshot = refinement_audit.get("_previous_module_layouts")
+                    refinement_audit = {
+                        key: value
+                        for key, value in dict(refinement_audit).items()
+                        if key != "_previous_module_layouts"
+                    }
                     reset_bootstrap_solver_assignments(network_dag, level_snapshot)
                     second_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
                     input_level, num_bootstraps, bootstrapper_slots = second_solver._solve_once(
@@ -1124,6 +1138,7 @@ class Scheme:
                             network_dag,
                             accepted_compile_plan,
                             depth_snapshot=accepted_depths,
+                            module_layout_snapshot=refinement_module_layout_snapshot,
                         )
                         reset_bootstrap_solver_assignments(network_dag, level_snapshot)
                         rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
