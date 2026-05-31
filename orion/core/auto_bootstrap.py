@@ -1,14 +1,158 @@
 import networkx as nx
 import matplotlib.pyplot as plt
+from typing import Any
 
 from .level_dag import LevelDAG
 from .bootstrap_fusion import (
     install_bootstrap_prescale_fusion,
+    module_bootstrap_ct_count,
     module_bootstrap_slots,
     runtime_fhe_output_shape,
 )
 from .bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.nn.operations import Bootstrap
+
+
+_MISSING = object()
+
+
+def snapshot_bootstrap_solver_assignments(network_dag: Any) -> dict[str, dict[str, Any]]:
+    """Capture solver-owned level/bootstrap state before a speculative solve."""
+
+    snapshot: dict[str, dict[str, Any]] = {}
+    for node in network_dag.nodes:
+        attrs = network_dag.nodes[node]
+        module = attrs.get("module")
+        snapshot[str(node)] = {
+            "dag_level": attrs.get("level", _MISSING),
+            "dag_bootstrap": attrs.get("bootstrap", _MISSING),
+            "module_level": getattr(module, "level", _MISSING) if module is not None else _MISSING,
+        }
+    return snapshot
+
+
+def reset_bootstrap_solver_assignments(
+    network_dag: Any,
+    snapshot: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Restore or clear bootstrap-solver assignments before a second solve.
+
+    ``LevelDAG.estimate_layer_latency`` treats an existing ``module.level`` as a
+    fixed user level.  Any boot-aware layout refinement must therefore remove
+    the first solver pass' assigned levels before rerunning the solver.
+    """
+
+    snapshot = snapshot or {}
+    for node in network_dag.nodes:
+        attrs = network_dag.nodes[node]
+        saved = snapshot.get(str(node), {})
+        for key, saved_key in (("level", "dag_level"), ("bootstrap", "dag_bootstrap")):
+            value = saved.get(saved_key, _MISSING)
+            if value is _MISSING:
+                attrs.pop(key, None)
+            else:
+                attrs[key] = value
+        module = attrs.get("module")
+        if module is not None:
+            value = saved.get("module_level", _MISSING)
+            if value is _MISSING:
+                module.level = None
+            else:
+                module.level = value
+    for attr in (
+        "bootstrap_layout_compression_audit",
+        "bootstrap_layout_refinement_audit",
+        "solved_residual_level_dags",
+    ):
+        if hasattr(network_dag, attr):
+            try:
+                delattr(network_dag, attr)
+            except AttributeError:
+                pass
+
+
+def _assigned_node_level(network_dag: Any, node: str) -> int | None:
+    attrs = network_dag.nodes[node]
+    value = attrs.get("level", None)
+    if value is None:
+        module = attrs.get("module")
+        value = getattr(module, "level", None) if module is not None else None
+    if value is None:
+        return None
+    return int(value)
+
+
+def collect_bootstrap_solver_audit(network_dag: Any, *, l_eff: int) -> dict[str, Any]:
+    query = LevelDAG(l_eff=int(l_eff), network_dag=network_dag, path=None)
+    nodes: list[dict[str, Any]] = []
+    boot_edges: list[dict[str, Any]] = []
+    counted_boot_nodes: set[str] = set()
+    counted_bootstraps = 0
+    bootstrapper_slots: list[int] = []
+
+    for node in network_dag.nodes:
+        module = network_dag.nodes[node].get("module")
+        level = _assigned_node_level(network_dag, str(node))
+        depth = getattr(module, "depth", None) if module is not None else None
+        bootstrap = bool(network_dag.nodes[node].get("bootstrap", False))
+        shape = runtime_fhe_output_shape(module) if module is not None else None
+        nodes.append(
+            {
+                "node": str(node),
+                "level": None if level is None else int(level),
+                "module_depth": None if depth is None else int(depth),
+                "bootstrap": bool(bootstrap),
+                "bootstrap_ct_count": int(module_bootstrap_ct_count(module)) if module is not None else 0,
+                "bootstrapper_slots": int(module_bootstrap_slots(module)) if module is not None else 0,
+                "runtime_fhe_output_shape": []
+                if shape is None
+                else [int(value) for value in tuple(shape)],
+            }
+        )
+
+    for source, target in network_dag.edges:
+        source_level = _assigned_node_level(network_dag, str(source))
+        target_level = _assigned_node_level(network_dag, str(target))
+        if source_level is None or target_level is None:
+            continue
+        _latency, boot_count = query.estimate_bootstrap_latency(
+            f"{str(source)}@l={int(source_level)}",
+            f"{str(target)}@l={int(target_level)}",
+        )
+        if int(boot_count) <= 0:
+            continue
+        module = network_dag.nodes[source].get("module")
+        slots = int(module_bootstrap_slots(module)) if module is not None else 0
+        boot_edges.append(
+            {
+                "source": str(source),
+                "target": str(target),
+                "source_level": int(source_level),
+                "target_level": int(target_level),
+                "source_depth": int(getattr(module, "depth", 0) or 0) if module is not None else 0,
+                "bootstrap_ct_count": int(boot_count),
+                "bootstrapper_slots": int(slots),
+            }
+        )
+        if str(source) not in counted_boot_nodes:
+            counted_boot_nodes.add(str(source))
+            counted_bootstraps += int(boot_count)
+            if int(slots) > 0 and int(slots) not in bootstrapper_slots:
+                bootstrapper_slots.append(int(slots))
+
+    flagged_bootstrap_nodes = [
+        str(row["node"])
+        for row in nodes
+        if bool(row.get("bootstrap", False))
+    ]
+    return {
+        "l_eff": int(l_eff),
+        "nodes": nodes,
+        "bootstrap_nodes": flagged_bootstrap_nodes,
+        "boot_edges": boot_edges,
+        "bootstrap_count": int(counted_bootstraps),
+        "bootstrapper_slots": [int(value) for value in bootstrapper_slots],
+    }
 
 
 class BootstrapSolver:
@@ -162,15 +306,24 @@ class BootstrapSolver:
         input_level = int(shortest_path[1].split("=")[-1])
         return input_level
 
-    def solve(self):
+    def _reset_full_level_dag(self):
+        self.full_level_dag = LevelDAG(l_eff=self.l_eff, network_dag=self.network_dag)
+
+    def _solve_once(self, *, apply_layout_compression: bool = True):
+        self._reset_full_level_dag()
         solved_residual_dags = self.first_solve_residual_subgraphs()
         self.then_build_full_level_dag(solved_residual_dags)
         input_level = self.finally_solve_full_level_dag()
 
         self.assign_levels_to_layers()
-        num_bootstraps, bootstrapper_slots = self.mark_bootstrap_locations()
+        num_bootstraps, bootstrapper_slots = self.mark_bootstrap_locations(
+            apply_layout_compression=bool(apply_layout_compression)
+        )
 
         return input_level, num_bootstraps, bootstrapper_slots
+
+    def solve(self):
+        return self._solve_once(apply_layout_compression=True)
     
     def assign_levels_to_layers(self):
         # Set each Orion module's attribute with it's level found by this
@@ -244,11 +397,13 @@ class BootstrapSolver:
 
         return total_bootstraps, bootstrapper_slots
 
-    def mark_bootstrap_locations(self):
+    def mark_bootstrap_locations(self, *, apply_layout_compression: bool = True):
         node_map = self._mark_bootstrap_flags()
-        self.network_dag.bootstrap_layout_compression_audit = apply_bootstrap_layout_compression(
-            self.network_dag
-        )
+        self._last_bootstrap_node_map = dict(node_map)
+        if bool(apply_layout_compression):
+            self.network_dag.bootstrap_layout_compression_audit = apply_bootstrap_layout_compression(
+                self.network_dag
+            )
         return self._count_marked_bootstraps(node_map)
 
     def get_bootstrap_slots(self, node):

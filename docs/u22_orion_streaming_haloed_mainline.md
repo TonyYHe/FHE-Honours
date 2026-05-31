@@ -191,6 +191,25 @@ rsync -az --delete --checksum "amd:/home/abc/orion/$run_root/" ".tmp/results/$ba
   --input-level 2
 ```
 
+Rotation/runtime audit: speedup in this kernel table should be interpreted as
+primarily rotation-driven.  To check apparent counterexamples, all rows whose
+beta=2-vs-beta=1 no-sharing stripe hot runtime direction disagreed with the
+rotation direction were rerun on AMD under
+`.tmp/repro/mismatch_rotation_runtime_amd_20260531T020037Z` with three hot
+runs per row.  With those reruns overriding the stale candidates, the 36
+matched beta pairs show `rotation_eval_count` as the strongest runtime-ratio
+predictor (`Pearson log-ratio=0.766`, `Spearman=0.663`); transform-key total is
+similar (`0.765` / `0.674`).  The prior large `dec3b 192x192` beta=2 speedup is
+not reproducible and should not be cited.
+
+| row | beta2/beta1 rotations | beta2/beta1 hot runtime | audit outcome |
+| --- | ---: | ---: | --- |
+| `bottleneckb 192x192` | 1.051 | 0.898 | residual opposite-sign case, but hot runs are highly variable (`52.2/37.5/37.7` vs `49.4/31.0/34.0`), so treat as noise pending more repeats |
+| `bottleneckb 384x384` | 1.088 | 1.157 | aligned with rotations |
+| `conv128 192x192` | 1.033 | 1.124 | aligned with rotations |
+| `dec1b 192x192` | 1.021 | 1.004 | effectively flat/noise |
+| `dec3b 192x192` | 1.033 | 1.201 | aligned with rotations; no large beta=2 speedup reproduced |
+
 <!-- CONV_KERNEL_TABLE_START -->
 | HW | kernel | logical input | multiplex | channels/group | packed FHE input | path / beta | status | input level | expected output level | actual output level | input halo T/B | output layout | channel fold | LT grouping | rotations | LT+accumulate s | hot run s | compile s | diag build s | diag shadow s | input ct | output ct | peak RSS GiB | runtime mode | result file | note |
 | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
@@ -218,7 +237,8 @@ rsync -az --delete --checksum "amd:/home/abc/orion/$run_root/" ".tmp/results/$ba
 | 224x224 | dec2b Conv 64,64 | 64x112x112 | 2 | 4 | 16x224x224 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 8,192 | 115.2 | 117.5 | 65.4 | 4.2 | 0.0 | 32 | 32 | 160.0 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec2b_224x224_provider_halo2_individual_lt.json |  |
 | 384x288 | dec2b Conv 64,64 | 64x192x144 | 2 | 4 | 16x384x288 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 16,384 | 224.1 | 229.0 | 132.3 | 8.2 | 0.0 | 64 | 64 | 298.5 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec2b_384x288_provider_halo2_individual_lt.json |  |
 | 384x384 | dec2b Conv 64,64 | 64x192x192 | 2 | 4 | 16x384x384 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 20,480 | 280.2 | 285.6 | 159.4 | 11.3 | 0.0 | 80 | 80 | 372.3 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec2b_384x384_provider_halo2_individual_lt.json |  |
-| 192x192 | dec3b Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 3,124 | 45.1 | 45.5 | 71.3 | 4.2 | 0.0 | 11 | 10 | 158.7 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec3b_192x192_provider_halo2_individual_lt.json |  |
+| 192x192 | dec3b Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | no-sharing stripe | ok | 2 | 1 | 1 | 1/1 | native_halo_stripe | per_stripe | individual | 3,024 | 48.3 | 44.2 | 277.8 | 3.9 | 0.0 | 10 | 10 | 165.4 | resident_compute | .tmp/repro/dec3b_beta_lt_profile_amd_20260531T013434Z/rows/dec3b_192x192_provider_halo1_individual_lt.json | profile rerun; hot runs 48.6/40.9/43.0; output halo 0/0 |
+| 192x192 | dec3b Conv 128,128 | 128x48x48 | 4 | 16 | 8x192x192 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 3,124 | 47.9 | 50.5 | 282.4 | 4.4 | 0.0 | 11 | 10 | 178.1 | resident_compute | .tmp/repro/dec3b_beta_lt_profile_amd_20260531T013434Z/rows/dec3b_192x192_provider_halo2_individual_lt.json | profile rerun; hot runs 48.2/48.6/54.8; output halo 1/1; no large speedup reproduced |
 | 224x224 | dec3b Conv 128,128 | 128x56x56 | 4 | 16 | 8x224x224 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 4,608 | 86.0 | 86.6 | 65.4 | 4.0 | 0.0 | 16 | 16 | 169.5 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec3b_224x224_provider_halo2_individual_lt.json |  |
 | 384x288 | dec3b Conv 128,128 | 128x96x72 | 4 | 16 | 8x384x288 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 9,216 | 167.6 | 168.8 | 141.1 | 8.3 | 0.0 | 32 | 32 | 337.1 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec3b_384x288_provider_halo2_individual_lt.json |  |
 | 384x384 | dec3b Conv 128,128 | 128x96x96 | 4 | 16 | 8x384x384 | provider beta=2 no-share stripe | ok | 2 | 1 | 1 | 2/2 | native_halo_stripe | per_stripe | individual | 12,008 | 219.4 | 221.0 | 191.0 | 11.6 | 0.0 | 42 | 42 | 445.6 | resident_compute | .tmp/results/conv_kernel_table_base32_provider_halo2_stripe_level2_e2e_amd_20260530T121801Z/rows/dec3b_384x384_provider_halo2_individual_lt.json |  |

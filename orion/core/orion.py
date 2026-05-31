@@ -36,7 +36,15 @@ from .tracer import StatsTracker, OrionTracer
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
-from .bootstrap_layout_compression import apply_bootstrap_layout_compression
+from .auto_bootstrap import collect_bootstrap_solver_audit
+from .auto_bootstrap import reset_bootstrap_solver_assignments
+from .auto_bootstrap import snapshot_bootstrap_solver_assignments
+from .bootstrap_layout_compression import (
+    apply_bootstrap_aware_layout_refinement,
+    apply_bootstrap_layout_compression,
+    bootstrap_aware_layout_refinement_applicable,
+    restore_layout_policy_compile_plan,
+)
 
 
 class _PackWorkerParams:
@@ -941,8 +949,104 @@ class Scheme:
             print("\n{4} Running bootstrap placement... ", end="", flush=True)
             start = time.time()
             l_eff = len(self.params.get_logq()) - 1
-            btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
-            input_level, num_bootstraps, bootstrapper_slots = btp_solver.solve()
+            if bootstrap_aware_layout_refinement_applicable(network_dag):
+                level_snapshot = snapshot_bootstrap_solver_assignments(network_dag)
+                btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                input_level, num_bootstraps, bootstrapper_slots = btp_solver._solve_once(
+                    apply_layout_compression=False
+                )
+                initial_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                current_audit = dict(initial_audit)
+                refinement_rounds: list[dict[str, Any]] = []
+                max_refinement_rounds = max(
+                    1,
+                    int(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS", "4") or 4),
+                )
+                rollback_audit: dict[str, Any] | None = None
+                stopped_reason = "max_rounds_reached"
+                for round_index in range(int(max_refinement_rounds)):
+                    refinement_audit = apply_bootstrap_aware_layout_refinement(
+                        network_dag,
+                        current_audit,
+                    )
+                    round_audit = {
+                        **dict(refinement_audit),
+                        "round": int(round_index + 1),
+                        "input_bootstrap_count": int(current_audit.get("bootstrap_count", 0) or 0),
+                    }
+                    if not bool(refinement_audit.get("enabled", False)):
+                        refinement_rounds.append(round_audit)
+                        stopped_reason = str(refinement_audit.get("reason", "no_candidates"))
+                        break
+
+                    reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                    second_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                    input_level, num_bootstraps, bootstrapper_slots = second_solver._solve_once(
+                        apply_layout_compression=False
+                    )
+                    final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                    round_audit = {
+                        **round_audit,
+                        "final_bootstrap_count": int(final_audit["bootstrap_count"]),
+                        "final_boot_edges": list(final_audit.get("boot_edges", [])),
+                    }
+                    if int(final_audit["bootstrap_count"]) > int(current_audit["bootstrap_count"]):
+                        restore_layout_policy_compile_plan(
+                            network_dag,
+                            refinement_audit["previous_compile_plan"],
+                            depth_snapshot=refinement_audit.get("previous_depths", []),
+                        )
+                        reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                        rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                        input_level, num_bootstraps, bootstrapper_slots = rollback_solver._solve_once(
+                            apply_layout_compression=False
+                        )
+                        rollback_audit = {
+                            **dict(round_audit),
+                            "enabled": False,
+                            "rolled_back": True,
+                            "rollback_reason": "bootstrap_count_increased",
+                        }
+                        refinement_rounds.append(dict(rollback_audit))
+                        stopped_reason = "bootstrap_count_increased_rollback"
+                        break
+                    else:
+                        round_audit = {
+                            **dict(round_audit),
+                            "rolled_back": False,
+                        }
+                        refinement_rounds.append(dict(round_audit))
+                        current_audit = dict(final_audit)
+
+                accepted_rounds = [
+                    row
+                    for row in refinement_rounds
+                    if bool(row.get("enabled", False)) and not bool(row.get("rolled_back", False))
+                ]
+                accepted_count = int(
+                    sum(int(row.get("accepted_count", 0) or 0) for row in accepted_rounds)
+                )
+                network_dag.bootstrap_layout_compression_audit = {
+                    "enabled": False,
+                    "reason": "staged_bootstrap_aware_refinement"
+                    if accepted_count > 0
+                    else "staged_bootstrap_aware_refinement_no_candidates",
+                }
+                network_dag.bootstrap_layout_refinement_audit = {
+                    "enabled": bool(accepted_count > 0),
+                    "policy": "dp_no_share_fold",
+                    "fixed_point": bool(rollback_audit is None and stopped_reason != "max_rounds_reached"),
+                    "stopped_reason": str(stopped_reason),
+                    "rolled_back": bool(rollback_audit is not None),
+                    "first_pass_bootstrap_count": int(initial_audit.get("bootstrap_count", 0) or 0),
+                    "final_bootstrap_count": int(num_bootstraps),
+                    "accepted_round_count": int(len(accepted_rounds)),
+                    "accepted_count": int(accepted_count),
+                    "rounds": refinement_rounds,
+                }
+            else:
+                btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                input_level, num_bootstraps, bootstrapper_slots = btp_solver.solve()
             print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
         print(f"├── Network requires {num_bootstraps} bootstrap "
             f"{'operation' if num_bootstraps == 1 else 'operations'}.")
