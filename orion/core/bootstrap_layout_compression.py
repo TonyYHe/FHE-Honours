@@ -739,6 +739,32 @@ def _rewrite_node_as_beta_lift_producer(
     return updated
 
 
+def _activation_transparent_single_native_beta_lift(
+    network_dag: Any,
+    *,
+    path: list[str],
+    path_edges: list[tuple[str, str]],
+    start_index: int,
+    producer_module: Any | None,
+    lifted_edges: list[tuple[str, str]],
+) -> bool:
+    if type(producer_module).__name__ != "Conv2d":
+        return False
+    if len(lifted_edges) != 1:
+        return False
+    native_edge = tuple(lifted_edges[0])
+    try:
+        native_edge_index = path_edges.index(native_edge)
+    except ValueError:
+        return False
+    if int(native_edge_index) <= int(start_index):
+        return False
+    activation_nodes = [str(node) for node in path[start_index + 1 : native_edge_index + 1]]
+    if not activation_nodes:
+        return False
+    return all(_layout_preserving_module(network_dag, node) for node in activation_nodes)
+
+
 def _try_apply_beta_lift_candidate(
     network_dag: Any,
     compile_plan: dict[str, Any],
@@ -821,13 +847,27 @@ def _try_apply_beta_lift_candidate(
             if edge_source == producer:
                 current_source_layout = current_demand
                 break
-        if current_source_layout is None or len(lifted_edges) < 2:
+        if current_source_layout is None:
             continue
+        if len(lifted_edges) < 2:
+            activation_transparent_single_native = _activation_transparent_single_native_beta_lift(
+                network_dag,
+                path=path,
+                path_edges=path_edges,
+                start_index=int(start_index),
+                producer_module=producer_module,
+                lifted_edges=lifted_edges,
+            )
+            if not activation_transparent_single_native:
+                continue
+        else:
+            activation_transparent_single_native = False
         if not _layout_has_halo(current_source_layout):
             continue
         updated_edge_rows = []
         live_layout = dict(current_source_layout)
         accepted_edges: list[dict[str, Any]] = []
+        carried_edges: list[dict[str, Any]] = []
         path_edge_set = set(path_edges[start_index:])
         edge_index_by_pair = {pair: index for index, pair in enumerate(path_edges)}
         for row in compile_plan.get("edge_layouts", []):
@@ -854,6 +894,23 @@ def _try_apply_beta_lift_candidate(
                             "target": str(edge_target),
                             "old_physical_layout": str(row.get("physical_layout", "")),
                             "new_physical_layout": str(updated.get("physical_layout", "")),
+                        }
+                    )
+                    updated_edge_rows.append(updated)
+                elif _layout_preserving_module(network_dag, edge_target):
+                    updated = _rewrite_row_as_compact_source(
+                        dict(row),
+                        source_layout=input_layout,
+                        target_layout=input_layout,
+                        reason="boot_interval_activation_transparent_beta_lift",
+                    )
+                    carried_edges.append(
+                        {
+                            "edge": str(edge_id),
+                            "source": str(edge_source),
+                            "target": str(edge_target),
+                            "op_kind": str(row.get("op_kind", "")),
+                            "physical_layout": str(updated.get("physical_layout", "")),
                         }
                     )
                     updated_edge_rows.append(updated)
@@ -900,8 +957,13 @@ def _try_apply_beta_lift_candidate(
                     reason="boot_interval_beta_lift",
                 )
             )
-        if len(accepted_edges) < 2:
+        if len(accepted_edges) < 2 and not activation_transparent_single_native:
             continue
+        candidate_kind = (
+            "activation_transparent_beta_lift"
+            if bool(activation_transparent_single_native)
+            else "producer_beta_lift"
+        )
         updated_plan = _refresh_layout_policy_plan_summary(
             {
                 **dict(compile_plan),
@@ -913,14 +975,17 @@ def _try_apply_beta_lift_candidate(
         summary["boot_refined_beta_lift_count"] = int(summary.get("boot_refined_beta_lift_count", 0) or 0) + 1
         updated_plan["summary"] = summary
         return {
+            "kind": candidate_kind,
+            "strategy": candidate_kind,
             "plan": updated_plan,
             "accepted": [
                 {
-                    "kind": "producer_beta_lift",
+                    "kind": candidate_kind,
                     "producer": str(producer),
                     "boot_edge": {"source": str(boot_source), "target": str(boot_target)},
                     "producer_layout": dict(current_source_layout),
                     "covered_edges": accepted_edges,
+                    "carried_edges": carried_edges,
                     "covered_edge_count": int(len(accepted_edges)),
                 }
             ],
@@ -1091,11 +1156,13 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
         if beta_lift is None:
             continue
         accepted = [dict(row) for row in beta_lift.get("accepted", [])]
+        candidate_kind = str(beta_lift.get("kind", "producer_beta_lift"))
+        candidate_strategy = str(beta_lift.get("strategy", candidate_kind))
         candidates.append(
             {
                 "candidate_id": f"bootstrap_refine_beta_lift_{len(candidates) + 1}",
-                "kind": "producer_beta_lift",
-                "strategy": "producer_beta_lift",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
                 "plan": dict(beta_lift["plan"]),
                 "accepted": accepted,
                 "rejected": list(beta_lift.get("rejected", [])),
