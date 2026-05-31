@@ -2932,6 +2932,123 @@ def test_concat_single_slot_metadata_matches_direct_pack_for_nonfused_output_hal
         scheme.delete_scheme()
 
 
+def test_concat_fusion_single_slot_uses_concat_output_beta_lift_materialization(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 2, kernel_size=3, padding=1, bias=True)
+        conv.init_orion_params()
+        conv.name = "conv"
+        conv.input_shape = torch.Size((1, 4, 8, 8))
+        conv.output_shape = torch.Size((1, 2, 8, 8))
+        conv.fhe_input_shape = torch.Size((1, 4, 10, 8))
+        conv.fhe_output_shape = torch.Size((1, 2, 8, 8))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.layout_policy_output_row_offset = 0
+        conv.concat_fusion_specs = (
+            {
+                "source": "a",
+                "concat_node": "cat",
+                "channel_start": 0,
+                "channel_end": 2,
+                "channels": 2,
+                "shape": torch.Size((1, 2, 8, 8)),
+                "fhe_shape": torch.Size((1, 2, 8, 8)),
+                "gap": 1,
+            },
+            {
+                "source": "b",
+                "concat_node": "cat",
+                "channel_start": 2,
+                "channel_end": 4,
+                "channels": 2,
+                "shape": torch.Size((1, 2, 8, 8)),
+                "fhe_shape": torch.Size((1, 2, 8, 8)),
+                "gap": 1,
+            },
+        )
+        conv.layout_policy_output_layout = {"top_beta": 0, "bottom_beta": 0, "gap": 1}
+        conv.layout_policy_output_materialization = ""
+        lifted = {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "core_slots": 256, "stored_slots": 320, "tile_count": 5}
+        compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "core_slots": 256, "stored_slots": 256, "tile_count": 4}
+        compile_plan = {
+            "policy": "dp_no_share_fold",
+            "edge_layouts": [
+                {
+                    "edge": "a->cat",
+                    "source": "a",
+                    "target": "cat",
+                    "op_kind": "concat",
+                    "selected_layout": dict(compact),
+                    "source_layout": dict(compact),
+                    "physical_layout": "packed_compact",
+                    "source_physical_layout": "packed_compact",
+                    "target_physical_layout": "packed_compact",
+                    "relayout": False,
+                },
+                {
+                    "edge": "b->cat",
+                    "source": "b",
+                    "target": "cat",
+                    "op_kind": "concat",
+                    "selected_layout": dict(compact),
+                    "source_layout": dict(compact),
+                    "physical_layout": "packed_compact",
+                    "source_physical_layout": "packed_compact",
+                    "target_physical_layout": "packed_compact",
+                    "relayout": False,
+                },
+                {
+                    "edge": "cat->conv",
+                    "source": "cat",
+                    "target": "conv",
+                    "op_kind": "conv2d",
+                    "selected_layout": dict(lifted),
+                    "source_layout": dict(lifted),
+                    "physical_layout": "logical_halo_compact",
+                    "source_physical_layout": "logical_halo_compact",
+                    "target_physical_layout": "logical_halo_compact",
+                    "concat_output_beta_lift": True,
+                    "relayout": False,
+                },
+            ],
+            "node_layouts": [],
+        }
+        conv.region_runtime = SimpleNamespace(
+            executor=SimpleNamespace(
+                compile_plan=compile_plan,
+                _native_halo_module_attrs=lambda: {},
+            )
+        )
+        conv.set_level(len(scheme.params.get_logq()) - 1)
+        conv.set_depth(1)
+        original_builder = native_halo_conv2d._build_compact_source_concat_transforms_single_slot
+        calls = []
+
+        def spy_builder(*args, **kwargs):
+            calls.append(dict(kwargs))
+            return original_builder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            native_halo_conv2d,
+            "_build_compact_source_concat_transforms_single_slot",
+            spy_builder,
+        )
+
+        assert conv._compile_concat_fusion_unified_transforms() is True
+        assert len(calls) == 2
+        assert all(int(call["source_layout"]["top_beta"]) == 0 for call in calls)
+        assert all(int(call["source_layout"]["bottom_beta"]) == 0 for call in calls)
+        assert all(str(call["output_materialization"]) == "fused_relayout" for call in calls)
+        assert tuple(int(value) for value in conv._concat_fusion_fhe_output_shape) == (1, 2, 10, 8)
+        assert conv._concat_output_layout_attrs()["layout_policy_output_row_offset"] == 1
+    finally:
+        scheme.delete_scheme()
+
+
 def test_concat_fusion_unified_supported_for_native_stripe_output_halo(monkeypatch) -> None:
     monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
     _init_python_scheme(logn=6)

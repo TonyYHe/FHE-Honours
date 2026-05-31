@@ -70,7 +70,7 @@ from orion.core.auto_bootstrap import snapshot_bootstrap_solver_assignments
 from orion.nn.activation import SiLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
-from orion.nn.operations import Add
+from orion.nn.operations import Add, Concat
 from orion.nn.pooling import AvgPool2d
 
 
@@ -2253,6 +2253,237 @@ def test_bootstrap_aware_refinement_rejects_pool_activation_conv_single_native_l
     assert audit["enabled"] is False
     assert audit["reason"] == "no_supported_boot_interval_native_physical_relayout"
     assert executor.compile_plan["edge_layouts"][1]["physical_layout"] == "native_source_stripe"
+
+
+def test_bootstrap_aware_refinement_lifts_concat_output_for_local_conv_consumer() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 32,
+        "tile_count": 1,
+    }
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 48,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 64,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "skip->cat",
+                "source": "skip",
+                "target": "cat",
+                "op_kind": "concat",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(compact),
+                "target_layout": dict(compact),
+                "required_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "packed_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "up->cat",
+                "source": "up",
+                "target": "cat",
+                "op_kind": "concat",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(compact),
+                "target_layout": dict(compact),
+                "required_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "packed_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "cat->conv",
+                "source": "cat",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 2, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+                "relayout": False,
+                "relayout_reason": "native_halo_physical_source_stripe_relayout",
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "cat",
+                "shape": [1, 2, 4, 4],
+                "fhe_shape": [1, 2, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "output_relayout": False,
+                "producer_materialized_halo": False,
+            },
+            {
+                "node": "conv",
+                "shape": [1, 2, 4, 4],
+                "fhe_shape": [1, 2, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "output_relayout": False,
+                "producer_materialized_halo": False,
+            },
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(depth=3)),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][2]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    conv = Conv2d(2, 1, kernel_size=3, padding=1)
+    conv.name = "conv"
+    conv.output_shape = torch.Size((1, 1, 4, 4))
+    conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+    conv.output_gap = 1
+    conv.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("skip", module=SimpleNamespace(depth=1))
+    dag.add_node("up", module=SimpleNamespace(depth=1))
+    dag.add_node("cat", module=Concat(dim=1))
+    dag.add_node("conv", module=conv)
+    dag.add_node("tail", module=SimpleNamespace(depth=1))
+    dag.add_edge("skip", "cat")
+    dag.add_edge("up", "cat")
+    dag.add_edge("cat", "conv")
+    dag.add_edge("conv", "tail")
+
+    audit = apply_bootstrap_aware_layout_refinement(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "conv", "target": "tail"}]},
+    )
+    updated = executor.compile_plan
+    nodes = {str(row["node"]): dict(row) for row in updated["node_layouts"]}
+    edges = {str(row["edge"]): dict(row) for row in updated["edge_layouts"]}
+
+    assert audit["enabled"] is True
+    assert audit["strategy"] == "concat_output_beta_lift"
+    assert audit["accepted"][0]["producer"] == "cat"
+    assert validate_layout_policy_compile_plan(updated)["ok"] is True
+    assert edges["skip->cat"]["physical_layout"] == "packed_compact"
+    assert edges["up->cat"]["physical_layout"] == "packed_compact"
+    assert edges["skip->cat"]["selected_layout"]["top_beta"] == 0
+    assert edges["up->cat"]["selected_layout"]["bottom_beta"] == 0
+    assert nodes["cat"]["physical_layout"] == "logical_halo_compact"
+    assert nodes["cat"]["producer_materialized_halo"] is True
+    assert nodes["cat"]["producer_materialized_halo_reason"] == "boot_interval_concat_output_beta_lift"
+    assert nodes["cat"]["selected_layout"]["top_beta"] == beta1["top_beta"]
+    assert edges["cat->conv"]["physical_layout"] == "logical_halo_compact"
+    assert edges["cat->conv"]["source_physical_layout"] == "logical_halo_compact"
+    assert edges["cat->conv"]["layout_mode"] == "concat_output_compact_halo_shared"
+    assert edges["cat->conv"]["concat_output_beta_lift"] is True
+    assert not executor.native_physical_relayout_rows
+    assert executor.compact_source_rows
+
+    conv.compile_plan = updated
+    assert conv._concat_source_input_layout({"source": "skip", "concat_node": "cat", "gap": 1})["top_beta"] == 0
+    output_attrs = conv._concat_output_layout_attrs()
+    assert output_attrs["layout_policy_output_layout"]["top_beta"] == 1
+    assert output_attrs["layout_policy_output_materialization"] == "fused_relayout"
+
+
+def test_bootstrap_aware_refinement_rejects_concat_output_lift_with_external_fanout() -> None:
+    compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "core_slots": 32, "stored_slots": 32, "tile_count": 1}
+    beta1 = {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "core_slots": 32, "stored_slots": 48, "tile_count": 1}
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 64,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": edge,
+                "source": source,
+                "target": target,
+                "op_kind": op_kind,
+                "shape": [1, 2 if source == "cat" else 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1 if source == "cat" else compact),
+                "target_layout": dict(beta1 if source == "cat" else compact),
+                "required_layout": dict(beta1 if source == "cat" else compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe" if source == "cat" else "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe" if source == "cat" else "packed_compact",
+                "relayout": False,
+            }
+            for edge, source, target, op_kind in (
+                ("skip->cat", "skip", "cat", "concat"),
+                ("up->cat", "up", "cat", "concat"),
+                ("cat->conv", "cat", "conv", "conv2d"),
+            )
+        ],
+        "node_layouts": [
+            {"node": "cat", "shape": [1, 2, 4, 4], "fhe_shape": [1, 2, 4, 4], "selected_layout": dict(compact), "compact_layout": dict(compact), "physical_layout": "packed_compact"},
+            {"node": "conv", "shape": [1, 2, 4, 4], "fhe_shape": [1, 2, 4, 4], "selected_layout": dict(compact), "compact_layout": dict(compact), "physical_layout": "packed_compact"},
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(depth=3)),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][2]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    conv = Conv2d(2, 1, kernel_size=3, padding=1)
+    conv.name = "conv"
+    conv.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("skip", module=SimpleNamespace(depth=1))
+    dag.add_node("up", module=SimpleNamespace(depth=1))
+    dag.add_node("cat", module=Concat(dim=1))
+    dag.add_node("conv", module=conv)
+    dag.add_node("side", module=SimpleNamespace(depth=1))
+    dag.add_node("tail", module=SimpleNamespace(depth=1))
+    dag.add_edge("skip", "cat")
+    dag.add_edge("up", "cat")
+    dag.add_edge("cat", "conv")
+    dag.add_edge("cat", "side")
+    dag.add_edge("conv", "tail")
+
+    audit = apply_bootstrap_aware_layout_refinement(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "conv", "target": "tail"}]},
+    )
+
+    assert audit["enabled"] is False
+    assert audit["reason"] == "no_supported_boot_interval_native_physical_relayout"
+    assert executor.compile_plan["edge_layouts"][2]["physical_layout"] == "native_source_stripe"
 
 
 def test_bootstrap_aware_refinement_rejects_beta_lift_with_external_fanout() -> None:

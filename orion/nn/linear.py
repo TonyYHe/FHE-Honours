@@ -523,22 +523,45 @@ class Conv2d(LinearTransform):
 
     def _concat_output_layout_attrs(self) -> dict:
         attrs = self._concat_layout_policy_module_attrs()
+        conv_input_row = self._concat_conv_input_layout_row()
         module_layout = dict(getattr(self, "layout_policy_output_layout", {}) or {})
-        output_layout = dict(module_layout or attrs.get("layout_policy_output_layout", {}) or {})
+        lifted_output_layout = (
+            dict(conv_input_row.get("target_layout", conv_input_row.get("selected_layout", {})) or {})
+            if bool(conv_input_row.get("concat_output_beta_lift", False))
+            else {}
+        )
+        output_layout = dict(lifted_output_layout or module_layout or attrs.get("layout_policy_output_layout", {}) or {})
         output_gap = max(1, int(output_layout.get("gap", getattr(self, "output_gap", 1)) or 1))
         output_top_beta = self._concat_layout_top_beta(output_layout)
-        output_row_offset = getattr(self, "layout_policy_output_row_offset", None)
+        output_bottom_beta = self._concat_layout_bottom_beta(output_layout)
+        if lifted_output_layout:
+            output_row_offset = int(output_top_beta * output_gap)
+        else:
+            output_row_offset = getattr(self, "layout_policy_output_row_offset", None)
         if output_row_offset is None:
             output_row_offset = attrs.get("layout_policy_output_row_offset", int(output_top_beta * output_gap))
         output_materialization = getattr(self, "layout_policy_output_materialization", None)
         if output_materialization is None:
             output_materialization = attrs.get("layout_policy_output_materialization", "")
+        if lifted_output_layout:
+            output_materialization = "fused_relayout"
         result = {
             "layout_policy_output_layout": dict(output_layout),
             "layout_policy_output_row_offset": int(output_row_offset or 0),
             "layout_policy_output_materialization": str(output_materialization or ""),
         }
-        if "fhe_output_shape" in attrs:
+        if lifted_output_layout:
+            n, channels, height, width = (int(value) for value in self.output_shape)
+            on_channels = int(math.ceil(int(channels) / float(output_gap * output_gap)))
+            result["fhe_output_shape"] = torch.Size(
+                (
+                    int(n),
+                    int(on_channels),
+                    int(height * output_gap + (output_top_beta + output_bottom_beta) * output_gap),
+                    int(width * output_gap),
+                )
+            )
+        elif "fhe_output_shape" in attrs:
             result["fhe_output_shape"] = torch.Size(attrs["fhe_output_shape"])
         return result
 

@@ -1145,6 +1145,139 @@ def _native_physical_relayout_refinement_candidate(
     }
 
 
+def _concat_output_beta_lift_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in compile_plan.get("edge_layouts", [])}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    candidates: list[dict[str, Any]] = []
+    for row in compile_plan.get("edge_layouts", []):
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        if edge_id not in actual_native_physical_edges:
+            continue
+        if str(current.get("op_kind", "")) != "conv2d":
+            continue
+        if str(current.get("physical_layout", "")) != "native_source_stripe":
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[source].get("module")).__name__ != "Concat":
+            continue
+        if type(network_dag.nodes[target].get("module")).__name__ != "Conv2d":
+            continue
+        if len(list(network_dag.successors(source))) != 1:
+            continue
+        if (source, target) in boot_edges:
+            continue
+        matches = _candidate_interval_matches(
+            row=current,
+            intervals=intervals,
+            boot_edges=boot_edges,
+        )
+        if len(matches) != 1:
+            continue
+        join_rows = [
+            dict(join_row)
+            for join_row in compile_plan.get("edge_layouts", [])
+            if str(join_row.get("target", "")) == source and str(join_row.get("op_kind", "")) == "concat"
+        ]
+        if len(join_rows) < 2:
+            continue
+        join_safe = True
+        for join_row in join_rows:
+            selected = dict(join_row.get("selected_layout", {}) or {})
+            target_physical = str(join_row.get("target_physical_layout", join_row.get("physical_layout", "")) or "")
+            if _layout_has_halo(selected) or target_physical != PHYSICAL_COMPACT:
+                join_safe = False
+                break
+        if not join_safe:
+            continue
+        selected = dict(current.get("selected_layout", {}) or {})
+        required = dict(current.get("required_layout", selected) or selected)
+        if not _layout_covers(selected, required):
+            continue
+        if int(selected.get("gap", 1) or 1) != int(required.get("gap", selected.get("gap", 1)) or 1):
+            continue
+        node_row = node_rows_by_node.get(source)
+        if node_row is None:
+            continue
+        updated_edge_rows: list[dict[str, Any]] = []
+        for candidate_row in compile_plan.get("edge_layouts", []):
+            if str(candidate_row.get("edge", "")) != edge_id:
+                updated_edge_rows.append(dict(candidate_row))
+                continue
+            updated = _rewrite_row_as_compact_source(
+                dict(candidate_row),
+                source_layout=selected,
+                target_layout=selected,
+                reason="boot_interval_concat_output_beta_lift",
+            )
+            updated["layout_mode"] = "concat_output_compact_halo_shared"
+            updated["concat_output_beta_lift"] = True
+            updated["concat_output_beta_lift_source"] = str(source)
+            updated_edge_rows.append(updated)
+        updated_node_rows: list[dict[str, Any]] = []
+        for candidate_node in compile_plan.get("node_layouts", []):
+            if str(candidate_node.get("node", "")) != source:
+                updated_node_rows.append(dict(candidate_node))
+                continue
+            updated_node_rows.append(
+                _rewrite_node_as_beta_lift_producer(
+                    dict(candidate_node),
+                    layout=selected,
+                    reason="boot_interval_concat_output_beta_lift",
+                )
+            )
+        updated_plan = _refresh_layout_policy_plan_summary(
+            {
+                **dict(compile_plan),
+                "edge_layouts": updated_edge_rows,
+                "node_layouts": updated_node_rows,
+            }
+        )
+        summary = dict(updated_plan.get("summary", {}) or {})
+        summary["boot_refined_concat_output_beta_lift_count"] = (
+            int(summary.get("boot_refined_concat_output_beta_lift_count", 0) or 0) + 1
+        )
+        updated_plan["summary"] = summary
+        boot_source, boot_target = matches[0].get("boot_edge", ("", ""))
+        candidates.append(
+            {
+                "kind": "concat_output_beta_lift",
+                "strategy": "concat_output_beta_lift",
+                "plan": updated_plan,
+                "accepted": [
+                    {
+                        "kind": "concat_output_beta_lift",
+                        "producer": str(source),
+                        "boot_edge": {"source": str(boot_source), "target": str(boot_target)},
+                        "producer_layout": dict(selected),
+                        "covered_edges": [
+                            {
+                                "edge": str(edge_id),
+                                "source": str(source),
+                                "target": str(target),
+                                "old_physical_layout": str(current.get("physical_layout", "")),
+                                "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                            }
+                        ],
+                        "covered_edge_count": 1,
+                    }
+                ],
+                "rejected": [],
+            }
+        )
+    return candidates
+
+
 def enumerate_bootstrap_aware_layout_refinement_candidates(
     network_dag: Any,
     first_pass_audit: dict[str, Any],
@@ -1197,6 +1330,32 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "plan": dict(beta_lift["plan"]),
                 "accepted": accepted,
                 "rejected": list(beta_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": 0,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
+    for concat_lift in _concat_output_beta_lift_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    ):
+        accepted = [dict(row) for row in concat_lift.get("accepted", [])]
+        candidate_kind = str(concat_lift.get("kind", "concat_output_beta_lift"))
+        candidate_strategy = str(concat_lift.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_concat_output_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(concat_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(concat_lift.get("rejected", [])),
                 "accepted_count": int(
                     sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
                 ),
