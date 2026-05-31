@@ -112,6 +112,44 @@ class _CProviderCompactSourceSpec(ctypes.Structure):
     ]
 
 
+class _CProviderStripeSpec(ctypes.Structure):
+    _fields_ = [
+        ("stripe_index", ctypes.c_int),
+        ("target_h_start", ctypes.c_int),
+        ("target_h_end", ctypes.c_int),
+        ("target_h", ctypes.c_int),
+        ("target_tile", ctypes.c_int),
+        ("target_group_count", ctypes.c_int),
+    ]
+
+
+class _CProviderCompactSourceConcatIndexSpec(ctypes.Structure):
+    _fields_ = [
+        ("slots", ctypes.c_int),
+        ("c_in", ctypes.c_int),
+        ("h_in", ctypes.c_int),
+        ("w_in", ctypes.c_int),
+        ("c_out", ctypes.c_int),
+        ("h_out", ctypes.c_int),
+        ("w_out", ctypes.c_int),
+        ("gap_out", ctypes.c_int),
+        ("kernel", ctypes.c_int),
+        ("stride", ctypes.c_int),
+        ("pad", ctypes.c_int),
+        ("dilation", ctypes.c_int),
+        ("source_top_beta", ctypes.c_int),
+        ("source_bottom_beta", ctypes.c_int),
+        ("source_gap", ctypes.c_int),
+        ("output_top_beta", ctypes.c_int),
+        ("output_bottom_beta", ctypes.c_int),
+        ("output_physical_top_beta", ctypes.c_int),
+        ("output_physical_bottom_beta", ctypes.c_int),
+        ("source_ct_count", ctypes.c_int),
+        ("target_ct_count", ctypes.c_int),
+        ("fuse_output_relayout", ctypes.c_int),
+    ]
+
+
 @dataclass(frozen=True)
 class DenseConv2DPayload:
     row: int
@@ -260,6 +298,16 @@ def load_library() -> ctypes.CDLL | None:
                     ctypes.c_int,
                 ]
                 provider_compact.restype = _CPayloadBatch
+            provider_concat_index = getattr(lib, "OrionBuildProviderCompactSourceConcatConv2DIndexOnly", None)
+            if provider_concat_index is not None:
+                provider_concat_index.argtypes = [
+                    _CProviderCompactSourceConcatIndexSpec,
+                    ctypes.POINTER(_CProviderStripeSpec),
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                ]
+                provider_concat_index.restype = _CPayloadBatch
             _LIB_CACHE = lib
             _LOAD_ERROR = None
             return _LIB_CACHE
@@ -763,6 +811,7 @@ def build_provider_native_source_conv2d_payload(
     spec: Any,
     plan: Any,
     weight: torch.Tensor,
+    weight_np: np.ndarray | None = None,
     stripe: Any,
     source_group: int,
     target_group: int,
@@ -815,7 +864,10 @@ def build_provider_native_source_conv2d_payload(
         int(compact_target_block is not None),
         int(-1 if compact_target_block is None else compact_target_block),
     )
-    weight_np = np.ascontiguousarray(weight.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1), dtype=np.float32)
+    if weight_np is None:
+        weight_np = np.ascontiguousarray(weight.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1), dtype=np.float32)
+    else:
+        weight_np = np.ascontiguousarray(np.asarray(weight_np, dtype=np.float32).reshape(-1), dtype=np.float32)
     started = time.perf_counter()
     batch = build(
         c_spec,
@@ -940,5 +992,129 @@ def build_provider_compact_source_conv2d_payload(
             "diag_builder_fallback_reason": "",
         }
         return payload.diag_indices, payload.diag_data, metadata
+    finally:
+        lib.OrionFreeDiagPayloadBatch(batch)
+
+
+def build_provider_compact_source_concat_conv2d_indices(
+    *,
+    spec: Any,
+    plan: Any,
+    weight: torch.Tensor,
+    source_layout: dict[str, Any],
+    source_ct_count: int,
+    target_ct_count: int,
+    output_materialization: str = "",
+    weight_np: np.ndarray | None = None,
+) -> tuple[dict[int, list[tuple[int, tuple[int, ...]]]], dict[str, Any]] | None:
+    lib = load_library()
+    build = None if lib is None else getattr(lib, "OrionBuildProviderCompactSourceConcatConv2DIndexOnly", None)
+    if not callable(build):
+        raise RuntimeError(load_error() or "provider compact-source concat index diag builder unavailable")
+    source_top_beta = max(
+        0,
+        int(
+            source_layout.get(
+                "physical_top_beta",
+                source_layout.get("top_beta", int(getattr(spec, "input_physical_top_beta", 0) or 0)),
+            )
+            or 0
+        ),
+    )
+    source_bottom_beta = max(
+        0,
+        int(
+            source_layout.get(
+                "physical_bottom_beta",
+                source_layout.get("bottom_beta", int(getattr(spec, "input_physical_bottom_beta", 0) or 0)),
+            )
+            or 0
+        ),
+    )
+    source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
+    c_spec = _CProviderCompactSourceConcatIndexSpec(
+        int(spec.slot_count),
+        int(spec.c_in),
+        int(spec.h_in),
+        int(spec.w_in),
+        int(spec.c_out),
+        int(spec.h_out),
+        int(spec.w_out),
+        int(spec.gap_out),
+        int(spec.kernel),
+        int(spec.stride),
+        int(spec.pad),
+        int(spec.dilation),
+        int(source_top_beta),
+        int(source_bottom_beta),
+        int(source_gap),
+        int(spec.output_top_beta),
+        int(spec.output_bottom_beta),
+        int(spec.output_physical_top_beta or 0),
+        int(spec.output_physical_bottom_beta or 0),
+        int(source_ct_count),
+        int(target_ct_count),
+        int(str(output_materialization or "") == "fused_relayout"),
+    )
+    stripe_specs = [
+        _CProviderStripeSpec(
+            int(stripe.index),
+            int(stripe.target_h_start),
+            int(stripe.target_h_end),
+            int(stripe.target_h),
+            int(plan.target_tile_for_stripe(stripe)),
+            int(plan.target_group_count_for_stripe(stripe)),
+        )
+        for stripe in plan.stripes
+    ]
+    stripes_array = (_CProviderStripeSpec * len(stripe_specs))(*stripe_specs) if stripe_specs else None
+    if weight_np is None:
+        weight_np = np.ascontiguousarray(weight.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1), dtype=np.float32)
+    else:
+        weight_np = np.ascontiguousarray(np.asarray(weight_np, dtype=np.float32).reshape(-1), dtype=np.float32)
+    started = time.perf_counter()
+    batch = build(
+        c_spec,
+        stripes_array,
+        int(len(stripe_specs)),
+        weight_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(weight_np.size),
+    )
+    build_s = float(time.perf_counter() - started)
+    try:
+        fallback_reason = _decode_c_string(batch.fallback_reason)
+        if fallback_reason:
+            raise RuntimeError(fallback_reason)
+        payloads = _copy_payloads(batch)
+        if not payloads:
+            metadata = {
+                "diag_builder_kind": _decode_c_string(batch.builder_kind) or "cpp_provider_native_halo_conv2d:compact_source_concat_index_only",
+                "diag_builder_source": "cpp",
+                "diag_builder_build_s": float(build_s),
+                "diag_builder_payload_count": 0.0,
+                "diag_builder_fallback_reason": "",
+            }
+            return {}, metadata
+        by_source: dict[int, list[tuple[int, tuple[int, ...]]]] = {}
+        for payload in payloads:
+            diag_tuple = tuple(int(value) for value in np.asarray(payload.diag_indices, dtype=np.int32).tolist())
+            if not diag_tuple:
+                continue
+            by_source.setdefault(int(payload.col), []).append((int(payload.row), diag_tuple))
+        ordered = {
+            int(source_block): [
+                (int(target_block), tuple(int(value) for value in diag_tuple))
+                for target_block, diag_tuple in sorted(items, key=lambda item: int(item[0]))
+            ]
+            for source_block, items in sorted(by_source.items(), key=lambda item: int(item[0]))
+        }
+        metadata = {
+            "diag_builder_kind": _decode_c_string(batch.builder_kind) or "cpp_provider_native_halo_conv2d:compact_source_concat_index_only",
+            "diag_builder_source": "cpp",
+            "diag_builder_build_s": float(build_s),
+            "diag_builder_payload_count": float(len(payloads)),
+            "diag_builder_fallback_reason": "",
+        }
+        return ordered, metadata
     finally:
         lib.OrionFreeDiagPayloadBatch(batch)

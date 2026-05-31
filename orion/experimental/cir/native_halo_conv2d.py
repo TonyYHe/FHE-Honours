@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable, Literal
+from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
 import time
@@ -28,6 +30,13 @@ from .r34_orion_same_shape import (
 
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
 _CPP_DIAG_BUILDER_FALLBACK = object()
+_NATIVE_BSGS_CACHE: dict[tuple[int, tuple[tuple[int, ...], ...]], tuple[int, int, int, int]] = {}
+_NATIVE_BSGS_ROTATION_SETS_CACHE: dict[tuple[int, int, tuple[int, ...]], tuple[tuple[int, ...], tuple[int, ...]]] = {}
+_NATIVE_DIAG_INDICES_CACHE: dict[tuple[Any, ...], tuple[int, ...]] = {}
+_COMPACT_OUTPUT_DIAG_SET_CACHE: dict[tuple[Any, ...], tuple[tuple[int, tuple[int, ...]], ...]] = {}
+_PER_STRIPE_FOLD_STRIPES_CACHE: dict[tuple[Any, ...], tuple["NativeHaloStripe", ...]] = {}
+_NATIVE_BSGS_CACHE_MAX_ENTRIES = 20000
+_NATIVE_DIAG_CACHE_MAX_ENTRIES = 50000
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -49,6 +58,26 @@ def _provider_diag_builder_shadow() -> bool:
     return bool(_env_enabled("ORION_CPP_DIAG_BUILDER_SHADOW"))
 
 
+def _provider_diag_build_workers(item_count: int) -> int:
+    if int(item_count) <= 1:
+        return 1
+    raw = (
+        os.environ.get("ORION_PROVIDER_DIAG_BUILD_WORKERS")
+        or os.environ.get("ORION_CPP_DIAG_BUILDER_PROVIDER_WORKERS")
+        or ""
+    )
+    if not raw:
+        return 1
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        requested = 1
+    if int(requested) <= 1:
+        return 1
+    cpu = max(1, int(os.cpu_count() or 1))
+    return max(1, min(int(item_count), int(cpu), int(requested)))
+
+
 def _record_provider_diag_builder_metadata(target: Any, metadata: dict[str, Any] | None) -> None:
     if not isinstance(metadata, dict) or not metadata:
         return
@@ -58,6 +87,7 @@ def _record_provider_diag_builder_metadata(target: Any, metadata: dict[str, Any]
     for key, value in metadata.items():
         if key in {
             "diag_builder_build_s",
+            "diag_builder_wall_s",
             "diag_builder_shadow_s",
             "diag_builder_payload_count",
             "diag_builder_fallback_count",
@@ -65,6 +95,124 @@ def _record_provider_diag_builder_metadata(target: Any, metadata: dict[str, Any]
             timing[str(key)] = float(timing.get(str(key), 0.0) or 0.0) + float(value or 0.0)
         else:
             timing[str(key)] = value
+
+
+_GROUP_COMPILE_PROFILE_NUMERIC_KEYS = (
+    "detect_complex_s",
+    "flatten_s",
+    "backend_pointer_pack_s",
+    "backend_generate_s",
+    "backend_generate_calls",
+    "record_keys_s",
+    "rotation_key_compile_s",
+    "rotation_key_required_count",
+    "rotation_key_generated_count",
+    "rotation_key_cached_count",
+    "save_unload_s",
+    "compile_gc_s",
+    "compile_gc_count",
+    "prepare_shared_cache_s",
+    "total_s",
+    "transform_count",
+    "stream_batch_limit",
+    "stream_batch_count",
+    "diag_index_count",
+    "diag_data_count",
+    "payload_bytes",
+)
+
+
+def _record_group_compile_profile(target: Any, group: Any) -> None:
+    profile = getattr(group, "last_compile_profile", None)
+    if not isinstance(profile, dict) or not profile:
+        return
+    timing = getattr(target, "last_runtime_timing", None)
+    if not isinstance(timing, dict):
+        return
+    timing["group_compile_profile_count"] = float(
+        timing.get("group_compile_profile_count", 0.0) or 0.0
+    ) + 1.0
+    for key in _GROUP_COMPILE_PROFILE_NUMERIC_KEYS:
+        value = profile.get(str(key), 0.0)
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, (int, float)):
+            timing[f"group_compile_{key}"] = float(
+                timing.get(f"group_compile_{key}", 0.0) or 0.0
+            ) + float(value)
+    mode = profile.get("mode")
+    if mode is not None:
+        modes = timing.setdefault("group_compile_modes", {})
+        if isinstance(modes, dict):
+            modes[str(mode)] = int(modes.get(str(mode), 0) or 0) + 1
+
+
+def _canonical_cache_key(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple((str(key), _canonical_cache_key(val)) for key, val in sorted(value.items(), key=lambda item: str(item[0])))
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonical_cache_key(item) for item in value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _diag_set_key(diag_indices: set[int] | tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(sorted(int(value) for value in diag_indices))
+
+
+def _native_diag_cache_guard() -> None:
+    if len(_NATIVE_DIAG_INDICES_CACHE) + len(_COMPACT_OUTPUT_DIAG_SET_CACHE) > int(_NATIVE_DIAG_CACHE_MAX_ENTRIES):
+        _NATIVE_DIAG_INDICES_CACHE.clear()
+        _COMPACT_OUTPUT_DIAG_SET_CACHE.clear()
+
+
+def _native_spec_structural_cache_key(spec: "NativeHaloConv2DSpec") -> tuple[tuple[str, Any], ...]:
+    payload = dict(spec.to_dict())
+    payload.pop("family_label", None)
+    return _canonical_cache_key(payload)
+
+
+def _native_stripe_cache_key(stripe: "NativeHaloStripe") -> tuple[tuple[str, Any], ...]:
+    return _canonical_cache_key(stripe.to_dict())
+
+
+def _native_plan_structural_cache_key(plan: "NativeHaloConv2DPlan") -> tuple[tuple[str, Any], ...]:
+    payload = dict(plan.to_dict())
+    spec_payload = dict(payload.get("spec", {}) or {})
+    spec_payload.pop("family_label", None)
+    payload["spec"] = spec_payload
+    return _canonical_cache_key(payload)
+
+
+def _cached_native_best_common_bsgs(entries: tuple[set[int], ...], *, slots: int) -> tuple[int, int, int, int]:
+    key = (int(slots), tuple(_diag_set_key(entry) for entry in entries))
+    cached = _NATIVE_BSGS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_NATIVE_BSGS_CACHE) > int(_NATIVE_BSGS_CACHE_MAX_ENTRIES):
+        _NATIVE_BSGS_CACHE.clear()
+        _NATIVE_BSGS_ROTATION_SETS_CACHE.clear()
+    result = _native_best_common_bsgs(entries, slots=int(slots))
+    _NATIVE_BSGS_CACHE[key] = result
+    return result
+
+
+def _cached_bsgs_rotation_sets(diag_indices: set[int], *, slots: int, n1: int) -> tuple[set[int], set[int]]:
+    diag_key = _diag_set_key(diag_indices)
+    key = (int(slots), int(n1), diag_key)
+    cached = _NATIVE_BSGS_ROTATION_SETS_CACHE.get(key)
+    if cached is not None:
+        baby, giant = cached
+        return set(int(value) for value in baby), set(int(value) for value in giant)
+    if len(_NATIVE_BSGS_ROTATION_SETS_CACHE) > int(_NATIVE_BSGS_CACHE_MAX_ENTRIES):
+        _NATIVE_BSGS_ROTATION_SETS_CACHE.clear()
+    baby_set, giant_set = _bsgs_rotation_sets(set(int(value) for value in diag_indices), slots=int(slots), n1=int(n1))
+    _NATIVE_BSGS_ROTATION_SETS_CACHE[key] = (
+        tuple(sorted(int(value) for value in baby_set)),
+        tuple(sorted(int(value) for value in giant_set)),
+    )
+    return baby_set, giant_set
 
 
 def _ceil_div(left: int, right: int) -> int:
@@ -225,6 +373,138 @@ def _idx_chw_gap_channel_positions(
         + w_values * int(g)
         + phase_w
     ).to(dtype=torch.int64)
+
+
+def _channel_base_offsets_chw_gap(
+    channel_start: int,
+    channel_count: int,
+    *,
+    height: int,
+    width: int,
+    gap: int,
+) -> np.ndarray:
+    count = max(0, int(channel_count))
+    if int(count) <= 0:
+        return np.empty((0,), dtype=np.int64)
+    g = max(1, int(gap))
+    phases = int(g * g)
+    packed_w = int(width) * int(g)
+    group_block = int(height) * int(g) * int(packed_w)
+    channels = np.arange(int(channel_start), int(channel_start) + int(count), dtype=np.int64)
+    groups = channels // int(phases)
+    phase = channels % int(phases)
+    phase_h = phase // int(g)
+    phase_w = phase % int(g)
+    return (
+        groups * int(group_block)
+        + phase_h * int(packed_w)
+        + phase_w
+    ).astype(np.int64, copy=False)
+
+
+def _mod_sum_values(left: set[int] | np.ndarray, right: set[int] | np.ndarray, *, slots: int) -> set[int]:
+    slots = max(1, int(slots))
+    if isinstance(left, np.ndarray):
+        left_values = left.astype(np.int64, copy=False).reshape(-1)
+    else:
+        left_values = np.asarray(tuple(int(value) for value in left), dtype=np.int64)
+    if isinstance(right, np.ndarray):
+        right_values = right.astype(np.int64, copy=False).reshape(-1)
+    else:
+        right_values = np.asarray(tuple(int(value) for value in right), dtype=np.int64)
+    if int(left_values.size) == 0 or int(right_values.size) == 0:
+        return set()
+    left_values = np.unique(np.remainder(left_values, int(slots)))
+    right_values = np.unique(np.remainder(right_values, int(slots)))
+    if int(left_values.size) > int(right_values.size):
+        left_values, right_values = right_values, left_values
+    mask = np.zeros((int(slots),), dtype=np.bool_)
+    chunk = max(1, min(4096, int(left_values.size)))
+    for start in range(0, int(left_values.size), int(chunk)):
+        values = np.remainder(right_values[None, :] + left_values[start : start + int(chunk), None], int(slots))
+        mask[values.reshape(-1)] = True
+    return set(int(value) for value in np.flatnonzero(mask).tolist())
+
+
+def _mod_difference_values(left: np.ndarray, right: np.ndarray, *, slots: int) -> set[int]:
+    slots = max(1, int(slots))
+    if int(left.size) == 0 or int(right.size) == 0:
+        return set()
+    left_values = np.unique(np.remainder(left.astype(np.int64, copy=False).reshape(-1), int(slots)))
+    right_values = np.unique(np.remainder(right.astype(np.int64, copy=False).reshape(-1), int(slots)))
+    mask = np.zeros((int(slots),), dtype=np.bool_)
+    chunk = max(1, min(4096, int(left_values.size)))
+    for start in range(0, int(left_values.size), int(chunk)):
+        values = np.remainder(left_values[start : start + int(chunk), None] - right_values[None, :], int(slots))
+        mask[values.reshape(-1)] = True
+    return set(int(value) for value in np.flatnonzero(mask).tolist())
+
+
+def _native_diag_indices_closed_form(
+    spec: "NativeHaloConv2DSpec",
+    stripe: "NativeHaloStripe",
+    *,
+    source_channel_count: int,
+    target_channel_count: int,
+) -> set[int]:
+    slots = int(spec.slot_count)
+    source_offsets = _channel_base_offsets_chw_gap(
+        0,
+        int(source_channel_count),
+        height=int(stripe.source_h),
+        width=int(spec.w_in),
+        gap=int(spec.gap_in),
+    )
+    target_offsets = _channel_base_offsets_chw_gap(
+        0,
+        int(target_channel_count),
+        height=int(stripe.target_h),
+        width=int(spec.w_out),
+        gap=int(spec.gap_out),
+    )
+    channel_shifts = _mod_difference_values(source_offsets, target_offsets, slots=int(slots))
+    if not channel_shifts:
+        return set()
+
+    source_packed_w = int(spec.w_in) * max(1, int(spec.gap_in))
+    target_packed_w = int(spec.w_out) * max(1, int(spec.gap_out))
+    spatial_shifts: set[int] = set()
+    out_h_values = range(int(stripe.target_h_start), int(stripe.target_h_end))
+    out_w_values = range(int(spec.w_out))
+    for kh in range(int(spec.kernel)):
+        h_shifts: set[int] = set()
+        for out_h in out_h_values:
+            in_h = int(out_h) * int(spec.stride) - int(spec.pad) + int(kh) * int(spec.dilation)
+            source_local_h = int(in_h) - int(stripe.source_h_start)
+            if (
+                int(in_h) < int(spec.input_h_min)
+                or int(in_h) >= int(spec.input_h_max)
+                or int(source_local_h) < 0
+                or int(source_local_h) >= int(stripe.source_h)
+            ):
+                continue
+            target_local_h = int(out_h) - int(stripe.target_h_start)
+            h_shifts.add(
+                int(
+                    int(source_local_h) * max(1, int(spec.gap_in)) * int(source_packed_w)
+                    - int(target_local_h) * max(1, int(spec.gap_out)) * int(target_packed_w)
+                )
+            )
+        if not h_shifts:
+            continue
+        for kw in range(int(spec.kernel)):
+            w_shifts: set[int] = set()
+            for out_w in out_w_values:
+                in_w = int(out_w) * int(spec.stride) - int(spec.pad) + int(kw) * int(spec.dilation)
+                if int(in_w) < 0 or int(in_w) >= int(spec.w_in):
+                    continue
+                w_shifts.add(int(int(in_w) * max(1, int(spec.gap_in)) - int(out_w) * max(1, int(spec.gap_out))))
+            if not w_shifts:
+                continue
+            spatial_shifts.update(_mod_sum_values(h_shifts, w_shifts, slots=int(slots)))
+    shifts = _mod_sum_values(channel_shifts, spatial_shifts, slots=int(slots))
+    shifts.discard(0)
+    return shifts
 
 
 def _native_halo_build_pair_chunk_limit() -> int:
@@ -631,6 +911,411 @@ class NativeHaloConv2DPlan:
         }
 
 
+@dataclass(frozen=True)
+class NativeHaloCompactOutputRotationStats:
+    c_only_rotations: int
+    cb_shared_rotations: int
+    shared_baby_rotations: int
+    shared_giant_rotations: int
+    transform_count: int
+    sharing_group_count: int
+    output_ct_count: int
+    diagonal_counts: tuple[int, ...]
+    rotation_counts: tuple[int, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "c_only_rotations": int(self.c_only_rotations),
+            "cb_shared_rotations": int(self.cb_shared_rotations),
+            "shared_baby_rotations": int(self.shared_baby_rotations),
+            "shared_giant_rotations": int(self.shared_giant_rotations),
+            "transform_count": int(self.transform_count),
+            "sharing_group_count": int(self.sharing_group_count),
+            "output_ct_count": int(self.output_ct_count),
+            "diagonal_counts": [int(value) for value in self.diagonal_counts],
+            "rotation_counts": [int(value) for value in self.rotation_counts],
+        }
+
+
+_COMPACT_OUTPUT_ROTATION_STATS_CACHE: dict[tuple[Any, Any], NativeHaloCompactOutputRotationStats] = {}
+
+
+def _compact_output_diag_sets_for_task(
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    stripe: NativeHaloStripe,
+    *,
+    source_group: int,
+    target_group: int,
+) -> dict[int, set[int]]:
+    source_tile = int(plan.source_tile_for_stripe(stripe))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    source_start = int(source_group) * int(source_tile)
+    source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
+    key = (
+        "compact_output_diag_sets",
+        _native_spec_structural_cache_key(spec),
+        _native_plan_structural_cache_key(plan),
+        _native_stripe_cache_key(stripe),
+        int(source_end - source_start),
+        int(target_start),
+        int(target_end - target_start),
+    )
+    cached = _COMPACT_OUTPUT_DIAG_SET_CACHE.get(key)
+    if cached is not None:
+        return {int(block): set(int(value) for value in values) for block, values in cached}
+    _native_diag_cache_guard()
+    diag_sets_by_block = _compact_output_diag_sets_for_task_closed_form(
+        spec,
+        plan,
+        stripe,
+        source_group=int(source_group),
+        target_group=int(target_group),
+    )
+    _COMPACT_OUTPUT_DIAG_SET_CACHE[key] = tuple(
+        (int(block), tuple(sorted(int(value) for value in diag_set)))
+        for block, diag_set in sorted(diag_sets_by_block.items())
+    )
+    return {int(block): set(int(value) for value in values) for block, values in _COMPACT_OUTPUT_DIAG_SET_CACHE[key]}
+
+
+def _compact_output_diag_sets_for_task_closed_form(
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    stripe: NativeHaloStripe,
+    *,
+    source_group: int,
+    target_group: int,
+) -> dict[int, set[int]]:
+    slots = int(spec.slot_count)
+    source_tile = int(plan.source_tile_for_stripe(stripe))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    source_start = int(source_group) * int(source_tile)
+    source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
+    source_count = int(source_end - source_start)
+    target_count = int(target_end - target_start)
+    if int(source_count) <= 0 or int(target_count) <= 0:
+        return {}
+
+    compact_output_h = _spec_physical_output_h(spec)
+    source_offsets = _channel_base_offsets_chw_gap(
+        0,
+        int(source_count),
+        height=int(stripe.source_h),
+        width=int(spec.w_in),
+        gap=int(spec.gap_in),
+    )
+    target_packed_w = int(spec.w_out) * max(1, int(spec.gap_out))
+    target_group_block = int(compact_output_h) * max(1, int(spec.gap_out)) * int(target_packed_w)
+    target_channel_bases = _channel_base_offsets_chw_gap(
+        int(target_start),
+        int(target_count),
+        height=int(compact_output_h),
+        width=int(spec.w_out),
+        gap=int(spec.gap_out),
+    )
+
+    gap_in = max(1, int(spec.gap_in))
+    gap_out = max(1, int(spec.gap_out))
+    source_packed_w = int(spec.w_in) * int(gap_in)
+    h_in_min = int(spec.input_h_min)
+    h_in_max = int(spec.input_h_max)
+    source_h_start = int(stripe.source_h_start)
+    stripe_source_h = int(stripe.source_h)
+    stride = int(spec.stride)
+    pad = int(spec.pad)
+    dilation = int(spec.dilation)
+    diag_masks_by_block: dict[int, np.ndarray] = {}
+    out_h_values = range(int(stripe.target_h_start), int(stripe.target_h_end))
+    out_w_values = range(int(spec.w_out))
+    for kh in range(int(spec.kernel)):
+        h_pairs: list[tuple[int, int]] = []
+        for out_h in out_h_values:
+            op_out_h = int(_materialized_output_source_h(
+                int(out_h),
+                h_out=int(spec.h_out),
+                output_top_beta=int(spec.output_top_beta),
+                output_bottom_beta=int(spec.output_bottom_beta),
+            ))
+            in_h = int(op_out_h) * int(stride) - int(pad) + int(kh) * int(dilation)
+            source_local_h = int(in_h) - int(source_h_start)
+            if (
+                int(in_h) < int(h_in_min)
+                or int(in_h) >= int(h_in_max)
+                or int(source_local_h) < 0
+                or int(source_local_h) >= int(stripe_source_h)
+                or not bool(_spec_physical_output_h_valid(spec, int(out_h)))
+            ):
+                continue
+            target_physical_h = int(_spec_physical_output_h_positions(spec, int(out_h)))
+            h_pairs.append((int(source_local_h), int(target_physical_h)))
+        if not h_pairs:
+            continue
+        h_pairs_array = np.asarray(h_pairs, dtype=np.int64)
+        source_h_base_values = h_pairs_array[:, 0] * int(gap_in) * int(source_packed_w)
+        target_h_base_values = h_pairs_array[:, 1] * int(gap_out) * int(target_packed_w)
+        for kw in range(int(spec.kernel)):
+            w_pairs: list[tuple[int, int]] = []
+            for out_w in out_w_values:
+                in_w = int(out_w) * int(stride) - int(pad) + int(kw) * int(dilation)
+                if int(in_w) < 0 or int(in_w) >= int(spec.w_in):
+                    continue
+                w_pairs.append((int(in_w), int(out_w)))
+            if not w_pairs:
+                continue
+            w_pairs_array = np.asarray(w_pairs, dtype=np.int64)
+            source_w_values = w_pairs_array[:, 0] * int(gap_in)
+            target_w_values = w_pairs_array[:, 1] * int(gap_out)
+            source_spatial_values = (source_h_base_values[:, None] + source_w_values[None, :]).reshape(-1)
+            target_spatial_values = (target_h_base_values[:, None] + target_w_values[None, :]).reshape(-1)
+            if int(source_spatial_values.size) == 0 or int(target_spatial_values.size) == 0:
+                continue
+            target_abs_grid = target_channel_bases[:, None] + target_spatial_values[None, :]
+            target_blocks_grid = target_abs_grid // int(slots)
+            target_slots_grid = target_abs_grid % int(slots)
+            pair_index_grid = np.broadcast_to(
+                np.arange(int(target_spatial_values.size), dtype=np.int64)[None, :],
+                target_blocks_grid.shape,
+            )
+            for target_block in np.unique(target_blocks_grid).tolist():
+                block = int(target_block)
+                block_mask = target_blocks_grid == int(block)
+                if not bool(block_mask.any()):
+                    continue
+                diag_mask = diag_masks_by_block.get(int(block))
+                if diag_mask is None:
+                    diag_mask = np.zeros((int(slots),), dtype=np.bool_)
+                    diag_masks_by_block[int(block)] = diag_mask
+                block_slots = target_slots_grid[block_mask].astype(np.int64, copy=False).reshape(-1)
+                block_pair_indices = pair_index_grid[block_mask].astype(np.int64, copy=False).reshape(-1)
+                event_count = int(block_slots.size)
+                chunk = max(1, min(8192, int(event_count)))
+                for start in range(0, int(event_count), int(chunk)):
+                    end = min(int(event_count), int(start) + int(chunk))
+                    source_for_events = source_spatial_values[block_pair_indices[start:end]]
+                    values = np.remainder(
+                        source_offsets[:, None]
+                        + source_for_events[None, :]
+                        - block_slots[start:end][None, :],
+                        int(slots),
+                    ).reshape(-1)
+                    diag_mask[values] = True
+    for mask in diag_masks_by_block.values():
+        mask[0] = False
+    return {
+        int(block): set(int(value) for value in np.flatnonzero(mask).tolist())
+        for block, mask in sorted(diag_masks_by_block.items())
+        if bool(mask.any())
+    }
+
+
+def _compact_output_diag_sets_for_task_torch_oracle(
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    stripe: NativeHaloStripe,
+    *,
+    source_group: int,
+    target_group: int,
+) -> dict[int, set[int]]:
+    slots = int(spec.slot_count)
+    source_tile = int(plan.source_tile_for_stripe(stripe))
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    source_start = int(source_group) * int(source_tile)
+    source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+    target_start = int(target_group) * int(target_tile)
+    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
+    source_count = int(source_end - source_start)
+    target_count = int(target_end - target_start)
+    if int(source_count) <= 0 or int(target_count) <= 0:
+        return {}
+
+    compact_output_h = _spec_physical_output_h(spec)
+    source_channels = torch.arange(int(source_count), dtype=torch.int64)
+    target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
+    out_h_values = torch.arange(
+        int(stripe.target_h_start),
+        int(stripe.target_h_end),
+        dtype=torch.int64,
+    )
+    out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
+    diag_sets_by_block: dict[int, set[int]] = {}
+    for kh in range(int(spec.kernel)):
+        op_out_h_values = _materialized_output_source_h(
+            out_h_values,
+            h_out=int(spec.h_out),
+            output_top_beta=int(spec.output_top_beta),
+            output_bottom_beta=int(spec.output_bottom_beta),
+        )
+        in_h_values = (
+            op_out_h_values * int(spec.stride)
+            - int(spec.pad)
+            + int(kh) * int(spec.dilation)
+        )
+        source_local_h_values = in_h_values - int(stripe.source_h_start)
+        valid_h = (
+            (in_h_values >= int(spec.input_h_min))
+            & (in_h_values < int(spec.input_h_max))
+            & (source_local_h_values >= 0)
+            & (source_local_h_values < int(stripe.source_h))
+        )
+        if not bool(valid_h.any().item()):
+            continue
+        valid_source_h = source_local_h_values[valid_h]
+        valid_out_h = out_h_values[valid_h]
+        for kw in range(int(spec.kernel)):
+            in_w_values = (
+                out_w_values * int(spec.stride)
+                - int(spec.pad)
+                + int(kw) * int(spec.dilation)
+            )
+            valid_w = (in_w_values >= 0) & (in_w_values < int(spec.w_in))
+            if not bool(valid_w.any().item()):
+                continue
+            valid_source_w = in_w_values[valid_w]
+            valid_out_w = out_w_values[valid_w]
+            source_h_grid, source_w_grid = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
+            out_h_grid, out_w_grid = torch.meshgrid(valid_out_h, valid_out_w, indexing="ij")
+            source_h_flat = source_h_grid.reshape(-1)
+            source_w_flat = source_w_grid.reshape(-1)
+            out_h_flat = out_h_grid.reshape(-1)
+            out_w_flat = out_w_grid.reshape(-1)
+            if int(source_h_flat.numel()) == 0:
+                continue
+            source_vec = _idx_chw_gap_channel_positions(
+                source_channels,
+                h=source_h_flat,
+                w=source_w_flat,
+                height=int(stripe.source_h),
+                width=int(spec.w_in),
+                gap=int(spec.gap_in),
+            )
+            target_h_valid = _spec_physical_output_h_valid(spec, out_h_flat)
+            compact_slots = _idx_chw_gap_channel_positions(
+                target_channels,
+                h=_spec_physical_output_h_positions(spec, out_h_flat),
+                w=out_w_flat,
+                height=int(compact_output_h),
+                width=int(spec.w_out),
+                gap=int(spec.gap_out),
+            )
+            target_blocks = torch.div(compact_slots, int(slots), rounding_mode="floor")
+            target_slots = torch.remainder(compact_slots, int(slots))
+            diag_index = (source_vec[:, None, :] - target_slots[None, :, :]).remainder(int(slots))
+            valid = target_h_valid[None, None, :].expand_as(diag_index)
+            if not bool(valid.any().item()):
+                continue
+            for target_block in torch.unique(target_blocks).tolist():
+                block = int(target_block)
+                block_mask = target_blocks == int(block)
+                mask = block_mask[None, :, :] & valid
+                if not bool(mask.any().item()):
+                    continue
+                diag_sets_by_block.setdefault(int(block), set()).update(
+                    int(value)
+                    for value in torch.unique(diag_index[mask]).tolist()
+                    if int(value) != 0
+                )
+    return diag_sets_by_block
+
+
+def native_halo_conv2d_compact_output_rotation_stats(
+    plan: NativeHaloConv2DPlan,
+) -> NativeHaloCompactOutputRotationStats:
+    spec = plan.spec
+    key = (
+        _native_spec_structural_cache_key(spec),
+        _native_plan_structural_cache_key(plan),
+    )
+    cached = _COMPACT_OUTPUT_ROTATION_STATS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    transform_count = 0
+    c_only_rotations = 0
+    cb_shared_rotations = 0
+    shared_baby_rotations = 0
+    shared_giant_rotations = 0
+    diagonal_counts: list[int] = []
+    rotation_counts: list[int] = []
+    diag_sets_cache: dict[tuple[int, int, int], dict[int, set[int]]] = {}
+    output_ct_count = _compact_ct_count(
+        int(spec.c_out),
+        _spec_physical_output_h(spec),
+        int(spec.w_out),
+        int(spec.gap_out),
+        int(spec.slot_count),
+    )
+    group_index = 0
+    for stripe in plan.stripes:
+        for source_group in range(int(plan.source_group_count_for_stripe(stripe))):
+            group_sets: list[set[int]] = []
+            group_n1 = int(plan.group_n1s[int(group_index)]) if int(group_index) < len(plan.group_n1s) else 1
+            for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                source_tile = int(plan.source_tile_for_stripe(stripe))
+                source_start = int(source_group) * int(source_tile)
+                source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
+                diag_key = (
+                    int(stripe.index),
+                    int(source_end - source_start),
+                    int(target_group),
+                )
+                cached_by_block = diag_sets_cache.get(diag_key)
+                if cached_by_block is None:
+                    cached_by_block = _compact_output_diag_sets_for_task(
+                        spec,
+                        plan,
+                        stripe,
+                        source_group=int(source_group),
+                        target_group=int(target_group),
+                    )
+                    diag_sets_cache[diag_key] = {
+                        int(block): set(int(value) for value in diag_set)
+                        for block, diag_set in cached_by_block.items()
+                    }
+                by_block = cached_by_block
+                for _target_block, diag_set in sorted(by_block.items()):
+                    if not diag_set:
+                        continue
+                    baby, giant = _cached_bsgs_rotation_sets(
+                        set(int(value) for value in diag_set),
+                        slots=int(spec.slot_count),
+                        n1=int(group_n1),
+                    )
+                    rotations = int(len(baby) + len(giant))
+                    transform_count += 1
+                    c_only_rotations += int(rotations)
+                    diagonal_counts.append(int(len(diag_set)))
+                    rotation_counts.append(int(rotations))
+                    group_sets.append(set(int(value) for value in diag_set))
+            if group_sets:
+                _n1, group_rotations, baby_count, giant_count = _cached_native_best_common_bsgs(
+                    tuple(group_sets),
+                    slots=int(spec.slot_count),
+                )
+                cb_shared_rotations += int(group_rotations)
+                shared_baby_rotations += int(baby_count)
+                shared_giant_rotations += int(giant_count)
+            group_index += 1
+
+    stats = NativeHaloCompactOutputRotationStats(
+        c_only_rotations=int(c_only_rotations),
+        cb_shared_rotations=int(cb_shared_rotations),
+        shared_baby_rotations=int(shared_baby_rotations),
+        shared_giant_rotations=int(shared_giant_rotations),
+        transform_count=int(transform_count),
+        sharing_group_count=int(group_index),
+        output_ct_count=int(output_ct_count),
+        diagonal_counts=tuple(int(value) for value in diagonal_counts),
+        rotation_counts=tuple(int(value) for value in rotation_counts),
+    )
+    _COMPACT_OUTPUT_ROTATION_STATS_CACHE[key] = stats
+    return stats
+
+
 class _BlockDiagonalCache:
     def __init__(self, build_all: Callable[[], dict[tuple[int, int], dict[int, Any]]]) -> None:
         self._build_all = build_all
@@ -693,6 +1378,60 @@ def _payload_to_diag_tensors(diag_indices: np.ndarray, diag_data: np.ndarray, *,
     return out
 
 
+def _transform_payload_block(transform: Any, *, slots: int, context: str) -> dict[int, torch.Tensor]:
+    block = dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
+    materialized: dict[int, torch.Tensor] = {}
+    for diag_idx, diag_values in block.items():
+        if isinstance(diag_values, torch.Tensor):
+            values = diag_values.detach().cpu().to(dtype=torch.float32).reshape(-1)
+        else:
+            values = torch.as_tensor(np.asarray(diag_values, dtype=np.float32)).reshape(-1)
+        if int(values.numel()) == int(slots):
+            materialized[int(diag_idx)] = values
+            continue
+        if int(values.numel()) == 0:
+            continue
+        raise RuntimeError(
+            f"{context} rebuilt diagonal {int(diag_idx)} has {int(values.numel())} values; "
+            f"expected {int(slots)}"
+        )
+    if materialized:
+        return materialized
+
+    preflattened = getattr(transform, "_preflattened_diag_payload", None)
+    if preflattened is None:
+        return {}
+    diag_indices, diag_data, _level = preflattened
+    indices = np.asarray(diag_indices, dtype=np.int32).reshape(-1)
+    data = np.asarray(diag_data, dtype=np.float32).reshape(-1)
+    expected = int(indices.size) * int(slots)
+    if int(data.size) != int(expected):
+        raise RuntimeError(
+            f"{context} rebuilt preflattened payload has {int(data.size)} values for "
+            f"{int(indices.size)} diagonals; expected {int(expected)}"
+        )
+    return _payload_to_diag_tensors(indices, data, slots=int(slots))
+
+
+def _payload_to_diag_dict(
+    diag_indices: np.ndarray,
+    diag_data: np.ndarray,
+    *,
+    slots: int,
+    materialize_tensors: bool,
+) -> dict[int, torch.Tensor]:
+    if bool(materialize_tensors):
+        return _payload_to_diag_tensors(diag_indices, diag_data, slots=int(slots))
+    indices = np.asarray(diag_indices, dtype=np.int32).reshape(-1)
+    data = np.asarray(diag_data, dtype=np.float32).reshape(-1)
+    if int(indices.size) <= 0:
+        return {}
+    expected = int(indices.size) * int(slots)
+    if int(data.size) != int(expected):
+        raise RuntimeError(f"provider diag payload length {int(data.size)} != expected {int(expected)}")
+    return {int(index): torch.empty((0,), dtype=torch.float32) for index in indices.tolist()}
+
+
 def _provider_payload_transform(
     *,
     name: str,
@@ -707,11 +1446,19 @@ def _provider_payload_transform(
     group_n1: int,
     rotation_group_id: str,
     rotation_cost_owner: bool,
+    materialize_tensors: bool = True,
 ) -> Any:
-    diag_tensors = _payload_to_diag_tensors(diag_indices, diag_data, slots=int(slots))
+    diag_tensors = _payload_to_diag_dict(
+        diag_indices,
+        diag_data,
+        slots=int(slots),
+        materialize_tensors=bool(materialize_tensors),
+    )
     if not diag_tensors:
         return None
     diag_set = set(int(value) for value in diag_tensors)
+    flat_diag_indices = np.ascontiguousarray(np.asarray(diag_indices, dtype=np.int32).reshape(-1), dtype=np.int32)
+    flat_diag_data = np.ascontiguousarray(np.asarray(diag_data, dtype=np.float32).reshape(-1), dtype=np.float32)
     baby, giant = _bsgs_rotation_sets(set(diag_set), slots=int(slots), n1=int(group_n1))
     payload = SimpleNamespace(
         name=str(name),
@@ -729,7 +1476,58 @@ def _provider_payload_transform(
         rotation_cost_owner=bool(rotation_cost_owner),
     )
     setattr(payload, "_diag_builder_metadata", dict(metadata))
+    if not bool(materialize_tensors):
+        setattr(payload, "_preflattened_diag_payload", (flat_diag_indices, flat_diag_data, int(level)))
+        setattr(payload, "_single_slot_diag_indices_by_block", {(0, 0): tuple(int(v) for v in flat_diag_indices)})
     return payload
+
+
+def _make_provider_native_source_transform_from_payload(
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    stripe: NativeHaloStripe,
+    source_group: int,
+    target_group: int,
+    compact_target_block: int | None,
+    diag_indices: np.ndarray,
+    diag_data: np.ndarray,
+    metadata: dict[str, Any],
+    level: int,
+    scheme: Any,
+    group_n1: int,
+) -> Any | None:
+    metadata = dict(metadata)
+    compact_output = compact_target_block is not None
+    target_index = (
+        int(compact_target_block)
+        if compact_target_block is not None
+        else int(plan.target_block_index(stripe, int(target_group)))
+    )
+    source_index = int(plan.source_block_index(stripe, int(source_group)))
+    name = (
+        f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
+        f"_tgt{int(target_group)}"
+        + ("" if compact_target_block is None else f"_compact{int(compact_target_block)}")
+    )
+    return _provider_payload_transform(
+        name=name,
+        diag_indices=diag_indices,
+        diag_data=diag_data,
+        metadata=metadata,
+        slots=int(spec.slot_count),
+        level=int(level),
+        scheme=scheme,
+        target_index=int(target_index),
+        input_id=f"native_source_tile_{int(source_index)}",
+        group_n1=int(group_n1),
+        rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
+        rotation_cost_owner=bool(
+            int(target_group) == 0
+            and (not bool(compact_output) or int(compact_target_block) == 0)
+        ),
+        materialize_tensors=not bool(str(metadata.get("diag_builder_source", "")).startswith("cpp")),
+    )
 
 
 def _cpp_provider_native_source_transform(
@@ -737,6 +1535,7 @@ def _cpp_provider_native_source_transform(
     spec: NativeHaloConv2DSpec,
     plan: NativeHaloConv2DPlan,
     weight: torch.Tensor,
+    weight_np: np.ndarray | None = None,
     stripe: NativeHaloStripe,
     source_group: int,
     target_group: int,
@@ -764,6 +1563,7 @@ def _cpp_provider_native_source_transform(
             spec=spec,
             plan=plan,
             weight=weight,
+            weight_np=weight_np,
             stripe=stripe,
             source_group=int(source_group),
             target_group=int(target_group),
@@ -785,33 +1585,19 @@ def _cpp_provider_native_source_transform(
     metadata["diag_builder_fallback_count"] = 0.0
     metadata["diag_builder_fallback_reason"] = ""
     metadata.setdefault("diag_builder_payload_count", 1.0)
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
-    target_index = (
-        int(compact_target_block)
-        if compact_target_block is not None
-        else int(plan.target_block_index(stripe, int(target_group)))
-    )
-    name = (
-        f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
-        f"_tgt{int(target_group)}"
-        + ("" if compact_target_block is None else f"_compact{int(compact_target_block)}")
-    )
-    transform = _provider_payload_transform(
-        name=name,
+    transform = _make_provider_native_source_transform_from_payload(
+        spec=spec,
+        plan=plan,
+        stripe=stripe,
+        source_group=int(source_group),
+        target_group=int(target_group),
+        compact_target_block=compact_target_block,
         diag_indices=diag_indices,
         diag_data=diag_data,
         metadata=metadata,
-        slots=int(spec.slot_count),
         level=int(level),
         scheme=scheme,
-        target_index=int(target_index),
-        input_id=f"native_source_tile_{int(source_index)}",
         group_n1=int(group_n1),
-        rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
-        rotation_cost_owner=bool(
-            int(target_group) == 0
-            and (compact_target_block is None or int(compact_target_block) == 0)
-        ),
     )
     if transform is None and _provider_diag_builder_strict():
         raise RuntimeError("provider C++ diag builder produced empty payload for non-empty native-source transform")
@@ -820,7 +1606,161 @@ def _cpp_provider_native_source_transform(
         transform._diag_builder_metadata["diag_builder_build_s"] = float(
             transform._diag_builder_metadata.get("diag_builder_build_s", elapsed) or elapsed
         )
+        transform._diag_builder_metadata["diag_builder_wall_s"] = float(elapsed)
     return transform
+
+
+def _build_conv_transform_batch(
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    weight_np: np.ndarray | None,
+    stripe: NativeHaloStripe,
+    source_group: int,
+    target_groups: list[int],
+    level: int,
+    scheme: Any,
+    group_n1: int,
+) -> list[tuple[int, Any]]:
+    if not target_groups:
+        return []
+    workers = _provider_diag_build_workers(len(target_groups))
+    if (
+        int(workers) <= 1
+        or not _provider_diag_builder_enabled()
+        or not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE")
+        or _provider_diag_builder_shadow()
+    ):
+        return [
+            (int(transform.target_index), transform)
+            for target_group in target_groups
+            for transform in [
+                _build_conv_transform(
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    weight_np=weight_np,
+                    stripe=stripe,
+                    source_group=int(source_group),
+                    target_group=int(target_group),
+                    level=int(level),
+                    scheme=scheme,
+                    group_n1=int(group_n1),
+                    compact_target_block=None,
+                )
+            ]
+            if transform is not None
+        ]
+
+    try:
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        if diag_builder.load_library() is None:
+            raise RuntimeError(diag_builder.load_error() or "provider native-source diag builder unavailable")
+    except Exception:
+        if _provider_diag_builder_strict():
+            raise
+        return [
+            (int(transform.target_index), transform)
+            for target_group in target_groups
+            for transform in [
+                _build_conv_transform(
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    weight_np=weight_np,
+                    stripe=stripe,
+                    source_group=int(source_group),
+                    target_group=int(target_group),
+                    level=int(level),
+                    scheme=scheme,
+                    group_n1=int(group_n1),
+                    compact_target_block=None,
+                )
+            ]
+            if transform is not None
+        ]
+
+    def build_one(target_group: int) -> tuple[int, tuple[np.ndarray, np.ndarray, dict[str, Any]] | None]:
+        built = diag_builder.build_provider_native_source_conv2d_payload(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            weight_np=weight_np,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            compact_target_block=None,
+        )
+        return int(target_group), built
+
+    started = time.time()
+    try:
+        with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-provider-diag-build") as executor:
+            built_payloads = list(executor.map(build_one, [int(value) for value in target_groups]))
+    except Exception:
+        if _provider_diag_builder_strict():
+            raise
+        return [
+            (int(transform.target_index), transform)
+            for target_group in target_groups
+            for transform in [
+                _build_conv_transform(
+                    spec=spec,
+                    plan=plan,
+                    weight=weight,
+                    weight_np=weight_np,
+                    stripe=stripe,
+                    source_group=int(source_group),
+                    target_group=int(target_group),
+                    level=int(level),
+                    scheme=scheme,
+                    group_n1=int(group_n1),
+                    compact_target_block=None,
+                )
+            ]
+            if transform is not None
+        ]
+    ordered: list[tuple[int, Any]] = []
+    for target_group, built in built_payloads:
+        if built is None:
+            continue
+        diag_indices, diag_data, metadata = built
+        metadata = dict(metadata)
+        metadata["diag_builder_kind"] = "provider_native_halo_conv2d:native_source"
+        metadata["diag_builder_source"] = "cpp"
+        metadata["diag_builder_build_s"] = float(metadata.get("diag_builder_build_s", 0.0) or 0.0)
+        metadata["diag_builder_wall_s"] = 0.0
+        metadata["diag_builder_shadow_s"] = 0.0
+        metadata["diag_builder_fallback_count"] = 0.0
+        metadata["diag_builder_fallback_reason"] = ""
+        metadata.setdefault("diag_builder_payload_count", 1.0)
+        transform = _make_provider_native_source_transform_from_payload(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            source_group=int(source_group),
+            target_group=int(target_group),
+            compact_target_block=None,
+            diag_indices=diag_indices,
+            diag_data=diag_data,
+            metadata=metadata,
+            level=int(level),
+            scheme=scheme,
+            group_n1=int(group_n1),
+        )
+        if transform is None:
+            if _provider_diag_builder_strict():
+                raise RuntimeError("provider C++ diag builder produced empty payload for non-empty native-source transform")
+            continue
+        ordered.append((int(transform.target_index), transform))
+    batch_wall_s = float(time.time() - started)
+    if ordered:
+        wall_share = float(batch_wall_s) / max(1.0, float(len(ordered)))
+        for _target_index, transform in ordered:
+            transform._diag_builder_metadata["diag_builder_wall_s"] = float(wall_share)
+    return ordered
 
 
 def _shadow_provider_payload(
@@ -1022,6 +1962,84 @@ def _build_compact_source_conv_payload_shadow(
         build_cpp_payload=build_cpp_payload,
         path="compact_source",
     )
+
+
+def _normalise_compact_source_concat_index_result(
+    value: dict[int, list[tuple[int, Any]]],
+) -> dict[int, list[tuple[int, tuple[int, ...]]]]:
+    return {
+        int(source_block): [
+            (int(target_block), tuple(sorted(int(index) for index in tuple(indices))))
+            for target_block, indices in sorted(list(items), key=lambda item: int(item[0]))
+            if tuple(indices)
+        ]
+        for source_block, items in sorted(dict(value).items(), key=lambda item: int(item[0]))
+        if items
+    }
+
+
+def _compact_source_concat_diag_sets_from_index_result(
+    value: dict[int, list[tuple[int, Any]]],
+) -> dict[tuple[int, int], set[int]]:
+    return {
+        (int(source_block), int(target_block)): set(int(index) for index in tuple(indices))
+        for source_block, items in _normalise_compact_source_concat_index_result(value).items()
+        for target_block, indices in items
+        if tuple(indices)
+    }
+
+
+def _build_compact_source_concat_indices_cpp(
+    *,
+    spec: NativeHaloConv2DSpec,
+    plan: NativeHaloConv2DPlan,
+    weight: torch.Tensor,
+    source_layout: dict[str, Any],
+    source_ct_count: int,
+    target_ct_count: int,
+    output_materialization: str,
+) -> tuple[dict[int, list[tuple[int, tuple[int, ...]]]], dict[str, Any]] | object:
+    if not _provider_diag_builder_enabled():
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if not _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE"):
+        if _provider_diag_builder_strict():
+            raise RuntimeError("provider compact_source concat index subpath unsupported by C++ diag builder env gate")
+        return _CPP_DIAG_BUILDER_FALLBACK
+    try:
+        from orion.backend.diag_builder import bindings as diag_builder
+
+        built = diag_builder.build_provider_compact_source_concat_conv2d_indices(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            source_layout=dict(source_layout),
+            source_ct_count=int(source_ct_count),
+            target_ct_count=int(target_ct_count),
+            output_materialization=str(output_materialization or ""),
+        )
+    except Exception:
+        if _provider_diag_builder_strict():
+            raise
+        return _CPP_DIAG_BUILDER_FALLBACK
+    if built is None:
+        return {}, {
+            "diag_builder_kind": "provider_native_halo_conv2d:compact_source_concat_index_only",
+            "diag_builder_source": "cpp",
+            "diag_builder_build_s": 0.0,
+            "diag_builder_payload_count": 0.0,
+            "diag_builder_fallback_count": 0.0,
+            "diag_builder_fallback_reason": "",
+        }
+    result, metadata = built
+    metadata = dict(metadata)
+    metadata["diag_builder_kind"] = "provider_native_halo_conv2d:compact_source_concat_index_only"
+    metadata["diag_builder_source"] = "cpp"
+    metadata["diag_builder_build_s"] = float(metadata.get("diag_builder_build_s", 0.0) or 0.0)
+    metadata["diag_builder_shadow_s"] = 0.0
+    metadata["diag_builder_fallback_count"] = 0.0
+    metadata["diag_builder_fallback_reason"] = ""
+    metadata.setdefault("diag_builder_payload_count", float(sum(len(items) for items in dict(result).values())))
+    return _normalise_compact_source_concat_index_result(result), metadata
 
 
 def _collect_compact_source_conv_diag_sets(
@@ -1258,15 +2276,22 @@ def _make_compact_source_conv_single_slot_transform(
                     f"for source_block={int(source_block)} target_index={int(target_index)}"
                 )
             return {(0, 0): {int(fallback_diag): torch.zeros((int(slots),), dtype=torch.float32)}}
-        diagonals = getattr(rebuilt, "diagonals", {})
-        if not diagonals:
+        block = _transform_payload_block(
+            rebuilt,
+            slots=int(slots),
+            context=(
+                f"{spec.family_label} compact-source single-slot payload rebuild "
+                f"source_block={int(source_block)} target_index={int(target_index)}"
+            ),
+        )
+        if not block:
             if diag_set:
                 raise RuntimeError(
                     f"{spec.family_label} compact-source single-slot payload rebuild returned empty diagonals "
                     f"for source_block={int(source_block)} target_index={int(target_index)}"
                 )
             return {(0, 0): {int(fallback_diag): torch.zeros((int(slots),), dtype=torch.float32)}}
-        return diagonals
+        return {(0, 0): block}
 
     compact_output = compact_target_block is not None
     return SimpleNamespace(
@@ -1312,7 +2337,25 @@ def _build_compact_source_concat_transforms_single_slot(
     group_n1: int,
     build_diagonals_by_block: Callable[[], dict[tuple[int, int], dict[int, Any]]] | None = None,
     output_materialization: str = "",
+    index_only: bool = False,
 ) -> dict[int, list[tuple[int, Any]]]:
+    cpp_started = time.perf_counter()
+    cpp_built = _build_compact_source_concat_indices_cpp(
+        spec=spec,
+        plan=plan,
+        weight=weight,
+        source_layout=dict(source_layout),
+        source_ct_count=int(source_ct_count),
+        target_ct_count=int(target_ct_count),
+        output_materialization=str(output_materialization or ""),
+    )
+    if bool(index_only):
+        if cpp_built is not _CPP_DIAG_BUILDER_FALLBACK and not _provider_diag_builder_shadow():
+            result, metadata = cpp_built
+            metadata = dict(metadata)
+            metadata["diag_builder_wall_s"] = float(time.perf_counter() - cpp_started)
+            return dict(_normalise_compact_source_concat_index_result(result))
+
     slots = int(spec.slot_count)
     source_channels = torch.arange(int(spec.c_in), dtype=torch.int64)
     source_top_beta = max(0, int(_layout_physical_top_beta(source_layout, default=spec.input_physical_top_beta or 0) or 0))
@@ -1325,135 +2368,172 @@ def _build_compact_source_concat_transforms_single_slot(
     compact_output_h = _spec_physical_output_h(spec)
     out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
     max_pair_count = int(_native_halo_build_pair_chunk_limit())
-    diag_sets: dict[tuple[int, int], set[int]] = {}
+    precomputed_index_diag_sets: dict[tuple[int, int], set[int]] | None = None
+    if cpp_built is not _CPP_DIAG_BUILDER_FALLBACK and not _provider_diag_builder_shadow():
+        cpp_result, _metadata = cpp_built
+        precomputed_index_diag_sets = _compact_source_concat_diag_sets_from_index_result(cpp_result)
+    diag_sets: dict[tuple[int, int], set[int]] = {} if precomputed_index_diag_sets is None else dict(precomputed_index_diag_sets)
     fuse_output_relayout = str(output_materialization or "") == "fused_relayout"
 
-    for stripe in plan.stripes:
-        out_h_values = torch.arange(
-            int(stripe.target_h_start),
-            int(stripe.target_h_end),
-            dtype=torch.int64,
-        )
-        op_out_h_values = (
-            _materialized_output_source_h(
-                out_h_values,
-                h_out=int(spec.h_out),
-                output_top_beta=int(spec.output_top_beta),
-                output_bottom_beta=int(spec.output_bottom_beta),
+    if precomputed_index_diag_sets is None:
+        for stripe in plan.stripes:
+            out_h_values = torch.arange(
+                int(stripe.target_h_start),
+                int(stripe.target_h_end),
+                dtype=torch.int64,
             )
-            if bool(fuse_output_relayout)
-            else out_h_values
-        )
-        for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
-            target_tile = int(plan.target_tile_for_stripe(stripe))
-            target_start = int(target_group) * int(target_tile)
-            target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
-            target_count = int(target_end - target_start)
-            if int(target_count) <= 0:
-                continue
-            target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
-            for kh in range(int(spec.kernel)):
-                for kw in range(int(spec.kernel)):
-                    coeff = weight[int(target_start): int(target_end), :, int(kh), int(kw)].to(dtype=torch.float32)
-                    if not bool(torch.any(coeff != 0).item()):
-                        continue
-                    coeff_by_source_target = coeff.t().contiguous()
-                    coeff_nonzero = torch.abs(coeff_by_source_target) > 0
-                    if not bool(coeff_nonzero.any().item()):
-                        continue
-                    in_h_values = (
-                        op_out_h_values * int(spec.stride)
-                        - int(spec.pad)
-                        + int(kh) * int(spec.dilation)
-                    )
-                    valid_h = (in_h_values >= 0) & (in_h_values < int(spec.h_in))
-                    if not bool(valid_h.any().item()):
-                        continue
-                    in_w_values = (
-                        out_w_values * int(spec.stride)
-                        - int(spec.pad)
-                        + int(kw) * int(spec.dilation)
-                    )
-                    valid_w = (in_w_values >= 0) & (in_w_values < int(spec.w_in))
-                    if not bool(valid_w.any().item()):
-                        continue
-
-                    valid_out_h = out_h_values[valid_h]
-                    valid_source_h = int(source_top_beta) + in_h_values[valid_h]
-                    valid_out_w = out_w_values[valid_w]
-                    valid_source_w = in_w_values[valid_w]
-                    grid_h, grid_w = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
-                    out_grid_h, out_grid_w = torch.meshgrid(valid_out_h, valid_out_w, indexing="ij")
-                    source_h_flat = grid_h.reshape(-1)
-                    source_w_flat = grid_w.reshape(-1)
-                    out_h_flat = out_grid_h.reshape(-1)
-                    out_w_flat = out_grid_w.reshape(-1)
-                    if int(source_h_flat.numel()) == 0:
-                        continue
-
-                    channel_pair_count = max(1, int(source_channels.numel()) * int(target_count))
-                    position_chunk = max(1, int(max_pair_count // channel_pair_count))
-                    for start in range(0, int(source_h_flat.numel()), int(position_chunk)):
-                        end = min(int(source_h_flat.numel()), int(start) + int(position_chunk))
-                        source_index = _idx_chw_gap_channel_positions(
-                            source_channels,
-                            h=source_h_flat[int(start): int(end)],
-                            w=source_w_flat[int(start): int(end)],
-                            height=int(source_height),
-                            width=int(spec.w_in),
-                            gap=int(source_gap),
-                        )
-                        source_blocks = torch.div(source_index, int(slots), rounding_mode="floor")
-                        source_valid = (
-                            (source_blocks >= 0)
-                            & (source_blocks < int(source_ct_count))
-                        )
-                        if not bool(source_valid.any().item()):
+            op_out_h_values = (
+                _materialized_output_source_h(
+                    out_h_values,
+                    h_out=int(spec.h_out),
+                    output_top_beta=int(spec.output_top_beta),
+                    output_bottom_beta=int(spec.output_bottom_beta),
+                )
+                if bool(fuse_output_relayout)
+                else out_h_values
+            )
+            for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                target_tile = int(plan.target_tile_for_stripe(stripe))
+                target_start = int(target_group) * int(target_tile)
+                target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
+                target_count = int(target_end - target_start)
+                if int(target_count) <= 0:
+                    continue
+                target_channels = torch.arange(int(target_start), int(target_end), dtype=torch.int64)
+                for kh in range(int(spec.kernel)):
+                    for kw in range(int(spec.kernel)):
+                        coeff = weight[int(target_start): int(target_end), :, int(kh), int(kw)].to(dtype=torch.float32)
+                        if not bool(torch.any(coeff != 0).item()):
                             continue
-                        source_vec = torch.remainder(source_index, int(slots))
+                        coeff_by_source_target = coeff.t().contiguous()
+                        coeff_nonzero = torch.abs(coeff_by_source_target) > 0
+                        if not bool(coeff_nonzero.any().item()):
+                            continue
+                        in_h_values = (
+                            op_out_h_values * int(spec.stride)
+                            - int(spec.pad)
+                            + int(kh) * int(spec.dilation)
+                        )
+                        valid_h = (in_h_values >= 0) & (in_h_values < int(spec.h_in))
+                        if not bool(valid_h.any().item()):
+                            continue
+                        in_w_values = (
+                            out_w_values * int(spec.stride)
+                            - int(spec.pad)
+                            + int(kw) * int(spec.dilation)
+                        )
+                        valid_w = (in_w_values >= 0) & (in_w_values < int(spec.w_in))
+                        if not bool(valid_w.any().item()):
+                            continue
 
-                        target_h_slice = out_h_flat[int(start): int(end)]
-                        target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
-                        target_index = _idx_chw_gap_channel_positions(
-                            target_channels,
-                            h=_spec_physical_output_h_positions(spec, target_h_slice),
-                            w=out_w_flat[int(start): int(end)],
-                            height=int(compact_output_h),
-                            width=int(spec.w_out),
-                            gap=int(spec.gap_out),
-                        )
-                        target_blocks = torch.div(target_index, int(slots), rounding_mode="floor")
-                        target_valid = (
-                            (target_blocks >= 0)
-                            & (target_blocks < int(target_ct_count))
-                            & target_h_valid
-                        )
-                        if not bool(target_valid.any().item()):
+                        valid_out_h = out_h_values[valid_h]
+                        valid_source_h = int(source_top_beta) + in_h_values[valid_h]
+                        valid_out_w = out_w_values[valid_w]
+                        valid_source_w = in_w_values[valid_w]
+                        grid_h, grid_w = torch.meshgrid(valid_source_h, valid_source_w, indexing="ij")
+                        out_grid_h, out_grid_w = torch.meshgrid(valid_out_h, valid_out_w, indexing="ij")
+                        source_h_flat = grid_h.reshape(-1)
+                        source_w_flat = grid_w.reshape(-1)
+                        out_h_flat = out_grid_h.reshape(-1)
+                        out_w_flat = out_grid_w.reshape(-1)
+                        if int(source_h_flat.numel()) == 0:
                             continue
-                        target_vec = torch.remainder(target_index, int(slots))
-                        diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
-                        pair_mask = (
-                            source_valid[:, None, :]
-                            & target_valid[None, :, :]
-                            & coeff_nonzero[:, :, None]
-                        )
-                        if not bool(pair_mask.any().item()):
-                            continue
-                        combined = (
-                            (
-                                source_blocks[:, None, :] * int(target_ct_count)
-                                + target_blocks[None, :, :]
+
+                        channel_pair_count = max(1, int(source_channels.numel()) * int(target_count))
+                        position_chunk = max(1, int(max_pair_count // channel_pair_count))
+                        for start in range(0, int(source_h_flat.numel()), int(position_chunk)):
+                            end = min(int(source_h_flat.numel()), int(start) + int(position_chunk))
+                            source_index = _idx_chw_gap_channel_positions(
+                                source_channels,
+                                h=source_h_flat[int(start): int(end)],
+                                w=source_w_flat[int(start): int(end)],
+                                height=int(source_height),
+                                width=int(spec.w_in),
+                                gap=int(source_gap),
                             )
-                            * int(slots)
-                            + diag_index
-                        )
-                        for value in torch.unique(combined[pair_mask]).tolist():
-                            encoded = int(value)
-                            diag = int(encoded % int(slots))
-                            pair = int(encoded // int(slots))
-                            target_block = int(pair % int(target_ct_count))
-                            source_block = int(pair // int(target_ct_count))
-                            diag_sets.setdefault((int(source_block), int(target_block)), set()).add(int(diag))
+                            source_blocks = torch.div(source_index, int(slots), rounding_mode="floor")
+                            source_valid = (
+                                (source_blocks >= 0)
+                                & (source_blocks < int(source_ct_count))
+                            )
+                            if not bool(source_valid.any().item()):
+                                continue
+                            source_vec = torch.remainder(source_index, int(slots))
+
+                            target_h_slice = out_h_flat[int(start): int(end)]
+                            target_h_valid = _spec_physical_output_h_valid(spec, target_h_slice)
+                            target_index = _idx_chw_gap_channel_positions(
+                                target_channels,
+                                h=_spec_physical_output_h_positions(spec, target_h_slice),
+                                w=out_w_flat[int(start): int(end)],
+                                height=int(compact_output_h),
+                                width=int(spec.w_out),
+                                gap=int(spec.gap_out),
+                            )
+                            target_blocks = torch.div(target_index, int(slots), rounding_mode="floor")
+                            target_valid = (
+                                (target_blocks >= 0)
+                                & (target_blocks < int(target_ct_count))
+                                & target_h_valid
+                            )
+                            if not bool(target_valid.any().item()):
+                                continue
+                            target_vec = torch.remainder(target_index, int(slots))
+                            diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
+                            pair_mask = (
+                                source_valid[:, None, :]
+                                & target_valid[None, :, :]
+                                & coeff_nonzero[:, :, None]
+                            )
+                            if not bool(pair_mask.any().item()):
+                                continue
+                            combined = (
+                                (
+                                    source_blocks[:, None, :] * int(target_ct_count)
+                                    + target_blocks[None, :, :]
+                                )
+                                * int(slots)
+                                + diag_index
+                            )
+                            for value in torch.unique(combined[pair_mask]).tolist():
+                                encoded = int(value)
+                                diag = int(encoded % int(slots))
+                                pair = int(encoded // int(slots))
+                                target_block = int(pair % int(target_ct_count))
+                                source_block = int(pair // int(target_ct_count))
+                                diag_sets.setdefault((int(source_block), int(target_block)), set()).add(int(diag))
+
+    if bool(index_only):
+        python_result = {
+            int(source_block): [
+                (int(target_block), tuple(sorted(int(value) for value in diag_set)))
+                for target_block, diag_set in sorted(target_items, key=lambda item: int(item[0]))
+                if diag_set
+            ]
+            for source_block, target_items in sorted(
+                (
+                    (
+                        int(source_block),
+                        [
+                            (int(target_block), set(int(value) for value in diag_set))
+                            for (candidate_source, target_block), diag_set in sorted(diag_sets.items())
+                            if int(candidate_source) == int(source_block)
+                        ],
+                    )
+                    for source_block in sorted({int(source_block) for source_block, _target_block in diag_sets})
+                ),
+                key=lambda item: int(item[0]),
+            )
+        }
+        if cpp_built is not _CPP_DIAG_BUILDER_FALLBACK and _provider_diag_builder_shadow():
+            cpp_result, _metadata = cpp_built
+            normal_cpp = _normalise_compact_source_concat_index_result(cpp_result)
+            normal_python = _normalise_compact_source_concat_index_result(python_result)
+            if normal_cpp != normal_python:
+                if _provider_diag_builder_strict():
+                    raise RuntimeError("provider compact-source concat C++ index mismatch")
+                return python_result
+        return python_result
 
     ordered: dict[int, list[tuple[int, Any]]] = {}
     representative_stripe = plan.stripes[0]
@@ -1637,6 +2717,34 @@ def _diag_indices_for_task(
     source_channel_count: int,
     target_channel_count: int,
 ) -> set[int]:
+    key = (
+        "diag_indices",
+        _native_spec_structural_cache_key(spec),
+        _native_stripe_cache_key(stripe),
+        int(source_channel_count),
+        int(target_channel_count),
+    )
+    cached = _NATIVE_DIAG_INDICES_CACHE.get(key)
+    if cached is not None:
+        return set(int(value) for value in cached)
+    _native_diag_cache_guard()
+    shifts = _native_diag_indices_closed_form(
+        spec,
+        stripe,
+        source_channel_count=int(source_channel_count),
+        target_channel_count=int(target_channel_count),
+    )
+    _NATIVE_DIAG_INDICES_CACHE[key] = tuple(sorted(int(value) for value in shifts))
+    return set(int(value) for value in shifts)
+
+
+def _diag_indices_for_task_torch_oracle(
+    spec: NativeHaloConv2DSpec,
+    stripe: NativeHaloStripe,
+    *,
+    source_channel_count: int,
+    target_channel_count: int,
+) -> set[int]:
     source_slots = _slot_indices(
         int(source_channel_count),
         int(stripe.source_h),
@@ -1773,6 +2881,16 @@ def _per_stripe_fold_stripes(
     base_source_tile: int,
     base_target_tile: int,
 ) -> tuple[NativeHaloStripe, ...]:
+    cache_key = (
+        _native_spec_structural_cache_key(spec),
+        int(base_source_tile),
+        int(base_target_tile),
+    )
+    cached = _PER_STRIPE_FOLD_STRIPES_CACHE.get(cache_key)
+    if cached is not None:
+        return tuple(cached)
+    if len(_PER_STRIPE_FOLD_STRIPES_CACHE) > 20000:
+        _PER_STRIPE_FOLD_STRIPES_CACHE.clear()
     base_source_h = _source_h_capacity_for_tile(spec, int(base_source_tile))
     target_stripes = _stripes_for_source_h(spec, source_h=int(base_source_h))
     source_tiles = _channel_tile_candidates(int(spec.c_in), int(spec.gap_in))
@@ -1836,14 +2954,16 @@ def _per_stripe_fold_stripes(
             target_tile = int(candidate.target_channel_tile)
             rotations = 0
             programs = 0
-            for source_group in range(int(source_group_count)):
-                source_start = int(source_group) * int(source_tile)
-                source_end = min(int(spec.c_in), int(source_start) + int(source_tile))
-                source_count = int(source_end - source_start)
-                for target_group in range(int(target_group_count)):
-                    target_start = int(target_group) * int(target_tile)
-                    target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
-                    target_count = int(target_end - target_start)
+            source_counts = Counter(
+                min(int(spec.c_in), int(source_group + 1) * int(source_tile)) - int(source_group) * int(source_tile)
+                for source_group in range(int(source_group_count))
+            )
+            target_counts = Counter(
+                min(int(spec.c_out), int(target_group + 1) * int(target_tile)) - int(target_group) * int(target_tile)
+                for target_group in range(int(target_group_count))
+            )
+            for source_count, source_multiplicity in sorted(source_counts.items()):
+                for target_count, target_multiplicity in sorted(target_counts.items()):
                     key = (
                         int(candidate.target_h),
                         int(candidate.source_h),
@@ -1861,10 +2981,11 @@ def _per_stripe_fold_stripes(
                     diag_indices = diag_cache[key]
                     bkey = tuple(sorted(int(value) for value in diag_indices))
                     if bkey not in bsgs_cache:
-                        _n1, cost, _baby, _giant = _native_best_common_bsgs((diag_indices,), slots=int(spec.slot_count))
+                        _n1, cost, _baby, _giant = _cached_native_best_common_bsgs((diag_indices,), slots=int(spec.slot_count))
                         bsgs_cache[bkey] = int(cost)
-                    rotations += int(bsgs_cache[bkey])
-                    programs += 1
+                    multiplicity = int(source_multiplicity) * int(target_multiplicity)
+                    rotations += int(multiplicity) * int(bsgs_cache[bkey])
+                    programs += int(multiplicity)
             score = (
                 int(rotations),
                 int(source_group_count + target_group_count),
@@ -1883,7 +3004,9 @@ def _per_stripe_fold_stripes(
             )
         else:
             selected.append(best[1])
-    return tuple(selected)
+    result = tuple(selected)
+    _PER_STRIPE_FOLD_STRIPES_CACHE[cache_key] = result
+    return result
 
 
 def native_halo_conv2d_plan(
@@ -1893,7 +3016,7 @@ def native_halo_conv2d_plan(
     channel_fold_mode: str | None = None,
 ) -> NativeHaloConv2DPlan:
     fold_mode = _normalise_channel_fold_mode(channel_fold_mode)
-    key = (tuple(spec.to_dict().items()), bool(require_native_target_fit), str(fold_mode))
+    key = (_native_spec_structural_cache_key(spec), bool(require_native_target_fit), str(fold_mode))
     cached = _PLAN_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1930,6 +3053,8 @@ def native_halo_conv2d_plan(
     ):
         raise ValueError(f"native halo target tile does not fit {spec.family_label}")
     diag_cache: dict[tuple[int, int, int], set[int]] = {}
+    program_bsgs_cache: dict[tuple[int, ...], tuple[int, int, int, int]] = {}
+    group_bsgs_cache: dict[tuple[tuple[int, ...], ...], tuple[int, int, int, int]] = {}
     program_diags: list[int] = []
     program_rots: list[int] = []
     group_n1s: list[int] = []
@@ -1945,6 +3070,7 @@ def native_halo_conv2d_plan(
             source_start = int(source_group) * int(stripe_source_tile)
             source_end = min(int(spec.c_in), int(source_start) + int(stripe_source_tile))
             entries: list[set[int]] = []
+            entry_keys: list[tuple[int, ...]] = []
             for target_group in range(int(target_group_count)):
                 target_start = int(target_group) * int(stripe_target_tile)
                 target_end = min(int(spec.c_out), int(target_start) + int(stripe_target_tile))
@@ -1962,16 +3088,23 @@ def native_halo_conv2d_plan(
                     )
                 diag_indices = set(diag_cache[diag_key])
                 entries.append(diag_indices)
-                _n1, rotations, _baby, _giant = _native_best_common_bsgs(
-                    (diag_indices,),
-                    slots=int(spec.slot_count),
-                )
+                bsgs_key = tuple(sorted(int(value) for value in diag_indices))
+                entry_keys.append(bsgs_key)
+                if bsgs_key not in program_bsgs_cache:
+                    program_bsgs_cache[bsgs_key] = _cached_native_best_common_bsgs(
+                        (diag_indices,),
+                        slots=int(spec.slot_count),
+                    )
+                _n1, rotations, _baby, _giant = program_bsgs_cache[bsgs_key]
                 program_diags.append(int(len(diag_indices)))
                 program_rots.append(int(rotations))
-            n1, rotations, baby, giant = _native_best_common_bsgs(
-                tuple(entries),
-                slots=int(spec.slot_count),
-            )
+            group_key = tuple(entry_keys)
+            if group_key not in group_bsgs_cache:
+                group_bsgs_cache[group_key] = _cached_native_best_common_bsgs(
+                    tuple(entries),
+                    slots=int(spec.slot_count),
+                )
+            n1, rotations, baby, giant = group_bsgs_cache[group_key]
             group_n1s.append(int(n1))
             group_rots.append(int(rotations))
             group_baby.append(int(baby))
@@ -2313,6 +3446,7 @@ def _build_conv_transform(
     spec: NativeHaloConv2DSpec,
     plan: NativeHaloConv2DPlan,
     weight: torch.Tensor,
+    weight_np: np.ndarray | None = None,
     stripe: NativeHaloStripe,
     source_group: int,
     target_group: int,
@@ -2331,6 +3465,7 @@ def _build_conv_transform(
             spec=spec,
             plan=plan,
             weight=weight,
+            weight_np=weight_np,
             stripe=stripe,
             source_group=int(source_group),
             target_group=int(target_group),
@@ -2539,7 +3674,14 @@ def _build_conv_transform(
                 )
                 if rebuilt is None:
                     return {}
-                block = dict(getattr(rebuilt, "diagonals", {}).get((0, 0), {}) or {})
+                block = _transform_payload_block(
+                    rebuilt,
+                    slots=int(slots),
+                    context=(
+                        f"{spec.family_label} native-source single-slot payload rebuild "
+                        f"source_index={int(source_index)} target_index={int(target_index)}"
+                    ),
+                )
                 return {(int(target_index), int(source_index)): block} if block else {}
 
             cache = _BlockDiagonalCache(build_all_blocks)
@@ -2858,7 +4000,14 @@ def _build_conv_transforms_for_compact_output(
             )
             blocks: dict[tuple[int, int], dict[int, Any]] = {}
             for rebuilt_target, rebuilt_transform in rebuilt:
-                block = dict(getattr(rebuilt_transform, "diagonals", {}).get((0, 0), {}) or {})
+                block = _transform_payload_block(
+                    rebuilt_transform,
+                    slots=int(slots),
+                    context=(
+                        f"{spec.family_label} native-source compact-output single-slot payload rebuild "
+                        f"source_index={int(source_index)} target_block={int(rebuilt_target)}"
+                    ),
+                )
                 if block:
                     blocks[(int(rebuilt_target), int(source_index))] = block
             return blocks
@@ -3141,7 +4290,14 @@ def _build_compact_source_conv_transform(
                         f"{spec.family_label} compact-source single-slot payload rebuild returned no transform "
                         f"for source_block={int(source_block)} target_index={int(target_index)}"
                     )
-                block = dict(getattr(rebuilt, "diagonals", {}).get((0, 0), {}) or {})
+                block = _transform_payload_block(
+                    rebuilt,
+                    slots=int(spec.slot_count),
+                    context=(
+                        f"{spec.family_label} compact-source single-slot payload rebuild "
+                        f"source_block={int(source_block)} target_index={int(target_index)}"
+                    ),
+                )
                 if not block:
                     raise RuntimeError(
                         f"{spec.family_label} compact-source single-slot payload rebuild returned empty diagonals "
@@ -3448,6 +4604,7 @@ class NativeHaloStripeNoRIConvExecutor:
             "retune_bsgs_s": 0.0,
             "group_compile_s": 0.0,
             "diag_builder_build_s": 0.0,
+            "diag_builder_wall_s": 0.0,
             "diag_builder_shadow_s": 0.0,
             "diag_builder_payload_count": 0.0,
             "diag_builder_fallback_count": 0.0,
@@ -3739,6 +4896,7 @@ class NativeHaloStripeNoRIConvExecutor:
                 group = UnifiedTransformGroup([transform])
                 group_compile_started = time.time()
                 group.compile_unified(scheme.backend)
+                _record_group_compile_profile(self, group)
                 _record_provider_diag_builder_metadata(self, getattr(transform, "_diag_builder_metadata", None))
                 self.last_runtime_timing["group_compile_s"] = float(
                     self.last_runtime_timing.get("group_compile_s", 0.0)
@@ -3763,6 +4921,7 @@ class NativeHaloStripeNoRIConvExecutor:
         group = UnifiedTransformGroup(transforms)
         group_compile_started = time.time()
         group.compile_unified(scheme.backend)
+        _record_group_compile_profile(self, group)
         for transform in transforms:
             _record_provider_diag_builder_metadata(self, getattr(transform, "_diag_builder_metadata", None))
         self.last_runtime_timing["group_compile_s"] = float(
@@ -3785,6 +4944,11 @@ class NativeHaloStripeNoRIConvExecutor:
             "build_transform_s": 0.0,
             "retune_bsgs_s": 0.0,
             "group_compile_s": 0.0,
+            "diag_builder_build_s": 0.0,
+            "diag_builder_wall_s": 0.0,
+            "diag_builder_shadow_s": 0.0,
+            "diag_builder_payload_count": 0.0,
+            "diag_builder_fallback_count": 0.0,
             "built_transform_count": 0.0,
             "compiled_group_count": 0.0,
             "evaluate_unified_s": 0.0,
@@ -4212,6 +5376,16 @@ class NativeHaloStripeNoRIConvExecutor:
         compact_output = self._uses_tight_compact_output()
         compact_source = self._uses_compact_source_input()
         compact_source_layout = self._compact_source_layout()
+        provider_weight_np = (
+            np.ascontiguousarray(weight.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1), dtype=np.float32)
+            if (
+                _provider_diag_builder_enabled()
+                and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE")
+                and not _provider_diag_builder_shadow()
+                and not bool(compact_source)
+            )
+            else None
+        )
         if bool(compact_source):
             if bool(compact_output):
                 self._compile_compact_source_layout_diagonals(scheme, level=int(conv_level))
@@ -4262,8 +5436,29 @@ class NativeHaloStripeNoRIConvExecutor:
                 for source_group in range(int(self.native_plan.source_group_count_for_stripe(stripe))):
                     ordered: list[tuple[int, Any]] = []
                     group_n1 = int(self.native_plan.group_n1s[int(group_index)])
-                    for target_group in range(int(self.native_plan.target_group_count_for_stripe(stripe))):
-                        if bool(compact_output):
+                    target_group_count = int(self.native_plan.target_group_count_for_stripe(stripe))
+                    if not bool(compact_output):
+                        build_started = time.time()
+                        ordered = _build_conv_transform_batch(
+                            spec=self.native_plan.spec,
+                            plan=self.native_plan,
+                            weight=weight,
+                            weight_np=provider_weight_np,
+                            stripe=stripe,
+                            source_group=int(source_group),
+                            target_groups=[int(value) for value in range(int(target_group_count))],
+                            level=int(conv_level),
+                            scheme=scheme,
+                            group_n1=int(group_n1),
+                        )
+                        self.last_runtime_timing["build_transform_s"] = float(
+                            self.last_runtime_timing.get("build_transform_s", 0.0)
+                        ) + float(time.time() - build_started)
+                        self.last_runtime_timing["built_transform_count"] = float(
+                            self.last_runtime_timing.get("built_transform_count", 0.0)
+                        ) + float(len(ordered))
+                    else:
+                        for target_group in range(int(target_group_count)):
                             build_started = time.time()
                             transforms = _build_conv_transforms_for_compact_output(
                                 spec=self.native_plan.spec,
@@ -4284,29 +5479,6 @@ class NativeHaloStripeNoRIConvExecutor:
                                     self.last_runtime_timing.get("built_transform_count", 0.0)
                                 ) + 1.0
                                 ordered.append((int(target_index), transform))
-                            continue
-                        build_started = time.time()
-                        transform = _build_conv_transform(
-                            spec=self.native_plan.spec,
-                            plan=self.native_plan,
-                            weight=weight,
-                            stripe=stripe,
-                            source_group=int(source_group),
-                            target_group=int(target_group),
-                            level=int(conv_level),
-                            scheme=scheme,
-                            group_n1=int(group_n1),
-                            compact_target_block=None,
-                        )
-                        self.last_runtime_timing["build_transform_s"] = float(
-                            self.last_runtime_timing.get("build_transform_s", 0.0)
-                        ) + float(time.time() - build_started)
-                        if transform is None:
-                            continue
-                        self.last_runtime_timing["built_transform_count"] = float(
-                            self.last_runtime_timing.get("built_transform_count", 0.0)
-                        ) + 1.0
-                        ordered.append((int(transform.target_index), transform))
                     input_index = int(self.native_plan.source_block_index(stripe, int(source_group)))
                     if ordered:
                         self._compile_ordered_runtime_groups(
@@ -4449,6 +5621,11 @@ class NativeHaloStripeNoRIConvExecutor:
             self.runtime_native_fhe_output_shape(),
         )
         self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
+        compact_output_rotation_stats = (
+            native_halo_conv2d_compact_output_rotation_stats(self.native_plan)
+            if self._uses_tight_compact_output()
+            else None
+        )
         self.last_runtime_io = {
             "runtime_lowering": (
                 f"native_halo_stripe_no_ri+{self._compact_output_storage_layout()}_output"
@@ -4471,6 +5648,29 @@ class NativeHaloStripeNoRIConvExecutor:
             "runtime_group_count": int(len(self.runtime_groups)),
             "internal_input_relayout": False,
             "internal_output_relayout": False,
+            "native_c_only_rotations": int(
+                compact_output_rotation_stats.c_only_rotations
+                if compact_output_rotation_stats is not None
+                else self.native_plan.c_only_rotations
+            ),
+            "native_cb_shared_rotations": int(
+                compact_output_rotation_stats.cb_shared_rotations
+                if compact_output_rotation_stats is not None
+                else self.native_plan.cb_shared_rotations
+            ),
+            "native_shared_baby_rotations": int(
+                compact_output_rotation_stats.shared_baby_rotations
+                if compact_output_rotation_stats is not None
+                else self.native_plan.shared_baby_rotations
+            ),
+            "native_shared_giant_rotations": int(
+                compact_output_rotation_stats.shared_giant_rotations
+                if compact_output_rotation_stats is not None
+                else self.native_plan.shared_giant_rotations
+            ),
+            "native_halo_channel_fold_mode": str(self.native_plan.channel_fold_mode),
+            "native_plan_c_only_rotations": int(self.native_plan.c_only_rotations),
+            "native_plan_cb_shared_rotations": int(self.native_plan.cb_shared_rotations),
         }
         return {self.output_node_id: native_output}
 

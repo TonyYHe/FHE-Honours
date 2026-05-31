@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -56,8 +58,12 @@ struct TensorState {
 struct LinearTransformState {
   std::vector<int> diag_indices;
   std::vector<std::vector<Complex>> diagonals;
+  std::vector<float> real_diagonals;
   int level = 0;
   int slots = 0;
+  float bsgs_ratio = 1.0f;
+  int explicit_bsgs_n1 = 0;
+  bool no_bsgs = false;
 };
 
 struct PolynomialState {
@@ -106,6 +112,192 @@ uint64_t ModulusProxyFromLog(int log_value) {
 }
 
 int MaxLevel() { return std::max(0, static_cast<int>(g_scheme.logq.size()) - 1); }
+
+uint64_t PowMod(uint64_t base, uint64_t exp, uint64_t mod) {
+  if (mod == 0) {
+    return 0;
+  }
+  uint64_t result = 1 % mod;
+  base %= mod;
+  while (exp > 0) {
+    if ((exp & 1U) != 0U) {
+      result = static_cast<uint64_t>((static_cast<__uint128_t>(result) * base) % mod);
+    }
+    base = static_cast<uint64_t>((static_cast<__uint128_t>(base) * base) % mod);
+    exp >>= 1U;
+  }
+  return result;
+}
+
+int LattigoNthRoot() {
+  return 4 * std::max(1, g_scheme.slots);
+}
+
+int LattigoLogBSGSRatio(float bsgs_ratio) {
+  if (!(bsgs_ratio > 0.0f)) {
+    return 0;
+  }
+  return static_cast<int>(std::log(static_cast<double>(bsgs_ratio)));
+}
+
+std::vector<int> PowersOfTwoBelow(int max_n) {
+  std::vector<int> values;
+  for (int n1 = 1; n1 < std::max(1, max_n); n1 <<= 1) {
+    values.push_back(n1);
+  }
+  return values;
+}
+
+std::pair<std::set<int>, std::set<int>> BSGSRotationSets(const std::vector<int> &diag_indices,
+                                                         int slots, int n1) {
+  std::set<int> rot_n1;
+  std::set<int> rot_n2;
+  const int mask = std::max(1, slots) - 1;
+  const int step = std::max(1, n1);
+  for (int raw : diag_indices) {
+    const int rot = raw & mask;
+    const int idx_n1 = ((rot / step) * step) & mask;
+    const int idx_n2 = rot & (step - 1);
+    rot_n1.insert(idx_n1);
+    rot_n2.insert(idx_n2);
+  }
+  return {rot_n1, rot_n2};
+}
+
+int FindBestBSGSRatio(const std::vector<int> &diag_indices, int slots, int log_max_ratio) {
+  const double max_ratio = static_cast<double>(1 << std::max(0, log_max_ratio));
+  for (int n1 : PowersOfTwoBelow(slots)) {
+    const auto sets = BSGSRotationSets(diag_indices, slots, n1);
+    const int nb_n1 = static_cast<int>(sets.first.size()) - 1;
+    const int nb_n2 = static_cast<int>(sets.second.size()) - 1;
+    const double ratio = static_cast<double>(nb_n2) / static_cast<double>(nb_n1);
+    if (ratio == max_ratio) {
+      return n1;
+    }
+    if (ratio > max_ratio) {
+      return std::max(1, n1 / 2);
+    }
+  }
+  return 1;
+}
+
+int FindOptimalUnifiedN1(const std::vector<std::vector<int>> &diag_sets, int slots) {
+  int best_n1 = 1;
+  int best_raw = std::numeric_limits<int>::max();
+  int best_giant = std::numeric_limits<int>::max();
+  int best_baby = std::numeric_limits<int>::max();
+  for (int n1 : PowersOfTwoBelow(slots)) {
+    std::set<int> shared_baby;
+    int total_giant = 0;
+    for (const std::vector<int> &diag_indices : diag_sets) {
+      const auto sets = BSGSRotationSets(diag_indices, slots, n1);
+      for (int value : sets.second) {
+        if (value != 0) {
+          shared_baby.insert(value);
+        }
+      }
+      for (int value : sets.first) {
+        if (value != 0) {
+          total_giant += 1;
+        }
+      }
+    }
+    const int baby = static_cast<int>(shared_baby.size());
+    const int raw = baby + total_giant;
+    if (raw < best_raw || (raw == best_raw && total_giant < best_giant) ||
+        (raw == best_raw && total_giant == best_giant && baby < best_baby) ||
+        (raw == best_raw && total_giant == best_giant && baby == best_baby && n1 < best_n1)) {
+      best_n1 = n1;
+      best_raw = raw;
+      best_giant = total_giant;
+      best_baby = baby;
+    }
+  }
+  return best_n1;
+}
+
+std::vector<int> LattigoBSGSRotations(const std::vector<int> &diag_indices,
+                                      int slots,
+                                      float bsgs_ratio,
+                                      int explicit_n1 = 0,
+                                      bool no_bsgs = false) {
+  slots = std::max(1, slots);
+  std::set<int> rotations;
+  if (no_bsgs) {
+    const auto sets = BSGSRotationSets(diag_indices, slots, slots);
+    rotations.insert(sets.second.begin(), sets.second.end());
+    return std::vector<int>(rotations.begin(), rotations.end());
+  }
+  int n1 = std::max(0, explicit_n1);
+  if (n1 <= 0) {
+    n1 = std::max(1, FindBestBSGSRatio(diag_indices, slots, LattigoLogBSGSRatio(bsgs_ratio)));
+  }
+  const auto sets = BSGSRotationSets(diag_indices, slots, n1);
+  rotations.insert(sets.first.begin(), sets.first.end());
+  rotations.insert(sets.second.begin(), sets.second.end());
+  return std::vector<int>(rotations.begin(), rotations.end());
+}
+
+std::vector<int> LattigoBSGSGaloisElements(const std::vector<int> &diag_indices,
+                                           int slots,
+                                           float bsgs_ratio,
+                                           int explicit_n1 = 0,
+                                           bool no_bsgs = false) {
+  const std::vector<int> rotations =
+      LattigoBSGSRotations(diag_indices, slots, bsgs_ratio, explicit_n1, no_bsgs);
+  const int nth_root = LattigoNthRoot();
+  std::set<int> galois;
+  for (int rot : rotations) {
+    const uint64_t exponent = static_cast<uint64_t>(rot) & static_cast<uint64_t>(nth_root - 1);
+    galois.insert(static_cast<int>(PowMod(5, exponent, static_cast<uint64_t>(nth_root))));
+  }
+  return std::vector<int>(galois.begin(), galois.end());
+}
+
+std::vector<int> LinearTransformRotationKeys(const LinearTransformState &transform) {
+  return LattigoBSGSGaloisElements(
+      transform.diag_indices,
+      transform.slots > 0 ? transform.slots : g_scheme.slots,
+      transform.bsgs_ratio,
+      transform.explicit_bsgs_n1,
+      transform.no_bsgs);
+}
+
+int LinearTransformRotationEvalCount(const LinearTransformState &transform) {
+  const std::vector<int> rotations = LattigoBSGSRotations(
+      transform.diag_indices,
+      transform.slots > 0 ? transform.slots : g_scheme.slots,
+      transform.bsgs_ratio,
+      transform.explicit_bsgs_n1,
+      transform.no_bsgs);
+  int count = 0;
+  for (int rotation : rotations) {
+    if (rotation != 0) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+bool EnvFlagEnabled(const char *name) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr) {
+    return false;
+  }
+  std::string value(raw);
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+bool UnifiedNoBSGSEnabled() {
+  return EnvFlagEnabled("ORION_LATTIGO_UNIFIED_NO_BSGS");
+}
+
+bool UnifiedIndividualEvalEnabled() {
+  return EnvFlagEnabled("ORION_UNIFIED_LT_INDIVIDUAL_EVAL");
+}
 
 int EnvInt(const char *name, int fallback) {
   const char *raw = std::getenv(name);
@@ -252,6 +444,15 @@ std::vector<Complex> ReadFloatDiagonal(const float *data, int len) {
   return out;
 }
 
+std::vector<float> ReadRealFloatDiagonal(const float *data, int len) {
+  std::vector<float> out;
+  if (data == nullptr || len <= 0) {
+    return out;
+  }
+  out.assign(data, data + len);
+  return out;
+}
+
 std::vector<Complex> ReadComplexDiagonal(const double *data, int len) {
   std::vector<Complex> out;
   if (data == nullptr || len <= 0) {
@@ -286,19 +487,87 @@ int StoreCiphertext(std::vector<Complex> values, int level, uint64_t scale, int 
   return id;
 }
 
-int StoreLinearTransform(std::vector<int> diag_indices,
-                         std::vector<std::vector<Complex>> diagonals,
-                         int level, int slots) {
+int StoreComplexLinearTransform(std::vector<int> diag_indices,
+                                std::vector<std::vector<Complex>> diagonals,
+                                int level, int slots,
+                                float bsgs_ratio = 1.0f,
+                                int explicit_bsgs_n1 = 0,
+                                bool no_bsgs = false) {
   const int id = AllocateId();
   g_scheme.linear_transforms.emplace(
       id,
       LinearTransformState{
           std::move(diag_indices),
           std::move(diagonals),
+          {},
           std::max(0, level),
           std::max(0, slots),
+          bsgs_ratio > 0.0f ? bsgs_ratio : 1.0f,
+          std::max(0, explicit_bsgs_n1),
+          bool(no_bsgs),
       });
   return id;
+}
+
+int StoreRealLinearTransform(std::vector<int> diag_indices,
+                             std::vector<float> real_diagonals,
+                             int level, int slots,
+                             float bsgs_ratio = 1.0f,
+                             int explicit_bsgs_n1 = 0,
+                             bool no_bsgs = false) {
+  const int id = AllocateId();
+  g_scheme.linear_transforms.emplace(
+      id,
+      LinearTransformState{
+          std::move(diag_indices),
+          {},
+          std::move(real_diagonals),
+          std::max(0, level),
+          std::max(0, slots),
+          bsgs_ratio > 0.0f ? bsgs_ratio : 1.0f,
+          std::max(0, explicit_bsgs_n1),
+          bool(no_bsgs),
+      });
+  return id;
+}
+
+bool TransformHasRealDiagonals(const LinearTransformState &transform) {
+  return !transform.real_diagonals.empty();
+}
+
+bool TransformRealDiagonalPresent(const LinearTransformState &transform, std::size_t index) {
+  const int slots = std::max(0, transform.slots);
+  if (slots <= 0 || !TransformHasRealDiagonals(transform)) {
+    return false;
+  }
+  const std::size_t start = index * static_cast<std::size_t>(slots);
+  return start + static_cast<std::size_t>(slots) <= transform.real_diagonals.size();
+}
+
+void EnsureComplexLinearTransformStorage(LinearTransformState &transform) {
+  if (!TransformHasRealDiagonals(transform)) {
+    return;
+  }
+  const int slots = std::max(0, transform.slots);
+  if (slots <= 0) {
+    transform.real_diagonals.clear();
+    return;
+  }
+  std::vector<std::vector<Complex>> converted(transform.diag_indices.size());
+  for (std::size_t i = 0; i < transform.diag_indices.size(); ++i) {
+    if (!TransformRealDiagonalPresent(transform, i)) {
+      continue;
+    }
+    const std::size_t start = i * static_cast<std::size_t>(slots);
+    converted[i].reserve(static_cast<std::size_t>(slots));
+    for (int j = 0; j < slots; ++j) {
+      converted[i].emplace_back(
+          static_cast<double>(transform.real_diagonals[start + static_cast<std::size_t>(j)]),
+          0.0);
+    }
+  }
+  transform.diagonals = std::move(converted);
+  transform.real_diagonals.clear();
 }
 
 std::vector<Complex> RotateValues(const std::vector<Complex> &values, int amount) {
@@ -405,17 +674,22 @@ std::vector<Complex> EvaluateLinearTransformValues(const LinearTransformState &t
   for (int j = 0; j < slots; ++j) {
     Complex acc{0.0, 0.0};
     for (std::size_t d = 0; d < transform.diag_indices.size(); ++d) {
-      if (d >= transform.diagonals.size() || transform.diagonals[d].empty()) {
-        continue;
-      }
       const int diag_idx = transform.diag_indices[d];
-      const std::vector<Complex> &diag = transform.diagonals[d];
       int src = (j + diag_idx) % input_size;
       if (src < 0) {
         src += input_size;
       }
-      const Complex coeff = diag[static_cast<std::size_t>(j) % diag.size()];
-      acc += coeff * input.values[static_cast<std::size_t>(src)];
+      if (TransformRealDiagonalPresent(transform, d)) {
+        const std::size_t offset = d * static_cast<std::size_t>(slots) + static_cast<std::size_t>(j);
+        acc += static_cast<double>(transform.real_diagonals[offset]) * input.values[static_cast<std::size_t>(src)];
+      } else {
+        if (d >= transform.diagonals.size() || transform.diagonals[d].empty()) {
+          continue;
+        }
+        const std::vector<Complex> &diag = transform.diagonals[d];
+        const Complex coeff = diag[static_cast<std::size_t>(j) % diag.size()];
+        acc += coeff * input.values[static_cast<std::size_t>(src)];
+      }
     }
     output[static_cast<std::size_t>(j)] = acc;
   }
@@ -434,7 +708,7 @@ std::vector<int> UniqueSortedNonZeroKeys(const std::vector<int> &keys) {
 
 std::vector<int> RotationKeyRequestsFor(const std::vector<int> &keys, int level) {
   std::vector<int> flat;
-  for (int key : UniqueSortedNonZeroKeys(keys)) {
+  for (int key : keys) {
     flat.push_back(key);
     flat.push_back(level);
   }
@@ -1008,21 +1282,25 @@ void NewLinearTransformEvaluator() {}
 
 int GenerateLinearTransform(const int *diagIdxs, int diagIdxsLen,
                             const float *diagData, int diagDataLen,
-                            int level, float /*bsgsRatio*/, const char *ioMode) {
+                            int level, float bsgsRatio, const char *ioMode) {
   std::lock_guard<std::mutex> lock(g_mu);
   const std::vector<int> indices = ReadIntArray(diagIdxs, diagIdxsLen);
   const bool load_mode = ioMode != nullptr && std::string(ioMode) == "load";
   const int slots = load_mode ? g_scheme.slots
                               : (diagIdxsLen > 0 ? diagDataLen / diagIdxsLen : g_scheme.slots);
+  if (!load_mode) {
+    return StoreRealLinearTransform(
+        indices,
+        ReadRealFloatDiagonal(diagData, diagDataLen),
+        level,
+        slots,
+        bsgsRatio);
+  }
   std::vector<std::vector<Complex>> diagonals;
   for (int i = 0; i < diagIdxsLen; ++i) {
-    if (load_mode) {
-      diagonals.emplace_back();
-    } else {
-      diagonals.push_back(ReadFloatDiagonal(diagData + i * slots, slots));
-    }
+    diagonals.emplace_back();
   }
-  return StoreLinearTransform(indices, std::move(diagonals), level, slots);
+  return StoreComplexLinearTransform(indices, std::move(diagonals), level, slots, bsgsRatio);
 }
 
 ArrayResultInt GenerateLinearTransformsBatch(int numTransforms,
@@ -1041,17 +1319,26 @@ ArrayResultInt GenerateLinearTransformsBatch(int numTransforms,
     const std::vector<int> indices = ReadIntArray(diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i], diag_len);
     const bool load_mode = ioMode != nullptr && std::string(ioMode) == "load";
     const int slots = load_mode ? g_scheme.slots : (diag_len > 0 ? data_len / diag_len : g_scheme.slots);
+    if (!load_mode) {
+      ids.push_back(StoreRealLinearTransform(
+          indices,
+          ReadRealFloatDiagonal(diagDataArray == nullptr ? nullptr : diagDataArray[i], data_len),
+          levels == nullptr ? MaxLevel() : levels[i],
+          slots,
+          bsgsRatio));
+      continue;
+    }
     std::vector<std::vector<Complex>> diagonals;
     for (int d = 0; d < diag_len; ++d) {
-      if (load_mode) {
-        diagonals.emplace_back();
-      } else {
-        diagonals.push_back(ReadFloatDiagonal(diagDataArray[i] + d * slots, slots));
-      }
+      diagonals.emplace_back();
     }
-    ids.push_back(StoreLinearTransform(indices, std::move(diagonals), levels == nullptr ? MaxLevel() : levels[i], slots));
+    ids.push_back(StoreComplexLinearTransform(
+        indices,
+        std::move(diagonals),
+        levels == nullptr ? MaxLevel() : levels[i],
+        slots,
+        bsgsRatio));
   }
-  (void)bsgsRatio;
   return MakeIntArrayResult(ids);
 }
 
@@ -1059,9 +1346,9 @@ int EvaluateLinearTransform(int transformID, int ctxtID) {
   std::lock_guard<std::mutex> lock(g_mu);
   const LinearTransformState &transform = LinearTransform(transformID);
   const TensorState &input = Ciphertext(ctxtID);
-  const int nonzero_keys = static_cast<int>(UniqueSortedNonZeroKeys(transform.diag_indices).size());
-  g_scheme.rotations_total += static_cast<uint64_t>(nonzero_keys);
-  g_scheme.rotations_lt += static_cast<uint64_t>(nonzero_keys);
+  const int rotation_count = LinearTransformRotationEvalCount(transform);
+  g_scheme.rotations_total += static_cast<uint64_t>(rotation_count);
+  g_scheme.rotations_lt += static_cast<uint64_t>(rotation_count);
   return StoreCiphertext(
       EvaluateLinearTransformValues(transform, input),
       std::min(input.level, transform.level),
@@ -1081,19 +1368,29 @@ int GetLiveLinearTransformCount() {
 
 ArrayResultInt GetLinearTransformRotationKeys(int transformID) {
   std::lock_guard<std::mutex> lock(g_mu);
-  return MakeIntArrayResult(UniqueSortedNonZeroKeys(LinearTransform(transformID).diag_indices));
+  return MakeIntArrayResult(LinearTransformRotationKeys(LinearTransform(transformID)));
+}
+
+int GetLinearTransformRotationEvalCount(int transformID) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return LinearTransformRotationEvalCount(LinearTransform(transformID));
 }
 
 ArrayResultInt PlanLinearTransformRotationKeys(const int *diagIdxs, int diagIdxsLen,
-                                               int /*level*/, float /*bsgsRatio*/) {
+                                               int /*level*/, float bsgsRatio) {
   std::lock_guard<std::mutex> lock(g_mu);
-  return MakeIntArrayResult(UniqueSortedNonZeroKeys(ReadIntArray(diagIdxs, diagIdxsLen)));
+  return MakeIntArrayResult(LattigoBSGSGaloisElements(
+      ReadIntArray(diagIdxs, diagIdxsLen),
+      g_scheme.slots,
+      bsgsRatio));
 }
 
 ArrayResultInt PlanLinearTransformRotationKeyRequests(const int *diagIdxs, int diagIdxsLen,
-                                                      int level, float /*bsgsRatio*/) {
+                                                      int level, float bsgsRatio) {
   std::lock_guard<std::mutex> lock(g_mu);
-  return MakeIntArrayResult(RotationKeyRequestsFor(ReadIntArray(diagIdxs, diagIdxsLen), level));
+  const std::vector<int> keys =
+      LattigoBSGSGaloisElements(ReadIntArray(diagIdxs, diagIdxsLen), g_scheme.slots, bsgsRatio);
+  return MakeIntArrayResult(RotationKeyRequestsFor(keys, level));
 }
 
 ArrayResultInt GetLinearTransformEmptyPlaintextKeys(int transformID) {
@@ -1101,7 +1398,9 @@ ArrayResultInt GetLinearTransformEmptyPlaintextKeys(int transformID) {
   const LinearTransformState &transform = LinearTransform(transformID);
   std::vector<int> empty;
   for (std::size_t i = 0; i < transform.diag_indices.size(); ++i) {
-    if (i >= transform.diagonals.size() || transform.diagonals[i].empty()) {
+    const bool real_present = TransformRealDiagonalPresent(transform, i);
+    const bool complex_present = i < transform.diagonals.size() && !transform.diagonals[i].empty();
+    if (!real_present && !complex_present) {
       empty.push_back(transform.diag_indices[i]);
     }
   }
@@ -1121,8 +1420,31 @@ ArrayResultInt GenerateLinearTransformsUnified(int numTransforms,
                                                const float **diagDataArray,
                                                const int *diagDataLens,
                                                const int *levels) {
-  return GenerateLinearTransformsBatch(
-      numTransforms, diagIdxsArray, diagIdxsLens, diagDataArray, diagDataLens, levels, 1.0f, "none");
+  std::lock_guard<std::mutex> lock(g_mu);
+  std::vector<std::vector<int>> diag_sets;
+  diag_sets.reserve(static_cast<std::size_t>(std::max(0, numTransforms)));
+  for (int i = 0; i < numTransforms; ++i) {
+    diag_sets.push_back(ReadIntArray(
+        diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i],
+        diagIdxsLens == nullptr ? 0 : diagIdxsLens[i]));
+  }
+  const bool no_bsgs = UnifiedNoBSGSEnabled();
+  const int unified_n1 = no_bsgs ? 0 : FindOptimalUnifiedN1(diag_sets, g_scheme.slots);
+  std::vector<int> ids;
+  for (int i = 0; i < numTransforms; ++i) {
+    const int diag_len = diagIdxsLens == nullptr ? 0 : diagIdxsLens[i];
+    const int data_len = diagDataLens == nullptr ? 0 : diagDataLens[i];
+    const int slots = diag_len > 0 ? data_len / diag_len : g_scheme.slots;
+    ids.push_back(StoreRealLinearTransform(
+        std::move(diag_sets[static_cast<std::size_t>(i)]),
+        ReadRealFloatDiagonal(diagDataArray == nullptr ? nullptr : diagDataArray[i], data_len),
+        levels == nullptr ? MaxLevel() : levels[i],
+        slots,
+        1.0f,
+        unified_n1,
+        no_bsgs));
+  }
+  return MakeIntArrayResult(ids);
 }
 
 ArrayResultInt PlanLinearTransformsUnifiedRotationKeys(int numTransforms,
@@ -1130,14 +1452,24 @@ ArrayResultInt PlanLinearTransformsUnifiedRotationKeys(int numTransforms,
                                                        const int *diagIdxsLens,
                                                        const int * /*levels*/) {
   std::lock_guard<std::mutex> lock(g_mu);
+  std::vector<std::vector<int>> diag_sets;
+  diag_sets.reserve(static_cast<std::size_t>(std::max(0, numTransforms)));
+  for (int i = 0; i < numTransforms; ++i) {
+    diag_sets.push_back(ReadIntArray(diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i],
+                                     diagIdxsLens == nullptr ? 0 : diagIdxsLens[i]));
+  }
+  const bool no_bsgs = UnifiedNoBSGSEnabled();
+  const int unified_n1 = no_bsgs ? 0 : FindOptimalUnifiedN1(diag_sets, g_scheme.slots);
   std::set<int> keys;
   for (int i = 0; i < numTransforms; ++i) {
-    std::vector<int> indices = ReadIntArray(diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i],
-                                            diagIdxsLens == nullptr ? 0 : diagIdxsLens[i]);
-    for (int key : indices) {
-      if (key != 0) {
-        keys.insert(key);
-      }
+    const std::vector<int> transform_keys = LattigoBSGSGaloisElements(
+        diag_sets[static_cast<std::size_t>(i)],
+        g_scheme.slots,
+        1.0f,
+        unified_n1,
+        no_bsgs);
+    for (int key : transform_keys) {
+      keys.insert(key);
     }
   }
   return MakeIntArrayResult(std::vector<int>(keys.begin(), keys.end()));
@@ -1150,6 +1482,15 @@ ArrayResultInt GenerateLinearTransformsUnifiedComplex(int numTransforms,
                                                       const int *diagDataLens,
                                                       const int *levels) {
   std::lock_guard<std::mutex> lock(g_mu);
+  std::vector<std::vector<int>> diag_sets;
+  diag_sets.reserve(static_cast<std::size_t>(std::max(0, numTransforms)));
+  for (int i = 0; i < numTransforms; ++i) {
+    diag_sets.push_back(ReadIntArray(
+        diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i],
+        diagIdxsLens == nullptr ? 0 : diagIdxsLens[i]));
+  }
+  const bool no_bsgs = UnifiedNoBSGSEnabled();
+  const int unified_n1 = no_bsgs ? 0 : FindOptimalUnifiedN1(diag_sets, g_scheme.slots);
   std::vector<int> ids;
   for (int i = 0; i < numTransforms; ++i) {
     const int diag_len = diagIdxsLens == nullptr ? 0 : diagIdxsLens[i];
@@ -1159,11 +1500,14 @@ ArrayResultInt GenerateLinearTransformsUnifiedComplex(int numTransforms,
     for (int d = 0; d < diag_len; ++d) {
       diagonals.push_back(ReadComplexDiagonal(diagDataArray[i] + d * slots * 2, slots * 2));
     }
-    ids.push_back(StoreLinearTransform(
-        ReadIntArray(diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i], diag_len),
+    ids.push_back(StoreComplexLinearTransform(
+        std::move(diag_sets[static_cast<std::size_t>(i)]),
         std::move(diagonals),
         levels == nullptr ? MaxLevel() : levels[i],
-        slots));
+        slots,
+        1.0f,
+        unified_n1,
+        no_bsgs));
   }
   return MakeIntArrayResult(ids);
 }
@@ -1173,15 +1517,27 @@ ArrayResultInt GenerateLinearTransformsUnifiedLoad(int numTransforms,
                                                    const int *diagIdxsLens,
                                                    const int *levels) {
   std::lock_guard<std::mutex> lock(g_mu);
+  std::vector<std::vector<int>> diag_sets;
+  diag_sets.reserve(static_cast<std::size_t>(std::max(0, numTransforms)));
+  for (int i = 0; i < numTransforms; ++i) {
+    diag_sets.push_back(ReadIntArray(
+        diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i],
+        diagIdxsLens == nullptr ? 0 : diagIdxsLens[i]));
+  }
+  const bool no_bsgs = UnifiedNoBSGSEnabled();
+  const int unified_n1 = no_bsgs ? 0 : FindOptimalUnifiedN1(diag_sets, g_scheme.slots);
   std::vector<int> ids;
   for (int i = 0; i < numTransforms; ++i) {
     const int diag_len = diagIdxsLens == nullptr ? 0 : diagIdxsLens[i];
     std::vector<std::vector<Complex>> diagonals(static_cast<std::size_t>(std::max(0, diag_len)));
-    ids.push_back(StoreLinearTransform(
-        ReadIntArray(diagIdxsArray == nullptr ? nullptr : diagIdxsArray[i], diag_len),
+    ids.push_back(StoreComplexLinearTransform(
+        std::move(diag_sets[static_cast<std::size_t>(i)]),
         std::move(diagonals),
         levels == nullptr ? MaxLevel() : levels[i],
-        g_scheme.slots));
+        g_scheme.slots,
+        1.0f,
+        unified_n1,
+        no_bsgs));
   }
   return MakeIntArrayResult(ids);
 }
@@ -1192,17 +1548,33 @@ ArrayResultInt EvaluateLinearTransformsWithSharedCache(const int *transformIDs,
   std::lock_guard<std::mutex> lock(g_mu);
   const TensorState input = Ciphertext(ctxtID);
   std::vector<int> out_ids;
+  std::set<int> shared_rotations;
+  uint64_t individual_rotation_count = 0;
   for (int i = 0; i < numTransforms; ++i) {
     const LinearTransformState &transform = LinearTransform(transformIDs[i]);
-    const int nonzero_keys = static_cast<int>(UniqueSortedNonZeroKeys(transform.diag_indices).size());
-    g_scheme.rotations_total += static_cast<uint64_t>(nonzero_keys);
-    g_scheme.rotations_lt += static_cast<uint64_t>(nonzero_keys);
+    individual_rotation_count += static_cast<uint64_t>(LinearTransformRotationEvalCount(transform));
+    const std::vector<int> rotations = LattigoBSGSRotations(
+        transform.diag_indices,
+        transform.slots > 0 ? transform.slots : g_scheme.slots,
+        transform.bsgs_ratio,
+        transform.explicit_bsgs_n1,
+        transform.no_bsgs);
+    for (int rotation : rotations) {
+      if (rotation != 0) {
+        shared_rotations.insert(rotation);
+      }
+    }
     out_ids.push_back(StoreCiphertext(
         EvaluateLinearTransformValues(transform, input),
         std::min(input.level, transform.level),
         input.scale,
         input.degree));
   }
+  const uint64_t rotation_count = UnifiedIndividualEvalEnabled()
+                                      ? individual_rotation_count
+                                      : static_cast<uint64_t>(shared_rotations.size());
+  g_scheme.rotations_total += rotation_count;
+  g_scheme.rotations_lt += rotation_count;
   return MakeIntArrayResult(out_ids);
 }
 
@@ -1222,13 +1594,24 @@ ArrayResultInt EvaluateLinearTransformSourcesWithSharedCacheAdd(
     const TensorState input = Ciphertext(ctxtIDs[source]);
     const int start = groupOffsets[source];
     const int end = groupOffsets[source + 1];
+    std::set<int> shared_rotations;
+    uint64_t individual_rotation_count = 0;
     for (int partial = start; partial < end && partial < numPartials; ++partial) {
       const int target = targetIDs[partial];
       const LinearTransformState &transform = LinearTransform(transformIDs[partial]);
       std::vector<Complex> values = EvaluateLinearTransformValues(transform, input);
-      const int nonzero_keys = static_cast<int>(UniqueSortedNonZeroKeys(transform.diag_indices).size());
-      g_scheme.rotations_total += static_cast<uint64_t>(nonzero_keys);
-      g_scheme.rotations_lt += static_cast<uint64_t>(nonzero_keys);
+      individual_rotation_count += static_cast<uint64_t>(LinearTransformRotationEvalCount(transform));
+      const std::vector<int> rotations = LattigoBSGSRotations(
+          transform.diag_indices,
+          transform.slots > 0 ? transform.slots : g_scheme.slots,
+          transform.bsgs_ratio,
+          transform.explicit_bsgs_n1,
+          transform.no_bsgs);
+      for (int rotation : rotations) {
+        if (rotation != 0) {
+          shared_rotations.insert(rotation);
+        }
+      }
       if (target < 0 || target >= numTargets) {
         continue;
       }
@@ -1243,6 +1626,11 @@ ArrayResultInt EvaluateLinearTransformSourcesWithSharedCacheAdd(
       scales[static_cast<std::size_t>(target)] = input.scale;
       degrees[static_cast<std::size_t>(target)] = input.degree;
     }
+    const uint64_t rotation_count = UnifiedIndividualEvalEnabled()
+                                        ? individual_rotation_count
+                                        : static_cast<uint64_t>(shared_rotations.size());
+    g_scheme.rotations_total += rotation_count;
+    g_scheme.rotations_lt += rotation_count;
   }
   std::vector<int> out_ids;
   for (int target = 0; target < numTargets; ++target) {
@@ -1296,6 +1684,16 @@ ArrayResultByte SerializeDiagonal(int transformID, int diagIdx) {
     if (transform.diag_indices[i] == diagIdx && i < transform.diagonals.size()) {
       return MakeByteArrayResult(SerializeVector(transform.diagonals[i]));
     }
+    if (transform.diag_indices[i] == diagIdx && TransformRealDiagonalPresent(transform, i)) {
+      const int slots = std::max(0, transform.slots);
+      const std::size_t start = i * static_cast<std::size_t>(slots);
+      std::vector<Complex> values;
+      values.reserve(static_cast<std::size_t>(slots));
+      for (int j = 0; j < slots; ++j) {
+        values.emplace_back(static_cast<double>(transform.real_diagonals[start + static_cast<std::size_t>(j)]), 0.0);
+      }
+      return MakeByteArrayResult(SerializeVector(values));
+    }
   }
   return MakeByteArrayResult({});
 }
@@ -1305,6 +1703,7 @@ void LoadPlaintextDiagonal(const unsigned char *data, unsigned long lenData,
   std::lock_guard<std::mutex> lock(g_mu);
   LinearTransformState &transform = LinearTransform(transformID);
   std::vector<Complex> values = DeserializeVector(data, lenData);
+  EnsureComplexLinearTransformStorage(transform);
   for (std::size_t i = 0; i < transform.diag_indices.size(); ++i) {
     if (transform.diag_indices[i] == static_cast<int>(diagIdx)) {
       if (i >= transform.diagonals.size()) {
@@ -1326,6 +1725,7 @@ void LoadPlaintextDiagonalsBatch(const unsigned char *payload, unsigned long len
   std::lock_guard<std::mutex> lock(g_mu);
   LinearTransformState &transform = LinearTransform(transformID);
   const int count = std::min({lenOffsets, lenLengths, lenDiagIndices});
+  bool complex_storage_ready = false;
   for (int i = 0; i < count; ++i) {
     const std::size_t offset = static_cast<std::size_t>(offsets[i]);
     const std::size_t length = static_cast<std::size_t>(lengths[i]);
@@ -1333,6 +1733,10 @@ void LoadPlaintextDiagonalsBatch(const unsigned char *payload, unsigned long len
       continue;
     }
     std::vector<Complex> values = DeserializeVector(payload + offset, length);
+    if (!complex_storage_ready) {
+      EnsureComplexLinearTransformStorage(transform);
+      complex_storage_ready = true;
+    }
     bool installed = false;
     for (std::size_t j = 0; j < transform.diag_indices.size(); ++j) {
       if (transform.diag_indices[j] == diagIndices[i]) {
@@ -1357,6 +1761,7 @@ void RemovePlaintextDiagonals(int transformID) {
   for (std::vector<Complex> &diag : transform.diagonals) {
     diag.clear();
   }
+  transform.real_diagonals.clear();
 }
 
 ArrayResultInt GetLinearTransformPlaintextLevels(int transformID) {

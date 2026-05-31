@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import torch
 
+from orion.core import bsgs_rotation_stats as bsgs_stats
 from orion.core.orion import _PackWorkerScheme
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
@@ -36,6 +38,7 @@ TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS = int(os.environ.get("HALOED_TEMPLATE_ESTIM
 PHYSICAL_COMPACT = "packed_compact"
 PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
 PHYSICAL_NATIVE_SOURCE_STRIPE = "native_source_stripe"
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
 POLICY_ALIASES = {
     "fixed": "fixed_max",
     "fixedmax": "fixed_max",
@@ -52,6 +55,18 @@ POLICY_ALIASES = {
     "fixedmax-fused": "fixed_max_fused",
     "fixed_max_fused": "fixed_max_fused",
     "fixed-max-fused": "fixed_max_fused",
+    "fixed_no_share": "fixed_max_no_share",
+    "fixed-no-share": "fixed_max_no_share",
+    "fixed_noshare": "fixed_max_no_share",
+    "fixed-noshare": "fixed_max_no_share",
+    "fixedmax_no_share": "fixed_max_no_share",
+    "fixedmax-no-share": "fixed_max_no_share",
+    "fixedmax_noshare": "fixed_max_no_share",
+    "fixedmax-noshare": "fixed_max_no_share",
+    "fixed_max_no_share": "fixed_max_no_share",
+    "fixed-max-no-share": "fixed_max_no_share",
+    "fixed_max_noshare": "fixed_max_no_share",
+    "fixed-max-noshare": "fixed_max_no_share",
     "eager": "eager",
     "eager_relayout": "eager",
     "eager-relayout": "eager",
@@ -73,6 +88,14 @@ POLICY_ALIASES = {
     "always-fused": "always_fused",
     "always_relayout_fused": "always_fused",
     "always-relayout-fused": "always_fused",
+    "always_no_share": "always_no_share",
+    "always-no-share": "always_no_share",
+    "always_noshare": "always_no_share",
+    "always-noshare": "always_no_share",
+    "always_relayout_no_share": "always_no_share",
+    "always-relayout-no-share": "always_no_share",
+    "always_relayout_noshare": "always_no_share",
+    "always-relayout-noshare": "always_no_share",
     "orion": "orion_dense",
     "dense": "orion_dense",
     "orion_dense": "orion_dense",
@@ -94,12 +117,14 @@ POLICY_ALIASES = {
 POLICY_LABELS = {
     "fixed_max": "Max-Re-Layout",
     "fixed_max_fused": "Fixed-Max-Halo+Fusion",
+    "fixed_max_no_share": "Fixed-Max-NoShare-Fold",
     "eager": "Eager-Re-Layout",
     "eager_fused": "Eager-Re-Layout+Fusion",
     "greedy": "Greedy-Max-Zero-Cycle",
     "greedy_fused": "Greedy-Local+Fusion",
     "always": "Always-Re-Layout",
     "always_fused": "Always-Re-Layout+Fusion",
+    "always_no_share": "Always-Re-Layout-NoShare-Fold",
     "orion_dense": "Orion-Dense-No-Halo",
     "dp": "DP-Global",
     "dp_no_share_fold": "DP-NoShare-Fold",
@@ -223,10 +248,16 @@ class EdgeInfo:
     output_channels: int = 0
     slots: int = DEFAULT_SLOTS
     activation_ct_mult_depth: int = 0
+    module: Any | None = None
 
     @property
     def edge_id(self) -> str:
         return f"{self.source}->{self.target}"
+
+
+_NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE: dict[tuple[Any, ...], dict[str, dict[str, Any]] | None] = {}
+_DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE: dict[tuple[Any, ...], dict[str, int] | None] = {}
+_CONCAT_FUSED_ROTATION_STATS_CACHE: dict[tuple[Any, ...], dict[str, int] | None] = {}
 
 
 @dataclass(frozen=True)
@@ -750,6 +781,7 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
                 output_channels=int(op_params["output_channels"]),
                 slots=int(slots),
                 activation_ct_mult_depth=int(_activation_ct_mult_depth(target_module)),
+                module=target_module,
             ),
         )
     edges_by_id = {str(edge.edge_id): edge for edge in edges}
@@ -984,11 +1016,26 @@ def _edge_row(
     consumer_fused_rotation_estimate: int = 0,
     producer_fused_relayout: bool = False,
     producer_fused_rotation_estimate: int = 0,
+    provider_lt_grouping_mode: str = "",
+    native_halo_channel_fold_mode: str = "",
+    native_halo_exact_compact_output: bool = True,
     estimator: str | None = None,
 ) -> dict[str, Any]:
     if str(layout_mode) == "compact_global_fallback":
         raise ValueError("compact global fallback is not a valid halo-local layout-policy edge")
     lt_stats = _lt_rotation_stats(edge, layout, estimator=estimator)
+    native_plan_stats = _native_halo_stripe_rotation_stats(
+        edge,
+        layout,
+        provider_lt_grouping_mode=str(provider_lt_grouping_mode),
+        native_halo_channel_fold_mode=str(native_halo_channel_fold_mode),
+        exact_compact_output=bool(native_halo_exact_compact_output),
+    ) if (
+        str(layout_mode) == "native_halo_stripe"
+        and (str(provider_lt_grouping_mode).strip() or str(native_halo_channel_fold_mode).strip())
+    ) else None
+    if native_plan_stats is not None:
+        lt_stats = {**dict(lt_stats), **dict(native_plan_stats["lt_stats"])}
     if lt_rotations is None:
         lt_rotations = int(lt_stats["rotations"])
     if planner_rotation_cost is None:
@@ -1060,10 +1107,13 @@ def _edge_row(
         "source_physical_layout": str(source_physical_layout or ""),
         "target_physical_layout": str(physical_layout),
         "physical_layout": str(physical_layout),
+        "provider_lt_grouping_mode": str(provider_lt_grouping_mode),
+        "native_halo_channel_fold_mode": str(native_halo_channel_fold_mode),
         "consumer_fused_relayout": bool(consumer_fused_relayout),
         "consumer_fused_rotation_estimate": int(consumer_fused_rotation_estimate),
         "producer_fused_relayout": bool(producer_fused_relayout),
         "producer_fused_rotation_estimate": int(producer_fused_rotation_estimate),
+        **({} if native_plan_stats is None else dict(native_plan_stats["audit"])),
     }
 
 
@@ -1553,6 +1603,157 @@ def _bsgs_index(diag_indices: Iterable[int], *, slots: int, n1: int) -> tuple[se
     return rot_n1, rot_n2
 
 
+def _lattigo_galois_element(rotation: int, *, slots: int) -> int:
+    nth_root = int(4 * max(1, int(slots)))
+    return int(pow(5, int(rotation) & int(nth_root - 1), int(nth_root)))
+
+
+def _lattigo_bsgs_galois_key_count(
+    diag_indices: Iterable[int],
+    *,
+    slots: int,
+    n1: int,
+    include_identity: bool = False,
+) -> dict[str, int]:
+    rot_n1, rot_n2 = _bsgs_index(diag_indices, slots=int(slots), n1=int(n1))
+    rotations = {int(value) for value in rot_n1}
+    rotations.update(int(value) for value in rot_n2)
+    galois = {
+        _lattigo_galois_element(int(rotation), slots=int(slots))
+        for rotation in rotations
+        if bool(include_identity) or int(rotation) != 0
+    }
+    baby = {
+        _lattigo_galois_element(int(rotation), slots=int(slots))
+        for rotation in rot_n2
+        if bool(include_identity) or int(rotation) != 0
+    }
+    giant = {
+        _lattigo_galois_element(int(rotation), slots=int(slots))
+        for rotation in rot_n1
+        if bool(include_identity) or int(rotation) != 0
+    }
+    return {
+        "rotations": int(len(galois)),
+        "baby_rotations": int(len(baby)),
+        "giant_rotations": int(len(giant)),
+    }
+
+
+def _optimal_unified_bsgs_n1(diag_sets: Sequence[Iterable[int]], *, slots: int) -> int:
+    base_sets: list[tuple[int, ...]] = []
+    for diag_set in diag_sets:
+        values = tuple(sorted({int(value) % int(slots) for value in diag_set}))
+        if values:
+            base_sets.append(values)
+    if not base_sets:
+        return 1
+    best_n1 = 1
+    best_raw = sys.maxsize
+    best_giant = sys.maxsize
+    best_baby = sys.maxsize
+    for n1 in _powers_of_two_below_slots(int(slots)):
+        shared_baby: set[int] = set()
+        total_giant = 0
+        for diag_set in base_sets:
+            rot_n1, rot_n2 = _bsgs_index(diag_set, slots=int(slots), n1=int(n1))
+            shared_baby.update(int(value) for value in rot_n2 if int(value) != 0)
+            total_giant += sum(1 for value in rot_n1 if int(value) != 0)
+        baby = int(len(shared_baby))
+        raw = int(baby + total_giant)
+        if (
+            int(raw) < int(best_raw)
+            or (int(raw) == int(best_raw) and int(total_giant) < int(best_giant))
+            or (int(raw) == int(best_raw) and int(total_giant) == int(best_giant) and int(baby) < int(best_baby))
+            or (
+                int(raw) == int(best_raw)
+                and int(total_giant) == int(best_giant)
+                and int(baby) == int(best_baby)
+                and int(n1) < int(best_n1)
+            )
+        ):
+            best_n1 = int(n1)
+            best_raw = int(raw)
+            best_giant = int(total_giant)
+            best_baby = int(baby)
+    return int(best_n1)
+
+
+def _best_bsgs_ratio_n1(diag_indices: Iterable[int], *, slots: int, bsgs_ratio: float) -> int:
+    values = tuple(sorted({int(value) % int(slots) for value in diag_indices}))
+    if not values:
+        return 1
+    max_ratio = float(1 << max(0, int(math.log(float(bsgs_ratio))) if float(bsgs_ratio) > 0.0 else 0))
+    for n1 in _powers_of_two_below_slots(int(slots)):
+        rot_n1, rot_n2 = _bsgs_index(values, slots=int(slots), n1=int(n1))
+        nb_n1 = int(len(rot_n1) - 1)
+        nb_n2 = int(len(rot_n2) - 1)
+        ratio = math.inf if int(nb_n1) == 0 else float(nb_n2) / float(nb_n1)
+        if float(ratio) == float(max_ratio):
+            return int(n1)
+        if float(ratio) > float(max_ratio):
+            return max(1, int(n1) // 2)
+    return 1
+
+
+def _individual_bsgs_ratio_galois_rotation_stats(
+    diag_sets: Sequence[Iterable[int]],
+    *,
+    slots: int,
+    bsgs_ratio: float,
+) -> dict[str, int]:
+    stats = bsgs_stats.individual_bsgs_ratio_rotation_stats(
+        tuple(tuple(int(value) for value in diag_set) for diag_set in diag_sets),
+        slots=int(slots),
+        bsgs_ratio=float(bsgs_ratio),
+    )
+    return {
+        "rotations": int(stats["rotations"]),
+        "baby_rotations": int(stats["baby_rotations"]),
+        "giant_rotations": int(stats["giant_rotations"]),
+        "transforms": int(stats["transforms"]),
+        "bsgs_groups": int(stats["bsgs_groups"]),
+    }
+
+
+def _individual_unified_galois_rotation_stats(
+    diag_sets: Sequence[Iterable[int]],
+    *,
+    slots: int,
+    include_identity: bool = False,
+) -> dict[str, int]:
+    del include_identity
+    total = 0
+    baby = 0
+    giant = 0
+    nonempty = 0
+    counts: Counter[tuple[int, ...]] = Counter(
+        tuple(sorted({int(value) % int(slots) for value in diag_set}))
+        for diag_set in diag_sets
+    )
+    for diag_set, multiplicity in sorted(counts.items()):
+        if not diag_set:
+            continue
+        stats = bsgs_stats.unified_bsgs_rotation_stats(
+            (diag_set,),
+            slots=int(slots),
+            individual_eval=True,
+        )
+        if int(stats["transforms"]) <= 0:
+            continue
+        total += int(multiplicity) * int(stats["rotations"])
+        baby += int(multiplicity) * int(stats["baby_rotations"])
+        giant += int(multiplicity) * int(stats["giant_rotations"])
+        nonempty += int(multiplicity) * int(stats["transforms"])
+    return {
+        "rotations": int(total),
+        "baby_rotations": int(baby),
+        "giant_rotations": int(giant),
+        "transforms": int(nonempty),
+        "bsgs_groups": int(nonempty),
+    }
+
+
 def _shared_bsgs_group_cost(
     diag_sets: Sequence[Sequence[int]],
     *,
@@ -1610,6 +1811,664 @@ def _output_gap_for_edge(edge: EdgeInfo) -> int:
     fhe_h = max(1, int(edge.output_fhe_shape[2]))
     fhe_w = max(1, int(edge.output_fhe_shape[3]))
     return max(1, min(max(1, int(round(fhe_h / clear_h))), max(1, int(round(fhe_w / clear_w)))))
+
+
+def _native_halo_stripe_rotation_stats_cache_key(
+    edge: EdgeInfo,
+    layout: LayoutState,
+    *,
+    provider_lt_grouping_mode: str,
+    native_halo_channel_fold_mode: str,
+    exact_compact_output: bool,
+) -> tuple[Any, ...]:
+    return (
+        str(edge.op_kind),
+        tuple(int(value) for value in edge.shape),
+        tuple(int(value) for value in (edge.output_shape or ())),
+        tuple(int(value) for value in (edge.output_fhe_shape or ())),
+        tuple(int(value) for value in edge.kernel_size),
+        tuple(int(value) for value in edge.stride),
+        tuple(int(value) for value in edge.padding),
+        tuple(int(value) for value in edge.dilation),
+        int(edge.groups),
+        int(edge.input_channels or 0),
+        int(edge.output_channels or 0),
+        int(edge.slots),
+        layout.key(),
+        str(provider_lt_grouping_mode or "").strip().lower().replace("-", "_"),
+        str(native_halo_channel_fold_mode or "").strip().lower().replace("-", "_"),
+        bool(exact_compact_output),
+    )
+
+
+def _copy_native_halo_stripe_rotation_stats(
+    stats: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]] | None:
+    if stats is None:
+        return None
+    return {
+        "lt_stats": dict(stats.get("lt_stats", {}) or {}),
+        "audit": dict(stats.get("audit", {}) or {}),
+    }
+
+
+def _native_halo_fast_fold_mode(native_halo_channel_fold_mode: str, *, exact_compact_output: bool) -> str:
+    del exact_compact_output
+    requested = str(native_halo_channel_fold_mode or "heuristic")
+    return requested
+
+
+def _native_halo_stripe_rotation_stats(
+    edge: EdgeInfo,
+    layout: LayoutState,
+    *,
+    provider_lt_grouping_mode: str = "",
+    native_halo_channel_fold_mode: str = "",
+    exact_compact_output: bool = True,
+) -> dict[str, dict[str, Any]] | None:
+    cache_key = _native_halo_stripe_rotation_stats_cache_key(
+        edge,
+        layout,
+        provider_lt_grouping_mode=str(provider_lt_grouping_mode),
+        native_halo_channel_fold_mode=str(native_halo_channel_fold_mode),
+        exact_compact_output=bool(exact_compact_output),
+    )
+    if cache_key in _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE:
+        return _copy_native_halo_stripe_rotation_stats(_NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key])
+
+    if str(edge.op_kind) != "conv2d":
+        _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    if edge.output_shape is None:
+        _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    kernel = tuple(int(value) for value in edge.kernel_size)
+    stride = tuple(int(value) for value in edge.stride)
+    padding = tuple(int(value) for value in edge.padding)
+    dilation = tuple(int(value) for value in edge.dilation)
+    groups = max(1, int(edge.groups or 1))
+    if len(kernel) < 2 or len(stride) < 2 or len(padding) < 2 or len(dilation) < 2:
+        _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    if (
+        int(groups) != 1
+        or int(kernel[0]) != int(kernel[1])
+        or int(stride[0]) != int(stride[1])
+        or int(padding[0]) != int(padding[1])
+        or int(dilation[0]) != int(dilation[1])
+    ):
+        _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    try:
+        from orion.experimental.cir.native_halo_conv2d import (
+            NativeHaloConv2DSpec,
+            native_halo_conv2d_compact_output_rotation_stats,
+            native_halo_conv2d_plan,
+        )
+    except Exception:
+        _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+
+    c_in = max(1, int(edge.input_channels or edge.shape[1]))
+    c_out = max(1, int(edge.output_channels or edge.output_shape[1]))
+    output_gap = _output_gap_for_edge(edge)
+    spec = NativeHaloConv2DSpec(
+        family_label=(
+            f"layout_policy_native_rotation_{edge.source}_{edge.target}"
+            f"_{int(c_in)}x{int(edge.shape[2])}x{int(edge.shape[3])}"
+            f"_to_{int(c_out)}x{int(edge.output_shape[2])}x{int(edge.output_shape[3])}"
+            f"_k{int(kernel[0])}s{int(stride[0])}_gap{int(layout.gap)}to{int(output_gap)}"
+        ),
+        c_in=int(c_in),
+        h_in=int(edge.shape[2]),
+        w_in=int(edge.shape[3]),
+        c_out=int(c_out),
+        h_out=int(edge.output_shape[2]),
+        w_out=int(edge.output_shape[3]),
+        gap_in=int(layout.gap),
+        gap_out=int(output_gap),
+        kernel=int(kernel[0]),
+        stride=int(stride[0]),
+        pad=int(padding[0]),
+        dilation=int(dilation[0]),
+        groups=int(groups),
+        slot_count=int(edge.slots),
+        input_top_beta=int(layout.top_beta),
+        input_bottom_beta=int(layout.bottom_beta),
+        output_top_beta=0,
+        output_bottom_beta=0,
+        input_physical_top_beta=_layout_physical_top_beta(layout),
+        input_physical_bottom_beta=_layout_physical_bottom_beta(layout),
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    requested_fold_mode = str(native_halo_channel_fold_mode or "heuristic")
+    fold_mode = _native_halo_fast_fold_mode(
+        requested_fold_mode,
+        exact_compact_output=bool(exact_compact_output),
+    )
+    try:
+        plan = native_halo_conv2d_plan(
+            spec,
+            require_native_target_fit=False,
+            channel_fold_mode=str(fold_mode),
+        )
+    except ValueError:
+        _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    grouping = str(provider_lt_grouping_mode or "").strip().lower().replace("-", "_")
+    individual = grouping in {
+        "individual",
+        "individual_lt",
+        "per_lt",
+        "per_linear_transform",
+        "no_share",
+        "no_shared_rotation",
+        "disable_shared_rotation",
+    }
+    compact_output_stats = native_halo_conv2d_compact_output_rotation_stats(plan) if bool(exact_compact_output) else None
+    c_only_rotations = (
+        int(compact_output_stats.c_only_rotations)
+        if compact_output_stats is not None
+        else int(plan.c_only_rotations)
+    )
+    cb_shared_rotations = (
+        int(compact_output_stats.cb_shared_rotations)
+        if compact_output_stats is not None
+        else int(plan.cb_shared_rotations)
+    )
+    shared_baby_rotations = (
+        int(compact_output_stats.shared_baby_rotations)
+        if compact_output_stats is not None
+        else int(plan.shared_baby_rotations)
+    )
+    shared_giant_rotations = (
+        int(compact_output_stats.shared_giant_rotations)
+        if compact_output_stats is not None
+        else int(plan.shared_giant_rotations)
+    )
+    transform_count = (
+        int(compact_output_stats.transform_count)
+        if compact_output_stats is not None
+        else int(plan.submatrix_program_count)
+    )
+    output_ct_count = (
+        int(compact_output_stats.output_ct_count)
+        if compact_output_stats is not None
+        else int(plan.output_ct_count)
+    )
+    rotations = int(
+        int(c_only_rotations) if bool(individual) else int(cb_shared_rotations)
+    )
+    baby_rotations = (
+        int(sum(int(value) for value in compact_output_stats.rotation_counts))
+        if bool(individual) and compact_output_stats is not None
+        else int(sum(int(value) for value in plan.program_rotation_counts))
+        if bool(individual)
+        else int(shared_baby_rotations)
+    )
+    giant_rotations = 0 if bool(individual) else int(shared_giant_rotations)
+    result = {
+        "lt_stats": {
+            "bsgs_groups": int(plan.submatrix_program_count if bool(individual) else plan.sharing_group_count),
+            "transforms": int(transform_count),
+            "baby_rotations": int(baby_rotations),
+            "giant_rotations": int(giant_rotations),
+            "input_channel_multiplier": int(plan.input_ct_count),
+            "output_channel_multiplier": int(plan.output_ct_count),
+            "rotations": int(rotations),
+            "input_cross_rotations": 0,
+            "local_submatrix_rotations": int(rotations),
+            "output_materialize_rotations": 0,
+            "local_programs": int(plan.submatrix_program_count),
+            "recovery_programs": 0,
+            "rho_hat_per_program": int(max(plan.program_rotation_counts) if plan.program_rotation_counts else 0),
+            "unfused_rotations": int(rotations),
+            "same_input_fusion_savings": 0,
+            "ct_pt_mults": int(plan.submatrix_program_count),
+            "estimator": "native_halo_plan" if bool(exact_compact_output) else "native_halo_plan_fast",
+        },
+        "audit": {
+            "native_halo_rotation_estimator": (
+                "native_halo_conv2d_plan" if bool(exact_compact_output) else "native_halo_conv2d_plan_fast"
+            ),
+            "native_halo_rotation_mode": "c_only" if bool(individual) else "cb_shared",
+            "native_c_only_rotation_estimate": int(c_only_rotations),
+            "native_cb_shared_rotation_estimate": int(cb_shared_rotations),
+            "native_shared_baby_rotation_estimate": int(shared_baby_rotations),
+            "native_shared_giant_rotation_estimate": int(shared_giant_rotations),
+            "native_plan_c_only_rotation_estimate": int(plan.c_only_rotations),
+            "native_plan_cb_shared_rotation_estimate": int(plan.cb_shared_rotations),
+            "native_stripe_count_estimate": int(len(plan.stripes)),
+            "native_input_ct_count_estimate": int(plan.input_ct_count),
+            "native_output_ct_count_estimate": int(output_ct_count),
+            "native_submatrix_program_count_estimate": int(transform_count),
+            "native_sharing_group_count_estimate": int(plan.sharing_group_count),
+            "native_halo_channel_fold_mode": str(requested_fold_mode),
+            "native_halo_plan_channel_fold_mode": str(plan.channel_fold_mode),
+            "native_halo_output_storage_layout": "tight_compact",
+            "native_halo_rotation_exact_compact_output": bool(exact_compact_output),
+            "native_halo_rotation_search_surrogate": "",
+        },
+    }
+    _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = _copy_native_halo_stripe_rotation_stats(result)
+    return _copy_native_halo_stripe_rotation_stats(result)
+
+
+def _row_set_rotation_stats(
+    row: dict[str, Any],
+    *,
+    rotations: int,
+    transform_count: int,
+    estimator: str,
+    baby_rotations: int | None = None,
+    giant_rotations: int | None = None,
+    bsgs_groups: int | None = None,
+    local_programs: int | None = None,
+    ct_pt_mults: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    rotations = int(rotations)
+    transforms = max(0, int(transform_count))
+    baby = int(rotations if baby_rotations is None else baby_rotations)
+    giant = int(max(0, rotations - baby) if giant_rotations is None else giant_rotations)
+    groups = int(transforms if bsgs_groups is None else bsgs_groups)
+    programs = int(transforms if local_programs is None else local_programs)
+    row["lt_bsgs_rotation_estimate"] = int(rotations)
+    row["planner_rotation_cost_estimate"] = int(rotations)
+    row["lt_baby_rotation_estimate"] = int(baby)
+    row["lt_giant_rotation_estimate"] = int(giant)
+    row["lt_input_cross_rotation_estimate"] = 0
+    row["lt_local_submatrix_rotation_estimate"] = int(rotations)
+    row["lt_output_materialize_rotation_estimate"] = 0
+    row["lt_bsgs_group_count_estimate"] = int(groups)
+    row["lt_transform_count_estimate"] = int(transforms)
+    row["lt_local_program_count_estimate"] = int(programs)
+    row["lt_recovery_program_count_estimate"] = 0
+    row["lt_rho_hat_per_program_estimate"] = int(rotations if transforms <= 1 else max(0, int(rotations)))
+    row["lt_unfused_rotation_estimate"] = int(rotations)
+    row["lt_same_input_fusion_savings_estimate"] = 0
+    if ct_pt_mults is not None:
+        row["lt_ct_pt_mult_estimate"] = int(ct_pt_mults)
+    row["lt_estimator"] = str(estimator)
+    if extra:
+        row.update(dict(extra))
+
+
+def _cpp_diag_builder_strict_enabled() -> bool:
+    value = os.environ.get("ORION_CPP_DIAG_BUILDER_STRICT")
+    if value is None:
+        return False
+    return str(value).strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _exact_dense_diag_indices_by_block(edge: EdgeInfo) -> tuple[dict[tuple[int, int], tuple[int, ...]], int] | None:
+    module = edge.module
+    if module is None:
+        return None
+    module_scheme = getattr(module, "scheme", None)
+    if module_scheme is None or getattr(module_scheme, "params", None) is None:
+        return None
+    try:
+        from orion.core import packing
+    except Exception:
+        return None
+    last = False
+    if str(edge.op_kind) == "conv_transpose2d":
+        slots = int(module_scheme.params.get_slots())
+        embed_method = str(module_scheme.params.get_embedding_method())
+        # The C++ tconv index-only builder is optimized for payload metadata,
+        # but it still scans every matrix entry.  The DP only needs exact
+        # diag-index sets for BSGS stats, and the existing numpy counter path
+        # produces the same indices much faster on large U-Net tconvs.
+        indices = packing.estimate_direct_conv_transpose2d_diagonal_count(
+            module,
+            int(slots),
+            str(embed_method),
+            bool(last),
+            allow_hybrid=True,
+            return_indices=True,
+        )
+        output_rotations = packing._packed_output_rotations(
+            matrix_height=int(torch.Size(module.fhe_output_shape).numel()),
+            num_slots=int(slots),
+            embed_method=str(embed_method),
+            is_last_layer=bool(last),
+            allow_hybrid=True,
+        )
+    elif str(edge.op_kind) in {"conv2d", "avgpool2d"}:
+        diagonals, output_rotations = packing.pack_conv2d(module, last=last, allow_hybrid=True)
+        diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
+        indices = {
+            (int(row), int(col)): tuple(sorted(int(index) for index in dict(block or {}).keys()))
+            for (row, col), block in sorted(dict(diagonals).items())
+        }
+    else:
+        return None
+    return {
+        (int(row), int(col)): tuple(sorted(int(index) for index in values))
+        for (row, col), values in dict(indices).items()
+    }, int(output_rotations)
+
+
+def _dense_single_slot_rotation_stats(edge: EdgeInfo, *, include_identity: bool = False) -> dict[str, int] | None:
+    cache_key = (
+        str(edge.edge_id),
+        str(edge.op_kind),
+        tuple(int(value) for value in edge.shape),
+        tuple(int(value) for value in (edge.output_shape or ())),
+        tuple(int(value) for value in (edge.output_fhe_shape or ())),
+        tuple(int(value) for value in edge.kernel_size),
+        tuple(int(value) for value in edge.stride),
+        tuple(int(value) for value in edge.padding),
+        tuple(int(value) for value in edge.dilation),
+        int(edge.groups),
+        int(edge.slots),
+        bool(include_identity),
+    )
+    if cache_key in _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE:
+        cached = _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE[cache_key]
+        return None if cached is None else dict(cached)
+    packed = _exact_dense_diag_indices_by_block(edge)
+    if packed is None:
+        _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    indices_by_block, output_rotations = packed
+    bsgs_ratio = float(getattr(edge.module, "bsgs_ratio", 2.0) if edge.module is not None else 2.0)
+    if bool(include_identity):
+        transform_stats = _individual_bsgs_ratio_galois_rotation_stats(
+            tuple(indices for _block, indices in sorted(indices_by_block.items())),
+            slots=int(edge.slots),
+            bsgs_ratio=float(bsgs_ratio),
+        )
+    else:
+        transform_stats = _individual_unified_galois_rotation_stats(
+            tuple(indices for _block, indices in sorted(indices_by_block.items())),
+            slots=int(edge.slots),
+            include_identity=False,
+        )
+    rows = 0 if not indices_by_block else max(int(row) for row, _col in indices_by_block) + 1
+    output_rotation_evals = int(rows * int(output_rotations))
+    result = {
+        "rotations": int(transform_stats["rotations"] + output_rotation_evals),
+        "baby_rotations": int(transform_stats["baby_rotations"]),
+        "giant_rotations": int(transform_stats["giant_rotations"]),
+        "transforms": int(transform_stats["transforms"]),
+        "bsgs_groups": int(transform_stats["bsgs_groups"]),
+        "rows": int(rows),
+        "cols": 0 if not indices_by_block else max(int(col) for _row, col in indices_by_block) + 1,
+        "output_rotations": int(output_rotations),
+        "output_rotation_evals": int(output_rotation_evals),
+    }
+    _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE[cache_key] = dict(result)
+    return dict(result)
+
+
+def _pool_provider_single_slot_rotation_stats(edge: EdgeInfo) -> dict[str, int] | None:
+    packed = _exact_dense_diag_indices_by_block(edge)
+    if packed is None:
+        return None
+    indices_by_block, output_rotations = packed
+    if int(output_rotations) != 0:
+        return None
+    by_col: dict[int, list[tuple[int, ...]]] = {}
+    for (row, col), indices in sorted(indices_by_block.items()):
+        del row
+        by_col.setdefault(int(col), []).append(tuple(int(value) for value in indices))
+    total = 0
+    baby = 0
+    giant = 0
+    transforms = 0
+    groups = 0
+    for _col, diag_sets in sorted(by_col.items()):
+        for diag_set in diag_sets:
+            stats = _individual_unified_galois_rotation_stats(
+                (diag_set,),
+                slots=int(edge.slots),
+                include_identity=False,
+            )
+            total += int(stats["rotations"])
+            baby += int(stats["baby_rotations"])
+            giant += int(stats["giant_rotations"])
+            transforms += int(stats["transforms"])
+        groups += 1
+    return {
+        "rotations": int(total),
+        "baby_rotations": int(baby),
+        "giant_rotations": int(giant),
+        "transforms": int(transforms),
+        "bsgs_groups": int(groups),
+    }
+
+
+def _join_input_physical_layout(row: dict[str, Any]) -> dict[str, Any]:
+    selected = dict(row.get("selected_layout", {}) or {})
+    source_layout = dict(row.get("source_layout", {}) or selected)
+    if bool(row.get("relayout", False)):
+        return dict(selected)
+    source_physical = str(row.get("source_physical_layout", "") or row.get("physical_layout", "") or "")
+    if str(row.get("source", "")) == "x" or source_physical == PHYSICAL_COMPACT:
+        updated = dict(source_layout or selected)
+        updated["top_beta"] = 0
+        updated["bottom_beta"] = 0
+        updated["physical_top_beta"] = 0
+        updated["physical_bottom_beta"] = 0
+        if "core_slots" in updated:
+            updated["stored_slots"] = int(updated.get("core_slots", 0) or 0)
+        return updated
+    return dict(source_layout or selected)
+
+
+def _concat_fused_conv_rotation_stats(
+    edge: EdgeInfo,
+    row: dict[str, Any],
+    edge_rows: Sequence[dict[str, Any]],
+) -> dict[str, int] | None:
+    module = edge.module
+    specs = tuple(getattr(module, "concat_fusion_specs", ()) or ()) if module is not None else ()
+    if str(edge.op_kind) != "conv2d" or not specs:
+        return None
+    if str(row.get("source", "")) != str(specs[0].get("concat_node", "")):
+        return None
+    cache_key = (
+        str(edge.edge_id),
+        tuple(int(value) for value in edge.shape),
+        tuple(int(value) for value in (edge.output_shape or ())),
+        tuple(int(value) for value in (edge.output_fhe_shape or ())),
+        tuple(int(value) for value in edge.kernel_size),
+        tuple(int(value) for value in edge.stride),
+        tuple(int(value) for value in edge.padding),
+        tuple(int(value) for value in edge.dilation),
+        int(edge.groups),
+        int(edge.slots),
+        str(row.get("source", "")),
+        tuple(
+            (
+                str(spec.get("source", "")),
+                str(spec.get("concat_node", "")),
+                int(spec.get("channel_start", 0)),
+                int(spec.get("channel_end", 0)),
+                int(spec.get("channels", 0)),
+                tuple(int(value) for value in tuple(spec.get("shape", ()) or ())),
+                int(spec.get("gap", 1)),
+            )
+            for spec in specs
+        ),
+        tuple(
+            (
+                str(candidate.get("source", "")),
+                str(candidate.get("target", "")),
+                tuple(sorted((str(key), str(value)) for key, value in dict(candidate.get("selected_layout", {}) or {}).items())),
+                tuple(sorted((str(key), str(value)) for key, value in dict(candidate.get("source_layout", {}) or {}).items())),
+                str(candidate.get("source_physical_layout", "")),
+                str(candidate.get("target_physical_layout", "")),
+                str(candidate.get("physical_layout", "")),
+                bool(candidate.get("relayout", False)),
+            )
+            for candidate in edge_rows
+            if str(candidate.get("target", "")) == str(row.get("source", "")) and str(candidate.get("op_kind", "")) == "concat"
+        ),
+    )
+    if cache_key in _CONCAT_FUSED_ROTATION_STATS_CACHE:
+        cached = _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key]
+        return None if cached is None else dict(cached)
+    try:
+        from orion.experimental.cir.native_halo_conv2d import (
+            NativeHaloConv2DSpec,
+            _build_compact_source_concat_transforms_single_slot,
+            native_halo_conv2d_plan,
+        )
+    except Exception:
+        _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+
+    weight = getattr(module, "on_weight", None)
+    if weight is None:
+        _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    output_shape = tuple(int(value) for value in getattr(module, "output_shape", edge.output_shape or ()))
+    if len(output_shape) != 4:
+        _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = None
+        return None
+    module_output_layout = dict(getattr(module, "layout_policy_output_layout", {}) or {})
+    output_top_beta = int(module_output_layout.get("top_beta", module_output_layout.get("alpha", 0)) or 0)
+    output_bottom_beta = int(module_output_layout.get("bottom_beta", module_output_layout.get("beta", 0)) or 0)
+    output_materialization = str(getattr(module, "layout_policy_output_materialization", "") or "")
+    target_ct_count = max(
+        1,
+        _ceil_div(
+            int(torch.Size(getattr(module, "fhe_output_shape", edge.output_fhe_shape or edge.output_shape)).numel()),
+            int(edge.slots),
+        ),
+    )
+    join_rows = {
+        (str(candidate.get("source", "")), str(candidate.get("target", ""))): dict(candidate)
+        for candidate in edge_rows
+        if str(candidate.get("target", "")) == str(row.get("source", "")) and str(candidate.get("op_kind", "")) == "concat"
+    }
+    total = 0
+    baby = 0
+    giant = 0
+    transforms = 0
+    groups = 0
+    for input_index, spec in enumerate(specs):
+        start = int(spec["channel_start"])
+        end = int(spec["channel_end"])
+        branch_weight = weight[:, int(start):int(end), :, :].detach().to(dtype=torch.float32)
+        join_row = join_rows.get((str(spec.get("source", "")), str(spec.get("concat_node", ""))), {})
+        input_layout = _join_input_physical_layout(join_row) if join_row else dict(row.get("source_layout", {}) or {})
+        input_gap = max(1, int(dict(input_layout).get("gap", int(spec["gap"])) or int(spec["gap"])))
+        input_top_beta = int(dict(input_layout).get("top_beta", dict(input_layout).get("alpha", 0)) or 0)
+        input_bottom_beta = int(dict(input_layout).get("bottom_beta", dict(input_layout).get("beta", 0)) or 0)
+        source_fhe_shape = _fhe_shape_for_layout(
+            shape=tuple(int(value) for value in spec["shape"]),
+            layout=_layout_for_shape(
+                shape=tuple(int(value) for value in spec["shape"]),
+                gap=int(input_gap),
+                top_beta=int(input_top_beta),
+                bottom_beta=int(input_bottom_beta),
+                stride=1,
+                slots=int(edge.slots),
+                physical_top_beta=int(dict(input_layout).get("physical_top_beta", input_top_beta) or 0),
+                physical_bottom_beta=int(dict(input_layout).get("physical_bottom_beta", input_bottom_beta) or 0),
+                boundary_pruned=bool(dict(input_layout).get("boundary_pruned", False)),
+            ),
+        )
+        source_ct_count = max(1, _ceil_div(int(torch.Size(source_fhe_shape).numel()), int(edge.slots)))
+        native_spec = NativeHaloConv2DSpec(
+            family_label=f"layout_policy_concat_rotation_{edge.target}_{int(input_index)}",
+            c_in=int(spec["channels"]),
+            h_in=int(spec["shape"][2]),
+            w_in=int(spec["shape"][3]),
+            c_out=int(output_shape[1]),
+            h_out=int(output_shape[2]),
+            w_out=int(output_shape[3]),
+            gap_in=int(input_gap),
+            gap_out=int(_output_gap_for_edge(edge)),
+            kernel=int(edge.kernel_size[0]),
+            stride=int(edge.stride[0]),
+            pad=int(edge.padding[0]),
+            dilation=int(edge.dilation[0]),
+            groups=1,
+            slot_count=int(edge.slots),
+            input_top_beta=int(input_top_beta),
+            input_bottom_beta=int(input_bottom_beta),
+            output_top_beta=int(output_top_beta),
+            output_bottom_beta=int(output_bottom_beta),
+        )
+        try:
+            plan = native_halo_conv2d_plan(native_spec, require_native_target_fit=False)
+            scheme = getattr(module, "scheme", None)
+            if scheme is None:
+                scheme = _PackWorkerScheme(slots=int(edge.slots), embedding_method="hybrid")
+            if not callable(getattr(getattr(scheme, "lt_evaluator", None), "single_slot_layer_cache_enabled", None)):
+                scheme.lt_evaluator = type(
+                    "_PlannerSingleSlotEvaluator",
+                    (),
+                    {"single_slot_layer_cache_enabled": lambda self: True},
+                )()
+            built_by_source = _build_compact_source_concat_transforms_single_slot(
+                spec=native_spec,
+                plan=plan,
+                weight=branch_weight,
+                level=0,
+                scheme=scheme,
+                source_layout=dict(input_layout),
+                source_ct_count=int(source_ct_count),
+                target_ct_count=int(target_ct_count),
+                group_n1=1,
+                build_diagonals_by_block=None,
+                output_materialization=str(output_materialization),
+                index_only=True,
+            )
+        except Exception:
+            if _cpp_diag_builder_strict_enabled():
+                raise
+            _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = None
+            return None
+        for _source_block, ordered in sorted(dict(built_by_source).items()):
+            diag_sets: list[tuple[int, ...]] = []
+            for _target_index, transform_or_indices in sorted(list(ordered), key=lambda item: int(item[0])):
+                if isinstance(transform_or_indices, tuple):
+                    diag_set = tuple(int(index) for index in transform_or_indices)
+                else:
+                    transform = transform_or_indices
+                    diag_indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
+                    if diag_indices_by_block is not None:
+                        values: set[int] = set()
+                        for block_indices in dict(diag_indices_by_block).values():
+                            values.update(int(index) for index in block_indices)
+                        diag_set = tuple(sorted(values))
+                    else:
+                        diag_set = tuple(
+                            sorted(
+                                int(index)
+                                for index in dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {}).keys()
+                            )
+                        )
+                if diag_set:
+                    diag_sets.append(diag_set)
+            if not diag_sets:
+                continue
+            stats = _individual_unified_galois_rotation_stats(
+                tuple(diag_sets),
+                slots=int(edge.slots),
+                include_identity=False,
+            )
+            total += int(stats["rotations"])
+            baby += int(stats["baby_rotations"])
+            giant += int(stats["giant_rotations"])
+            transforms += int(stats["transforms"])
+            groups += 1
+    result = {
+        "rotations": int(total),
+        "baby_rotations": int(baby),
+        "giant_rotations": int(giant),
+        "transforms": int(transforms),
+        "bsgs_groups": int(groups),
+    }
+    _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = dict(result)
+    return dict(result)
 
 
 def _normalize_layout_estimator(estimator: str | None) -> str:
@@ -1715,7 +2574,7 @@ def _lt_ct_pt_mults(edge: EdgeInfo, layout: LayoutState) -> int:
 
 
 def _count_only_rotation_estimate(edge: EdgeInfo, layout: LayoutState) -> RotationEstimate:
-    if (str(edge.op_kind) in {"add", "concat", "input"}):
+    if str(edge.op_kind) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
         return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     if edge.output_shape is None or edge.output_fhe_shape is None:
         return RotationEstimate(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -2383,6 +3242,111 @@ def _finalize_policy(
     )
 
 
+def _dp_no_share_fold_runtime_rotation_row_adjustments(
+    *,
+    edge_rows: list[dict[str, Any]],
+    edge_by_id: dict[str, EdgeInfo],
+) -> None:
+    for row in edge_rows:
+        edge = edge_by_id.get(str(row.get("edge", "")))
+        if edge is None:
+            continue
+        concat_stats = _concat_fused_conv_rotation_stats(edge, row, edge_rows)
+        if concat_stats is not None:
+            _row_set_rotation_stats(
+                row,
+                rotations=int(concat_stats["rotations"]),
+                transform_count=int(concat_stats["transforms"]),
+                baby_rotations=int(concat_stats["baby_rotations"]),
+                giant_rotations=int(concat_stats["giant_rotations"]),
+                bsgs_groups=int(concat_stats["bsgs_groups"]),
+                estimator="concat_fused_module_unified_plan",
+                extra={
+                    "rotation_report_source": "compiled_backend_unified_transform_rotation_keys",
+                    "rotation_eval_count_mode": "independent_transform_bsgs",
+                    "concat_fusion_runtime_estimate": True,
+                    "native_halo_rotation_estimator": "concat_fused_module_unified_plan",
+                    "native_halo_rotation_exact_compact_output": True,
+                    "native_halo_rotation_search_surrogate": "",
+                },
+            )
+            continue
+        if str(row.get("op_kind", "")) == "conv2d" and (
+            str(row.get("layout_mode", "")) == "native_halo_stripe"
+            or str(row.get("source", "")) in {"x"}
+            or str(row.get("target", "")) == "output"
+        ):
+            layout_dict = dict(row.get("selected_layout", {}) or edge.compact.to_dict())
+            try:
+                layout = LayoutState(**layout_dict)
+            except TypeError:
+                layout = edge.compact
+            if str(row.get("source", "")) in {"x"} or str(row.get("target", "")) == "output":
+                layout = edge.compact
+            stats = _native_halo_stripe_rotation_stats(
+                edge,
+                layout,
+                provider_lt_grouping_mode="individual",
+                native_halo_channel_fold_mode="per_stripe",
+            )
+            if stats is not None:
+                lt_stats = dict(stats["lt_stats"])
+                runtime_boundary = bool(str(row.get("source", "")) in {"x"} or str(row.get("target", "")) == "output")
+                _row_set_rotation_stats(
+                    row,
+                    rotations=int(lt_stats["rotations"]),
+                    transform_count=int(lt_stats["transforms"]),
+                    baby_rotations=int(lt_stats["baby_rotations"]),
+                    giant_rotations=int(lt_stats["giant_rotations"]),
+                    bsgs_groups=int(lt_stats["bsgs_groups"]),
+                    local_programs=int(lt_stats["local_programs"]),
+                    ct_pt_mults=int(lt_stats["ct_pt_mults"]),
+                    estimator="native_halo_plan_runtime_boundary" if runtime_boundary else "native_halo_plan",
+                    extra={
+                        **dict(stats["audit"]),
+                        "native_halo_rotation_mode": "c_only",
+                        **({"native_halo_runtime_boundary_estimate": True} if runtime_boundary else {}),
+                    },
+                )
+            continue
+        if str(row.get("op_kind", "")) == "conv_transpose2d":
+            stats = _dense_single_slot_rotation_stats(edge, include_identity=False)
+            if stats is None:
+                continue
+            _row_set_rotation_stats(
+                row,
+                rotations=int(stats["rotations"]),
+                transform_count=int(stats["transforms"]),
+                baby_rotations=int(stats["baby_rotations"]),
+                giant_rotations=int(stats["giant_rotations"]),
+                bsgs_groups=int(stats["bsgs_groups"]),
+                estimator="dense_single_slot_bsgs_plan",
+                extra={
+                    "rotation_report_source": "planned_single_slot_dense_rotation_keys",
+                    "dense_single_slot_output_rotations_per_output_ct": int(stats["output_rotations"]),
+                    "dense_single_slot_output_rotation_eval_count": int(stats["output_rotation_evals"]),
+                },
+            )
+            continue
+        if str(row.get("op_kind", "")) == "avgpool2d":
+            stats = _pool_provider_single_slot_rotation_stats(edge)
+            if stats is None:
+                continue
+            _row_set_rotation_stats(
+                row,
+                rotations=int(stats["rotations"]),
+                transform_count=int(stats["transforms"]),
+                baby_rotations=int(stats["baby_rotations"]),
+                giant_rotations=int(stats["giant_rotations"]),
+                bsgs_groups=int(stats["bsgs_groups"]),
+                estimator="provider_pool_unified_snapshot_plan",
+                extra={
+                    "rotation_report_source": "runtime_io_unified_rotation_snapshot",
+                    "rotation_eval_count_mode": "independent_transform_bsgs",
+                },
+            )
+            continue
+
 def _align_add_inputs(dag: NetworkDAG, rows_by_edge: dict[str, dict[str, Any]], relayout_layouts: list[LayoutState], *, slots: int) -> None:
     for node in dag.topological_sort():
         module = dag.nodes[node].get("module")
@@ -2575,8 +3539,12 @@ def _no_halo_layout_from_semantic(
 
 def _base_non_dp_policy(policy: str) -> str:
     normalized = str(policy)
+    if normalized == "fixed_max_no_share":
+        return "fixed_max"
     if normalized == "fixed_max_fused":
         return "fixed_max"
+    if normalized == "always_no_share":
+        return "always"
     if normalized == "eager_fused":
         return "eager"
     if normalized == "greedy_fused":
@@ -2736,6 +3704,39 @@ def _non_dp_consumer_fused_row(
     )
 
 
+def _non_dp_no_share_native_row(
+    policy: str,
+    edge: EdgeInfo,
+    *,
+    source_layout: LayoutState,
+    source_physical: str,
+    target_layout: LayoutState,
+    relayout: bool,
+    relayout_reason: str,
+) -> dict[str, Any] | None:
+    if str(policy) not in {"fixed_max_no_share", "always_no_share"}:
+        return None
+    if not _conv_native_stripe_candidate_allowed(edge, target_layout):
+        return None
+    if str(edge.source) == "x":
+        return None
+    native_relayout = bool(relayout) or str(source_physical) != PHYSICAL_NATIVE_SOURCE_STRIPE
+    return _edge_row(
+        edge,
+        target_layout,
+        relayout=bool(native_relayout),
+        relayout_reason=str(relayout_reason or f"{policy}_native_source_stripe_relayout")
+        if bool(native_relayout)
+        else "",
+        layout_mode="native_halo_stripe",
+        source_layout=source_layout,
+        source_physical_layout=str(source_physical),
+        physical_layout=PHYSICAL_NATIVE_SOURCE_STRIPE,
+        provider_lt_grouping_mode="individual",
+        native_halo_channel_fold_mode="per_stripe",
+    )
+
+
 def _non_dp_producer_fused_output_preference(
     policy: str,
     module: Any | None,
@@ -2855,10 +3856,17 @@ def _plan_non_dp_topological(
                     str(source_physical),
                     target_layout,
                 )
-                if bool(relayout):
-                    relayout_layouts.append(target_layout)
-                incoming_rows.append(
-                    _edge_row(
+                row = (
+                    _non_dp_no_share_native_row(
+                        str(policy),
+                        edge,
+                        source_layout=physical_source_layout,
+                        source_physical=str(source_physical),
+                        target_layout=target_layout,
+                        relayout=bool(relayout),
+                        relayout_reason=f"{policy}_add_input_alignment" if bool(relayout) else "",
+                    )
+                    or _edge_row(
                         edge,
                         target_layout,
                         relayout=bool(relayout),
@@ -2869,6 +3877,9 @@ def _plan_non_dp_topological(
                         physical_layout=_compact_packing_for_layout(target_layout),
                     )
                 )
+                if bool(row.get("relayout", False)):
+                    relayout_layouts.append(target_layout)
+                incoming_rows.append(row)
         else:
             for edge in incoming:
                 source_layout = live[edge.source]
@@ -2895,8 +3906,25 @@ def _plan_non_dp_topological(
                     if bool(relayout) and bool(fuse_local_relayouts)
                     else None
                 )
-                if fused_row is not None:
-                    incoming_rows.append(fused_row)
+                native_row = (
+                    _non_dp_no_share_native_row(
+                        str(policy),
+                        edge,
+                        source_layout=source_layout,
+                        source_physical=str(source_physical),
+                        target_layout=target_layout,
+                        relayout=bool(relayout),
+                        relayout_reason=str(reason) if bool(relayout) else "",
+                    )
+                    if fused_row is None
+                    else None
+                )
+                if fused_row is not None or native_row is not None:
+                    row = fused_row if fused_row is not None else native_row
+                    assert row is not None
+                    if bool(row.get("relayout", False)):
+                        relayout_layouts.append(target_layout)
+                    incoming_rows.append(row)
                 else:
                     if bool(relayout):
                         relayout_layouts.append(target_layout)
@@ -3039,6 +4067,10 @@ def _plan_fixed_max_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: 
     return _plan_non_dp_topological(dag, edges, policy="fixed_max_fused", slots=int(slots))
 
 
+def _plan_fixed_max_no_share(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="fixed_max_no_share", slots=int(slots))
+
+
 def _plan_eager(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
     return _plan_non_dp_topological(dag, edges, policy="eager", slots=int(slots))
 
@@ -3061,6 +4093,10 @@ def _plan_always(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> P
 
 def _plan_always_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
     return _plan_non_dp_topological(dag, edges, policy="always_fused", slots=int(slots))
+
+
+def _plan_always_no_share(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="always_no_share", slots=int(slots))
 
 
 def _plan_orion_dense(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
@@ -3872,6 +4908,7 @@ def estimate_candidate_cost(
     candidate: ExecutionCandidate,
     *,
     estimator: str | None = None,
+    native_halo_exact_compact_output: bool = False,
 ) -> tuple[list[dict[str, Any]], list[LayoutState]]:
     """Turn an execution candidate into planner rows and relayout accounting."""
 
@@ -3899,6 +4936,9 @@ def estimate_candidate_cost(
         consumer_fused_relayout=bool(candidate.consumer_fused_relayout),
         consumer_fused_rotation_estimate=int(candidate.consumer_fused_rotation_estimate),
         planner_rotation_cost=planner_rotation_cost,
+        provider_lt_grouping_mode=str(candidate.provider_lt_grouping_mode),
+        native_halo_channel_fold_mode=str(candidate.native_halo_channel_fold_mode),
+        native_halo_exact_compact_output=bool(native_halo_exact_compact_output),
         estimator=estimator,
     )
     if candidate.provider_lt_grouping_mode:
@@ -4246,6 +5286,11 @@ def _plan_dp(
     )
     rows = [{**dict(row), "dp_state_planned": True} for row in best_state.edge_rows]
     rows.sort(key=lambda row: (topo_index.get(str(row["source"]), 10**9), topo_index.get(str(row["target"]), 10**9)))
+    if bool(no_share_fold):
+        _dp_no_share_fold_runtime_rotation_row_adjustments(
+            edge_rows=rows,
+            edge_by_id={str(edge.edge_id): edge for edge in edges},
+        )
     return _finalize_policy(
         policy="dp_no_share_fold" if bool(no_share_fold) else "dp",
         edge_rows=rows,
@@ -4303,6 +5348,8 @@ def plan_policy(
         return _plan_fixed_max(dag, edges, slots=int(slots))
     if normalized == "fixed_max_fused":
         return _plan_fixed_max_fused(dag, edges, slots=int(slots))
+    if normalized == "fixed_max_no_share":
+        return _plan_fixed_max_no_share(dag, edges, slots=int(slots))
     if normalized == "eager":
         return _plan_eager(dag, edges, slots=int(slots))
     if normalized == "eager_fused":
@@ -4315,6 +5362,8 @@ def plan_policy(
         return _plan_always(dag, edges, slots=int(slots))
     if normalized == "always_fused":
         return _plan_always_fused(dag, edges, slots=int(slots))
+    if normalized == "always_no_share":
+        return _plan_always_no_share(dag, edges, slots=int(slots))
     if normalized == "orion_dense":
         return _plan_orion_dense(dag, edges, slots=int(slots))
     if normalized == "dp":
@@ -4329,14 +5378,15 @@ def validate_layout_policy_compile_plan(compile_plan: dict[str, Any]) -> dict[st
 
     policy = str(compile_plan.get("policy", ""))
     errors: list[str] = []
-    if policy == "dp_no_share_fold":
+    no_share_native_policies = {"dp_no_share_fold", "fixed_max_no_share", "always_no_share"}
+    if policy in no_share_native_policies:
         for row in compile_plan.get("edge_layouts", []):
             edge = str(row.get("edge", ""))
             op_kind = str(row.get("op_kind", ""))
             selected = dict(row.get("selected_layout", {}) or {})
             physical = str(row.get("physical_layout", "") or "")
             target_physical = str(row.get("target_physical_layout", "") or physical)
-            if op_kind == "concat":
+            if policy == "dp_no_share_fold" and op_kind == "concat":
                 if (
                     int(selected.get("top_beta", 0) or 0) != 0
                     or int(selected.get("bottom_beta", 0) or 0) != 0
@@ -4457,7 +5507,10 @@ def build_planner_ablation(
     edges = build_edge_infos(dag, slots=int(slots))
     normalized_policies = normalize_policies(policies)
     plans = [plan_policy(dag, edges, policy, slots=int(slots)) for policy in normalized_policies]
-    fixed_objective = next((plan.objective for plan in plans if plan.policy == "fixed_max"), None)
+    fixed_objective = next(
+        (plan.objective for plan in plans if plan.policy in {"fixed_max", "fixed_max_no_share"}),
+        None,
+    )
     if fixed_objective is None:
         fixed_objective = plan_policy(dag, edges, "fixed_max", slots=int(slots)).objective
     with_speedups = []
@@ -4597,6 +5650,8 @@ def _provider_mode_for_policy(spec: NetworkSpec, policy: str) -> str:
     suffixes = {
         "fixed_max": "fixedmax",
         "fixed_max_fused": "fixedmax_fused",
+        "fixed_max_no_share": "fixedmax_no_share",
+        "always_no_share": "always_no_share",
         "orion_dense": "oriondense",
     }
     suffix = suffixes.get(str(normalized), str(normalized))

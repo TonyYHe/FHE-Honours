@@ -45,7 +45,8 @@ ROW_DIR_NAME = "rows"
 
 DEFAULT_HW = ("192x192", "224x224", "384x288", "384x384")
 DEFAULT_CHANNELS = (32, 64, 128, 256)
-DEFAULT_VARIANTS = ("orion", "provider_halo1_individual_lt", "provider_halo2_individual_lt")
+DEFAULT_VARIANTS = ("orion", "provider_halo1_no_share", "provider_halo1_individual_lt")
+DEFAULT_KERNEL_CASES = ("conv32", "conv64", "conv128", "conv256", "dec1b", "dec2b", "dec3b", "dec4b", "bottleneckb")
 DEFAULT_INPUT_LEVEL = 2
 CONV_KERNEL_DEPTH = 1
 CKKS_PROFILE_ID = "resnet_e2e_logn16_logscale40_h192"
@@ -56,16 +57,94 @@ VARIANT_CHOICES = (
     "orion",
     "provider_halo1",
     "provider_halo2",
+    "provider_halo1_no_share",
     "provider_halo1_individual_lt",
     "provider_halo2_individual_lt",
 )
 PROVIDER_OUTPUT_LAYOUTS = ("tight_compact", "native_stripe")
 VARIANT_LABELS = {
-    "orion": "Orion dense",
+    "orion": "dense",
     "provider_halo1": "provider beta=1 shared",
     "provider_halo2": "provider beta=2 shared",
-    "provider_halo1_individual_lt": "provider beta=1 no-share stripe",
+    "provider_halo1_no_share": "no-sharing",
+    "provider_halo1_individual_lt": "no-sharing stripe",
     "provider_halo2_individual_lt": "provider beta=2 no-share stripe",
+}
+
+
+@dataclass(frozen=True)
+class KernelCase:
+    case_id: str
+    label: str
+    channels: int
+    stage_gap: int
+    note: str = ""
+
+
+KERNEL_CASES: dict[str, KernelCase] = {
+    "conv32": KernelCase(
+        case_id="conv32",
+        label="Conv 32,32",
+        channels=32,
+        stage_gap=1,
+        note="existing stage-packed kernel",
+    ),
+    "conv64": KernelCase(
+        case_id="conv64",
+        label="Conv 64,64",
+        channels=64,
+        stage_gap=2,
+        note="existing stage-packed kernel",
+    ),
+    "conv128": KernelCase(
+        case_id="conv128",
+        label="Conv 128,128",
+        channels=128,
+        stage_gap=4,
+        note="existing stage-packed kernel",
+    ),
+    "conv256": KernelCase(
+        case_id="conv256",
+        label="Conv 256,256",
+        channels=256,
+        stage_gap=8,
+        note="existing stage-packed kernel",
+    ),
+    "dec1b": KernelCase(
+        case_id="dec1b",
+        label="dec1b Conv 32,32",
+        channels=32,
+        stage_gap=1,
+        note="U22 base_dim=32 decoder same-in/out conv",
+    ),
+    "dec2b": KernelCase(
+        case_id="dec2b",
+        label="dec2b Conv 64,64",
+        channels=64,
+        stage_gap=2,
+        note="U22 base_dim=32 decoder same-in/out conv",
+    ),
+    "dec3b": KernelCase(
+        case_id="dec3b",
+        label="dec3b Conv 128,128",
+        channels=128,
+        stage_gap=4,
+        note="U22 base_dim=32 decoder same-in/out conv",
+    ),
+    "dec4b": KernelCase(
+        case_id="dec4b",
+        label="dec4b Conv 256,256",
+        channels=256,
+        stage_gap=8,
+        note="U22 base_dim=32 decoder same-in/out conv",
+    ),
+    "bottleneckb": KernelCase(
+        case_id="bottleneckb",
+        label="bottleneckb Conv 512,512",
+        channels=512,
+        stage_gap=16,
+        note="U22 base_dim=32 bottleneck same-in/out conv",
+    ),
 }
 
 
@@ -76,6 +155,9 @@ class ConvKernelRow:
     width: int
     variant: str
     input_level: int = DEFAULT_INPUT_LEVEL
+    case_id: str = ""
+    stage_gap_override: int | None = None
+    kernel_label: str = ""
 
     @property
     def hw(self) -> str:
@@ -83,11 +165,16 @@ class ConvKernelRow:
 
     @property
     def stage_gap(self) -> int:
+        if self.stage_gap_override is not None:
+            return int(self.stage_gap_override)
         mapping = {32: 1, 64: 2, 128: 4, 256: 8}
         try:
             return int(mapping[int(self.channels)])
         except KeyError as exc:
-            raise ValueError(f"unsupported U-Net stage channel count: {self.channels}") from exc
+            raise ValueError(
+                f"unsupported U-Net stage channel count: {self.channels}; "
+                "pass an explicit --kernel-cases entry with a stage gap"
+            ) from exc
 
     @property
     def channel_group_size(self) -> int:
@@ -131,7 +218,7 @@ class ConvKernelRow:
 
     @property
     def halo(self) -> int | None:
-        if str(self.variant) in {"provider_halo1", "provider_halo1_individual_lt"}:
+        if str(self.variant) in {"provider_halo1", "provider_halo1_no_share", "provider_halo1_individual_lt"}:
             return 1
         if str(self.variant) in {"provider_halo2", "provider_halo2_individual_lt"}:
             return 2
@@ -139,6 +226,8 @@ class ConvKernelRow:
 
     @property
     def provider_lt_grouping_mode(self) -> str:
+        if str(self.variant) == "provider_halo1_no_share":
+            return "individual"
         return "individual" if str(self.variant).endswith("_individual_lt") else "shared"
 
     @property
@@ -153,11 +242,18 @@ class ConvKernelRow:
     def native_halo_channel_fold_mode(self) -> str:
         if self.path != "provider":
             return ""
+        if str(self.variant) == "provider_halo1_no_share":
+            return "heuristic"
         return "per_stripe" if str(self.variant).endswith("_individual_lt") else "heuristic"
 
     @property
     def row_id(self) -> str:
-        return f"conv{int(self.channels)}_{self.hw}_{self.variant}".replace("x", "x")
+        prefix = str(self.case_id or f"conv{int(self.channels)}")
+        return f"{prefix}_{self.hw}_{self.variant}".replace("x", "x")
+
+    @property
+    def kernel_name(self) -> str:
+        return str(self.kernel_label or f"Conv {int(self.channels)},{int(self.channels)}")
 
 
 @contextlib.contextmanager
@@ -405,10 +501,12 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "reused_from": str(source_label),
         "backend": str(result.get("backend", "lattigo")),
         "row_id": row.row_id,
+        "case_id": str(row.case_id or ""),
         "hw": row.hw,
         "logical_hw": row.logical_hw,
         "channels": int(row.channels),
         "conv": f"{int(row.channels)},{int(row.channels)}",
+        "kernel_label": row.kernel_name,
         "input_level": int(row.input_level),
         "expected_output_level": int(row.expected_output_level),
         "actual_output_level": result.get("actual_output_level"),
@@ -1145,10 +1243,12 @@ def _run_row(
             "created_at_utc": _now_utc(),
             "backend": str(backend),
             "row_id": row.row_id,
+            "case_id": str(row.case_id or ""),
             "hw": row.hw,
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "kernel_label": row.kernel_name,
             "input_level": int(row.input_level),
             "expected_output_level": int(row.expected_output_level),
             "actual_output_level": int(actual_output_level),
@@ -1315,16 +1415,38 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
 def _rows_from_args(args: argparse.Namespace) -> list[ConvKernelRow]:
     hw_values = [_parse_hw(str(value)) for value in args.hw]
     rows: list[ConvKernelRow] = []
-    for channels in [int(value) for value in args.channels]:
+    explicit_cases = [str(value) for value in getattr(args, "kernel_cases", []) or []]
+    if explicit_cases:
+        case_specs: list[KernelCase] = []
+        for case_id in explicit_cases:
+            if case_id not in KERNEL_CASES:
+                choices = ", ".join(sorted(KERNEL_CASES))
+                raise ValueError(f"unknown kernel case {case_id!r}; choose from: {choices}")
+            case_specs.append(KERNEL_CASES[str(case_id)])
+    else:
+        channel_stage_gaps = {32: 1, 64: 2, 128: 4, 256: 8}
+        case_specs = [
+            KernelCase(
+                case_id=f"conv{int(channels)}",
+                label=f"Conv {int(channels)},{int(channels)}",
+                channels=int(channels),
+                stage_gap=channel_stage_gaps[int(channels)],
+            )
+            for channels in [int(value) for value in args.channels]
+        ]
+    for case in case_specs:
         for height, width in hw_values:
             for variant in [str(value) for value in args.variants]:
                 rows.append(
                     ConvKernelRow(
-                        channels=int(channels),
+                        channels=int(case.channels),
                         height=int(height),
                         width=int(width),
                         variant=str(variant),
                         input_level=int(args.input_level),
+                        case_id=str(case.case_id),
+                        stage_gap_override=int(case.stage_gap),
+                        kernel_label=str(case.label),
                     )
                 )
     return rows
@@ -1390,7 +1512,7 @@ def _table_payload(
         table_rows.append(
             [
                 row.hw,
-                f"Conv {int(row.channels)},{int(row.channels)}",
+                row.kernel_name,
                 row.logical_chw,
                 str(int(row.stage_gap)),
                 str(int(row.channel_group_size)),
@@ -1573,10 +1695,12 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "status": "running",
             "created_at_utc": _now_utc(),
             "row_id": row.row_id,
+            "case_id": str(row.case_id or ""),
             "hw": row.hw,
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "kernel_label": row.kernel_name,
             "input_level": int(row.input_level),
             "expected_output_level": int(row.expected_output_level),
             "ckks_profile": CKKS_PROFILE_ID,
@@ -1633,10 +1757,12 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "status": "error",
             "finished_at_utc": _now_utc(),
             "row_id": row.row_id,
+            "case_id": str(row.case_id or ""),
             "hw": row.hw,
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "kernel_label": row.kernel_name,
             "input_level": int(row.input_level),
             "expected_output_level": int(row.expected_output_level),
             "ckks_profile": CKKS_PROFILE_ID,
@@ -1701,6 +1827,7 @@ def run_all(args: argparse.Namespace) -> int:
         "input_level": int(args.input_level),
         "expected_output_level": int(args.input_level) - int(CONV_KERNEL_DEPTH),
         "channels": [int(value) for value in args.channels],
+        "kernel_cases": [str(value) for value in getattr(args, "kernel_cases", []) or []],
         "hw": [str(value) for value in args.hw],
         "variants": [str(value) for value in args.variants],
         "repeats": int(args.repeats),
@@ -1714,8 +1841,12 @@ def run_all(args: argparse.Namespace) -> int:
             "runtime_parallelism": "GOMAXPROCS=1 during kernel evaluation; compile and diagonal encode worker pools may use host CPU count",
             "row_scheduling": "parent runner executes one worker process at a time; no concurrent LT rows",
             "orion": "dense Conv2d path with default resident Lattigo LT",
+            "variant_scope": "current AMD kernel table uses dense, beta=1 no-sharing, and beta=1 no-sharing stripe only; beta=2 is intentionally excluded",
             "provider_halo1": "legacy native halo provider beta=1 with shared rotation grouping and heuristic channel fold",
             "provider_halo2": "legacy native halo provider beta=2 with shared rotation grouping and heuristic channel fold",
+            "provider_halo1_no_share": (
+                "native halo provider beta=1; no shared rotations; heuristic native halo channel fold; BSGS preserved within each individual LT"
+            ),
             "provider_halo1_individual_lt": (
                 "native halo provider beta=1; no shared rotations; per-stripe native halo channel fold; BSGS preserved within each individual LT"
             ),
@@ -1727,6 +1858,11 @@ def run_all(args: argparse.Namespace) -> int:
                 "Conv 64,64": "logical 64x(Horig/2)x(Worig/2), multiplex/input_gap/output_gap=2, 4 channels/group, packed FHE 16xHorigxWorig",
                 "Conv 128,128": "logical 128x(Horig/4)x(Worig/4), multiplex/input_gap/output_gap=4, 16 channels/group, packed FHE 8xHorigxWorig",
                 "Conv 256,256": "logical 256x(Horig/8)x(Worig/8), multiplex/input_gap/output_gap=8, 64 channels/group, packed FHE 4xHorigxWorig",
+                "dec1b Conv 32,32": "logical 32xHorigxWorig, multiplex/input_gap/output_gap=1, packed FHE 32xHorigxWorig",
+                "dec2b Conv 64,64": "logical 64x(Horig/2)x(Worig/2), multiplex/input_gap/output_gap=2, 4 channels/group, packed FHE 16xHorigxWorig",
+                "dec3b Conv 128,128": "logical 128x(Horig/4)x(Worig/4), multiplex/input_gap/output_gap=4, 16 channels/group, packed FHE 8xHorigxWorig",
+                "dec4b Conv 256,256": "logical 256x(Horig/8)x(Worig/8), multiplex/input_gap/output_gap=8, 64 channels/group, packed FHE 4xHorigxWorig",
+                "bottleneckb Conv 512,512": "logical 512x(Horig/16)x(Worig/16), multiplex/input_gap/output_gap=16, 256 channels/group, packed FHE 2xHorigxWorig",
             },
         },
         "env": {key: str(env.get(key, "")) for key in sorted(_env_snapshot())},
@@ -1799,6 +1935,8 @@ def run_all(args: argparse.Namespace) -> int:
                 str(args.backend),
                 "--channels",
                 str(row.channels),
+                "--kernel-cases",
+                str(row.case_id or f"conv{int(row.channels)}"),
                 "--hw",
                 row.hw,
                 "--variants",
@@ -1910,10 +2048,12 @@ def run_one(args: argparse.Namespace) -> int:
             "created_at_utc": _now_utc(),
             "backend": str(args.backend),
             "row_id": row.row_id,
+            "case_id": str(row.case_id or ""),
             "hw": row.hw,
             "logical_hw": row.logical_hw,
             "channels": int(row.channels),
             "conv": f"{int(row.channels)},{int(row.channels)}",
+            "kernel_label": row.kernel_name,
             "input_level": int(row.input_level),
             "expected_output_level": int(row.expected_output_level),
             "ckks_profile": CKKS_PROFILE_ID,
@@ -1958,6 +2098,16 @@ def main() -> int:
     parser.add_argument("--doc", type=Path, default=DEFAULT_DOC)
     parser.add_argument("--backend", choices=("lattigo", "python"), default="lattigo")
     parser.add_argument("--channels", type=int, nargs="+", default=list(DEFAULT_CHANNELS))
+    parser.add_argument(
+        "--kernel-cases",
+        nargs="+",
+        choices=tuple(KERNEL_CASES),
+        default=list(DEFAULT_KERNEL_CASES),
+        help=(
+            "Explicit kernel cases to run. Overrides --channels and allows stage-packed U22 cases such as "
+            "dec1b/dec2b/dec3b/dec4b/bottleneckb."
+        ),
+    )
     parser.add_argument("--hw", nargs="+", default=list(DEFAULT_HW))
     parser.add_argument("--variants", nargs="+", choices=tuple(VARIANT_CHOICES), default=list(DEFAULT_VARIANTS))
     parser.add_argument("--repeats", type=int, default=1)
@@ -1996,8 +2146,11 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=Path("/tmp/conv_kernel_row.json"), help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    if any(str(variant).endswith("_individual_lt") for variant in args.variants) and str(args.provider_output_layout) != "native_stripe":
-        parser.error("provider *_individual_lt variants require --provider-output-layout native_stripe")
+    if any(
+        str(variant).endswith("_individual_lt") or str(variant) == "provider_halo1_no_share"
+        for variant in args.variants
+    ) and str(args.provider_output_layout) != "native_stripe":
+        parser.error("provider no-sharing variants require --provider-output-layout native_stripe")
     if int(args.input_level) < int(CONV_KERNEL_DEPTH):
         parser.error(f"--input-level must be at least {CONV_KERNEL_DEPTH} for a depth-{CONV_KERNEL_DEPTH} Conv kernel")
     if int(args.input_level) >= len(E2E_LOGQ):

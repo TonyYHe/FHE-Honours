@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -7,6 +8,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -100,14 +102,49 @@ struct OrionProviderCompactSourceSpec {
   int compact_target_block;
 };
 
+struct OrionProviderStripeSpec {
+  int stripe_index;
+  int target_h_start;
+  int target_h_end;
+  int target_h;
+  int target_tile;
+  int target_group_count;
+};
+
+struct OrionProviderCompactSourceConcatIndexSpec {
+  int slots;
+  int c_in;
+  int h_in;
+  int w_in;
+  int c_out;
+  int h_out;
+  int w_out;
+  int gap_out;
+  int kernel;
+  int stride;
+  int pad;
+  int dilation;
+  int source_top_beta;
+  int source_bottom_beta;
+  int source_gap;
+  int output_top_beta;
+  int output_bottom_beta;
+  int output_physical_top_beta;
+  int output_physical_bottom_beta;
+  int source_ct_count;
+  int target_ct_count;
+  int fuse_output_relayout;
+};
+
 }
 
 namespace {
 
 constexpr const char *kDenseConv2DBuilderKind = "cpp_dense_conv2d";
 constexpr const char *kDenseConvTranspose2DBuilderKind = "cpp_dense_conv_transpose2d";
+constexpr const char *kProviderConcatIndexBuilderKind = "cpp_provider_native_halo_conv2d:compact_source_concat_index_only";
 
-std::string g_last_error;
+thread_local std::string g_last_error;
 
 template <typename T>
 T *AllocArray(std::size_t count) {
@@ -244,6 +281,81 @@ int64_t MaterializedOutputSourceH(int64_t output_h, int h_out, int output_top_be
     value -= output_bottom_beta;
   }
   return std::min<int64_t>(std::max<int64_t>(value, 0), std::max(0, h_out - 1));
+}
+
+int64_t ChannelBaseOffsetChwGap(int channel, int height, int width, int gap) {
+  const int g = std::max(1, gap);
+  const int phases = g * g;
+  const int packed_w = width * g;
+  const int group_block = height * g * packed_w;
+  const int group = channel / phases;
+  const int phase = channel % phases;
+  const int phase_h = phase / g;
+  const int phase_w = phase % g;
+  return static_cast<int64_t>(group) * group_block + static_cast<int64_t>(phase_h) * packed_w + phase_w;
+}
+
+void AddDiagMask(
+    std::map<std::pair<int, int>, std::vector<unsigned char>> &masks,
+    int source_block,
+    int target_block,
+    int diag,
+    int slots) {
+  if (source_block < 0 || target_block < 0 || slots <= 0) {
+    return;
+  }
+  auto &mask = masks[std::make_pair(source_block, target_block)];
+  if (mask.empty()) {
+    mask.assign(static_cast<std::size_t>(slots), 0);
+  }
+  mask[static_cast<std::size_t>(diag)] = 1;
+}
+
+struct SpatialEvent {
+  int64_t source_spatial = 0;
+  int64_t target_spatial = 0;
+};
+
+struct ConcatIndexWorkItem {
+  int stripe_index = 0;
+  int target_group = 0;
+  int target_start = 0;
+  int target_end = 0;
+  int kh = 0;
+  int kw = 0;
+};
+
+int RequestedDiagBuilderWorkers() {
+  const char *raw = std::getenv("ORION_CPP_DIAG_BUILDER_PROVIDER_WORKERS");
+  if (raw == nullptr || raw[0] == '\0') {
+    raw = std::getenv("ORION_PROVIDER_DIAG_BUILD_WORKERS");
+  }
+  if (raw == nullptr || raw[0] == '\0') {
+    const unsigned int hw = std::thread::hardware_concurrency();
+    return std::max(1, static_cast<int>(hw == 0 ? 1 : hw));
+  }
+  try {
+    return std::max(1, std::stoi(std::string(raw)));
+  } catch (...) {
+    return 1;
+  }
+}
+
+void MergeDiagMasks(
+    std::map<std::pair<int, int>, std::vector<unsigned char>> &dst,
+    const std::map<std::pair<int, int>, std::vector<unsigned char>> &src,
+    int slots) {
+  for (const auto &item : src) {
+    auto &mask = dst[item.first];
+    if (mask.empty()) {
+      mask.assign(static_cast<std::size_t>(slots), 0);
+    }
+    const std::vector<unsigned char> &other = item.second;
+    const std::size_t count = std::min(mask.size(), other.size());
+    for (std::size_t i = 0; i < count; ++i) {
+      mask[i] = static_cast<unsigned char>(mask[i] | other[i]);
+    }
+  }
 }
 
 int PhysicalOutputH(const OrionProviderNativeSourceSpec &spec) {
@@ -1387,6 +1499,204 @@ OrionDiagPayloadBatch BuildProviderCompactSourcePayload(
   return out;
 }
 
+OrionDiagPayloadBatch BuildProviderCompactSourceConcatIndexOnly(
+    const OrionProviderCompactSourceConcatIndexSpec &spec,
+    const OrionProviderStripeSpec *stripes,
+    int stripe_count,
+    const float *weight,
+    int weight_len) {
+  const int64_t expected_weight = static_cast<int64_t>(spec.c_out) * spec.c_in * spec.kernel * spec.kernel;
+  if (expected_weight != weight_len) {
+    throw std::invalid_argument("provider compact-source concat index weight length does not match spec");
+  }
+  if (stripes == nullptr && stripe_count > 0) {
+    throw std::invalid_argument("provider compact-source concat index stripes are required");
+  }
+  if (spec.source_ct_count <= 0 || spec.target_ct_count <= 0 || spec.slots <= 0) {
+    return OrionDiagPayloadBatch{nullptr, 0, 0, kProviderConcatIndexBuilderKind, nullptr};
+  }
+
+  const int source_height = spec.h_in + std::max(0, spec.source_top_beta) + std::max(0, spec.source_bottom_beta);
+  const int compact_output_h = spec.h_out + std::max(0, spec.output_physical_top_beta) + std::max(0, spec.output_physical_bottom_beta);
+  const int source_gap = std::max(1, spec.source_gap);
+  const int target_gap = std::max(1, spec.gap_out);
+  const int source_packed_w = spec.w_in * source_gap;
+  const int target_packed_w = spec.w_out * target_gap;
+  std::vector<int64_t> source_channel_bases(static_cast<std::size_t>(spec.c_in), 0);
+  for (int channel = 0; channel < spec.c_in; ++channel) {
+    source_channel_bases[static_cast<std::size_t>(channel)] =
+        ChannelBaseOffsetChwGap(channel, source_height, spec.w_in, source_gap);
+  }
+  std::vector<int64_t> target_channel_bases(static_cast<std::size_t>(spec.c_out), 0);
+  for (int channel = 0; channel < spec.c_out; ++channel) {
+    target_channel_bases[static_cast<std::size_t>(channel)] =
+        ChannelBaseOffsetChwGap(channel, compact_output_h, spec.w_out, target_gap);
+  }
+
+  std::vector<ConcatIndexWorkItem> work_items;
+  for (int stripe_i = 0; stripe_i < stripe_count; ++stripe_i) {
+    const OrionProviderStripeSpec &stripe = stripes[stripe_i];
+    if (stripe.target_h_end <= stripe.target_h_start || stripe.target_tile <= 0 || stripe.target_group_count <= 0) {
+      continue;
+    }
+    for (int target_group = 0; target_group < stripe.target_group_count; ++target_group) {
+      const int target_start = target_group * stripe.target_tile;
+      const int target_end = std::min(spec.c_out, target_start + stripe.target_tile);
+      if (target_end <= target_start) {
+        continue;
+      }
+      for (int kh = 0; kh < spec.kernel; ++kh) {
+        for (int kw = 0; kw < spec.kernel; ++kw) {
+          work_items.push_back(ConcatIndexWorkItem{stripe_i, target_group, target_start, target_end, kh, kw});
+        }
+      }
+    }
+  }
+
+  std::map<std::pair<int, int>, std::vector<unsigned char>> masks;
+  if (work_items.empty()) {
+    return OrionDiagPayloadBatch{nullptr, 0, 0, kProviderConcatIndexBuilderKind, nullptr};
+  }
+
+  const int worker_count = std::max(1, std::min(static_cast<int>(work_items.size()), RequestedDiagBuilderWorkers()));
+  auto process_range = [&](int begin, int end) {
+    std::map<std::pair<int, int>, std::vector<unsigned char>> local_masks;
+    for (int work_index = begin; work_index < end; ++work_index) {
+      const ConcatIndexWorkItem &work = work_items[static_cast<std::size_t>(work_index)];
+      const OrionProviderStripeSpec &stripe = stripes[work.stripe_index];
+      const int target_start = work.target_start;
+      const int target_end = work.target_end;
+      const int kh = work.kh;
+      const int kw = work.kw;
+          std::vector<SpatialEvent> events;
+          events.reserve(static_cast<std::size_t>(std::max(0, stripe.target_h_end - stripe.target_h_start) * std::max(0, spec.w_out)));
+          for (int64_t out_h = stripe.target_h_start; out_h < stripe.target_h_end; ++out_h) {
+            const int64_t op_out_h = spec.fuse_output_relayout
+                ? MaterializedOutputSourceH(out_h, spec.h_out, spec.output_top_beta, spec.output_bottom_beta)
+                : out_h;
+            const int64_t in_h = op_out_h * spec.stride - spec.pad + static_cast<int64_t>(kh) * spec.dilation;
+            if (in_h < 0 || in_h >= spec.h_in) {
+              continue;
+            }
+            const int64_t source_h = static_cast<int64_t>(std::max(0, spec.source_top_beta)) + in_h;
+            const bool target_h_valid = out_h >= -std::max(0, spec.output_physical_top_beta) &&
+                out_h < spec.h_out + std::max(0, spec.output_physical_bottom_beta);
+            if (!target_h_valid) {
+              continue;
+            }
+            const int64_t target_h = out_h + std::max(0, spec.output_physical_top_beta);
+            if (target_h < 0 || target_h >= compact_output_h) {
+              continue;
+            }
+            for (int out_w = 0; out_w < spec.w_out; ++out_w) {
+              const int64_t in_w = static_cast<int64_t>(out_w) * spec.stride - spec.pad + static_cast<int64_t>(kw) * spec.dilation;
+              if (in_w < 0 || in_w >= spec.w_in) {
+                continue;
+              }
+              events.push_back(SpatialEvent{
+                  source_h * static_cast<int64_t>(source_gap) * source_packed_w + in_w * static_cast<int64_t>(source_gap),
+                  target_h * static_cast<int64_t>(target_gap) * target_packed_w + static_cast<int64_t>(out_w) * target_gap,
+              });
+            }
+          }
+          if (events.empty()) {
+            continue;
+          }
+          for (int source_channel = 0; source_channel < spec.c_in; ++source_channel) {
+            const int64_t source_channel_base = source_channel_bases[static_cast<std::size_t>(source_channel)];
+            for (int target_channel = target_start; target_channel < target_end; ++target_channel) {
+              const int64_t weight_index =
+                  (((static_cast<int64_t>(target_channel) * spec.c_in + source_channel) * spec.kernel + kh) * spec.kernel + kw);
+              if (weight[weight_index] == 0.0f) {
+                continue;
+              }
+              const int64_t target_channel_base = target_channel_bases[static_cast<std::size_t>(target_channel)];
+              for (const SpatialEvent &event : events) {
+                const int64_t source_index = source_channel_base + event.source_spatial;
+                const int source_block = static_cast<int>(source_index / spec.slots);
+                if (source_block < 0 || source_block >= spec.source_ct_count) {
+                  continue;
+                }
+                const int source_slot = static_cast<int>(source_index % spec.slots);
+                const int64_t target_index = target_channel_base + event.target_spatial;
+                const int target_block = static_cast<int>(target_index / spec.slots);
+                if (target_block < 0 || target_block >= spec.target_ct_count) {
+                  continue;
+                }
+                const int target_slot = static_cast<int>(target_index % spec.slots);
+                int diag = (source_slot - target_slot) % spec.slots;
+                if (diag < 0) {
+                  diag += spec.slots;
+                }
+                AddDiagMask(local_masks, source_block, target_block, diag, spec.slots);
+              }
+            }
+          }
+    }
+    return local_masks;
+  };
+
+  if (worker_count <= 1) {
+    masks = process_range(0, static_cast<int>(work_items.size()));
+  } else {
+    std::vector<std::map<std::pair<int, int>, std::vector<unsigned char>>> partials(static_cast<std::size_t>(worker_count));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(worker_count));
+    for (int worker = 0; worker < worker_count; ++worker) {
+      const int begin = static_cast<int>((static_cast<int64_t>(work_items.size()) * worker) / worker_count);
+      const int end = static_cast<int>((static_cast<int64_t>(work_items.size()) * (worker + 1)) / worker_count);
+      threads.emplace_back([&, worker, begin, end]() {
+        partials[static_cast<std::size_t>(worker)] = process_range(begin, end);
+      });
+    }
+    for (std::thread &thread : threads) {
+      thread.join();
+    }
+    for (const auto &partial : partials) {
+      MergeDiagMasks(masks, partial, spec.slots);
+    }
+  }
+
+
+  std::vector<std::pair<std::pair<int, int>, std::vector<int>>> payload_indices;
+  payload_indices.reserve(masks.size());
+  for (const auto &item : masks) {
+    std::vector<int> indices;
+    const std::vector<unsigned char> &mask = item.second;
+    for (int diag = 0; diag < static_cast<int>(mask.size()); ++diag) {
+      if (mask[static_cast<std::size_t>(diag)] != 0) {
+        indices.push_back(diag);
+      }
+    }
+    if (!indices.empty()) {
+      payload_indices.emplace_back(item.first, std::move(indices));
+    }
+  }
+
+  OrionDiagPayloadBatch out{nullptr, 0, 0, kProviderConcatIndexBuilderKind, nullptr};
+  if (payload_indices.empty()) {
+    return out;
+  }
+  out.payloads = AllocArray<OrionDiagPayload>(payload_indices.size());
+  out.len = static_cast<unsigned long>(payload_indices.size());
+  for (std::size_t i = 0; i < payload_indices.size(); ++i) {
+    const auto &entry = payload_indices[i];
+    const std::vector<int> &indices = entry.second;
+    OrionDiagPayload payload{};
+    payload.row = entry.first.second;
+    payload.col = entry.first.first;
+    payload.level = 0;
+    payload.task_id = nullptr;
+    payload.diag_indices = AllocArray<int>(indices.size());
+    payload.diag_indices_len = static_cast<unsigned long>(indices.size());
+    payload.diag_data = nullptr;
+    payload.diag_data_len = 0;
+    std::memcpy(payload.diag_indices, indices.data(), sizeof(int) * indices.size());
+    out.payloads[i] = payload;
+  }
+  return out;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1692,6 +2002,25 @@ OrionDiagPayloadBatch OrionBuildProviderCompactSourceConv2D(
     return ErrorBatch(exc.what());
   } catch (...) {
     return ErrorBatch("unknown C++ provider compact-source builder error");
+  }
+}
+
+OrionDiagPayloadBatch OrionBuildProviderCompactSourceConcatConv2DIndexOnly(
+    OrionProviderCompactSourceConcatIndexSpec spec,
+    const OrionProviderStripeSpec *stripes,
+    int stripe_count,
+    const float *weight,
+    int weight_len) {
+  try {
+    g_last_error.clear();
+    if (weight == nullptr) {
+      return ErrorBatch("null provider compact-source concat index weight", kProviderConcatIndexBuilderKind);
+    }
+    return BuildProviderCompactSourceConcatIndexOnly(spec, stripes, stripe_count, weight, weight_len);
+  } catch (const std::exception &exc) {
+    return ErrorBatch(exc.what(), kProviderConcatIndexBuilderKind);
+  } catch (...) {
+    return ErrorBatch("unknown C++ provider compact-source concat index builder error", kProviderConcatIndexBuilderKind);
   }
 }
 

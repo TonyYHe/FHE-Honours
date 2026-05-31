@@ -50,6 +50,9 @@ class _PackWorkerParams:
     def get_embedding_method(self) -> str:
         return str(self._embedding_method)
 
+    def get_io_mode(self) -> str:
+        return "none"
+
 
 class _PackWorkerScheme:
     def __init__(self, *, slots: int, embedding_method: str) -> None:
@@ -380,6 +383,14 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                 for multi_token_policy in (
                     "dp_no_share_fold",
                     "dp_noshare_fold",
+                    "fixed_max_no_share",
+                    "fixedmax_no_share",
+                    "fixed_max_noshare",
+                    "fixedmax_noshare",
+                    "always_no_share",
+                    "always_noshare",
+                    "always_relayout_no_share",
+                    "always_relayout_noshare",
                     "no_share_fold",
                     "noshare_fold",
                 ):
@@ -399,12 +410,20 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                     "fixedmax": "fixed_max",
                     "fixed_fused": "fixed_max_fused",
                     "fixedmax_fused": "fixed_max_fused",
+                    "fixed_max_no_share": "fixed_max_no_share",
+                    "fixedmax_no_share": "fixed_max_no_share",
+                    "fixed_max_noshare": "fixed_max_no_share",
+                    "fixedmax_noshare": "fixed_max_no_share",
                     "eager": "eager",
                     "eager_fused": "eager_fused",
                     "greedy": "greedy",
                     "greedy_fused": "greedy_fused",
                     "always": "always",
                     "always_fused": "always_fused",
+                    "always_no_share": "always_no_share",
+                    "always_noshare": "always_no_share",
+                    "always_relayout_no_share": "always_no_share",
+                    "always_relayout_noshare": "always_no_share",
                     "orion": "orion_dense",
                     "dense": "orion_dense",
                     "oriondense": "orion_dense",
@@ -422,7 +441,7 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                     u22_layout_policy = str(policy_aliases[raw_policy])
                     index += int(consumed)
                     continue
-            if token in {"fixedmax", "eager", "greedy", "always", "dp", "fused"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
+            if token in {"fixedmax", "noshare", "no", "share", "relayout", "eager", "greedy", "always", "dp", "fused"} and int(index) > 0 and tokens[int(index - 1)] == "layout":
                 index += 1
                 continue
             if not token.startswith("up"):

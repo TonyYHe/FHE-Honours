@@ -117,7 +117,15 @@ PROVIDER_MODES = {
     "greedy": "u22_256_base32_layout_greedy",
     "always": "u22_256_base32_layout_always",
     "always_fused": "u22_256_base32_layout_always_fused",
-    "fixed_max": "u22_256_base32_layout_fixedmax",
+    "always_no_share": "u22_256_base32_layout_always_no_share",
+    "always_noshare": "u22_256_base32_layout_always_no_share",
+    "always_relayout_no_share": "u22_256_base32_layout_always_no_share",
+    "always_relayout_noshare": "u22_256_base32_layout_always_no_share",
+    "fixed_max": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_max_no_share": "u22_256_base32_layout_fixedmax_no_share",
+    "fixedmax_no_share": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_noshare": "u22_256_base32_layout_fixedmax_no_share",
+    "fixedmax_noshare": "u22_256_base32_layout_fixedmax_no_share",
 }
 
 CPU_COUNT = max(1, int(os.cpu_count() or 1))

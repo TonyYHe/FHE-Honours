@@ -83,6 +83,44 @@ def test_clear_lattigo_backend_explicit_encode_encrypt_lt_direction() -> None:
         scheme.delete_scheme()
 
 
+def test_clear_lattigo_linear_transform_rotation_keys_follow_lattigo_bsgs() -> None:
+    scheme = _scheme()
+    try:
+        diag_idxs = [1, 2, 3, 4]
+        # LogN=4 standard CKKS has 8 slots and RLWE NthRoot=32. Lattigo's
+        # FindBestBSGSRatio(..., logRatio=int(log(2))) selects N1=2 here:
+        # rotations {0,1,2,4} -> Galois elements {1,5,25,17}.
+        expected_galois = [1, 5, 17, 25]
+
+        planned = list(scheme.backend.PlanLinearTransformRotationKeys(diag_idxs, 2, 2.0))
+        assert planned == expected_galois
+
+        flat_requests = list(scheme.backend.PlanLinearTransformRotationKeyRequests(diag_idxs, 2, 2.0))
+        assert [
+            (int(flat_requests[index]), int(flat_requests[index + 1]))
+            for index in range(0, len(flat_requests), 2)
+        ] == [(key, 2) for key in expected_galois]
+
+        transform_id = scheme.backend.GenerateLinearTransform(
+            diag_idxs,
+            [1.0] * (len(diag_idxs) * 8),
+            2,
+            2.0,
+            "none",
+        )
+        assert list(scheme.backend.GetLinearTransformRotationKeys(transform_id)) == expected_galois
+        assert scheme.backend.GetLinearTransformRotationEvalCount(transform_id) == 3
+
+        x = torch.arange(8, dtype=torch.float32)
+        ct = scheme.encrypt(scheme.encode(x, level=2, scale=1 << 30))
+        scheme.backend.ResetOperationCounters()
+        scheme.backend.EvaluateLinearTransform(transform_id, ct.ids[0])
+        counters = list(scheme.backend.GetOperationCounters())
+        assert counters[:2] == [3, 3]
+    finally:
+        scheme.delete_scheme()
+
+
 def test_clear_lattigo_unified_and_source_sum_apis() -> None:
     scheme = _scheme()
     try:

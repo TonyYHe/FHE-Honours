@@ -554,6 +554,9 @@ class PythonBackend:
         transform = self._linear_transforms[int(transform_id)]
         return [int(idx) for idx in transform.diag_indices]
 
+    def GetLinearTransformRotationEvalCount(self, transform_id):
+        return len([int(key) for key in self.GetLinearTransformRotationKeys(transform_id) if int(key) != 0])
+
     def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
         return [int(idx) for idx in np.asarray(diag_idxs, dtype=np.int32).reshape(-1)]
 

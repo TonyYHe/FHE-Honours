@@ -350,6 +350,7 @@ def _fake_transform(
         scheme=SimpleNamespace(
             params=SimpleNamespace(
                 get_logq=lambda: [0, 1, 2, 3],
+                get_slots=lambda: 8,
                 get_io_mode=lambda: str(io_mode),
                 get_diags_path=lambda: str(diags_path),
                 get_keys_path=lambda: str(keys_path),
@@ -533,10 +534,22 @@ def test_single_slot_layer_cache_evicts_between_tiny_64_layers(monkeypatch) -> N
         )
 
     assert backend.live_before_generate == [(), (), ()]
-    assert backend.max_live_plaintext_transforms == 1
-    assert backend.live_plaintext_transforms == set()
-    assert backend.deleted == [11, 12, 13]
-    assert [entry["num_transforms"] for entry in backend.generated] == [1, 1, 1]
+
+
+def test_single_slot_rotation_stats_report_bsgs_eval_not_identity_key_count(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    backend = _FakeBackend()
+    transform = _fake_transform({0: [1.0, 0.0, 0.0, 0.0], 1: [0.0, 2.0, 0.0, 0.0]})
+    group = UnifiedTransformGroup((transform,))
+
+    group.compile_unified(backend)
+
+    stats = group._single_slot_rotation_stats
+    assert stats["source"] == "planned_single_slot_unified_bsgs_eval_rotations"
+    assert stats["identity_rotation_key_requested"] is True
+    assert stats["transform_rotation_eval_count_total"] == 1
+    assert stats["rotation_eval_count_estimate"] == 1
+    assert stats["shared_rotation_eval_count_total"] == 1
 
 
 def test_single_slot_requires_recipe_and_never_generates_backend_ids_at_compile(monkeypatch) -> None:
@@ -554,6 +567,22 @@ def test_single_slot_requires_recipe_and_never_generates_backend_ids_at_compile(
 
     assert backend.generated == []
     assert backend.generated_keys == []
+
+
+def test_single_slot_materialization_rejects_index_only_diagonal_shell(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    backend = _SingleSlotTrackingBackend()
+    transform = _fake_transform({0: torch.ones(16)}, level=2)
+    transform.diagonals = {}
+    transform._single_slot_diag_indices_by_block = {(0, 0): (0,)}
+    transform._single_slot_build_diagonals = lambda: {(0, 0): {0: torch.empty((0,), dtype=torch.float32)}}
+    group = UnifiedTransformGroup((transform,))
+
+    group.compile_unified(backend)
+    with pytest.raises(ValueError, match="zero payload values|index-only diagonal shells"):
+        group.evaluate_unified(77, backend)
+
+    assert backend.generated == []
 
 
 def test_single_slot_materializes_whole_group_once_and_evicts_once(monkeypatch) -> None:

@@ -208,7 +208,16 @@ def test_u22_concat_skip_consumer_conv_has_concat_fusion_specs_in_provider_mode(
         scheme.delete_scheme()
 
 
-def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join() -> None:
+@pytest.mark.parametrize(
+    "bootstrap_fusion",
+    [
+        None,
+        {"scale": 0.5, "bias": 1.25},
+    ],
+)
+def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join(
+    bootstrap_fusion: dict[str, float] | None,
+) -> None:
     from orion.experimental.cir.native_halo_conv2d import _materialized_output_source_h
 
     def layout_beta(layout: dict, name: str) -> int:
@@ -279,6 +288,8 @@ def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join() -> None
 
         conv = dag.nodes["dec4a"]["module"]
         cat = dag.nodes[str(conv.concat_fusion_specs[0]["concat_node"])]["module"]
+        if bootstrap_fusion is not None:
+            conv._bootstrap_prescale_fusion = dict(bootstrap_fusion)
         conv.generate_diagonals(last=False)
         conv.compile()
         cat.he_mode = True
@@ -329,10 +340,15 @@ def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join() -> None
             width=int(conv.output_shape[3]),
             layout=output_layout,
         )
+        effective_weight = conv.on_weight.detach().to(dtype=torch.float32)
+        effective_bias = conv.on_bias.detach().to(dtype=torch.float32)
+        if bootstrap_fusion is not None:
+            effective_weight = effective_weight * float(bootstrap_fusion["scale"])
+            effective_bias = effective_bias * float(bootstrap_fusion["scale"]) + float(bootstrap_fusion["bias"])
         reference_core = F.conv2d(
             torch.cat(clear_parts, dim=1),
-            conv.on_weight.detach().to(dtype=torch.float32),
-            conv.on_bias.detach().to(dtype=torch.float32),
+            effective_weight,
+            effective_bias,
             stride=tuple(int(value) for value in conv.stride),
             padding=tuple(int(value) for value in conv.padding),
             dilation=tuple(int(value) for value in conv.dilation),
@@ -1157,6 +1173,73 @@ def test_provider_diag_builder_native_source_cpp_use_builds_payload_without_pyth
         assert metadata["diag_builder_source"] == "cpp"
         assert metadata["diag_builder_payload_count"] == 1.0
         assert transform.diagonals[(0, 0)]
+        assert getattr(transform, "_preflattened_diag_payload", None) is not None
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_parallel_native_source_keeps_individual_groups(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloStripeNoRIConvExecutor,
+        native_halo_conv2d_spec_from_module,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE", "1")
+    monkeypatch.setenv("ORION_PROVIDER_DIAG_BUILD_WORKERS", "2")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_SHADOW", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 4, kernel_size=3, padding=1, bias=False)
+        torch.manual_seed(42)
+        conv.weight.data = torch.randn_like(conv.weight.data) / 10.0
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 4, 8, 8))
+        conv.output_shape = torch.Size((1, 4, 8, 8))
+        conv.fhe_input_shape = torch.Size((1, 4, 8, 8))
+        conv.fhe_output_shape = torch.Size((1, 4, 8, 8))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "provider_diag_builder_parallel_native_source"
+        conv.layout_policy_input_layout = {"top_beta": 1, "bottom_beta": 1, "gap": 1}
+        conv.layout_policy_output_layout = {"top_beta": 1, "bottom_beta": 1, "gap": 1}
+        conv.layout_policy_output_materialization = "native_halo_stripe"
+        conv.layout_policy_provider_lt_grouping_mode = "individual"
+        conv.layout_policy_provider_disable_shared_rotation = True
+        conv.layout_policy_native_halo_channel_fold_mode = "per_stripe"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(1)
+
+        calls: list[int] = []
+
+        def _fake_compile_unified(self, _backend):
+            calls.append(int(len(self.transforms)))
+            self.unified_ids = [int(10_000 + len(calls))]
+            self.is_compiled = True
+
+        monkeypatch.setattr(native_halo_conv2d.UnifiedTransformGroup, "compile_unified", _fake_compile_unified)
+
+        spec = native_halo_conv2d_spec_from_module(conv, output_node_id="conv")
+        assert spec is not None
+        executor = NativeHaloStripeNoRIConvExecutor(module=conv, spec=spec, output_node_id="conv")
+        executor.assigned_level = level
+        executor.assigned_depth = 1
+        try:
+            executor.compile(scheme)
+            assert executor.compile_cache_metadata()["provider_lt_grouping_mode"] == "individual"
+            assert calls
+            assert all(count == 1 for count in calls)
+            assert int(executor.last_runtime_timing["built_transform_count"]) == int(len(executor.runtime_groups))
+            assert executor.last_runtime_timing["diag_builder_source"] == "cpp"
+            assert executor.last_runtime_timing["diag_builder_build_s"] > 0.0
+            assert executor.last_runtime_timing["diag_builder_payload_count"] == pytest.approx(
+                float(len(executor.runtime_groups))
+            )
+        finally:
+            executor.cleanup(getattr(scheme, "backend", None))
     finally:
         scheme.delete_scheme()
 
@@ -1279,6 +1362,67 @@ def test_provider_diag_builder_compact_output_cpp_use_builds_payload_without_pyt
             assert metadata["diag_builder_source"] == "cpp"
             assert metadata["diag_builder_fallback_reason"] == ""
             assert transform.diagonals[(0, 0)]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_single_slot_compact_output_cpp_rebuild_materializes_full_payload(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_conv_transforms_for_compact_output,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT", "1")
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_SHADOW", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="provider_single_slot_compact_output_cpp_rebuild",
+            c_in=2,
+            h_in=4,
+            w_in=4,
+            c_out=2,
+            h_out=4,
+            w_out=4,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=32,
+            input_top_beta=1,
+            input_bottom_beta=1,
+            output_top_beta=0,
+            output_bottom_beta=0,
+            output_physical_top_beta=0,
+            output_physical_bottom_beta=0,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        transforms = _build_conv_transforms_for_compact_output(
+            spec=spec,
+            plan=plan,
+            weight=torch.randn((2, 2, 3, 3), dtype=torch.float32),
+            stripe=plan.stripes[0],
+            source_group=0,
+            target_group=0,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            group_n1=1,
+        )
+
+        assert transforms
+        for _target_index, transform in transforms:
+            build_diagonals = getattr(transform, "_single_slot_build_diagonals", None)
+            assert callable(build_diagonals)
+            rebuilt = build_diagonals()
+            block = rebuilt[(0, 0)]
+            assert block
+            for diagonal in block.values():
+                assert int(diagonal.numel()) == int(spec.slot_count)
     finally:
         scheme.delete_scheme()
 
@@ -2480,6 +2624,142 @@ def test_compact_source_single_slot_concat_compile_skips_payload_coalesce(monkey
         )
         assert rebuilt is not None
         assert per_transform_metadata_indices == set(int(value) for value in rebuilt.diagonals[(0, 0)].keys())
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_concat_index_cpp_matches_python_sparse_halo(monkeypatch) -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_concat_transforms_single_slot,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE", "1")
+    _init_python_scheme(logn=6)
+    try:
+        torch.manual_seed(37)
+        spec = NativeHaloConv2DSpec(
+            family_label="concat_cpp_index_sparse_halo",
+            c_in=5,
+            h_in=9,
+            w_in=7,
+            c_out=5,
+            h_out=9,
+            w_out=7,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+            input_top_beta=1,
+            input_bottom_beta=2,
+            output_top_beta=1,
+            output_bottom_beta=1,
+            output_physical_top_beta=2,
+            output_physical_bottom_beta=1,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False, channel_fold_mode="per_stripe")
+        weight = torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32)
+        weight[0, :, :, :] = 0
+        weight[:, 1, :, :] = 0
+        weight[2, 3, 1, 1] = 0
+        source_layout = {"physical_top_beta": 1, "physical_bottom_beta": 2, "gap": 1}
+        cpp_result = _build_compact_source_concat_transforms_single_slot(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout=source_layout,
+            source_ct_count=5,
+            target_ct_count=5,
+            group_n1=1,
+            build_diagonals_by_block=None,
+            output_materialization="fused_relayout",
+            index_only=True,
+        )
+
+        monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+        python_result = _build_compact_source_concat_transforms_single_slot(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout=source_layout,
+            source_ct_count=5,
+            target_ct_count=5,
+            group_n1=1,
+            build_diagonals_by_block=None,
+            output_materialization="fused_relayout",
+            index_only=True,
+        )
+
+        assert cpp_result == python_result
+        assert cpp_result
+        assert all(tuple(indices) == tuple(sorted(indices)) for items in cpp_result.values() for _target, indices in items)
+    finally:
+        scheme.delete_scheme()
+
+
+def test_provider_diag_builder_concat_index_cpp_use_avoids_torch_unique(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        _build_compact_source_concat_transforms_single_slot,
+        native_halo_conv2d_plan,
+    )
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE", "1")
+    monkeypatch.delenv("ORION_CPP_DIAG_BUILDER_SHADOW", raising=False)
+    _init_python_scheme(logn=6)
+    try:
+        spec = NativeHaloConv2DSpec(
+            family_label="concat_cpp_index_use",
+            c_in=4,
+            h_in=8,
+            w_in=8,
+            c_out=4,
+            h_out=8,
+            w_out=8,
+            gap_in=1,
+            gap_out=1,
+            kernel=3,
+            stride=1,
+            pad=1,
+            slot_count=64,
+        )
+        plan = native_halo_conv2d_plan(spec, require_native_target_fit=False)
+        weight = torch.randn(spec.c_out, spec.c_in, spec.kernel, spec.kernel, dtype=torch.float32)
+
+        def _fail_unique(*_args, **_kwargs):
+            raise AssertionError("C++ concat index path should not call torch.unique")
+
+        monkeypatch.setattr(native_halo_conv2d.torch, "unique", _fail_unique)
+        built = _build_compact_source_concat_transforms_single_slot(
+            spec=spec,
+            plan=plan,
+            weight=weight,
+            level=len(scheme.params.get_logq()) - 1,
+            scheme=scheme,
+            source_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+            source_ct_count=4,
+            target_ct_count=4,
+            group_n1=1,
+            build_diagonals_by_block=None,
+            output_materialization="",
+            index_only=True,
+        )
+
+        assert built
     finally:
         scheme.delete_scheme()
 

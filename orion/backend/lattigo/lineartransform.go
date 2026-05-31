@@ -1681,6 +1681,32 @@ func GetLinearTransformRotationKeys(transformID C.int) (*C.int, C.ulong) {
 	return arrPtr, length
 }
 
+//export GetLinearTransformRotationEvalCount
+func GetLinearTransformRotationEvalCount(transformID C.int) C.int {
+	transform := RetrieveLinearTransform(int(transformID))
+	count := 0
+	if transform.N1 != 0 {
+		_, rotN1, rotN2 := commonlintrans.LinearTransformation(transform).BSGSIndex()
+		for _, rotation := range rotN1 {
+			if rotation != 0 {
+				count++
+			}
+		}
+		for _, rotation := range rotN2 {
+			if rotation != 0 {
+				count++
+			}
+		}
+		return C.int(count)
+	}
+	for diagIdx := range transform.Vec {
+		if diagIdx != 0 {
+			count++
+		}
+	}
+	return C.int(count)
+}
+
 //export PlanLinearTransformRotationKeys
 func PlanLinearTransformRotationKeys(
 	diagIdxsC *C.int, diagIdxsLen C.int,

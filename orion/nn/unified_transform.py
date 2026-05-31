@@ -33,6 +33,7 @@ from orion.backend.python.compile_policy import (
     auto_worker_count,
     batch_limit_for_payloads,
 )
+from orion.core.bsgs_rotation_stats import unified_bsgs_rotation_stats
 from orion.core.progress import write_progress_event
 
 
@@ -330,38 +331,56 @@ class UnifiedTransformGroup:
         return ()
 
     def _single_slot_rotation_stats_from_recipes(self, backend, recipes) -> dict[str, Any]:
+        params = self._scheme_params()
+        slots = int(params.get_slots()) if params is not None and hasattr(params, "get_slots") else 1
+        diag_sets = [tuple(int(value) for value in recipe[0]) for recipe in (recipes or ())]
+        stats = unified_bsgs_rotation_stats(diag_sets, slots=int(slots), individual_eval=True)
         per_transform: list[dict[str, Any]] = []
-        unique_keys: set[int] = set()
-        transform_rotation_total = 0
+        key_request_total = 0
+        per_stats = list(stats.get("per_transform", []) or [])
         for transform_index, recipe in enumerate(recipes or ()):
             planned = self._plan_single_slot_rotation_keys(backend, (recipe,))
-            nonzero_keys = sorted({int(key) for key, _level in planned if int(key) != 0})
-            unique_keys.update(nonzero_keys)
-            transform_rotation_total += int(len(nonzero_keys))
+            key_request_total += int(len(planned))
             transform = recipe[2] if len(recipe) >= 3 else None
+            transform_stats = dict(per_stats[transform_index]) if transform_index < len(per_stats) else {}
             per_transform.append(
                 {
                     "transform_index": int(transform_index),
                     "transform_id": None,
                     "name": str(getattr(transform, "name", "")),
-                    "rotation_key_count": int(len(nonzero_keys)),
+                    "rotation_eval_count": int(transform_stats.get("rotation_eval_count", 0) or 0),
+                    "baby_rotation_eval_count": int(transform_stats.get("baby_rotation_eval_count", 0) or 0),
+                    "giant_rotation_eval_count": int(transform_stats.get("giant_rotation_eval_count", 0) or 0),
+                    "rotation_key_request_count": int(len(planned)),
+                    "rotation_key_count": int(transform_stats.get("rotation_key_count", 0) or 0),
+                    "identity_rotation_key_requested": bool(
+                        any(int(key) == int(stats.get("identity_rotation_key", 1)) for key, _level in planned)
+                    ),
                 }
             )
         shared_keys = sorted(
             {
                 int(key)
                 for key, _level in getattr(self, "_required_keys", ())
-                if int(key) != 0
+                if int(key) != int(stats.get("identity_rotation_key", 1))
             }
         )
         return {
-            "source": "planned_single_slot_unified_rotation_keys",
+            "source": "planned_single_slot_unified_bsgs_eval_rotations",
             "transform_count": int(len(recipes or ())),
-            "transform_rotation_key_count_total": int(transform_rotation_total),
-            "shared_rotation_eval_count": int(len(shared_keys)),
-            "shared_rotation_eval_count_total": int(len(shared_keys)),
-            "unique_rotation_key_count": int(len(unique_keys)),
-            "unique_rotation_keys": sorted(int(key) for key in unique_keys),
+            "transform_rotation_eval_count_total": int(stats["transform_rotation_eval_count_total"]),
+            "transform_rotation_key_request_count_total": int(key_request_total),
+            "transform_rotation_key_count_total": int(stats["transform_rotation_eval_count_total"]),
+            "shared_rotation_eval_count": int(stats["shared_rotation_eval_count_total"]),
+            "shared_rotation_eval_count_total": int(stats["shared_rotation_eval_count_total"]),
+            "rotation_eval_count_estimate": int(stats["rotation_eval_count_estimate"]),
+            "rotation_eval_count_mode": "independent_transform_bsgs",
+            "unique_rotation_key_count": int(stats["unique_rotation_key_count"]),
+            "unique_rotation_keys": sorted(int(key) for key in stats["unique_rotation_keys"]),
+            "identity_rotation_key": int(stats["identity_rotation_key"]),
+            "identity_rotation_key_requested": bool(
+                any(int(key) == int(stats["identity_rotation_key"]) for key, _level in getattr(self, "_required_keys", ()))
+            ),
             "per_transform": per_transform,
         }
 
@@ -1010,6 +1029,10 @@ class UnifiedTransformGroup:
             return
         try:
             getattr(transform, "diagonals", {}).clear()
+        except Exception:
+            pass
+        try:
+            setattr(transform, "_preflattened_diag_payload", None)
         except Exception:
             pass
 
@@ -2463,6 +2486,30 @@ class UnifiedTransformGroup:
         has_complex: bool,
         require_recipe: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, int]:
+        preflattened = getattr(transform, "_preflattened_diag_payload", None)
+        if preflattened is not None and not bool(require_recipe):
+            diag_idxs, diag_data_flat, level = preflattened
+            diag_idxs = np.ascontiguousarray(np.asarray(diag_idxs, dtype=np.int32).reshape(-1), dtype=np.int32)
+            if bool(has_complex):
+                values = np.asarray(diag_data_flat)
+                if np.iscomplexobj(values):
+                    values = values.astype(np.complex64, copy=False).reshape(-1)
+                    interleaved = np.empty(int(values.size) * 2, dtype=np.float64)
+                    interleaved[0::2] = values.real.astype(np.float64, copy=False)
+                    interleaved[1::2] = values.imag.astype(np.float64, copy=False)
+                    diag_data = interleaved
+                else:
+                    real = np.asarray(values, dtype=np.float64).reshape(-1)
+                    interleaved = np.zeros(int(real.size) * 2, dtype=np.float64)
+                    interleaved[0::2] = real
+                    diag_data = interleaved
+            else:
+                diag_data = np.ascontiguousarray(
+                    np.asarray(diag_data_flat, dtype=np.float32).reshape(-1),
+                    dtype=np.float32,
+                )
+            return diag_idxs, diag_data, int(level)
+
         all_diagonals: dict[int, torch.Tensor] = {}
         build_diagonals = getattr(transform, "_single_slot_build_diagonals", None)
         if callable(build_diagonals):
@@ -2487,6 +2534,11 @@ class UnifiedTransformGroup:
         chunks: list[np.ndarray] = []
         for idx in diag_idxs:
             values = all_diagonals[int(idx)].reshape(-1)
+            if int(values.numel()) == 0:
+                raise ValueError(
+                    f"linear transform diagonal {int(idx)} has zero payload values; "
+                    "index-only diagonal shells must be materialized before backend generation"
+                )
             if has_complex:
                 if not bool(torch.is_complex(values)):
                     values = values.to(dtype=torch.complex64)

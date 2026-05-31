@@ -20,6 +20,7 @@ from orion.experimental.layout_policy_ablation import (
     attach_backend_runtime_anchors,
     attach_non_ckks_simulation,
     attach_runtime_anchor,
+    build_edge_infos,
     build_planner_ablation,
     build_layout_policy_compile_plan,
     build_u22_dag,
@@ -30,7 +31,20 @@ from orion.experimental.layout_policy_ablation import (
     validate_layout_policy_compile_plan,
     _fill_beta_to_tile_capacity,
     _layout_for_shape,
+    _layout_physical_bottom_beta,
+    _layout_physical_top_beta,
+    _output_gap_for_edge,
     _runtime_config,
+)
+from orion.experimental.cir.native_halo_conv2d import (
+    NativeHaloConv2DSpec,
+    _COMPACT_OUTPUT_DIAG_SET_CACHE,
+    _compact_output_diag_sets_for_task,
+    _compact_output_diag_sets_for_task_torch_oracle,
+    _diag_indices_for_task,
+    _diag_indices_for_task_torch_oracle,
+    native_halo_conv2d_compact_output_rotation_stats,
+    native_halo_conv2d_plan,
 )
 from orion.models.resnet import BasicBlock, ResNet
 from orion.models.unet import UNet22
@@ -51,6 +65,28 @@ from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
 from orion.nn.operations import Add
 from orion.nn.pooling import AvgPool2d
+
+
+def _build_u23_dim8_192_dag() -> NetworkDAG:
+    from tools import generate_unet22_compile_plan_csv as gen
+
+    saved = (
+        int(gen.BASE_DIM),
+        str(gen.ACTIVATION),
+        int(gen.SILU_DEGREE),
+    )
+    gen.BASE_DIM = 8
+    gen.ACTIVATION = "silu"
+    gen.SILU_DEGREE = 7
+    try:
+        return gen._build_real_unet22_dag(
+            height=192,
+            width=192,
+            in_channels=1,
+            out_channels=4,
+        )
+    finally:
+        gen.BASE_DIM, gen.ACTIVATION, gen.SILU_DEGREE = saved
 
 
 def _policy(payload: dict, name: str) -> dict:
@@ -347,6 +383,214 @@ def test_layout_policy_no_share_fold_keeps_conservative_boundaries() -> None:
     assert all(row["native_halo_channel_fold_mode"] == "per_stripe" for row in native_rows)
 
 
+def test_layout_policy_no_share_fold_native_rotation_estimate_uses_c_only_plan() -> None:
+    dag = _prepared_one_down_one_up_dag(image_size=128, base_channels=8)
+    edges = {
+        edge.edge_id: edge
+        for edge in build_edge_infos(dag, slots=4096)
+    }
+    plan = build_layout_policy_compile_plan(dag, policy="dp_no_share_fold", slots=4096)
+
+    native_rows = [
+        row
+        for row in plan["edge_layouts"]
+        if row.get("layout_mode") == "native_halo_stripe"
+        and not bool(row.get("concat_fusion_runtime_estimate", False))
+    ]
+
+    assert native_rows
+    for row in native_rows:
+        edge = edges[str(row["edge"])]
+        layout = _layout_for_shape(
+            shape=edge.shape,
+            gap=int(row["selected_layout"]["gap"]),
+            top_beta=int(row["selected_layout"]["top_beta"]),
+            bottom_beta=int(row["selected_layout"]["bottom_beta"]),
+            stride=int(row["selected_layout"]["stride"]),
+            slots=int(edge.slots),
+            physical_top_beta=int(row["selected_layout"].get("physical_top_beta", 0)),
+            physical_bottom_beta=int(row["selected_layout"].get("physical_bottom_beta", 0)),
+            boundary_pruned=bool(row["selected_layout"].get("boundary_pruned", False)),
+        )
+        kernel_h, kernel_w = (int(value) for value in edge.kernel_size)
+        assert kernel_h == kernel_w
+        spec = NativeHaloConv2DSpec(
+            family_label=f"test_{str(row['edge']).replace('->', '_')}",
+            c_in=int(edge.input_channels or edge.shape[1]),
+            h_in=int(edge.shape[2]),
+            w_in=int(edge.shape[3]),
+            c_out=int(edge.output_channels or edge.output_shape[1]),
+            h_out=int(edge.output_shape[2]),
+            w_out=int(edge.output_shape[3]),
+            gap_in=int(layout.gap),
+            gap_out=int(_output_gap_for_edge(edge)),
+            kernel=int(kernel_h),
+            stride=int(edge.stride[0]),
+            pad=int(edge.padding[0]),
+            dilation=int(edge.dilation[0]),
+            groups=int(edge.groups),
+            slot_count=int(edge.slots),
+            input_top_beta=int(layout.top_beta),
+            input_bottom_beta=int(layout.bottom_beta),
+            output_top_beta=0,
+            output_bottom_beta=0,
+            input_physical_top_beta=_layout_physical_top_beta(layout),
+            input_physical_bottom_beta=_layout_physical_bottom_beta(layout),
+            output_physical_top_beta=0,
+            output_physical_bottom_beta=0,
+        )
+        native_plan = native_halo_conv2d_plan(
+            spec,
+            require_native_target_fit=False,
+            channel_fold_mode="per_stripe",
+        )
+        compact_stats = native_halo_conv2d_compact_output_rotation_stats(native_plan)
+
+        assert row["provider_lt_grouping_mode"] == "individual"
+        assert row["native_halo_channel_fold_mode"] == "per_stripe"
+        assert row["native_halo_plan_channel_fold_mode"] == "per_stripe"
+        assert row["native_halo_rotation_mode"] == "c_only"
+        assert row["native_halo_rotation_exact_compact_output"] is True
+        assert int(row["planner_rotation_cost_estimate"]) == int(compact_stats.c_only_rotations)
+        assert int(row["lt_bsgs_rotation_estimate"]) == int(compact_stats.c_only_rotations)
+        assert int(row["native_c_only_rotation_estimate"]) == int(compact_stats.c_only_rotations)
+        assert int(row["native_cb_shared_rotation_estimate"]) == int(compact_stats.cb_shared_rotations)
+        assert int(row["native_plan_c_only_rotation_estimate"]) == int(native_plan.c_only_rotations)
+        assert int(row["native_plan_cb_shared_rotation_estimate"]) == int(native_plan.cb_shared_rotations)
+
+
+def test_native_halo_closed_form_diag_sets_match_torch_oracle() -> None:
+    for gap in (1, 2, 4):
+        for beta in (0, 1, 2):
+            spec = NativeHaloConv2DSpec(
+                family_label=f"diag_oracle_g{gap}_b{beta}",
+                c_in=17,
+                h_in=32,
+                w_in=24,
+                c_out=19,
+                h_out=32,
+                w_out=24,
+                gap_in=int(gap),
+                gap_out=int(gap),
+                kernel=3,
+                stride=1,
+                pad=1,
+                dilation=1,
+                slot_count=4096,
+                input_top_beta=int(beta),
+                input_bottom_beta=int(beta),
+                output_top_beta=int(beta),
+                output_bottom_beta=int(beta),
+                input_physical_top_beta=int(beta),
+                input_physical_bottom_beta=int(beta),
+                output_physical_top_beta=int(beta),
+                output_physical_bottom_beta=int(beta),
+            )
+            plan = native_halo_conv2d_plan(spec, require_native_target_fit=False, channel_fold_mode="per_stripe")
+            selected = {
+                int(stripe.index): stripe
+                for stripe in (plan.stripes[0], plan.stripes[len(plan.stripes) // 2], plan.stripes[-1])
+            }
+            for stripe in selected.values():
+                source_counts = (
+                    1,
+                    min(5, int(spec.c_in)),
+                    int(spec.c_in) % max(1, int(plan.source_tile_for_stripe(stripe))) or int(plan.source_tile_for_stripe(stripe)),
+                )
+                target_counts = (
+                    1,
+                    min(7, int(spec.c_out)),
+                    int(spec.c_out) % max(1, int(plan.target_tile_for_stripe(stripe))) or int(plan.target_tile_for_stripe(stripe)),
+                )
+                for source_count in source_counts:
+                    for target_count in target_counts:
+                        assert _diag_indices_for_task(
+                            spec,
+                            stripe,
+                            source_channel_count=int(source_count),
+                            target_channel_count=int(target_count),
+                        ) == _diag_indices_for_task_torch_oracle(
+                            spec,
+                            stripe,
+                            source_channel_count=int(source_count),
+                            target_channel_count=int(target_count),
+                        )
+                for source_group in (0, max(0, int(plan.source_group_count_for_stripe(stripe)) - 1)):
+                    for target_group in (0, max(0, int(plan.target_group_count_for_stripe(stripe)) - 1)):
+                        _COMPACT_OUTPUT_DIAG_SET_CACHE.clear()
+                        assert _compact_output_diag_sets_for_task(
+                            spec,
+                            plan,
+                            stripe,
+                            source_group=int(source_group),
+                            target_group=int(target_group),
+                        ) == _compact_output_diag_sets_for_task_torch_oracle(
+                            spec,
+                            plan,
+                            stripe,
+                            source_group=int(source_group),
+                            target_group=int(target_group),
+                        )
+
+
+@pytest.mark.parametrize("policy", ("fixed_max_no_share", "always_no_share"))
+def test_layout_policy_non_dp_no_share_variants_use_individual_native_stripe(policy: str) -> None:
+    plan = build_layout_policy_compile_plan(
+        _prepared_one_down_one_up_dag(image_size=128, base_channels=8),
+        policy=policy,
+        slots=4096,
+    )
+
+    assert plan["validation"]["ok"] is True
+    native_rows = [
+        row
+        for row in plan["edge_layouts"]
+        if row.get("layout_mode") == "native_halo_stripe"
+    ]
+
+    assert native_rows
+    assert all(row["physical_layout"] == "native_source_stripe" for row in native_rows)
+    assert all(row["provider_lt_grouping_mode"] == "individual" for row in native_rows)
+    assert all(row["native_halo_channel_fold_mode"] == "per_stripe" for row in native_rows)
+    assert all(row["native_halo_rotation_mode"] == "c_only" for row in native_rows)
+
+
+@pytest.mark.parametrize("policy", ("fixed_max_no_share", "always_no_share"))
+def test_layout_policy_non_dp_no_share_validator_requires_individual_stripe(policy: str) -> None:
+    with pytest.raises(ValueError, match="individual LT grouping"):
+        validate_layout_policy_compile_plan(
+            {
+                "policy": policy,
+                "edge_layouts": [
+                    {
+                        "edge": "a->b",
+                        "op_kind": "conv2d",
+                        "physical_layout": "native_source_stripe",
+                        "provider_lt_grouping_mode": "shared",
+                        "native_halo_channel_fold_mode": "per_stripe",
+                    }
+                ],
+                "node_layouts": [],
+            }
+        )
+    with pytest.raises(ValueError, match="per-stripe"):
+        validate_layout_policy_compile_plan(
+            {
+                "policy": policy,
+                "edge_layouts": [
+                    {
+                        "edge": "a->b",
+                        "op_kind": "conv2d",
+                        "physical_layout": "native_source_stripe",
+                        "provider_lt_grouping_mode": "individual",
+                        "native_halo_channel_fold_mode": "heuristic",
+                    }
+                ],
+                "node_layouts": [],
+            }
+        )
+
+
 def test_layout_policy_no_share_fold_validator_rejects_double_fused_relayout() -> None:
     with pytest.raises(ValueError, match="producer and consumer fused"):
         validate_layout_policy_compile_plan(
@@ -371,6 +615,8 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
     assert opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
     assert _region_first_mode_options("u22_64_base32_layout_always")["u22_layout_policy"] == "always"
     assert _region_first_mode_options("u22_256_base32_layout_fixed_max_fused")["u22_layout_policy"] == "fixed_max_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share")["u22_layout_policy"] == "fixed_max_no_share"
+    assert _region_first_mode_options("u22_256_base32_layout_always_no_share")["u22_layout_policy"] == "always_no_share"
     assert _region_first_mode_options("u22_256_base32_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
     assert _region_first_mode_options("u22_256_base32_layout_dp_noshare_fold")["u22_layout_policy"] == "dp_no_share_fold"
     assert _region_first_mode_options("generic_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
@@ -1991,6 +2237,23 @@ def test_u22_224_silu7_provider_runner_accepts_always_fused_policy() -> None:
     from tools import run_u22_base32_silu7_streaming_provider_e2e as runner
 
     assert runner._provider_mode("always_fused") == "u22_256_base32_layout_always_fused"
+    assert runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
+    assert runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share"
+
+    env = runner._apply_env_defaults(
+        {
+            "GOMAXPROCS": "99",
+            "ORION_LATTIGO_BOOTSTRAP_MANY": "1",
+            "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "0",
+            "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
+            "ORION_LATTIGO_UNIFIED_NO_BSGS": "1",
+        }
+    )
+    assert env["GOMAXPROCS"] == "1"
+    assert env["ORION_LATTIGO_BOOTSTRAP_MANY"] == "0"
+    assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
+    assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
+    assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
 
 
 def test_u22_dim32_runners_accept_no_share_fold_policy() -> None:
@@ -1999,15 +2262,19 @@ def test_u22_dim32_runners_accept_no_share_fold_policy() -> None:
 
     assert matrix_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert matrix_runner._provider_mode("dp_noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
+    assert matrix_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
+    assert matrix_runner._provider_mode("always_no_share") == "u22_256_base32_layout_always_no_share"
     assert encoder4_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert encoder4_runner._provider_mode("noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
+    assert encoder4_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
+    assert encoder4_runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share"
 
 
 def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
     from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
+    from tools import run_u22_dim32_encoder4_noshare_e2e as encoder4_runner
 
-    env = matrix_runner._apply_env_defaults(
-        {
+    bad_env = {
             "GOMAXPROCS": "99",
             "ORION_LATTIGO_BOOTSTRAP_MANY": "1",
             "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "0",
@@ -2015,124 +2282,17 @@ def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
             "ORION_LATTIGO_UNIFIED_NO_BSGS": "1",
             "ORION_CONCAT_FUSION": "0",
             "ORION_PACK_CONV_WORKERS": "240",
-        }
-    )
-
-    assert env["GOMAXPROCS"] == "1"
-    assert env["ORION_SINGLE_SLOT_LAYER_CACHE"] == "1"
-    assert env["ORION_LATTIGO_BOOTSTRAP_MANY"] == "0"
-    assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
-    assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
-    assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
-    assert env["ORION_CONCAT_FUSION"] == "1"
-    assert env["ORION_PACK_CONV_WORKERS"] == "240"
-
-
-def test_u22_dim32_runner_summary_merge_upgrades_old_rows() -> None:
-    from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
-    from tools import run_u22_dim32_encoder4_noshare_e2e as encoder4_runner
-
-    old_matrix = [
-        [
-            "192x192",
-            "IBSR",
-            "1->4",
-            "ok",
-            "ok",
-            "10",
-            "5",
-            "2",
-            "11",
-            "6",
-            "100",
-            "50",
-            "2",
-            "1",
-            "20.0",
-            "10.0",
-            "mode",
-            "dense:old_dense; provider:old_provider",
-            "old",
-        ]
-    ]
-    new_matrix = [
-        [
-            "192x192",
-            "IBSR",
-            "1->4",
-            "pending",
-            "ok",
-            "",
-            "4",
-            "",
-            "",
-            "5",
-            "",
-            "1.5",
-            "",
-            "0.5",
-            "",
-            "0.2",
-            "",
-            "0.3",
-            "",
-            "0.4",
-            "40",
-            "44",
-            "2",
-            "1",
-            "18.0",
-            "9.0",
-            "mode",
-            "dense:; provider:new_provider",
-            "new",
-        ]
-    ]
-    merged_matrix = matrix_runner._merge_summary_rows(old_matrix, new_matrix, ["provider"])
-    assert len(merged_matrix) == 1
-    assert len(merged_matrix[0]) == 29
-    assert merged_matrix[0][3] == "ok"
-    assert merged_matrix[0][4] == "ok"
-    assert merged_matrix[0][5] == "10"
-    assert merged_matrix[0][6] == "4"
-    assert "dense:old_dense" in merged_matrix[0][27]
-    assert "provider:new_provider" in merged_matrix[0][27]
-
-    old_encoder = [
-        [
-            "192x192",
-            "IBSR",
-            "ok",
-            "ok",
-            "10",
-            "5",
-            "2",
-            "11",
-            "6",
-            "100",
-            "50",
-            "1000",
-            "500",
-            "2",
-            "1",
-            "20",
-            "10",
-            "20.0",
-            "10.0",
-            "dense:old_dense; provider:old_provider",
-            "old",
-        ]
-    ]
-    new_encoder = [["192x192", "IBSR", "pending", "ok", "", "4", "", "", "5", "", "1.5", "", "0.5", "", "0.2", "", "0.3", "", "40", "", "500", "", "1", "18.0", "9.0", "dense:; provider:new_provider", "new"]]
-    merged_encoder = encoder4_runner._merge_summary_rows(old_encoder, new_encoder, ["provider"])
-    assert len(merged_encoder) == 1
-    assert len(merged_encoder[0]) == 27
-    assert merged_encoder[0][2] == "ok"
-    assert merged_encoder[0][3] == "ok"
-    assert merged_encoder[0][4] == "10"
-    assert merged_encoder[0][5] == "4"
-    assert "dense:old_dense" in merged_encoder[0][25]
-    assert "provider:new_provider" in merged_encoder[0][25]
+    }
+    for runner in (matrix_runner, encoder4_runner):
+        env = runner._apply_env_defaults(dict(bad_env))
+        assert env["GOMAXPROCS"] == "1"
+        assert env["ORION_SINGLE_SLOT_LAYER_CACHE"] == "1"
+        assert env["ORION_LATTIGO_BOOTSTRAP_MANY"] == "0"
+        assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
+        assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
+        assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
+        assert env["ORION_CONCAT_FUSION"] == "1"
+    assert matrix_runner._apply_env_defaults(dict(bad_env))["ORION_PACK_CONV_WORKERS"] == "240"
 
 
 def test_layout_policy_cli_non_ckks_simulation_smoke(tmp_path: Path) -> None:

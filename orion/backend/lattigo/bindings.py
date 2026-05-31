@@ -856,6 +856,14 @@ class LattigoLibrary:
             restype=ArrayResultInt
         )
 
+        get_rotation_eval_count = getattr(self.lib, "GetLinearTransformRotationEvalCount", None)
+        if get_rotation_eval_count is not None:
+            self.GetLinearTransformRotationEvalCount = LattigoFunction(
+                get_rotation_eval_count,
+                argtypes=[ctypes.c_int],
+                restype=ctypes.c_int,
+            )
+
         plan_rotation_keys = getattr(self.lib, "PlanLinearTransformRotationKeys", None)
         if plan_rotation_keys is not None:
             self.PlanLinearTransformRotationKeys = LattigoFunction(

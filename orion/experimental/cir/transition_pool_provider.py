@@ -69,6 +69,59 @@ def _release_single_slot_cache(transform: Any | None) -> None:
         release()
 
 
+def _unified_group_rotation_snapshot(groups: list[Any], *, individual_eval: bool) -> dict[str, Any]:
+    unique_keys: set[int] = set()
+    transform_rotation_total = 0
+    shared_rotation_total = 0
+    transform_count = 0
+    per_group: list[dict[str, Any]] = []
+    for group_index, group in enumerate(groups):
+        cached = getattr(group, "_single_slot_rotation_stats", None)
+        if isinstance(cached, dict):
+            cached_keys = {int(key) for key in cached.get("unique_rotation_keys", [])}
+            group_transform_total = int(
+                cached.get(
+                    "transform_rotation_eval_count_total",
+                    cached.get("transform_rotation_key_count_total", 0),
+                )
+                or 0
+            )
+            group_shared_total = int(
+                cached.get("shared_rotation_eval_count", cached.get("shared_rotation_eval_count_total", 0)) or 0
+            )
+            group_transform_count = int(cached.get("transform_count", 0) or 0)
+        else:
+            cached_keys = set()
+            group_transform_total = 0
+            group_shared_total = 0
+            group_transform_count = int(len(getattr(group, "unified_ids", ()) or ()))
+        unique_keys.update(cached_keys)
+        transform_rotation_total += int(group_transform_total)
+        shared_rotation_total += int(group_shared_total)
+        transform_count += int(group_transform_count)
+        per_group.append(
+            {
+                "group_index": int(group_index),
+                "transform_count": int(group_transform_count),
+                "rotation_key_count_total": int(group_transform_total),
+                "shared_rotation_eval_count": int(group_shared_total),
+                "unique_rotation_key_count": int(len(cached_keys)),
+            }
+        )
+    return {
+        "source": "runtime_io_unified_rotation_snapshot",
+        "runtime_group_count": int(len(groups)),
+        "runtime_transform_count": int(transform_count),
+        "transform_rotation_key_count_total": int(transform_rotation_total),
+        "shared_rotation_eval_count_total": int(shared_rotation_total),
+        "unique_rotation_key_count": int(len(unique_keys)),
+        "rotation_eval_count_estimate": int(transform_rotation_total if bool(individual_eval) else shared_rotation_total),
+        "rotation_eval_count_mode": "independent_transform_bsgs" if bool(individual_eval) else "shared_group_bsgs",
+        "unique_rotation_keys": sorted(int(key) for key in unique_keys),
+        "runtime_rotation_groups": per_group,
+    }
+
+
 def _runtime_primary_diagonals(transform: Any | None) -> dict[int, Any]:
     if transform is None:
         return {}
@@ -374,6 +427,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             "input_pack_s": 0.0,
             "real_extract_s": 0.0,
         }
+        self.last_runtime_io: dict[str, Any] = {}
         self._compile_cache_metadata: dict[str, Any] = {}
         self._save_resume_precreated_groups_by_pair: dict[
             int,
@@ -833,6 +887,28 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
             ct.ids = []
         _delete_ciphertext_ids(scheme, owned_temp_ids)
         self.last_runtime_timing["postprocess_s"] = float(time.perf_counter() - postprocess_started)
+        individual_eval = str(__import__("os").environ.get("ORION_UNIFIED_LT_INDIVIDUAL_EVAL", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        rotation_snapshot = _unified_group_rotation_snapshot(
+            list(self.groups_by_pair),
+            individual_eval=bool(individual_eval),
+        )
+        self.last_runtime_io = {
+            "runtime_lowering": "input_pair_conv_shared_rotations",
+            "provider_executor": type(self).__name__,
+            "use_ct_pt_hybrid_packing": bool(self.use_ct_pt_hybrid_packing),
+            "runtime_input_ct_count": int(self.cols),
+            "runtime_output_ct_count": int(self.rows),
+            "output_rotations": int(self.output_rotations),
+            "hybrid_pair_count": int(self.hybrid_pair_count),
+            "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
+            "hybrid_pair_layout_strategy": str(self.hybrid_pair_layout_strategy),
+            **rotation_snapshot,
+        }
         return {self.output_node_id: CipherTensor(scheme, output_ids, self.output_shape, self.fhe_output_shape)}
 
     def cleanup(self, backend: Any) -> None:

@@ -31,16 +31,28 @@ SIZES: dict[str, tuple[int, int, int, int]] = {
 }
 
 POLICY_PROVIDER_SUFFIX: dict[str, str] = {
-    "fixed_max": "fixedmax",
+    "fixed_max": "fixedmax_no_share",
+    "fixed_max_no_share": "fixedmax_no_share",
+    "fixedmax_no_share": "fixedmax_no_share",
+    "fixed_noshare": "fixedmax_no_share",
+    "fixedmax_noshare": "fixedmax_no_share",
     "always": "always",
+    "always_no_share": "always_no_share",
+    "always_noshare": "always_no_share",
+    "always_relayout_no_share": "always_no_share",
+    "always_relayout_noshare": "always_no_share",
     "always_fused": "always_fused",
     "greedy": "greedy",
     "dp": "dp",
+    "dp_no_share_fold": "dp_no_share_fold",
+    "dp_noshare_fold": "dp_no_share_fold",
+    "noshare_fold": "dp_no_share_fold",
 }
 
 ENV_DEFAULTS: dict[str, str] = {
     "PYTHONUNBUFFERED": "1",
     "MALLOC_ARENA_MAX": "2",
+    "GOMAXPROCS": "1",
     "ORION_COMPILE_PARALLEL_POLICY": "manual",
     "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
     "ORION_SINGLE_SLOT_ENCODE_WORKERS": "16",
@@ -48,13 +60,24 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_UNIFIED_STREAM_COMPILE_IO_NONE": "0",
     "ORION_LATTIGO_MEMORY_BOUNDED_COMPILE": "0",
     "ORION_LATTIGO_MEMORY_BOUNDED_EVAL": "0",
-    "ORION_LATTIGO_BOOTSTRAP_MANY": "1",
+    "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
-    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
+    "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
+    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
+    "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
+}
+
+REQUIRED_MAINLINE_ENV: dict[str, str] = {
+    "GOMAXPROCS": "1",
+    "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
+    "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
+    "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
+    "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
+    "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
 }
 
 
@@ -106,6 +129,8 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated = dict(env)
     for key, value in ENV_DEFAULTS.items():
         updated.setdefault(key, value)
+    for key, value in REQUIRED_MAINLINE_ENV.items():
+        updated[key] = value
     return updated
 
 

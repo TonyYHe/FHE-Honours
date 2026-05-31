@@ -16,6 +16,7 @@ from .io_prefetch import (
 from .memory_lifecycle import guard_host_memory, host_memory_info
 from .compile_policy import auto_batch_limit, auto_worker_count
 from orion.backend.python.tensors import CipherTensor
+from orion.core.bsgs_rotation_stats import individual_bsgs_ratio_rotation_stats
 from orion.core.progress import write_progress_event
 
 
@@ -706,9 +707,8 @@ class NewEvaluator:
         self._add_profile("diag_generate_s", time.perf_counter() - plan_started)
 
         key_requests: dict[int, int | None] = {}
-        per_transform: list[dict[str, int]] = []
-        transform_rotation_total = 0
-        unique_keys: set[int] = set()
+        diag_sets: list[tuple[int, ...]] = []
+        block_keys_by_block: dict[tuple[int, int], tuple[int, ...]] = {}
         for _block, diag_idxs in sorted(diag_indices_by_block.items()):
             row, col = (int(value) for value in _block)
             block_keys: set[int] = set()
@@ -719,20 +719,13 @@ class NewEvaluator:
             ):
                 if int(key) != 0:
                     block_keys.add(int(key))
-                    unique_keys.add(int(key))
                 if key_level is None:
                     key_requests[int(key)] = None
                 else:
                     current = key_requests.get(int(key))
                     key_requests[int(key)] = int(key_level) if current is None else max(int(current), int(key_level))
-            transform_rotation_total += int(len(block_keys))
-            per_transform.append(
-                {
-                    "row": int(row),
-                    "col": int(col),
-                    "rotation_key_count": int(len(block_keys)),
-                }
-            )
+            block_keys_by_block[(int(row), int(col))] = tuple(sorted(int(key) for key in block_keys))
+            diag_sets.append(tuple(int(value) for value in diag_idxs))
         self.generate_rotation_key_requests(tuple(sorted((int(key), key_level) for key, key_level in key_requests.items())))
 
         rows = 0
@@ -742,17 +735,47 @@ class NewEvaluator:
             cols = max(int(col) for _row, col in diag_indices_by_block) + 1
         output_rotations = int(getattr(linear_layer, "output_rotations", 0) or 0)
         output_rotation_evals = int(rows * output_rotations)
+        transform_stats = individual_bsgs_ratio_rotation_stats(
+            diag_sets,
+            slots=int(getattr(self.params, "get_slots", lambda: 0)() or 0),
+            bsgs_ratio=float(bsgs_ratio),
+        )
+        per_transform: list[dict[str, int | bool]] = []
+        stats_by_order = list(transform_stats.get("per_transform", []) or [])
+        for transform_index, ((row, col), _diag_idxs) in enumerate(sorted(diag_indices_by_block.items())):
+            stats = dict(stats_by_order[transform_index]) if transform_index < len(stats_by_order) else {}
+            key_count = int(stats.get("rotation_key_count", len(block_keys_by_block.get((int(row), int(col)), ()))) or 0)
+            per_transform.append(
+                {
+                    "row": int(row),
+                    "col": int(col),
+                    "rotation_eval_count": int(stats.get("rotation_eval_count", 0) or 0),
+                    "baby_rotation_eval_count": int(stats.get("baby_rotation_eval_count", 0) or 0),
+                    "giant_rotation_eval_count": int(stats.get("giant_rotation_eval_count", 0) or 0),
+                    "rotation_key_request_count": int(stats.get("rotation_key_request_count", key_count) or 0),
+                    "rotation_key_count": int(key_count),
+                    "identity_rotation_key_requested": bool(stats.get("identity_rotation_key_requested", False)),
+                }
+            )
+        transform_rotation_total = int(transform_stats["transform_rotation_eval_count_total"])
         linear_layer._dense_layer_cache_rotation_stats = {
-            "source": "planned_single_slot_dense_rotation_keys",
+            "source": "planned_single_slot_dense_bsgs_eval_rotations",
             "transform_count": int(len(diag_indices_by_block)),
             "rows": int(rows),
             "cols": int(cols),
+            "transform_rotation_eval_count_total": int(transform_rotation_total),
+            "transform_rotation_key_request_count_total": int(transform_stats["transform_rotation_key_request_count_total"]),
             "transform_rotation_key_count_total": int(transform_rotation_total),
-            "unique_rotation_key_count": int(len(unique_keys)),
+            "unique_rotation_key_count": int(transform_stats["unique_rotation_key_count"]),
             "output_rotations_per_output_ct": int(output_rotations),
             "output_rotation_eval_count": int(output_rotation_evals),
             "rotation_eval_count_estimate": int(transform_rotation_total + output_rotation_evals),
-            "unique_rotation_keys": sorted(int(key) for key in unique_keys),
+            "unique_rotation_keys": sorted(int(key) for key in transform_stats["unique_rotation_keys"]),
+            "identity_rotation_key": int(transform_stats["identity_rotation_key"]),
+            "identity_rotation_key_requested": bool(
+                any(int(key) == int(transform_stats["identity_rotation_key"]) for key in key_requests)
+            ),
+            "rotation_eval_count_mode": "independent_transform_bsgs",
             "per_transform": per_transform,
         }
         linear_layer._dense_layer_cache_deferred = True

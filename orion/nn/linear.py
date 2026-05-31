@@ -12,6 +12,34 @@ from .module import Module, timer
 from ..core import packing
 
 
+class _temporary_attrs:
+    def __init__(self, target, **attrs) -> None:
+        self.target = target
+        self.attrs = dict(attrs)
+        self.old_values = {}
+        self.missing = set()
+
+    def __enter__(self):
+        for name, value in self.attrs.items():
+            if hasattr(self.target, str(name)):
+                self.old_values[str(name)] = getattr(self.target, str(name))
+            else:
+                self.missing.add(str(name))
+            setattr(self.target, str(name), value)
+        return self.target
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        for name in self.attrs:
+            name = str(name)
+            if name in self.missing:
+                try:
+                    delattr(self.target, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(self.target, name, self.old_values[name])
+
+
 class LinearTransform(Module):
     def __init__(self, bsgs_ratio, level) -> None:
         super().__init__()
@@ -530,6 +558,25 @@ class Conv2d(LinearTransform):
         )
         return packing.construct_conv2d_bias(bias_proxy)
 
+    def _concat_bootstrap_prescale_fusion_spec(self) -> dict[str, float] | None:
+        fusion = getattr(self, "_bootstrap_prescale_fusion", None)
+        if not fusion:
+            return None
+        return {
+            "scale": float(dict(fusion).get("scale", 1.0)),
+            "bias": float(dict(fusion).get("bias", 0.0)),
+        }
+
+    def _concat_effective_weight_and_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self.on_weight.detach().clone()
+        bias = self.on_bias.detach().clone()
+        fusion = self._concat_bootstrap_prescale_fusion_spec()
+        if fusion is not None:
+            scale = float(fusion["scale"])
+            weight = weight * float(scale)
+            bias = bias * float(scale) + float(fusion["bias"])
+        return weight, bias
+
     def _concat_source_fhe_shape(self, spec: dict, layout: dict) -> torch.Size:
         if not layout:
             return torch.Size(spec["fhe_shape"])
@@ -659,7 +706,9 @@ class Conv2d(LinearTransform):
         self._concat_diagonals_by_input = []
         self._concat_output_rotations = 0
 
-        bias = self._concat_construct_bias(output_attrs)
+        effective_weight, effective_bias = self._concat_effective_weight_and_bias()
+        with _temporary_attrs(self, on_bias=effective_bias):
+            bias = self._concat_construct_bias(output_attrs)
         self._concat_store_compile_bias(bias)
         evaluator = getattr(self.scheme, "lt_evaluator", None)
         single_slot_layer_cache = (
@@ -670,7 +719,7 @@ class Conv2d(LinearTransform):
         for input_index, concat_spec in enumerate(self._concat_fusion_specs()):
             channel_start = int(concat_spec["channel_start"])
             channel_end = int(concat_spec["channel_end"])
-            branch_weight = self.on_weight[:, channel_start:channel_end, :, :].detach().clone()
+            branch_weight = effective_weight[:, channel_start:channel_end, :, :].detach().clone()
             input_layout = self._concat_source_input_layout(concat_spec)
             input_gap = max(1, int(dict(input_layout).get("gap", int(concat_spec["gap"])) or int(concat_spec["gap"])))
             input_top_beta = int(_layout_top_beta(input_layout))
@@ -833,7 +882,8 @@ class Conv2d(LinearTransform):
         for input_index, spec in enumerate(self._concat_fusion_specs()):
             start = int(spec["channel_start"])
             end = int(spec["channel_end"])
-            weight = self.on_weight[:, start:end, :, :].detach().clone()
+            effective_weight, _effective_bias = self._concat_effective_weight_and_bias()
+            weight = effective_weight[:, start:end, :, :].detach().clone()
             proxy = self._concat_source_proxy(
                 spec,
                 weight=weight,
@@ -862,7 +912,9 @@ class Conv2d(LinearTransform):
             diagonals_by_input = list(getattr(self, "_concat_diagonals_by_input", []) or [])
         output_attrs = self._concat_output_layout_attrs()
         self._concat_fusion_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
-        bias = self._concat_construct_bias(output_attrs)
+        _effective_weight, effective_bias = self._concat_effective_weight_and_bias()
+        with _temporary_attrs(self, on_bias=effective_bias):
+            bias = self._concat_construct_bias(output_attrs)
         self._concat_store_compile_bias(bias)
         self._concat_transform_ids_by_input = []
         self._concat_transform_sources_by_input = []

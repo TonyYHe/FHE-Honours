@@ -20,6 +20,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from orion.core.orion import scheme
 from orion.core import packing
+from orion.core.bsgs_rotation_stats import (
+    identity_galois_element,
+    unified_bsgs_rotation_stats,
+)
 from orion.backend.python.tensors import CipherTensor
 from orion.backend.python.compile_policy import auto_worker_count, policy_audit
 from orion.models.resnet import ResNet18, ResNet20, ResNet32, ResNet34, ResNet50
@@ -1302,6 +1306,17 @@ def _timed(payload: dict[str, Any], out_path: Path, step: str, fn: Callable[[], 
     return value
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(str(name))
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return float(value) if math.isfinite(float(value)) else float(default)
+
+
 def _saved_io_prewarm_mode() -> str:
     return str(os.environ.get("ORION_SAVED_IO_PREWARM_MODE", "") or "").strip().lower()
 
@@ -1767,6 +1782,147 @@ def _layer_mae_adjust_clear_outputs_after_compile(
     return outputs, applied, diagnostics
 
 
+def _install_layer_mae_polynomial_clear_capture(
+    net: torch.nn.Module,
+    names: set[str],
+) -> tuple[dict[str, torch.Tensor], Callable[[], None]]:
+    outputs: dict[str, torch.Tensor] = {}
+    handles: list[Any] = []
+
+    def make_hook(module_name: str):
+        @_dynamo_disable
+        def hook(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            if isinstance(output, torch.Tensor):
+                outputs[str(module_name)] = _layer_mae_tensor(output)
+
+        return hook
+
+    for name, module in net.named_modules():
+        if str(name) in names:
+            handles.append(module.register_forward_hook(make_hook(str(name))))
+
+    def remove() -> None:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+
+    return outputs, remove
+
+
+def _chebyshev_eval_tensor(value: torch.Tensor, coeffs: Any) -> torch.Tensor:
+    coeff_list = [float(coeff) for coeff in (coeffs or [])]
+    x = _layer_mae_tensor(value)
+    if not coeff_list:
+        return torch.zeros_like(x)
+    t0 = torch.ones_like(x)
+    result = t0 * float(coeff_list[0])
+    if len(coeff_list) == 1:
+        return result
+    t1 = x
+    result = result + t1 * float(coeff_list[1])
+    for coeff in coeff_list[2:]:
+        tk = 2.0 * x * t1 - t0
+        result = result + tk * float(coeff)
+        t0, t1 = t1, tk
+    return result
+
+
+def _activation_polynomial_reference(module: torch.nn.Module, value: torch.Tensor) -> torch.Tensor | None:
+    if isinstance(module, Chebyshev):
+        x = _layer_mae_tensor(value)
+        if not bool(getattr(module, "fused", False)):
+            prescale = float(getattr(module, "prescale", 1.0))
+            constant = float(getattr(module, "constant", 0.0))
+            if prescale != 1.0:
+                x = x * float(prescale)
+            if constant != 0.0:
+                x = x + float(constant)
+        return _chebyshev_eval_tensor(x, getattr(module, "coeffs", None))
+    return None
+
+
+def _collect_layer_mae_polynomial_clear_outputs(
+    net: torch.nn.Module,
+    x0: torch.Tensor,
+    names: set[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "source": "post_compile_clear_forward_with_fitted_polynomials",
+        "status": "started",
+        "target_count": int(len(names)),
+        "error": "",
+    }
+    outputs, remove = _install_layer_mae_polynomial_clear_capture(net, names)
+    old_he_modes: list[tuple[Module, bool]] = []
+    old_linear_params: list[tuple[LinearTransform, torch.Tensor, torch.Tensor | None]] = []
+    old_chebyshev_forwards: list[tuple[Chebyshev, Any]] = []
+    skipped_linear_substitutions: list[str] = []
+    try:
+        for module_name, module in net.named_modules():
+            if isinstance(module, Module):
+                old_he_modes.append((module, bool(getattr(module, "he_mode", False))))
+                module.he_mode = False
+            if isinstance(module, LinearTransform) and hasattr(module, "on_weight"):
+                on_weight = _layer_mae_tensor(getattr(module, "on_weight"))
+                if tuple(on_weight.shape) != tuple(module.weight.data.shape):
+                    skipped_linear_substitutions.append(str(module_name))
+                    continue
+                old_weight = module.weight.data.detach().clone()
+                old_bias = (
+                    module.bias.data.detach().clone()
+                    if hasattr(module, "bias") and module.bias is not None
+                    else None
+                )
+                module.weight.data.copy_(on_weight.to(module.weight.device))
+                if hasattr(module, "bias") and module.bias is not None and getattr(module, "on_bias", None) is not None:
+                    on_bias = _layer_mae_tensor(getattr(module, "on_bias"))
+                    if tuple(on_bias.shape) == tuple(module.bias.data.shape):
+                        module.bias.data.copy_(on_bias.to(module.bias.device))
+                old_linear_params.append((module, old_weight, old_bias))
+            if isinstance(module, Chebyshev):
+                old_chebyshev_forwards.append((module, module.forward))
+
+                def _poly_forward(self, x):
+                    reference = _activation_polynomial_reference(self, x)
+                    if reference is None:
+                        return x
+                    return reference.to(device=x.device, dtype=x.dtype)
+
+                module.forward = _poly_forward.__get__(module, type(module))
+        with torch.no_grad():
+            net(x0)
+    except Exception as exc:
+        diagnostics["status"] = "failed"
+        diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        diagnostics["traceback"] = traceback.format_exc(limit=20)
+    finally:
+        remove()
+        for module, old_he_mode in old_he_modes:
+            module.he_mode = bool(old_he_mode)
+        for module, old_forward in old_chebyshev_forwards:
+            module.forward = old_forward
+        for module, old_weight, old_bias in old_linear_params:
+            module.weight.data.copy_(old_weight.to(module.weight.device))
+            if old_bias is not None and hasattr(module, "bias") and module.bias is not None:
+                module.bias.data.copy_(old_bias.to(module.bias.device))
+
+    updated = dict(outputs)
+    diagnostics["captured_count"] = int(len(outputs))
+    diagnostics["linear_parameter_substitution_count"] = int(len(old_linear_params))
+    diagnostics["skipped_linear_parameter_substitutions"] = sorted(skipped_linear_substitutions)
+    diagnostics["polynomial_reference_count"] = int(len(old_chebyshev_forwards))
+    diagnostics["polynomial_reference_modules"] = sorted(
+        str(name)
+        for name, module in _layer_mae_module_by_name(net).items()
+        if isinstance(module, Chebyshev)
+    )
+    if str(diagnostics.get("status")) == "started":
+        diagnostics["status"] = "ok"
+    return updated, diagnostics
+
+
 def _install_layer_mae_he_capture(
     net: torch.nn.Module,
     *,
@@ -1872,6 +2028,14 @@ def _install_layer_mae_he_capture(
                 reference_transform = dict(reference_transforms.get(str(module_name), {}) or {})
                 if reference_transform:
                     row["reference_transform"] = reference_transform
+                    consumer = str(reference_transform.get("consumer", ""))
+                    row["status"] = "skipped"
+                    row["skip_reason"] = "producer_fused_reference_covered_by_consumer"
+                    if consumer in clear_outputs:
+                        row["reference"] = _layer_mae_tensor_summary(clear_outputs[str(consumer)])
+                    row["decode_s"] = float(time.perf_counter() - started)
+                    append_row(row)
+                    return
                 if reference is None:
                     if reference_transform and str(reference_transform.get("consumer", "")) in clear_outputs:
                         consumer = str(reference_transform.get("consumer", ""))
@@ -1891,6 +2055,9 @@ def _install_layer_mae_he_capture(
                     if not bool(metrics.get("shape_match", False)):
                         row["status"] = "shape_mismatch"
                         row["skip_reason"] = "shape_mismatch"
+                    elif not bool(metrics.get("numel_match", False)):
+                        row["status"] = "shape_mismatch"
+                        row["skip_reason"] = "numel_mismatch"
                     else:
                         row["status"] = "ok"
             except BaseException as exc:
@@ -1932,7 +2099,12 @@ def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] |
         if str(row.get("skip_reason", "")) not in allowed_skip_reasons
     ]
     observed = {str(row.get("module_path", "")) for row in rows if str(row.get("module_path", ""))}
-    missing_he_modules = sorted(str(name) for name in set(expected_names or set()) - observed)
+    covered_by_consumer = {
+        str(row.get("module_path", ""))
+        for row in rows
+        if str(row.get("skip_reason", "")) == "producer_fused_reference_covered_by_consumer"
+    }
+    missing_he_modules = sorted(str(name) for name in set(expected_names or set()) - observed - covered_by_consumer)
     reference_transform_rows = [
         {
             "module_path": str(row.get("module_path", "")),
@@ -1964,6 +2136,18 @@ def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] |
         ),
         None,
     )
+    mae_threshold = _env_float("ORION_LAYER_MAE_MAX_MAE", 1e-3)
+    max_abs_threshold = _env_float("ORION_LAYER_MAE_MAX_ABS", 1e-2)
+    failing_threshold_rows = [
+        row
+        for row in ok_rows
+        if (
+            row.get("metrics_vs_clear", {}).get("mae") is None
+            or row.get("metrics_vs_clear", {}).get("max_abs") is None
+            or float(row.get("metrics_vs_clear", {}).get("mae") or 0.0) > float(mae_threshold)
+            or float(row.get("metrics_vs_clear", {}).get("max_abs") or 0.0) > float(max_abs_threshold)
+        )
+    ]
     return {
         "row_count": int(len(rows)),
         "ok_count": int(len(ok_rows)),
@@ -1973,9 +2157,17 @@ def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] |
         "missing_he_modules": missing_he_modules,
         "reference_transform_count": int(len(reference_transform_rows)),
         "reference_transforms": reference_transform_rows,
-        "overall_ok": bool(not unexpected_rows and not missing_he_modules and first_nonfinite is None),
+        "overall_ok": bool(
+            not unexpected_rows
+            and not missing_he_modules
+            and first_nonfinite is None
+            and not failing_threshold_rows
+        ),
         "max_mae": max(values) if values else None,
         "max_abs": max(max_values) if max_values else None,
+        "mae_threshold": float(mae_threshold),
+        "max_abs_threshold": float(max_abs_threshold),
+        "threshold_failure_count": int(len(failing_threshold_rows)),
         "total_decode_s": float(sum(float(row.get("decode_s", 0.0) or 0.0) for row in rows)),
         "first_nonfinite": None if first_nonfinite is None else str(first_nonfinite.get("module_path", "")),
         "skipped_rows": [
@@ -1997,6 +2189,21 @@ def _layer_mae_summary(rows: list[dict[str, Any]], *, expected_names: set[str] |
                 "error": str(row.get("error", "")),
             }
             for row in unexpected_rows
+        ],
+        "threshold_failures": [
+            {
+                "module_path": str(row.get("module_path", "")),
+                "class": str(row.get("class", "")),
+                "mae": row.get("metrics_vs_clear", {}).get("mae"),
+                "max_abs": row.get("metrics_vs_clear", {}).get("max_abs"),
+                "rmse": row.get("metrics_vs_clear", {}).get("rmse"),
+                "shape_match": row.get("metrics_vs_clear", {}).get("shape_match"),
+            }
+            for row in sorted(
+                failing_threshold_rows,
+                key=lambda row: float(row.get("metrics_vs_clear", {}).get("mae") or -1.0),
+                reverse=True,
+            )[:20]
         ],
         "worst_by_mae": [
             {
@@ -3403,6 +3610,25 @@ def _linear_transform_device_estimate(transform_id: int) -> dict[str, Any]:
     }
 
 
+def _nonidentity_rotation_keys(keys: list[int], *, slots: int | None = None) -> list[int]:
+    if slots is None:
+        try:
+            slots = int(scheme.params.get_slots())
+        except Exception:
+            slots = 32768
+    identity = identity_galois_element(slots=int(slots))
+    return sorted(int(key) for key in keys if int(key) != int(identity))
+
+
+def _backend_transform_rotation_eval_count(transform_id: int, *, fallback_keys: list[int] | None = None) -> int:
+    backend = getattr(scheme, "backend", None)
+    getter = getattr(backend, "GetLinearTransformRotationEvalCount", None)
+    if callable(getter):
+        return int(getter(int(transform_id)))
+    keys = list(fallback_keys or getattr(backend, "GetLinearTransformRotationKeys")(int(transform_id)))
+    return int(len(_nonidentity_rotation_keys([int(key) for key in keys])))
+
+
 def _dense_cols(module: torch.nn.Module) -> int:
     keys = list(getattr(module, "transform_ids", {}).keys())
     if not keys:
@@ -3422,9 +3648,10 @@ def _linear_transform_rotation_stats(module: torch.nn.Module) -> dict[str, Any]:
     device_estimates: list[dict[str, Any]] = []
     for (row, col), transform_id in sorted(transform_ids.items()):
         keys = [int(key) for key in scheme.backend.GetLinearTransformRotationKeys(int(transform_id))]
-        nonzero_keys = sorted(int(key) for key in keys if int(key) != 0)
-        unique_keys.update(nonzero_keys)
-        transform_rotation_total += int(len(nonzero_keys))
+        nonidentity_keys = _nonidentity_rotation_keys(keys)
+        rotation_eval_count = _backend_transform_rotation_eval_count(int(transform_id), fallback_keys=keys)
+        unique_keys.update(nonidentity_keys)
+        transform_rotation_total += int(rotation_eval_count)
         estimate = _linear_transform_device_estimate(int(transform_id))
         device_estimates.append(estimate)
         per_transform.append(
@@ -3432,7 +3659,9 @@ def _linear_transform_rotation_stats(module: torch.nn.Module) -> dict[str, Any]:
                 "row": int(row),
                 "col": int(col),
                 "transform_id": int(transform_id),
-                "rotation_key_count": int(len(nonzero_keys)),
+                "rotation_eval_count": int(rotation_eval_count),
+                "rotation_key_count": int(len(nonidentity_keys)),
+                "rotation_key_request_count": int(len(keys)),
                 "estimate_device_bytes": estimate.get("estimate_device_bytes"),
                 "uses_streaming": estimate.get("uses_streaming"),
             }
@@ -3451,6 +3680,7 @@ def _linear_transform_rotation_stats(module: torch.nn.Module) -> dict[str, Any]:
         "transform_count": int(len(transform_ids)),
         "rows": int(rows),
         "cols": int(cols),
+        "transform_rotation_eval_count_total": int(transform_rotation_total),
         "transform_rotation_key_count_total": int(transform_rotation_total),
         "unique_rotation_key_count": int(len(unique_keys)),
         "output_rotations_per_output_ct": int(output_rotations),
@@ -3486,10 +3716,16 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
         per_transform: list[dict[str, Any]] = []
         cached = getattr(group, "_single_slot_rotation_stats", None)
         if not ids and isinstance(cached, dict):
-            cached_keys = {int(key) for key in cached.get("unique_rotation_keys", []) if int(key) != 0}
+            cached_keys = {int(key) for key in cached.get("unique_rotation_keys", [])}
             group_keys.update(cached_keys)
             unique_keys.update(cached_keys)
-            group_transform_total = int(cached.get("transform_rotation_key_count_total", 0) or 0)
+            group_transform_total = int(
+                cached.get(
+                    "transform_rotation_eval_count_total",
+                    cached.get("transform_rotation_key_count_total", 0),
+                )
+                or 0
+            )
             group_shared_total = int(
                 cached.get("shared_rotation_eval_count", cached.get("shared_rotation_eval_count_total", 0)) or 0
             )
@@ -3509,23 +3745,79 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
                 }
             )
             continue
+        diag_indices_by_transform = getattr(group, "_diag_indices_by_transform", None)
+        if isinstance(diag_indices_by_transform, dict) and ids:
+            diag_sets = [
+                tuple(int(value) for value in diag_indices_by_transform.get(int(transform_id), ()))
+                for transform_id in ids
+            ]
+            try:
+                slots = int(scheme.params.get_slots())
+            except Exception:
+                slots = 32768
+            group_stats = unified_bsgs_rotation_stats(
+                diag_sets,
+                slots=int(slots),
+                individual_eval=bool(individual_eval),
+            )
+            group_transform_total = int(group_stats["transform_rotation_eval_count_total"])
+            group_shared_total = int(group_stats["shared_rotation_eval_count_total"])
+            transform_rotation_total += int(group_transform_total)
+            shared_rotation_total += int(group_shared_total)
+            transform_count += int(len(ids))
+            unique_keys.update(int(key) for key in group_stats["unique_rotation_keys"])
+            for transform_index, transform_id in enumerate(ids):
+                estimate = _linear_transform_device_estimate(int(transform_id))
+                if estimate.get("estimate_device_bytes") is not None:
+                    estimate_values.append(int(estimate["estimate_device_bytes"]))
+                if estimate.get("uses_streaming") is True:
+                    streaming_transform_count += 1
+                stat = dict(group_stats["per_transform"][transform_index])
+                per_transform.append(
+                    {
+                        "transform_index": int(transform_index),
+                        "transform_id": int(transform_id),
+                        "rotation_eval_count": int(stat.get("rotation_eval_count", 0) or 0),
+                        "rotation_key_count": int(stat.get("rotation_key_count", 0) or 0),
+                        "rotation_key_request_count": int(stat.get("rotation_key_request_count", 0) or 0),
+                        "estimate_device_bytes": estimate.get("estimate_device_bytes"),
+                        "uses_streaming": estimate.get("uses_streaming"),
+                    }
+                )
+            per_group.append(
+                {
+                    "group_index": int(group_index),
+                    "transform_count": int(len(ids)),
+                    "rotation_key_count_total": int(group_transform_total),
+                    "transform_rotation_eval_count_total": int(group_transform_total),
+                    "shared_rotation_eval_count": int(group_shared_total),
+                    "unique_rotation_key_count": int(group_stats["unique_rotation_key_count"]),
+                    "per_transform": per_transform,
+                    "source": "compiled_group_diag_indices_bsgs_eval_rotations",
+                    "n1": int(group_stats["n1"]),
+                }
+            )
+            continue
         for transform_index, transform_id in enumerate(ids):
             keys = [int(key) for key in scheme.backend.GetLinearTransformRotationKeys(int(transform_id))]
-            nonzero_keys = sorted(int(key) for key in keys if int(key) != 0)
+            nonidentity_keys = _nonidentity_rotation_keys(keys)
+            rotation_eval_count = _backend_transform_rotation_eval_count(int(transform_id), fallback_keys=keys)
             estimate = _linear_transform_device_estimate(int(transform_id))
             if estimate.get("estimate_device_bytes") is not None:
                 estimate_values.append(int(estimate["estimate_device_bytes"]))
             if estimate.get("uses_streaming") is True:
                 streaming_transform_count += 1
-            group_keys.update(nonzero_keys)
-            unique_keys.update(nonzero_keys)
-            transform_rotation_total += int(len(nonzero_keys))
+            group_keys.update(nonidentity_keys)
+            unique_keys.update(nonidentity_keys)
+            transform_rotation_total += int(rotation_eval_count)
             transform_count += 1
             per_transform.append(
                 {
                     "transform_index": int(transform_index),
                     "transform_id": int(transform_id),
-                    "rotation_key_count": int(len(nonzero_keys)),
+                    "rotation_eval_count": int(rotation_eval_count),
+                    "rotation_key_count": int(len(nonidentity_keys)),
+                    "rotation_key_request_count": int(len(keys)),
                     "estimate_device_bytes": estimate.get("estimate_device_bytes"),
                     "uses_streaming": estimate.get("uses_streaming"),
                 }
@@ -3544,7 +3836,9 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
     return {
         "source": "compiled_backend_unified_transform_rotation_keys",
         "group_count": int(len(groups)),
+        "group_object_ids": [int(id(group)) for group in groups],
         "transform_count": int(transform_count),
+        "transform_rotation_eval_count_total": int(transform_rotation_total),
         "transform_rotation_key_count_total": int(transform_rotation_total),
         "shared_rotation_eval_count_total": int(shared_rotation_total),
         "unique_rotation_key_count": int(len(unique_keys)),
@@ -3560,7 +3854,29 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
     }
 
 
+def _rotation_report_stats_key(stats: dict[str, Any]) -> tuple[str, tuple[int, ...]]:
+    group_ids = tuple(int(value) for value in list(stats.get("group_object_ids", []) or []))
+    if group_ids:
+        return ("groups", tuple(sorted(group_ids)))
+    transform_ids: list[int] = []
+    for item in list(stats.get("per_transform", []) or []):
+        if isinstance(item, dict) and item.get("transform_id") is not None:
+            transform_ids.append(int(item["transform_id"]))
+    for group in list(stats.get("per_group", []) or []):
+        if not isinstance(group, dict):
+            continue
+        for item in list(group.get("per_transform", []) or []):
+            if isinstance(item, dict) and item.get("transform_id") is not None:
+                transform_ids.append(int(item["transform_id"]))
+    if transform_ids:
+        return ("transforms", tuple(sorted(set(transform_ids))))
+    return ("stats", (int(id(stats)),))
+
+
 def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
+    groups = _executor_unified_groups(executor)
+    if groups:
+        return _unified_group_rotation_stats(groups)
     if getattr(executor, "group", None) is not None:
         return _unified_group_rotation_stats([executor.group])
     groups = list(getattr(executor, "groups", []) or [])
@@ -3581,6 +3897,84 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     groups_by_input_index = getattr(executor, "groups_by_input_index", None) or {}
     if groups_by_input_index:
         return _unified_group_rotation_stats([group for _input_index, group in sorted(groups_by_input_index.items())])
+    runtime_groups = list(getattr(executor, "runtime_groups", []) or [])
+    if runtime_groups:
+        groups = []
+        for runtime_group in runtime_groups:
+            group = getattr(runtime_group, "group", runtime_group)
+            if group is not None:
+                groups.append(group)
+        if groups:
+            return _unified_group_rotation_stats(groups)
+    runtime_io = dict(getattr(executor, "last_runtime_io", {}) or {})
+    if runtime_io.get("rotation_eval_count_estimate") is not None:
+        group_mode = str(runtime_io.get("rotation_eval_count_mode", "") or "")
+        return {
+            "source": str(runtime_io.get("source", "runtime_io_unified_rotation_snapshot")),
+            "group_count": int(runtime_io.get("runtime_group_count") or 0),
+            "transform_count": int(runtime_io.get("runtime_transform_count") or 0),
+            "transform_rotation_key_count_total": int(runtime_io.get("transform_rotation_key_count_total") or 0),
+            "shared_rotation_eval_count_total": int(runtime_io.get("shared_rotation_eval_count_total") or 0),
+            "unique_rotation_key_count": int(runtime_io.get("unique_rotation_key_count") or 0),
+            "output_rotations_per_output_ct": int(runtime_io.get("output_rotations") or 0),
+            "output_rotation_eval_count": int(runtime_io.get("output_rotation_eval_count") or 0),
+            "rotation_eval_count_estimate": int(runtime_io.get("rotation_eval_count_estimate") or 0),
+            "rotation_eval_count_mode": str(group_mode),
+            "unique_rotation_keys": [
+                int(key)
+                for key in list(runtime_io.get("unique_rotation_keys", []) or [])
+            ],
+            "per_group": list(runtime_io.get("runtime_rotation_groups", []) or []),
+        }
+    if runtime_io.get("native_c_only_rotations") is not None:
+        group_mode = str(
+            runtime_io.get("provider_lt_grouping_mode")
+            or runtime_io.get("lt_grouping_mode")
+            or ""
+        ).strip().lower().replace("-", "_")
+        individual = group_mode in {
+            "individual",
+            "individual_lt",
+            "per_lt",
+            "per_linear_transform",
+            "no_share",
+            "no_shared_rotation",
+            "disable_shared_rotation",
+        } or bool(runtime_io.get("provider_disable_shared_rotation", False))
+        transform_total = int(runtime_io.get("native_c_only_rotations") or 0)
+        shared_total = int(runtime_io.get("native_cb_shared_rotations") or 0)
+        transform_count = int(
+            runtime_io.get("runtime_transform_count")
+            or getattr(executor, "last_runtime_counts", {}).get("partial_count", 0)
+            or getattr(executor, "last_runtime_timing", {}).get("built_transform_count", 0)
+            or runtime_io.get("runtime_group_count", 0)
+            or 0
+        )
+        return {
+            "source": "runtime_io_native_halo_rotation_estimate",
+            "group_count": int(runtime_io.get("runtime_group_count") or 0),
+            "transform_count": int(transform_count),
+            "transform_rotation_key_count_total": int(transform_total),
+            "shared_rotation_eval_count_total": int(shared_total),
+            "unique_rotation_key_count": 0,
+            "output_rotations_per_output_ct": 0,
+            "output_rotation_eval_count": 0,
+            "rotation_eval_count_estimate": int(transform_total if individual else shared_total),
+            "rotation_eval_count_mode": "independent_transform_bsgs" if individual else "shared_group_bsgs",
+            "unique_rotation_keys": [],
+            "native_plan_c_only_rotation_estimate": (
+                None
+                if runtime_io.get("native_plan_c_only_rotations") is None
+                else int(runtime_io.get("native_plan_c_only_rotations") or 0)
+            ),
+            "native_plan_cb_shared_rotation_estimate": (
+                None
+                if runtime_io.get("native_plan_cb_shared_rotations") is None
+                else int(runtime_io.get("native_plan_cb_shared_rotations") or 0)
+            ),
+            "native_halo_channel_fold_mode": str(runtime_io.get("native_halo_channel_fold_mode", "")),
+            "native_output_storage_layout": str(runtime_io.get("native_output_storage_layout", "")),
+        }
     transform_ids = dict(getattr(executor, "transform_ids", {}) or {})
     if not transform_ids:
         return {
@@ -3604,20 +3998,23 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     streaming_transform_count = 0
     for (row, col), transform_id in sorted(transform_ids.items()):
         keys = [int(key) for key in scheme.backend.GetLinearTransformRotationKeys(int(transform_id))]
-        nonzero_keys = sorted(int(key) for key in keys if int(key) != 0)
+        nonidentity_keys = _nonidentity_rotation_keys(keys)
+        rotation_eval_count = _backend_transform_rotation_eval_count(int(transform_id), fallback_keys=keys)
         estimate = _linear_transform_device_estimate(int(transform_id))
         if estimate.get("estimate_device_bytes") is not None:
             estimate_values.append(int(estimate["estimate_device_bytes"]))
         if estimate.get("uses_streaming") is True:
             streaming_transform_count += 1
-        unique_keys.update(nonzero_keys)
-        transform_rotation_total += int(len(nonzero_keys))
+        unique_keys.update(nonidentity_keys)
+        transform_rotation_total += int(rotation_eval_count)
         per_transform.append(
             {
                 "row": int(row),
                 "col": int(col),
                 "transform_id": int(transform_id),
-                "rotation_key_count": int(len(nonzero_keys)),
+                "rotation_eval_count": int(rotation_eval_count),
+                "rotation_key_count": int(len(nonidentity_keys)),
+                "rotation_key_request_count": int(len(keys)),
                 "estimate_device_bytes": estimate.get("estimate_device_bytes"),
                 "uses_streaming": estimate.get("uses_streaming"),
             }
@@ -3629,6 +4026,7 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
         "transform_count": int(len(transform_ids)),
         "rows": int(rows),
         "cols": int(cols),
+        "transform_rotation_eval_count_total": int(transform_rotation_total),
         "transform_rotation_key_count_total": int(transform_rotation_total),
         "unique_rotation_key_count": int(len(unique_keys)),
         "output_rotations_per_output_ct": int(output_rotations),
@@ -3648,6 +4046,18 @@ def _collect_rotation_report(net: torch.nn.Module, *, mode: str) -> dict[str, An
     for name, module in net.named_modules():
         if not isinstance(module, LinearTransform):
             continue
+        module_unified_groups = _executor_unified_groups(module)
+        if module_unified_groups:
+            rows.append(
+                {
+                    "node": str(name),
+                    "module_path": str(name),
+                    "kind": f"{type(module).__name__}_module_unified",
+                    "stage": "module_unified",
+                    "nodes": [str(name)],
+                    "stats": _unified_group_rotation_stats(module_unified_groups),
+                }
+            )
         runtime = getattr(module, "region_runtime", None)
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(scheme))
         if (
@@ -3682,22 +4092,36 @@ def _collect_rotation_report(net: torch.nn.Module, *, mode: str) -> dict[str, An
                 }
             )
 
+    total_rows: list[dict[str, Any]] = []
+    seen_stats: set[tuple[str, tuple[int, ...]]] = set()
+    for row in rows:
+        stats = dict(row.get("stats", {}) or {})
+        key = _rotation_report_stats_key(stats)
+        row["stats_identity"] = {"kind": key[0], "ids": [int(value) for value in key[1]]}
+        duplicate = key in seen_stats
+        row["duplicate_rotation_stats"] = bool(duplicate)
+        if not duplicate:
+            seen_stats.add(key)
+            total_rows.append(row)
+
     total_rotation_estimate = int(
-        sum(int(row.get("stats", {}).get("rotation_eval_count_estimate", 0)) for row in rows)
+        sum(int(row.get("stats", {}).get("rotation_eval_count_estimate", 0)) for row in total_rows)
     )
     total_transform_rotation_keys = int(
-        sum(int(row.get("stats", {}).get("transform_rotation_key_count_total", 0)) for row in rows)
+        sum(int(row.get("stats", {}).get("transform_rotation_key_count_total", 0)) for row in total_rows)
     )
     total_shared_rotation_evals = int(
-        sum(int(row.get("stats", {}).get("shared_rotation_eval_count_total", 0)) for row in rows)
+        sum(int(row.get("stats", {}).get("shared_rotation_eval_count_total", 0)) for row in total_rows)
     )
     total_output_rotation_evals = int(
-        sum(int(row.get("stats", {}).get("output_rotation_eval_count", 0)) for row in rows)
+        sum(int(row.get("stats", {}).get("output_rotation_eval_count", 0)) for row in total_rows)
     )
     return {
         "mode": str(mode),
         "source": "compiled_backend_rotation_keys_plus_output_rotation_estimate",
         "row_count": int(len(rows)),
+        "unique_rotation_stats_row_count": int(len(total_rows)),
+        "duplicate_rotation_stats_row_count": int(len(rows) - len(total_rows)),
         "total_rotation_eval_count_estimate": int(total_rotation_estimate),
         "total_transform_rotation_key_count": int(total_transform_rotation_keys),
         "total_shared_rotation_eval_count": int(total_shared_rotation_evals),
@@ -4213,6 +4637,13 @@ def _run_one(
                 layer_mae_clear_outputs,
             )
             post_compile_layer_mae_names = set(_layer_mae_target_names(net))
+            polynomial_outputs, polynomial_reference_diagnostics = _collect_layer_mae_polynomial_clear_outputs(
+                net,
+                x0,
+                post_compile_layer_mae_names,
+            )
+            if str(polynomial_reference_diagnostics.get("status", "")) == "ok":
+                adjusted_outputs.update(polynomial_outputs)
             layer_mae_clear_outputs = {
                 str(name): value
                 for name, value in dict(adjusted_outputs or {}).items()
@@ -4227,6 +4658,7 @@ def _run_one(
             payload["layer_mae_reference_transform_count"] = int(len(layer_mae_reference_transforms))
             payload["layer_mae_reference_transforms"] = dict(layer_mae_reference_transforms)
             payload["layer_mae_reference_transform_diagnostics"] = dict(reference_transform_diagnostics)
+            payload["layer_mae_polynomial_reference_diagnostics"] = dict(polynomial_reference_diagnostics)
             payload["layer_mae_clear_output_count_after_reference_alignment"] = int(
                 len(layer_mae_clear_outputs or {})
             )

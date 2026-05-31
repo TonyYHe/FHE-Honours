@@ -50,8 +50,16 @@ BOOTSTRAP_OWNER_HINTS = {
 }
 
 PROVIDER_MODES = {
-    "fixed_max": "u22_256_base32_layout_fixedmax",
+    "fixed_max": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_max_no_share": "u22_256_base32_layout_fixedmax_no_share",
+    "fixedmax_no_share": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_noshare": "u22_256_base32_layout_fixedmax_no_share",
+    "fixedmax_noshare": "u22_256_base32_layout_fixedmax_no_share",
     "always": "u22_256_base32_layout_always",
+    "always_no_share": "u22_256_base32_layout_always_no_share",
+    "always_noshare": "u22_256_base32_layout_always_no_share",
+    "always_relayout_no_share": "u22_256_base32_layout_always_no_share",
+    "always_relayout_noshare": "u22_256_base32_layout_always_no_share",
     "dp": "u22_256_base32_layout_dp",
     "dp_no_share_fold": "u22_256_base32_layout_dp_no_share_fold",
     "dp_noshare_fold": "u22_256_base32_layout_dp_no_share_fold",
@@ -103,9 +111,12 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     for key, value in ENV_DEFAULTS.items():
         updated.setdefault(key, value)
     updated["GOMAXPROCS"] = "1"
+    updated["ORION_SINGLE_SLOT_LAYER_CACHE"] = "1"
+    updated["ORION_LATTIGO_BOOTSTRAP_MANY"] = "0"
     updated["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] = "1"
     updated["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] = "0"
     updated["ORION_LATTIGO_UNIFIED_NO_BSGS"] = "0"
+    updated["ORION_CONCAT_FUSION"] = "1"
     return updated
 
 
