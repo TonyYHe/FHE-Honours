@@ -121,11 +121,23 @@ PROVIDER_MODES = {
     "always_noshare": "u22_256_base32_layout_always_no_share",
     "always_relayout_no_share": "u22_256_base32_layout_always_no_share",
     "always_relayout_noshare": "u22_256_base32_layout_always_no_share",
+    "always_no_share_fused": "u22_256_base32_layout_always_no_share",
+    "always_noshare_fused": "u22_256_base32_layout_always_no_share",
+    "always_relayout_no_share_fused": "u22_256_base32_layout_always_no_share",
+    "always_relayout_noshare_fused": "u22_256_base32_layout_always_no_share",
+    "always_no_share_unfused": "u22_256_base32_layout_always_no_share_unfused",
+    "always_noshare_unfused": "u22_256_base32_layout_always_no_share_unfused",
     "fixed_max": "u22_256_base32_layout_fixedmax_no_share",
     "fixed_max_no_share": "u22_256_base32_layout_fixedmax_no_share",
     "fixedmax_no_share": "u22_256_base32_layout_fixedmax_no_share",
     "fixed_noshare": "u22_256_base32_layout_fixedmax_no_share",
     "fixedmax_noshare": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_max_no_share_fused": "u22_256_base32_layout_fixedmax_no_share",
+    "fixedmax_no_share_fused": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_noshare_fused": "u22_256_base32_layout_fixedmax_no_share",
+    "fixedmax_noshare_fused": "u22_256_base32_layout_fixedmax_no_share",
+    "fixed_max_no_share_unfused": "u22_256_base32_layout_fixedmax_no_share_unfused",
+    "fixedmax_no_share_unfused": "u22_256_base32_layout_fixedmax_no_share_unfused",
 }
 
 CPU_COUNT = max(1, int(os.cpu_count() or 1))

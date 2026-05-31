@@ -7,6 +7,11 @@ import torch
 
 PHYSICAL_COMPACT = "packed_compact"
 PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
+BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES = {
+    "dp_no_share_fold",
+    "fixed_max_no_share_fused",
+    "always_no_share_fused",
+}
 
 _LAYOUT_PRESERVING_MODULES = {
     "Activation",
@@ -266,7 +271,7 @@ def bootstrap_aware_layout_refinement_applicable(network_dag: Any) -> bool:
     plan = _layout_policy_compile_plan_for_dag(network_dag)
     if not isinstance(plan, dict):
         return False
-    return str(plan.get("policy", "")) == "dp_no_share_fold"
+    return str(plan.get("policy", "")) in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES
 
 
 def _executor_relayout_depth(executor: Any) -> int:
@@ -480,6 +485,7 @@ def _rebuild_relayout_edges(edge_layouts: list[dict[str, Any]]) -> list[dict[str
 
 def _refresh_layout_policy_plan_summary(compile_plan: dict[str, Any]) -> dict[str, Any]:
     edge_layouts = [dict(row) for row in compile_plan.get("edge_layouts", [])]
+    node_layouts = [dict(row) for row in compile_plan.get("node_layouts", [])]
     relayout_edges = _rebuild_relayout_edges(edge_layouts)
     output_nodes = [
         dict(row)
@@ -500,21 +506,123 @@ def _refresh_layout_policy_plan_summary(compile_plan: dict[str, Any]) -> dict[st
         sum(int(row.get("depth_estimate", 0) or 0) for row in relayout_edges)
         + sum(int(row.get("depth_estimate", 0) or 0) for row in output_nodes)
     )
+    producer_nodes = [
+        row
+        for row in node_layouts
+        if bool(row.get("producer_materialized_halo", False))
+    ]
+    summary["producer_fused_materialization_count"] = int(len(producer_nodes))
+    summary["producer_fused_rotation_estimate"] = int(
+        sum(int(row.get("producer_fused_rotation_estimate", 0) or 0) for row in producer_nodes)
+    )
     summary["consumer_fused_relayout_count"] = int(
         sum(1 for row in edge_layouts if bool(row.get("consumer_fused_relayout", False)))
     )
     summary["consumer_fused_rotation_estimate"] = int(
         sum(int(row.get("consumer_fused_rotation_estimate", 0) or 0) for row in edge_layouts)
     )
+    summary["planner_rotation_cost_estimate"] = int(
+        sum(
+            int(row.get("planner_rotation_cost_estimate", row.get("lt_bsgs_rotation_estimate", 0)) or 0)
+            for row in edge_layouts
+        )
+    )
+    if str(compile_plan.get("policy", "")) != "orion_dense":
+        summary["reported_rotation_estimate"] = int(
+            int(summary["planner_rotation_cost_estimate"])
+            + int(summary["relayout_rotation_estimate"])
+            + int(summary["producer_fused_rotation_estimate"])
+        )
     return {
         **dict(compile_plan),
         "edge_layouts": edge_layouts,
+        "node_layouts": node_layouts,
         "relayout_edges": relayout_edges,
         "relayout_edge_count": int(len(relayout_edges)),
         "output_relayout_nodes": output_nodes,
         "output_relayout_node_count": int(len(output_nodes)),
         "summary": summary,
     }
+
+
+def _plan_rotation_cost(compile_plan: dict[str, Any]) -> int:
+    summary = dict(compile_plan.get("summary", {}) or {})
+    edge_layouts = [dict(row) for row in compile_plan.get("edge_layouts", [])]
+    if not edge_layouts and "reported_rotation_estimate" in summary:
+        return int(summary.get("reported_rotation_estimate", 0) or 0)
+    relayout_edges = _rebuild_relayout_edges(edge_layouts)
+    producer_nodes = [
+        dict(row)
+        for row in compile_plan.get("node_layouts", [])
+        if bool(row.get("producer_materialized_halo", False))
+    ]
+    return int(
+        sum(
+            int(row.get("planner_rotation_cost_estimate", row.get("lt_bsgs_rotation_estimate", 0)) or 0)
+            for row in edge_layouts
+        )
+        + sum(int(row.get("rotation_estimate", 0) or 0) for row in relayout_edges)
+        + sum(int(row.get("producer_fused_rotation_estimate", 0) or 0) for row in producer_nodes)
+    )
+
+
+def _layout_stored_slots(layout: dict[str, Any]) -> int:
+    return max(1, int(dict(layout).get("stored_slots", dict(layout).get("core_slots", 1)) or 1))
+
+
+def _producer_layout_growth_rotation_delta(
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    old_layout: dict[str, Any],
+    new_layout: dict[str, Any],
+) -> int:
+    old_slots = _layout_stored_slots(old_layout)
+    new_slots = _layout_stored_slots(new_layout)
+    if int(new_slots) <= int(old_slots):
+        return 0
+    incoming_cost = int(
+        sum(
+            int(row.get("planner_rotation_cost_estimate", row.get("lt_bsgs_rotation_estimate", 0)) or 0)
+            for row in compile_plan.get("edge_layouts", [])
+            if str(row.get("target", "")) == str(node)
+        )
+    )
+    if int(incoming_cost) <= 0:
+        return int(max(0, int(new_slots) - int(old_slots)))
+    return int(math.ceil(float(incoming_cost) * float(int(new_slots) - int(old_slots)) / float(old_slots)))
+
+
+def _producer_node_layout_growth_rotation_delta(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+    old_row: dict[str, Any],
+    new_layout: dict[str, Any],
+) -> int:
+    module = network_dag.nodes[str(node)].get("module") if str(node) in network_dag.nodes else None
+    if not _producer_beta_lift_allowed(module):
+        return 0
+    return _producer_layout_growth_rotation_delta(
+        compile_plan,
+        node=str(node),
+        old_layout=dict(old_row.get("selected_layout", {}) or {}),
+        new_layout=dict(new_layout),
+    )
+
+
+def _candidate_rotation_delta(
+    previous_plan: dict[str, Any],
+    updated_plan: dict[str, Any],
+    *,
+    extra_rotation_delta: int = 0,
+) -> int:
+    return int(
+        _plan_rotation_cost(updated_plan)
+        - _plan_rotation_cost(previous_plan)
+        + int(extra_rotation_delta)
+    )
 
 
 def _compact_physical_for_refined_source(row: dict[str, Any]) -> str:
@@ -1064,13 +1172,24 @@ def _try_apply_beta_lift_candidate(
             if layout is None:
                 updated_node_rows.append(dict(row))
                 continue
-            updated_node_rows.append(
-                _rewrite_node_as_beta_lift_producer(
-                    dict(row),
-                    layout=layout,
-                    reason="boot_interval_beta_lift",
-                )
+            producer_growth_delta = _producer_node_layout_growth_rotation_delta(
+                network_dag,
+                compile_plan,
+                node=str(node),
+                old_row=dict(row),
+                new_layout=dict(layout),
             )
+            updated_node = _rewrite_node_as_beta_lift_producer(
+                dict(row),
+                layout=layout,
+                reason="boot_interval_beta_lift",
+            )
+            if int(producer_growth_delta) > 0:
+                updated_node["producer_fused_rotation_estimate"] = int(
+                    int(row.get("producer_fused_rotation_estimate", 0) or 0)
+                    + int(producer_growth_delta)
+                )
+            updated_node_rows.append(updated_node)
         if len(accepted_edges) < 2 and not activation_transparent_single_native:
             if not pool_direct_single_native:
                 continue
@@ -1095,6 +1214,7 @@ def _try_apply_beta_lift_candidate(
             "kind": candidate_kind,
             "strategy": candidate_kind,
             "plan": updated_plan,
+            "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
             "accepted": [
                 {
                     "kind": candidate_kind,
@@ -1223,6 +1343,7 @@ def _native_physical_relayout_refinement_candidate(
         "kind": "native_physical_relayout",
         "strategy": "native_physical_relayout",
         "plan": updated_plan,
+        "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
         "accepted": accepted,
         "rejected": rejected,
         "accepted_count": int(len(accepted)),
@@ -1340,6 +1461,7 @@ def _concat_output_beta_lift_refinement_candidates(
                 "kind": "concat_output_beta_lift",
                 "strategy": "concat_output_beta_lift",
                 "plan": updated_plan,
+                "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
                 "accepted": [
                     {
                         "kind": "concat_output_beta_lift",
@@ -1518,13 +1640,25 @@ def _boot_boundary_beta_lift_refinement_candidates(
             if str(candidate_node.get("node", "")) not in lift_nodes:
                 updated_node_rows.append(dict(candidate_node))
                 continue
-            updated_node_rows.append(
-                _rewrite_node_as_beta_lift_producer(
-                    dict(candidate_node),
-                    layout=selected,
-                    reason=producer_reason,
-                )
+            node = str(candidate_node.get("node", ""))
+            producer_growth_delta = _producer_node_layout_growth_rotation_delta(
+                network_dag,
+                compile_plan,
+                node=str(node),
+                old_row=dict(candidate_node),
+                new_layout=dict(selected),
             )
+            updated_node = _rewrite_node_as_beta_lift_producer(
+                dict(candidate_node),
+                layout=selected,
+                reason=producer_reason,
+            )
+            if int(producer_growth_delta) > 0:
+                updated_node["producer_fused_rotation_estimate"] = int(
+                    int(candidate_node.get("producer_fused_rotation_estimate", 0) or 0)
+                    + int(producer_growth_delta)
+                )
+            updated_node_rows.append(updated_node)
 
         updated_plan = _refresh_layout_policy_plan_summary(
             {
@@ -1544,11 +1678,177 @@ def _boot_boundary_beta_lift_refinement_candidates(
                 "kind": str(kind),
                 "strategy": str(kind),
                 "plan": updated_plan,
+                "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
                 "accepted": [
                     {
                         "kind": str(kind),
                         "producer": str(producer),
                         "boot_edge": {"source": str(boot_source), "target": str(boot_target)},
+                        "producer_layout": dict(selected),
+                        "covered_edges": [
+                            {
+                                "edge": str(edge_id),
+                                "source": str(source),
+                                "target": str(target),
+                                "old_physical_layout": str(current.get("physical_layout", "")),
+                                "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                            }
+                        ],
+                        "carried_edges": carried_edges,
+                        "covered_edge_count": 1,
+                    }
+                ],
+                "rejected": [],
+            }
+        )
+    return candidates
+
+
+def _local_activation_beta_lift_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in compile_plan.get("edge_layouts", [])}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    candidates: list[dict[str, Any]] = []
+    for row in compile_plan.get("edge_layouts", []):
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        if edge_id not in actual_native_physical_edges:
+            continue
+        if not _native_conv_row_beta_lift_supported(current):
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[target].get("module")).__name__ != "Conv2d":
+            continue
+        if not _layout_preserving_module(network_dag, source):
+            continue
+        producer = _single_predecessor(network_dag, source)
+        if producer is None or producer not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[producer].get("module")).__name__ != "Conv2d":
+            continue
+        if (source, target) in boot_edges or (producer, source) in boot_edges:
+            continue
+        if _candidate_interval_matches(
+            row=current,
+            intervals=intervals,
+            boot_edges=boot_edges,
+        ):
+            continue
+        if _single_predecessor(network_dag, target) != source:
+            continue
+        if not _single_successor(network_dag, producer, source):
+            continue
+        if not _single_successor(network_dag, source, target):
+            continue
+
+        selected = dict(current.get("selected_layout", {}) or {})
+        activation_edge_id = f"{producer}->{source}"
+        activation_edge = edge_rows_by_edge.get(activation_edge_id)
+        producer_row = node_rows_by_node.get(producer)
+        source_node_row = node_rows_by_node.get(source)
+        if activation_edge is None or producer_row is None or source_node_row is None:
+            continue
+        activation_required = dict(
+            activation_edge.get("required_layout", activation_edge.get("selected_layout", {}) or {}) or {}
+        )
+        if activation_required and not _layout_covers(selected, activation_required):
+            continue
+        if int(selected.get("gap", 1) or 1) != int(
+            activation_required.get("gap", selected.get("gap", 1)) or 1
+        ):
+            continue
+
+        updated_edge_rows: list[dict[str, Any]] = []
+        carried_edges: list[dict[str, Any]] = []
+        for candidate_row in compile_plan.get("edge_layouts", []):
+            candidate_edge_id = str(candidate_row.get("edge", ""))
+            if candidate_edge_id == edge_id:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=selected,
+                    target_layout=selected,
+                    reason="local_activation_beta_lift",
+                )
+                updated["local_activation_beta_lift"] = True
+                updated["local_activation_beta_lift_source"] = str(producer)
+                updated_edge_rows.append(updated)
+            elif candidate_edge_id == activation_edge_id:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=selected,
+                    target_layout=selected,
+                    reason="local_activation_beta_lift",
+                )
+                carried_edges.append(
+                    {
+                        "edge": str(candidate_edge_id),
+                        "source": str(candidate_row.get("source", "")),
+                        "target": str(candidate_row.get("target", "")),
+                        "op_kind": str(candidate_row.get("op_kind", "")),
+                        "physical_layout": str(updated.get("physical_layout", "")),
+                    }
+                )
+                updated_edge_rows.append(updated)
+            else:
+                updated_edge_rows.append(dict(candidate_row))
+
+        updated_node_rows: list[dict[str, Any]] = []
+        lift_nodes = {str(producer), str(source)}
+        for candidate_node in compile_plan.get("node_layouts", []):
+            if str(candidate_node.get("node", "")) not in lift_nodes:
+                updated_node_rows.append(dict(candidate_node))
+                continue
+            node = str(candidate_node.get("node", ""))
+            producer_growth_delta = _producer_node_layout_growth_rotation_delta(
+                network_dag,
+                compile_plan,
+                node=str(node),
+                old_row=dict(candidate_node),
+                new_layout=dict(selected),
+            )
+            updated_node = _rewrite_node_as_beta_lift_producer(
+                dict(candidate_node),
+                layout=selected,
+                reason="local_activation_beta_lift",
+            )
+            if int(producer_growth_delta) > 0:
+                updated_node["producer_fused_rotation_estimate"] = int(
+                    int(candidate_node.get("producer_fused_rotation_estimate", 0) or 0)
+                    + int(producer_growth_delta)
+                )
+            updated_node_rows.append(updated_node)
+
+        updated_plan = _refresh_layout_policy_plan_summary(
+            {
+                **dict(compile_plan),
+                "edge_layouts": updated_edge_rows,
+                "node_layouts": updated_node_rows,
+            }
+        )
+        summary = dict(updated_plan.get("summary", {}) or {})
+        summary["boot_refined_local_activation_beta_lift_count"] = (
+            int(summary.get("boot_refined_local_activation_beta_lift_count", 0) or 0) + 1
+        )
+        updated_plan["summary"] = summary
+        candidates.append(
+            {
+                "kind": "local_activation_beta_lift",
+                "strategy": "local_activation_beta_lift",
+                "plan": updated_plan,
+                "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
+                "accepted": [
+                    {
+                        "kind": "local_activation_beta_lift",
+                        "producer": str(producer),
                         "producer_layout": dict(selected),
                         "covered_edges": [
                             {
@@ -1586,8 +1886,8 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
     compile_plan = _layout_policy_compile_plan_for_dag(network_dag)
     if not isinstance(compile_plan, dict):
         return {"enabled": False, "reason": "no_layout_policy_executors"}
-    if str(compile_plan.get("policy", "")) != "dp_no_share_fold":
-        return {"enabled": False, "reason": "policy_not_dp_no_share_fold"}
+    if str(compile_plan.get("policy", "")) not in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES:
+        return {"enabled": False, "reason": "policy_not_bootstrap_aware_refinement"}
 
     boot_edges = _bootstrap_edge_set(first_pass_audit)
     if not boot_edges:
@@ -1624,7 +1924,13 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "accepted_count": int(
                     sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
                 ),
-                "rotation_delta": 0,
+                "rotation_delta": int(
+                    beta_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(beta_lift["plan"])),
+                    )
+                    or 0
+                ),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -1650,7 +1956,13 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "accepted_count": int(
                     sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
                 ),
-                "rotation_delta": 0,
+                "rotation_delta": int(
+                    concat_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(concat_lift["plan"])),
+                    )
+                    or 0
+                ),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -1676,7 +1988,48 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "accepted_count": int(
                     sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
                 ),
-                "rotation_delta": 0,
+                "rotation_delta": int(
+                    boot_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(boot_lift["plan"])),
+                    )
+                    or 0
+                ),
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
+    for local_lift in _local_activation_beta_lift_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    ):
+        accepted = [dict(row) for row in local_lift.get("accepted", [])]
+        candidate_kind = str(local_lift.get("kind", "local_activation_beta_lift"))
+        candidate_strategy = str(local_lift.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_local_activation_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(local_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(local_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": int(
+                    local_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(local_lift["plan"])),
+                    )
+                    or 0
+                ),
+                "candidate_priority": 1,
+                "require_bootstrap_count_unchanged": True,
+                "require_bootstrap_shape_nonincrease": True,
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -1699,7 +2052,13 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "accepted": list(native_candidate.get("accepted", [])),
                 "rejected": fallback_rejected,
                 "accepted_count": int(native_candidate.get("accepted_count", 0) or 0),
-                "rotation_delta": 0,
+                "rotation_delta": int(
+                    native_candidate.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(native_candidate["plan"])),
+                    )
+                    or 0
+                ),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -1708,6 +2067,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
     if not candidates:
         return {
             "enabled": False,
+            "policy": str(compile_plan.get("policy", "")),
             "reason": str(native_candidate.get("reason", "no_supported_boot_interval_native_physical_relayout")),
             "rejected": fallback_rejected,
             "native_physical_relayout_edge_count": int(len(actual_native_physical_edges)),
@@ -1784,6 +2144,9 @@ def apply_bootstrap_aware_layout_refinement_candidate(
         "rejected": list(candidate.get("rejected", [])),
         "accepted_count": int(candidate.get("accepted_count", len(accepted)) or 0),
         "rotation_delta": int(candidate.get("rotation_delta", 0) or 0),
+        "candidate_priority": int(candidate.get("candidate_priority", 0) or 0),
+        "require_bootstrap_count_unchanged": bool(candidate.get("require_bootstrap_count_unchanged", False)),
+        "require_bootstrap_shape_nonincrease": bool(candidate.get("require_bootstrap_shape_nonincrease", False)),
         "depth_updates": depth_updates,
         "true_relayout_kernel_depth_before": int(true_relayout_count_before),
         "true_relayout_kernel_depth_after": int(true_relayout_count_after),
@@ -1850,7 +2213,7 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
     compressed_nodes: set[str] = set()
     audit_nodes: list[dict[str, Any]] = []
     queue: list[str] = []
-    force_compact = str(compile_plan.get("policy", "")) == "dp_no_share_fold"
+    force_compact = str(compile_plan.get("policy", "")) in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES
     for node in sorted(str(value) for value in bootstrap_nodes):
         row = node_rows.get(str(node))
         if row is None:

@@ -55,18 +55,40 @@ POLICY_ALIASES = {
     "fixedmax-fused": "fixed_max_fused",
     "fixed_max_fused": "fixed_max_fused",
     "fixed-max-fused": "fixed_max_fused",
-    "fixed_no_share": "fixed_max_no_share",
-    "fixed-no-share": "fixed_max_no_share",
-    "fixed_noshare": "fixed_max_no_share",
-    "fixed-noshare": "fixed_max_no_share",
-    "fixedmax_no_share": "fixed_max_no_share",
-    "fixedmax-no-share": "fixed_max_no_share",
-    "fixedmax_noshare": "fixed_max_no_share",
-    "fixedmax-noshare": "fixed_max_no_share",
-    "fixed_max_no_share": "fixed_max_no_share",
-    "fixed-max-no-share": "fixed_max_no_share",
-    "fixed_max_noshare": "fixed_max_no_share",
-    "fixed-max-noshare": "fixed_max_no_share",
+    "fixed_no_share": "fixed_max_no_share_fused",
+    "fixed-no-share": "fixed_max_no_share_fused",
+    "fixed_noshare": "fixed_max_no_share_fused",
+    "fixed-noshare": "fixed_max_no_share_fused",
+    "fixedmax_no_share": "fixed_max_no_share_fused",
+    "fixedmax-no-share": "fixed_max_no_share_fused",
+    "fixedmax_noshare": "fixed_max_no_share_fused",
+    "fixedmax-noshare": "fixed_max_no_share_fused",
+    "fixed_max_no_share": "fixed_max_no_share_fused",
+    "fixed-max-no-share": "fixed_max_no_share_fused",
+    "fixed_max_noshare": "fixed_max_no_share_fused",
+    "fixed-max-noshare": "fixed_max_no_share_fused",
+    "fixed_no_share_fused": "fixed_max_no_share_fused",
+    "fixed-no-share-fused": "fixed_max_no_share_fused",
+    "fixed_noshare_fused": "fixed_max_no_share_fused",
+    "fixed-noshare-fused": "fixed_max_no_share_fused",
+    "fixedmax_no_share_fused": "fixed_max_no_share_fused",
+    "fixedmax-no-share-fused": "fixed_max_no_share_fused",
+    "fixedmax_noshare_fused": "fixed_max_no_share_fused",
+    "fixedmax-noshare-fused": "fixed_max_no_share_fused",
+    "fixed_max_no_share_fused": "fixed_max_no_share_fused",
+    "fixed-max-no-share-fused": "fixed_max_no_share_fused",
+    "fixed_max_noshare_fused": "fixed_max_no_share_fused",
+    "fixed-max-noshare-fused": "fixed_max_no_share_fused",
+    "fixed_no_share_unfused": "fixed_max_no_share_unfused",
+    "fixed-no-share-unfused": "fixed_max_no_share_unfused",
+    "fixed_noshare_unfused": "fixed_max_no_share_unfused",
+    "fixed-noshare-unfused": "fixed_max_no_share_unfused",
+    "fixedmax_no_share_unfused": "fixed_max_no_share_unfused",
+    "fixedmax-no-share-unfused": "fixed_max_no_share_unfused",
+    "fixedmax_noshare_unfused": "fixed_max_no_share_unfused",
+    "fixedmax-noshare-unfused": "fixed_max_no_share_unfused",
+    "fixed_max_no_share_unfused": "fixed_max_no_share_unfused",
+    "fixed-max-no-share-unfused": "fixed_max_no_share_unfused",
     "eager": "eager",
     "eager_relayout": "eager",
     "eager-relayout": "eager",
@@ -88,14 +110,28 @@ POLICY_ALIASES = {
     "always-fused": "always_fused",
     "always_relayout_fused": "always_fused",
     "always-relayout-fused": "always_fused",
-    "always_no_share": "always_no_share",
-    "always-no-share": "always_no_share",
-    "always_noshare": "always_no_share",
-    "always-noshare": "always_no_share",
-    "always_relayout_no_share": "always_no_share",
-    "always-relayout-no-share": "always_no_share",
-    "always_relayout_noshare": "always_no_share",
-    "always-relayout-noshare": "always_no_share",
+    "always_no_share": "always_no_share_fused",
+    "always-no-share": "always_no_share_fused",
+    "always_noshare": "always_no_share_fused",
+    "always-noshare": "always_no_share_fused",
+    "always_relayout_no_share": "always_no_share_fused",
+    "always-relayout-no-share": "always_no_share_fused",
+    "always_relayout_noshare": "always_no_share_fused",
+    "always-relayout-noshare": "always_no_share_fused",
+    "always_no_share_fused": "always_no_share_fused",
+    "always-no-share-fused": "always_no_share_fused",
+    "always_noshare_fused": "always_no_share_fused",
+    "always-noshare-fused": "always_no_share_fused",
+    "always_relayout_no_share_fused": "always_no_share_fused",
+    "always-relayout-no-share-fused": "always_no_share_fused",
+    "always_relayout_noshare_fused": "always_no_share_fused",
+    "always-relayout-noshare-fused": "always_no_share_fused",
+    "always_no_share_unfused": "always_no_share_unfused",
+    "always-no-share-unfused": "always_no_share_unfused",
+    "always_noshare_unfused": "always_no_share_unfused",
+    "always-noshare-unfused": "always_no_share_unfused",
+    "always_relayout_no_share_unfused": "always_no_share_unfused",
+    "always-relayout-no-share-unfused": "always_no_share_unfused",
     "orion": "orion_dense",
     "dense": "orion_dense",
     "orion_dense": "orion_dense",
@@ -117,14 +153,16 @@ POLICY_ALIASES = {
 POLICY_LABELS = {
     "fixed_max": "Max-Re-Layout",
     "fixed_max_fused": "Fixed-Max-Halo+Fusion",
-    "fixed_max_no_share": "Fixed-Max-NoShare-Fold",
+    "fixed_max_no_share_fused": "Fixed-Max-NoShare-Fold+Fusion",
+    "fixed_max_no_share_unfused": "Fixed-Max-NoShare-Fold-Unfused",
     "eager": "Eager-Re-Layout",
     "eager_fused": "Eager-Re-Layout+Fusion",
     "greedy": "Greedy-Max-Zero-Cycle",
     "greedy_fused": "Greedy-Local+Fusion",
     "always": "Always-Re-Layout",
     "always_fused": "Always-Re-Layout+Fusion",
-    "always_no_share": "Always-Re-Layout-NoShare-Fold",
+    "always_no_share_fused": "Always-Re-Layout-NoShare-Fold+Fusion",
+    "always_no_share_unfused": "Always-Re-Layout-NoShare-Fold-Unfused",
     "orion_dense": "Orion-Dense-No-Halo",
     "dp": "DP-Global",
     "dp_no_share_fold": "DP-NoShare-Fold",
@@ -3539,11 +3577,11 @@ def _no_halo_layout_from_semantic(
 
 def _base_non_dp_policy(policy: str) -> str:
     normalized = str(policy)
-    if normalized == "fixed_max_no_share":
+    if normalized in {"fixed_max_no_share", "fixed_max_no_share_fused", "fixed_max_no_share_unfused"}:
         return "fixed_max"
     if normalized == "fixed_max_fused":
         return "fixed_max"
-    if normalized == "always_no_share":
+    if normalized in {"always_no_share", "always_no_share_fused", "always_no_share_unfused"}:
         return "always"
     if normalized == "eager_fused":
         return "eager"
@@ -3555,7 +3593,27 @@ def _base_non_dp_policy(policy: str) -> str:
 
 
 def _non_dp_policy_uses_fusion(policy: str) -> bool:
-    return str(policy) in {"fixed_max_fused", "eager_fused", "greedy_fused", "always_fused"}
+    return str(policy) in {
+        "fixed_max_fused",
+        "fixed_max_no_share",
+        "fixed_max_no_share_fused",
+        "eager_fused",
+        "greedy_fused",
+        "always_fused",
+        "always_no_share",
+        "always_no_share_fused",
+    }
+
+
+def _non_dp_policy_is_no_share(policy: str) -> bool:
+    return str(policy) in {
+        "fixed_max_no_share",
+        "fixed_max_no_share_fused",
+        "fixed_max_no_share_unfused",
+        "always_no_share",
+        "always_no_share_fused",
+        "always_no_share_unfused",
+    }
 
 
 def _layout_has_halo(layout: LayoutState) -> bool:
@@ -3642,6 +3700,7 @@ def _non_dp_consumer_fused_row(
         and str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE
         and _conv_native_stripe_candidate_allowed(edge, source_layout)
     ):
+        no_share = _non_dp_policy_is_no_share(str(policy))
         return _edge_row(
             edge,
             selected_layout,
@@ -3656,6 +3715,8 @@ def _non_dp_consumer_fused_row(
                 selected_layout,
                 layout_mode="native_halo_stripe",
             ),
+            provider_lt_grouping_mode="individual" if bool(no_share) else "",
+            native_halo_channel_fold_mode="per_stripe" if bool(no_share) else "",
         )
     if str(edge.op_kind) == "conv_transpose2d" and source_layout.covers(edge.requirement):
         physical_layout = PHYSICAL_LOGICAL_HALO if _layout_has_halo(selected_layout) else PHYSICAL_COMPACT
@@ -3714,7 +3775,7 @@ def _non_dp_no_share_native_row(
     relayout: bool,
     relayout_reason: str,
 ) -> dict[str, Any] | None:
-    if str(policy) not in {"fixed_max_no_share", "always_no_share"}:
+    if not _non_dp_policy_is_no_share(str(policy)):
         return None
     if not _conv_native_stripe_candidate_allowed(edge, target_layout):
         return None
@@ -4068,7 +4129,15 @@ def _plan_fixed_max_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: 
 
 
 def _plan_fixed_max_no_share(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
-    return _plan_non_dp_topological(dag, edges, policy="fixed_max_no_share", slots=int(slots))
+    return _plan_fixed_max_no_share_fused(dag, edges, slots=int(slots))
+
+
+def _plan_fixed_max_no_share_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="fixed_max_no_share_fused", slots=int(slots))
+
+
+def _plan_fixed_max_no_share_unfused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="fixed_max_no_share_unfused", slots=int(slots))
 
 
 def _plan_eager(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
@@ -4096,7 +4165,15 @@ def _plan_always_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int
 
 
 def _plan_always_no_share(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
-    return _plan_non_dp_topological(dag, edges, policy="always_no_share", slots=int(slots))
+    return _plan_always_no_share_fused(dag, edges, slots=int(slots))
+
+
+def _plan_always_no_share_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="always_no_share_fused", slots=int(slots))
+
+
+def _plan_always_no_share_unfused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="always_no_share_unfused", slots=int(slots))
 
 
 def _plan_orion_dense(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
@@ -5350,6 +5427,10 @@ def plan_policy(
         return _plan_fixed_max_fused(dag, edges, slots=int(slots))
     if normalized == "fixed_max_no_share":
         return _plan_fixed_max_no_share(dag, edges, slots=int(slots))
+    if normalized == "fixed_max_no_share_fused":
+        return _plan_fixed_max_no_share_fused(dag, edges, slots=int(slots))
+    if normalized == "fixed_max_no_share_unfused":
+        return _plan_fixed_max_no_share_unfused(dag, edges, slots=int(slots))
     if normalized == "eager":
         return _plan_eager(dag, edges, slots=int(slots))
     if normalized == "eager_fused":
@@ -5364,6 +5445,10 @@ def plan_policy(
         return _plan_always_fused(dag, edges, slots=int(slots))
     if normalized == "always_no_share":
         return _plan_always_no_share(dag, edges, slots=int(slots))
+    if normalized == "always_no_share_fused":
+        return _plan_always_no_share_fused(dag, edges, slots=int(slots))
+    if normalized == "always_no_share_unfused":
+        return _plan_always_no_share_unfused(dag, edges, slots=int(slots))
     if normalized == "orion_dense":
         return _plan_orion_dense(dag, edges, slots=int(slots))
     if normalized == "dp":
@@ -5378,7 +5463,15 @@ def validate_layout_policy_compile_plan(compile_plan: dict[str, Any]) -> dict[st
 
     policy = str(compile_plan.get("policy", ""))
     errors: list[str] = []
-    no_share_native_policies = {"dp_no_share_fold", "fixed_max_no_share", "always_no_share"}
+    no_share_native_policies = {
+        "dp_no_share_fold",
+        "fixed_max_no_share",
+        "fixed_max_no_share_fused",
+        "fixed_max_no_share_unfused",
+        "always_no_share",
+        "always_no_share_fused",
+        "always_no_share_unfused",
+    }
     if policy in no_share_native_policies:
         for row in compile_plan.get("edge_layouts", []):
             edge = str(row.get("edge", ""))
@@ -5508,7 +5601,16 @@ def build_planner_ablation(
     normalized_policies = normalize_policies(policies)
     plans = [plan_policy(dag, edges, policy, slots=int(slots)) for policy in normalized_policies]
     fixed_objective = next(
-        (plan.objective for plan in plans if plan.policy in {"fixed_max", "fixed_max_no_share"}),
+        (
+            plan.objective
+            for plan in plans
+            if plan.policy in {
+                "fixed_max",
+                "fixed_max_no_share",
+                "fixed_max_no_share_fused",
+                "fixed_max_no_share_unfused",
+            }
+        ),
         None,
     )
     if fixed_objective is None:
@@ -5651,7 +5753,11 @@ def _provider_mode_for_policy(spec: NetworkSpec, policy: str) -> str:
         "fixed_max": "fixedmax",
         "fixed_max_fused": "fixedmax_fused",
         "fixed_max_no_share": "fixedmax_no_share",
+        "fixed_max_no_share_fused": "fixedmax_no_share",
+        "fixed_max_no_share_unfused": "fixedmax_no_share_unfused",
         "always_no_share": "always_no_share",
+        "always_no_share_fused": "always_no_share",
+        "always_no_share_unfused": "always_no_share_unfused",
         "orion_dense": "oriondense",
     }
     suffix = suffixes.get(str(normalized), str(normalized))

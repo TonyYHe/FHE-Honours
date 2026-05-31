@@ -289,7 +289,37 @@ def _normalize_u22_layout_policy(value: str) -> str:
         "fixed_max_noshare",
         "fixed-max-noshare",
     }:
-        return "fixed_max_no_share"
+        return "fixed_max_no_share_fused"
+    if normalized in {
+        "fixed_no_share_fused",
+        "fixed-no-share-fused",
+        "fixed_noshare_fused",
+        "fixed-noshare-fused",
+        "fixedmax_no_share_fused",
+        "fixedmax-no-share-fused",
+        "fixedmax_noshare_fused",
+        "fixedmax-noshare-fused",
+        "fixed_max_no_share_fused",
+        "fixed-max-no-share-fused",
+        "fixed_max_noshare_fused",
+        "fixed-max-noshare-fused",
+    }:
+        return "fixed_max_no_share_fused"
+    if normalized in {
+        "fixed_no_share_unfused",
+        "fixed-no-share-unfused",
+        "fixed_noshare_unfused",
+        "fixed-noshare-unfused",
+        "fixedmax_no_share_unfused",
+        "fixedmax-no-share-unfused",
+        "fixedmax_noshare_unfused",
+        "fixedmax-noshare-unfused",
+        "fixed_max_no_share_unfused",
+        "fixed-max-no-share-unfused",
+        "fixed_max_noshare_unfused",
+        "fixed-max-noshare-unfused",
+    }:
+        return "fixed_max_no_share_unfused"
     if normalized in {"fixed_fused", "fixed-fused", "fixedmax_fused", "fixedmax-fused", "fixed_max_fused", "fixed-max-fused"}:
         return "fixed_max_fused"
     if normalized in {"eager_fused", "eager-fused", "eager_relayout_fused", "eager-relayout-fused"}:
@@ -308,7 +338,29 @@ def _normalize_u22_layout_policy(value: str) -> str:
         "always_relayout_noshare",
         "always-relayout-noshare",
     }:
-        return "always_no_share"
+        return "always_no_share_fused"
+    if normalized in {
+        "always_no_share_fused",
+        "always-no-share-fused",
+        "always_noshare_fused",
+        "always-noshare-fused",
+        "always_relayout_no_share_fused",
+        "always-relayout-no-share-fused",
+        "always_relayout_noshare_fused",
+        "always-relayout-noshare-fused",
+    }:
+        return "always_no_share_fused"
+    if normalized in {
+        "always_no_share_unfused",
+        "always-no-share-unfused",
+        "always_noshare_unfused",
+        "always-noshare-unfused",
+        "always_relayout_no_share_unfused",
+        "always-relayout-no-share-unfused",
+        "always_relayout_noshare_unfused",
+        "always-relayout-noshare-unfused",
+    }:
+        return "always_no_share_unfused"
     if normalized in {"orion", "dense", "orion_dense", "orion-dense", "oriondense", "no_halo", "no-halo", "nohalo"}:
         return "orion_dense"
     if normalized in {
@@ -826,7 +878,15 @@ def _layout_policy_native_module_attrs(
                 _layout_physical_top_beta(output_layout) > 0 or _layout_physical_bottom_beta(output_layout) > 0
             ):
                 attrs["layout_policy_output_materialization"] = "fused_relayout"
-    if str(compile_plan.get("policy", "")) in {"dp_no_share_fold", "fixed_max_no_share", "always_no_share"}:
+    if str(compile_plan.get("policy", "")) in {
+        "dp_no_share_fold",
+        "fixed_max_no_share",
+        "fixed_max_no_share_fused",
+        "fixed_max_no_share_unfused",
+        "always_no_share",
+        "always_no_share_fused",
+        "always_no_share_unfused",
+    }:
         attrs["layout_policy_provider_lt_grouping_mode"] = "individual"
         attrs["layout_policy_native_halo_channel_fold_mode"] = "per_stripe"
     return attrs
@@ -4159,6 +4219,8 @@ class U22CompileRegistry:
                 "fixed_max",
                 "fixed_max_fused",
                 "fixed_max_no_share",
+                "fixed_max_no_share_fused",
+                "fixed_max_no_share_unfused",
                 "eager",
                 "eager_fused",
                 "greedy",
@@ -4166,6 +4228,8 @@ class U22CompileRegistry:
                 "always",
                 "always_fused",
                 "always_no_share",
+                "always_no_share_fused",
+                "always_no_share_unfused",
                 "orion_dense",
                 "dp",
                 "dp_no_share_fold",
@@ -4173,7 +4237,15 @@ class U22CompileRegistry:
         ):
             registry_policy = (
                 "dp_no_share_fold"
-                if normalized_layout_policy in {"fixed_max_no_share", "always_no_share"}
+                if normalized_layout_policy
+                in {
+                    "fixed_max_no_share",
+                    "fixed_max_no_share_fused",
+                    "fixed_max_no_share_unfused",
+                    "always_no_share",
+                    "always_no_share_fused",
+                    "always_no_share_unfused",
+                }
                 else "dp"
             )
             provider_registry = cls.for_dag(

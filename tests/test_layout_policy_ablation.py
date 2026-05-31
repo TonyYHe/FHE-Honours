@@ -29,6 +29,7 @@ from orion.experimental.layout_policy_ablation import (
     build_layout_policy_compile_plan,
     build_u22_dag,
     network_spec,
+    normalize_policy,
     run_backend_runtime_anchors,
     run_non_ckks_layout_simulation,
     run_runtime_anchor,
@@ -540,7 +541,7 @@ def test_native_halo_closed_form_diag_sets_match_torch_oracle() -> None:
                         )
 
 
-@pytest.mark.parametrize("policy", ("fixed_max_no_share", "always_no_share"))
+@pytest.mark.parametrize("policy", ("fixed_max_no_share_unfused", "always_no_share_unfused"))
 def test_layout_policy_non_dp_no_share_variants_use_individual_native_stripe(policy: str) -> None:
     plan = build_layout_policy_compile_plan(
         _prepared_one_down_one_up_dag(image_size=128, base_channels=8),
@@ -562,7 +563,35 @@ def test_layout_policy_non_dp_no_share_variants_use_individual_native_stripe(pol
     assert all(row["native_halo_rotation_mode"] == "c_only" for row in native_rows)
 
 
-@pytest.mark.parametrize("policy", ("fixed_max_no_share", "always_no_share"))
+@pytest.mark.parametrize(
+    ("public_policy", "canonical"),
+    (
+        ("fixed_max_no_share", "fixed_max_no_share_fused"),
+        ("fixedmax_no_share", "fixed_max_no_share_fused"),
+        ("always_no_share", "always_no_share_fused"),
+        ("always_relayout_no_share", "always_no_share_fused"),
+    ),
+)
+def test_layout_policy_no_share_defaults_to_fused(public_policy: str, canonical: str) -> None:
+    assert normalize_policy(public_policy) == canonical
+    plan = build_layout_policy_compile_plan(
+        _prepared_one_down_one_up_dag(image_size=128, base_channels=8),
+        policy=public_policy,
+        slots=4096,
+    )
+    assert plan["policy"] == canonical
+    assert plan["validation"]["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        "fixed_max_no_share_fused",
+        "fixed_max_no_share_unfused",
+        "always_no_share_fused",
+        "always_no_share_unfused",
+    ),
+)
 def test_layout_policy_non_dp_no_share_validator_requires_individual_stripe(policy: str) -> None:
     with pytest.raises(ValueError, match="individual LT grouping"):
         validate_layout_policy_compile_plan(
@@ -622,8 +651,12 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
     assert opts["u22_allowed_nodes"] == ("up1", "up2", "up3", "up4")
     assert _region_first_mode_options("u22_64_base32_layout_always")["u22_layout_policy"] == "always"
     assert _region_first_mode_options("u22_256_base32_layout_fixed_max_fused")["u22_layout_policy"] == "fixed_max_fused"
-    assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share")["u22_layout_policy"] == "fixed_max_no_share"
-    assert _region_first_mode_options("u22_256_base32_layout_always_no_share")["u22_layout_policy"] == "always_no_share"
+    assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share")["u22_layout_policy"] == "fixed_max_no_share_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share_fused")["u22_layout_policy"] == "fixed_max_no_share_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share_unfused")["u22_layout_policy"] == "fixed_max_no_share_unfused"
+    assert _region_first_mode_options("u22_256_base32_layout_always_no_share")["u22_layout_policy"] == "always_no_share_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_always_no_share_fused")["u22_layout_policy"] == "always_no_share_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_always_no_share_unfused")["u22_layout_policy"] == "always_no_share_unfused"
     assert _region_first_mode_options("u22_256_base32_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
     assert _region_first_mode_options("u22_256_base32_layout_dp_noshare_fold")["u22_layout_policy"] == "dp_no_share_fold"
     assert _region_first_mode_options("generic_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
@@ -2549,6 +2582,216 @@ def test_bootstrap_aware_refinement_lifts_conv_to_conv_boot_boundary() -> None:
     assert not executor.native_physical_relayout_rows
 
 
+def test_bootstrap_aware_refinement_lifts_local_activation_tail_cleanup() -> None:
+    compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "core_slots": 16, "stored_slots": 16, "tile_count": 1}
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 8,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "conv1->act",
+                "source": "conv1",
+                "target": "act",
+                "op_kind": "silu",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(compact),
+                "target_layout": dict(compact),
+                "required_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "packed_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "act->conv2",
+                "source": "act",
+                "target": "conv2",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "relayout": False,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": node,
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            }
+            for node in ("conv1", "act", "conv2")
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(depth=2)),
+        output_node_id="conv2",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][1]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    conv2 = Conv2d(1, 1, kernel_size=3, padding=1)
+    conv2.region_runtime = SimpleNamespace(executor=executor)
+    act = SiLU(degree=7)
+    act.fhe_output_shape = torch.Size((1, 1, 4, 4))
+
+    dag = nx.DiGraph()
+    dag.add_node("conv1", module=Conv2d(1, 1, kernel_size=3, padding=1))
+    dag.add_node("act", module=act)
+    dag.add_node("conv2", module=conv2)
+    dag.add_node("boot_src", module=SimpleNamespace(depth=1))
+    dag.add_node("boot_tgt", module=SimpleNamespace(depth=1))
+    dag.add_edge("conv1", "act")
+    dag.add_edge("act", "conv2")
+    dag.add_edge("boot_src", "boot_tgt")
+
+    enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+    )
+    local_candidates = [
+        row for row in enumeration["candidates"] if row["strategy"] == "local_activation_beta_lift"
+    ]
+
+    audit = apply_bootstrap_aware_layout_refinement(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+    )
+    updated = executor.compile_plan
+    nodes = {str(row["node"]): dict(row) for row in updated["node_layouts"]}
+    edges = {str(row["edge"]): dict(row) for row in updated["edge_layouts"]}
+
+    assert len(local_candidates) == 1
+    assert local_candidates[0]["candidate_priority"] == 1
+    assert int(local_candidates[0]["rotation_delta"]) > 0
+    assert local_candidates[0]["require_bootstrap_count_unchanged"] is True
+    assert local_candidates[0]["require_bootstrap_shape_nonincrease"] is True
+    assert audit["enabled"] is True
+    assert audit["strategy"] == "local_activation_beta_lift"
+    assert int(audit["rotation_delta"]) > 0
+    assert int(updated["summary"]["producer_fused_rotation_estimate"]) == int(audit["rotation_delta"])
+    assert int(updated["summary"]["reported_rotation_estimate"]) == int(audit["rotation_delta"])
+    assert audit["require_bootstrap_count_unchanged"] is True
+    assert audit["require_bootstrap_shape_nonincrease"] is True
+    assert audit["accepted"][0]["producer"] == "conv1"
+    assert audit["accepted"][0]["carried_edges"][0]["edge"] == "conv1->act"
+    assert nodes["conv1"]["producer_materialized_halo"] is True
+    assert nodes["act"]["producer_materialized_halo"] is True
+    assert edges["conv1->act"]["physical_layout"] == "logical_halo_compact"
+    assert edges["act->conv2"]["physical_layout"] == "logical_halo_compact"
+    assert tuple(int(value) for value in act.fhe_output_shape) == (1, 1, 6, 4)
+    assert not executor.native_physical_relayout_rows
+
+
+def test_bootstrap_aware_refinement_rejects_local_activation_cleanup_with_external_fanout() -> None:
+    compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "core_slots": 16, "stored_slots": 16, "tile_count": 1}
+    beta1 = {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "core_slots": 16, "stored_slots": 24, "tile_count": 1}
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 8,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "conv1->act",
+                "source": "conv1",
+                "target": "act",
+                "op_kind": "silu",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(compact),
+                "target_layout": dict(compact),
+                "required_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "packed_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "act->conv2",
+                "source": "act",
+                "target": "conv2",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "relayout": False,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": node,
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            }
+            for node in ("conv1", "act", "conv2")
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(depth=2)),
+        output_node_id="conv2",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][1]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    conv2 = Conv2d(1, 1, kernel_size=3, padding=1)
+    conv2.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("conv1", module=Conv2d(1, 1, kernel_size=3, padding=1))
+    dag.add_node("act", module=SiLU(degree=7))
+    dag.add_node("conv2", module=conv2)
+    dag.add_node("side", module=SimpleNamespace(depth=1))
+    dag.add_node("boot_src", module=SimpleNamespace(depth=1))
+    dag.add_node("boot_tgt", module=SimpleNamespace(depth=1))
+    dag.add_edge("conv1", "act")
+    dag.add_edge("act", "conv2")
+    dag.add_edge("act", "side")
+    dag.add_edge("boot_src", "boot_tgt")
+
+    audit = apply_bootstrap_aware_layout_refinement(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+    )
+
+    assert audit["enabled"] is False
+    assert audit["reason"] == "no_supported_boot_interval_native_physical_relayout"
+    assert executor.compile_plan["edge_layouts"][1]["physical_layout"] == "native_source_stripe"
+
+
 def test_bootstrap_aware_refinement_rejects_boot_boundary_lift_with_external_fanout() -> None:
     compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "core_slots": 16, "stored_slots": 16, "tile_count": 1}
     beta1 = {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "core_slots": 16, "stored_slots": 24, "tile_count": 1}
@@ -3867,7 +4110,11 @@ def test_u22_224_silu7_provider_runner_accepts_always_fused_policy() -> None:
 
     assert runner._provider_mode("always_fused") == "u22_256_base32_layout_always_fused"
     assert runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
+    assert runner._provider_mode("fixed_max_no_share_fused") == "u22_256_base32_layout_fixedmax_no_share"
+    assert runner._provider_mode("fixed_max_no_share_unfused") == "u22_256_base32_layout_fixedmax_no_share_unfused"
     assert runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share"
+    assert runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share"
+    assert runner._provider_mode("always_no_share_unfused") == "u22_256_base32_layout_always_no_share_unfused"
 
     env = runner._apply_env_defaults(
         {
@@ -3892,11 +4139,19 @@ def test_u22_dim32_runners_accept_no_share_fold_policy() -> None:
     assert matrix_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert matrix_runner._provider_mode("dp_noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert matrix_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
+    assert matrix_runner._provider_mode("fixed_max_no_share_fused") == "u22_256_base32_layout_fixedmax_no_share"
+    assert matrix_runner._provider_mode("fixed_max_no_share_unfused") == "u22_256_base32_layout_fixedmax_no_share_unfused"
     assert matrix_runner._provider_mode("always_no_share") == "u22_256_base32_layout_always_no_share"
+    assert matrix_runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share"
+    assert matrix_runner._provider_mode("always_no_share_unfused") == "u22_256_base32_layout_always_no_share_unfused"
     assert encoder4_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert encoder4_runner._provider_mode("noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert encoder4_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
+    assert encoder4_runner._provider_mode("fixed_max_no_share_fused") == "u22_256_base32_layout_fixedmax_no_share"
+    assert encoder4_runner._provider_mode("fixed_max_no_share_unfused") == "u22_256_base32_layout_fixedmax_no_share_unfused"
     assert encoder4_runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share"
+    assert encoder4_runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share"
+    assert encoder4_runner._provider_mode("always_no_share_unfused") == "u22_256_base32_layout_always_no_share_unfused"
 
 
 def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:

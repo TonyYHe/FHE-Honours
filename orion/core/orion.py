@@ -396,10 +396,26 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                     "fixedmax_no_share",
                     "fixed_max_noshare",
                     "fixedmax_noshare",
+                    "fixed_max_no_share_fused",
+                    "fixedmax_no_share_fused",
+                    "fixed_max_noshare_fused",
+                    "fixedmax_noshare_fused",
+                    "fixed_max_no_share_unfused",
+                    "fixedmax_no_share_unfused",
+                    "fixed_max_noshare_unfused",
+                    "fixedmax_noshare_unfused",
                     "always_no_share",
                     "always_noshare",
                     "always_relayout_no_share",
                     "always_relayout_noshare",
+                    "always_no_share_fused",
+                    "always_noshare_fused",
+                    "always_relayout_no_share_fused",
+                    "always_relayout_noshare_fused",
+                    "always_no_share_unfused",
+                    "always_noshare_unfused",
+                    "always_relayout_no_share_unfused",
+                    "always_relayout_noshare_unfused",
                     "no_share_fold",
                     "noshare_fold",
                 ):
@@ -414,25 +430,44 @@ def _region_first_mode_options(mode: str) -> dict[str, Any]:
                 if fused_index < len(tokens) and str(tokens[fused_index]) == "fused":
                     raw_policy = f"{raw_policy}_fused"
                     consumed += 1
+                elif fused_index < len(tokens) and str(tokens[fused_index]) == "unfused":
+                    raw_policy = f"{raw_policy}_unfused"
+                    consumed += 1
                 policy_aliases = {
                     "fixed": "fixed_max",
                     "fixedmax": "fixed_max",
                     "fixed_fused": "fixed_max_fused",
                     "fixedmax_fused": "fixed_max_fused",
-                    "fixed_max_no_share": "fixed_max_no_share",
-                    "fixedmax_no_share": "fixed_max_no_share",
-                    "fixed_max_noshare": "fixed_max_no_share",
-                    "fixedmax_noshare": "fixed_max_no_share",
+                    "fixed_max_no_share": "fixed_max_no_share_fused",
+                    "fixedmax_no_share": "fixed_max_no_share_fused",
+                    "fixed_max_noshare": "fixed_max_no_share_fused",
+                    "fixedmax_noshare": "fixed_max_no_share_fused",
+                    "fixed_max_no_share_fused": "fixed_max_no_share_fused",
+                    "fixedmax_no_share_fused": "fixed_max_no_share_fused",
+                    "fixed_max_noshare_fused": "fixed_max_no_share_fused",
+                    "fixedmax_noshare_fused": "fixed_max_no_share_fused",
+                    "fixed_max_no_share_unfused": "fixed_max_no_share_unfused",
+                    "fixedmax_no_share_unfused": "fixed_max_no_share_unfused",
+                    "fixed_max_noshare_unfused": "fixed_max_no_share_unfused",
+                    "fixedmax_noshare_unfused": "fixed_max_no_share_unfused",
                     "eager": "eager",
                     "eager_fused": "eager_fused",
                     "greedy": "greedy",
                     "greedy_fused": "greedy_fused",
                     "always": "always",
                     "always_fused": "always_fused",
-                    "always_no_share": "always_no_share",
-                    "always_noshare": "always_no_share",
-                    "always_relayout_no_share": "always_no_share",
-                    "always_relayout_noshare": "always_no_share",
+                    "always_no_share": "always_no_share_fused",
+                    "always_noshare": "always_no_share_fused",
+                    "always_relayout_no_share": "always_no_share_fused",
+                    "always_relayout_noshare": "always_no_share_fused",
+                    "always_no_share_fused": "always_no_share_fused",
+                    "always_noshare_fused": "always_no_share_fused",
+                    "always_relayout_no_share_fused": "always_no_share_fused",
+                    "always_relayout_noshare_fused": "always_no_share_fused",
+                    "always_no_share_unfused": "always_no_share_unfused",
+                    "always_noshare_unfused": "always_no_share_unfused",
+                    "always_relayout_no_share_unfused": "always_no_share_unfused",
+                    "always_relayout_noshare_unfused": "always_no_share_unfused",
                     "orion": "orion_dense",
                     "dense": "orion_dense",
                     "oriondense": "orion_dense",
@@ -963,13 +998,86 @@ class Scheme:
                     1,
                     int(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS", "16") or 16),
                 )
+                target_bootstrap_count: int | None = None
+                target_bootstrap_source = ""
+                target_bootstrap_audit: dict[str, Any] | None = None
+                target_bootstrap_error = ""
+                target_raw = str(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_TARGET_BOOTSTRAPS", "") or "").strip()
+                if target_raw:
+                    try:
+                        target_bootstrap_count = max(0, int(target_raw))
+                        target_bootstrap_source = "env"
+                    except (TypeError, ValueError):
+                        target_bootstrap_error = f"invalid_env_target:{target_raw}"
+                auto_target_enabled = (
+                    target_bootstrap_count is None
+                    and str(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_AUTO_TARGET", "1") or "1").lower()
+                    not in {"0", "false", "no", "off"}
+                )
+
+                def _restore_depth_snapshot(depth_snapshot: list[dict[str, Any]]) -> None:
+                    for depth_row in depth_snapshot:
+                        runtime = depth_row.get("runtime")
+                        module = depth_row.get("module")
+                        if runtime is not None:
+                            if depth_row.get("runtime_depth") is not None:
+                                runtime.depth = int(depth_row["runtime_depth"])
+                            if depth_row.get("runtime_solver_depth") is not None:
+                                runtime.solver_depth = int(depth_row["runtime_solver_depth"])
+                        if module is not None and depth_row.get("module_depth") is not None:
+                            if hasattr(module, "set_depth"):
+                                module.set_depth(int(depth_row["module_depth"]))
+                            else:
+                                module.depth = int(depth_row["module_depth"])
+
+                def _estimate_relayout_free_bootstrap_target(
+                    depth_snapshot: list[dict[str, Any]],
+                ) -> tuple[int, dict[str, Any]]:
+                    assignment_snapshot = snapshot_bootstrap_solver_assignments(network_dag)
+                    try:
+                        for depth_row in depth_snapshot:
+                            runtime = depth_row.get("runtime")
+                            module = depth_row.get("module")
+                            raw_depth = depth_row.get("runtime_solver_depth")
+                            if raw_depth is None:
+                                raw_depth = depth_row.get("runtime_depth")
+                            if raw_depth is None:
+                                raw_depth = depth_row.get("module_depth")
+                            if raw_depth is None:
+                                continue
+                            base_depth = max(
+                                0,
+                                int(raw_depth) - int(depth_row.get("relayout_depth", 0) or 0),
+                            )
+                            if runtime is not None:
+                                runtime.depth = int(base_depth)
+                                runtime.solver_depth = int(base_depth)
+                            if module is not None:
+                                if hasattr(module, "set_depth"):
+                                    module.set_depth(int(base_depth))
+                                else:
+                                    module.depth = int(base_depth)
+                        reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                        target_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                        _target_input_level, target_bootstraps, _target_slots = target_solver._solve_once(
+                            apply_layout_compression=False
+                        )
+                        target_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                        return int(target_audit.get("bootstrap_count", target_bootstraps) or 0), dict(target_audit)
+                    finally:
+                        _restore_depth_snapshot(depth_snapshot)
+                        reset_bootstrap_solver_assignments(network_dag, assignment_snapshot)
+
                 rollback_audit: dict[str, Any] | None = None
                 stopped_reason = "max_rounds_reached"
+                refinement_policy = "dp_no_share_fold"
                 for round_index in range(int(max_refinement_rounds)):
                     candidate_audit = enumerate_bootstrap_aware_layout_refinement_candidates(
                         network_dag,
                         current_audit,
                     )
+                    if str(candidate_audit.get("policy", "")):
+                        refinement_policy = str(candidate_audit.get("policy", ""))
                     round_audit = {
                         **dict(candidate_audit),
                         "round": int(round_index + 1),
@@ -987,9 +1095,46 @@ class Scheme:
                     current_relayout_depth = int(
                         sum(int(row.get("relayout_depth", 0) or 0) for row in accepted_depths)
                     )
+                    if target_bootstrap_count is None and auto_target_enabled:
+                        try:
+                            target_bootstrap_count, target_bootstrap_audit = _estimate_relayout_free_bootstrap_target(
+                                accepted_depths
+                            )
+                            target_bootstrap_source = "relayout_free_depth"
+                        except Exception as exc:
+                            target_bootstrap_error = str(exc)
+                            auto_target_enabled = False
+                    if target_bootstrap_count is not None:
+                        round_audit = {
+                            **dict(round_audit),
+                            "target_bootstrap_count": int(target_bootstrap_count),
+                            "target_bootstrap_source": str(target_bootstrap_source),
+                        }
+                        if int(current_boot_count) <= int(target_bootstrap_count):
+                            round_audit = {
+                                **dict(round_audit),
+                                "enabled": False,
+                                "stopped_at_bootstrap_target": True,
+                                "trials": [],
+                            }
+                            refinement_rounds.append(round_audit)
+                            stopped_reason = "bootstrap_target_reached"
+                            break
+                    current_bootstrap_ct_count = int(
+                        sum(
+                            int(row.get("bootstrap_ct_count", 0) or 0)
+                            for row in current_audit.get("boot_edges", [])
+                        )
+                    )
+                    current_bootstrap_slots_total = int(
+                        sum(
+                            int(row.get("bootstrapper_slots", 0) or 0)
+                            for row in current_audit.get("boot_edges", [])
+                        )
+                    )
                     trials: list[dict[str, Any]] = []
                     best_trial: dict[str, Any] | None = None
-                    best_score: tuple[int, int, int, int, int, int, int, str] | None = None
+                    best_score: tuple[int, int, int, int, int, int, int, int, str] | None = None
                     for candidate in candidates:
                         trial_module_layout_snapshot = None
                         try:
@@ -1026,14 +1171,29 @@ class Scheme:
                                     for row in trial_final_audit.get("boot_edges", [])
                                 )
                             )
+                            bootstrap_ct_delta = int(bootstrap_ct_count - current_bootstrap_ct_count)
                             bootstrap_slots_total = int(
                                 sum(
                                     int(row.get("bootstrapper_slots", 0) or 0)
                                     for row in trial_final_audit.get("boot_edges", [])
                                 )
                             )
+                            bootstrap_slots_delta = int(bootstrap_slots_total - current_bootstrap_slots_total)
                             accepted_count_for_score = int(trial_apply_audit.get("accepted_count", 0) or 0)
-                            acceptable = bool(int(boot_delta) <= 0 and int(depth_delta) < 0)
+                            bootstrap_shape_safe = bool(
+                                not bool(candidate.get("require_bootstrap_shape_nonincrease", False))
+                                or (int(bootstrap_ct_delta) <= 0 and int(bootstrap_slots_delta) <= 0)
+                            )
+                            bootstrap_count_safe = bool(
+                                int(boot_delta) == 0
+                                if bool(candidate.get("require_bootstrap_count_unchanged", False))
+                                else int(boot_delta) <= 0
+                            )
+                            acceptable = bool(
+                                bool(bootstrap_count_safe)
+                                and int(depth_delta) < 0
+                                and bool(bootstrap_shape_safe)
+                            )
                             trial_audit = {
                                 **dict(trial_apply_audit),
                                 "accepted": bool(acceptable),
@@ -1042,17 +1202,23 @@ class Scheme:
                                 "trial_bootstrapper_slots": [int(value) for value in trial_slots],
                                 "boot_delta": int(boot_delta),
                                 "relayout_depth_delta": int(depth_delta),
+                                "bootstrap_ct_delta": int(bootstrap_ct_delta),
+                                "bootstrap_slots_delta": int(bootstrap_slots_delta),
+                                "bootstrap_count_safe": bool(bootstrap_count_safe),
+                                "bootstrap_shape_safe": bool(bootstrap_shape_safe),
                                 "trial_boot_edges": list(trial_final_audit.get("boot_edges", [])),
                             }
                             trials.append(trial_audit)
                             if bool(acceptable):
+                                rotation_delta = int(candidate.get("rotation_delta", 0) or 0)
                                 score = (
                                     int(boot_delta),
-                                    int(depth_delta),
+                                    int(candidate.get("candidate_priority", 0) or 0),
+                                    int(rotation_delta),
                                     int(bootstrap_ct_count),
                                     int(bootstrap_slots_total),
+                                    int(depth_delta),
                                     -int(accepted_count_for_score),
-                                    int(candidate.get("rotation_delta", 0) or 0),
                                     int(len(trials)),
                                     str(candidate.get("candidate_id", "")),
                                 )
@@ -1130,6 +1296,10 @@ class Scheme:
                         **dict(refinement_audit),
                         "candidate_count": int(candidate_audit.get("candidate_count", len(candidates)) or len(candidates)),
                         "trials": trials,
+                        "target_bootstrap_count": (
+                            None if target_bootstrap_count is None else int(target_bootstrap_count)
+                        ),
+                        "target_bootstrap_source": str(target_bootstrap_source),
                         "final_bootstrap_count": int(final_audit["bootstrap_count"]),
                         "final_boot_edges": list(final_audit.get("boot_edges", [])),
                     }
@@ -1178,12 +1348,18 @@ class Scheme:
                 }
                 network_dag.bootstrap_layout_refinement_audit = {
                     "enabled": bool(accepted_count > 0),
-                    "policy": "dp_no_share_fold",
+                    "policy": str(refinement_policy),
                     "fixed_point": bool(rollback_audit is None and stopped_reason != "max_rounds_reached"),
                     "stopped_reason": str(stopped_reason),
                     "rolled_back": bool(rollback_audit is not None),
                     "first_pass_bootstrap_count": int(initial_audit.get("bootstrap_count", 0) or 0),
                     "final_bootstrap_count": int(num_bootstraps),
+                    "target_bootstrap_count": (
+                        None if target_bootstrap_count is None else int(target_bootstrap_count)
+                    ),
+                    "target_bootstrap_source": str(target_bootstrap_source),
+                    "target_bootstrap_error": str(target_bootstrap_error),
+                    "target_boot_edges": list((target_bootstrap_audit or {}).get("boot_edges", [])),
                     "accepted_round_count": int(len(accepted_rounds)),
                     "accepted_count": int(accepted_count),
                     "rounds": refinement_rounds,
