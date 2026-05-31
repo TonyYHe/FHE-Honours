@@ -336,6 +336,57 @@ def test_cpp_dense_conv2d_block_payload_builder_handles_gap_offsets_and_late_blo
     assert getattr(layer, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
 
 
+def test_cpp_dense_conv2d_block_payload_builder_sorts_deduplicates_and_drops_oob(monkeypatch) -> None:
+    torch.manual_seed(17)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    layer = Conv2d(3, 4, kernel_size=3, padding=1, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=32, embedding_method="square")
+    _configure_conv2d(layer, torch.randn(1, 3, 4, 5), input_gap=1)
+
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "0")
+    full, _rotations = packing.pack_conv2d(layer, last=False)
+    sorted_keys = tuple(sorted(full.keys()))
+    requested = (
+        sorted_keys[-1],
+        sorted_keys[0],
+        sorted_keys[-1],
+        (999, 999),
+        (-1, 0),
+    )
+    expected_keys = tuple(sorted({sorted_keys[0], sorted_keys[-1]}))
+    expected = packing.pack_conv2d_blocks(layer, last=False, blocks=requested)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    actual = packing.pack_conv2d_blocks(layer, last=False, blocks=requested)
+    payloads = packing.build_conv2d_block_payloads(layer, last=False, blocks=requested)
+
+    assert tuple(sorted(actual)) == expected_keys
+    assert [(row, col) for row, col, _idx, _data in payloads] == list(expected_keys)
+    _assert_diagonals_close(actual, expected)
+    assert getattr(layer, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
+
+
+def test_cpp_dense_conv2d_block_payload_builder_oob_only_is_empty(monkeypatch) -> None:
+    torch.manual_seed(18)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    layer = Conv2d(2, 2, kernel_size=3, padding=1, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=32, embedding_method="square")
+    _configure_conv2d(layer, torch.randn(1, 2, 3, 4), input_gap=1)
+
+    requested = ((123, 456), (-1, 0))
+    payloads = packing.build_conv2d_block_payloads(layer, last=False, blocks=requested)
+
+    assert tuple(payloads) == ()
+    assert getattr(layer, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
+
+
 def test_cpp_dense_conv2d_payload_builder_covers_avgpool(monkeypatch) -> None:
     monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
     monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
@@ -611,6 +662,24 @@ def test_cpp_dense_conv_transpose2d_block_payload_builder_handles_gap_offsets_an
     assert set(actual) == set(block_keys)
     _assert_diagonals_close(actual, expected)
     assert [(row, col) for row, col, _idx, _data in payloads] == list(block_keys)
+    assert getattr(layer, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
+
+
+def test_cpp_dense_conv_transpose2d_block_payload_builder_oob_only_is_empty(monkeypatch) -> None:
+    torch.manual_seed(19)
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_DENSE", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_SHADOW", "1")
+    monkeypatch.setenv("ORION_CPP_DIAG_BUILDER_STRICT", "1")
+    layer = ConvTranspose2d(2, 2, kernel_size=2, stride=2, padding=0, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=32, embedding_method="square")
+    _configure_tconv2d(layer, torch.randn(1, 2, 3, 4), input_gap=1)
+
+    requested = ((123, 456), (-1, 0))
+    payloads = packing.build_conv_transpose2d_block_payloads(layer, last=False, blocks=requested)
+
+    assert tuple(payloads) == ()
     assert getattr(layer, "_last_diag_builder_metadata", {})["diag_builder_shadow_ok"] is True
 
 

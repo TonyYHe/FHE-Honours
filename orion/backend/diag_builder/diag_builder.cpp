@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -399,6 +400,11 @@ struct DenseSpec {
 };
 
 struct Accumulator {
+  struct Block {
+    std::pair<int, int> key = {-1, -1};
+    std::unordered_map<int, std::vector<float>> diagonals;
+  };
+
   int64_t matrix_height = 0;
   int64_t matrix_width = 0;
   int slots = 0;
@@ -407,14 +413,40 @@ struct Accumulator {
   int block_height = 0;
   int output_rotations = 0;
   bool restrict_blocks = false;
-  std::vector<std::pair<int, int>> requested_blocks;
-  std::map<std::pair<int, int>, std::map<int, std::vector<float>>> diagonals;
+  std::vector<Block> blocks;
+  std::unordered_map<int64_t, int> block_lookup;
 
-  bool BlockAllowed(int row, int col) const {
-    if (!restrict_blocks) {
-      return true;
+  static int64_t BlockLookupKey(int row, int col) {
+    return (static_cast<int64_t>(row) << 32) ^ static_cast<unsigned int>(col);
+  }
+
+  void InitBlocks(const std::vector<std::pair<int, int>> &block_keys, bool restricted) {
+    restrict_blocks = bool(restricted);
+    blocks.clear();
+    blocks.reserve(block_keys.size());
+    block_lookup.clear();
+    block_lookup.reserve(block_keys.size());
+    for (const auto &key : block_keys) {
+      const int index = static_cast<int>(blocks.size());
+      Block block;
+      block.key = key;
+      blocks.push_back(std::move(block));
+      block_lookup.emplace(BlockLookupKey(key.first, key.second), index);
     }
-    return std::binary_search(requested_blocks.begin(), requested_blocks.end(), std::make_pair(row, col));
+  }
+
+  Block *FindBlock(int row, int col) {
+    if (row < 0 || row >= num_block_rows || col < 0 || col >= num_block_cols) {
+      return nullptr;
+    }
+    if (!restrict_blocks) {
+      return &blocks[static_cast<std::size_t>(row * num_block_cols + col)];
+    }
+    const auto it = block_lookup.find(BlockLookupKey(row, col));
+    if (it == block_lookup.end()) {
+      return nullptr;
+    }
+    return &blocks[static_cast<std::size_t>(it->second)];
   }
 
   void AddEntry(int64_t row, int64_t col, float value) {
@@ -453,13 +485,13 @@ struct Accumulator {
       }
     }
 
-    if (!BlockAllowed(block_row, block_col)) {
+    Block *block = FindBlock(block_row, block_col);
+    if (block == nullptr) {
       return;
     }
-    auto &block = diagonals[std::make_pair(block_row, block_col)];
-    auto it = block.find(diag_idx);
-    if (it == block.end()) {
-      it = block.emplace(diag_idx, std::vector<float>(static_cast<std::size_t>(slots), 0.0f)).first;
+    auto it = block->diagonals.find(diag_idx);
+    if (it == block->diagonals.end()) {
+      it = block->diagonals.emplace(diag_idx, std::vector<float>(static_cast<std::size_t>(slots), 0.0f)).first;
     }
     it->second[static_cast<std::size_t>(position)] += value;
   }
@@ -517,6 +549,11 @@ struct IndexAccumulator {
   }
 };
 
+std::vector<std::pair<int, int>> ValidBlockKeys(
+    int num_block_rows,
+    int num_block_cols,
+    const std::vector<std::pair<int, int>> &blocks);
+
 Accumulator MakeAccumulator(const DenseSpec &spec, const std::vector<std::pair<int, int>> &blocks) {
   Accumulator acc;
   acc.matrix_height = Numel4(spec.fhe_output_shape);
@@ -535,8 +572,7 @@ Accumulator MakeAccumulator(const DenseSpec &spec, const std::vector<std::pair<i
     acc.block_height = spec.slots;
     acc.output_rotations = 0;
   }
-  acc.restrict_blocks = !blocks.empty();
-  acc.requested_blocks = blocks;
+  acc.InitBlocks(ValidBlockKeys(acc.num_block_rows, acc.num_block_cols, blocks), !blocks.empty());
   return acc;
 }
 
@@ -1034,9 +1070,17 @@ OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float 
   out.len = static_cast<unsigned long>(block_keys.size());
   for (std::size_t i = 0; i < block_keys.size(); ++i) {
     const auto &block_key = block_keys[i];
-    const auto block_it = acc.diagonals.find(block_key);
-    const bool empty = block_it == acc.diagonals.end() || block_it->second.empty();
-    const int diag_count = empty ? 1 : static_cast<int>(block_it->second.size());
+    Accumulator::Block *block = acc.FindBlock(block_key.first, block_key.second);
+    const bool empty = block == nullptr || block->diagonals.empty();
+    std::vector<int> sorted_indices;
+    if (!empty) {
+      sorted_indices.reserve(block->diagonals.size());
+      for (const auto &diag : block->diagonals) {
+        sorted_indices.push_back(diag.first);
+      }
+      std::sort(sorted_indices.begin(), sorted_indices.end());
+    }
+    const int diag_count = empty ? 1 : static_cast<int>(sorted_indices.size());
     OrionDiagPayload payload{};
     payload.row = block_key.first;
     payload.col = block_key.second;
@@ -1051,11 +1095,12 @@ OrionDiagPayloadBatch BuildDensePayloadBatch(const DenseSpec &spec, const float 
       std::fill(payload.diag_data, payload.diag_data + spec.slots, 0.0f);
     } else {
       int offset = 0;
-      for (const auto &diag : block_it->second) {
-        payload.diag_indices[offset] = diag.first;
+      for (const int diag_idx : sorted_indices) {
+        const auto diag_it = block->diagonals.find(diag_idx);
+        payload.diag_indices[offset] = diag_idx;
         std::memcpy(
             payload.diag_data + static_cast<std::size_t>(offset) * spec.slots,
-            diag.second.data(),
+            diag_it->second.data(),
             sizeof(float) * static_cast<std::size_t>(spec.slots));
         ++offset;
       }
@@ -1134,9 +1179,17 @@ OrionDiagPayloadBatch BuildDenseConvTransposePayloadBatch(const DenseSpec &spec,
   out.len = static_cast<unsigned long>(block_keys.size());
   for (std::size_t i = 0; i < block_keys.size(); ++i) {
     const auto &block_key = block_keys[i];
-    const auto block_it = acc.diagonals.find(block_key);
-    const bool empty = block_it == acc.diagonals.end() || block_it->second.empty();
-    const int diag_count = empty ? 1 : static_cast<int>(block_it->second.size());
+    Accumulator::Block *block = acc.FindBlock(block_key.first, block_key.second);
+    const bool empty = block == nullptr || block->diagonals.empty();
+    std::vector<int> sorted_indices;
+    if (!empty) {
+      sorted_indices.reserve(block->diagonals.size());
+      for (const auto &diag : block->diagonals) {
+        sorted_indices.push_back(diag.first);
+      }
+      std::sort(sorted_indices.begin(), sorted_indices.end());
+    }
+    const int diag_count = empty ? 1 : static_cast<int>(sorted_indices.size());
     OrionDiagPayload payload{};
     payload.row = block_key.first;
     payload.col = block_key.second;
@@ -1151,11 +1204,12 @@ OrionDiagPayloadBatch BuildDenseConvTransposePayloadBatch(const DenseSpec &spec,
       std::fill(payload.diag_data, payload.diag_data + spec.slots, 0.0f);
     } else {
       int offset = 0;
-      for (const auto &diag : block_it->second) {
-        payload.diag_indices[offset] = diag.first;
+      for (const int diag_idx : sorted_indices) {
+        const auto diag_it = block->diagonals.find(diag_idx);
+        payload.diag_indices[offset] = diag_idx;
         std::memcpy(
             payload.diag_data + static_cast<std::size_t>(offset) * spec.slots,
-            diag.second.data(),
+            diag_it->second.data(),
             sizeof(float) * static_cast<std::size_t>(spec.slots));
         ++offset;
       }
