@@ -13,7 +13,7 @@ from .io_prefetch import (
     estimate_linear_transform_device_bytes,
     should_prefetch_saved_io,
 )
-from .memory_lifecycle import guard_host_memory, host_memory_info
+from .memory_lifecycle import forward_min_available_bytes, guard_host_memory, host_memory_info
 from .compile_policy import auto_batch_limit, auto_worker_count
 from orion.backend.python.tensors import CipherTensor
 from orion.core.bsgs_rotation_stats import individual_bsgs_ratio_rotation_stats
@@ -36,6 +36,7 @@ _DENSE_RESERVED_PLAINTEXT_DATASETS = _DENSE_COARSE_DIAG_DATASETS | {
 }
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
 _DENSE_LAYER_CACHE_GRANULARITIES = {"layer", "lt", "group"}
+_DENSE_LAYER_CACHE_AUTO_GROUP_VALUES = {"auto", "adaptive"}
 
 
 _COMPILE_PROFILE_KEYS = (
@@ -603,10 +604,109 @@ class NewEvaluator:
         raw_value = os.environ.get("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS")
         if raw_value is None:
             raw_value = os.environ.get("ORION_DENSE_LAYER_CACHE_GROUP_SIZE", "1")
+        if str(raw_value).strip().lower() in _DENSE_LAYER_CACHE_AUTO_GROUP_VALUES:
+            return 2**31 - 1
         try:
             return max(1, int(raw_value))
         except (TypeError, ValueError):
             return 1
+
+    def dense_layer_cache_auto_group_enabled(self) -> bool:
+        raw_value = os.environ.get("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS")
+        return str(raw_value or "").strip().lower() in _DENSE_LAYER_CACHE_AUTO_GROUP_VALUES
+
+    def _dense_layer_cache_auto_budget_bytes(self) -> int:
+        raw_gb = os.environ.get("ORION_DENSE_LAYER_CACHE_GROUP_BUDGET_GB")
+        if raw_gb is not None and str(raw_gb).strip():
+            try:
+                return max(1, int(float(raw_gb) * 1024**3))
+            except (TypeError, ValueError):
+                pass
+        info = host_memory_info()
+        if info is None:
+            return int(64 * 1024**3)
+        available_after_reserve = max(
+            1,
+            int(info.get("available_bytes", 0) or 0) - int(self._dense_layer_cache_auto_reserve_bytes()),
+        )
+        return int(min(192 * 1024**3, max(1, available_after_reserve // 4)))
+
+    def _dense_layer_cache_auto_reserve_bytes(self) -> int:
+        explicit = int(forward_min_available_bytes())
+        if explicit > 0:
+            return int(explicit)
+        if not self.dense_layer_cache_auto_group_enabled():
+            return 0
+        info = host_memory_info()
+        if info is None:
+            return 0
+        total = int(info.get("total_bytes", 0) or 0)
+        if total < int(128 * 1024**3):
+            return 0
+        return int(min(256 * 1024**3, max(1, total // 4)))
+
+    def _dense_layer_cache_check_auto_memory_cap(self, *, reason: str, estimated_bytes: int) -> None:
+        if not self.dense_layer_cache_auto_group_enabled():
+            return
+        reserve = int(self._dense_layer_cache_auto_reserve_bytes())
+        if reserve <= 0:
+            return
+        info = host_memory_info()
+        if info is None:
+            return
+        available = int(info.get("available_bytes", 0) or 0)
+        if int(available) - int(estimated_bytes) < int(reserve):
+            raise MemoryError(
+                "Orion dense single-slot auto group refused materialization before "
+                f"{reason}: available={available} estimated_needed={int(estimated_bytes)} "
+                f"auto_reserve={int(reserve)}."
+            )
+
+    def _dense_layer_cache_encoded_plaintext_estimate_bytes(self, *, raw_diag_count: int, level: int) -> int:
+        raw_diag_count = max(1, int(raw_diag_count))
+        level_q_count = max(1, int(level) + 1)
+        try:
+            level_p_count = max(0, len(self.params.get_logp()))
+        except Exception:
+            level_p_count = 0
+        try:
+            ring_degree = int(self.params.get_ring_degree())
+        except Exception:
+            slots = int(getattr(self.params, "get_slots", lambda: 32768)() or 32768)
+            ring_degree = 2 * int(slots)
+        per_plaintext_bytes = int((int(level_q_count) + int(level_p_count)) * int(ring_degree) * 8)
+        # Raw diagonal count is a conservative proxy until the backend exposes
+        # exact BSGS shell plaintext counts. The factor covers Go-side float64
+        # diagonal expansion, encoder scratch, and allocator retention observed
+        # in U22 single-slot probes.
+        safety_factor = 4.0
+        return int(raw_diag_count * int(per_plaintext_bytes) * float(safety_factor))
+
+    def _dense_layer_cache_payload_estimate_bytes(self, *, raw_diag_count: int) -> int:
+        raw_diag_count = max(1, int(raw_diag_count))
+        slots = int(getattr(self.params, "get_slots", lambda: 32768)() or 32768)
+        # float32 payload plus a conservative duplicate for contiguous copies.
+        return int(raw_diag_count * int(slots) * 4 * 2)
+
+    def _dense_layer_cache_group_estimate_bytes(self, linear_layer, blocks) -> int:
+        metadata = dict(getattr(linear_layer, "_dense_layer_cache_block_memory_estimates", {}) or {})
+        total = 0
+        diag_indices_by_block = dict(getattr(linear_layer, "_dense_layer_cache_diag_indices_by_block", {}) or {})
+        level = int(getattr(linear_layer, "_dense_layer_cache_level", getattr(linear_layer, "level", 0)))
+        for row, col in tuple((int(row), int(col)) for row, col in blocks):
+            entry = dict(metadata.get((int(row), int(col)), {}) or {})
+            estimated = int(entry.get("estimated_total_bytes", 0) or 0)
+            if estimated <= 0:
+                raw_diag_count = len(tuple(diag_indices_by_block.get((int(row), int(col)), ()) or (0,)))
+                estimated = int(
+                    self._dense_layer_cache_encoded_plaintext_estimate_bytes(
+                        raw_diag_count=int(raw_diag_count),
+                        level=int(level),
+                    )
+                    + self._dense_layer_cache_payload_estimate_bytes(raw_diag_count=int(raw_diag_count))
+                )
+            total += int(estimated)
+        return int(total)
 
     def dense_layer_cache_enabled_for(self, linear_layer) -> bool:
         if not self.single_slot_layer_cache_enabled():
@@ -709,8 +809,23 @@ class NewEvaluator:
         key_requests: dict[int, int | None] = {}
         diag_sets: list[tuple[int, ...]] = []
         block_keys_by_block: dict[tuple[int, int], tuple[int, ...]] = {}
+        block_memory_estimates: dict[tuple[int, int], dict[str, int | float]] = {}
         for _block, diag_idxs in sorted(diag_indices_by_block.items()):
             row, col = (int(value) for value in _block)
+            raw_diag_count = int(len(tuple(diag_idxs)))
+            payload_bytes = self._dense_layer_cache_payload_estimate_bytes(raw_diag_count=int(raw_diag_count))
+            encoded_bytes = self._dense_layer_cache_encoded_plaintext_estimate_bytes(
+                raw_diag_count=int(raw_diag_count),
+                level=int(level),
+            )
+            block_memory_estimates[(int(row), int(col))] = {
+                "raw_diag_count": int(raw_diag_count),
+                "level": int(level),
+                "bsgs_ratio": float(bsgs_ratio),
+                "estimated_payload_bytes": int(payload_bytes),
+                "estimated_encoded_bytes": int(encoded_bytes),
+                "estimated_total_bytes": int(payload_bytes + encoded_bytes),
+            }
             block_keys: set[int] = set()
             for key, key_level in self._plan_linear_transform_rotation_key_requests(
                 diag_idxs,
@@ -781,6 +896,7 @@ class NewEvaluator:
         linear_layer._dense_layer_cache_deferred = True
         linear_layer._dense_layer_cache_level = int(level)
         linear_layer._dense_layer_cache_bsgs_ratio = float(bsgs_ratio)
+        linear_layer._dense_layer_cache_block_memory_estimates = dict(block_memory_estimates)
         linear_layer._dense_layer_cache_active_transform_ids = {}
         linear_layer._dense_layer_cache_pending_timing = {
             "layer_cache_encode_s": 0.0,
@@ -1261,11 +1377,29 @@ class NewEvaluator:
             self._add_profile("wait_s", time.perf_counter() - wait_started)
         return list(ordered)
 
-    def _materialize_dense_layer_cache_blocks(self, linear_layer, blocks) -> tuple[dict[tuple[int, int], int], dict[str, float]]:
+    def _materialize_dense_layer_cache_blocks(
+        self,
+        linear_layer,
+        blocks,
+        *,
+        bypass_auto_memory_cap: bool = False,
+    ) -> tuple[dict[tuple[int, int], int], dict[str, float]]:
         requested = tuple((int(row), int(col)) for row, col in blocks)
         if not requested:
             return {}, {"layer_cache_encode_s": 0.0, "layer_cache_key_prepare_s": 0.0}
         layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
+        estimated_group_bytes = self._dense_layer_cache_group_estimate_bytes(linear_layer, requested)
+        if int(estimated_group_bytes) > 0:
+            if not bool(bypass_auto_memory_cap):
+                self._dense_layer_cache_check_auto_memory_cap(
+                    reason=f"dense_layer_cache_materialize:{layer_name}",
+                    estimated_bytes=int(estimated_group_bytes),
+                )
+            self._forward_memory_guard(
+                reason=f"before_dense_layer_cache_materialize:{layer_name}",
+                needed_bytes=int(estimated_group_bytes),
+                raise_on_low=True,
+            )
         memory_before = host_memory_info()
         write_progress_event(
             "start",
@@ -1276,6 +1410,7 @@ class NewEvaluator:
             backend_transform_count=int(len(requested)),
             block_rows=[int(row) for row, _col in requested],
             block_cols=[int(col) for _row, col in requested],
+            estimated_group_bytes=int(estimated_group_bytes),
             host_available_bytes_before=None if memory_before is None else int(memory_before.get("available_bytes", 0)),
         )
         payloads = None
@@ -1315,6 +1450,7 @@ class NewEvaluator:
             layer_cache_encode_s=float(encode_s),
             layer_cache_key_prepare_s=float(key_prepare_s),
             backend_transform_count=int(len(transform_ids)),
+            estimated_group_bytes=int(estimated_group_bytes),
             host_available_bytes_after=(
                 None
                 if (memory_after := host_memory_info()) is None
@@ -1836,13 +1972,38 @@ class NewEvaluator:
             evict_materialized_group()
             if not blocks:
                 return
-            block_ids, timing = self._materialize_dense_layer_cache_blocks(linear_layer, blocks)
+            estimated_group_bytes = self._dense_layer_cache_group_estimate_bytes(linear_layer, blocks)
+            runtime_timing["layer_cache_group_count"] = float(
+                runtime_timing.get("layer_cache_group_count", 0.0) or 0.0
+            ) + 1.0
+            runtime_timing["layer_cache_group_estimated_bytes_max"] = float(
+                max(
+                    float(runtime_timing.get("layer_cache_group_estimated_bytes_max", 0.0) or 0.0),
+                    float(estimated_group_bytes),
+                )
+            )
+            bypass_auto_memory_cap = bool(
+                auto_group_enabled
+                and len(blocks) == 1
+                and int(estimated_group_bytes) > int(auto_group_budget_bytes)
+            )
+            block_ids, timing = self._materialize_dense_layer_cache_blocks(
+                linear_layer,
+                blocks,
+                bypass_auto_memory_cap=bool(bypass_auto_memory_cap),
+            )
             materialized_group = dict(block_ids)
             add_cache_timing(timing)
 
         group_size = 1
+        auto_group_enabled = False
+        auto_group_budget_bytes = 0
         if dense_cache_granularity == "group":
+            auto_group_enabled = self.dense_layer_cache_auto_group_enabled()
+            auto_group_budget_bytes = self._dense_layer_cache_auto_budget_bytes() if bool(auto_group_enabled) else 0
             group_size = self.dense_layer_cache_group_size()
+            runtime_timing["layer_cache_group_policy"] = "auto" if bool(auto_group_enabled) else "fixed"
+            runtime_timing["layer_cache_group_budget_bytes"] = float(auto_group_budget_bytes)
 
         for i in range(rows):
             ct_out = None
@@ -1865,8 +2026,18 @@ class NewEvaluator:
                         dense_cache_granularity == "group"
                         and block_index < len(eval_blocks)
                         and int(eval_blocks[block_index][2]) == -2
-                        and len(pending) < int(group_size)
                     ):
+                        if not bool(auto_group_enabled) and len(pending) >= int(group_size):
+                            break
+                        if bool(auto_group_enabled):
+                            candidate = [*pending, eval_blocks[block_index]]
+                            candidate_blocks = [(row, col) for row, col, _tid in candidate]
+                            candidate_bytes = self._dense_layer_cache_group_estimate_bytes(
+                                linear_layer,
+                                candidate_blocks,
+                            )
+                            if len(pending) >= 1 and int(candidate_bytes) > int(auto_group_budget_bytes):
+                                break
                         pending.append(eval_blocks[block_index])
                         block_index += 1
                     materialize_group_for([(row, col) for row, col, _tid in pending])

@@ -13,6 +13,7 @@ import orion
 from orion.backend.python.lt_evaluator import NewEvaluator
 from orion.backend.python.tensors import CipherTensor
 from orion.backend.python import compile_cache
+from orion.backend.python import lt_evaluator as lt_evaluator_module
 from orion.core import packing
 from orion.core import orion as orion_core
 from orion.nn.linear import Conv2d, ConvTranspose2d
@@ -1078,6 +1079,7 @@ def test_dense_layer_cache_eval_stays_independent_and_evicts_op(monkeypatch, tmp
     [
         ("lt", None, [[910], [911]]),
         ("group", "2", [[910, 911]]),
+        ("group", "auto", [[910, 911]]),
     ],
 )
 def test_dense_layer_cache_lt_group_granularity_never_builds_full_layer(
@@ -1143,6 +1145,8 @@ def test_dense_layer_cache_lt_group_granularity_never_builds_full_layer(
     monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GRANULARITY", granularity)
     if group_size is not None:
         monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS", group_size)
+    if group_size == "auto":
+        monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_BUDGET_GB", "0.00001")
     progress_path = tmp_path / f"dense_progress_{granularity}.jsonl"
     monkeypatch.setenv("ORION_PROGRESS_JSONL", str(progress_path))
     backend = Backend()
@@ -1207,6 +1211,200 @@ def test_dense_layer_cache_lt_group_granularity_never_builds_full_layer(
     rows = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
     assert any(row.get("phase") == "diag_encode" and row.get("backend_transform_count") for row in rows)
     assert any(row.get("phase") == "evict" and row.get("backend_transform_count") for row in rows)
+
+
+def test_dense_layer_cache_auto_group_splits_by_estimated_budget(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.next_id = 1200
+            self.generated_batches = []
+            self.evaluated = []
+            self.deleted = []
+            self.removed = []
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
+            return [int(value) + 5000 for value in diag_idxs]
+
+        def GenerateLinearTransformRotationKey(self, _key):
+            return None
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            ids = list(range(self.next_id, self.next_id + int(num_transforms)))
+            self.next_id += int(num_transforms)
+            self.generated_batches.append(ids)
+            return ids
+
+        def EvaluateLinearTransform(self, transform_id, ciphertext_id):
+            self.evaluated.append((int(transform_id), int(ciphertext_id)))
+            return int(transform_id) + int(ciphertext_id)
+
+        def RemovePlaintextDiagonals(self, transform_id):
+            self.removed.append(int(transform_id))
+
+        def DeleteLinearTransform(self, transform_id):
+            self.deleted.append(int(transform_id))
+
+        def DeleteCiphertext(self, _ciphertext_id):
+            return None
+
+    class Evaluator:
+        def add_ciphertext(self, left, right, _in_place=False):
+            return int(left) + int(right) + 100
+
+        def rescale(self, value, in_place=False):
+            return int(value) + 1000
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GRANULARITY", "group")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS", "auto")
+    # With slots=4 and level=2 the conservative estimate is about 800 bytes
+    # per one-diagonal block. This admits two blocks but not three.
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_BUDGET_GB", "0.0000016")
+
+    backend = Backend()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=Evaluator(),
+        encoder=SimpleNamespace(encode=lambda value, level: object()),
+        encryptor=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    requested_blocks = []
+
+    def build_blocks(blocks):
+        normalized = tuple((int(row), int(col)) for row, col in blocks)
+        requested_blocks.append(normalized)
+        return {
+            (int(row), int(col)): {int(col): np.asarray([float(col + 1), 0.0, 0.0, 0.0], dtype=np.float32)}
+            for row, col in normalized
+        }
+
+    layer = SimpleNamespace(
+        name="layer_cache_auto_budget",
+        diagonals={},
+        _dense_layer_cache_diag_indices_by_block={(0, 0): (0,), (0, 1): (1,), (0, 2): (2,)},
+        _dense_layer_cache_build_diagonals=lambda: (_ for _ in ()).throw(AssertionError("full build forbidden")),
+        _dense_layer_cache_build_block_diagonals=build_blocks,
+        level=2,
+        depth=1,
+        bsgs_ratio=2,
+        get_io_mode=lambda: "none",
+        output_shape=torch.Size((1, 1, 1, 1)),
+        fhe_output_shape=torch.Size((1, 1, 1, 1)),
+    )
+    evaluator.generate_transforms(layer)
+    x = CipherTensor(fake_scheme, [5, 7, 11], layer.output_shape, layer.fhe_output_shape)
+
+    evaluator.evaluate_transforms(layer, x)
+
+    assert requested_blocks == [((0, 0), (0, 1)), ((0, 2),)]
+    assert backend.generated_batches == [[1200, 1201], [1202]]
+    assert backend.evaluated == [(1200, 5), (1201, 7), (1202, 11)]
+    assert backend.deleted == [1200, 1201, 1202]
+
+
+def test_dense_layer_cache_auto_memory_cap_refuses_low_available(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS", "auto")
+    monkeypatch.delenv("ORION_FORWARD_MIN_AVAILABLE_GB", raising=False)
+    monkeypatch.delenv("ORION_FORWARD_MIN_AVAILABLE_BYTES", raising=False)
+    gib = 1024**3
+    monkeypatch.setattr(
+        lt_evaluator_module,
+        "host_memory_info",
+        lambda: {"total_bytes": 512 * gib, "available_bytes": 120 * gib},
+    )
+    fake_scheme = SimpleNamespace(
+        backend=SimpleNamespace(NewLinearTransformEvaluator=lambda: None),
+        evaluator=SimpleNamespace(),
+        encoder=SimpleNamespace(),
+        encryptor=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+
+    with pytest.raises(MemoryError, match="auto group refused materialization"):
+        evaluator._dense_layer_cache_check_auto_memory_cap(
+            reason="unit_test",
+            estimated_bytes=32 * gib,
+        )
+
+
+def test_dense_layer_cache_auto_allows_oversized_single_block_to_bypass_cap(monkeypatch) -> None:
+    class Backend:
+        def __init__(self):
+            self.generated_batches = []
+            self.evaluated = []
+            self.deleted = []
+
+        def NewLinearTransformEvaluator(self):
+            return None
+
+        def PlanLinearTransformRotationKeys(self, diag_idxs, _level, _bsgs_ratio):
+            return [int(value) + 7000 for value in diag_idxs]
+
+        def GenerateLinearTransformRotationKey(self, _key):
+            return None
+
+        def GenerateLinearTransformsBatch(self, num_transforms, *_args):
+            ids = list(range(1400, 1400 + int(num_transforms)))
+            self.generated_batches.append(ids)
+            return ids
+
+        def EvaluateLinearTransform(self, transform_id, ciphertext_id):
+            self.evaluated.append((int(transform_id), int(ciphertext_id)))
+            return int(transform_id) + int(ciphertext_id)
+
+        def DeleteLinearTransform(self, transform_id):
+            self.deleted.append(int(transform_id))
+
+        def DeleteCiphertext(self, _ciphertext_id):
+            return None
+
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GRANULARITY", "group")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS", "auto")
+    monkeypatch.setenv("ORION_DENSE_LAYER_CACHE_GROUP_BUDGET_GB", "0.000000001")
+    backend = Backend()
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        evaluator=SimpleNamespace(rescale=lambda value, in_place=False: int(value)),
+        encoder=SimpleNamespace(encode=lambda value, level: object()),
+        encryptor=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        params=_FakeParams(slots=4),
+    )
+    evaluator = NewEvaluator(fake_scheme)
+    evaluator._dense_layer_cache_check_auto_memory_cap = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("unsplittable single block should bypass auto cap")
+    )
+    layer = SimpleNamespace(
+        name="layer_cache_single_block_bypass",
+        diagonals={},
+        _dense_layer_cache_diag_indices_by_block={(0, 0): (0,)},
+        _dense_layer_cache_build_diagonals=lambda: (_ for _ in ()).throw(AssertionError("full build forbidden")),
+        _dense_layer_cache_build_block_diagonals=lambda blocks: {
+            (0, 0): {0: np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
+        },
+        level=2,
+        depth=1,
+        bsgs_ratio=2,
+        get_io_mode=lambda: "none",
+        output_shape=torch.Size((1, 1, 1, 1)),
+        fhe_output_shape=torch.Size((1, 1, 1, 1)),
+    )
+    evaluator.generate_transforms(layer)
+
+    evaluator.evaluate_transforms(layer, CipherTensor(fake_scheme, [5], layer.output_shape, layer.fhe_output_shape))
+
+    assert backend.generated_batches == [[1400]]
+    assert backend.evaluated == [(1400, 5)]
+    assert backend.deleted == [1400]
 
 
 def test_dense_layer_cache_lt_granularity_cleans_up_after_eval_error(monkeypatch) -> None:

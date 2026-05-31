@@ -182,6 +182,7 @@ class UnifiedTransformGroup:
         self._single_slot_active_backend = None
         self._single_slot_payloads: list[tuple[np.ndarray, np.ndarray, int]] | None = None
         self._single_slot_recipes: list[tuple[np.ndarray, int, Any]] | None = None
+        self._single_slot_prematerialized_timing: dict[str, Any] | None = None
         self._single_slot_has_complex = False
         self.memory_trace: list[dict[str, Any]] = []
         self.last_runtime_timing: dict[str, Any] = self._empty_runtime_timing()
@@ -3424,8 +3425,14 @@ class UnifiedTransformGroup:
             "layer_cache_encode_s": 0.0,
             "layer_cache_key_prepare_s": 0.0,
         }
-        if bool(self._single_slot_layer_cache) and self.unified_ids is None:
-            single_slot_timing = self._materialize_single_slot_for_eval(backend)
+        if bool(self._single_slot_layer_cache):
+            prematerialized_timing = getattr(self, "_single_slot_prematerialized_timing", None)
+            if self.unified_ids is None:
+                self._single_slot_prematerialized_timing = None
+                single_slot_timing = self._materialize_single_slot_for_eval(backend)
+            elif isinstance(prematerialized_timing, dict):
+                single_slot_timing.update(dict(prematerialized_timing))
+                self._single_slot_prematerialized_timing = None
         if not self.is_compiled or self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be compiled before evaluation")
         if _unified_individual_eval_enabled():

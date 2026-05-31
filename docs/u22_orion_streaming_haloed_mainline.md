@@ -62,7 +62,7 @@ The fair comparison path is:
 3. If a resident path exceeds the RSS cap, rerun that exact node/input/path with single-slot layer cache and record the encode worker count.
 4. Compare compute time separately from memory feasibility. Do not mix resident dense RAM certificates, streamed fallback timings, and HaloED timings without labeling the path.
 
-Streaming does not mean disabling BSGS.  The intended baseline is now a single-slot layer cache: compile records diagonal-index metadata, rotation-key plans, and runtime diagonal recipes without keeping raw diagonal payloads or encoded plaintexts; memory-bounded E2E runtime should materialize/encode only the current dense LT or bounded dense LT group, evaluate it, and evict it before the next LT/group.  The default `ORION_DENSE_LAYER_CACHE_GRANULARITY=layer` preserves old layer-at-a-time behavior; use `ORION_DENSE_LAYER_CACHE_GRANULARITY=lt` or `group` plus `ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS=N` for high-watermark U-Net runs.  Orion dense remains independent LT evaluation with BSGS only inside each materialized LT; HaloED/provider uses grouped provider kernels where the lowering exposes shared-source structure.  Report layer compute time separately from `layer_cache_turnover_s` (`layer_cache_encode_s + layer_cache_key_prepare_s + layer_cache_evict_s`).  Legacy chunked Lattigo LT streaming is not the mainline and requires the explicit `ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT=1` gate.  Kernel-level benchmarks remain resident by default; single-slot is only for full-network/E2E memory-bounded evaluation.
+Streaming does not mean disabling BSGS.  The intended baseline is now a single-slot layer cache: compile records diagonal-index metadata, rotation-key plans, and runtime diagonal recipes without keeping raw diagonal payloads or encoded plaintexts; memory-bounded E2E runtime should materialize/encode only the current dense LT or bounded dense LT group, evaluate it, and evict it before the next LT/group.  The default `ORION_DENSE_LAYER_CACHE_GRANULARITY=layer` preserves old layer-at-a-time behavior; use `ORION_DENSE_LAYER_CACHE_GRANULARITY=lt` or `group` plus `ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS=N` for fixed high-watermark U-Net runs, or `ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS=auto` for the E2E single-slot default.  `auto` batches adjacent independent dense LTs, and no-sharing provider `UnifiedTransformGroup`s, up to a conservative host-memory budget so Lattigo can encode several transforms per batch instead of paying full per-LT overhead.  It is a runtime materialization batching policy, not a new dense/provider strategy: execution order is unchanged, cross-block sharing is not introduced, and BSGS stays inside each materialized LT/group.  If a single LT/group already exceeds the auto group budget, it is treated as an unsplittable singleton and may run by itself; the budget limits only additional co-materialization.  Orion dense remains independent LT evaluation with BSGS only inside each materialized LT; HaloED/provider uses grouped provider kernels where the lowering exposes shared-source structure.  Report layer compute time separately from `layer_cache_turnover_s` (`layer_cache_encode_s + layer_cache_key_prepare_s + layer_cache_evict_s`).  Legacy chunked Lattigo LT streaming is not the mainline and requires the explicit `ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT=1` gate.  Kernel-level benchmarks remain resident by default; single-slot is only for full-network/E2E memory-bounded evaluation.
 
 ## Dim32 Packed-Diagonal Level Replay
 
@@ -516,6 +516,26 @@ enabled with `ORION_LATTIGO_UNIFIED_NO_BSGS=0`.  Dense and provider both use the
 single-slot layer cache (`ORION_SINGLE_SLOT_LAYER_CACHE=1`), concat fusion
 (`ORION_CONCAT_FUSION=1`), and the default single-bootstrap path
 (`ORION_LATTIGO_BOOTSTRAP_MANY=0`).
+
+E2E single-slot runs should leave `ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS=auto`
+for both dense and provider modes unless a task explicitly asks for a fixed
+stress probe.  The auto group policy exists to reduce the `diag_encode`/LT
+materialization bottleneck by batching several independent transforms into one
+Lattigo generation call when the estimated encoded-plaintext footprint fits the
+current host-memory budget.  Dense still evaluates independent LTs in row/column
+order, and provider no-share-fold still evaluates each `UnifiedTransformGroup`
+in the original runtime-group order; auto only decides how many of those
+already-independent materializations are encoded before the next evaluation
+sequence begins.  On no-sharing provider runs, this matters because each
+provider runtime group commonly contains a single LT, so provider otherwise pays
+the same one-LT-at-a-time encode overhead as dense.  If one LT/group by itself is
+larger than the auto budget, do not split it further and do not classify that as
+a policy failure: it is an unsplittable singleton and may bypass the auto budget
+while still being measured as a single materialized LT/group.  Report the
+resulting `layer_cache_group_policy`, `layer_cache_group_budget_bytes`,
+`layer_cache_group_count`, and max estimated group bytes when present; keep
+`layer_cache_encode_s`, `layer_cache_key_prepare_s`, and `layer_cache_evict_s`
+separate from strict compute time.
 
 The table below is per-layer.  `layer cache turnover s` is the single-slot
 resident layer-cache overhead

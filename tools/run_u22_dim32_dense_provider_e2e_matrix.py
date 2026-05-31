@@ -196,12 +196,12 @@ REQUIRED_MAINLINE_ENV: dict[str, str] = {
 
 DENSE_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
-    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "1",
+    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
 }
 
 PROVIDER_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "layer",
-    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "1",
+    "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
 }
 
 ENV_TUNING_KEYS = (
@@ -210,6 +210,7 @@ ENV_TUNING_KEYS = (
     "ORION_SINGLE_SLOT_LAYER_CACHE",
     "ORION_DENSE_LAYER_CACHE_GRANULARITY",
     "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS",
+    "ORION_DENSE_LAYER_CACHE_GROUP_BUDGET_GB",
     "ORION_SINGLE_SLOT_ENCODE_WORKERS",
     "ORION_LT_COMPILE_WORKERS",
     "ORION_UNIFIED_COMPILE_WORKERS",
@@ -651,15 +652,17 @@ def _layer_stats(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         stream_eval = _as_float(timing.get("stream_eval_s"))
         stream_accum = _as_float(timing.get("stream_accumulate_s"))
         baby_giant = _as_float(timing.get("cpp_baby_step_s")) + _as_float(timing.get("cpp_giant_step_s"))
-        layer_cache_encode = _as_float(row.get("lt_layer_cache_encode_s")) or _as_float(
-            timing.get("layer_cache_encode_s")
+        layer_cache_encode = (
+            _as_float(row.get("lt_layer_cache_encode_s"))
+            or _as_float(timing.get("layer_cache_encode_s"))
+            or _as_float(timing.get("provider_layer_cache_encode_s"))
         )
-        layer_cache_key_prepare = _as_float(row.get("lt_layer_cache_key_prepare_s")) or _as_float(
-            timing.get("layer_cache_key_prepare_s")
+        layer_cache_key_prepare = (
+            _as_float(row.get("lt_layer_cache_key_prepare_s"))
+            or _as_float(timing.get("layer_cache_key_prepare_s"))
+            or _as_float(timing.get("provider_layer_cache_key_prepare_s"))
         )
-        layer_cache_evict = _as_float(row.get("lt_layer_cache_evict_s")) or _as_float(
-            timing.get("layer_cache_evict_s")
-        )
+        layer_cache_evict = _as_float(row.get("lt_layer_cache_evict_s")) or _as_float(timing.get("layer_cache_evict_s"))
         layer_cache_turnover = _as_float(row.get("lt_layer_cache_turnover_s")) or (
             layer_cache_encode + layer_cache_key_prepare + layer_cache_evict
         )

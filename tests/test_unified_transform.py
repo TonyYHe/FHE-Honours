@@ -536,6 +536,30 @@ def test_single_slot_layer_cache_evicts_between_tiny_64_layers(monkeypatch) -> N
     assert backend.live_before_generate == [(), (), ()]
 
 
+def test_single_slot_prematerialized_timing_is_reported(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
+    backend = _SingleSlotTrackingBackend()
+    transform = _fake_transform({0: torch.ones(8), 1: torch.ones(8)}, level=2)
+    group = UnifiedTransformGroup((transform,))
+    group.compile_unified(backend)
+
+    timing = group._materialize_single_slot_for_eval(backend)
+    generated_after_materialize = len(backend.generated)
+    group._single_slot_prematerialized_timing = dict(timing)
+
+    assert group.evaluate_unified(77, backend) == [100]
+    assert len(backend.generated) == generated_after_materialize
+    assert group.unified_ids is None
+    assert group.last_runtime_timing["layer_cache_encode_s"] == pytest.approx(
+        timing["layer_cache_encode_s"]
+    )
+    assert group.last_runtime_timing["layer_cache_turnover_s"] == pytest.approx(
+        group.last_runtime_timing["layer_cache_encode_s"]
+        + group.last_runtime_timing["layer_cache_key_prepare_s"]
+        + group.last_runtime_timing["layer_cache_evict_s"]
+    )
+
+
 def test_single_slot_rotation_stats_report_bsgs_eval_not_identity_key_count(monkeypatch) -> None:
     monkeypatch.setenv("ORION_SINGLE_SLOT_LAYER_CACHE", "1")
     backend = _FakeBackend()

@@ -5755,6 +5755,18 @@ class NativeHaloStripeNoRIConvExecutor:
         self.last_runtime_timing["partial_wrap_s"] = 0.0
         self.last_runtime_timing["partial_rescale_s"] = 0.0
         self.last_runtime_timing["partial_accumulate_s"] = 0.0
+        for key in (
+            "layer_cache_encode_s",
+            "layer_cache_key_prepare_s",
+            "layer_cache_evict_s",
+            "layer_cache_turnover_s",
+            "provider_layer_cache_batch_count",
+            "provider_layer_cache_batch_materialize_s",
+            "provider_layer_cache_encode_s",
+            "provider_layer_cache_key_prepare_s",
+            "provider_layer_cache_group_estimated_bytes_max",
+        ):
+            self.last_runtime_timing[str(key)] = 0.0
         ids = tuple(int(value) for value in getattr(source_ct, "ids", ()))
         if len(ids) < int(self.cols):
             source_kind = "compact source blocks" if self._uses_compact_source_input() else "native source tiles"
@@ -5808,7 +5820,147 @@ class NativeHaloStripeNoRIConvExecutor:
                 )
                 self.last_runtime_timing["partial_wrap_s"] += float(time.time() - wrap_started)
         else:
-            for runtime_group in sorted_groups:
+            lt_evaluator = getattr(scheme, "lt_evaluator", None)
+            provider_auto_group = bool(
+                str(self._compiled_lt_grouping_mode) == "individual"
+                and lt_evaluator is not None
+                and callable(getattr(lt_evaluator, "dense_layer_cache_auto_group_enabled", None))
+                and lt_evaluator.dense_layer_cache_auto_group_enabled()
+            )
+            provider_group_budget_bytes = (
+                int(lt_evaluator._dense_layer_cache_auto_budget_bytes())
+                if bool(provider_auto_group) and callable(getattr(lt_evaluator, "_dense_layer_cache_auto_budget_bytes", None))
+                else 0
+            )
+
+            def runtime_group_can_pre_materialize(runtime_group) -> bool:
+                if not bool(provider_auto_group):
+                    return False
+                group = runtime_group.group
+                return bool(getattr(group, "_single_slot_layer_cache", False)) and bool(
+                    getattr(group, "_single_slot_recipes", None)
+                )
+
+            def runtime_group_estimated_bytes(runtime_group) -> int:
+                if not bool(provider_auto_group):
+                    return 0
+                group = runtime_group.group
+                recipes = getattr(group, "_single_slot_recipes", None)
+                if not bool(runtime_group_can_pre_materialize(runtime_group)):
+                    return int(provider_group_budget_bytes) + 1
+                total = 0
+                for diag_idxs, level, _transform in recipes:
+                    raw_diag_count = int(len(tuple(int(value) for value in diag_idxs)))
+                    total += int(
+                        lt_evaluator._dense_layer_cache_encoded_plaintext_estimate_bytes(
+                            raw_diag_count=int(raw_diag_count),
+                            level=int(level),
+                        )
+                        + lt_evaluator._dense_layer_cache_payload_estimate_bytes(
+                            raw_diag_count=int(raw_diag_count)
+                        )
+                    )
+                return int(total)
+
+            def provider_runtime_batches() -> list[list[Any]]:
+                if not bool(provider_auto_group):
+                    return [[runtime_group] for runtime_group in sorted_groups]
+                batches: list[list[Any]] = []
+                current: list[Any] = []
+                current_bytes = 0
+                for runtime_group in sorted_groups:
+                    group_bytes = int(runtime_group_estimated_bytes(runtime_group))
+                    if current and int(current_bytes + group_bytes) > int(provider_group_budget_bytes):
+                        batches.append(list(current))
+                        current = []
+                        current_bytes = 0
+                    current.append(runtime_group)
+                    current_bytes += int(group_bytes)
+                if current:
+                    batches.append(list(current))
+                return batches
+
+            def materialize_provider_batch(batch: list[Any]) -> None:
+                if not bool(provider_auto_group):
+                    return
+                materializable_batch = [
+                    runtime_group for runtime_group in batch if bool(runtime_group_can_pre_materialize(runtime_group))
+                ]
+                if not materializable_batch:
+                    return
+                batch_started = time.time()
+                encoded = 0.0
+                key_prepare = 0.0
+                estimated = sum(int(runtime_group_estimated_bytes(runtime_group)) for runtime_group in materializable_batch)
+                bypass_auto_memory_cap = bool(
+                    len(batch) == 1
+                    and len(materializable_batch) == 1
+                    and int(estimated) > int(provider_group_budget_bytes)
+                )
+                if (
+                    not bool(bypass_auto_memory_cap)
+                    and callable(getattr(lt_evaluator, "_dense_layer_cache_check_auto_memory_cap", None))
+                ):
+                    lt_evaluator._dense_layer_cache_check_auto_memory_cap(
+                        reason=f"provider_single_slot_materialize:{self.output_node_id}",
+                        estimated_bytes=int(estimated),
+                    )
+                for runtime_group in materializable_batch:
+                    group = runtime_group.group
+                    if (
+                        bool(getattr(group, "_single_slot_layer_cache", False))
+                        and getattr(group, "unified_ids", None) is None
+                    ):
+                        timing = group._materialize_single_slot_for_eval(scheme.backend)
+                        setattr(group, "_single_slot_prematerialized_timing", dict(timing))
+                        encoded += float(timing.get("layer_cache_encode_s", 0.0) or 0.0)
+                        key_prepare += float(timing.get("layer_cache_key_prepare_s", 0.0) or 0.0)
+                self.last_runtime_timing["provider_layer_cache_batch_count"] = float(
+                    self.last_runtime_timing.get("provider_layer_cache_batch_count", 0.0)
+                ) + 1.0
+                self.last_runtime_timing["provider_layer_cache_batch_materialize_s"] = float(
+                    self.last_runtime_timing.get("provider_layer_cache_batch_materialize_s", 0.0)
+                ) + float(time.time() - batch_started)
+                self.last_runtime_timing["provider_layer_cache_encode_s"] = float(
+                    self.last_runtime_timing.get("provider_layer_cache_encode_s", 0.0)
+                ) + float(encoded)
+                self.last_runtime_timing["provider_layer_cache_key_prepare_s"] = float(
+                    self.last_runtime_timing.get("provider_layer_cache_key_prepare_s", 0.0)
+                ) + float(key_prepare)
+                self.last_runtime_timing["layer_cache_encode_s"] = float(
+                    self.last_runtime_timing.get("layer_cache_encode_s", 0.0)
+                ) + float(encoded)
+                self.last_runtime_timing["layer_cache_key_prepare_s"] = float(
+                    self.last_runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                ) + float(key_prepare)
+                self.last_runtime_timing["layer_cache_turnover_s"] = float(
+                    self.last_runtime_timing.get("layer_cache_encode_s", 0.0)
+                    + self.last_runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                    + self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
+                )
+                self.last_runtime_timing["provider_layer_cache_group_estimated_bytes_max"] = float(
+                    max(
+                        float(self.last_runtime_timing.get("provider_layer_cache_group_estimated_bytes_max", 0.0) or 0.0),
+                        float(estimated),
+                    )
+                )
+
+            def cleanup_materialized_provider_batch(batch: list[Any]) -> None:
+                if not bool(provider_auto_group):
+                    return
+                for runtime_group in batch:
+                    group = runtime_group.group
+                    if (
+                        bool(getattr(group, "_single_slot_layer_cache", False))
+                        and getattr(group, "unified_ids", None) is not None
+                    ):
+                        try:
+                            group._evict_single_slot_after_eval(scheme.backend)
+                        finally:
+                            setattr(group, "_single_slot_prematerialized_timing", None)
+
+            def evaluate_runtime_group(runtime_group) -> None:
+                nonlocal evaluated_group_count, partial_count, rescale_count, accumulate_count
                 group_started = time.time()
                 output_ids = runtime_group.group.evaluate_unified(int(ids[int(runtime_group.input_index)]), scheme.backend)
                 self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
@@ -5836,6 +5988,13 @@ class NativeHaloStripeNoRIConvExecutor:
                         output_blocks[int(target_index)] = lhs + rhs
                         self.last_runtime_timing["partial_accumulate_s"] += float(time.time() - accumulate_started)
                         accumulate_count += 1
+            for batch in provider_runtime_batches():
+                try:
+                    materialize_provider_batch(batch)
+                    for runtime_group in batch:
+                        evaluate_runtime_group(runtime_group)
+                finally:
+                    cleanup_materialized_provider_batch(batch)
         if fuse_output_rescale:
             for block_index, block_ct in enumerate(output_blocks):
                 if block_ct is None:

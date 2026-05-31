@@ -1441,6 +1441,231 @@ def test_provider_single_slot_compact_output_cpp_rebuild_materializes_full_paylo
         scheme.delete_scheme()
 
 
+class _FakeProviderAutoGroup:
+    def __init__(
+        self,
+        name: str,
+        *,
+        output_id: int,
+        diag_count: int,
+        events: list[tuple[str, str]],
+        fail: bool = False,
+    ) -> None:
+        self.name = str(name)
+        self.output_id = int(output_id)
+        self.events = events
+        self.fail = bool(fail)
+        self._single_slot_layer_cache = True
+        self._single_slot_recipes = [
+            (tuple(range(int(diag_count))), 3, SimpleNamespace(name=str(name))),
+        ]
+        self._single_slot_prematerialized_timing = None
+        self.unified_ids = None
+
+    def _materialize_single_slot_for_eval(self, _backend):
+        self.events.append(("materialize", self.name))
+        self.unified_ids = [int(self.output_id) + 1000]
+        return {
+            "layer_cache_encode_s": 0.125,
+            "layer_cache_key_prepare_s": 0.025,
+        }
+
+    def _evict_single_slot_after_eval(self, _backend):
+        if self.unified_ids is None:
+            return 0.0
+        self.events.append(("evict", self.name))
+        self.unified_ids = None
+        return 0.005
+
+    def evaluate_unified(self, ct_input_id: int, backend):
+        self.events.append(("evaluate", self.name))
+        if self.fail:
+            self._evict_single_slot_after_eval(backend)
+            raise RuntimeError(f"{self.name} failed")
+        self._evict_single_slot_after_eval(backend)
+        return [int(self.output_id)]
+
+
+class _FakeProviderAutoLtEvaluator:
+    def __init__(self, *, budget: int, fail_cap: bool = False) -> None:
+        self.budget = int(budget)
+        self.fail_cap = bool(fail_cap)
+        self.checked_estimates: list[int] = []
+
+    def dense_layer_cache_auto_group_enabled(self) -> bool:
+        return True
+
+    def _dense_layer_cache_auto_budget_bytes(self) -> int:
+        return int(self.budget)
+
+    def _dense_layer_cache_encoded_plaintext_estimate_bytes(self, *, raw_diag_count: int, level: int) -> int:
+        assert int(level) == 3
+        return int(raw_diag_count) * 10
+
+    def _dense_layer_cache_payload_estimate_bytes(self, *, raw_diag_count: int) -> int:
+        return 0
+
+    def _dense_layer_cache_check_auto_memory_cap(self, *, reason: str, estimated_bytes: int) -> None:
+        assert reason == "provider_single_slot_materialize:conv"
+        self.checked_estimates.append(int(estimated_bytes))
+        if self.fail_cap:
+            raise MemoryError("provider cap")
+
+
+def _provider_auto_fake_executor(native_halo_conv2d, *, groups, lt_evaluator):
+    module = SimpleNamespace(
+        on_weight=torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 1, 1, 1]),
+        output_shape=torch.Size([1, 1, 1, len(groups)]),
+        fhe_input_shape=torch.Size([1, 1, 1, 1]),
+        fhe_output_shape=torch.Size([1, 1, 1, len(groups)]),
+        stride=(1, 1),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_layout={},
+        layout_policy_output_layout={},
+        layout_policy_provider_disable_shared_rotation=True,
+    )
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="provider_auto_batch_unit",
+        c_in=1,
+        h_in=1,
+        w_in=1,
+        c_out=1,
+        h_out=1,
+        w_out=1,
+        gap_in=1,
+        gap_out=1,
+        kernel=1,
+        stride=1,
+        pad=0,
+        slot_count=8,
+    )
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    executor.compile = lambda _scheme: None
+    executor._compiled_lt_grouping_mode = "individual"
+    executor.rows = len(groups)
+    executor.cols = 1
+    executor.output_shape = module.output_shape
+    executor.fhe_output_shape = module.fhe_output_shape
+    executor.runtime_groups = [
+        SimpleNamespace(input_index=0, group=group, target_indices=(index,))
+        for index, group in enumerate(groups)
+    ]
+    backend = SimpleNamespace(
+        DeleteCiphertext=lambda _ct: None,
+        SetCiphertextScale=lambda _ct, _scale: None,
+    )
+    fake_scheme = SimpleNamespace(
+        backend=backend,
+        encryptor=SimpleNamespace(),
+        evaluator=SimpleNamespace(),
+        bootstrapper=SimpleNamespace(),
+        lt_evaluator=lt_evaluator,
+        params=SimpleNamespace(
+            get_default_scale=lambda: 1 << 30,
+            get_logq=lambda: [45, 30, 30, 45],
+        ),
+    )
+    return executor, fake_scheme
+
+
+def test_provider_single_slot_auto_batches_materialization_preserving_eval_order(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    events: list[tuple[str, str]] = []
+    groups = [
+        _FakeProviderAutoGroup("g0", output_id=100, diag_count=1, events=events),
+        _FakeProviderAutoGroup("g1", output_id=101, diag_count=1, events=events),
+        _FakeProviderAutoGroup("g2", output_id=102, diag_count=1, events=events),
+    ]
+    lt_evaluator = _FakeProviderAutoLtEvaluator(budget=20)
+    executor, fake_scheme = _provider_auto_fake_executor(
+        native_halo_conv2d,
+        groups=groups,
+        lt_evaluator=lt_evaluator,
+    )
+    monkeypatch.setattr(native_halo_conv2d, "_rescale_cipher_tensor", lambda ct: ct)
+
+    out = executor(SimpleNamespace(ids=[7], scheme=fake_scheme))
+
+    assert out["conv"].ids == [100, 101, 102]
+    out["conv"].ids = []
+    assert events == [
+        ("materialize", "g0"),
+        ("materialize", "g1"),
+        ("evaluate", "g0"),
+        ("evict", "g0"),
+        ("evaluate", "g1"),
+        ("evict", "g1"),
+        ("materialize", "g2"),
+        ("evaluate", "g2"),
+        ("evict", "g2"),
+    ]
+    assert lt_evaluator.checked_estimates == [20, 10]
+    assert executor.last_runtime_timing["provider_layer_cache_batch_count"] == 2.0
+    assert executor.last_runtime_timing["provider_layer_cache_encode_s"] == pytest.approx(0.375)
+
+
+def test_provider_single_slot_auto_allows_oversized_singleton_to_bypass_cap(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    events: list[tuple[str, str]] = []
+    group = _FakeProviderAutoGroup("wide", output_id=100, diag_count=2, events=events)
+    lt_evaluator = _FakeProviderAutoLtEvaluator(budget=10, fail_cap=True)
+    executor, fake_scheme = _provider_auto_fake_executor(
+        native_halo_conv2d,
+        groups=[group],
+        lt_evaluator=lt_evaluator,
+    )
+    monkeypatch.setattr(native_halo_conv2d, "_rescale_cipher_tensor", lambda ct: ct)
+
+    out = executor(SimpleNamespace(ids=[7], scheme=fake_scheme))
+
+    assert out["conv"].ids == [100]
+    out["conv"].ids = []
+    assert lt_evaluator.checked_estimates == []
+    assert events == [("materialize", "wide"), ("evaluate", "wide"), ("evict", "wide")]
+    assert group.unified_ids is None
+
+
+def test_provider_single_slot_auto_cleans_prematerialized_batch_after_eval_error(monkeypatch) -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    events: list[tuple[str, str]] = []
+    first = _FakeProviderAutoGroup("first", output_id=100, diag_count=1, events=events, fail=True)
+    second = _FakeProviderAutoGroup("second", output_id=101, diag_count=1, events=events)
+    lt_evaluator = _FakeProviderAutoLtEvaluator(budget=20)
+    executor, fake_scheme = _provider_auto_fake_executor(
+        native_halo_conv2d,
+        groups=[first, second],
+        lt_evaluator=lt_evaluator,
+    )
+    monkeypatch.setattr(native_halo_conv2d, "_rescale_cipher_tensor", lambda ct: ct)
+
+    with pytest.raises(RuntimeError, match="first failed"):
+        executor(SimpleNamespace(ids=[7], scheme=fake_scheme))
+
+    assert events == [
+        ("materialize", "first"),
+        ("materialize", "second"),
+        ("evaluate", "first"),
+        ("evict", "first"),
+        ("evict", "second"),
+    ]
+    assert first.unified_ids is None
+    assert second.unified_ids is None
+    assert second._single_slot_prematerialized_timing is None
+
+
 def test_native_stripe_cache_load_rejects_out_of_range_targets(monkeypatch) -> None:
     from orion.experimental.cir import native_halo_conv2d
 
