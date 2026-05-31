@@ -765,6 +765,26 @@ def _activation_transparent_single_native_beta_lift(
     return all(_layout_preserving_module(network_dag, node) for node in activation_nodes)
 
 
+def _pool_direct_single_native_beta_lift(
+    network_dag: Any,
+    *,
+    path_edges: list[tuple[str, str]],
+    start_index: int,
+    producer_module: Any | None,
+    lifted_edges: list[tuple[str, str]],
+) -> bool:
+    if type(producer_module).__name__ != "AvgPool2d":
+        return False
+    if len(lifted_edges) != 1:
+        return False
+    native_edge = tuple(lifted_edges[0])
+    if native_edge != tuple(path_edges[int(start_index)]):
+        return False
+    _source, target = native_edge
+    target_module = network_dag.nodes[str(target)].get("module") if str(target) in network_dag.nodes else None
+    return type(target_module).__name__ == "Conv2d"
+
+
 def _try_apply_beta_lift_candidate(
     network_dag: Any,
     compile_plan: dict[str, Any],
@@ -773,7 +793,7 @@ def _try_apply_beta_lift_candidate(
     actual_native_edges: set[str],
 ) -> dict[str, Any] | None:
     path = _linear_interval_path(network_dag, interval)
-    if path is None or len(path) < 3:
+    if path is None or len(path) < 2:
         return None
     plan_slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
     edge_rows_by_edge = {
@@ -784,7 +804,7 @@ def _try_apply_beta_lift_candidate(
     path_edges = [(path[index], path[index + 1]) for index in range(len(path) - 1)]
     boot_source, boot_target = interval.get("boot_edge", ("", ""))
     interval_edge_set = set(path_edges)
-    for start_index in range(len(path_edges) - 1):
+    for start_index in range(len(path_edges)):
         producer = str(path[start_index])
         if producer == "x":
             continue
@@ -858,10 +878,18 @@ def _try_apply_beta_lift_candidate(
                 producer_module=producer_module,
                 lifted_edges=lifted_edges,
             )
-            if not activation_transparent_single_native:
+            pool_direct_single_native = _pool_direct_single_native_beta_lift(
+                network_dag,
+                path_edges=path_edges,
+                start_index=int(start_index),
+                producer_module=producer_module,
+                lifted_edges=lifted_edges,
+            )
+            if not activation_transparent_single_native and not pool_direct_single_native:
                 continue
         else:
             activation_transparent_single_native = False
+            pool_direct_single_native = False
         if not _layout_has_halo(current_source_layout):
             continue
         updated_edge_rows = []
@@ -958,10 +986,13 @@ def _try_apply_beta_lift_candidate(
                 )
             )
         if len(accepted_edges) < 2 and not activation_transparent_single_native:
-            continue
+            if not pool_direct_single_native:
+                continue
         candidate_kind = (
             "activation_transparent_beta_lift"
             if bool(activation_transparent_single_native)
+            else "pool_direct_beta_lift"
+            if bool(pool_direct_single_native)
             else "producer_beta_lift"
         )
         updated_plan = _refresh_layout_policy_plan_summary(
