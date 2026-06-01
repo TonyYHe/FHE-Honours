@@ -10,6 +10,7 @@ import networkx as nx
 import pytest
 import torch
 
+import orion.core.orion as orion_core
 from orion.core import packing
 from orion.core.bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement
@@ -70,6 +71,7 @@ from orion.core.auto_bootstrap import BootstrapSolver
 from orion.core.auto_bootstrap import collect_bootstrap_solver_audit
 from orion.core.auto_bootstrap import reset_bootstrap_solver_assignments
 from orion.core.auto_bootstrap import snapshot_bootstrap_solver_assignments
+from orion.core.bootstrap_trial_evaluator import ExactBootstrapTrialEvaluator
 from orion.nn.activation import SiLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
@@ -120,6 +122,169 @@ def test_layout_policy_runtime_config_uses_resnet_e2e_logq_budget() -> None:
 def _layout_key(row: dict) -> tuple[int, int, int, int]:
     layout = row["selected_layout"]
     return int(layout["top_beta"]), int(layout["bottom_beta"]), int(layout["stride"]), int(layout["gap"])
+
+
+class _FakeBootstrapParams:
+    def __init__(self, slots: int) -> None:
+        self._slots = int(slots)
+
+    def get_slots(self) -> int:
+        return int(self._slots)
+
+
+class _FakeBootstrapScheme:
+    def __init__(self, slots: int = 16) -> None:
+        self.params = _FakeBootstrapParams(slots)
+
+
+class _FakeDepthModule:
+    def __init__(
+        self,
+        *,
+        depth: int,
+        elements: int = 16,
+        slots: int = 16,
+        level: int | None = None,
+    ) -> None:
+        self.depth = int(depth)
+        self.level = level
+        self.scheme = _FakeBootstrapScheme(slots)
+        self.fhe_output_shape = torch.Size((1, 1, 1, int(elements)))
+
+
+def _bootstrap_test_dag() -> NetworkDAG:
+    return NetworkDAG(SimpleNamespace())
+
+
+def _assert_exact_trial_evaluator_matches_solver(dag: NetworkDAG, *, l_eff: int) -> None:
+    snapshot = snapshot_bootstrap_solver_assignments(dag)
+    reset_bootstrap_solver_assignments(dag, snapshot)
+    solver = BootstrapSolver(SimpleNamespace(), dag, l_eff=int(l_eff))
+    official_input_level, official_boots, official_slots = solver._solve_once(
+        apply_layout_compression=False
+    )
+    official_audit = collect_bootstrap_solver_audit(dag, l_eff=int(l_eff))
+    reset_bootstrap_solver_assignments(dag, snapshot)
+
+    result = ExactBootstrapTrialEvaluator(dag, l_eff=int(l_eff)).evaluate()
+
+    assert int(result.input_level) == int(official_input_level)
+    assert int(result.bootstrap_count) == int(official_boots)
+    assert result.bootstrapper_slots == [int(value) for value in official_slots]
+    assert result.audit["bootstrap_count"] == official_audit["bootstrap_count"]
+    assert result.audit["bootstrapper_slots"] == official_audit["bootstrapper_slots"]
+    assert result.audit["boot_edges"] == official_audit["boot_edges"]
+    assert {row["node"]: row["level"] for row in result.audit["nodes"]} == {
+        row["node"]: row["level"] for row in official_audit["nodes"]
+    }
+
+
+def test_exact_bootstrap_trial_evaluator_matches_level_dag_chain() -> None:
+    dag = _bootstrap_test_dag()
+    dag.add_node("a", module=_FakeDepthModule(depth=1, elements=8))
+    dag.add_node("b", module=_FakeDepthModule(depth=3, elements=20))
+    dag.add_node("c", module=_FakeDepthModule(depth=2, elements=8))
+    dag.add_edges_from([("a", "b"), ("b", "c")])
+
+    _assert_exact_trial_evaluator_matches_solver(dag, l_eff=5)
+
+
+def test_exact_bootstrap_trial_evaluator_preserves_level_zero_not_forced() -> None:
+    dag = _bootstrap_test_dag()
+    dag.add_node("a", module=_FakeDepthModule(depth=1, level=0))
+    dag.add_node("b", module=_FakeDepthModule(depth=1))
+    dag.add_edge("a", "b")
+
+    _assert_exact_trial_evaluator_matches_solver(dag, l_eff=4)
+
+
+def test_exact_bootstrap_trial_evaluator_matches_level_dag_residual() -> None:
+    dag = _bootstrap_test_dag()
+    dag.add_node("src", module=_FakeDepthModule(depth=1))
+    dag.add_node("src_fork", module=None)
+    dag.add_node("left", module=_FakeDepthModule(depth=3, elements=24))
+    dag.add_node("right", module=_FakeDepthModule(depth=1))
+    dag.add_node("out_join", module=None)
+    dag.add_node("out", module=_FakeDepthModule(depth=2))
+    dag.add_edges_from(
+        [
+            ("src", "src_fork"),
+            ("src_fork", "left"),
+            ("src_fork", "right"),
+            ("left", "out_join"),
+            ("right", "out_join"),
+            ("out_join", "out"),
+        ]
+    )
+    dag.residuals["src_fork"] = "out_join"
+
+    _assert_exact_trial_evaluator_matches_solver(dag, l_eff=5)
+
+
+def _compile_tiny_u22_with_trial_evaluator_env(monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.setenv("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS", "1")
+    config = _runtime_config(
+        backend="python",
+        provider_mode="u22_256_base32_layout_dp_no_share_fold",
+        logn=16,
+    )
+    scheme.init_scheme(config)
+    Module.set_scheme(scheme)
+    Module.set_margin(scheme.params.get_margin())
+    try:
+        net = UNet22(
+            dataset="kvasir_polyp_256",
+            in_channels=3,
+            out_channels=1,
+            base_channels=1,
+            activation="silu",
+            silu_degree=7,
+        )
+        net.eval()
+        x = torch.randn((1, 3, 32, 32), dtype=torch.float32)
+        scheme.fit(net, x)
+        return int(scheme.compile(net))
+    finally:
+        scheme.delete_scheme()
+
+
+def test_bootstrap_trial_evaluator_default_legacy_does_not_instantiate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed = {"value": False}
+
+    class RaisingEvaluator:
+        def __init__(self, *args, **kwargs) -> None:
+            constructed["value"] = True
+            raise AssertionError("legacy mode should not instantiate the trial evaluator")
+
+    monkeypatch.delenv("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_TRIAL_EVALUATOR", raising=False)
+    monkeypatch.setattr(orion_core, "ExactBootstrapTrialEvaluator", RaisingEvaluator)
+
+    assert _compile_tiny_u22_with_trial_evaluator_env(monkeypatch) >= 0
+    assert constructed["value"] is False
+
+
+def test_bootstrap_trial_evaluator_selected_mode_falls_back_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed = {"value": False}
+
+    class RaisingEvaluator:
+        def __init__(self, *args, **kwargs) -> None:
+            constructed["value"] = True
+
+        def evaluate(self):
+            raise RuntimeError("forced evaluator failure")
+
+    monkeypatch.setenv(
+        "ORION_BOOTSTRAP_LAYOUT_REFINEMENT_TRIAL_EVALUATOR",
+        "exact_cached_selected_verify",
+    )
+    monkeypatch.setattr(orion_core, "ExactBootstrapTrialEvaluator", RaisingEvaluator)
+
+    assert _compile_tiny_u22_with_trial_evaluator_env(monkeypatch) >= 0
+    assert constructed["value"] is True
 
 
 def _layout_covers(selected: dict, required: dict) -> bool:

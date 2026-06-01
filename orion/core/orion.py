@@ -46,6 +46,7 @@ from .bootstrap_layout_compression import (
     enumerate_bootstrap_aware_layout_refinement_candidates,
     restore_layout_policy_compile_plan,
 )
+from .bootstrap_trial_evaluator import ExactBootstrapTrialEvaluator
 
 
 class _PackWorkerParams:
@@ -1014,6 +1015,22 @@ class Scheme:
                     and str(os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_AUTO_TARGET", "1") or "1").lower()
                     not in {"0", "false", "no", "off"}
                 )
+                trial_evaluator_mode = str(
+                    os.environ.get("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_TRIAL_EVALUATOR", "legacy") or "legacy"
+                ).strip().lower()
+                if trial_evaluator_mode in {"", "0", "false", "no", "off"}:
+                    trial_evaluator_mode = "legacy"
+                trial_evaluator_enabled = trial_evaluator_mode in {
+                    "exact_cached_verify_all",
+                    "exact_cached_selected_verify",
+                }
+                trial_evaluator_fallback_reason = ""
+                trial_evaluator_fallback_round: int | None = None
+                trial_evaluator = (
+                    ExactBootstrapTrialEvaluator(network_dag, l_eff=l_eff)
+                    if trial_evaluator_enabled
+                    else None
+                )
 
                 def _restore_depth_snapshot(depth_snapshot: list[dict[str, Any]]) -> None:
                     for depth_row in depth_snapshot:
@@ -1135,7 +1152,105 @@ class Scheme:
                     trials: list[dict[str, Any]] = []
                     best_trial: dict[str, Any] | None = None
                     best_score: tuple[int, int, int, int, int, int, int, int, str] | None = None
-                    for candidate in candidates:
+                    round_trial_evaluator_audit: dict[str, Any] = {
+                        "mode": str(trial_evaluator_mode),
+                        "enabled": bool(trial_evaluator_enabled),
+                        "rank_verification": "legacy",
+                        "candidate_count": int(len(candidates)),
+                    }
+
+                    def _trial_from_result(
+                        *,
+                        candidate: dict[str, Any],
+                        trial_apply_audit: dict[str, Any],
+                        trial_input_level: int,
+                        trial_bootstraps: int,
+                        trial_slots: list[int],
+                        trial_final_audit: dict[str, Any],
+                        trial_number: int,
+                    ) -> tuple[dict[str, Any], tuple[int, int, int, int, int, int, int, int, str] | None, dict[str, Any] | None]:
+                        trial_relayout_depth = int(
+                            trial_apply_audit.get(
+                                "true_relayout_kernel_depth_after",
+                                current_relayout_depth,
+                            )
+                            or 0
+                        )
+                        trial_boot_count = int(trial_final_audit.get("bootstrap_count", trial_bootstraps) or 0)
+                        boot_delta = int(trial_boot_count - current_boot_count)
+                        depth_delta = int(trial_relayout_depth - current_relayout_depth)
+                        bootstrap_ct_count = int(
+                            sum(
+                                int(row.get("bootstrap_ct_count", 0) or 0)
+                                for row in trial_final_audit.get("boot_edges", [])
+                            )
+                        )
+                        bootstrap_ct_delta = int(bootstrap_ct_count - current_bootstrap_ct_count)
+                        bootstrap_slots_total = int(
+                            sum(
+                                int(row.get("bootstrapper_slots", 0) or 0)
+                                for row in trial_final_audit.get("boot_edges", [])
+                            )
+                        )
+                        bootstrap_slots_delta = int(bootstrap_slots_total - current_bootstrap_slots_total)
+                        accepted_count_for_score = int(trial_apply_audit.get("accepted_count", 0) or 0)
+                        bootstrap_shape_safe = bool(
+                            not bool(candidate.get("require_bootstrap_shape_nonincrease", False))
+                            or (int(bootstrap_ct_delta) <= 0 and int(bootstrap_slots_delta) <= 0)
+                        )
+                        bootstrap_count_safe = bool(
+                            int(boot_delta) == 0
+                            if bool(candidate.get("require_bootstrap_count_unchanged", False))
+                            else int(boot_delta) <= 0
+                        )
+                        acceptable = bool(
+                            bool(bootstrap_count_safe)
+                            and int(depth_delta) < 0
+                            and bool(bootstrap_shape_safe)
+                        )
+                        trial_audit = {
+                            **dict(trial_apply_audit),
+                            "accepted": bool(acceptable),
+                            "trial_input_level": int(trial_input_level),
+                            "trial_bootstrap_count": int(trial_boot_count),
+                            "trial_bootstrapper_slots": [int(value) for value in trial_slots],
+                            "boot_delta": int(boot_delta),
+                            "relayout_depth_delta": int(depth_delta),
+                            "bootstrap_ct_delta": int(bootstrap_ct_delta),
+                            "bootstrap_slots_delta": int(bootstrap_slots_delta),
+                            "bootstrap_count_safe": bool(bootstrap_count_safe),
+                            "bootstrap_shape_safe": bool(bootstrap_shape_safe),
+                            "trial_boot_edges": list(trial_final_audit.get("boot_edges", [])),
+                        }
+                        if not bool(acceptable):
+                            return trial_audit, None, None
+                        rotation_delta = int(candidate.get("rotation_delta", 0) or 0)
+                        score = (
+                            int(boot_delta),
+                            int(candidate.get("candidate_priority", 0) or 0),
+                            int(rotation_delta),
+                            int(bootstrap_ct_count),
+                            int(bootstrap_slots_total),
+                            int(depth_delta),
+                            -int(accepted_count_for_score),
+                            int(trial_number),
+                            str(candidate.get("candidate_id", "")),
+                        )
+                        payload = {
+                            "candidate": dict(candidate),
+                            "trial_audit": dict(trial_audit),
+                            "final_audit": dict(trial_final_audit),
+                            "input_level": int(trial_input_level),
+                            "bootstrap_count": int(trial_boot_count),
+                            "bootstrapper_slots": [int(value) for value in trial_slots],
+                            "score": tuple(score),
+                        }
+                        return trial_audit, score, payload
+
+                    def _score_official_candidate(
+                        candidate: dict[str, Any],
+                        trial_number: int,
+                    ) -> tuple[dict[str, Any], tuple[int, int, int, int, int, int, int, int, str] | None, dict[str, Any] | None]:
                         trial_module_layout_snapshot = None
                         try:
                             trial_apply_audit = apply_bootstrap_aware_layout_refinement_candidate(
@@ -1155,85 +1270,17 @@ class Scheme:
                                 apply_layout_compression=False
                             )
                             trial_final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
-                            trial_relayout_depth = int(
-                                trial_apply_audit.get(
-                                    "true_relayout_kernel_depth_after",
-                                    current_relayout_depth,
-                                )
-                                or 0
+                            return _trial_from_result(
+                                candidate=candidate,
+                                trial_apply_audit=trial_apply_audit,
+                                trial_input_level=int(trial_input_level),
+                                trial_bootstraps=int(trial_bootstraps),
+                                trial_slots=[int(value) for value in trial_slots],
+                                trial_final_audit=trial_final_audit,
+                                trial_number=int(trial_number),
                             )
-                            trial_boot_count = int(trial_final_audit.get("bootstrap_count", trial_bootstraps) or 0)
-                            boot_delta = int(trial_boot_count - current_boot_count)
-                            depth_delta = int(trial_relayout_depth - current_relayout_depth)
-                            bootstrap_ct_count = int(
-                                sum(
-                                    int(row.get("bootstrap_ct_count", 0) or 0)
-                                    for row in trial_final_audit.get("boot_edges", [])
-                                )
-                            )
-                            bootstrap_ct_delta = int(bootstrap_ct_count - current_bootstrap_ct_count)
-                            bootstrap_slots_total = int(
-                                sum(
-                                    int(row.get("bootstrapper_slots", 0) or 0)
-                                    for row in trial_final_audit.get("boot_edges", [])
-                                )
-                            )
-                            bootstrap_slots_delta = int(bootstrap_slots_total - current_bootstrap_slots_total)
-                            accepted_count_for_score = int(trial_apply_audit.get("accepted_count", 0) or 0)
-                            bootstrap_shape_safe = bool(
-                                not bool(candidate.get("require_bootstrap_shape_nonincrease", False))
-                                or (int(bootstrap_ct_delta) <= 0 and int(bootstrap_slots_delta) <= 0)
-                            )
-                            bootstrap_count_safe = bool(
-                                int(boot_delta) == 0
-                                if bool(candidate.get("require_bootstrap_count_unchanged", False))
-                                else int(boot_delta) <= 0
-                            )
-                            acceptable = bool(
-                                bool(bootstrap_count_safe)
-                                and int(depth_delta) < 0
-                                and bool(bootstrap_shape_safe)
-                            )
-                            trial_audit = {
-                                **dict(trial_apply_audit),
-                                "accepted": bool(acceptable),
-                                "trial_input_level": int(trial_input_level),
-                                "trial_bootstrap_count": int(trial_boot_count),
-                                "trial_bootstrapper_slots": [int(value) for value in trial_slots],
-                                "boot_delta": int(boot_delta),
-                                "relayout_depth_delta": int(depth_delta),
-                                "bootstrap_ct_delta": int(bootstrap_ct_delta),
-                                "bootstrap_slots_delta": int(bootstrap_slots_delta),
-                                "bootstrap_count_safe": bool(bootstrap_count_safe),
-                                "bootstrap_shape_safe": bool(bootstrap_shape_safe),
-                                "trial_boot_edges": list(trial_final_audit.get("boot_edges", [])),
-                            }
-                            trials.append(trial_audit)
-                            if bool(acceptable):
-                                rotation_delta = int(candidate.get("rotation_delta", 0) or 0)
-                                score = (
-                                    int(boot_delta),
-                                    int(candidate.get("candidate_priority", 0) or 0),
-                                    int(rotation_delta),
-                                    int(bootstrap_ct_count),
-                                    int(bootstrap_slots_total),
-                                    int(depth_delta),
-                                    -int(accepted_count_for_score),
-                                    int(len(trials)),
-                                    str(candidate.get("candidate_id", "")),
-                                )
-                                if best_score is None or score < best_score:
-                                    best_score = score
-                                    best_trial = {
-                                        "candidate": dict(candidate),
-                                        "trial_audit": dict(trial_audit),
-                                        "final_audit": dict(trial_final_audit),
-                                        "input_level": int(trial_input_level),
-                                        "bootstrap_count": int(trial_boot_count),
-                                        "bootstrapper_slots": [int(value) for value in trial_slots],
-                                    }
                         except Exception as exc:
-                            trials.append(
+                            return (
                                 {
                                     "candidate_id": str(candidate.get("candidate_id", "")),
                                     "kind": str(candidate.get("kind", candidate.get("strategy", ""))),
@@ -1241,7 +1288,9 @@ class Scheme:
                                     "rejected": True,
                                     "reject_reason": "trial_solve_error",
                                     "error": str(exc),
-                                }
+                                },
+                                None,
+                                None,
                             )
                         finally:
                             restore_layout_policy_compile_plan(
@@ -1251,6 +1300,203 @@ class Scheme:
                                 module_layout_snapshot=trial_module_layout_snapshot,
                             )
                             reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+
+                    def _score_evaluator_candidate(
+                        candidate: dict[str, Any],
+                        trial_number: int,
+                    ) -> tuple[dict[str, Any], tuple[int, int, int, int, int, int, int, int, str] | None, dict[str, Any] | None]:
+                        if trial_evaluator is None:
+                            raise RuntimeError("bootstrap trial evaluator is not enabled")
+                        trial_module_layout_snapshot = None
+                        try:
+                            trial_apply_audit = apply_bootstrap_aware_layout_refinement_candidate(
+                                network_dag,
+                                candidate,
+                                first_pass_audit=current_audit,
+                            )
+                            trial_module_layout_snapshot = trial_apply_audit.get("_previous_module_layouts")
+                            trial_apply_audit = {
+                                key: value
+                                for key, value in dict(trial_apply_audit).items()
+                                if key != "_previous_module_layouts"
+                            }
+                            reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                            trial_result = trial_evaluator.evaluate()
+                            return _trial_from_result(
+                                candidate=candidate,
+                                trial_apply_audit=trial_apply_audit,
+                                trial_input_level=int(trial_result.input_level),
+                                trial_bootstraps=int(trial_result.bootstrap_count),
+                                trial_slots=[int(value) for value in trial_result.bootstrapper_slots],
+                                trial_final_audit=dict(trial_result.audit),
+                                trial_number=int(trial_number),
+                            )
+                        finally:
+                            restore_layout_policy_compile_plan(
+                                network_dag,
+                                accepted_compile_plan,
+                                depth_snapshot=accepted_depths,
+                                module_layout_snapshot=trial_module_layout_snapshot,
+                            )
+                            reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+
+                    def _select_best(
+                        scored_trials: list[
+                            tuple[
+                                dict[str, Any],
+                                tuple[int, int, int, int, int, int, int, int, str] | None,
+                                dict[str, Any] | None,
+                            ]
+                        ],
+                    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, tuple[int, int, int, int, int, int, int, int, str] | None]:
+                        selected_trials: list[dict[str, Any]] = []
+                        selected_best_trial: dict[str, Any] | None = None
+                        selected_best_score: tuple[int, int, int, int, int, int, int, int, str] | None = None
+                        for trial_audit, score, payload in scored_trials:
+                            selected_trials.append(dict(trial_audit))
+                            if score is None or payload is None:
+                                continue
+                            if selected_best_score is None or tuple(score) < tuple(selected_best_score):
+                                selected_best_score = tuple(score)
+                                selected_best_trial = dict(payload)
+                        return selected_trials, selected_best_trial, selected_best_score
+
+                    def _trial_signature(
+                        trial_audit: dict[str, Any],
+                        score: tuple[int, int, int, int, int, int, int, int, str] | None,
+                    ) -> tuple[Any, ...]:
+                        boot_edges = [
+                            (
+                                str(row.get("source", "")),
+                                str(row.get("target", "")),
+                                int(row.get("source_level", 0) or 0),
+                                int(row.get("target_level", 0) or 0),
+                                int(row.get("source_depth", 0) or 0),
+                                int(row.get("bootstrap_ct_count", 0) or 0),
+                                int(row.get("bootstrapper_slots", 0) or 0),
+                            )
+                            for row in trial_audit.get("trial_boot_edges", [])
+                        ]
+                        return (
+                            bool(trial_audit.get("accepted", False)),
+                            None if score is None else tuple(score),
+                            int(trial_audit.get("trial_bootstrap_count", 0) or 0),
+                            tuple(int(value) for value in trial_audit.get("trial_bootstrapper_slots", []) or []),
+                            int(trial_audit.get("boot_delta", 0) or 0),
+                            int(trial_audit.get("relayout_depth_delta", 0) or 0),
+                            int(trial_audit.get("bootstrap_ct_delta", 0) or 0),
+                            int(trial_audit.get("bootstrap_slots_delta", 0) or 0),
+                            tuple(boot_edges),
+                        )
+
+                    def _score_all_official() -> tuple[list[dict[str, Any]], dict[str, Any] | None, tuple[int, int, int, int, int, int, int, int, str] | None]:
+                        scored = [
+                            _score_official_candidate(dict(candidate), int(index + 1))
+                            for index, candidate in enumerate(candidates)
+                        ]
+                        return _select_best(scored)
+
+                    try:
+                        if trial_evaluator_enabled and trial_evaluator_mode == "exact_cached_verify_all":
+                            evaluator_started = time.perf_counter()
+                            evaluator_scored = [
+                                _score_evaluator_candidate(dict(candidate), int(index + 1))
+                                for index, candidate in enumerate(candidates)
+                            ]
+                            evaluator_s = float(time.perf_counter() - evaluator_started)
+                            official_started = time.perf_counter()
+                            official_scored = [
+                                _score_official_candidate(dict(candidate), int(index + 1))
+                                for index, candidate in enumerate(candidates)
+                            ]
+                            official_s = float(time.perf_counter() - official_started)
+                            evaluator_trials, evaluator_best, evaluator_score = _select_best(evaluator_scored)
+                            official_trials, official_best, official_score = _select_best(official_scored)
+                            mismatch_reason = ""
+                            for index, (eval_row, official_row) in enumerate(zip(evaluator_scored, official_scored)):
+                                if _trial_signature(eval_row[0], eval_row[1]) != _trial_signature(official_row[0], official_row[1]):
+                                    mismatch_reason = f"candidate_{index + 1}_signature_mismatch"
+                                    break
+                            if not mismatch_reason and (
+                                (evaluator_best or {}).get("candidate", {}).get("candidate_id")
+                                != (official_best or {}).get("candidate", {}).get("candidate_id")
+                                or evaluator_score != official_score
+                            ):
+                                mismatch_reason = "selected_candidate_mismatch"
+                            round_trial_evaluator_audit = {
+                                **dict(round_trial_evaluator_audit),
+                                "rank_verification": "all_candidates",
+                                "evaluator_timing_s": evaluator_s,
+                                "official_verifier_timing_s": official_s,
+                                "selected_candidate_parity": not bool(mismatch_reason),
+                                "mismatch_reason": str(mismatch_reason),
+                            }
+                            if mismatch_reason:
+                                trial_evaluator_enabled = False
+                                trial_evaluator_fallback_reason = str(mismatch_reason)
+                                trial_evaluator_fallback_round = int(round_index + 1)
+                            trials, best_trial, best_score = official_trials, official_best, official_score
+                        elif trial_evaluator_enabled and trial_evaluator_mode == "exact_cached_selected_verify":
+                            evaluator_started = time.perf_counter()
+                            evaluator_scored = [
+                                _score_evaluator_candidate(dict(candidate), int(index + 1))
+                                for index, candidate in enumerate(candidates)
+                            ]
+                            evaluator_s = float(time.perf_counter() - evaluator_started)
+                            evaluator_trials, evaluator_best, evaluator_score = _select_best(evaluator_scored)
+                            mismatch_reason = ""
+                            official_s = 0.0
+                            official_trials = None
+                            official_best = None
+                            official_score = None
+                            if evaluator_best is not None:
+                                selected_index = int(evaluator_score[7]) if evaluator_score is not None else 0
+                                official_started = time.perf_counter()
+                                official_selected = _score_official_candidate(
+                                    dict(evaluator_best["candidate"]),
+                                    int(selected_index),
+                                )
+                                official_s = float(time.perf_counter() - official_started)
+                                official_trial, official_score, official_payload = official_selected
+                                if official_score is None or official_payload is None:
+                                    mismatch_reason = "selected_candidate_rejected_by_official"
+                                elif tuple(evaluator_score or ()) != tuple(official_score):
+                                    mismatch_reason = "selected_candidate_score_mismatch"
+                            else:
+                                official_started = time.perf_counter()
+                                official_trials, official_best, official_score = _score_all_official()
+                                official_s = float(time.perf_counter() - official_started)
+                                if official_best is not None:
+                                    mismatch_reason = "selected_candidate_missing_from_evaluator"
+                            round_trial_evaluator_audit = {
+                                **dict(round_trial_evaluator_audit),
+                                "rank_verification": "selected_only",
+                                "evaluator_timing_s": evaluator_s,
+                                "official_verifier_timing_s": official_s,
+                                "selected_candidate_parity": not bool(mismatch_reason),
+                                "mismatch_reason": str(mismatch_reason),
+                            }
+                            if mismatch_reason:
+                                trial_evaluator_enabled = False
+                                trial_evaluator_fallback_reason = str(mismatch_reason)
+                                trial_evaluator_fallback_round = int(round_index + 1)
+                                if official_trials is None:
+                                    official_trials, official_best, official_score = _score_all_official()
+                                trials, best_trial, best_score = official_trials, official_best, official_score
+                            else:
+                                trials, best_trial, best_score = evaluator_trials, evaluator_best, evaluator_score
+                        else:
+                            trials, best_trial, best_score = _score_all_official()
+                    except Exception as exc:
+                        trial_evaluator_enabled = False
+                        trial_evaluator_fallback_reason = f"{type(exc).__name__}: {exc}"
+                        trial_evaluator_fallback_round = int(round_index + 1)
+                        round_trial_evaluator_audit = {
+                            **dict(round_trial_evaluator_audit),
+                            "enabled": False,
+                            "fallback_reason": str(trial_evaluator_fallback_reason),
+                        }
+                        trials, best_trial, best_score = _score_all_official()
 
                     if best_trial is None:
                         reset_bootstrap_solver_assignments(network_dag, level_snapshot)
@@ -1269,6 +1515,7 @@ class Scheme:
                             "rolled_back": True,
                             "rollback_reason": "no_candidate_improved_boot_safe_relayout_depth",
                             "trials": trials,
+                            "trial_evaluator": dict(round_trial_evaluator_audit),
                         }
                         refinement_rounds.append(dict(rollback_audit))
                         stopped_reason = "no_candidate_improved_boot_safe_relayout_depth"
@@ -1296,6 +1543,7 @@ class Scheme:
                         **dict(refinement_audit),
                         "candidate_count": int(candidate_audit.get("candidate_count", len(candidates)) or len(candidates)),
                         "trials": trials,
+                        "trial_evaluator": dict(round_trial_evaluator_audit),
                         "target_bootstrap_count": (
                             None if target_bootstrap_count is None else int(target_bootstrap_count)
                         ),
@@ -1362,6 +1610,13 @@ class Scheme:
                     "target_boot_edges": list((target_bootstrap_audit or {}).get("boot_edges", [])),
                     "accepted_round_count": int(len(accepted_rounds)),
                     "accepted_count": int(accepted_count),
+                    "candidate_trial_count": int(
+                        sum(len(row.get("trials", []) or []) for row in refinement_rounds)
+                    ),
+                    "trial_evaluator_mode": str(trial_evaluator_mode),
+                    "trial_evaluator_enabled_final": bool(trial_evaluator_enabled),
+                    "trial_evaluator_fallback_reason": str(trial_evaluator_fallback_reason),
+                    "trial_evaluator_fallback_round": trial_evaluator_fallback_round,
                     "rounds": refinement_rounds,
                 }
             else:
