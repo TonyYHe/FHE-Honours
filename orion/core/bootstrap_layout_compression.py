@@ -686,6 +686,18 @@ def _pair_max(value: Any, default: int = 1) -> int:
     return int(value if value is not None else default)
 
 
+def _pair_values(value: Any, default: int = 1) -> tuple[int, int]:
+    if isinstance(value, (tuple, list)):
+        if not value:
+            return int(default), int(default)
+        if len(value) == 1:
+            single = int(value[0])
+            return single, single
+        return int(value[0]), int(value[1])
+    scalar = int(value if value is not None else default)
+    return scalar, scalar
+
+
 def _conv_halo_consume(module: Any | None) -> int:
     if module is None:
         return 0
@@ -912,6 +924,27 @@ def _rewrite_row_as_compact_source(
     return updated
 
 
+def _row_is_native_source_stripe_relayout(row: dict[str, Any]) -> bool:
+    selected = dict(row.get("selected_layout", {}) or {})
+    required = dict(row.get("required_layout", selected) or selected)
+    reason = str(row.get("relayout_reason", "") or "")
+    source_physical = row.get("source_physical_layout", None)
+    return bool(
+        str(row.get("op_kind", "")) == "conv2d"
+        and str(row.get("source", "")) != "x"
+        and str(row.get("physical_layout", "")) == "native_source_stripe"
+        and str(row.get("target_physical_layout", row.get("physical_layout", "")) or "") == "native_source_stripe"
+        and source_physical is not None
+        and str(source_physical or "") != "native_source_stripe"
+        and _layout_has_halo(selected)
+        and _layout_covers(selected, required)
+        and int(selected.get("gap", 1) or 1) == int(required.get("gap", selected.get("gap", 1)) or 1)
+        and ("native_source_stripe_relayout" in reason or "physical_source_stripe_relayout" in reason)
+        and str(row.get("provider_lt_grouping_mode", "")) == "individual"
+        and str(row.get("native_halo_channel_fold_mode", "")) == "per_stripe"
+    )
+
+
 def _rewrite_node_as_beta_lift_producer(
     row: dict[str, Any],
     *,
@@ -977,6 +1010,119 @@ def _pool_direct_single_native_beta_lift(
     _source, target = native_edge
     target_module = network_dag.nodes[str(target)].get("module") if str(target) in network_dag.nodes else None
     return type(target_module).__name__ == "Conv2d"
+
+
+def _conv2d_unit_stride_radius_one(module: Any | None) -> bool:
+    if type(module).__name__ != "Conv2d":
+        return False
+    stride_h, stride_w = _pair_values(getattr(module, "stride", 1), 1)
+    dilation_h, dilation_w = _pair_values(getattr(module, "dilation", 1), 1)
+    kernel_h, kernel_w = _pair_values(getattr(module, "kernel_size", 1), 1)
+    padding_h, padding_w = _pair_values(getattr(module, "padding", 0), 0)
+    return bool(
+        int(stride_h) == 1
+        and int(stride_w) == 1
+        and int(dilation_h) == 1
+        and int(dilation_w) == 1
+        and int(kernel_h) == 3
+        and int(kernel_w) == 3
+        and int(padding_h) == 1
+        and int(padding_w) == 1
+    )
+
+
+def _producer_transitive_conv_conv_beta_lift(
+    network_dag: Any,
+    *,
+    path: list[str],
+    path_edges: list[tuple[str, str]],
+    edge_rows_by_edge: dict[str, dict[str, Any]],
+    start_index: int,
+    producer_module: Any | None,
+    lifted_edges: list[tuple[str, str]],
+    producer_layout: dict[str, Any],
+) -> bool:
+    if type(producer_module).__name__ not in {"AvgPool2d", "ConvTranspose2d"}:
+        return False
+    if len(lifted_edges) != 2:
+        return False
+    indexed_edges: list[tuple[int, tuple[str, str]]] = []
+    for edge in lifted_edges:
+        native_edge = tuple(edge)
+        try:
+            native_edge_index = path_edges.index(native_edge)
+        except ValueError:
+            return False
+        indexed_edges.append((int(native_edge_index), native_edge))
+    indexed_edges.sort(key=lambda item: item[0])
+    first_index, first_edge = indexed_edges[0]
+    second_index, second_edge = indexed_edges[1]
+    if int(first_index) != int(start_index):
+        return False
+    if int(second_index) <= int(first_index):
+        return False
+    first_consumer = str(first_edge[1])
+    final_consumer = str(second_edge[1])
+    middle_module = (
+        network_dag.nodes[str(first_consumer)].get("module") if str(first_consumer) in network_dag.nodes else None
+    )
+    consumer_module = (
+        network_dag.nodes[str(final_consumer)].get("module") if str(final_consumer) in network_dag.nodes else None
+    )
+    if not _conv2d_unit_stride_radius_one(middle_module):
+        return False
+    if not _conv2d_unit_stride_radius_one(consumer_module):
+        return False
+    carried_edge_ids: list[str] = []
+    for edge_index in range(int(first_index) + 1, int(second_index)):
+        carried_edge = path_edges[int(edge_index)]
+        carried_edge_id = f"{carried_edge[0]}->{carried_edge[1]}"
+        carried_row = edge_rows_by_edge.get(carried_edge_id)
+        if carried_row is None:
+            return False
+        intermediate_target = str(path_edges[int(edge_index)][1])
+        if not _layout_preserving_module(network_dag, intermediate_target):
+            return False
+        carried_edge_ids.append(str(carried_edge_id))
+
+    first_edge_id = f"{first_edge[0]}->{first_edge[1]}"
+    second_edge_id = f"{second_edge[0]}->{second_edge[1]}"
+    first_row = edge_rows_by_edge.get(first_edge_id)
+    second_row = edge_rows_by_edge.get(second_edge_id)
+    if first_row is None or second_row is None:
+        return False
+    first_selected = dict(first_row.get("selected_layout", {}) or {})
+    second_selected = dict(second_row.get("selected_layout", {}) or {})
+    first_gap = int(first_selected.get("gap", 1) or 1)
+    second_gap = int(second_selected.get("gap", 1) or 1)
+    producer_gap = int(dict(producer_layout).get("gap", 1) or 1)
+    if int(first_gap) != int(second_gap) or int(producer_gap) != int(second_gap):
+        return False
+    for carried_edge_id in carried_edge_ids:
+        carried_row = edge_rows_by_edge.get(str(carried_edge_id))
+        carried_selected = dict(carried_row.get("selected_layout", {}) or {}) if carried_row is not None else {}
+        carried_required = dict(carried_row.get("required_layout", carried_selected) or carried_selected)
+        if int(carried_selected.get("gap", 1) or 1) != int(second_gap):
+            return False
+        if int(carried_required.get("gap", carried_selected.get("gap", 1)) or 1) != int(second_gap):
+            return False
+        if not _layout_covers(second_selected, carried_required):
+            return False
+    if _layout_top_beta(producer_layout) != _layout_top_beta(second_selected) + 1:
+        return False
+    if _layout_bottom_beta(producer_layout) != _layout_bottom_beta(second_selected) + 1:
+        return False
+
+    middle_layout = _semantic_output_layout(
+        middle_module,
+        dict(second_row),
+        dict(producer_layout),
+    )
+    if _layout_top_beta(middle_layout) != _layout_top_beta(second_selected):
+        return False
+    if _layout_bottom_beta(middle_layout) != _layout_bottom_beta(second_selected):
+        return False
+    return True
 
 
 def _try_apply_beta_lift_candidate(
@@ -1063,6 +1209,9 @@ def _try_apply_beta_lift_candidate(
                 break
         if current_source_layout is None:
             continue
+        activation_transparent_single_native = False
+        pool_direct_single_native = False
+        producer_transitive_conv_conv = False
         if len(lifted_edges) < 2:
             activation_transparent_single_native = _activation_transparent_single_native_beta_lift(
                 network_dag,
@@ -1082,8 +1231,18 @@ def _try_apply_beta_lift_candidate(
             if not activation_transparent_single_native and not pool_direct_single_native:
                 continue
         else:
-            activation_transparent_single_native = False
-            pool_direct_single_native = False
+            producer_transitive_conv_conv = _producer_transitive_conv_conv_beta_lift(
+                network_dag,
+                path=path,
+                path_edges=path_edges,
+                edge_rows_by_edge=edge_rows_by_edge,
+                start_index=int(start_index),
+                producer_module=producer_module,
+                lifted_edges=lifted_edges,
+                producer_layout=dict(current_source_layout),
+            )
+            if type(producer_module).__name__ in {"AvgPool2d", "ConvTranspose2d"} and not producer_transitive_conv_conv:
+                continue
         if not _layout_has_halo(current_source_layout):
             continue
         updated_edge_rows = []
@@ -1120,6 +1279,10 @@ def _try_apply_beta_lift_candidate(
                     )
                     updated_edge_rows.append(updated)
                 elif _layout_preserving_module(network_dag, edge_target):
+                    required = dict(row.get("required_layout", row.get("selected_layout", {})) or {})
+                    if required and not _layout_covers(input_layout, required):
+                        accepted_edges = []
+                        break
                     updated = _rewrite_row_as_compact_source(
                         dict(row),
                         source_layout=input_layout,
@@ -1198,6 +1361,8 @@ def _try_apply_beta_lift_candidate(
             if bool(activation_transparent_single_native)
             else "pool_direct_beta_lift"
             if bool(pool_direct_single_native)
+            else "mvm_transitive_beta_lift"
+            if bool(producer_transitive_conv_conv)
             else "producer_beta_lift"
         )
         updated_plan = _refresh_layout_policy_plan_summary(
@@ -1210,7 +1375,7 @@ def _try_apply_beta_lift_candidate(
         summary = dict(updated_plan.get("summary", {}) or {})
         summary["boot_refined_beta_lift_count"] = int(summary.get("boot_refined_beta_lift_count", 0) or 0) + 1
         updated_plan["summary"] = summary
-        return {
+        result = {
             "kind": candidate_kind,
             "strategy": candidate_kind,
             "plan": updated_plan,
@@ -1228,6 +1393,11 @@ def _try_apply_beta_lift_candidate(
             ],
             "rejected": [],
         }
+        if bool(producer_transitive_conv_conv):
+            result["candidate_priority"] = 2
+            result["require_bootstrap_count_unchanged"] = False
+            result["require_bootstrap_shape_nonincrease"] = False
+        return result
     return None
 
 
@@ -1478,6 +1648,335 @@ def _concat_output_beta_lift_refinement_candidates(
                             }
                         ],
                         "covered_edge_count": 1,
+                    }
+                ],
+                "rejected": [],
+            }
+        )
+    return candidates
+
+
+def _concat_transitive_consumer_chain(
+    network_dag: Any,
+    edge_rows_by_edge: dict[str, dict[str, Any]],
+    *,
+    first_conv: str,
+) -> dict[str, Any] | None:
+    first_module = network_dag.nodes[str(first_conv)].get("module") if str(first_conv) in network_dag.nodes else None
+    if not _conv2d_unit_stride_radius_one(first_module):
+        return None
+    current = str(first_conv)
+    carried_edge_ids: list[str] = []
+    carried_edges: list[dict[str, Any]] = []
+    while True:
+        try:
+            successors = [str(value) for value in network_dag.successors(str(current))]
+        except Exception:
+            return None
+        if len(successors) != 1:
+            return None
+        successor = str(successors[0])
+        edge_id = f"{current}->{successor}"
+        edge_row = edge_rows_by_edge.get(edge_id)
+        if edge_row is None:
+            return None
+        successor_module = network_dag.nodes[str(successor)].get("module") if str(successor) in network_dag.nodes else None
+        if _layout_preserving_module(network_dag, successor):
+            carried_edge_ids.append(str(edge_id))
+            carried_edges.append(
+                {
+                    "edge": str(edge_id),
+                    "source": str(current),
+                    "target": str(successor),
+                    "op_kind": str(edge_row.get("op_kind", "")),
+                }
+            )
+            current = str(successor)
+            continue
+        if _conv2d_unit_stride_radius_one(successor_module):
+            return {
+                "final_conv": str(successor),
+                "final_edge_id": str(edge_id),
+                "final_edge_row": dict(edge_row),
+                "carried_edge_ids": carried_edge_ids,
+                "carried_edges": carried_edges,
+            }
+        return None
+
+
+def _local_concat_transitive_beta_lift_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    plan_slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
+    edge_rows = [{**dict(row), "slots": int(plan_slots)} for row in compile_plan.get("edge_layouts", [])]
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in edge_rows}
+    native_physical_edge_ids = {
+        str(row.get("edge", ""))
+        for row in edge_rows
+        if str(row.get("edge", "")) and _row_is_native_source_stripe_relayout(row)
+    } | {str(edge_id) for edge_id in actual_native_physical_edges}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    candidates: list[dict[str, Any]] = []
+    for row in edge_rows:
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        if edge_id not in native_physical_edge_ids:
+            continue
+        if (source, target) in boot_edges:
+            continue
+        if _candidate_interval_matches(row=current, intervals=intervals, boot_edges=boot_edges):
+            continue
+        if str(current.get("op_kind", "")) != "conv2d":
+            continue
+        if str(current.get("physical_layout", "")) != "native_source_stripe":
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[source].get("module")).__name__ != "Concat":
+            continue
+        if not _single_successor(network_dag, source, target):
+            continue
+        if node_rows_by_node.get(source) is None or node_rows_by_node.get(target) is None:
+            continue
+        join_rows = [
+            dict(join_row)
+            for join_row in edge_rows
+            if str(join_row.get("target", "")) == source and str(join_row.get("op_kind", "")) == "concat"
+        ]
+        predecessor_set = {str(predecessor) for predecessor in network_dag.predecessors(source)}
+        join_source_set = {str(join_row.get("source", "")) for join_row in join_rows}
+        synthetic_join = False
+        if len(predecessor_set) == 1:
+            join_node = str(next(iter(predecessor_set), ""))
+            if join_node == f"{source}_join" and join_node in network_dag.nodes:
+                join_pred_sources = {
+                    str(pred)[: -len("_fork")] if str(pred).endswith("_fork") else str(pred)
+                    for pred in network_dag.predecessors(join_node)
+                }
+                synthetic_join = bool(
+                    join_pred_sources == join_source_set
+                    and {str(succ) for succ in network_dag.successors(join_node)} == {source}
+                )
+        if len(join_rows) < 2 or (join_source_set != predecessor_set and not synthetic_join):
+            continue
+        join_safe = True
+        for join_row in join_rows:
+            selected = dict(join_row.get("selected_layout", {}) or {})
+            source_physical = str(join_row.get("source_physical_layout", PHYSICAL_COMPACT) or "")
+            physical = str(join_row.get("physical_layout", "") or "")
+            target_physical = str(join_row.get("target_physical_layout", join_row.get("physical_layout", "")) or "")
+            if (
+                _layout_has_halo(selected)
+                or source_physical != PHYSICAL_COMPACT
+                or physical != PHYSICAL_COMPACT
+                or target_physical != PHYSICAL_COMPACT
+            ):
+                join_safe = False
+                break
+        if not join_safe:
+            continue
+
+        chain = _concat_transitive_consumer_chain(
+            network_dag,
+            edge_rows_by_edge,
+            first_conv=str(target),
+        )
+        if chain is None:
+            continue
+        final_edge_id = str(chain.get("final_edge_id", ""))
+        final_edge = dict(chain.get("final_edge_row", {}) or {})
+        final_selected = dict(final_edge.get("selected_layout", {}) or {})
+        final_required = dict(final_edge.get("required_layout", final_selected) or final_selected)
+        if not _layout_has_halo(final_selected):
+            continue
+        if not _layout_covers(final_selected, final_required):
+            continue
+        if int(final_selected.get("gap", 1) or 1) != int(
+            final_required.get("gap", final_selected.get("gap", 1)) or 1
+        ):
+            continue
+        producer_layout = _input_demand_for_output_layout(
+            network_dag.nodes[target].get("module"),
+            current,
+            final_selected,
+        )
+        if not _layout_has_halo(producer_layout):
+            continue
+        if int(producer_layout.get("gap", 1) or 1) != int(final_selected.get("gap", 1) or 1):
+            continue
+        if _layout_top_beta(producer_layout) != _layout_top_beta(final_selected) + 1:
+            continue
+        if _layout_bottom_beta(producer_layout) != _layout_bottom_beta(final_selected) + 1:
+            continue
+        current_required = dict(current.get("required_layout", current.get("selected_layout", {}) or {}) or {})
+        if current_required and not _layout_covers(producer_layout, current_required):
+            continue
+        carried_supported = True
+        for carried_edge_id in chain.get("carried_edge_ids", []) or []:
+            carried_row = edge_rows_by_edge.get(str(carried_edge_id))
+            if carried_row is None:
+                carried_supported = False
+                break
+            carried_selected = dict(carried_row.get("selected_layout", {}) or {})
+            carried_required = dict(carried_row.get("required_layout", carried_selected) or carried_selected)
+            if int(carried_selected.get("gap", 1) or 1) != int(final_selected.get("gap", 1) or 1):
+                carried_supported = False
+                break
+            if int(carried_required.get("gap", carried_selected.get("gap", 1)) or 1) != int(
+                final_selected.get("gap", 1) or 1
+            ):
+                carried_supported = False
+                break
+            if not _layout_covers(final_selected, carried_required):
+                carried_supported = False
+                break
+        if not carried_supported:
+            continue
+
+        carried_edge_ids = {str(value) for value in chain.get("carried_edge_ids", []) or []}
+        updated_edge_rows: list[dict[str, Any]] = []
+        accepted_edges: list[dict[str, Any]] = []
+        carried_edges: list[dict[str, Any]] = []
+        for candidate_row in compile_plan.get("edge_layouts", []):
+            candidate_edge_id = str(candidate_row.get("edge", ""))
+            if candidate_edge_id == edge_id:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=producer_layout,
+                    target_layout=producer_layout,
+                    reason="local_concat_transitive_beta_lift",
+                )
+                updated["layout_mode"] = "concat_output_transitive_compact_halo_shared"
+                updated["concat_output_beta_lift"] = True
+                updated["local_concat_transitive_beta_lift"] = True
+                updated["concat_output_beta_lift_source"] = str(source)
+                accepted_edges.append(
+                    {
+                        "edge": str(edge_id),
+                        "source": str(source),
+                        "target": str(target),
+                        "old_physical_layout": str(current.get("physical_layout", "")),
+                        "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                    }
+                )
+                updated_edge_rows.append(updated)
+            elif candidate_edge_id in carried_edge_ids:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=final_selected,
+                    target_layout=final_selected,
+                    reason="local_concat_transitive_beta_lift",
+                )
+                carried_edges.append(
+                    {
+                        "edge": str(candidate_edge_id),
+                        "source": str(candidate_row.get("source", "")),
+                        "target": str(candidate_row.get("target", "")),
+                        "op_kind": str(candidate_row.get("op_kind", "")),
+                        "physical_layout": str(updated.get("physical_layout", "")),
+                    }
+                )
+                updated_edge_rows.append(updated)
+            elif (
+                candidate_edge_id == final_edge_id
+                and candidate_edge_id in native_physical_edge_ids
+                and str(candidate_row.get("physical_layout", "")) == "native_source_stripe"
+            ):
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=final_selected,
+                    target_layout=final_selected,
+                    reason="local_concat_transitive_beta_lift",
+                )
+                accepted_edges.append(
+                    {
+                        "edge": str(candidate_edge_id),
+                        "source": str(candidate_row.get("source", "")),
+                        "target": str(candidate_row.get("target", "")),
+                        "old_physical_layout": str(candidate_row.get("physical_layout", "")),
+                        "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                    }
+                )
+                updated_edge_rows.append(updated)
+            else:
+                updated_edge_rows.append(dict(candidate_row))
+
+        lift_nodes = {str(source), str(target)}
+        for carried_edge_id in carried_edge_ids:
+            carried_row = edge_rows_by_edge.get(str(carried_edge_id), {})
+            carried_target = str(carried_row.get("target", ""))
+            if carried_target:
+                lift_nodes.add(str(carried_target))
+        updated_node_rows: list[dict[str, Any]] = []
+        for candidate_node in compile_plan.get("node_layouts", []):
+            node = str(candidate_node.get("node", ""))
+            if node == source:
+                updated_node_rows.append(
+                    _rewrite_node_as_beta_lift_producer(
+                        dict(candidate_node),
+                        layout=producer_layout,
+                        reason="local_concat_transitive_beta_lift",
+                    )
+                )
+            elif node in lift_nodes:
+                producer_growth_delta = _producer_node_layout_growth_rotation_delta(
+                    network_dag,
+                    compile_plan,
+                    node=str(node),
+                    old_row=dict(candidate_node),
+                    new_layout=dict(final_selected),
+                )
+                updated_node = _rewrite_node_as_beta_lift_producer(
+                    dict(candidate_node),
+                    layout=final_selected,
+                    reason="local_concat_transitive_beta_lift",
+                )
+                if int(producer_growth_delta) > 0:
+                    updated_node["producer_fused_rotation_estimate"] = int(
+                        int(candidate_node.get("producer_fused_rotation_estimate", 0) or 0)
+                        + int(producer_growth_delta)
+                    )
+                updated_node_rows.append(updated_node)
+            else:
+                updated_node_rows.append(dict(candidate_node))
+
+        updated_plan = _refresh_layout_policy_plan_summary(
+            {
+                **dict(compile_plan),
+                "edge_layouts": updated_edge_rows,
+                "node_layouts": updated_node_rows,
+            }
+        )
+        summary = dict(updated_plan.get("summary", {}) or {})
+        summary["boot_refined_local_concat_transitive_beta_lift_count"] = (
+            int(summary.get("boot_refined_local_concat_transitive_beta_lift_count", 0) or 0) + 1
+        )
+        updated_plan["summary"] = summary
+        candidates.append(
+            {
+                "kind": "local_concat_transitive_beta_lift",
+                "strategy": "local_concat_transitive_beta_lift",
+                "plan": updated_plan,
+                "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
+                "candidate_priority": 2,
+                "require_bootstrap_count_unchanged": False,
+                "require_bootstrap_shape_nonincrease": False,
+                "accepted": [
+                    {
+                        "kind": "local_concat_transitive_beta_lift",
+                        "producer": str(source),
+                        "producer_layout": dict(producer_layout),
+                        "consumer_layout": dict(final_selected),
+                        "covered_edges": accepted_edges,
+                        "carried_edges": carried_edges,
+                        "covered_edge_count": int(len(accepted_edges)),
                     }
                 ],
                 "rejected": [],
@@ -1931,6 +2430,13 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                     )
                     or 0
                 ),
+                "candidate_priority": int(beta_lift.get("candidate_priority", 0) or 0),
+                "require_bootstrap_count_unchanged": bool(
+                    beta_lift.get("require_bootstrap_count_unchanged", False)
+                ),
+                "require_bootstrap_shape_nonincrease": bool(
+                    beta_lift.get("require_bootstrap_shape_nonincrease", False)
+                ),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -2030,6 +2536,45 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "candidate_priority": 1,
                 "require_bootstrap_count_unchanged": True,
                 "require_bootstrap_shape_nonincrease": True,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
+    for concat_lift in _local_concat_transitive_beta_lift_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    ):
+        accepted = [dict(row) for row in concat_lift.get("accepted", [])]
+        candidate_kind = str(concat_lift.get("kind", "local_concat_transitive_beta_lift"))
+        candidate_strategy = str(concat_lift.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_local_concat_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(concat_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(concat_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": int(
+                    concat_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(concat_lift["plan"])),
+                    )
+                    or 0
+                ),
+                "candidate_priority": int(concat_lift.get("candidate_priority", 2) or 2),
+                "require_bootstrap_count_unchanged": bool(
+                    concat_lift.get("require_bootstrap_count_unchanged", True)
+                ),
+                "require_bootstrap_shape_nonincrease": bool(
+                    concat_lift.get("require_bootstrap_shape_nonincrease", True)
+                ),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
