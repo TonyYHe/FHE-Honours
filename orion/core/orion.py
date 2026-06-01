@@ -109,6 +109,18 @@ def _mem_available_bytes() -> int | None:
     return None
 
 
+def _bootstrap_shape_nonincrease_safe(
+    candidate: dict[str, Any],
+    *,
+    bootstrap_ct_delta: int,
+    bootstrap_slots_delta: int,
+    force: bool = False,
+) -> bool:
+    if not bool(force) and not bool(candidate.get("require_bootstrap_shape_nonincrease", False)):
+        return True
+    return bool(int(bootstrap_ct_delta) <= 0 and int(bootstrap_slots_delta) <= 0)
+
+
 def _dense_pack_worker_budget(target_workers: int) -> tuple[int, int | None, int, int]:
     reserve_raw = os.environ.get("ORION_DENSE_PACK_MEMORY_RESERVE_BYTES")
     if reserve_raw is None:
@@ -1127,16 +1139,34 @@ class Scheme:
                             "target_bootstrap_count": int(target_bootstrap_count),
                             "target_bootstrap_source": str(target_bootstrap_source),
                         }
+                        post_target_cleanup_round = False
                         if int(current_boot_count) <= int(target_bootstrap_count):
+                            post_target_candidates = [
+                                dict(candidate)
+                                for candidate in candidates
+                                if bool(candidate.get("allow_after_bootstrap_target", False))
+                                and int(candidate.get("output_tile_delta", 0) or 0) <= 0
+                                and int(candidate.get("rotation_delta", 0) or 0) <= 0
+                            ]
+                            if not post_target_candidates:
+                                round_audit = {
+                                    **dict(round_audit),
+                                    "enabled": False,
+                                    "stopped_at_bootstrap_target": True,
+                                    "trials": [],
+                                }
+                                refinement_rounds.append(round_audit)
+                                stopped_reason = "bootstrap_target_reached"
+                                break
+                            candidates = post_target_candidates
+                            post_target_cleanup_round = True
                             round_audit = {
                                 **dict(round_audit),
-                                "enabled": False,
-                                "stopped_at_bootstrap_target": True,
-                                "trials": [],
+                                "bootstrap_target_reached_cleanup": True,
+                                "post_target_candidate_count": int(len(candidates)),
                             }
-                            refinement_rounds.append(round_audit)
-                            stopped_reason = "bootstrap_target_reached"
-                            break
+                    else:
+                        post_target_cleanup_round = False
                     current_bootstrap_ct_count = int(
                         sum(
                             int(row.get("bootstrap_ct_count", 0) or 0)
@@ -1194,18 +1224,30 @@ class Scheme:
                         )
                         bootstrap_slots_delta = int(bootstrap_slots_total - current_bootstrap_slots_total)
                         accepted_count_for_score = int(trial_apply_audit.get("accepted_count", 0) or 0)
-                        bootstrap_shape_safe = bool(
-                            not bool(candidate.get("require_bootstrap_shape_nonincrease", False))
-                            or (int(bootstrap_ct_delta) <= 0 and int(bootstrap_slots_delta) <= 0)
+                        bootstrap_shape_forced = bool(post_target_cleanup_round)
+                        bootstrap_shape_safe = _bootstrap_shape_nonincrease_safe(
+                            candidate,
+                            bootstrap_ct_delta=int(bootstrap_ct_delta),
+                            bootstrap_slots_delta=int(bootstrap_slots_delta),
+                            force=bool(bootstrap_shape_forced),
                         )
                         bootstrap_count_safe = bool(
                             int(boot_delta) == 0
                             if bool(candidate.get("require_bootstrap_count_unchanged", False))
                             else int(boot_delta) <= 0
                         )
+                        rotation_delta = int(candidate.get("rotation_delta", 0) or 0)
+                        output_tile_delta = int(candidate.get("output_tile_delta", 0) or 0)
+                        allow_depth_unchanged = bool(
+                            candidate.get("allow_relayout_depth_unchanged", False)
+                            and int(depth_delta) == 0
+                            and int(rotation_delta) <= 0
+                            and int(output_tile_delta) <= 0
+                        )
+                        relayout_depth_safe = bool(int(depth_delta) < 0 or bool(allow_depth_unchanged))
                         acceptable = bool(
                             bool(bootstrap_count_safe)
-                            and int(depth_delta) < 0
+                            and bool(relayout_depth_safe)
                             and bool(bootstrap_shape_safe)
                         )
                         trial_audit = {
@@ -1220,11 +1262,16 @@ class Scheme:
                             "bootstrap_slots_delta": int(bootstrap_slots_delta),
                             "bootstrap_count_safe": bool(bootstrap_count_safe),
                             "bootstrap_shape_safe": bool(bootstrap_shape_safe),
+                            "bootstrap_shape_forced": bool(bootstrap_shape_forced),
+                            "relayout_depth_safe": bool(relayout_depth_safe),
+                            "allow_relayout_depth_unchanged": bool(
+                                candidate.get("allow_relayout_depth_unchanged", False)
+                            ),
+                            "output_tile_delta": int(output_tile_delta),
                             "trial_boot_edges": list(trial_final_audit.get("boot_edges", [])),
                         }
                         if not bool(acceptable):
                             return trial_audit, None, None
-                        rotation_delta = int(candidate.get("rotation_delta", 0) or 0)
                         score = (
                             int(boot_delta),
                             int(candidate.get("candidate_priority", 0) or 0),
@@ -1538,6 +1585,22 @@ class Scheme:
                         apply_layout_compression=False
                     )
                     final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                    final_bootstrap_ct_count = int(
+                        sum(
+                            int(row.get("bootstrap_ct_count", 0) or 0)
+                            for row in final_audit.get("boot_edges", [])
+                        )
+                    )
+                    final_bootstrap_slots_total = int(
+                        sum(
+                            int(row.get("bootstrapper_slots", 0) or 0)
+                            for row in final_audit.get("boot_edges", [])
+                        )
+                    )
+                    final_bootstrap_ct_delta = int(final_bootstrap_ct_count - current_bootstrap_ct_count)
+                    final_bootstrap_slots_delta = int(
+                        final_bootstrap_slots_total - current_bootstrap_slots_total
+                    )
                     round_audit = {
                         **round_audit,
                         **dict(refinement_audit),
@@ -1549,9 +1612,14 @@ class Scheme:
                         ),
                         "target_bootstrap_source": str(target_bootstrap_source),
                         "final_bootstrap_count": int(final_audit["bootstrap_count"]),
+                        "final_bootstrap_ct_delta": int(final_bootstrap_ct_delta),
+                        "final_bootstrap_slots_delta": int(final_bootstrap_slots_delta),
                         "final_boot_edges": list(final_audit.get("boot_edges", [])),
                     }
-                    if int(final_audit["bootstrap_count"]) > int(current_audit["bootstrap_count"]):
+                    if int(final_audit["bootstrap_count"]) > int(current_audit["bootstrap_count"]) or (
+                        bool(post_target_cleanup_round)
+                        and (int(final_bootstrap_ct_delta) > 0 or int(final_bootstrap_slots_delta) > 0)
+                    ):
                         restore_layout_policy_compile_plan(
                             network_dag,
                             accepted_compile_plan,
@@ -1567,10 +1635,15 @@ class Scheme:
                             **dict(round_audit),
                             "enabled": False,
                             "rolled_back": True,
-                            "rollback_reason": "bootstrap_count_increased",
+                            "rollback_reason": (
+                                "post_target_bootstrap_shape_increased"
+                                if bool(post_target_cleanup_round)
+                                and (int(final_bootstrap_ct_delta) > 0 or int(final_bootstrap_slots_delta) > 0)
+                                else "bootstrap_count_increased"
+                            ),
                         }
                         refinement_rounds.append(dict(rollback_audit))
-                        stopped_reason = "bootstrap_count_increased_rollback"
+                        stopped_reason = str(rollback_audit["rollback_reason"]) + "_rollback"
                         break
                     else:
                         round_audit = {

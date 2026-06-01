@@ -12,12 +12,14 @@ import torch
 
 import orion.core.orion as orion_core
 from orion.core import packing
+from orion.core.orion import _bootstrap_shape_nonincrease_safe
 from orion.core.bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement_candidate
 from orion.core.bootstrap_layout_compression import enumerate_bootstrap_aware_layout_refinement_candidates
 from orion.core.bootstrap_layout_compression import restore_layout_policy_compile_plan
 from orion.core.bootstrap_layout_compression import _conv2d_unit_stride_radius_one
+from orion.core.bootstrap_layout_compression import _producer_layout_growth_rotation_delta
 from orion.core.bootstrap_layout_compression import _row_is_native_source_stripe_relayout
 from orion.core.orion import _region_first_mode_options
 from orion.core.orion import scheme
@@ -310,6 +312,100 @@ def test_capacity_fill_balances_extra_halo_without_growing_tile_count() -> None:
     assert bool(required.boundary_pruned) is True
     assert int(filled.tile_count) == int(required.tile_count)
     assert (int(filled.top_beta), int(filled.bottom_beta)) == (1, 1)
+
+
+def test_producer_growth_rotation_delta_tracks_tile_count_not_stored_slots() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 4,
+        "core_slots": 401408,
+        "stored_slots": 401408,
+        "tile_count": 13,
+    }
+    same_tile_halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 4,
+        "core_slots": 401408,
+        "stored_slots": 415744,
+        "tile_count": 13,
+    }
+    grown_tile_halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 4,
+        "core_slots": 401408,
+        "stored_slots": 430080,
+        "tile_count": 14,
+    }
+    compile_plan = {
+        "slots": 32768,
+        "edge_layouts": [
+            {
+                "edge": "prev->act",
+                "source": "prev",
+                "target": "act",
+                "planner_rotation_cost_estimate": 130,
+            }
+        ],
+    }
+
+    assert (
+        _producer_layout_growth_rotation_delta(
+            compile_plan,
+            node="act",
+            old_layout=compact,
+            new_layout=same_tile_halo,
+        )
+        == 0
+    )
+    assert (
+        _producer_layout_growth_rotation_delta(
+            compile_plan,
+            node="act",
+            old_layout=compact,
+            new_layout=grown_tile_halo,
+        )
+        == 10
+    )
+
+
+def test_post_target_cleanup_forces_bootstrap_shape_nonincrease() -> None:
+    relaxed_candidate = {
+        "require_bootstrap_shape_nonincrease": False,
+        "allow_after_bootstrap_target": True,
+        "output_tile_delta": 0,
+        "rotation_delta": 0,
+    }
+
+    assert _bootstrap_shape_nonincrease_safe(
+        relaxed_candidate,
+        bootstrap_ct_delta=1,
+        bootstrap_slots_delta=0,
+        force=False,
+    )
+    assert not _bootstrap_shape_nonincrease_safe(
+        relaxed_candidate,
+        bootstrap_ct_delta=1,
+        bootstrap_slots_delta=0,
+        force=True,
+    )
+    assert not _bootstrap_shape_nonincrease_safe(
+        relaxed_candidate,
+        bootstrap_ct_delta=0,
+        bootstrap_slots_delta=1,
+        force=True,
+    )
+    assert _bootstrap_shape_nonincrease_safe(
+        relaxed_candidate,
+        bootstrap_ct_delta=0,
+        bootstrap_slots_delta=0,
+        force=True,
+    )
 
 
 def _init_python_scheme(provider_mode: str) -> None:
@@ -2763,6 +2859,11 @@ def test_bootstrap_aware_refinement_lifts_pool_to_conv_boot_boundary() -> None:
 
     assert audit["enabled"] is True
     assert audit["strategy"] == "boot_boundary_pool_direct_beta_lift"
+    assert audit["candidate_priority"] == -1
+    assert int(audit["rotation_delta"]) == 0
+    assert audit["allow_relayout_depth_unchanged"] is True
+    assert audit["allow_after_bootstrap_target"] is True
+    assert int(audit["output_tile_delta"]) == 0
     assert audit["accepted"][0]["boot_edge"] == {"source": "pool", "target": "conv"}
     assert nodes["pool"]["producer_materialized_halo"] is True
     assert nodes["pool"]["selected_layout"]["top_beta"] == 1
@@ -2965,6 +3066,11 @@ def test_bootstrap_aware_refinement_lifts_conv_to_conv_boot_boundary() -> None:
 
     assert audit["enabled"] is True
     assert audit["strategy"] == "boot_boundary_beta_lift"
+    assert audit["candidate_priority"] == -1
+    assert int(audit["rotation_delta"]) == 0
+    assert audit["allow_relayout_depth_unchanged"] is True
+    assert audit["allow_after_bootstrap_target"] is True
+    assert int(audit["output_tile_delta"]) == 0
     assert edges["conv1->conv2"]["physical_layout"] == "logical_halo_compact"
     assert not executor.native_physical_relayout_rows
 
@@ -3072,15 +3178,21 @@ def test_bootstrap_aware_refinement_lifts_local_activation_tail_cleanup() -> Non
     edges = {str(row["edge"]): dict(row) for row in updated["edge_layouts"]}
 
     assert len(local_candidates) == 1
-    assert local_candidates[0]["candidate_priority"] == 1
-    assert int(local_candidates[0]["rotation_delta"]) > 0
+    assert local_candidates[0]["candidate_priority"] == -1
+    assert int(local_candidates[0]["rotation_delta"]) == 0
+    assert local_candidates[0]["allow_relayout_depth_unchanged"] is True
+    assert local_candidates[0]["allow_after_bootstrap_target"] is True
+    assert int(local_candidates[0]["output_tile_delta"]) == 0
     assert local_candidates[0]["require_bootstrap_count_unchanged"] is True
     assert local_candidates[0]["require_bootstrap_shape_nonincrease"] is True
     assert audit["enabled"] is True
     assert audit["strategy"] == "local_activation_beta_lift"
-    assert int(audit["rotation_delta"]) > 0
+    assert int(audit["rotation_delta"]) == 0
     assert int(updated["summary"]["producer_fused_rotation_estimate"]) == int(audit["rotation_delta"])
     assert int(updated["summary"]["reported_rotation_estimate"]) == int(audit["rotation_delta"])
+    assert audit["allow_relayout_depth_unchanged"] is True
+    assert audit["allow_after_bootstrap_target"] is True
+    assert int(audit["output_tile_delta"]) == 0
     assert audit["require_bootstrap_count_unchanged"] is True
     assert audit["require_bootstrap_shape_nonincrease"] is True
     assert audit["accepted"][0]["producer"] == "conv1"
@@ -3434,6 +3546,11 @@ def test_bootstrap_aware_refinement_lifts_concat_output_for_local_conv_consumer(
 
     assert audit["enabled"] is True
     assert audit["strategy"] == "concat_output_beta_lift"
+    assert audit["candidate_priority"] == -1
+    assert int(audit["rotation_delta"]) == 0
+    assert audit["allow_relayout_depth_unchanged"] is True
+    assert audit["allow_after_bootstrap_target"] is True
+    assert int(audit["output_tile_delta"]) == 0
     assert audit["accepted"][0]["producer"] == "cat"
     assert validate_layout_policy_compile_plan(updated)["ok"] is True
     assert edges["skip->cat"]["physical_layout"] == "packed_compact"

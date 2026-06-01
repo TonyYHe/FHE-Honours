@@ -570,6 +570,77 @@ def _layout_stored_slots(layout: dict[str, Any]) -> int:
     return max(1, int(dict(layout).get("stored_slots", dict(layout).get("core_slots", 1)) or 1))
 
 
+def _layout_tile_count(layout: dict[str, Any], *, slots: int = 32768) -> int:
+    layout = dict(layout)
+    if "tile_count" in layout:
+        return max(1, int(layout.get("tile_count", 1) or 1))
+    return max(1, _ceil_div(_layout_stored_slots(layout), max(1, int(slots or 32768))))
+
+
+def _layout_tile_count_delta(
+    old_layout: dict[str, Any],
+    new_layout: dict[str, Any],
+    *,
+    slots: int = 32768,
+) -> int:
+    return int(
+        max(
+            0,
+            _layout_tile_count(new_layout, slots=int(slots))
+            - _layout_tile_count(old_layout, slots=int(slots)),
+        )
+    )
+
+
+def _plan_output_tile_count_delta(
+    old_plan: dict[str, Any],
+    new_plan: dict[str, Any],
+) -> int:
+    slots = max(1, int(dict(old_plan).get("slots", dict(new_plan).get("slots", 32768)) or 32768))
+    old_rows = {
+        str(row.get("node", "")): dict(row)
+        for row in dict(old_plan).get("node_layouts", [])
+        if str(row.get("node", ""))
+    }
+    delta = 0
+    for new_row in dict(new_plan).get("node_layouts", []):
+        node = str(dict(new_row).get("node", ""))
+        if not node or node not in old_rows:
+            continue
+        old_layout = dict(old_rows[node].get("selected_layout", {}) or {})
+        new_layout = dict(dict(new_row).get("selected_layout", {}) or {})
+        delta += _layout_tile_count_delta(old_layout, new_layout, slots=slots)
+    return int(delta)
+
+
+def _annotate_costless_output_lift_candidate(
+    compile_plan: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    annotated = dict(candidate)
+    plan = dict(annotated.get("plan", {}) or {})
+    rotation_delta = int(
+        annotated.get("rotation_delta", _candidate_rotation_delta(compile_plan, plan)) or 0
+    )
+    output_tile_delta = int(
+        annotated.get(
+            "output_tile_delta",
+            _plan_output_tile_count_delta(compile_plan, plan),
+        )
+        or 0
+    )
+    annotated["rotation_delta"] = int(rotation_delta)
+    annotated["output_tile_delta"] = int(output_tile_delta)
+    if int(output_tile_delta) <= 0 and int(rotation_delta) <= 0:
+        annotated["allow_relayout_depth_unchanged"] = True
+        annotated["allow_after_bootstrap_target"] = True
+        annotated["candidate_priority"] = min(
+            int(annotated.get("candidate_priority", 0) or 0),
+            -1,
+        )
+    return annotated
+
+
 def _producer_layout_growth_rotation_delta(
     compile_plan: dict[str, Any],
     *,
@@ -577,9 +648,11 @@ def _producer_layout_growth_rotation_delta(
     old_layout: dict[str, Any],
     new_layout: dict[str, Any],
 ) -> int:
-    old_slots = _layout_stored_slots(old_layout)
-    new_slots = _layout_stored_slots(new_layout)
-    if int(new_slots) <= int(old_slots):
+    slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
+    old_tiles = _layout_tile_count(old_layout, slots=slots)
+    new_tiles = _layout_tile_count(new_layout, slots=slots)
+    tile_delta = int(new_tiles - old_tiles)
+    if int(tile_delta) <= 0:
         return 0
     incoming_cost = int(
         sum(
@@ -589,8 +662,8 @@ def _producer_layout_growth_rotation_delta(
         )
     )
     if int(incoming_cost) <= 0:
-        return int(max(0, int(new_slots) - int(old_slots)))
-    return int(math.ceil(float(incoming_cost) * float(int(new_slots) - int(old_slots)) / float(old_slots)))
+        return int(tile_delta)
+    return int(math.ceil(float(incoming_cost) * float(tile_delta) / float(max(1, int(old_tiles)))))
 
 
 def _producer_node_layout_growth_rotation_delta(
@@ -2302,11 +2375,18 @@ def _local_activation_beta_lift_refinement_candidates(
 
         updated_node_rows: list[dict[str, Any]] = []
         lift_nodes = {str(producer), str(source)}
+        output_tile_delta = 0
+        slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
         for candidate_node in compile_plan.get("node_layouts", []):
             if str(candidate_node.get("node", "")) not in lift_nodes:
                 updated_node_rows.append(dict(candidate_node))
                 continue
             node = str(candidate_node.get("node", ""))
+            output_tile_delta += _layout_tile_count_delta(
+                dict(candidate_node.get("selected_layout", {}) or {}),
+                dict(selected),
+                slots=slots,
+            )
             producer_growth_delta = _producer_node_layout_growth_rotation_delta(
                 network_dag,
                 compile_plan,
@@ -2338,17 +2418,24 @@ def _local_activation_beta_lift_refinement_candidates(
             int(summary.get("boot_refined_local_activation_beta_lift_count", 0) or 0) + 1
         )
         updated_plan["summary"] = summary
+        rotation_delta = _candidate_rotation_delta(compile_plan, updated_plan)
+        allow_depth_unchanged = bool(int(output_tile_delta) <= 0 and int(rotation_delta) <= 0)
         candidates.append(
             {
                 "kind": "local_activation_beta_lift",
                 "strategy": "local_activation_beta_lift",
                 "plan": updated_plan,
-                "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
+                "rotation_delta": int(rotation_delta),
+                "candidate_priority": -1 if bool(allow_depth_unchanged) else 1,
+                "allow_relayout_depth_unchanged": bool(allow_depth_unchanged),
+                "allow_after_bootstrap_target": bool(allow_depth_unchanged),
+                "output_tile_delta": int(output_tile_delta),
                 "accepted": [
                     {
                         "kind": "local_activation_beta_lift",
                         "producer": str(producer),
                         "producer_layout": dict(selected),
+                        "output_tile_delta": int(output_tile_delta),
                         "covered_edges": [
                             {
                                 "edge": str(edge_id),
@@ -2409,6 +2496,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
         )
         if beta_lift is None:
             continue
+        beta_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(beta_lift))
         accepted = [dict(row) for row in beta_lift.get("accepted", [])]
         candidate_kind = str(beta_lift.get("kind", "producer_beta_lift"))
         candidate_strategy = str(beta_lift.get("strategy", candidate_kind))
@@ -2431,6 +2519,11 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                     or 0
                 ),
                 "candidate_priority": int(beta_lift.get("candidate_priority", 0) or 0),
+                "allow_relayout_depth_unchanged": bool(
+                    beta_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(beta_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(beta_lift.get("output_tile_delta", 0) or 0),
                 "require_bootstrap_count_unchanged": bool(
                     beta_lift.get("require_bootstrap_count_unchanged", False)
                 ),
@@ -2448,6 +2541,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
         boot_edges=boot_edges,
         actual_native_physical_edges=actual_native_physical_edges,
     ):
+        concat_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(concat_lift))
         accepted = [dict(row) for row in concat_lift.get("accepted", [])]
         candidate_kind = str(concat_lift.get("kind", "concat_output_beta_lift"))
         candidate_strategy = str(concat_lift.get("strategy", candidate_kind))
@@ -2469,6 +2563,12 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                     )
                     or 0
                 ),
+                "candidate_priority": int(concat_lift.get("candidate_priority", 0) or 0),
+                "allow_relayout_depth_unchanged": bool(
+                    concat_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(concat_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(concat_lift.get("output_tile_delta", 0) or 0),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -2480,6 +2580,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
         boot_edges=boot_edges,
         actual_native_physical_edges=actual_native_physical_edges,
     ):
+        boot_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(boot_lift))
         accepted = [dict(row) for row in boot_lift.get("accepted", [])]
         candidate_kind = str(boot_lift.get("kind", "boot_boundary_beta_lift"))
         candidate_strategy = str(boot_lift.get("strategy", candidate_kind))
@@ -2501,6 +2602,12 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                     )
                     or 0
                 ),
+                "candidate_priority": int(boot_lift.get("candidate_priority", 0) or 0),
+                "allow_relayout_depth_unchanged": bool(
+                    boot_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(boot_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(boot_lift.get("output_tile_delta", 0) or 0),
                 "boot_interval_count": int(len(intervals)),
                 "boot_intervals": boot_interval_rows,
             }
@@ -2512,6 +2619,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
         boot_edges=boot_edges,
         actual_native_physical_edges=actual_native_physical_edges,
     ):
+        local_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(local_lift))
         accepted = [dict(row) for row in local_lift.get("accepted", [])]
         candidate_kind = str(local_lift.get("kind", "local_activation_beta_lift"))
         candidate_strategy = str(local_lift.get("strategy", candidate_kind))
@@ -2533,7 +2641,16 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                     )
                     or 0
                 ),
-                "candidate_priority": 1,
+                "candidate_priority": int(
+                    local_lift["candidate_priority"]
+                    if "candidate_priority" in local_lift
+                    else 1
+                ),
+                "allow_relayout_depth_unchanged": bool(
+                    local_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(local_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(local_lift.get("output_tile_delta", 0) or 0),
                 "require_bootstrap_count_unchanged": True,
                 "require_bootstrap_shape_nonincrease": True,
                 "boot_interval_count": int(len(intervals)),
@@ -2547,6 +2664,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
         boot_edges=boot_edges,
         actual_native_physical_edges=actual_native_physical_edges,
     ):
+        concat_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(concat_lift))
         accepted = [dict(row) for row in concat_lift.get("accepted", [])]
         candidate_kind = str(concat_lift.get("kind", "local_concat_transitive_beta_lift"))
         candidate_strategy = str(concat_lift.get("strategy", candidate_kind))
@@ -2569,6 +2687,11 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                     or 0
                 ),
                 "candidate_priority": int(concat_lift.get("candidate_priority", 2) or 2),
+                "allow_relayout_depth_unchanged": bool(
+                    concat_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(concat_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(concat_lift.get("output_tile_delta", 0) or 0),
                 "require_bootstrap_count_unchanged": bool(
                     concat_lift.get("require_bootstrap_count_unchanged", True)
                 ),
@@ -2690,6 +2813,9 @@ def apply_bootstrap_aware_layout_refinement_candidate(
         "accepted_count": int(candidate.get("accepted_count", len(accepted)) or 0),
         "rotation_delta": int(candidate.get("rotation_delta", 0) or 0),
         "candidate_priority": int(candidate.get("candidate_priority", 0) or 0),
+        "allow_relayout_depth_unchanged": bool(candidate.get("allow_relayout_depth_unchanged", False)),
+        "allow_after_bootstrap_target": bool(candidate.get("allow_after_bootstrap_target", False)),
+        "output_tile_delta": int(candidate.get("output_tile_delta", 0) or 0),
         "require_bootstrap_count_unchanged": bool(candidate.get("require_bootstrap_count_unchanged", False)),
         "require_bootstrap_shape_nonincrease": bool(candidate.get("require_bootstrap_shape_nonincrease", False)),
         "depth_updates": depth_updates,
