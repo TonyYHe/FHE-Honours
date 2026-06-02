@@ -23,6 +23,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import orion.nn as on
+from orion.models.unet import UNet22PlusOutput
+from orion.nn.linear import Conv2d as OrionConv2d
+from orion.nn.linear import ConvTranspose2d as OrionConvTranspose2d
+from orion.nn.pooling import AvgPool2d as OrionAvgPool2d
 from tools.train_fhelipe_medseg_unet22 import (
     FhelipeSegmentationDataset,
     SPECS,
@@ -214,6 +219,53 @@ class ConcatUNet(nn.Module):
         return self.outc(x)
 
 
+def make_stage_model(
+    *,
+    architecture: str,
+    in_channels: int,
+    out_channels: int,
+    base_dim: int,
+    activation: str,
+    pool: str,
+    scale_margin: float,
+    silu_degree: int,
+) -> nn.Module:
+    normalized = str(architecture).strip().lower().replace("_", "-")
+    if normalized == "concat-unet":
+        return ConcatUNet(
+            in_channels=int(in_channels),
+            out_channels=int(out_channels),
+            base_dim=int(base_dim),
+            activation=str(activation),
+            pool=str(pool),
+            scale_margin=float(scale_margin),
+        )
+    if normalized in {"unet22-plus-output", "u22-plus-output", "u23"}:
+        if str(activation) == "scaled-silu":
+            raise ValueError("UNet22PlusOutput supports exact ReLU/SiLU training; use --stage2-activation plain-silu")
+        orion_activation = "silu" if str(activation) in {"plain-silu", "plain_silu", "silu"} else str(activation)
+        model = UNet22PlusOutput(
+            in_channels=int(in_channels),
+            out_channels=int(out_channels),
+            base_channels=int(base_dim),
+            activation=orion_activation,
+            silu_degree=int(silu_degree),
+        )
+        model.config = {
+            "architecture": "unet22-plus-output",
+            "in_channels": int(in_channels),
+            "out_channels": int(out_channels),
+            "base_dim": int(base_dim),
+            "activation": str(orion_activation),
+            "silu_degree": int(silu_degree),
+            "pool": "avg",
+            "skip": "concat",
+            "output_head": "1x1",
+        }
+        return model
+    raise ValueError(f"unsupported architecture {architecture!r}")
+
+
 def init_model(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
@@ -223,6 +275,10 @@ def init_model(model: nn.Module) -> None:
         elif isinstance(module, nn.BatchNorm2d):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+        elif isinstance(module, (OrionConv2d, OrionConvTranspose2d)) and not isinstance(module, OrionAvgPool2d):
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
 
 def set_scaled_silu_updates(model: nn.Module, *, enabled: bool) -> None:
@@ -302,7 +358,7 @@ def collect_plain_silu_input_ranges(
         return hook
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.SiLU):
+        if isinstance(module, (nn.SiLU, on.SiLU)):
             handles.append(module.register_forward_pre_hook(make_hook(name)))
     model.eval()
     for images, _masks in tqdm(loader, desc="calibrate", leave=False):
@@ -525,6 +581,12 @@ def load_conv_compatible_weights(dst: nn.Module, src_state: dict[str, torch.Tens
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Retrain staged concat-skip U-Net baselines on FHELIPE medical NPZ datasets.")
     parser.add_argument("--dataset", choices=sorted(SPECS), default="covid19")
+    parser.add_argument(
+        "--architecture",
+        choices=("concat-unet", "unet22-plus-output"),
+        default="concat-unet",
+        help="Model family to train. unet22-plus-output matches Orion's U22 body plus explicit 1x1 output head.",
+    )
     parser.add_argument("--data-root", type=Path, default=ROOT / "data" / "fhelipe_medseg")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "checkpoints" / "fhelipe_medseg_staged")
     parser.add_argument("--result", type=Path, default=ROOT / ".tmp" / "results" / "fhelipe_medseg_staged_unet.json")
@@ -556,6 +618,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--scale-margin", type=float, default=2.0)
+    parser.add_argument("--silu-degree", type=int, default=31)
     parser.add_argument("--poly-degree", type=int, default=7)
     parser.add_argument("--poly-finetune-epochs", type=int, default=0)
     parser.add_argument("--poly-lr", type=float, default=1.0e-5)
@@ -622,8 +685,10 @@ def main() -> int:
         seed=int(args.seed),
     )
 
-    stage1_pool = str(args.stage1_pool)
-    tag = f"{spec.name}_concat_unet_base{int(args.base_dim)}_{int(args.image_size)}"
+    architecture = str(args.architecture)
+    architecture_tag = str(architecture).replace("-", "_")
+    stage1_pool = "avg" if architecture == "unet22-plus-output" else str(args.stage1_pool)
+    tag = f"{spec.name}_{architecture_tag}_base{int(args.base_dim)}_{int(args.image_size)}"
     stage1_name = f"relu_{stage1_pool}pool"
     stage2_init = str(args.stage2_init)
     stage2_activation = str(args.stage2_activation)
@@ -635,13 +700,15 @@ def main() -> int:
     stage2_path = Path(args.out_dir) / f"{tag}_{stage2_name}_best.pt"
     started = time.time()
 
-    stage1_model = ConcatUNet(
+    stage1_model = make_stage_model(
+        architecture=architecture,
         in_channels=1,
         out_channels=1,
         base_dim=int(args.base_dim),
         activation="relu",
         pool=stage1_pool,
         scale_margin=float(args.scale_margin),
+        silu_degree=int(args.silu_degree),
     ).to(device)
     if bool(args.eval_poly_only):
         if not stage1_path.exists():
@@ -670,13 +737,15 @@ def main() -> int:
         stage1_model.to(device)
         stage1_metrics = evaluate_with_reference(stage1_model, val_loader, device=device)
 
-    stage2_model = ConcatUNet(
+    stage2_model = make_stage_model(
+        architecture=architecture,
         in_channels=1,
         out_channels=1,
         base_dim=int(args.base_dim),
         activation=stage2_activation,
         pool="avg",
         scale_margin=float(args.scale_margin),
+        silu_degree=int(args.silu_degree),
     ).to(device)
     if bool(args.eval_poly_only):
         if not stage2_path.exists():
@@ -810,6 +879,7 @@ def main() -> int:
         "val_count": len(val_set),
         "config": {
             "base_dim": int(args.base_dim),
+            "architecture": architecture,
             "image_size": int(args.image_size),
             "batch_size": int(args.batch_size),
             "train_limit": int(args.train_limit),
@@ -824,6 +894,7 @@ def main() -> int:
             "weight_decay": float(args.weight_decay),
             "grad_clip_norm": float(args.grad_clip_norm),
             "scale_margin": float(args.scale_margin),
+            "silu_degree": int(args.silu_degree),
             "poly_degree": int(args.poly_degree),
             "poly_finetune_epochs": int(args.poly_finetune_epochs),
             "poly_lr": float(args.poly_lr),

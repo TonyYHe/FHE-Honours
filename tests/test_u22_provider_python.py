@@ -208,6 +208,219 @@ def test_u22_concat_skip_consumer_conv_has_concat_fusion_specs_in_provider_mode(
         scheme.delete_scheme()
 
 
+def test_provider_runtime_preempts_concat_fusion_dense_transforms(monkeypatch) -> None:
+    from orion.nn.operations import ConcatCipherTensor
+
+    class Runtime:
+        executable = True
+        depth = 2
+        executor = SimpleNamespace()
+
+        def __init__(self) -> None:
+            self.compile_calls = 0
+            self.output_inputs = []
+
+        def supports_scheme(self, _scheme) -> bool:
+            return True
+
+        def compile(self, _scheme) -> None:
+            self.compile_calls += 1
+
+        def output(self, output_id: str, x):
+            self.output_inputs.append((str(output_id), x))
+            return SimpleNamespace(kind="runtime_output")
+
+    class ConcatModule:
+        output_shape = torch.Size((1, 4, 8, 8))
+        fhe_output_shape = torch.Size((1, 4, 8, 8))
+
+        def __init__(self) -> None:
+            self.materialized = SimpleNamespace(kind="materialized_concat")
+            self.materialize_calls = 0
+
+        def materialize(self, _parts):
+            self.materialize_calls += 1
+            return self.materialized
+
+    class OwnedPart:
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        def release(self) -> None:
+            self.release_calls += 1
+
+    _init_python_scheme(logn=6)
+    try:
+        conv = Conv2d(4, 2, kernel_size=3, padding=1, bias=True)
+        conv.init_orion_params()
+        conv.name = "provider_concat_consumer"
+        conv.input_shape = torch.Size((1, 4, 8, 8))
+        conv.output_shape = torch.Size((1, 2, 8, 8))
+        conv.fhe_input_shape = torch.Size((1, 4, 8, 8))
+        conv.fhe_output_shape = torch.Size((1, 2, 8, 8))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.concat_fusion_specs = (
+            {
+                "source": "a",
+                "concat_node": "cat",
+                "channel_start": 0,
+                "channel_end": 2,
+                "channels": 2,
+                "shape": torch.Size((1, 2, 8, 8)),
+                "fhe_shape": torch.Size((1, 2, 8, 8)),
+                "gap": 1,
+            },
+            {
+                "source": "b",
+                "concat_node": "cat",
+                "channel_start": 2,
+                "channel_end": 4,
+                "channels": 2,
+                "shape": torch.Size((1, 2, 8, 8)),
+                "fhe_shape": torch.Size((1, 2, 8, 8)),
+                "gap": 1,
+            },
+        )
+        conv.region_runtime = Runtime()
+        conv.region_first_skip_dense_pack = True
+        conv.set_level(len(scheme.params.get_logq()) - 1)
+        conv.set_depth(1)
+
+        def fail_concat_fusion(*_args, **_kwargs):
+            raise AssertionError("provider runtime should preempt concat fusion")
+
+        monkeypatch.setattr(conv, "_generate_concat_fusion_diagonals", fail_concat_fusion)
+        conv.generate_diagonals(last=False)
+        assert conv.diagonals == {}
+        assert conv.output_rotations == 0
+
+        monkeypatch.setattr(conv, "_compile_concat_fusion_transforms", fail_concat_fusion)
+        conv.compile()
+        assert conv.region_runtime.compile_calls == 1
+        assert conv.transform_ids == {}
+
+        conv.he()
+        conv._concat_unified_groups_by_input = [{0: object()}]
+        monkeypatch.setattr(conv, "_evaluate_concat_fusion", fail_concat_fusion)
+        concat_module = ConcatModule()
+        part = SimpleNamespace(scheme=scheme)
+        owned = OwnedPart()
+        out = conv(ConcatCipherTensor(concat_module, (part, part), owned_parts=(owned,)))
+
+        assert getattr(out, "kind") == "runtime_output"
+        assert concat_module.materialize_calls == 1
+        assert owned.release_calls == 1
+        assert conv.region_runtime.output_inputs == [
+            ("provider_concat_consumer", concat_module.materialized)
+        ]
+    finally:
+        scheme.delete_scheme()
+
+
+def test_native_concat_fusion_preempts_provider_runtime_materialization() -> None:
+    class Runtime:
+        executable = True
+        executor = SimpleNamespace()
+
+        def supports_scheme(self, _scheme) -> bool:
+            return True
+
+        def output(self, *_args, **_kwargs):
+            raise AssertionError("native concat fusion should preempt provider runtime")
+
+    class ConcatCipherTensor:
+        scheme = object()
+        parts = (SimpleNamespace(ids=[1]), SimpleNamespace(ids=[2]))
+
+        def materialize(self):
+            raise AssertionError("native concat fusion should not materialize concat")
+
+        def release_owned_parts(self):
+            raise AssertionError("native concat fusion should own release through evaluator")
+
+    conv = Conv2d(2, 1, kernel_size=3, padding=1)
+    conv.region_runtime = Runtime()
+    conv.he_mode = True
+    conv._concat_unified_groups_by_input = [{0: object()}]
+    conv._concat_fusion_native_source_inputs = True
+
+    called = {}
+
+    def evaluate(concat_tensor):
+        called["value"] = concat_tensor
+        return "native-concat-output"
+
+    conv._evaluate_concat_fusion = evaluate
+    out = conv(ConcatCipherTensor())
+
+    assert out == "native-concat-output"
+    assert called["value"].parts[0].ids == [1]
+
+
+def test_provider_rejects_compact_concat_to_native_source_relayout() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 64,
+        "edge_layouts": [
+            {
+                "edge": "cat->conv",
+                "source": "cat",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 2, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+                "relayout": True,
+                "relayout_reason": "dp_native_source_stripe_relayout",
+            }
+        ],
+        "node_layouts": [],
+    }
+    base_executor = SimpleNamespace(
+        module=SimpleNamespace(input_gap=1),
+        native_halo_input_capable=True,
+        native_plan=SimpleNamespace(input_ct_count=2),
+    )
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+
+    assert executor.unsupported_layout_policy_reason == (
+        "layout_policy_concat_native_source_requires_native_concat_fusion"
+    )
+    assert executor.native_physical_relayout_rows
+
+
 @pytest.mark.parametrize(
     "bootstrap_fusion",
     [
@@ -288,6 +501,7 @@ def test_u22_dp_concat_fusion_runtime_matches_clear_conv_for_halo_join(
 
         conv = dag.nodes["dec4a"]["module"]
         cat = dag.nodes[str(conv.concat_fusion_specs[0]["concat_node"])]["module"]
+        conv.region_runtime.executable = False
         if bootstrap_fusion is not None:
             conv._bootstrap_prescale_fusion = dict(bootstrap_fusion)
         conv.generate_diagonals(last=False)

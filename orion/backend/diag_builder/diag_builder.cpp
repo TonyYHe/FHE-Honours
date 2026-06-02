@@ -58,6 +58,8 @@ struct OrionProviderNativeSourceSpec {
   int stripe_index;
   int stripe_source_h_start;
   int stripe_source_h;
+  int stripe_source_owner_h_start;
+  int stripe_source_owner_h_end;
   int stripe_target_h_start;
   int stripe_target_h_end;
   int stripe_target_h;
@@ -1305,6 +1307,8 @@ OrionDiagPayloadBatch BuildProviderNativeSourcePayload(
         const int64_t source_local_h = in_h - spec.stripe_source_h_start;
         const int64_t target_local_h = out_h - spec.stripe_target_h_start;
         if (in_h < spec.input_h_min || in_h >= spec.input_h_max ||
+            in_h < spec.stripe_source_owner_h_start ||
+            in_h >= spec.stripe_source_owner_h_end ||
             source_local_h < 0 || source_local_h >= spec.stripe_source_h ||
             target_local_h < 0 || target_local_h >= spec.stripe_target_h) {
           continue;

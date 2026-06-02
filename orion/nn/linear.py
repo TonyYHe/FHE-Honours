@@ -365,6 +365,17 @@ class Conv2d(LinearTransform):
     def _is_concat_cipher_tensor(self, value) -> bool:
         return bool(type(value).__name__ == "ConcatCipherTensor" and hasattr(value, "parts"))
 
+    def _region_runtime_if_ready(self, *, require_skip_dense_pack: bool):
+        runtime = getattr(self, "region_runtime", None)
+        if runtime is None or not bool(getattr(runtime, "executable", False)):
+            return None
+        if bool(require_skip_dense_pack) and not bool(getattr(self, "region_first_skip_dense_pack", False)):
+            return None
+        supports = getattr(runtime, "supports_scheme", None)
+        if callable(supports) and not bool(supports(getattr(self, "scheme", None))):
+            return None
+        return runtime
+
     def _concat_fusion_specs(self):
         return tuple(getattr(self, "concat_fusion_specs", ()) or ())
 
@@ -386,13 +397,24 @@ class Conv2d(LinearTransform):
             return False
         if int(getattr(self, "output_shape", (1,))[0]) != 1:
             return False
+        source_physical_layouts = []
         for spec in self._concat_fusion_specs():
             shape = tuple(int(value) for value in spec.get("shape", ()))
             if len(shape) < 4 or int(shape[0]) != 1:
                 return False
             physical_layout = self._concat_source_input_physical_layout(dict(spec))
-            if physical_layout and str(physical_layout) not in {"packed_compact", "logical_halo_compact"}:
+            if physical_layout:
+                source_physical_layouts.append(str(physical_layout))
+            if physical_layout and str(physical_layout) not in {
+                "packed_compact",
+                "logical_halo_compact",
+                "native_source_stripe",
+            }:
                 return False
+        if "native_source_stripe" in source_physical_layouts and any(
+            str(value) != "native_source_stripe" for value in source_physical_layouts
+        ):
+            return False
         output_attrs = self._concat_output_layout_attrs()
         output_layout = dict(output_attrs.get("layout_policy_output_layout", {}) or {})
         output_has_halo = bool(
@@ -417,6 +439,15 @@ class Conv2d(LinearTransform):
             and int(pad_h) == int(pad_w)
             and int(dil_h) == int(dil_w)
         )
+
+    def _concat_fusion_uses_native_source_inputs(self) -> bool:
+        if not self._concat_fusion_supported():
+            return False
+        specs = self._concat_fusion_specs()
+        if not specs:
+            return False
+        layouts = [self._concat_source_input_physical_layout(dict(spec)) for spec in specs]
+        return bool(layouts) and all(str(layout) == "native_source_stripe" for layout in layouts)
 
     def _concat_layout_top_beta(self, layout: dict) -> int:
         return max(0, int(dict(layout).get("top_beta", dict(layout).get("alpha", 0)) or 0))
@@ -468,6 +499,9 @@ class Conv2d(LinearTransform):
         runtime = getattr(self, "region_runtime", None)
         executor = getattr(runtime, "executor", None)
         compile_plan = getattr(executor, "compile_plan", None)
+        if isinstance(compile_plan, dict):
+            return dict(compile_plan)
+        compile_plan = getattr(self, "compile_plan", None)
         return dict(compile_plan) if isinstance(compile_plan, dict) else {}
 
     def _concat_zero_halo_layout(self, layout: dict) -> dict:
@@ -530,7 +564,10 @@ class Conv2d(LinearTransform):
                 return str(row.get("physical_layout", "") or "")
             return str(row.get("source_physical_layout", "") or row.get("physical_layout", "") or "")
         attrs = self._concat_layout_policy_module_attrs()
-        return str(attrs.get("layout_policy_input_physical_layout", "") or "")
+        physical = str(attrs.get("layout_policy_input_physical_layout", "") or "")
+        if physical:
+            return physical
+        return str(getattr(self, "layout_policy_input_physical_layout", "") or "")
 
     def _concat_source_input_layout(self, spec: dict) -> dict:
         join_row = self._concat_join_input_layout_row(spec)
@@ -605,8 +642,30 @@ class Conv2d(LinearTransform):
         attrs = dict(output_attrs or self._concat_output_layout_attrs())
         return torch.Size(attrs.get("fhe_output_shape", getattr(self, "fhe_output_shape")))
 
+    def _concat_dense_proxy_output_attrs_for_diagonal_cache(self, output_attrs: dict) -> dict:
+        attrs = dict(output_attrs)
+        output_layout = dict(attrs.get("layout_policy_output_layout", {}) or {})
+        output_gap = max(1, int(output_layout.get("gap", getattr(self, "output_gap", 1)) or 1))
+        physical_top = self._concat_layout_physical_top_beta(output_layout)
+        physical_bottom = self._concat_layout_physical_bottom_beta(output_layout)
+        n, channels, height, width = (int(value) for value in self.output_shape)
+        on_channels = int(math.ceil(int(channels) / float(output_gap * output_gap)))
+        attrs["fhe_output_shape"] = torch.Size(
+            (
+                int(n),
+                int(on_channels),
+                int(height * output_gap + (int(physical_top) + int(physical_bottom)) * output_gap),
+                int(width * output_gap),
+            )
+        )
+        attrs["layout_policy_output_materialization"] = ""
+        return attrs
+
     def _concat_construct_bias(self, output_attrs: dict | None = None) -> torch.Tensor:
         attrs = dict(output_attrs or self._concat_output_layout_attrs())
+        native_bias = self._concat_native_output_bias(attrs)
+        if native_bias is not None:
+            return native_bias
         effective_fhe_output_shape = self._concat_effective_fhe_output_shape(attrs)
         bias_proxy = SimpleNamespace(
             output_shape=self.output_shape,
@@ -616,6 +675,139 @@ class Conv2d(LinearTransform):
             layout_policy_output_layout=dict(attrs.get("layout_policy_output_layout", {}) or {}),
         )
         return packing.construct_conv2d_bias(bias_proxy)
+
+    def _concat_native_output_materialization(self, output_attrs: dict | None = None) -> bool:
+        attrs = dict(output_attrs or self._concat_output_layout_attrs())
+        return str(attrs.get("layout_policy_output_materialization", "") or "") in {
+            "native_halo_stripe",
+            "native_stripe",
+            "channel_aligned_native_stripe",
+        }
+
+    @staticmethod
+    def _concat_native_plan_target_ct_count(plan) -> int:
+        return Conv2d._concat_native_plan_native_target_ct_count(plan)
+
+    @staticmethod
+    def _concat_native_plan_native_target_ct_count(plan) -> int:
+        return int(
+            sum(
+                int(plan.target_group_count_for_stripe(stripe))
+                for stripe in getattr(plan, "stripes", ()) or ()
+            )
+        )
+
+    @staticmethod
+    def _concat_native_plan_uses_compact_physical_targets(plan) -> bool:
+        return False
+
+    @staticmethod
+    def _concat_native_plan_target_signature(plan) -> tuple[tuple[int, ...], ...]:
+        if Conv2d._concat_native_plan_uses_compact_physical_targets(plan):
+            spec = getattr(plan, "spec", None)
+            if spec is None:
+                return ((int(Conv2d._concat_native_plan_target_ct_count(plan)),),)
+            return (
+                (
+                    int(Conv2d._concat_native_plan_target_ct_count(plan)),
+                    int(getattr(spec, "c_out", 0) or 0),
+                    int(getattr(spec, "h_out", 0) or 0),
+                    int(getattr(spec, "w_out", 0) or 0),
+                    int(getattr(spec, "gap_out", 1) or 1),
+                    int(getattr(spec, "output_top_beta", 0) or 0),
+                    int(getattr(spec, "output_bottom_beta", 0) or 0),
+                    int(getattr(spec, "output_physical_top_beta", 0) or 0),
+                    int(getattr(spec, "output_physical_bottom_beta", 0) or 0),
+                ),
+            )
+        rows: list[tuple[int, ...]] = []
+        for stripe in plan.stripes:
+            for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                rows.append(
+                    (
+                        int(stripe.target_h_start),
+                        int(stripe.target_h_end),
+                        int(stripe.target_h),
+                        int(target_group),
+                        int(plan.target_tile_for_stripe(stripe)),
+                        int(plan.target_block_index(stripe, int(target_group))),
+                    )
+                )
+        return tuple(rows)
+
+    def _concat_native_output_bias(self, output_attrs: dict | None = None) -> torch.Tensor | None:
+        attrs = dict(output_attrs or self._concat_output_layout_attrs())
+        if not self._concat_native_output_materialization(attrs):
+            return None
+        plan = getattr(self, "_concat_native_output_plan", None)
+        spec = getattr(plan, "spec", None)
+        target_ct_count = int(getattr(self, "_concat_unified_output_ct_count", 0) or 0)
+        if plan is None or spec is None or int(target_ct_count) <= 0:
+            return None
+        bias = getattr(self, "on_bias", None)
+        if bias is None:
+            return None
+        from orion.experimental.cir.native_halo_conv2d import _idx_chw_gap_channel_positions
+
+        slots = int(spec.slot_count)
+        result = torch.zeros((int(target_ct_count), int(slots)), dtype=torch.float32)
+        bias_vector = bias.detach().to(dtype=torch.float32)
+        if bool(self._concat_native_plan_uses_compact_physical_targets(plan)):
+            compact_output_h = int(spec.h_out) + max(0, int(spec.output_physical_top_beta or 0)) + max(
+                0,
+                int(spec.output_physical_bottom_beta or 0),
+            )
+            out_h = torch.arange(int(compact_output_h), dtype=torch.int64).repeat_interleave(int(spec.w_out))
+            out_w = torch.arange(int(spec.w_out), dtype=torch.int64).repeat(int(compact_output_h))
+            channels = torch.arange(int(spec.c_out), dtype=torch.int64)
+            flat_index = _idx_chw_gap_channel_positions(
+                channels,
+                h=out_h,
+                w=out_w,
+                height=int(compact_output_h),
+                width=int(spec.w_out),
+                gap=int(spec.gap_out),
+            )
+            values = bias_vector[:, None].expand_as(flat_index)
+            for block_index in range(int(target_ct_count)):
+                start = int(block_index) * int(slots)
+                stop = int(start) + int(slots)
+                mask = (flat_index >= int(start)) & (flat_index < int(stop))
+                if bool(mask.any().item()):
+                    positions = (flat_index[mask] - int(start)).to(dtype=torch.int64)
+                    result[int(block_index)].index_copy_(0, positions, values[mask])
+            return result
+        for block_index in range(int(target_ct_count)):
+            stripe_group = plan.target_stripe_and_group_for_block(int(block_index))
+            if stripe_group is None:
+                continue
+            stripe, target_group = stripe_group
+            target_tile = int(plan.target_tile_for_stripe(stripe))
+            channel_start = int(target_group) * int(target_tile)
+            channel_end = min(int(spec.c_out), int(channel_start) + int(target_tile))
+            if int(channel_end) <= int(channel_start):
+                continue
+            active_target_h = int(stripe.target_h_end) - int(stripe.target_h_start)
+            if int(active_target_h) <= 0:
+                continue
+            local_channels = torch.arange(int(channel_end - channel_start), dtype=torch.int64)
+            out_h = torch.arange(int(active_target_h), dtype=torch.int64).repeat_interleave(int(spec.w_out))
+            out_w = torch.arange(int(spec.w_out), dtype=torch.int64).repeat(int(active_target_h))
+            flat_index = _idx_chw_gap_channel_positions(
+                local_channels,
+                h=out_h,
+                w=out_w,
+                height=int(stripe.target_h),
+                width=int(spec.w_out),
+                gap=int(spec.gap_out),
+            )
+            values = (
+                bias_vector[int(channel_start): int(channel_end), None]
+                .expand_as(flat_index)
+                .reshape(-1)
+            )
+            result[int(block_index)].index_copy_(0, flat_index.reshape(-1).to(dtype=torch.int64), values)
+        return result
 
     def _concat_bootstrap_prescale_fusion_spec(self) -> dict[str, float] | None:
         fusion = getattr(self, "_bootstrap_prescale_fusion", None)
@@ -654,9 +846,9 @@ class Conv2d(LinearTransform):
             )
         )
 
-    def _concat_source_proxy(self, spec: dict, *, weight: torch.Tensor, name: str):
+    def _concat_source_proxy(self, spec: dict, *, weight: torch.Tensor, name: str, output_attrs: dict | None = None):
         input_layout = self._concat_source_input_layout(spec)
-        output_attrs = self._concat_output_layout_attrs()
+        output_attrs = dict(output_attrs or self._concat_output_layout_attrs())
         effective_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
         output_layout_attrs = dict(output_attrs)
         output_layout_attrs.pop("fhe_output_shape", None)
@@ -741,6 +933,8 @@ class Conv2d(LinearTransform):
             NativeHaloConv2DSpec,
             _build_compact_source_conv_transform,
             _build_compact_source_concat_transforms_single_slot,
+            _build_conv_transform_batch,
+            _build_conv_transforms_for_compact_output,
             _layout_bottom_beta,
             _layout_physical_bottom_beta,
             _layout_physical_top_beta,
@@ -754,21 +948,68 @@ class Conv2d(LinearTransform):
         level = int(self.level)
         output_attrs = self._concat_output_layout_attrs()
         effective_fhe_output_shape = self._concat_effective_fhe_output_shape(output_attrs)
+        concat_specs = tuple(self._concat_fusion_specs())
+        output_materialization = str(output_attrs.get("layout_policy_output_materialization", "") or "")
+        native_output_materialization = bool(self._concat_native_output_materialization(output_attrs))
         target_ct_count = int(self._concat_output_ct_count())
+        runtime_fhe_output_shape = torch.Size(effective_fhe_output_shape)
         output_layout = dict(output_attrs.get("layout_policy_output_layout", {}) or {})
         output_top_beta = int(output_attrs.get("_semantic_output_top_beta", _layout_top_beta(output_layout)) or 0)
         output_bottom_beta = int(output_attrs.get("_semantic_output_bottom_beta", _layout_bottom_beta(output_layout)) or 0)
         output_physical_top_beta = int(_layout_physical_top_beta(output_layout))
         output_physical_bottom_beta = int(_layout_physical_bottom_beta(output_layout))
+        native_output_signature: tuple[tuple[int, ...], ...] | None = None
+        self._concat_native_output_plan = None
+        if bool(native_output_materialization):
+            if not concat_specs:
+                raise RuntimeError(f"concat-fused Conv2d {getattr(self, 'name', '')} has no concat specs")
+            first_spec = dict(concat_specs[0])
+            first_input_layout = self._concat_source_input_layout(first_spec)
+            first_input_gap = max(
+                1,
+                int(dict(first_input_layout).get("gap", int(first_spec["gap"])) or int(first_spec["gap"])),
+            )
+            first_native_spec = NativeHaloConv2DSpec(
+                family_label=f"{getattr(self, 'name', self.__class__.__name__)}_concat_native_output_probe",
+                c_in=int(first_spec["channels"]),
+                h_in=int(first_spec["shape"][2]),
+                w_in=int(first_spec["shape"][3]),
+                c_out=int(self.output_shape[1]),
+                h_out=int(self.output_shape[2]),
+                w_out=int(self.output_shape[3]),
+                gap_in=int(first_input_gap),
+                gap_out=int(self.output_gap),
+                kernel=int(self.kernel_size[0]),
+                stride=int(self.stride[0]),
+                pad=int(self.padding[0]),
+                dilation=int(self.dilation[0]),
+                groups=1,
+                slot_count=int(slots),
+                input_top_beta=int(_layout_top_beta(first_input_layout)),
+                input_bottom_beta=int(_layout_bottom_beta(first_input_layout)),
+                output_top_beta=int(output_top_beta),
+                output_bottom_beta=int(output_bottom_beta),
+                input_physical_top_beta=int(_layout_physical_top_beta(first_input_layout)),
+                input_physical_bottom_beta=int(_layout_physical_bottom_beta(first_input_layout)),
+                output_physical_top_beta=int(output_physical_top_beta),
+                output_physical_bottom_beta=int(output_physical_bottom_beta),
+            )
+            native_output_plan = native_halo_conv2d_plan(first_native_spec, require_native_target_fit=False)
+            target_ct_count = int(self._concat_native_plan_target_ct_count(native_output_plan))
+            native_output_signature = self._concat_native_plan_target_signature(native_output_plan)
+            self._concat_native_output_plan = native_output_plan
+            runtime_fhe_output_shape = torch.Size([int(target_ct_count), int(slots)])
 
         self._concat_unified_groups_by_input = []
         self._concat_unified_targets_by_input = []
         self._concat_unified_output_ct_count = int(target_ct_count)
-        self._concat_fusion_fhe_output_shape = torch.Size(effective_fhe_output_shape)
+        self._concat_fusion_fhe_output_shape = torch.Size(runtime_fhe_output_shape)
         self._concat_transform_ids_by_input = []
         self._concat_transform_sources_by_input = []
         self._concat_diagonals_by_input = []
         self._concat_output_rotations = 0
+        self._concat_fusion_native_source_inputs = bool(self._concat_fusion_uses_native_source_inputs())
+        native_output_target_coverage: set[int] = set()
 
         effective_weight, effective_bias = self._concat_effective_weight_and_bias()
         with _temporary_attrs(self, on_bias=effective_bias):
@@ -780,11 +1021,13 @@ class Conv2d(LinearTransform):
             and bool(evaluator.single_slot_layer_cache_enabled())
         )
 
-        for input_index, concat_spec in enumerate(self._concat_fusion_specs()):
+        for input_index, concat_spec in enumerate(concat_specs):
             channel_start = int(concat_spec["channel_start"])
             channel_end = int(concat_spec["channel_end"])
             branch_weight = effective_weight[:, channel_start:channel_end, :, :].detach().clone()
             input_layout = self._concat_source_input_layout(concat_spec)
+            input_physical_layout = self._concat_source_input_physical_layout(concat_spec)
+            native_source_input = bool(str(input_physical_layout) == "native_source_stripe")
             input_gap = max(1, int(dict(input_layout).get("gap", int(concat_spec["gap"])) or int(concat_spec["gap"])))
             input_top_beta = int(_layout_top_beta(input_layout))
             input_bottom_beta = int(_layout_bottom_beta(input_layout))
@@ -826,8 +1069,18 @@ class Conv2d(LinearTransform):
                 output_physical_bottom_beta=int(output_physical_bottom_beta),
             )
             plan = native_halo_conv2d_plan(native_spec, require_native_target_fit=False)
+            if bool(native_output_materialization):
+                branch_target_count = int(self._concat_native_plan_target_ct_count(plan))
+                branch_signature = self._concat_native_plan_target_signature(plan)
+                if int(branch_target_count) != int(target_ct_count) or tuple(branch_signature) != tuple(
+                    native_output_signature or ()
+                ):
+                    raise RuntimeError(
+                        f"concat-fused Conv2d {getattr(self, 'name', '')} native output target mapping "
+                        f"differs across concat branches"
+                    )
 
-            def build_source(source_block: int) -> tuple[int, list[tuple[int, object]]]:
+            def build_compact_source(source_block: int) -> tuple[int, list[tuple[int, object]]]:
                 ordered: list[tuple[int, object]] = []
                 for stripe in plan.stripes:
                     for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
@@ -849,11 +1102,68 @@ class Conv2d(LinearTransform):
                                 ordered.append((int(target_block), transform))
                 return int(source_block), ordered
 
-            if bool(single_slot_layer_cache):
+            if bool(native_source_input):
+                compact_output = (
+                    output_materialization
+                    not in {
+                        "native_halo_stripe",
+                        "native_stripe",
+                        "channel_aligned_native_stripe",
+                    }
+                )
+                built = []
+                group_index = 0
+                for stripe in plan.stripes:
+                    for source_group in range(int(plan.source_group_count_for_stripe(stripe))):
+                        group_n1 = (
+                            int(plan.group_n1s[int(group_index)])
+                            if int(group_index) < len(plan.group_n1s)
+                            else 1
+                        )
+                        target_group_count = int(plan.target_group_count_for_stripe(stripe))
+                        if bool(compact_output):
+                            ordered = []
+                            for target_group in range(int(target_group_count)):
+                                ordered.extend(
+                                    _build_conv_transforms_for_compact_output(
+                                        spec=native_spec,
+                                        plan=plan,
+                                        weight=branch_weight,
+                                        stripe=stripe,
+                                        source_group=int(source_group),
+                                        target_group=int(target_group),
+                                        level=int(level),
+                                        scheme=self.scheme,
+                                        group_n1=int(group_n1),
+                                    )
+                                )
+                        else:
+                            ordered = _build_conv_transform_batch(
+                                spec=native_spec,
+                                plan=plan,
+                                weight=branch_weight,
+                                weight_np=None,
+                                stripe=stripe,
+                                source_group=int(source_group),
+                                target_groups=[int(value) for value in range(int(target_group_count))],
+                                level=int(level),
+                                scheme=self.scheme,
+                                group_n1=int(group_n1),
+                            )
+                        source_block = int(plan.source_block_index(stripe, int(source_group)))
+                        if ordered:
+                            built.append((int(source_block), list(ordered)))
+                        group_index += 1
+            elif bool(single_slot_layer_cache):
                 proxy = self._concat_source_proxy(
                     concat_spec,
                     weight=branch_weight,
                     name=f"{getattr(self, 'name', self.__class__.__name__)}_concat_source_{int(input_index)}",
+                    output_attrs=(
+                        self._concat_dense_proxy_output_attrs_for_diagonal_cache(output_attrs)
+                        if bool(native_output_materialization)
+                        else output_attrs
+                    ),
                 )
 
                 def build_diagonals_by_block(proxy=proxy, branch_weight=branch_weight):
@@ -897,10 +1207,10 @@ class Conv2d(LinearTransform):
                     requested_workers = 1
                 workers = max(1, min(int(source_ct_count), int(requested_workers)))
                 if int(workers) <= 1:
-                    built = [build_source(int(source_block)) for source_block in range(int(source_ct_count))]
+                    built = [build_compact_source(int(source_block)) for source_block in range(int(source_ct_count))]
                 else:
                     with ThreadPoolExecutor(max_workers=int(workers), thread_name_prefix="orion-concat-fusion") as pool:
-                        built = list(pool.map(build_source, range(int(source_ct_count))))
+                        built = list(pool.map(build_compact_source, range(int(source_ct_count))))
 
             groups_by_source: dict[int, UnifiedTransformGroup] = {}
             targets_by_source: dict[int, tuple[int, ...]] = {}
@@ -909,11 +1219,21 @@ class Conv2d(LinearTransform):
                     continue
                 ordered.sort(key=lambda item: int(item[0]))
                 transforms = [transform for _target_index, transform in ordered]
-                _retune_transform_group_bsgs(transforms, slots=int(slots))
+                if not bool(native_source_input):
+                    _retune_transform_group_bsgs(transforms, slots=int(slots))
                 group = UnifiedTransformGroup(transforms)
                 group.compile_unified(self.scheme.backend)
                 groups_by_source[int(source_block)] = group
                 targets_by_source[int(source_block)] = tuple(int(target_index) for target_index, _transform in ordered)
+                if bool(native_output_materialization):
+                    for target_index, _transform in ordered:
+                        target_index = int(target_index)
+                        if int(target_index) < 0 or int(target_index) >= int(target_ct_count):
+                            raise RuntimeError(
+                                f"concat-fused Conv2d {getattr(self, 'name', '')} native output target "
+                                f"{int(target_index)} outside [0, {int(target_ct_count)})"
+                            )
+                        native_output_target_coverage.add(int(target_index))
             if not groups_by_source:
                 raise RuntimeError(
                     f"concat-fused Conv2d {getattr(self, 'name', '')} produced no unified transforms "
@@ -921,6 +1241,16 @@ class Conv2d(LinearTransform):
                 )
             self._concat_unified_groups_by_input.append(groups_by_source)
             self._concat_unified_targets_by_input.append(targets_by_source)
+
+        if bool(native_output_materialization):
+            expected_targets = set(range(int(target_ct_count)))
+            if native_output_target_coverage != expected_targets:
+                missing = sorted(int(value) for value in expected_targets - native_output_target_coverage)
+                extra = sorted(int(value) for value in native_output_target_coverage - expected_targets)
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} native output target coverage mismatch: "
+                    f"missing={missing} extra={extra}"
+                )
 
         self.diagonals = {}
         self.transform_ids = {}
@@ -1226,13 +1556,12 @@ class Conv2d(LinearTransform):
             self.diagonals = {}
             self.output_rotations = 0
             return
-        if self._generate_concat_fusion_diagonals(last=bool(last)):
-            return
-        runtime = getattr(self, "region_runtime", None)
-        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
-        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
+        runtime = self._region_runtime_if_ready(require_skip_dense_pack=True)
+        if runtime is not None:
             self.diagonals = {}
             self.output_rotations = 0
+            return
+        if self._generate_concat_fusion_diagonals(last=bool(last)):
             return
         if self.load_cached_transform_metadata():
             return
@@ -1260,11 +1589,17 @@ class Conv2d(LinearTransform):
         if bool(getattr(self, "region_first_probe_dense_bypass", False)):
             self.transform_ids = {}
             return
-        if self._compile_concat_fusion_transforms():
-            return
-        runtime = getattr(self, "region_runtime", None)
-        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
-        if runtime is not None and bool(getattr(runtime, "executable", False)) and bool(getattr(self, "region_first_skip_dense_pack", False)) and bool(runtime_supported):
+        native_concat_fusion = bool(self._concat_fusion_uses_native_source_inputs())
+        if bool(native_concat_fusion):
+            if self._compile_concat_fusion_transforms():
+                return
+            self._concat_fusion_native_source_inputs = False
+            raise RuntimeError(
+                f"native-source concat fusion is required for Conv2d {getattr(self, 'name', '')}, "
+                "but no executable concat-fusion plan was produced"
+            )
+        runtime = self._region_runtime_if_ready(require_skip_dense_pack=True)
+        if runtime is not None:
             runtime.assigned_level = int(self.level)
             runtime_depth = int(getattr(runtime, "depth", self.depth or 0) or 0)
             runtime.assigned_depth = int(runtime_depth)
@@ -1275,6 +1610,9 @@ class Conv2d(LinearTransform):
             if not bool(getattr(self, "region_first_probe_lazy_region_compile", False)):
                 runtime.compile(self.scheme)
             self.transform_ids = {}
+            return
+        self._concat_fusion_native_source_inputs = False
+        if self._compile_concat_fusion_transforms():
             return
         # If the user specifies an io mode = "save" or "load", then diagonals will
         # be temporarily stored to disk to save memory. Load right before they're 
@@ -1295,15 +1633,25 @@ class Conv2d(LinearTransform):
 
     def forward(self, x):
         # Forward pass that handles both cleartext and FHE inference.
+        runtime = self._region_runtime_if_ready(require_skip_dense_pack=False)
+        release_concat_owned_parts = None
         if self.he_mode and self._is_concat_cipher_tensor(x):
-            if self._concat_fusion_ready():
+            if self._concat_fusion_ready() and bool(getattr(self, "_concat_fusion_native_source_inputs", False)):
                 return self._evaluate_concat_fusion(x)
-            x = x.materialize()
-        runtime = getattr(self, "region_runtime", None)
-        runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
-        if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)) and bool(runtime_supported):
+            if runtime is not None:
+                release_concat_owned_parts = getattr(x, "release_owned_parts", None)
+                x = x.materialize()
+            elif self._concat_fusion_ready():
+                return self._evaluate_concat_fusion(x)
+            else:
+                x = x.materialize()
+        if self.he_mode and runtime is not None:
             output_id = getattr(self, "region_output_id", None) or getattr(self, "name", self.__class__.__name__)
-            return runtime.output(str(output_id), x)
+            try:
+                return runtime.output(str(output_id), x)
+            finally:
+                if callable(release_concat_owned_parts):
+                    release_concat_owned_parts()
         if self.he_mode and bool(getattr(self, "region_first_probe_dense_bypass", False)):
             from orion.backend.python.tensors import CipherTensor
 

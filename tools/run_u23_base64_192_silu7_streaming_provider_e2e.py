@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.generate_unet22_compile_plan_csv import UNet22PlusOutput
+from orion.models.unet import UNet22PlusOutput
 
 
 DOC_MARKER = "U23_BASE64_192_SILU7_STREAMING_PROVIDER_E2E_TABLE"

@@ -20,13 +20,12 @@ from orion.core.bootstrap_fusion import module_bootstrap_ct_count, module_bootst
 from orion.core.level_dag import LevelDAG
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
-from orion.models.unet import UNet22, _apply_u22_activation, _make_u22_activation
+from orion.models.unet import UNet22PlusOutput
 from orion.nn.module import Module
 from orion.nn.activation import SiLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.operations import Add, Concat
 from orion.nn.pooling import AvgPool2d
-import orion.nn as on
 
 
 SLOTS = 32768
@@ -41,63 +40,6 @@ EDGE_KINDS = ("carry", "fused", "explicit", "bootstrap-drop")
 # Non-DP policies call the LT estimator through the planner module default in a
 # few helper paths, so set it explicitly here as well as passing estimator= below.
 layout_planner.LAYOUT_ESTIMATOR_DEFAULT = layout_planner.LAYOUT_ESTIMATOR_TEMPLATE
-
-
-class UNet22PlusOutput(UNet22):
-    """UNet22 body plus a separate logits/output layer.
-
-    The repository's UNet22 currently folds the output projection into dec1b.
-    This variant keeps dec1b as the final 64->64 decoder conv, applies SiLU7,
-    and adds an explicit 1x1 output layer.
-    """
-
-    def __init__(
-        self,
-        *,
-        in_channels: int,
-        out_channels: int,
-        base_channels: int,
-        activation: str,
-        silu_degree: int,
-    ) -> None:
-        super().__init__(
-            dataset="kvasir_polyp_256",
-            in_channels=int(in_channels),
-            out_channels=int(base_channels),
-            base_channels=int(base_channels),
-            activation=str(activation),
-            silu_degree=int(silu_degree),
-        )
-        requested_out = int(out_channels)
-        self.out_channels = requested_out
-        self.dec1b_act = _make_u22_activation(self.activation, silu_degree=self.silu_degree)
-        self.output = on.Conv2d(int(base_channels), requested_out, kernel_size=1, padding=0, bias=True)
-
-    def forward(self, x):
-        x = _apply_u22_activation(self.enc1a_act, self.enc1a(x))
-        skip1 = _apply_u22_activation(self.enc1b_act, self.enc1b(x))
-
-        x = _apply_u22_activation(self.enc2a_act, self.enc2a(self.pool1(skip1)))
-        skip2 = _apply_u22_activation(self.enc2b_act, self.enc2b(x))
-
-        x = _apply_u22_activation(self.enc3a_act, self.enc3a(self.pool2(skip2)))
-        skip3 = _apply_u22_activation(self.enc3b_act, self.enc3b(x))
-
-        x = _apply_u22_activation(self.enc4a_act, self.enc4a(self.pool3(skip3)))
-        skip4 = _apply_u22_activation(self.enc4b_act, self.enc4b(x))
-
-        x = _apply_u22_activation(self.bottlenecka_act, self.bottlenecka(self.pool4(skip4)))
-        x = _apply_u22_activation(self.bottleneckb_act, self.bottleneckb(x))
-
-        x = _apply_u22_activation(self.dec4a_act, self.dec4a(self.cat4(self.up4(x), skip4)))
-        x = _apply_u22_activation(self.dec4b_act, self.dec4b(x))
-        x = _apply_u22_activation(self.dec3a_act, self.dec3a(self.cat3(self.up3(x), skip3)))
-        x = _apply_u22_activation(self.dec3b_act, self.dec3b(x))
-        x = _apply_u22_activation(self.dec2a_act, self.dec2a(self.cat2(self.up2(x), skip2)))
-        x = _apply_u22_activation(self.dec2b_act, self.dec2b(x))
-        x = _apply_u22_activation(self.dec1a_act, self.dec1a(self.cat1(self.up1(x), skip1)))
-        x = _apply_u22_activation(self.dec1b_act, self.dec1b(x))
-        return self.output(x)
 
 
 class _DummyParams:

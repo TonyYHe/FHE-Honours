@@ -43,6 +43,7 @@ from .bootstrap_layout_compression import (
     apply_bootstrap_aware_layout_refinement_candidate,
     apply_bootstrap_layout_compression,
     bootstrap_aware_layout_refinement_applicable,
+    enumerate_final_boot_boundary_halo0_cleanup_candidate,
     enumerate_bootstrap_aware_layout_refinement_candidates,
     restore_layout_policy_compile_plan,
 )
@@ -1097,6 +1098,426 @@ class Scheme:
                         _restore_depth_snapshot(depth_snapshot)
                         reset_bootstrap_solver_assignments(network_dag, assignment_snapshot)
 
+                def _bootstrap_ct_slots(audit: dict[str, Any]) -> tuple[int, int]:
+                    return (
+                        int(
+                            sum(
+                                int(row.get("bootstrap_ct_count", 0) or 0)
+                                for row in audit.get("boot_edges", [])
+                            )
+                        ),
+                        int(
+                            sum(
+                                int(row.get("bootstrap_ct_count", 0) or 0)
+                                * int(row.get("bootstrapper_slots", 0) or 0)
+                                for row in audit.get("boot_edges", [])
+                            )
+                        ),
+                    )
+
+                def _cleanup_edge_ids(candidate: dict[str, Any]) -> tuple[str, ...]:
+                    return tuple(
+                        sorted(
+                            str(row.get("edge", ""))
+                            for row in candidate.get("accepted", [])
+                            if str(row.get("edge", ""))
+                        )
+                    )
+
+                def _strip_cleanup_private(candidate: dict[str, Any]) -> dict[str, Any]:
+                    return {
+                        key: value
+                        for key, value in dict(candidate).items()
+                        if key not in {"plan", "previous_compile_plan", "previous_depths", "_previous_module_layouts"}
+                    }
+
+                def _run_final_halo0_cleanup(
+                    base_audit: dict[str, Any],
+                ) -> tuple[int, int, list[int], dict[str, Any], dict[str, Any]]:
+                    base_boot_count = int(base_audit.get("bootstrap_count", num_bootstraps) or 0)
+                    base_bootstrap_ct_count, base_bootstrap_slots_total = _bootstrap_ct_slots(base_audit)
+                    cleanup_rounds: list[dict[str, Any]] = []
+                    working_audit = dict(base_audit)
+                    base_compile_plan: dict[str, Any] | None = None
+                    base_depths: list[dict[str, Any]] | None = None
+                    max_cleanup_rounds = max(
+                        1,
+                        int(os.environ.get("ORION_BOOTSTRAP_LAYOUT_FINAL_HALO0_CLEANUP_MAX_ROUNDS", "8") or 8),
+                    )
+
+                    for cleanup_round_index in range(int(max_cleanup_rounds)):
+                        cleanup_candidate = enumerate_final_boot_boundary_halo0_cleanup_candidate(
+                            network_dag,
+                            working_audit,
+                        )
+                        if base_compile_plan is None and isinstance(
+                            cleanup_candidate.get("previous_compile_plan"), dict
+                        ):
+                            base_compile_plan = dict(cleanup_candidate["previous_compile_plan"])
+                            base_depths = list(cleanup_candidate.get("previous_depths", []))
+                        if not bool(cleanup_candidate.get("enabled", False)):
+                            cleanup_rounds.append(
+                                {
+                                    **_strip_cleanup_private(cleanup_candidate),
+                                    "round": int(cleanup_round_index + 1),
+                                    "input_bootstrap_count": int(working_audit.get("bootstrap_count", 0) or 0),
+                                }
+                            )
+                            if cleanup_round_index == 0:
+                                return int(input_level), int(num_bootstraps), [int(v) for v in bootstrapper_slots], dict(base_audit), {
+                                    "enabled": False,
+                                    "reason": str(
+                                        cleanup_candidate.get(
+                                            "reason",
+                                            "no_final_boot_boundary_halo0_cleanup_candidates",
+                                        )
+                                    ),
+                                    "rounds": cleanup_rounds,
+                                }
+                            break
+
+                        if base_compile_plan is None:
+                            base_compile_plan = dict(cleanup_candidate.get("previous_compile_plan", {}) or {})
+                            base_depths = list(cleanup_candidate.get("previous_depths", []))
+                        if not base_compile_plan:
+                            cleanup_rounds.append(
+                                {
+                                    **_strip_cleanup_private(cleanup_candidate),
+                                    "round": int(cleanup_round_index + 1),
+                                    "enabled": False,
+                                    "rolled_back": True,
+                                    "rollback_reason": "missing_base_compile_plan",
+                                }
+                            )
+                            break
+
+                        cleanup_edges = _cleanup_edge_ids(cleanup_candidate)
+                        cleanup_module_layout_snapshot = None
+                        try:
+                            cleanup_apply_audit = apply_bootstrap_aware_layout_refinement_candidate(
+                                network_dag,
+                                dict(cleanup_candidate),
+                                first_pass_audit=working_audit,
+                            )
+                            cleanup_module_layout_snapshot = cleanup_apply_audit.get("_previous_module_layouts")
+                            cleanup_apply_public = _strip_cleanup_private(cleanup_apply_audit)
+                            reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                            cleanup_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                            _cleanup_input_level, cleanup_bootstraps, _cleanup_slots = cleanup_solver._solve_once(
+                                apply_layout_compression=False
+                            )
+                            cleanup_final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                        except Exception as exc:
+                            restore_layout_policy_compile_plan(
+                                network_dag,
+                                base_compile_plan,
+                                depth_snapshot=base_depths or [],
+                                module_layout_snapshot=cleanup_module_layout_snapshot,
+                            )
+                            reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                            rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                            rollback_input_level, rollback_bootstraps, rollback_slots = rollback_solver._solve_once(
+                                apply_layout_compression=False
+                            )
+                            cleanup_rounds.append(
+                                {
+                                    **_strip_cleanup_private(cleanup_candidate),
+                                    "round": int(cleanup_round_index + 1),
+                                    "enabled": False,
+                                    "rolled_back": True,
+                                    "rollback_reason": "final_halo0_cleanup_trial_error",
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+                            return (
+                                int(rollback_input_level),
+                                int(rollback_bootstraps),
+                                [int(v) for v in rollback_slots],
+                                dict(base_audit),
+                                {
+                                    "enabled": False,
+                                    "reason": "final_halo0_cleanup_trial_error",
+                                    "rolled_back": True,
+                                    "rounds": cleanup_rounds,
+                                },
+                            )
+                        cleanup_boot_count = int(
+                            cleanup_final_audit.get("bootstrap_count", cleanup_bootstraps) or 0
+                        )
+                        cleanup_bootstrap_ct_count, cleanup_bootstrap_slots_total = _bootstrap_ct_slots(
+                            cleanup_final_audit
+                        )
+                        boot_delta = int(cleanup_boot_count - base_boot_count)
+                        bootstrap_ct_delta = int(cleanup_bootstrap_ct_count - base_bootstrap_ct_count)
+                        bootstrap_slots_delta = int(cleanup_bootstrap_slots_total - base_bootstrap_slots_total)
+                        relayout_depth_before = int(
+                            cleanup_apply_audit.get("true_relayout_kernel_depth_before", 0) or 0
+                        )
+                        relayout_depth_after = int(
+                            cleanup_apply_audit.get("true_relayout_kernel_depth_after", relayout_depth_before) or 0
+                        )
+                        relayout_depth_delta = int(relayout_depth_after - relayout_depth_before)
+                        bootstrap_shape_safe = _bootstrap_shape_nonincrease_safe(
+                            cleanup_candidate,
+                            bootstrap_ct_delta=int(bootstrap_ct_delta),
+                            bootstrap_slots_delta=int(bootstrap_slots_delta),
+                            force=True,
+                        )
+                        bootstrap_width_reduced = bool(int(bootstrap_slots_delta) < 0)
+                        safe = bool(
+                            int(boot_delta) <= 0
+                            and bool(bootstrap_shape_safe)
+                            and bool(bootstrap_width_reduced)
+                            and int(relayout_depth_delta) <= 0
+                        )
+
+                        restore_layout_policy_compile_plan(
+                            network_dag,
+                            base_compile_plan,
+                            depth_snapshot=base_depths or [],
+                            module_layout_snapshot=cleanup_module_layout_snapshot,
+                        )
+                        reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+
+                        if not bool(safe):
+                            rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                            rollback_input_level, rollback_bootstraps, rollback_slots = rollback_solver._solve_once(
+                                apply_layout_compression=False
+                            )
+                            cleanup_rounds.append(
+                                {
+                                    **_strip_cleanup_private(cleanup_candidate),
+                                    **dict(cleanup_apply_public),
+                                    "round": int(cleanup_round_index + 1),
+                                    "enabled": False,
+                                    "rolled_back": True,
+                                    "rollback_reason": (
+                                        "final_halo0_bootstrap_shape_increased"
+                                        if bool(bootstrap_shape_safe) is False
+                                        else "final_halo0_no_boot_width_reduction"
+                                        if not bool(bootstrap_width_reduced)
+                                        else "final_halo0_bootstrap_count_or_depth_increased"
+                                    ),
+                                    "boot_delta": int(boot_delta),
+                                    "bootstrap_ct_delta": int(bootstrap_ct_delta),
+                                    "bootstrap_slots_delta": int(bootstrap_slots_delta),
+                                    "bootstrap_width_reduced": bool(bootstrap_width_reduced),
+                                    "relayout_depth_delta": int(relayout_depth_delta),
+                                    "trial_boot_edges": list(cleanup_final_audit.get("boot_edges", [])),
+                                }
+                            )
+                            return (
+                                int(rollback_input_level),
+                                int(rollback_bootstraps),
+                                [int(v) for v in rollback_slots],
+                                dict(base_audit),
+                                {
+                                    "enabled": False,
+                                    "reason": str(cleanup_rounds[-1]["rollback_reason"]),
+                                    "rolled_back": True,
+                                    "rounds": cleanup_rounds,
+                                },
+                            )
+
+                        next_candidate = enumerate_final_boot_boundary_halo0_cleanup_candidate(
+                            network_dag,
+                            cleanup_final_audit,
+                        )
+                        next_edges = (
+                            _cleanup_edge_ids(next_candidate)
+                            if bool(next_candidate.get("enabled", False))
+                            else tuple()
+                        )
+                        stable_edges = bool(tuple(cleanup_edges) == tuple(next_edges))
+                        round_row = {
+                            **_strip_cleanup_private(cleanup_candidate),
+                            **dict(cleanup_apply_public),
+                            "round": int(cleanup_round_index + 1),
+                            "committed": bool(stable_edges),
+                            "rolled_back": not bool(stable_edges),
+                            "rollback_reason": ""
+                            if bool(stable_edges)
+                            else "revalidate_with_moved_boot_boundary",
+                            "input_bootstrap_count": int(working_audit.get("bootstrap_count", 0) or 0),
+                            "final_bootstrap_count": int(cleanup_boot_count),
+                            "boot_delta": int(boot_delta),
+                            "bootstrap_ct_delta": int(bootstrap_ct_delta),
+                            "bootstrap_slots_delta": int(bootstrap_slots_delta),
+                            "bootstrap_width_reduced": bool(bootstrap_width_reduced),
+                            "relayout_depth_delta": int(relayout_depth_delta),
+                            "cleanup_edges": list(cleanup_edges),
+                            "next_cleanup_edges": list(next_edges),
+                            "stable_final_boot_boundary": bool(stable_edges),
+                            "trial_boot_edges": list(cleanup_final_audit.get("boot_edges", [])),
+                        }
+                        cleanup_rounds.append(dict(round_row))
+
+                        if bool(stable_edges):
+                            final_candidate = cleanup_candidate
+                            final_module_layout_snapshot = None
+                            try:
+                                final_apply_audit = apply_bootstrap_aware_layout_refinement_candidate(
+                                    network_dag,
+                                    dict(final_candidate),
+                                    first_pass_audit=working_audit,
+                                )
+                                final_module_layout_snapshot = final_apply_audit.get("_previous_module_layouts")
+                                final_apply_public = _strip_cleanup_private(final_apply_audit)
+                                reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                                final_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                                final_input_level, final_bootstraps, final_slots = final_solver._solve_once(
+                                    apply_layout_compression=False
+                                )
+                                final_audit = collect_bootstrap_solver_audit(network_dag, l_eff=l_eff)
+                            except Exception as exc:
+                                restore_layout_policy_compile_plan(
+                                    network_dag,
+                                    base_compile_plan,
+                                    depth_snapshot=base_depths or [],
+                                    module_layout_snapshot=final_module_layout_snapshot,
+                                )
+                                reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                                rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                                rollback_input_level, rollback_bootstraps, rollback_slots = rollback_solver._solve_once(
+                                    apply_layout_compression=False
+                                )
+                                cleanup_rounds[-1] = {
+                                    **dict(cleanup_rounds[-1]),
+                                    "enabled": False,
+                                    "committed": False,
+                                    "rolled_back": True,
+                                    "rollback_reason": "final_halo0_cleanup_commit_error",
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                                return (
+                                    int(rollback_input_level),
+                                    int(rollback_bootstraps),
+                                    [int(v) for v in rollback_slots],
+                                    dict(base_audit),
+                                    {
+                                        "enabled": False,
+                                        "reason": "final_halo0_cleanup_commit_error",
+                                        "rolled_back": True,
+                                        "rounds": cleanup_rounds,
+                                    },
+                                )
+                            final_boot_count = int(final_audit.get("bootstrap_count", final_bootstraps) or 0)
+                            final_bootstrap_ct_count, final_bootstrap_slots_total = _bootstrap_ct_slots(final_audit)
+                            final_boot_delta = int(final_boot_count - base_boot_count)
+                            final_ct_delta = int(final_bootstrap_ct_count - base_bootstrap_ct_count)
+                            final_slots_delta = int(final_bootstrap_slots_total - base_bootstrap_slots_total)
+                            final_depth_before = int(
+                                final_apply_audit.get("true_relayout_kernel_depth_before", 0) or 0
+                            )
+                            final_depth_after = int(
+                                final_apply_audit.get("true_relayout_kernel_depth_after", final_depth_before) or 0
+                            )
+                            final_depth_delta = int(final_depth_after - final_depth_before)
+                            final_shape_safe = _bootstrap_shape_nonincrease_safe(
+                                final_candidate,
+                                bootstrap_ct_delta=int(final_ct_delta),
+                                bootstrap_slots_delta=int(final_slots_delta),
+                                force=True,
+                            )
+                            final_width_reduced = bool(int(final_slots_delta) < 0)
+                            final_safe = bool(
+                                int(final_boot_delta) <= 0
+                                and bool(final_shape_safe)
+                                and bool(final_width_reduced)
+                                and int(final_depth_delta) <= 0
+                            )
+                            if not bool(final_safe):
+                                restore_layout_policy_compile_plan(
+                                    network_dag,
+                                    base_compile_plan,
+                                    depth_snapshot=base_depths or [],
+                                    module_layout_snapshot=final_module_layout_snapshot,
+                                )
+                                reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                                rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                                rollback_input_level, rollback_bootstraps, rollback_slots = rollback_solver._solve_once(
+                                    apply_layout_compression=False
+                                )
+                                reason = (
+                                    "final_halo0_bootstrap_shape_increased"
+                                    if not bool(final_shape_safe)
+                                    else "final_halo0_no_boot_width_reduction"
+                                    if not bool(final_width_reduced)
+                                    else "final_halo0_bootstrap_count_or_depth_increased"
+                                )
+                                cleanup_rounds[-1] = {
+                                    **dict(cleanup_rounds[-1]),
+                                    "enabled": False,
+                                    "committed": False,
+                                    "rolled_back": True,
+                                    "rollback_reason": str(reason),
+                                    "final_boot_delta": int(final_boot_delta),
+                                    "final_bootstrap_ct_delta": int(final_ct_delta),
+                                    "final_bootstrap_slots_delta": int(final_slots_delta),
+                                    "final_bootstrap_width_reduced": bool(final_width_reduced),
+                                    "final_relayout_depth_delta": int(final_depth_delta),
+                                }
+                                return (
+                                    int(rollback_input_level),
+                                    int(rollback_bootstraps),
+                                    [int(v) for v in rollback_slots],
+                                    dict(base_audit),
+                                    {
+                                        "enabled": False,
+                                        "reason": str(reason),
+                                        "rolled_back": True,
+                                        "rounds": cleanup_rounds,
+                                    },
+                                )
+                            return (
+                                int(final_input_level),
+                                int(final_bootstraps),
+                                [int(v) for v in final_slots],
+                                dict(final_audit),
+                                {
+                                    **_strip_cleanup_private(final_candidate),
+                                    **dict(final_apply_public),
+                                    "enabled": True,
+                                    "fixed_point": True,
+                                    "rolled_back": False,
+                                    "round_count": int(len(cleanup_rounds)),
+                                    "rounds": cleanup_rounds,
+                                    "final_bootstrap_count": int(final_boot_count),
+                                    "final_boot_delta": int(final_boot_delta),
+                                    "final_bootstrap_ct_delta": int(final_ct_delta),
+                                    "final_bootstrap_slots_delta": int(final_slots_delta),
+                                    "final_bootstrap_width_reduced": bool(final_width_reduced),
+                                    "final_relayout_depth_delta": int(final_depth_delta),
+                                    "final_boot_edges": list(final_audit.get("boot_edges", [])),
+                                },
+                            )
+
+                        working_audit = dict(cleanup_final_audit)
+
+                    if base_compile_plan:
+                        restore_layout_policy_compile_plan(
+                            network_dag,
+                            base_compile_plan,
+                            depth_snapshot=base_depths or [],
+                        )
+                    reset_bootstrap_solver_assignments(network_dag, level_snapshot)
+                    rollback_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+                    rollback_input_level, rollback_bootstraps, rollback_slots = rollback_solver._solve_once(
+                        apply_layout_compression=False
+                    )
+                    return (
+                        int(rollback_input_level),
+                        int(rollback_bootstraps),
+                        [int(v) for v in rollback_slots],
+                        dict(base_audit),
+                        {
+                            "enabled": False,
+                            "reason": "final_halo0_cleanup_fixed_point_not_reached",
+                            "rolled_back": True,
+                            "rounds": cleanup_rounds,
+                        },
+                    )
+
                 rollback_audit: dict[str, Any] | None = None
                 stopped_reason = "max_rounds_reached"
                 refinement_policy = "dp_no_share_fold"
@@ -1661,14 +2082,21 @@ class Scheme:
                 accepted_count = int(
                     sum(int(row.get("accepted_count", 0) or 0) for row in accepted_rounds)
                 )
+                input_level, num_bootstraps, bootstrapper_slots, current_audit, final_halo0_cleanup_audit = (
+                    _run_final_halo0_cleanup(current_audit)
+                )
+                final_halo0_cleanup_enabled = bool(final_halo0_cleanup_audit.get("enabled", False))
+                final_halo0_cleanup_accepted_count = int(
+                    final_halo0_cleanup_audit.get("accepted_count", 0) or 0
+                )
                 network_dag.bootstrap_layout_compression_audit = {
                     "enabled": False,
                     "reason": "staged_bootstrap_aware_refinement"
-                    if accepted_count > 0
+                    if accepted_count > 0 or final_halo0_cleanup_enabled
                     else "staged_bootstrap_aware_refinement_no_candidates",
                 }
                 network_dag.bootstrap_layout_refinement_audit = {
-                    "enabled": bool(accepted_count > 0),
+                    "enabled": bool(accepted_count > 0 or final_halo0_cleanup_enabled),
                     "policy": str(refinement_policy),
                     "fixed_point": bool(rollback_audit is None and stopped_reason != "max_rounds_reached"),
                     "stopped_reason": str(stopped_reason),
@@ -1683,6 +2111,9 @@ class Scheme:
                     "target_boot_edges": list((target_bootstrap_audit or {}).get("boot_edges", [])),
                     "accepted_round_count": int(len(accepted_rounds)),
                     "accepted_count": int(accepted_count),
+                    "final_halo0_cleanup_enabled": bool(final_halo0_cleanup_enabled),
+                    "final_halo0_cleanup_accepted_count": int(final_halo0_cleanup_accepted_count),
+                    "final_halo0_cleanup": dict(final_halo0_cleanup_audit),
                     "candidate_trial_count": int(
                         sum(len(row.get("trials", []) or []) for row in refinement_rounds)
                     ),

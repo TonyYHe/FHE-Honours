@@ -64,6 +64,8 @@ class _CProviderNativeSourceSpec(ctypes.Structure):
         ("stripe_index", ctypes.c_int),
         ("stripe_source_h_start", ctypes.c_int),
         ("stripe_source_h", ctypes.c_int),
+        ("stripe_source_owner_h_start", ctypes.c_int),
+        ("stripe_source_owner_h_end", ctypes.c_int),
         ("stripe_target_h_start", ctypes.c_int),
         ("stripe_target_h_end", ctypes.c_int),
         ("stripe_target_h", ctypes.c_int),
@@ -816,6 +818,8 @@ def build_provider_native_source_conv2d_payload(
     source_group: int,
     target_group: int,
     compact_target_block: int | None = None,
+    source_index_override: int | None = None,
+    target_index_override: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]] | None:
     lib = load_library()
     build = None if lib is None else getattr(lib, "OrionBuildProviderNativeSourceConv2D", None)
@@ -826,9 +830,21 @@ def build_provider_native_source_conv2d_payload(
     target_index = (
         int(compact_target_block)
         if compact_target_block is not None
+        else int(target_index_override)
+        if target_index_override is not None
         else int(plan.target_block_index(stripe, int(target_group)))
     )
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
+    source_index = (
+        int(source_index_override)
+        if source_index_override is not None
+        else int(plan.source_block_index(stripe, int(source_group)))
+    )
+    source_owner_h_start = getattr(stripe, "source_owner_h_start", None)
+    if source_owner_h_start is None:
+        source_owner_h_start = int(stripe.source_h_start)
+    source_owner_h_end = getattr(stripe, "source_owner_h_end", None)
+    if source_owner_h_end is None:
+        source_owner_h_end = int(stripe.source_h_end)
     c_spec = _CProviderNativeSourceSpec(
         int(spec.slot_count),
         int(spec.c_in),
@@ -852,6 +868,8 @@ def build_provider_native_source_conv2d_payload(
         int(stripe.index),
         int(stripe.source_h_start),
         int(stripe.source_h),
+        int(source_owner_h_start),
+        int(source_owner_h_end),
         int(stripe.target_h_start),
         int(stripe.target_h_end),
         int(stripe.target_h),
@@ -889,6 +907,12 @@ def build_provider_native_source_conv2d_payload(
             "diag_builder_build_s": float(build_s),
             "diag_builder_payload_count": 1.0,
             "diag_builder_fallback_reason": "",
+            "diag_builder_source_index": int(source_index),
+            "diag_builder_target_index": int(target_index),
+            "diag_builder_source_owner_h_start": int(source_owner_h_start),
+            "diag_builder_source_owner_h_end": int(source_owner_h_end),
+            "diag_builder_source_index_override": bool(source_index_override is not None),
+            "diag_builder_target_index_override": bool(target_index_override is not None),
         }
         return payload.diag_indices, payload.diag_data, metadata
     finally:

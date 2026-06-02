@@ -3,6 +3,7 @@ import torch
 
 from orion.models.unet import (
     UNet22,
+    UNet22PlusOutput,
     UNet22KvasirPolyp256,
     UNet22MontgomeryLung64,
     get_unet22_medical_model,
@@ -80,6 +81,26 @@ def test_unet22_uses_concat_decoder_skips() -> None:
     assert model.dec3a.in_channels == 2 * model.up3.out_channels
     assert model.dec2a.in_channels == 2 * model.up2.out_channels
     assert model.dec1a.in_channels == 2 * model.up1.out_channels
+
+
+def test_unet22_plus_output_keeps_explicit_output_head() -> None:
+    model = UNet22PlusOutput(in_channels=1, out_channels=4, base_channels=8, activation="silu", silu_degree=7)
+
+    assert model.dec1b.in_channels == 8
+    assert model.dec1b.out_channels == 8
+    assert type(model.dec1b_act).__name__ == "SiLU"
+    assert model.output.in_channels == 8
+    assert model.output.out_channels == 4
+    assert model.output.kernel_size == (1, 1)
+
+
+def test_unet22_plus_output_forward_shape_on_small_base() -> None:
+    model = UNet22PlusOutput(dataset="tiny", in_channels=1, out_channels=4, base_dim=4, activation=None)
+    model.eval()
+
+    out = model(torch.randn(1, 1, 32, 32))
+
+    assert tuple(out.shape) == (1, 4, 32, 32)
 
 
 @pytest.mark.parametrize(

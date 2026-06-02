@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
 
 PHYSICAL_COMPACT = "packed_compact"
 PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
+PHYSICAL_NATIVE_SOURCE_STRIPE = "native_source_stripe"
+NATIVE_OUTPUT_MATERIALIZATION = "native_halo_stripe"
 BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES = {
     "dp_no_share_fold",
     "fixed_max_no_share_fused",
@@ -29,6 +32,20 @@ _LAYOUT_PRESERVING_MODULES = {
 _MISSING = object()
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(str(name), str(default))).strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _bootstrap_halo0_channel_aligned_stripe_enabled() -> bool:
+    return _env_truthy("ORION_LAYOUT_POLICY_HALO0_CHANNEL_ALIGNED_STRIPE", "1")
+
+
 def _ceil_div(left: int, right: int) -> int:
     return -(-int(left) // int(right))
 
@@ -39,6 +56,16 @@ def _layout_top_beta(layout: dict[str, Any]) -> int:
 
 def _layout_bottom_beta(layout: dict[str, Any]) -> int:
     return max(0, int(dict(layout).get("bottom_beta", dict(layout).get("beta", 0)) or 0))
+
+
+def _layout_physical_top_beta(layout: dict[str, Any]) -> int:
+    values = dict(layout)
+    return max(0, int(values.get("physical_top_beta", values.get("top_beta", values.get("alpha", 0))) or 0))
+
+
+def _layout_physical_bottom_beta(layout: dict[str, Any]) -> int:
+    values = dict(layout)
+    return max(0, int(values.get("physical_bottom_beta", values.get("bottom_beta", values.get("beta", 0))) or 0))
 
 
 def _shape_tuple(value: Any) -> tuple[int, int, int, int] | None:
@@ -110,6 +137,41 @@ def _fhe_shape_for_layout(row: dict[str, Any], layout: dict[str, Any]) -> torch.
     )
 
 
+def _positive_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return int(default)
+    return int(parsed) if int(parsed) > 0 else int(default)
+
+
+def _native_output_ct_count_for_node(row: dict[str, Any], compile_plan: dict[str, Any]) -> int:
+    node = str(row.get("node", ""))
+    counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+    for key in (
+        "native_physical_output_ct_count",
+        "native_output_ct_count",
+        "native_output_ct_count_estimate",
+    ):
+        value = _positive_int(row.get(key, 0), 0)
+        if int(value) > 0:
+            return int(value)
+    return _positive_int(counts.get(node, 0), 0)
+
+
+def _fhe_shape_for_output_row(
+    row: dict[str, Any],
+    layout: dict[str, Any],
+    compile_plan: dict[str, Any],
+) -> torch.Size | None:
+    if str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE:
+        ct_count = _native_output_ct_count_for_node(row, compile_plan)
+        if int(ct_count) > 0:
+            slots = max(1, int(compile_plan.get("slots", row.get("slots", 32768)) or 32768))
+            return torch.Size((int(ct_count), int(slots)))
+    return _fhe_shape_for_layout(row, layout)
+
+
 def _layout_for_row_shape(
     row: dict[str, Any],
     *,
@@ -152,6 +214,18 @@ def _layout_covers(left: dict[str, Any], right: dict[str, Any]) -> bool:
         int(dict(left).get("gap", 1) or 1) == int(dict(right).get("gap", 1) or 1)
         and _layout_top_beta(left) >= _layout_top_beta(right)
         and _layout_bottom_beta(left) >= _layout_bottom_beta(right)
+    )
+
+
+def _layout_storage_key(layout: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+    values = dict(layout)
+    return (
+        _layout_top_beta(values),
+        _layout_bottom_beta(values),
+        _layout_physical_top_beta(values),
+        _layout_physical_bottom_beta(values),
+        max(1, int(values.get("stride", 1) or 1)),
+        max(1, int(values.get("gap", 1) or 1)),
     )
 
 
@@ -362,7 +436,12 @@ def _apply_layout_policy_module_output_layouts(network_dag: Any, compile_plan: d
         if not node or node not in network_dag.nodes:
             continue
         layout = dict(row.get("selected_layout", {}) or {})
-        if not _layout_has_halo(layout):
+        should_apply = bool(
+            _layout_has_halo(layout)
+            or str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+            or bool(row.get("boot_refined_halo0_channel_aligned_stripe", False))
+        )
+        if not bool(should_apply):
             continue
         module = network_dag.nodes[node].get("module")
         if module is None:
@@ -377,15 +456,22 @@ def _apply_layout_policy_module_output_layouts(network_dag: Any, compile_plan: d
         if module is None:
             continue
         layout = dict(row.get("selected_layout", {}) or {})
-        shape = _fhe_shape_for_layout(dict(row), layout)
+        shape = _fhe_shape_for_output_row(dict(row), layout, compile_plan)
         if shape is not None:
             module.fhe_output_shape = shape
         gap = max(1, int(layout.get("gap", 1) or 1))
-        top_beta = _layout_top_beta(layout)
+        top_beta = _layout_physical_top_beta(layout)
         module.layout_policy_output_layout = dict(layout)
         module.layout_policy_output_row_offset = int(top_beta * gap)
-        if bool(row.get("producer_materialized_halo", False)) or _layout_has_halo(layout):
+        if str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE:
+            module.layout_policy_output_materialization = NATIVE_OUTPUT_MATERIALIZATION
+        elif bool(row.get("producer_materialized_halo", False)) or _layout_has_halo(layout):
             module.layout_policy_output_materialization = "fused_relayout"
+        else:
+            try:
+                delattr(module, "layout_policy_output_materialization")
+            except AttributeError:
+                pass
     return snapshot
 
 
@@ -486,6 +572,31 @@ def _rebuild_relayout_edges(edge_layouts: list[dict[str, Any]]) -> list[dict[str
 def _refresh_layout_policy_plan_summary(compile_plan: dict[str, Any]) -> dict[str, Any]:
     edge_layouts = [dict(row) for row in compile_plan.get("edge_layouts", [])]
     node_layouts = [dict(row) for row in compile_plan.get("node_layouts", [])]
+    native_output_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+    native_output_nodes: set[str] = set()
+    sanitized_node_layouts: list[dict[str, Any]] = []
+    for row in node_layouts:
+        updated = dict(row)
+        node = str(updated.get("node", ""))
+        if str(updated.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE:
+            if node:
+                native_output_nodes.add(node)
+        else:
+            for key in (
+                "native_physical_output_ct_count",
+                "native_output_ct_count",
+                "native_output_ct_count_estimate",
+            ):
+                updated.pop(key, None)
+            if str(updated.get("layout_policy_output_materialization", "")) == NATIVE_OUTPUT_MATERIALIZATION:
+                updated.pop("layout_policy_output_materialization", None)
+        sanitized_node_layouts.append(updated)
+    node_layouts = sanitized_node_layouts
+    native_output_counts = {
+        str(node): int(count)
+        for node, count in native_output_counts.items()
+        if str(node) in native_output_nodes and _positive_int(count, 0) > 0
+    }
     relayout_edges = _rebuild_relayout_edges(edge_layouts)
     output_nodes = [
         dict(row)
@@ -537,6 +648,7 @@ def _refresh_layout_policy_plan_summary(compile_plan: dict[str, Any]) -> dict[st
         **dict(compile_plan),
         "edge_layouts": edge_layouts,
         "node_layouts": node_layouts,
+        "_native_physical_output_ct_counts": native_output_counts,
         "relayout_edges": relayout_edges,
         "relayout_edge_count": int(len(relayout_edges)),
         "output_relayout_nodes": output_nodes,
@@ -708,6 +820,8 @@ def _compact_physical_for_refined_source(row: dict[str, Any]) -> str:
 
 def _rewrite_native_physical_relayout_row_for_boot_refinement(row: dict[str, Any]) -> dict[str, Any] | None:
     if str(row.get("op_kind", "")) != "conv2d":
+        return None
+    if _native_source_stripe_compact_rewrite_blocked(row):
         return None
     if str(row.get("source", "")) == "x":
         return None
@@ -966,13 +1080,25 @@ def _linear_interval_path(network_dag: Any, interval: dict[str, Any]) -> list[st
     return path
 
 
+def _native_source_stripe_compact_rewrite_blocked(row: dict[str, Any]) -> bool:
+    return bool(
+        str(row.get("op_kind", "")) == "conv2d"
+        and str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and str(row.get("provider_lt_grouping_mode", "")) == "individual"
+        and str(row.get("native_halo_channel_fold_mode", "")) == "per_stripe"
+    )
+
+
 def _rewrite_row_as_compact_source(
     row: dict[str, Any],
     *,
     source_layout: dict[str, Any],
     target_layout: dict[str, Any],
     reason: str,
-) -> dict[str, Any]:
+    allow_protected_native_source: bool = False,
+) -> dict[str, Any] | None:
+    if _native_source_stripe_compact_rewrite_blocked(row) and not bool(allow_protected_native_source):
+        return None
     updated = dict(row)
     updated["source_layout"] = dict(source_layout)
     updated["selected_layout"] = dict(target_layout)
@@ -997,6 +1123,390 @@ def _rewrite_row_as_compact_source(
     return updated
 
 
+def _native_input_ct_count_from_edge(row: dict[str, Any]) -> int:
+    for key in (
+        "native_input_ct_count",
+        "native_input_ct_count_estimate",
+        "native_output_ct_count",
+        "native_output_ct_count_estimate",
+    ):
+        value = _positive_int(row.get(key, 0), 0)
+        if int(value) > 0:
+            return int(value)
+    layout = dict(row.get("selected_layout", {}) or {})
+    return _positive_int(layout.get("tile_count", 0), 0)
+
+
+def _rewrite_row_as_native_source(
+    row: dict[str, Any],
+    *,
+    source_layout: dict[str, Any],
+    target_layout: dict[str, Any],
+    native_ct_count: int,
+    reason: str,
+) -> dict[str, Any]:
+    updated = dict(row)
+    updated["source_layout"] = dict(source_layout)
+    updated["selected_layout"] = dict(target_layout)
+    updated["target_layout"] = dict(target_layout)
+    updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["relayout"] = False
+    updated["relayout_reason"] = ""
+    updated["relayout_rotation_estimate"] = 0
+    updated["relayout_mask_mult_estimate"] = 0
+    updated["relayout_sparse_lt_estimate"] = 0
+    updated["relayout_depth_estimate"] = 0
+    updated["consumer_fused_relayout"] = False
+    updated["consumer_fused_rotation_estimate"] = 0
+    updated["boot_refined_beta_lift"] = True
+    updated["boot_refinement_reason"] = str(reason)
+    if int(native_ct_count) > 0:
+        updated["native_input_ct_count_estimate"] = int(native_ct_count)
+        updated["native_source_output_ct_count"] = int(native_ct_count)
+    if str(row.get("op_kind", "")) == "conv2d":
+        updated["layout_mode"] = "native_halo_stripe"
+        updated["provider_lt_grouping_mode"] = "individual"
+        updated["native_halo_channel_fold_mode"] = "per_stripe"
+    elif str(row.get("layout_mode", "")):
+        updated["layout_mode"] = str(row.get("layout_mode", ""))
+    else:
+        updated["layout_mode"] = "layout_preserving_native_halo_stripe"
+    return updated
+
+
+def _rewrite_row_as_native_compact_source(
+    row: dict[str, Any],
+    *,
+    source_layout: dict[str, Any],
+    target_layout: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    physical = PHYSICAL_LOGICAL_HALO if _layout_has_halo(source_layout) else PHYSICAL_COMPACT
+    updated = dict(row)
+    updated["source_layout"] = dict(source_layout)
+    updated["selected_layout"] = dict(target_layout)
+    updated["target_layout"] = dict(target_layout)
+    updated["physical_layout"] = str(physical)
+    updated["source_physical_layout"] = str(physical)
+    updated["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["relayout"] = False
+    updated["relayout_reason"] = ""
+    updated["relayout_rotation_estimate"] = 0
+    updated["relayout_mask_mult_estimate"] = 0
+    updated["relayout_sparse_lt_estimate"] = 0
+    updated["relayout_depth_estimate"] = 0
+    updated["consumer_fused_relayout"] = True
+    updated["consumer_fused_rotation_estimate"] = 0
+    updated["boot_refined_beta_lift"] = True
+    updated["boot_refinement_reason"] = str(reason)
+    updated["native_compact_source_fused"] = True
+    updated["layout_mode"] = "native_halo_stripe"
+    updated["provider_lt_grouping_mode"] = "individual"
+    updated["native_halo_channel_fold_mode"] = "per_stripe"
+    return updated
+
+
+def _source_is_concat_like(source: str) -> bool:
+    return str(source).startswith("cat")
+
+
+def _row_is_concat_like_source(row: dict[str, Any], network_dag: Any) -> bool:
+    source = str(row.get("source", "") or "")
+    if _source_is_concat_like(source):
+        return True
+    if source in getattr(network_dag, "nodes", {}):
+        if type(network_dag.nodes[source].get("module")).__name__ == "Concat":
+            return True
+    return bool(
+        bool(row.get("concat_fusion_runtime_estimate", False))
+        or str(row.get("lt_estimator", "")) == "concat_fused_module_unified_plan"
+        or bool(row.get("concat_output_beta_lift", False))
+        or bool(row.get("local_concat_transitive_beta_lift", False))
+        or str(row.get("layout_mode", "")) == "concat_output_compact_halo_shared"
+    )
+
+
+def _conv2d_module_halo0_channel_aligned_native_stats(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    compact_layout: dict[str, Any],
+    input_layout: dict[str, Any] | None = None,
+    node_rows_by_node: dict[str, dict[str, Any]],
+) -> dict[str, int] | None:
+    target = str(row.get("target", ""))
+    if not target or target not in network_dag.nodes:
+        return None
+    module = network_dag.nodes[target].get("module")
+    if type(module).__name__ != "Conv2d":
+        return None
+    input_shape = _shape_tuple(row.get("shape", ()))
+    output_row = node_rows_by_node.get(str(target), {})
+    output_shape = _shape_tuple(output_row.get("shape", ()))
+    if output_shape is None:
+        try:
+            output_shape = _shape_tuple(getattr(module, "output_shape"))
+        except Exception:
+            output_shape = None
+    if input_shape is None or output_shape is None:
+        return None
+    kernel = _pair_values(getattr(module, "kernel_size", 1), 1)
+    stride = _pair_values(getattr(module, "stride", 1), 1)
+    padding = _pair_values(getattr(module, "padding", 0), 0)
+    dilation = _pair_values(getattr(module, "dilation", 1), 1)
+    groups = max(1, int(getattr(module, "groups", 1) or 1))
+    if (
+        int(groups) != 1
+        or int(kernel[0]) != int(kernel[1])
+        or int(stride[0]) != int(stride[1])
+        or int(padding[0]) != int(padding[1])
+        or int(dilation[0]) != int(dilation[1])
+    ):
+        return None
+    try:
+        from orion.experimental.cir.native_halo_conv2d import NativeHaloConv2DSpec, native_halo_conv2d_plan
+    except Exception:
+        return None
+    stats_input_layout = dict(input_layout) if input_layout is not None else dict(compact_layout)
+    output_layout = dict(output_row.get("selected_layout", {}) or {})
+    output_gap = max(1, int(output_layout.get("gap", compact_layout.get("gap", 1)) or 1))
+    slots = max(1, int(compile_plan.get("slots", row.get("slots", 32768)) or 32768))
+    c_in = max(1, int(getattr(module, "in_channels", input_shape[1]) or input_shape[1]))
+    c_out = max(1, int(getattr(module, "out_channels", output_shape[1]) or output_shape[1]))
+    spec = NativeHaloConv2DSpec(
+        family_label=(
+            f"bootstrap_refine_halo0_channel_aligned_{row.get('source', '')}_{target}"
+            f"_{int(c_in)}x{int(input_shape[2])}x{int(input_shape[3])}"
+            f"_to_{int(c_out)}x{int(output_shape[2])}x{int(output_shape[3])}"
+        ),
+        c_in=int(c_in),
+        h_in=int(input_shape[2]),
+        w_in=int(input_shape[3]),
+        c_out=int(c_out),
+        h_out=int(output_shape[2]),
+        w_out=int(output_shape[3]),
+        gap_in=max(1, int(stats_input_layout.get("gap", compact_layout.get("gap", 1)) or 1)),
+        gap_out=int(output_gap),
+        kernel=int(kernel[0]),
+        stride=int(stride[0]),
+        pad=int(padding[0]),
+        dilation=int(dilation[0]),
+        groups=int(groups),
+        slot_count=int(slots),
+        input_top_beta=_layout_top_beta(stats_input_layout),
+        input_bottom_beta=_layout_bottom_beta(stats_input_layout),
+        output_top_beta=0,
+        output_bottom_beta=0,
+        input_physical_top_beta=_layout_physical_top_beta(stats_input_layout),
+        input_physical_bottom_beta=_layout_physical_bottom_beta(stats_input_layout),
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    try:
+        plan = native_halo_conv2d_plan(
+            spec,
+            require_native_target_fit=False,
+            channel_fold_mode="per_stripe",
+        )
+    except ValueError:
+        return None
+    native_output_ct_count = int(
+        sum(
+            int(plan.target_group_count_for_stripe(stripe))
+            for stripe in getattr(plan, "stripes", ()) or ()
+        )
+    )
+    return {
+        "rotations": int(plan.c_only_rotations),
+        "cb_shared_rotations": int(plan.cb_shared_rotations),
+        "baby_rotations": int(sum(int(value) for value in plan.program_rotation_counts)),
+        "giant_rotations": int(plan.shared_giant_rotations),
+        "transform_count": int(plan.submatrix_program_count),
+        "input_ct_count": int(plan.input_ct_count),
+        "output_ct_count": int(native_output_ct_count),
+        "compact_output_ct_count": int(plan.output_ct_count),
+        "stripe_count": int(getattr(plan, "stripe_count", 0) or 0),
+    }
+
+
+def _rewrite_row_as_halo0_channel_aligned_native_stripe(
+    row: dict[str, Any],
+    *,
+    compact_layout: dict[str, Any],
+    native_stats: dict[str, int],
+    reason: str,
+) -> dict[str, Any]:
+    updated = dict(row)
+    updated["source_layout"] = dict(compact_layout)
+    updated["selected_layout"] = dict(compact_layout)
+    updated["target_layout"] = dict(compact_layout)
+    updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["relayout"] = False
+    updated["relayout_reason"] = ""
+    updated["relayout_rotation_estimate"] = 0
+    updated["relayout_mask_mult_estimate"] = 0
+    updated["relayout_sparse_lt_estimate"] = 0
+    updated["relayout_depth_estimate"] = 0
+    updated["consumer_fused_relayout"] = False
+    updated["consumer_fused_rotation_estimate"] = 0
+    updated["layout_mode"] = "native_halo_stripe"
+    updated["provider_lt_grouping_mode"] = "individual"
+    updated["native_halo_channel_fold_mode"] = "per_stripe"
+    updated["native_halo_channel_aligned_stripe"] = True
+    updated["native_halo_input_storage_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["native_halo_output_storage_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["boot_refined_halo0_channel_aligned_stripe"] = True
+    updated["boot_refinement_reason"] = str(reason)
+    updated["boot_refinement_original_physical_layout"] = str(row.get("physical_layout", ""))
+    rotations = int(native_stats.get("rotations", 0) or 0)
+    updated["planner_rotation_cost_estimate"] = int(rotations)
+    updated["lt_bsgs_rotation_estimate"] = int(rotations)
+    updated["lt_baby_rotation_estimate"] = int(native_stats.get("baby_rotations", rotations) or rotations)
+    updated["lt_giant_rotation_estimate"] = int(native_stats.get("giant_rotations", 0) or 0)
+    updated["lt_transform_count_estimate"] = int(native_stats.get("transform_count", 0) or 0)
+    updated["native_c_only_rotation_estimate"] = int(rotations)
+    updated["native_cb_shared_rotation_estimate"] = int(native_stats.get("cb_shared_rotations", rotations) or rotations)
+    updated["native_plan_c_only_rotation_estimate"] = int(rotations)
+    updated["native_plan_cb_shared_rotation_estimate"] = int(native_stats.get("cb_shared_rotations", rotations) or rotations)
+    updated["native_shared_baby_rotation_estimate"] = int(native_stats.get("baby_rotations", rotations) or rotations)
+    updated["native_shared_giant_rotation_estimate"] = int(native_stats.get("giant_rotations", 0) or 0)
+    updated["native_input_ct_count_estimate"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_input_ct_count"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_output_ct_count_estimate"] = int(native_stats.get("output_ct_count", 0) or 0)
+    updated["native_output_ct_count"] = int(native_stats.get("output_ct_count", 0) or 0)
+    updated["native_ct_count_estimate"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_ct_count"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_submatrix_program_count_estimate"] = int(native_stats.get("transform_count", 0) or 0)
+    updated["native_stripe_count_estimate"] = int(native_stats.get("stripe_count", 0) or 0)
+    updated["native_halo_rotation_estimator"] = "native_halo_conv2d_plan_boot_interval_halo0"
+    updated["native_halo_rotation_mode"] = "c_only"
+    updated["native_halo_rotation_exact_compact_output"] = False
+    updated["native_halo_rotation_search_surrogate"] = ""
+    return updated
+
+
+def _rewrite_row_as_halo0_channel_aligned_native_output(
+    row: dict[str, Any],
+    *,
+    native_stats: dict[str, int],
+    reason: str,
+) -> dict[str, Any]:
+    """Keep the native-source input layout and make only the Conv output beta0 native."""
+
+    updated = dict(row)
+    updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["relayout"] = False
+    updated["relayout_reason"] = ""
+    updated["relayout_rotation_estimate"] = 0
+    updated["relayout_mask_mult_estimate"] = 0
+    updated["relayout_sparse_lt_estimate"] = 0
+    updated["relayout_depth_estimate"] = 0
+    updated["consumer_fused_relayout"] = False
+    updated["consumer_fused_rotation_estimate"] = 0
+    updated["layout_mode"] = "native_halo_stripe"
+    updated["provider_lt_grouping_mode"] = "individual"
+    updated["native_halo_channel_fold_mode"] = "per_stripe"
+    updated["native_halo_input_storage_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["native_halo_output_storage_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["boot_refined_halo0_channel_aligned_stripe"] = True
+    updated["boot_refined_halo0_native_output_only"] = True
+    updated["boot_refinement_reason"] = str(reason)
+    updated["boot_refinement_original_output_storage_layout"] = str(
+        row.get("native_halo_output_storage_layout", "")
+    )
+    rotations = int(native_stats.get("rotations", 0) or 0)
+    updated["planner_rotation_cost_estimate"] = int(rotations)
+    updated["lt_bsgs_rotation_estimate"] = int(rotations)
+    updated["lt_baby_rotation_estimate"] = int(native_stats.get("baby_rotations", rotations) or rotations)
+    updated["lt_giant_rotation_estimate"] = int(native_stats.get("giant_rotations", 0) or 0)
+    updated["lt_transform_count_estimate"] = int(native_stats.get("transform_count", 0) or 0)
+    updated["native_c_only_rotation_estimate"] = int(rotations)
+    updated["native_cb_shared_rotation_estimate"] = int(native_stats.get("cb_shared_rotations", rotations) or rotations)
+    updated["native_plan_c_only_rotation_estimate"] = int(rotations)
+    updated["native_plan_cb_shared_rotation_estimate"] = int(native_stats.get("cb_shared_rotations", rotations) or rotations)
+    updated["native_shared_baby_rotation_estimate"] = int(native_stats.get("baby_rotations", rotations) or rotations)
+    updated["native_shared_giant_rotation_estimate"] = int(native_stats.get("giant_rotations", 0) or 0)
+    updated["native_input_ct_count_estimate"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_input_ct_count"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_output_ct_count_estimate"] = int(native_stats.get("output_ct_count", 0) or 0)
+    updated["native_output_ct_count"] = int(native_stats.get("output_ct_count", 0) or 0)
+    updated["native_ct_count_estimate"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_ct_count"] = int(native_stats.get("input_ct_count", 0) or 0)
+    updated["native_submatrix_program_count_estimate"] = int(native_stats.get("transform_count", 0) or 0)
+    updated["native_stripe_count_estimate"] = int(native_stats.get("stripe_count", 0) or 0)
+    updated["native_halo_rotation_estimator"] = "native_halo_conv2d_plan_boot_boundary_output_only"
+    updated["native_halo_rotation_mode"] = "c_only"
+    updated["native_halo_rotation_exact_compact_output"] = False
+    updated["native_halo_rotation_search_surrogate"] = ""
+    return updated
+
+
+def _rewrite_node_as_halo0_boot_boundary_output(
+    row: dict[str, Any],
+    *,
+    compact_layout: dict[str, Any],
+    native_ct_count: int,
+    slots: int,
+    reason: str,
+) -> dict[str, Any]:
+    updated = dict(row)
+    updated["selected_layout"] = dict(compact_layout)
+    updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["output_relayout"] = False
+    updated["output_relayout_reason"] = ""
+    updated["producer_materialized_halo"] = False
+    updated["producer_materialized_halo_reason"] = ""
+    updated["layout_policy_output_materialization"] = NATIVE_OUTPUT_MATERIALIZATION
+    updated["native_halo_output_storage_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["boot_refined_halo0_channel_aligned_stripe"] = True
+    updated["boot_refinement_reason"] = str(reason)
+    if int(native_ct_count) > 0:
+        updated["native_physical_output_ct_count"] = int(native_ct_count)
+        updated["native_output_ct_count"] = int(native_ct_count)
+        updated["native_output_ct_count_estimate"] = int(native_ct_count)
+        updated["fhe_shape"] = [int(native_ct_count), max(1, int(slots))]
+    return updated
+
+
+def _rewrite_layout_preserving_edge_as_halo0_compact(
+    row: dict[str, Any],
+    *,
+    compact_layout: dict[str, Any],
+    native_ct_count: int = 0,
+    reason: str,
+) -> dict[str, Any]:
+    updated = dict(row)
+    updated["source_layout"] = dict(compact_layout)
+    updated["selected_layout"] = dict(compact_layout)
+    updated["target_layout"] = dict(compact_layout)
+    updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["relayout"] = False
+    updated["relayout_reason"] = ""
+    updated["relayout_rotation_estimate"] = 0
+    updated["relayout_mask_mult_estimate"] = 0
+    updated["relayout_sparse_lt_estimate"] = 0
+    updated["relayout_depth_estimate"] = 0
+    updated["consumer_fused_relayout"] = False
+    updated["consumer_fused_rotation_estimate"] = 0
+    updated["boot_refined_halo0_channel_aligned_stripe"] = True
+    updated["boot_refinement_reason"] = str(reason)
+    if int(native_ct_count) > 0:
+        updated["native_input_ct_count"] = int(native_ct_count)
+        updated["native_input_ct_count_estimate"] = int(native_ct_count)
+        updated["native_ct_count"] = int(native_ct_count)
+        updated["native_ct_count_estimate"] = int(native_ct_count)
+    return updated
+
+
 def _row_is_native_source_stripe_relayout(row: dict[str, Any]) -> bool:
     selected = dict(row.get("selected_layout", {}) or {})
     required = dict(row.get("required_layout", selected) or selected)
@@ -1018,6 +1528,70 @@ def _row_is_native_source_stripe_relayout(row: dict[str, Any]) -> bool:
     )
 
 
+def _row_is_already_native_source_boot_boundary(row: dict[str, Any]) -> bool:
+    selected = dict(row.get("selected_layout", {}) or {})
+    required = dict(row.get("required_layout", selected) or selected)
+    return bool(
+        str(row.get("op_kind", "")) == "conv2d"
+        and str(row.get("source", "")) != "x"
+        and str(row.get("layout_mode", "")) == "native_halo_stripe"
+        and str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and str(row.get("source_physical_layout", "") or "") == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and str(row.get("target_physical_layout", "") or "") == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and _layout_covers(selected, required)
+        and int(selected.get("gap", 1) or 1) == int(required.get("gap", selected.get("gap", 1)) or 1)
+        and str(row.get("provider_lt_grouping_mode", "")) == "individual"
+        and str(row.get("native_halo_channel_fold_mode", "")) == "per_stripe"
+    )
+
+
+def _bootstrap_boundary_halo0_candidate_edges(
+    network_dag: Any,
+    edge_rows_by_edge: dict[str, dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+) -> dict[str, list[tuple[str, str]]]:
+    """Map conv input edges that immediately produce a booted source."""
+
+    candidate_edges: dict[str, list[tuple[str, str]]] = {}
+    for boot_source, boot_target in sorted((str(source), str(target)) for source, target in boot_edges):
+        if not boot_source or boot_source not in getattr(network_dag, "nodes", {}):
+            continue
+        producer = str(boot_source)
+        if _layout_preserving_module(network_dag, producer):
+            predecessors = [str(value) for value in network_dag.predecessors(producer)]
+            if len(predecessors) != 1:
+                continue
+            upstream = str(predecessors[0])
+            if upstream not in getattr(network_dag, "nodes", {}):
+                continue
+            upstream_successors = [str(value) for value in network_dag.successors(upstream)]
+            if len(upstream_successors) != 1 or set(upstream_successors) != {producer}:
+                continue
+            boot_source_successors = [str(value) for value in network_dag.successors(producer)]
+            if any((producer, successor) not in boot_edges for successor in boot_source_successors):
+                continue
+            producer = upstream
+        producer_module = network_dag.nodes[producer].get("module") if producer in network_dag.nodes else None
+        if type(producer_module).__name__ != "Conv2d":
+            continue
+        producer_successors = [str(value) for value in network_dag.successors(producer)]
+        if boot_source == producer:
+            if any((producer, successor) not in boot_edges for successor in producer_successors):
+                continue
+        else:
+            if len(producer_successors) != 1 or set(producer_successors) != {boot_source}:
+                continue
+        predecessors = [str(value) for value in network_dag.predecessors(producer)]
+        if len(predecessors) != 1:
+            continue
+        edge_id = f"{predecessors[0]}->{producer}"
+        row = edge_rows_by_edge.get(edge_id)
+        if row is None or str(row.get("op_kind", "")) != "conv2d":
+            continue
+        candidate_edges.setdefault(edge_id, []).append((str(boot_source), str(boot_target)))
+    return candidate_edges
+
+
 def _rewrite_node_as_beta_lift_producer(
     row: dict[str, Any],
     *,
@@ -1033,9 +1607,45 @@ def _rewrite_node_as_beta_lift_producer(
     updated["producer_materialized_halo_reason"] = str(reason) if _layout_has_halo(layout) else ""
     updated["producer_fused_rotation_estimate"] = 0
     updated["producer_fused_depth_estimate"] = 0
+    for key in (
+        "native_physical_output_ct_count",
+        "native_output_ct_count",
+        "native_output_ct_count_estimate",
+    ):
+        updated.pop(key, None)
+    if str(updated.get("layout_policy_output_materialization", "")) == NATIVE_OUTPUT_MATERIALIZATION:
+        updated.pop("layout_policy_output_materialization", None)
     shape = _fhe_shape_for_layout(updated, layout)
     if shape is not None:
         updated["fhe_shape"] = [int(value) for value in shape]
+    return updated
+
+
+def _rewrite_node_as_native_output_producer(
+    row: dict[str, Any],
+    *,
+    layout: dict[str, Any],
+    native_ct_count: int,
+    slots: int,
+    reason: str,
+) -> dict[str, Any]:
+    updated = dict(row)
+    updated["selected_layout"] = dict(layout)
+    updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+    updated["output_relayout"] = False
+    updated["output_relayout_reason"] = ""
+    updated["producer_materialized_halo"] = bool(_layout_has_halo(layout))
+    updated["producer_materialized_halo_reason"] = str(reason) if _layout_has_halo(layout) else ""
+    updated["producer_fused_rotation_estimate"] = 0
+    updated["producer_fused_depth_estimate"] = 0
+    updated["layout_policy_output_materialization"] = NATIVE_OUTPUT_MATERIALIZATION
+    if int(native_ct_count) > 0:
+        updated["native_physical_output_ct_count"] = int(native_ct_count)
+        updated["fhe_shape"] = [int(native_ct_count), max(1, int(slots))]
+    else:
+        shape = _fhe_shape_for_layout(updated, layout)
+        if shape is not None:
+            updated["fhe_shape"] = [int(value) for value in shape]
     return updated
 
 
@@ -1318,10 +1928,23 @@ def _try_apply_beta_lift_candidate(
                 continue
         if not _layout_has_halo(current_source_layout):
             continue
+        allow_protected_compact_rewrite = bool(pool_direct_single_native or producer_transitive_conv_conv)
+        if bool(producer_transitive_conv_conv):
+            indexed_lifted_edges: list[tuple[int, tuple[str, str]]] = []
+            for lifted_edge in lifted_edges:
+                try:
+                    lifted_index = path_edges.index(tuple(lifted_edge))
+                except ValueError:
+                    continue
+                indexed_lifted_edges.append((int(lifted_index), tuple(lifted_edge)))
+            indexed_lifted_edges.sort(key=lambda item: int(item[0]))
+            if len(indexed_lifted_edges) < 2:
+                continue
         updated_edge_rows = []
         live_layout = dict(current_source_layout)
         accepted_edges: list[dict[str, Any]] = []
         carried_edges: list[dict[str, Any]] = []
+        rewrite_failed = False
         path_edge_set = set(path_edges[start_index:])
         edge_index_by_pair = {pair: index for index, pair in enumerate(path_edges)}
         for row in compile_plan.get("edge_layouts", []):
@@ -1339,8 +1962,26 @@ def _try_apply_beta_lift_candidate(
                         dict(row),
                         source_layout=input_layout,
                         target_layout=input_layout,
-                        reason="boot_interval_beta_lift",
+                        reason=(
+                            "boot_interval_transitive_beta_lift"
+                            if bool(producer_transitive_conv_conv)
+                            else "boot_interval_beta_lift"
+                        ),
+                        allow_protected_native_source=bool(allow_protected_compact_rewrite),
+                    ) if not bool(allow_protected_compact_rewrite) else _rewrite_row_as_native_source(
+                        dict(row),
+                        source_layout=input_layout,
+                        target_layout=input_layout,
+                        native_ct_count=_native_input_ct_count_from_edge(dict(row)),
+                        reason=(
+                            "boot_interval_transitive_beta_lift"
+                            if bool(producer_transitive_conv_conv)
+                            else "boot_interval_beta_lift"
+                        ),
                     )
+                    if updated is None:
+                        rewrite_failed = True
+                        break
                     accepted_edges.append(
                         {
                             "edge": str(edge_id),
@@ -1360,8 +2001,26 @@ def _try_apply_beta_lift_candidate(
                         dict(row),
                         source_layout=input_layout,
                         target_layout=input_layout,
-                        reason="boot_interval_activation_transparent_beta_lift",
+                        reason=(
+                            "boot_interval_transitive_activation_carry"
+                            if bool(producer_transitive_conv_conv)
+                            else "boot_interval_activation_transparent_beta_lift"
+                        ),
+                        allow_protected_native_source=bool(allow_protected_compact_rewrite),
+                    ) if not bool(allow_protected_compact_rewrite) else _rewrite_row_as_native_source(
+                        dict(row),
+                        source_layout=input_layout,
+                        target_layout=input_layout,
+                        native_ct_count=_native_input_ct_count_from_edge(dict(row)),
+                        reason=(
+                            "boot_interval_transitive_activation_carry"
+                            if bool(producer_transitive_conv_conv)
+                            else "boot_interval_activation_transparent_beta_lift"
+                        ),
                     )
+                    if updated is None:
+                        rewrite_failed = True
+                        break
                     carried_edges.append(
                         {
                             "edge": str(edge_id),
@@ -1385,6 +2044,29 @@ def _try_apply_beta_lift_candidate(
                     )
             else:
                 updated_edge_rows.append(dict(row))
+        if rewrite_failed:
+            continue
+        candidate_kind = (
+            "activation_transparent_beta_lift"
+            if bool(activation_transparent_single_native)
+            else "pool_direct_beta_lift"
+            if bool(pool_direct_single_native)
+            else "mvm_transitive_beta_lift"
+            if bool(producer_transitive_conv_conv)
+            else "producer_beta_lift"
+        )
+        protected_native_lift = bool(pool_direct_single_native or producer_transitive_conv_conv)
+        native_count_by_source: dict[str, int] = {}
+        if bool(protected_native_lift):
+            for updated_edge in updated_edge_rows:
+                if str(updated_edge.get("physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
+                    continue
+                count = _native_input_ct_count_from_edge(dict(updated_edge))
+                if int(count) <= 0:
+                    continue
+                source_node = str(updated_edge.get("source", ""))
+                if source_node:
+                    native_count_by_source[str(source_node)] = int(count)
         live_layout = dict(current_source_layout)
         node_output_updates: dict[str, dict[str, Any]] = {str(producer): dict(current_source_layout)}
         for edge_index, (_edge_source, edge_target) in enumerate(path_edges[start_index:]):
@@ -1415,11 +2097,24 @@ def _try_apply_beta_lift_candidate(
                 old_row=dict(row),
                 new_layout=dict(layout),
             )
-            updated_node = _rewrite_node_as_beta_lift_producer(
-                dict(row),
-                layout=layout,
-                reason="boot_interval_beta_lift",
-            )
+            if bool(protected_native_lift) and int(native_count_by_source.get(str(node), 0) or 0) > 0:
+                updated_node = _rewrite_node_as_native_output_producer(
+                    dict(row),
+                    layout=layout,
+                    native_ct_count=int(native_count_by_source[str(node)]),
+                    slots=int(plan_slots),
+                    reason=str(candidate_kind),
+                )
+            else:
+                updated_node = _rewrite_node_as_beta_lift_producer(
+                    dict(row),
+                    layout=layout,
+                    reason=(
+                        "boot_interval_transitive_beta_lift"
+                        if bool(producer_transitive_conv_conv)
+                        else "boot_interval_beta_lift"
+                    ),
+                )
             if int(producer_growth_delta) > 0:
                 updated_node["producer_fused_rotation_estimate"] = int(
                     int(row.get("producer_fused_rotation_estimate", 0) or 0)
@@ -1429,20 +2124,21 @@ def _try_apply_beta_lift_candidate(
         if len(accepted_edges) < 2 and not activation_transparent_single_native:
             if not pool_direct_single_native:
                 continue
-        candidate_kind = (
-            "activation_transparent_beta_lift"
-            if bool(activation_transparent_single_native)
-            else "pool_direct_beta_lift"
-            if bool(pool_direct_single_native)
-            else "mvm_transitive_beta_lift"
-            if bool(producer_transitive_conv_conv)
-            else "producer_beta_lift"
-        )
+        native_output_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+        if bool(protected_native_lift):
+            for node, count in native_count_by_source.items():
+                if str(node) in node_output_updates and int(count) > 0:
+                    native_output_counts[str(node)] = int(count)
+        if bool(producer_transitive_conv_conv):
+            for node in node_output_updates:
+                if str(node) != str(producer):
+                    native_output_counts.pop(str(node), None)
         updated_plan = _refresh_layout_policy_plan_summary(
             {
                 **dict(compile_plan),
                 "edge_layouts": updated_edge_rows,
                 "node_layouts": updated_node_rows,
+                "_native_physical_output_ct_counts": native_output_counts,
             }
         )
         summary = dict(updated_plan.get("summary", {}) or {})
@@ -1595,6 +2291,453 @@ def _native_physical_relayout_refinement_candidate(
     }
 
 
+def _halo0_channel_aligned_stripe_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    if not _bootstrap_halo0_channel_aligned_stripe_enabled():
+        return []
+
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in compile_plan.get("edge_layouts", [])}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    boot_boundary_candidate_edges = _bootstrap_boundary_halo0_candidate_edges(
+        network_dag,
+        edge_rows_by_edge,
+        boot_edges,
+    )
+    updated_by_edge: dict[str, dict[str, Any]] = {}
+    updated_by_node: dict[str, dict[str, Any]] = {}
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for row in compile_plan.get("edge_layouts", []):
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        native_relayout_candidate = bool(_row_is_native_source_stripe_relayout(current))
+        already_native_candidate = bool(_row_is_already_native_source_boot_boundary(current))
+        if edge_id not in actual_native_physical_edges and not already_native_candidate:
+            continue
+        if not bool(native_relayout_candidate or already_native_candidate):
+            continue
+        boundary_boot_edges = list(boot_boundary_candidate_edges.get(edge_id, []) or [])
+        if not boundary_boot_edges:
+            rejected.append(
+                {
+                    "edge": edge_id,
+                    "source": source,
+                    "target": target,
+                    "reason": "not_immediate_boot_boundary_last_hop",
+                }
+            )
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if str(source) == "x" or _row_is_concat_like_source(current, network_dag):
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "unsupported_source"})
+            continue
+        source_physical = str(current.get("source_physical_layout", "") or "")
+        if not bool(already_native_candidate) and source_physical not in {PHYSICAL_COMPACT, PHYSICAL_LOGICAL_HALO}:
+            rejected.append(
+                {
+                    "edge": edge_id,
+                    "source": source,
+                    "target": target,
+                    "reason": "source_not_compact_physical",
+                    "source_physical_layout": source_physical,
+                }
+            )
+            continue
+        source_layout = dict(current.get("source_layout", {}) or {})
+        if not bool(already_native_candidate) and (
+            _layout_physical_top_beta(source_layout) != 0 or _layout_physical_bottom_beta(source_layout) != 0
+        ):
+            rejected.append(
+                {
+                    "edge": edge_id,
+                    "source": source,
+                    "target": target,
+                    "reason": "source_materializes_physical_halo",
+                    "source_layout": dict(source_layout),
+                }
+            )
+            continue
+        selected = dict(current.get("selected_layout", {}) or {})
+        required = dict(current.get("required_layout", selected) or selected)
+        if int(selected.get("stride", 1) or 1) != int(required.get("stride", selected.get("stride", 1)) or 1):
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "stride_mismatch"})
+            continue
+        compact_layout = _layout_for_row_shape(
+            current,
+            top_beta=0,
+            bottom_beta=0,
+            stride=max(1, int(selected.get("stride", 1) or 1)),
+        )
+        if int(compact_layout.get("gap", 1) or 1) != int(required.get("gap", compact_layout.get("gap", 1)) or 1):
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "gap_mismatch"})
+            continue
+        source_row = node_rows_by_node.get(source)
+        source_module = network_dag.nodes[source].get("module") if source in network_dag.nodes else None
+        source_shape = _shape_tuple(source_row.get("shape", ())) if source_row else None
+        edge_source_shape = _shape_tuple(current.get("shape", ()))
+        if source_row is None or source_shape != edge_source_shape:
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "source_node_shape_mismatch"})
+            continue
+        source_successors = [str(value) for value in network_dag.successors(source)]
+        if len(source_successors) != 1 or set(source_successors) != {target}:
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "source_external_fanout"})
+            continue
+        native_stats = _conv2d_module_halo0_channel_aligned_native_stats(
+            network_dag,
+            compile_plan,
+            current,
+            compact_layout=dict(compact_layout),
+            input_layout=dict(selected) if bool(already_native_candidate) else None,
+            node_rows_by_node=node_rows_by_node,
+        )
+        if native_stats is None:
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "native_plan_unavailable"})
+            continue
+        native_output_ct_count = int(native_stats.get("output_ct_count", 0) or 0)
+        if int(native_output_ct_count) <= 0:
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "native_output_count_unavailable"})
+            continue
+        native_input_ct_count = int(native_stats.get("input_ct_count", 0) or 0)
+        if int(native_input_ct_count) <= 0:
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "native_input_count_unavailable"})
+            continue
+        source_compact_layout = _compact_layout_for_row(source_row)
+        source_promoted_nodes: list[dict[str, Any]] = []
+        source_promoted_edges: list[dict[str, Any]] = []
+        if bool(already_native_candidate):
+            pass
+        elif _layout_preserving_module(network_dag, source):
+            predecessors = [str(value) for value in network_dag.predecessors(source)]
+            if len(predecessors) != 1:
+                rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "layout_preserving_source_predecessor_count"})
+                continue
+            upstream = str(predecessors[0])
+            upstream_row = node_rows_by_node.get(upstream)
+            upstream_module = network_dag.nodes[upstream].get("module") if upstream in network_dag.nodes else None
+            upstream_edge_id = f"{upstream}->{source}"
+            upstream_edge_row = edge_rows_by_edge.get(upstream_edge_id)
+            upstream_successors = [str(value) for value in network_dag.successors(upstream)]
+            upstream_shape = _shape_tuple(upstream_row.get("shape", ())) if upstream_row else None
+            upstream_compact_layout = _compact_layout_for_row(upstream_row) if upstream_row else {}
+            if (
+                upstream_row is None
+                or upstream_edge_row is None
+                or not _producer_beta_lift_allowed(upstream_module)
+                or len(upstream_successors) != 1
+                or set(upstream_successors) != {source}
+                or upstream_shape != source_shape
+                or _layout_storage_key(upstream_compact_layout) != _layout_storage_key(source_compact_layout)
+            ):
+                rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "unsafe_layout_preserving_source_promotion"})
+                continue
+            updated_by_node[upstream] = _rewrite_node_as_halo0_boot_boundary_output(
+                upstream_row,
+                compact_layout=dict(upstream_compact_layout),
+                native_ct_count=int(native_input_ct_count),
+                slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
+                reason="boot_boundary_halo0_channel_aligned_source",
+            )
+            updated_by_edge[upstream_edge_id] = _rewrite_layout_preserving_edge_as_halo0_compact(
+                upstream_edge_row,
+                compact_layout=dict(source_compact_layout),
+                native_ct_count=int(native_input_ct_count),
+                reason="boot_boundary_halo0_channel_aligned_source_carry",
+            )
+            source_promoted_nodes.append(
+                {
+                    "node": upstream,
+                    "old_physical_layout": str(upstream_row.get("physical_layout", "")),
+                    "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                    "native_ct_count": int(native_input_ct_count),
+                }
+            )
+            source_promoted_edges.append(
+                {
+                    "edge": upstream_edge_id,
+                    "old_physical_layout": str(upstream_edge_row.get("physical_layout", "")),
+                    "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                }
+            )
+        elif not _producer_beta_lift_allowed(source_module):
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "unsupported_source_producer"})
+            continue
+        if not bool(already_native_candidate):
+            updated_by_node[source] = _rewrite_node_as_halo0_boot_boundary_output(
+                source_row,
+                compact_layout=dict(source_compact_layout),
+                native_ct_count=int(native_input_ct_count),
+                slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
+                reason="boot_boundary_halo0_channel_aligned_source",
+            )
+            source_promoted_nodes.append(
+                {
+                    "node": source,
+                    "old_physical_layout": str(source_row.get("physical_layout", "")),
+                    "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                    "native_ct_count": int(native_input_ct_count),
+                }
+            )
+        rewritten = (
+            _rewrite_row_as_halo0_channel_aligned_native_output(
+                current,
+                native_stats=dict(native_stats),
+                reason="boot_boundary_halo0_channel_aligned_output",
+            )
+            if bool(already_native_candidate)
+            else _rewrite_row_as_halo0_channel_aligned_native_stripe(
+                current,
+                compact_layout=dict(compact_layout),
+                native_stats=dict(native_stats),
+                reason="boot_boundary_halo0_channel_aligned_stripe",
+            )
+        )
+        updated_by_edge[edge_id] = dict(rewritten)
+        target_output_row = node_rows_by_node.get(target)
+        target_output_compact_layout: dict[str, Any] | None = None
+        if target_output_row:
+            target_output_compact_layout = _compact_layout_for_row(target_output_row)
+            updated_by_node[target] = _rewrite_node_as_halo0_boot_boundary_output(
+                target_output_row,
+                compact_layout=dict(target_output_compact_layout),
+                native_ct_count=int(native_output_ct_count),
+                slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
+                reason="boot_boundary_halo0_channel_aligned_stripe",
+            )
+        boot_source_nodes: list[dict[str, Any]] = []
+        passthrough_edges: list[dict[str, Any]] = []
+        carry_rewrite_failed = False
+        target_shape = _shape_tuple(target_output_row.get("shape", ())) if target_output_row else None
+        for edge_source, _edge_target in boundary_boot_edges:
+            boot_source = str(edge_source)
+            boot_source_row = node_rows_by_node.get(boot_source)
+            if boot_source_row:
+                boot_source_compact_layout = _compact_layout_for_row(boot_source_row)
+                if boot_source != target:
+                    passthrough_edge_id = f"{target}->{boot_source}"
+                    passthrough_row = edge_rows_by_edge.get(passthrough_edge_id)
+                    boot_source_shape = _shape_tuple(boot_source_row.get("shape", ()))
+                    if (
+                        target_output_compact_layout is None
+                        or passthrough_row is None
+                        or not _layout_preserving_module(network_dag, boot_source)
+                        or target_shape != boot_source_shape
+                        or _layout_storage_key(target_output_compact_layout)
+                        != _layout_storage_key(boot_source_compact_layout)
+                        or int(native_output_ct_count) <= 0
+                    ):
+                        rejected.append(
+                            {
+                                "edge": edge_id,
+                                "source": source,
+                                "target": target,
+                                "boot_source": boot_source,
+                                "reason": "unsafe_layout_preserving_boot_source_carry",
+                            }
+                        )
+                        carry_rewrite_failed = True
+                        break
+                updated_by_node[boot_source] = _rewrite_node_as_halo0_boot_boundary_output(
+                    boot_source_row,
+                    compact_layout=dict(boot_source_compact_layout),
+                    native_ct_count=int(native_output_ct_count),
+                    slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
+                    reason="boot_boundary_halo0_channel_aligned_stripe",
+                )
+                boot_source_nodes.append(
+                    {
+                        "node": boot_source,
+                        "old_physical_layout": str(boot_source_row.get("physical_layout", "")),
+                        "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                        "old_layout": dict(boot_source_row.get("selected_layout", {}) or {}),
+                        "new_layout": dict(boot_source_compact_layout),
+                    }
+                )
+            passthrough_edge_id = f"{target}->{boot_source}"
+            passthrough_row = edge_rows_by_edge.get(passthrough_edge_id)
+            if passthrough_row is not None and target_output_compact_layout is not None:
+                updated_by_edge[passthrough_edge_id] = _rewrite_layout_preserving_edge_as_halo0_compact(
+                    passthrough_row,
+                    compact_layout=dict(target_output_compact_layout),
+                    reason="boot_boundary_halo0_channel_aligned_stripe",
+                )
+                passthrough_edges.append(
+                    {
+                        "edge": passthrough_edge_id,
+                        "old_physical_layout": str(passthrough_row.get("physical_layout", "")),
+                        "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                    }
+                )
+        if carry_rewrite_failed:
+            continue
+        boot_source, boot_target = boundary_boot_edges[0]
+        accepted.append(
+            {
+                "kind": (
+                    "halo0_channel_aligned_native_output"
+                    if bool(already_native_candidate)
+                    else "halo0_channel_aligned_stripe"
+                ),
+                "edge": edge_id,
+                "source": source,
+                "target": target,
+                "boot_edge": {"source": str(boot_source), "target": str(boot_target)},
+                "boot_edges": [
+                    {"source": str(edge_source), "target": str(edge_target)}
+                    for edge_source, edge_target in boundary_boot_edges
+                ],
+                "old_physical_layout": str(current.get("physical_layout", "")),
+                "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "old_source_physical_layout": str(current.get("source_physical_layout", "")),
+                "new_source_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "old_relayout_depth": int(current.get("relayout_depth_estimate", 0) or 0),
+                "new_relayout_depth": 0,
+                "old_rotation": int(current.get("planner_rotation_cost_estimate", 0) or 0),
+                "new_rotation": int(rewritten.get("planner_rotation_cost_estimate", 0) or 0),
+                "source_layout": dict(source_layout),
+                "selected_layout": dict(selected if bool(already_native_candidate) else compact_layout),
+                "output_layout": dict(target_output_compact_layout or compact_layout),
+                "input_layout_preserved": bool(already_native_candidate),
+                "source_promoted_nodes": source_promoted_nodes,
+                "source_promoted_edges": source_promoted_edges,
+                "updated_boot_source_nodes": boot_source_nodes,
+                "updated_passthrough_edges": passthrough_edges,
+            }
+        )
+
+    if not accepted:
+        return []
+
+    updated_edge_rows = [
+        dict(updated_by_edge.get(str(row.get("edge", "")), dict(row)))
+        for row in compile_plan.get("edge_layouts", [])
+    ]
+    updated_node_rows = [
+        dict(updated_by_node.get(str(row.get("node", "")), dict(row)))
+        for row in compile_plan.get("node_layouts", [])
+    ]
+    updated_plan = _refresh_layout_policy_plan_summary(
+        {
+            **dict(compile_plan),
+            "edge_layouts": updated_edge_rows,
+            "node_layouts": updated_node_rows,
+        }
+    )
+    summary = dict(updated_plan.get("summary", {}) or {})
+    summary["boot_refined_halo0_channel_aligned_stripe_count"] = int(len(accepted))
+    updated_plan["summary"] = summary
+    updated_plan["bootstrap_aware_layout_refinement"] = {
+        "enabled": True,
+        "accepted": accepted,
+        "rejected": rejected,
+    }
+    return [
+        {
+            "kind": "halo0_channel_aligned_stripe",
+            "strategy": "halo0_channel_aligned_stripe",
+            "plan": updated_plan,
+            "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
+            "accepted": accepted,
+            "rejected": rejected,
+            "accepted_count": int(len(accepted)),
+            "candidate_priority": -3,
+            "allow_after_bootstrap_target": True,
+            "require_bootstrap_count_unchanged": True,
+            "require_bootstrap_shape_nonincrease": True,
+            "boot_interval_count": int(len(intervals)),
+            "boot_intervals": _boot_interval_audit_rows(intervals),
+        }
+    ]
+
+
+def enumerate_final_boot_boundary_halo0_cleanup_candidate(
+    network_dag: Any,
+    final_bootstrap_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the opt-in halo0 cleanup only from the current final boot edges.
+
+    Unlike the normal refinement candidates, this is intentionally not part of
+    the iterative search frontier.  Callers apply it after boot placement has
+    reached its normal fixed point, then re-solve and either keep the cleanup or
+    restore the previous compile plan.
+    """
+
+    if not _bootstrap_halo0_channel_aligned_stripe_enabled():
+        return {"enabled": False, "reason": "halo0_channel_aligned_stripe_disabled"}
+
+    compile_plan = _layout_policy_compile_plan_for_dag(network_dag)
+    if not isinstance(compile_plan, dict):
+        return {"enabled": False, "reason": "no_layout_policy_executors"}
+    if str(compile_plan.get("policy", "")) not in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES:
+        return {
+            "enabled": False,
+            "policy": str(compile_plan.get("policy", "")),
+            "reason": "policy_not_bootstrap_aware_refinement",
+        }
+
+    boot_edges = _bootstrap_edge_set(final_bootstrap_audit)
+    if not boot_edges:
+        return {
+            "enabled": False,
+            "policy": str(compile_plan.get("policy", "")),
+            "reason": "no_final_boot_edges",
+        }
+
+    intervals = _bootstrap_upstream_intervals(network_dag, final_bootstrap_audit)
+    previous_depths = _snapshot_layout_policy_depths(network_dag)
+    actual_native_physical_edges = _actual_native_edge_ids(network_dag)
+    candidates = _halo0_channel_aligned_stripe_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    )
+    if not candidates:
+        return {
+            "enabled": False,
+            "policy": str(compile_plan.get("policy", "")),
+            "reason": "no_final_boot_boundary_halo0_cleanup_candidates",
+            "native_physical_relayout_edge_count": int(len(actual_native_physical_edges)),
+            "final_boot_edge_count": int(len(boot_edges)),
+            "boot_interval_count": int(len(intervals)),
+            "boot_intervals": _boot_interval_audit_rows(intervals),
+            "previous_compile_plan": compile_plan,
+            "previous_depths": previous_depths,
+        }
+
+    candidate = dict(candidates[0])
+    accepted = [dict(row) for row in candidate.get("accepted", [])]
+    return {
+        **candidate,
+        "enabled": True,
+        "candidate_id": "bootstrap_final_halo0_boundary_cleanup",
+        "kind": "final_boot_boundary_halo0_cleanup",
+        "strategy": "final_boot_boundary_halo0_cleanup",
+        "accepted": accepted,
+        "accepted_count": int(candidate.get("accepted_count", len(accepted)) or len(accepted)),
+        "candidate_priority": int(candidate.get("candidate_priority", -3) or -3),
+        "allow_after_bootstrap_target": True,
+        "require_bootstrap_count_unchanged": True,
+        "require_bootstrap_shape_nonincrease": True,
+        "policy": str(compile_plan.get("policy", "")),
+        "current_bootstrap_count": int(final_bootstrap_audit.get("bootstrap_count", 0) or 0),
+        "native_physical_relayout_edge_count": int(len(actual_native_physical_edges)),
+        "final_boot_edge_count": int(len(boot_edges)),
+        "previous_compile_plan": compile_plan,
+        "previous_depths": previous_depths,
+    }
+
+
 def _concat_output_beta_lift_refinement_candidates(
     network_dag: Any,
     compile_plan: dict[str, Any],
@@ -1660,6 +2803,7 @@ def _concat_output_beta_lift_refinement_candidates(
         if node_row is None:
             continue
         updated_edge_rows: list[dict[str, Any]] = []
+        rewrite_failed = False
         for candidate_row in compile_plan.get("edge_layouts", []):
             if str(candidate_row.get("edge", "")) != edge_id:
                 updated_edge_rows.append(dict(candidate_row))
@@ -1669,11 +2813,17 @@ def _concat_output_beta_lift_refinement_candidates(
                 source_layout=selected,
                 target_layout=selected,
                 reason="boot_interval_concat_output_beta_lift",
+                allow_protected_native_source=True,
             )
+            if updated is None:
+                rewrite_failed = True
+                break
             updated["layout_mode"] = "concat_output_compact_halo_shared"
             updated["concat_output_beta_lift"] = True
             updated["concat_output_beta_lift_source"] = str(source)
             updated_edge_rows.append(updated)
+        if rewrite_failed:
+            continue
         updated_node_rows: list[dict[str, Any]] = []
         for candidate_node in compile_plan.get("node_layouts", []):
             if str(candidate_node.get("node", "")) != source:
@@ -1917,6 +3067,7 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
         updated_edge_rows: list[dict[str, Any]] = []
         accepted_edges: list[dict[str, Any]] = []
         carried_edges: list[dict[str, Any]] = []
+        rewrite_failed = False
         for candidate_row in compile_plan.get("edge_layouts", []):
             candidate_edge_id = str(candidate_row.get("edge", ""))
             if candidate_edge_id == edge_id:
@@ -1925,8 +3076,11 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                     source_layout=producer_layout,
                     target_layout=producer_layout,
                     reason="local_concat_transitive_beta_lift",
+                    allow_protected_native_source=True,
                 )
-                updated["layout_mode"] = "concat_output_transitive_compact_halo_shared"
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 updated["concat_output_beta_lift"] = True
                 updated["local_concat_transitive_beta_lift"] = True
                 updated["concat_output_beta_lift_source"] = str(source)
@@ -1936,7 +3090,8 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                         "source": str(source),
                         "target": str(target),
                         "old_physical_layout": str(current.get("physical_layout", "")),
-                        "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                        "new_physical_layout": str(updated.get("physical_layout", "")),
+                        "new_layout_mode": str(updated.get("layout_mode", "")),
                     }
                 )
                 updated_edge_rows.append(updated)
@@ -1945,8 +3100,12 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                     dict(candidate_row),
                     source_layout=final_selected,
                     target_layout=final_selected,
-                    reason="local_concat_transitive_beta_lift",
+                    reason="local_concat_transitive_activation_carry",
+                    allow_protected_native_source=True,
                 )
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 carried_edges.append(
                     {
                         "edge": str(candidate_edge_id),
@@ -1967,19 +3126,26 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                     source_layout=final_selected,
                     target_layout=final_selected,
                     reason="local_concat_transitive_beta_lift",
+                    allow_protected_native_source=True,
                 )
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 accepted_edges.append(
                     {
                         "edge": str(candidate_edge_id),
                         "source": str(candidate_row.get("source", "")),
                         "target": str(candidate_row.get("target", "")),
                         "old_physical_layout": str(candidate_row.get("physical_layout", "")),
-                        "new_physical_layout": PHYSICAL_LOGICAL_HALO,
+                        "new_physical_layout": str(updated.get("physical_layout", "")),
+                        "new_layout_mode": str(updated.get("layout_mode", "")),
                     }
                 )
                 updated_edge_rows.append(updated)
             else:
                 updated_edge_rows.append(dict(candidate_row))
+        if rewrite_failed:
+            continue
 
         lift_nodes = {str(source), str(target)}
         for carried_edge_id in carried_edge_ids:
@@ -2020,11 +3186,16 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
             else:
                 updated_node_rows.append(dict(candidate_node))
 
+        native_output_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+        for node in lift_nodes:
+            if str(node) != str(source):
+                native_output_counts.pop(str(node), None)
         updated_plan = _refresh_layout_policy_plan_summary(
             {
                 **dict(compile_plan),
                 "edge_layouts": updated_edge_rows,
                 "node_layouts": updated_node_rows,
+                "_native_physical_output_ct_counts": native_output_counts,
             }
         )
         summary = dict(updated_plan.get("summary", {}) or {})
@@ -2074,6 +3245,118 @@ def _single_predecessor(network_dag: Any, node: str) -> str | None:
     if len(predecessors) != 1:
         return None
     return str(predecessors[0])
+
+
+def _node_region_executor(network_dag: Any, node: str) -> tuple[Any | None, Any | None]:
+    module = network_dag.nodes[str(node)].get("module") if str(node) in network_dag.nodes else None
+    runtime = getattr(module, "region_runtime", None) if module is not None else None
+    executor = getattr(runtime, "executor", None) if runtime is not None else None
+    return module, executor
+
+
+def _restore_object_attrs(obj: Any, snapshot: dict[str, Any]) -> None:
+    if obj is None:
+        return
+    for name, value in snapshot.items():
+        if value is _MISSING:
+            try:
+                delattr(obj, name)
+            except AttributeError:
+                pass
+        else:
+            setattr(obj, name, value)
+
+
+def _producer_native_output_plan_ct_count(
+    network_dag: Any,
+    *,
+    producer: str,
+    layout: dict[str, Any],
+    native_ct_count: int,
+    slots: int,
+    allow_output_ct_superset: bool = False,
+) -> int:
+    module, executor = _node_region_executor(network_dag, str(producer))
+    if module is None or executor is None:
+        return 0
+    base_executor = getattr(executor, "base_executor", executor)
+    if not bool(
+        getattr(base_executor, "native_halo_output_capable", False)
+        or getattr(executor, "native_halo_output_capable", False)
+    ):
+        return 0
+    refresh = getattr(base_executor, "_refresh_runtime_plan", None)
+    if not callable(refresh):
+        return 0
+
+    gap = max(1, int(dict(layout).get("gap", 1) or 1))
+    output_attrs = {
+        "layout_policy_output_layout": dict(layout),
+        "layout_policy_output_row_offset": int(_layout_physical_top_beta(layout) * gap),
+        "layout_policy_output_materialization": NATIVE_OUTPUT_MATERIALIZATION,
+        "fhe_output_shape": torch.Size([int(native_ct_count), max(1, int(slots))]),
+    }
+    module_snapshot = {name: getattr(module, name, _MISSING) for name in output_attrs}
+    executor_snapshot = {
+        name: getattr(base_executor, name, _MISSING)
+        for name in (
+            "native_plan",
+            "_native_plan_require_target_fit",
+            "rows",
+            "cols",
+            "slots",
+            "output_shape",
+            "fhe_output_shape",
+        )
+    }
+    try:
+        for name, value in output_attrs.items():
+            setattr(module, name, value)
+        refresh()
+        tight_output = getattr(base_executor, "_uses_tight_compact_output", None)
+        if not callable(tight_output):
+            return 0
+        if bool(tight_output()):
+            return 0
+        plan = getattr(base_executor, "native_plan", None)
+        output_count = _positive_int(getattr(plan, "output_ct_count", 0), 0)
+        if int(output_count) <= 0:
+            return 0
+        if bool(allow_output_ct_superset):
+            if int(output_count) < int(native_ct_count):
+                return 0
+        elif int(output_count) != int(native_ct_count):
+            return 0
+        return int(output_count) if int(native_ct_count) > 0 else 0
+    except Exception:
+        return 0
+    finally:
+        _restore_object_attrs(module, module_snapshot)
+        _restore_object_attrs(base_executor, executor_snapshot)
+
+
+def _producer_native_output_plan_fits(
+    network_dag: Any,
+    *,
+    producer: str,
+    layout: dict[str, Any],
+    native_ct_count: int,
+    slots: int,
+    allow_output_ct_superset: bool = False,
+) -> bool:
+    return (
+        int(
+            _producer_native_output_plan_ct_count(
+                network_dag,
+                producer=str(producer),
+                layout=dict(layout),
+                native_ct_count=int(native_ct_count),
+                slots=int(slots),
+                allow_output_ct_superset=bool(allow_output_ct_superset),
+            )
+        )
+        > 0
+    )
 
 
 def _native_conv_row_beta_lift_supported(row: dict[str, Any]) -> bool:
@@ -2172,6 +3455,7 @@ def _boot_boundary_beta_lift_refinement_candidates(
             continue
 
         updated_edge_rows: list[dict[str, Any]] = []
+        rewrite_failed = False
         for candidate_row in compile_plan.get("edge_layouts", []):
             candidate_edge_id = str(candidate_row.get("edge", ""))
             if candidate_edge_id == edge_id:
@@ -2181,6 +3465,9 @@ def _boot_boundary_beta_lift_refinement_candidates(
                     target_layout=selected,
                     reason=producer_reason,
                 )
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 updated["boot_boundary_beta_lift"] = True
                 updated["boot_boundary_beta_lift_source"] = str(producer)
                 updated_edge_rows.append(updated)
@@ -2191,6 +3478,9 @@ def _boot_boundary_beta_lift_refinement_candidates(
                     target_layout=selected,
                     reason="boot_boundary_activation_beta_lift",
                 )
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 carried_edges.append(
                     {
                         "edge": str(candidate_edge_id),
@@ -2203,6 +3493,8 @@ def _boot_boundary_beta_lift_refinement_candidates(
                 updated_edge_rows.append(updated)
             else:
                 updated_edge_rows.append(dict(candidate_row))
+        if rewrite_failed:
+            continue
 
         updated_node_rows: list[dict[str, Any]] = []
         lift_nodes = {str(producer)}
@@ -2341,6 +3633,7 @@ def _local_activation_beta_lift_refinement_candidates(
 
         updated_edge_rows: list[dict[str, Any]] = []
         carried_edges: list[dict[str, Any]] = []
+        rewrite_failed = False
         for candidate_row in compile_plan.get("edge_layouts", []):
             candidate_edge_id = str(candidate_row.get("edge", ""))
             if candidate_edge_id == edge_id:
@@ -2350,6 +3643,9 @@ def _local_activation_beta_lift_refinement_candidates(
                     target_layout=selected,
                     reason="local_activation_beta_lift",
                 )
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 updated["local_activation_beta_lift"] = True
                 updated["local_activation_beta_lift_source"] = str(producer)
                 updated_edge_rows.append(updated)
@@ -2360,6 +3656,9 @@ def _local_activation_beta_lift_refinement_candidates(
                     target_layout=selected,
                     reason="local_activation_beta_lift",
                 )
+                if updated is None:
+                    rewrite_failed = True
+                    break
                 carried_edges.append(
                     {
                         "edge": str(candidate_edge_id),
@@ -2372,6 +3671,8 @@ def _local_activation_beta_lift_refinement_candidates(
                 updated_edge_rows.append(updated)
             else:
                 updated_edge_rows.append(dict(candidate_row))
+        if rewrite_failed:
+            continue
 
         updated_node_rows: list[dict[str, Any]] = []
         lift_nodes = {str(producer), str(source)}
@@ -2453,6 +3754,502 @@ def _local_activation_beta_lift_refinement_candidates(
             }
         )
     return candidates
+
+
+def _local_native_output_beta_lift_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in compile_plan.get("edge_layouts", [])}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    candidates: list[dict[str, Any]] = []
+    slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
+
+    for row in compile_plan.get("edge_layouts", []):
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        if edge_id not in actual_native_physical_edges:
+            continue
+        if not _native_source_stripe_compact_rewrite_blocked(current):
+            continue
+        if not _native_conv_row_beta_lift_supported(current):
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[target].get("module")).__name__ != "Conv2d":
+            continue
+        if (source, target) in boot_edges:
+            continue
+        if _candidate_interval_matches(row=current, intervals=intervals, boot_edges=boot_edges):
+            continue
+        if _single_predecessor(network_dag, target) != source:
+            continue
+
+        selected = dict(current.get("selected_layout", {}) or {})
+        native_ct_count = _native_input_ct_count_from_edge(current)
+        if int(native_ct_count) <= 0:
+            continue
+
+        producer = source
+        carried_edge_ids: list[str] = []
+        carried_edges: list[dict[str, Any]] = []
+        kind = "local_direct_native_output_beta_lift"
+        source_module = network_dag.nodes[source].get("module")
+        if _layout_preserving_module(network_dag, source):
+            predecessor = _single_predecessor(network_dag, source)
+            if predecessor is None or predecessor not in network_dag.nodes:
+                continue
+            if type(network_dag.nodes[predecessor].get("module")).__name__ != "Conv2d":
+                continue
+            if not _single_successor(network_dag, predecessor, source):
+                continue
+            if not _single_successor(network_dag, source, target):
+                continue
+            activation_edge_id = f"{predecessor}->{source}"
+            activation_edge = edge_rows_by_edge.get(activation_edge_id)
+            if activation_edge is None:
+                continue
+            activation_required = dict(
+                activation_edge.get("required_layout", activation_edge.get("selected_layout", {}) or {}) or {}
+            )
+            if activation_required and not _layout_covers(selected, activation_required):
+                continue
+            if int(selected.get("gap", 1) or 1) != int(
+                activation_required.get("gap", selected.get("gap", 1)) or 1
+            ):
+                continue
+            if (predecessor, source) in boot_edges:
+                continue
+            producer = str(predecessor)
+            carried_edge_ids.append(str(activation_edge_id))
+            kind = "local_activation_native_output_beta_lift"
+        elif type(source_module).__name__ in {"AvgPool2d", "Conv2d", "ConvTranspose2d"}:
+            if not _single_successor(network_dag, source, target):
+                continue
+        else:
+            continue
+
+        producer_row = node_rows_by_node.get(producer)
+        source_node_row = node_rows_by_node.get(source)
+        if producer_row is None or source_node_row is None:
+            continue
+        current_shape = _shape_tuple(current.get("shape", ()))
+        for node_row in (producer_row, source_node_row):
+            node_shape = _shape_tuple(dict(node_row).get("shape", ()))
+            if current_shape is not None and node_shape is not None and tuple(node_shape) != tuple(current_shape):
+                producer_row = None
+                break
+        if producer_row is None:
+            continue
+        if not _producer_native_output_plan_fits(
+            network_dag,
+            producer=str(producer),
+            layout=selected,
+            native_ct_count=int(native_ct_count),
+            slots=int(slots),
+        ):
+            continue
+
+        updated_edge_rows: list[dict[str, Any]] = []
+        for candidate_row in compile_plan.get("edge_layouts", []):
+            candidate_edge_id = str(candidate_row.get("edge", ""))
+            if candidate_edge_id == edge_id:
+                updated = _rewrite_row_as_native_source(
+                    dict(candidate_row),
+                    source_layout=selected,
+                    target_layout=selected,
+                    native_ct_count=int(native_ct_count),
+                    reason=kind,
+                )
+                updated["local_native_output_beta_lift"] = True
+                updated["local_native_output_beta_lift_source"] = str(producer)
+                updated_edge_rows.append(updated)
+            elif candidate_edge_id in carried_edge_ids:
+                updated = _rewrite_row_as_native_source(
+                    dict(candidate_row),
+                    source_layout=selected,
+                    target_layout=selected,
+                    native_ct_count=int(native_ct_count),
+                    reason=kind,
+                )
+                carried_edges.append(
+                    {
+                        "edge": str(candidate_edge_id),
+                        "source": str(candidate_row.get("source", "")),
+                        "target": str(candidate_row.get("target", "")),
+                        "op_kind": str(candidate_row.get("op_kind", "")),
+                        "physical_layout": str(updated.get("physical_layout", "")),
+                    }
+                )
+                updated_edge_rows.append(updated)
+            else:
+                updated_edge_rows.append(dict(candidate_row))
+
+        lift_nodes = {str(producer), str(source)}
+        updated_node_rows: list[dict[str, Any]] = []
+        output_tile_delta = 0
+        for candidate_node in compile_plan.get("node_layouts", []):
+            node = str(candidate_node.get("node", ""))
+            if node not in lift_nodes:
+                updated_node_rows.append(dict(candidate_node))
+                continue
+            output_tile_delta += _layout_tile_count_delta(
+                dict(candidate_node.get("selected_layout", {}) or {}),
+                dict(selected),
+                slots=slots,
+            )
+            updated_node_rows.append(
+                _rewrite_node_as_native_output_producer(
+                    dict(candidate_node),
+                    layout=selected,
+                    native_ct_count=int(native_ct_count),
+                    slots=int(slots),
+                    reason=kind,
+                )
+            )
+
+        native_output_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+        for node in sorted(lift_nodes):
+            native_output_counts[str(node)] = int(native_ct_count)
+        updated_plan = _refresh_layout_policy_plan_summary(
+            {
+                **dict(compile_plan),
+                "edge_layouts": updated_edge_rows,
+                "node_layouts": updated_node_rows,
+                "_native_physical_output_ct_counts": native_output_counts,
+            }
+        )
+        summary = dict(updated_plan.get("summary", {}) or {})
+        summary["boot_refined_local_native_output_beta_lift_count"] = (
+            int(summary.get("boot_refined_local_native_output_beta_lift_count", 0) or 0) + 1
+        )
+        updated_plan["summary"] = summary
+        rotation_delta = _candidate_rotation_delta(compile_plan, updated_plan)
+        candidates.append(
+            {
+                "kind": str(kind),
+                "strategy": str(kind),
+                "plan": updated_plan,
+                "rotation_delta": int(rotation_delta),
+                "candidate_priority": 0,
+                "output_tile_delta": int(output_tile_delta),
+                "require_bootstrap_count_unchanged": True,
+                "require_bootstrap_shape_nonincrease": True,
+                "accepted": [
+                    {
+                        "kind": str(kind),
+                        "producer": str(producer),
+                        "producer_layout": dict(selected),
+                        "native_output_ct_count": int(native_ct_count),
+                        "output_tile_delta": int(output_tile_delta),
+                        "covered_edges": [
+                            {
+                                "edge": str(edge_id),
+                                "source": str(source),
+                                "target": str(target),
+                                "old_physical_layout": str(current.get("physical_layout", "")),
+                                "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                            }
+                        ],
+                        "carried_edges": carried_edges,
+                        "covered_edge_count": 1,
+                    }
+                ],
+                "rejected": [],
+            }
+        )
+    return candidates
+
+
+def _batched_activation_native_output_beta_lift_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+    *,
+    intervals: list[dict[str, Any]],
+    boot_edges: set[tuple[str, str]],
+    actual_native_physical_edges: set[str],
+) -> list[dict[str, Any]]:
+    edge_rows_by_edge = {str(row.get("edge", "")): dict(row) for row in compile_plan.get("edge_layouts", [])}
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
+
+    units: list[dict[str, Any]] = []
+    seen_edges: set[str] = set()
+    for row in compile_plan.get("edge_layouts", []):
+        current = dict(row)
+        edge_id = str(current.get("edge", ""))
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        if not edge_id or edge_id in seen_edges:
+            continue
+        if edge_id not in actual_native_physical_edges:
+            continue
+        if not _native_source_stripe_compact_rewrite_blocked(current):
+            continue
+        if not _native_conv_row_beta_lift_supported(current):
+            continue
+        if not source or not target or source not in network_dag.nodes or target not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[target].get("module")).__name__ != "Conv2d":
+            continue
+        if not _layout_preserving_module(network_dag, source):
+            continue
+        producer = _single_predecessor(network_dag, source)
+        if producer is None or producer not in network_dag.nodes:
+            continue
+        if type(network_dag.nodes[producer].get("module")).__name__ != "Conv2d":
+            continue
+        if _single_predecessor(network_dag, target) != source:
+            continue
+        if not _single_successor(network_dag, producer, source):
+            continue
+        if not _single_successor(network_dag, source, target):
+            continue
+
+        interval_matches = _candidate_interval_matches(
+            row=current,
+            intervals=intervals,
+            boot_edges=boot_edges,
+        )
+        if not interval_matches and (source, target) not in boot_edges and (producer, source) not in boot_edges:
+            continue
+
+        selected = dict(current.get("selected_layout", {}) or {})
+        target_native_ct_count = _native_input_ct_count_from_edge(current)
+        logical_ct_count = int(selected.get("tile_count", 0) or 0)
+        if int(target_native_ct_count) <= 0 or int(logical_ct_count) <= 0:
+            continue
+
+        activation_edge_id = f"{producer}->{source}"
+        activation_edge = edge_rows_by_edge.get(activation_edge_id)
+        producer_row = node_rows_by_node.get(str(producer))
+        source_node_row = node_rows_by_node.get(str(source))
+        if activation_edge is None or producer_row is None or source_node_row is None:
+            continue
+        activation_required = dict(
+            activation_edge.get("required_layout", activation_edge.get("selected_layout", {}) or {}) or {}
+        )
+        if activation_required and not _layout_covers(selected, activation_required):
+            continue
+        if int(selected.get("gap", 1) or 1) != int(
+            activation_required.get("gap", selected.get("gap", 1)) or 1
+        ):
+            continue
+
+        current_shape = _shape_tuple(current.get("shape", ()))
+        shape_mismatch = False
+        for node_row in (producer_row, source_node_row):
+            node_shape = _shape_tuple(dict(node_row).get("shape", ()))
+            if current_shape is not None and node_shape is not None and tuple(node_shape) != tuple(current_shape):
+                shape_mismatch = True
+                break
+        if bool(shape_mismatch):
+            continue
+        native_output_ct_count = _producer_native_output_plan_ct_count(
+            network_dag,
+            producer=str(producer),
+            layout=selected,
+            native_ct_count=int(target_native_ct_count),
+            slots=int(slots),
+        )
+        if int(native_output_ct_count) != int(target_native_ct_count):
+            continue
+        mode = "native_source"
+        output_ct_count = int(native_output_ct_count)
+
+        units.append(
+            {
+                "edge_id": str(edge_id),
+                "source": str(source),
+                "target": str(target),
+                "producer": str(producer),
+                "activation_edge_id": str(activation_edge_id),
+                "selected": dict(selected),
+                "native_ct_count": int(target_native_ct_count),
+                "output_ct_count": int(output_ct_count),
+                "mode": str(mode),
+                "current": dict(current),
+            }
+        )
+        seen_edges.add(str(edge_id))
+
+    if len(units) < 2:
+        return []
+
+    node_updates: dict[str, tuple[dict[str, Any], int, str]] = {}
+    for unit in units:
+        layout = dict(unit["selected"])
+        output_ct_count = int(unit["output_ct_count"])
+        mode = str(unit["mode"])
+        for node in (str(unit["producer"]), str(unit["source"])):
+            existing = node_updates.get(str(node))
+            if existing is not None:
+                existing_layout, existing_count, existing_mode = existing
+                if (
+                    dict(existing_layout) != dict(layout)
+                    or int(existing_count) != int(output_ct_count)
+                    or str(existing_mode) != str(mode)
+                ):
+                    return []
+            node_updates[str(node)] = (dict(layout), int(output_ct_count), str(mode))
+
+    units_by_edge = {str(unit["edge_id"]): dict(unit) for unit in units}
+    carried_by_edge = {str(unit["activation_edge_id"]): dict(unit) for unit in units}
+    updated_edge_rows: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+    for candidate_row in compile_plan.get("edge_layouts", []):
+        candidate_edge_id = str(candidate_row.get("edge", ""))
+        if candidate_edge_id in units_by_edge:
+            unit = units_by_edge[candidate_edge_id]
+            layout = dict(unit["selected"])
+            native_ct_count = int(unit["native_ct_count"])
+            if str(unit["mode"]) == "native_source":
+                updated = _rewrite_row_as_native_source(
+                    dict(candidate_row),
+                    source_layout=layout,
+                    target_layout=layout,
+                    native_ct_count=int(native_ct_count),
+                    reason="batched_activation_native_output_beta_lift",
+                )
+            else:
+                updated = _rewrite_row_as_native_compact_source(
+                    dict(candidate_row),
+                    source_layout=layout,
+                    target_layout=layout,
+                    reason="batched_activation_native_output_beta_lift",
+                )
+            updated["batched_activation_native_output_beta_lift"] = True
+            updated["batched_activation_native_output_beta_lift_source"] = str(unit["producer"])
+            updated_edge_rows.append(updated)
+            accepted.append(
+                {
+                    "kind": "batched_activation_native_output_beta_lift",
+                    "producer": str(unit["producer"]),
+                    "producer_layout": dict(layout),
+                    "native_output_ct_count": int(unit["output_ct_count"]),
+                    "mode": str(unit["mode"]),
+                    "covered_edges": [
+                        {
+                            "edge": str(candidate_edge_id),
+                            "source": str(unit["source"]),
+                            "target": str(unit["target"]),
+                            "old_physical_layout": str(dict(unit["current"]).get("physical_layout", "")),
+                            "new_physical_layout": str(updated.get("physical_layout", "")),
+                        }
+                    ],
+                    "carried_edges": [
+                        {
+                            "edge": str(unit["activation_edge_id"]),
+                            "source": str(unit["producer"]),
+                            "target": str(unit["source"]),
+                            "op_kind": str(edge_rows_by_edge.get(str(unit["activation_edge_id"]), {}).get("op_kind", "")),
+                            "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE
+                            if str(unit["mode"]) == "native_source"
+                            else PHYSICAL_LOGICAL_HALO,
+                        }
+                    ],
+                    "covered_edge_count": 1,
+                }
+            )
+        elif candidate_edge_id in carried_by_edge:
+            unit = carried_by_edge[candidate_edge_id]
+            layout = dict(unit["selected"])
+            native_ct_count = int(unit["native_ct_count"])
+            if str(unit["mode"]) == "native_source":
+                updated = _rewrite_row_as_native_source(
+                    dict(candidate_row),
+                    source_layout=layout,
+                    target_layout=layout,
+                    native_ct_count=int(native_ct_count),
+                    reason="batched_activation_native_output_beta_lift",
+                )
+            else:
+                updated = _rewrite_row_as_compact_source(
+                    dict(candidate_row),
+                    source_layout=layout,
+                    target_layout=layout,
+                    reason="batched_activation_native_output_beta_lift",
+                )
+                if updated is None:
+                    return []
+            updated["batched_activation_native_output_beta_lift"] = True
+            updated_edge_rows.append(updated)
+        else:
+            updated_edge_rows.append(dict(candidate_row))
+
+    updated_node_rows: list[dict[str, Any]] = []
+    output_tile_delta = 0
+    for candidate_node in compile_plan.get("node_layouts", []):
+        node = str(candidate_node.get("node", ""))
+        update = node_updates.get(str(node))
+        if update is None:
+            updated_node_rows.append(dict(candidate_node))
+            continue
+        layout, output_ct_count, mode = update
+        output_tile_delta += _layout_tile_count_delta(
+            dict(candidate_node.get("selected_layout", {}) or {}),
+            dict(layout),
+            slots=int(slots),
+        )
+        if str(mode) == "native_source":
+            updated_node_rows.append(
+                _rewrite_node_as_native_output_producer(
+                    dict(candidate_node),
+                    layout=dict(layout),
+                    native_ct_count=int(output_ct_count),
+                    slots=int(slots),
+                    reason="batched_activation_native_output_beta_lift",
+                )
+            )
+        else:
+            updated_node_rows.append(
+                _rewrite_node_as_beta_lift_producer(
+                    dict(candidate_node),
+                    layout=dict(layout),
+                    reason="batched_activation_native_output_beta_lift",
+                )
+            )
+    if int(output_tile_delta) > 0:
+        return []
+
+    native_output_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+    for node, (_layout, output_ct_count, mode) in node_updates.items():
+        if str(mode) == "native_source":
+            native_output_counts[str(node)] = int(output_ct_count)
+
+    updated_plan = _refresh_layout_policy_plan_summary(
+        {
+            **dict(compile_plan),
+            "edge_layouts": updated_edge_rows,
+            "node_layouts": updated_node_rows,
+            "_native_physical_output_ct_counts": native_output_counts,
+        }
+    )
+    summary = dict(updated_plan.get("summary", {}) or {})
+    summary["boot_refined_batched_activation_native_output_beta_lift_count"] = (
+        int(summary.get("boot_refined_batched_activation_native_output_beta_lift_count", 0) or 0) + 1
+    )
+    updated_plan["summary"] = summary
+    return [
+        {
+            "kind": "batched_activation_native_output_beta_lift",
+            "strategy": "batched_activation_native_output_beta_lift",
+            "plan": updated_plan,
+            "rotation_delta": _candidate_rotation_delta(compile_plan, updated_plan),
+            "candidate_priority": -2,
+            "output_tile_delta": int(output_tile_delta),
+            "require_bootstrap_count_unchanged": False,
+            "require_bootstrap_shape_nonincrease": True,
+            "accepted": accepted,
+            "rejected": [],
+        }
+    ]
 
 
 def enumerate_bootstrap_aware_layout_refinement_candidates(
@@ -2612,6 +4409,88 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "boot_intervals": boot_interval_rows,
             }
         )
+    for native_lift in _local_native_output_beta_lift_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    ):
+        native_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(native_lift))
+        accepted = [dict(row) for row in native_lift.get("accepted", [])]
+        candidate_kind = str(native_lift.get("kind", "local_native_output_beta_lift"))
+        candidate_strategy = str(native_lift.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_local_native_output_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(native_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(native_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": int(
+                    native_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(native_lift["plan"])),
+                    )
+                    or 0
+                ),
+                "candidate_priority": int(native_lift.get("candidate_priority", 0) or 0),
+                "allow_relayout_depth_unchanged": bool(
+                    native_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(native_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(native_lift.get("output_tile_delta", 0) or 0),
+                "require_bootstrap_count_unchanged": True,
+                "require_bootstrap_shape_nonincrease": True,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
+    for batch_lift in _batched_activation_native_output_beta_lift_refinement_candidates(
+        network_dag,
+        compile_plan,
+        intervals=intervals,
+        boot_edges=boot_edges,
+        actual_native_physical_edges=actual_native_physical_edges,
+    ):
+        batch_lift = _annotate_costless_output_lift_candidate(compile_plan, dict(batch_lift))
+        accepted = [dict(row) for row in batch_lift.get("accepted", [])]
+        candidate_kind = str(batch_lift.get("kind", "batched_activation_native_output_beta_lift"))
+        candidate_strategy = str(batch_lift.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_batched_activation_native_output_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(batch_lift["plan"]),
+                "accepted": accepted,
+                "rejected": list(batch_lift.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": int(
+                    batch_lift.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(batch_lift["plan"])),
+                    )
+                    or 0
+                ),
+                "candidate_priority": int(batch_lift.get("candidate_priority", -2) or -2),
+                "allow_relayout_depth_unchanged": bool(
+                    batch_lift.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_after_bootstrap_target": bool(batch_lift.get("allow_after_bootstrap_target", False)),
+                "output_tile_delta": int(batch_lift.get("output_tile_delta", 0) or 0),
+                "require_bootstrap_count_unchanged": False,
+                "require_bootstrap_shape_nonincrease": True,
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
     for local_lift in _local_activation_beta_lift_refinement_candidates(
         network_dag,
         compile_plan,
@@ -2693,7 +4572,7 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "allow_after_bootstrap_target": bool(concat_lift.get("allow_after_bootstrap_target", False)),
                 "output_tile_delta": int(concat_lift.get("output_tile_delta", 0) or 0),
                 "require_bootstrap_count_unchanged": bool(
-                    concat_lift.get("require_bootstrap_count_unchanged", True)
+                    concat_lift.get("require_bootstrap_count_unchanged", False)
                 ),
                 "require_bootstrap_shape_nonincrease": bool(
                     concat_lift.get("require_bootstrap_shape_nonincrease", True)
@@ -2702,7 +4581,6 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "boot_intervals": boot_interval_rows,
             }
         )
-
     native_candidate = _native_physical_relayout_refinement_candidate(
         compile_plan,
         intervals=intervals,
@@ -2828,7 +4706,9 @@ def apply_bootstrap_aware_layout_refinement_candidate(
         "_previous_module_layouts": previous_module_layouts,
     }
     network_dag.bootstrap_layout_refinement_audit = {
-        key: value for key, value in dict(audit).items() if key != "_previous_module_layouts"
+        key: value
+        for key, value in dict(audit).items()
+        if key not in {"_previous_module_layouts", "previous_compile_plan", "previous_depths"}
     }
     return audit
 

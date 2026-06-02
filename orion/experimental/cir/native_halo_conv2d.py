@@ -313,6 +313,22 @@ def _spec_has_physical_output_halo(spec: NativeHaloConv2DSpec) -> bool:
     return bool(int(spec.output_physical_top_beta) > 0 or int(spec.output_physical_bottom_beta) > 0)
 
 
+def _input_physical_h_min(spec: NativeHaloConv2DSpec) -> int:
+    return -max(0, int(spec.input_physical_top_beta or 0))
+
+
+def _input_physical_h_max(spec: NativeHaloConv2DSpec) -> int:
+    return int(spec.h_in) + max(0, int(spec.input_physical_bottom_beta or 0))
+
+
+def _output_physical_h_min(spec: NativeHaloConv2DSpec) -> int:
+    return -max(0, int(spec.output_physical_top_beta or 0))
+
+
+def _output_physical_h_max(spec: NativeHaloConv2DSpec) -> int:
+    return int(spec.h_out) + max(0, int(spec.output_physical_bottom_beta or 0))
+
+
 def _slot_indices(channel_count: int, height: int, width: int, gap: int) -> torch.Tensor:
     g = max(1, int(gap))
     phases = int(g * g)
@@ -493,6 +509,10 @@ def _native_diag_indices_closed_form(
             if (
                 int(in_h) < int(spec.input_h_min)
                 or int(in_h) >= int(spec.input_h_max)
+                or int(in_h) < int(_input_physical_h_min(spec))
+                or int(in_h) >= int(_input_physical_h_max(spec))
+                or int(in_h) < int(_stripe_source_owner_h_start(stripe))
+                or int(in_h) >= int(_stripe_source_owner_h_end(stripe))
                 or int(source_local_h) < 0
                 or int(source_local_h) >= int(stripe.source_h)
             ):
@@ -548,10 +568,7 @@ def _materialized_output_source_h(output_h: torch.Tensor | int, *, h_out: int, o
 
 
 def _spec_physical_output_h(spec: NativeHaloConv2DSpec) -> int:
-    return int(spec.h_out) + max(0, int(spec.output_physical_top_beta or 0)) + max(
-        0,
-        int(spec.output_physical_bottom_beta or 0),
-    )
+    return int(_output_physical_h_max(spec)) - int(_output_physical_h_min(spec))
 
 
 def _spec_physical_output_h_positions(spec: NativeHaloConv2DSpec, output_h: torch.Tensor | int):
@@ -642,7 +659,10 @@ def _source_h_range_with_physical_input_halo(
         start = min(int(start), -max(0, int(spec.input_physical_top_beta or 0)))
     if int(end) >= int(spec.h_in):
         end = max(int(end), int(spec.h_in) + max(0, int(spec.input_physical_bottom_beta or 0)))
-    return max(int(spec.input_h_min), int(start)), min(int(spec.input_h_max), int(end))
+    return (
+        max(int(spec.input_h_min), int(_input_physical_h_min(spec)), int(start)),
+        min(int(spec.input_h_max), int(_input_physical_h_max(spec)), int(end)),
+    )
 
 
 @dataclass(frozen=True)
@@ -743,6 +763,8 @@ class NativeHaloStripe:
     source_h_end: int
     source_channel_tile: int = 0
     target_channel_tile: int = 0
+    source_owner_h_start: int | None = None
+    source_owner_h_end: int | None = None
 
     @property
     def source_h(self) -> int:
@@ -764,7 +786,19 @@ class NativeHaloStripe:
             "halo_redundant_rows": int(self.source_h - self.target_h),
             "source_channel_tile": int(self.source_channel_tile or 0),
             "target_channel_tile": int(self.target_channel_tile or 0),
+            "source_owner_h_start": int(_stripe_source_owner_h_start(self)),
+            "source_owner_h_end": int(_stripe_source_owner_h_end(self)),
         }
+
+
+def _stripe_source_owner_h_start(stripe: NativeHaloStripe) -> int:
+    value = getattr(stripe, "source_owner_h_start", None)
+    return int(stripe.source_h_start if value is None else value)
+
+
+def _stripe_source_owner_h_end(stripe: NativeHaloStripe) -> int:
+    value = getattr(stripe, "source_owner_h_end", None)
+    return int(stripe.source_h_end if value is None else value)
 
 
 @dataclass(frozen=True)
@@ -780,6 +814,22 @@ class NativeHaloConv2DPlan:
     group_baby_rotations: tuple[int, ...]
     group_giant_rotations: tuple[int, ...]
     channel_fold_mode: str = "heuristic"
+    source_storage_signature: tuple[tuple[int, int, int, int], ...] = ()
+    target_storage_signature: tuple[tuple[int, int, int, int], ...] = ()
+    source_stripes: tuple[NativeHaloStripe, ...] = ()
+    target_stripes: tuple[NativeHaloStripe, ...] = ()
+
+    @property
+    def effective_source_stripes(self) -> tuple[NativeHaloStripe, ...]:
+        return tuple(self.source_stripes or self.stripes)
+
+    @property
+    def effective_target_stripes(self) -> tuple[NativeHaloStripe, ...]:
+        return tuple(self.target_stripes or self.stripes)
+
+    @property
+    def independent_source_target_stripes(self) -> bool:
+        return bool(self.source_stripes and self.target_stripes)
 
     @property
     def source_channel_group_count(self) -> int:
@@ -803,11 +853,11 @@ class NativeHaloConv2DPlan:
 
     @property
     def source_channel_group_counts(self) -> tuple[int, ...]:
-        return tuple(int(self.source_group_count_for_stripe(stripe)) for stripe in self.stripes)
+        return tuple(int(self.source_group_count_for_stripe(stripe)) for stripe in self.effective_source_stripes)
 
     @property
     def target_channel_group_counts(self) -> tuple[int, ...]:
-        return tuple(int(self.target_group_count_for_stripe(stripe)) for stripe in self.stripes)
+        return tuple(int(self.target_group_count_for_stripe(stripe)) for stripe in self.effective_target_stripes)
 
     @property
     def source_stripe_offsets(self) -> tuple[int, ...]:
@@ -837,7 +887,7 @@ class NativeHaloConv2DPlan:
         block_index = int(block_index)
         offsets = self.target_stripe_offsets
         counts = self.target_channel_group_counts
-        for stripe, offset, count in zip(self.stripes, offsets, counts, strict=True):
+        for stripe, offset, count in zip(self.effective_target_stripes, offsets, counts, strict=True):
             if int(offset) <= int(block_index) < int(offset) + int(count):
                 return stripe, int(block_index - int(offset))
         return None
@@ -901,7 +951,14 @@ class NativeHaloConv2DPlan:
             "target_channel_group_counts": [int(value) for value in self.target_channel_group_counts],
             "source_stripe_offsets": [int(value) for value in self.source_stripe_offsets],
             "target_stripe_offsets": [int(value) for value in self.target_stripe_offsets],
+            "source_storage_signature": [
+                [int(value) for value in item] for item in self.source_storage_signature
+            ],
+            "target_storage_signature": [
+                [int(value) for value in item] for item in self.target_storage_signature
+            ],
             "stripe_count": int(len(self.stripes)),
+            "independent_source_target_stripes": bool(self.independent_source_target_stripes),
             "input_ct_count": int(self.input_ct_count),
             "output_ct_count": int(self.output_ct_count),
             "submatrix_program_count": int(self.submatrix_program_count),
@@ -917,6 +974,8 @@ class NativeHaloConv2DPlan:
             "group_baby_rotations": [int(value) for value in self.group_baby_rotations],
             "group_giant_rotations": [int(value) for value in self.group_giant_rotations],
             "stripes": [stripe.to_dict() for stripe in self.stripes],
+            "source_stripes": [stripe.to_dict() for stripe in self.effective_source_stripes],
+            "target_stripes": [stripe.to_dict() for stripe in self.effective_target_stripes],
             "notes": [
                 "Height stripes come from the halo-stripe oracle source range required by each target stripe.",
                 "source_local_h = in_h - source_h_start; target_local_h = out_h - target_h_start.",
@@ -1036,8 +1095,8 @@ def _compact_output_diag_sets_for_task_closed_form(
     gap_in = max(1, int(spec.gap_in))
     gap_out = max(1, int(spec.gap_out))
     source_packed_w = int(spec.w_in) * int(gap_in)
-    h_in_min = int(spec.input_h_min)
-    h_in_max = int(spec.input_h_max)
+    h_in_min = max(int(spec.input_h_min), int(_input_physical_h_min(spec)))
+    h_in_max = min(int(spec.input_h_max), int(_input_physical_h_max(spec)))
     source_h_start = int(stripe.source_h_start)
     stripe_source_h = int(stripe.source_h)
     stride = int(spec.stride)
@@ -1060,6 +1119,8 @@ def _compact_output_diag_sets_for_task_closed_form(
             if (
                 int(in_h) < int(h_in_min)
                 or int(in_h) >= int(h_in_max)
+                or int(in_h) < int(_stripe_source_owner_h_start(stripe))
+                or int(in_h) >= int(_stripe_source_owner_h_end(stripe))
                 or int(source_local_h) < 0
                 or int(source_local_h) >= int(stripe_source_h)
                 or not bool(_spec_physical_output_h_valid(spec, int(out_h)))
@@ -1173,6 +1234,10 @@ def _compact_output_diag_sets_for_task_torch_oracle(
         valid_h = (
             (in_h_values >= int(spec.input_h_min))
             & (in_h_values < int(spec.input_h_max))
+            & (in_h_values >= int(_input_physical_h_min(spec)))
+            & (in_h_values < int(_input_physical_h_max(spec)))
+            & (in_h_values >= int(_stripe_source_owner_h_start(stripe)))
+            & (in_h_values < int(_stripe_source_owner_h_end(stripe)))
             & (source_local_h_values >= 0)
             & (source_local_h_values < int(stripe.source_h))
         )
@@ -1264,7 +1329,7 @@ def native_halo_conv2d_compact_output_rotation_stats(
         int(spec.slot_count),
     )
     group_index = 0
-    for stripe in plan.stripes:
+    for stripe in plan.effective_source_stripes:
         for source_group in range(int(plan.source_group_count_for_stripe(stripe))):
             group_sets: list[set[int]] = []
             group_n1 = int(plan.group_n1s[int(group_index)]) if int(group_index) < len(plan.group_n1s) else 1
@@ -1522,15 +1587,23 @@ def _make_provider_native_source_transform_from_payload(
     level: int,
     scheme: Any,
     group_n1: int,
+    source_index_override: int | None = None,
+    target_index_override: int | None = None,
 ) -> Any | None:
     metadata = dict(metadata)
     compact_output = compact_target_block is not None
     target_index = (
         int(compact_target_block)
         if compact_target_block is not None
+        else int(target_index_override)
+        if target_index_override is not None
         else int(plan.target_block_index(stripe, int(target_group)))
     )
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
+    source_index = (
+        int(source_index_override)
+        if source_index_override is not None
+        else int(plan.source_block_index(stripe, int(source_group)))
+    )
     name = (
         f"native_halo_{spec.family_label}_s{int(stripe.index)}_src{int(source_group)}"
         f"_tgt{int(target_group)}"
@@ -1569,6 +1642,8 @@ def _cpp_provider_native_source_transform(
     scheme: Any,
     group_n1: int,
     compact_target_block: int | None = None,
+    source_index_override: int | None = None,
+    target_index_override: int | None = None,
     path: str = "native_source",
     env_gate: str = "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE",
 ) -> Any | None | object:
@@ -1594,6 +1669,8 @@ def _cpp_provider_native_source_transform(
             source_group=int(source_group),
             target_group=int(target_group),
             compact_target_block=compact_target_block,
+            source_index_override=source_index_override,
+            target_index_override=target_index_override,
         )
     except Exception:
         if _provider_diag_builder_strict():
@@ -1624,6 +1701,8 @@ def _cpp_provider_native_source_transform(
         level=int(level),
         scheme=scheme,
         group_n1=int(group_n1),
+        source_index_override=source_index_override,
+        target_index_override=target_index_override,
     )
     if transform is None and _provider_diag_builder_strict():
         raise RuntimeError("provider C++ diag builder produced empty payload for non-empty native-source transform")
@@ -1753,6 +1832,13 @@ def _build_conv_transform_batch(
     ordered: list[tuple[int, Any]] = []
     for target_group, built in built_payloads:
         if built is None:
+            if _provider_diag_builder_strict():
+                raise RuntimeError(
+                    "provider C++ diag builder returned empty payload for native-source target "
+                    f"stripe=({int(stripe.source_h_start)},{int(stripe.source_h_end)}"
+                    f"->{int(stripe.target_h_start)},{int(stripe.target_h_end)}) "
+                    f"source_group={int(source_group)} target_group={int(target_group)}"
+                )
             continue
         diag_indices, diag_data, metadata = built
         metadata = dict(metadata)
@@ -2594,6 +2680,29 @@ def _build_compact_source_concat_transforms_single_slot(
     return ordered
 
 
+def _avgpool_depthwise_grouped_native_supported(
+    module: Any,
+    *,
+    input_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+    out_channels: int,
+    in_per_group: int,
+    groups: int,
+) -> bool:
+    if type(module).__name__ != "AvgPool2d":
+        return False
+    if len(input_shape) < 4 or len(output_shape) < 4:
+        return False
+    c_in = int(input_shape[1])
+    c_out = int(output_shape[1])
+    return bool(
+        int(groups) == int(c_in)
+        and int(groups) == int(c_out)
+        and int(in_per_group) == 1
+        and int(out_channels) == int(c_out)
+    )
+
+
 def native_halo_conv2d_spec_from_module(module: Any, *, output_node_id: str) -> NativeHaloConv2DSpec | None:
     weight = getattr(module, "on_weight", None)
     weight_shape = _safe_shape(getattr(weight, "shape", ()))
@@ -2606,13 +2715,26 @@ def native_halo_conv2d_spec_from_module(module: Any, *, output_node_id: str) -> 
     pad = _pair(getattr(module, "padding", (0, 0)), default=(0, 0))
     dilation = _pair(getattr(module, "dilation", (1, 1)))
     groups = int(getattr(module, "groups", 1))
-    if int(groups) != 1:
-        return None
     if int(kernel_h) != int(kernel_w) or int(stride[0]) != int(stride[1]):
         return None
     if int(pad[0]) != int(pad[1]) or int(dilation[0]) != int(dilation[1]):
         return None
-    if int(input_shape[1]) != int(in_per_group) or int(output_shape[1]) != int(out_channels):
+    expanded_grouped_native = False
+    if int(groups) != 1:
+        expanded_grouped_native = _avgpool_depthwise_grouped_native_supported(
+            module,
+            input_shape=input_shape,
+            output_shape=output_shape,
+            out_channels=int(out_channels),
+            in_per_group=int(in_per_group),
+            groups=int(groups),
+        )
+        if not bool(expanded_grouped_native):
+            return None
+        groups = 1
+    elif int(input_shape[1]) != int(in_per_group):
+        return None
+    if int(output_shape[1]) != int(out_channels):
         return None
     input_gap = int(getattr(module, "input_gap", 1))
     output_gap = int(getattr(module, "output_gap", input_gap))
@@ -2630,11 +2752,13 @@ def native_halo_conv2d_spec_from_module(module: Any, *, output_node_id: str) -> 
             slot_count = int(RING_SLOT_COUNT)
     raw_label = str(getattr(module, "name", "") or output_node_id or "conv")
     label = "".join(ch if ch.isalnum() else "_" for ch in raw_label).strip("_") or "conv"
+    grouped_suffix = "_expanded_grouped" if bool(expanded_grouped_native) else ""
     return NativeHaloConv2DSpec(
         family_label=(
             f"native_halo_{label}_{int(input_shape[1])}x{int(input_shape[2])}x{int(input_shape[3])}"
             f"_to_{int(output_shape[1])}x{int(output_shape[2])}x{int(output_shape[3])}"
             f"_k{int(kernel_h)}s{int(stride[0])}_gap{int(input_gap)}to{int(output_gap)}"
+            f"{grouped_suffix}"
         ),
         c_in=int(input_shape[1]),
         h_in=int(input_shape[2]),
@@ -2670,7 +2794,7 @@ def _target_h_end_for_source_h(
     """Greedily cover as many target rows as one source stripe can support."""
 
     lo = int(target_h_start) + 1
-    hi = int(spec.output_h_max)
+    hi = int(_output_physical_h_max(spec))
     best = int(lo)
     while int(lo) <= int(hi):
         mid = (int(lo) + int(hi)) // 2
@@ -2699,8 +2823,8 @@ def _target_h_end_for_source_h(
 
 def _stripes_for_source_h(spec: NativeHaloConv2DSpec, *, source_h: int) -> tuple[NativeHaloStripe, ...]:
     stripes: list[NativeHaloStripe] = []
-    target_h = int(spec.output_h_min)
-    while int(target_h) < int(spec.output_h_max):
+    target_h = int(_output_physical_h_min(spec))
+    while int(target_h) < int(_output_physical_h_max(spec)):
         th0 = int(target_h)
         th1 = _target_h_end_for_source_h(spec, target_h_start=int(th0), source_h=int(source_h))
         req0, req1 = _source_h_range_for_target(
@@ -2722,8 +2846,8 @@ def _stripes_for_source_h(spec: NativeHaloConv2DSpec, *, source_h: int) -> tuple
             required_start=int(req0),
             required_end=int(req1),
             desired_len=int(source_h),
-            lower=int(spec.input_h_min),
-            upper=int(spec.input_h_max),
+            lower=int(_input_physical_h_min(spec)),
+            upper=int(_input_physical_h_max(spec)),
         )
         stripes.append(
             NativeHaloStripe(
@@ -2799,6 +2923,10 @@ def _diag_indices_for_task_torch_oracle(
         valid_h = (
             (in_h_values >= int(spec.input_h_min))
             & (in_h_values < int(spec.input_h_max))
+            & (in_h_values >= int(_input_physical_h_min(spec)))
+            & (in_h_values < int(_input_physical_h_max(spec)))
+            & (in_h_values >= int(_stripe_source_owner_h_start(stripe)))
+            & (in_h_values < int(_stripe_source_owner_h_end(stripe)))
             & (source_local_h_values >= 0)
             & (source_local_h_values < int(stripe.source_h))
         )
@@ -2849,6 +2977,11 @@ _CACHE_PLAN_GUARD_KEYS = (
     "source_stripe_offsets",
     "target_stripe_offsets",
     "stripes",
+    "independent_source_target_stripes",
+    "source_stripes",
+    "target_stripes",
+    "source_storage_signature",
+    "target_storage_signature",
 )
 
 
@@ -2880,7 +3013,7 @@ def _channel_tile_candidates(channel_count: int, gap: int) -> tuple[int, ...]:
 def _source_h_capacity_for_tile(spec: NativeHaloConv2DSpec, source_tile: int) -> int:
     source_groups_per_tile = _ceil_div(int(source_tile), _phase_count(int(spec.gap_in)))
     denom = int(source_groups_per_tile) * int(spec.w_in) * _phase_count(int(spec.gap_in))
-    input_total_h = int(spec.input_h_max) - int(spec.input_h_min)
+    input_total_h = int(_input_physical_h_max(spec)) - int(_input_physical_h_min(spec))
     return min(int(input_total_h), max(1, int(spec.slot_count) // max(1, int(denom))))
 
 
@@ -2901,6 +3034,404 @@ def _with_stripe_channel_tiles(
         source_channel_tile=int(source_tile),
         target_channel_tile=int(target_tile),
     )
+
+
+def _normalise_target_storage_signature(
+    signature: Any,
+    *,
+    c_out: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    blocks: list[tuple[int, int, int, int]] = []
+    for raw in signature or ():
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            raise ValueError("native halo target storage signature entries must be 4-tuples")
+        h_start, h_end, channel_start, channel_count = (int(value) for value in raw)
+        if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+            raise ValueError("native halo target storage signature has an empty block")
+        if int(channel_start) < 0 or int(channel_start) >= int(c_out):
+            raise ValueError("native halo target storage signature channel start is out of range")
+        if int(channel_start) + int(channel_count) > int(c_out):
+            raise ValueError("native halo target storage signature channel block exceeds output channels")
+        blocks.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+    return tuple(sorted(blocks, key=lambda item: (int(item[0]), int(item[1]), int(item[2]))))
+
+
+def _normalise_source_storage_signature(
+    signature: Any,
+    *,
+    c_in: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    blocks: list[tuple[int, int, int, int]] = []
+    for raw in signature or ():
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            raise ValueError("native halo source storage signature entries must be 4-tuples")
+        h_start, h_end, channel_start, channel_count = (int(value) for value in raw)
+        if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+            raise ValueError("native halo source storage signature has an empty block")
+        if int(channel_start) < 0 or int(channel_start) >= int(c_in):
+            raise ValueError("native halo source storage signature channel start is out of range")
+        if int(channel_start) + int(channel_count) > int(c_in):
+            raise ValueError("native halo source storage signature channel block exceeds input channels")
+        blocks.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+    return tuple(sorted(blocks, key=lambda item: (int(item[0]), int(item[1]), int(item[2]))))
+
+
+def _channel_tile_by_height_from_signature(
+    blocks: tuple[tuple[int, int, int, int], ...],
+    *,
+    channels: int,
+    label: str,
+) -> tuple[tuple[int, int, int], ...]:
+    by_height: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
+    for block in blocks:
+        by_height.setdefault((int(block[0]), int(block[1])), []).append(block)
+    result: list[tuple[int, int, int]] = []
+    for (h_start, h_end), height_blocks in sorted(
+        by_height.items(), key=lambda item: (int(item[0][0]), int(item[0][1]))
+    ):
+        ordered_blocks = sorted(height_blocks, key=lambda item: int(item[2]))
+        tile = int(ordered_blocks[0][3])
+        if int(ordered_blocks[0][2]) != 0 or int(tile) <= 0:
+            raise ValueError(f"native halo {label} storage signature must start at channel 0")
+        expected_start = 0
+        for block_index, (_h0, _h1, channel_start, channel_count) in enumerate(ordered_blocks):
+            expected_count = min(int(tile), int(channels) - int(expected_start))
+            if int(channel_start) != int(expected_start) or int(channel_count) != int(expected_count):
+                raise ValueError(
+                    f"native halo {label} storage signature must be contiguous equal-width "
+                    "channel groups except for the final partial group"
+                )
+            expected_start += int(channel_count)
+            if int(block_index) + 1 < len(ordered_blocks) and int(channel_count) != int(tile):
+                raise ValueError(f"native halo {label} storage signature has an early partial channel group")
+        if int(expected_start) != int(channels):
+            raise ValueError(f"native halo {label} storage signature does not cover all channels")
+        result.append((int(h_start), int(h_end), int(tile)))
+    return tuple(result)
+
+
+def _target_h_end_for_source_range(
+    spec: NativeHaloConv2DSpec,
+    *,
+    target_h_start: int,
+    source_h_start: int,
+    source_h_end: int,
+) -> int:
+    lo = int(target_h_start) + 1
+    hi = int(_output_physical_h_max(spec))
+    best = int(target_h_start)
+    physical_min = int(_input_physical_h_min(spec))
+    physical_max = int(_input_physical_h_max(spec))
+    while int(lo) <= int(hi):
+        mid = (int(lo) + int(hi)) // 2
+        req0, req1 = _source_h_range_for_target(
+            target_h_start=int(target_h_start),
+            target_h_end=int(mid),
+            input_h_min=int(spec.input_h_min),
+            input_h_max=int(spec.input_h_max),
+            kernel=int(spec.kernel),
+            stride=int(spec.stride),
+            pad=int(spec.pad),
+            dilation=int(spec.dilation),
+        )
+        req0, req1 = _source_h_range_with_physical_input_halo(
+            spec,
+            required_start=int(req0),
+            required_end=int(req1),
+        )
+        effective_req0 = max(int(req0), int(physical_min))
+        effective_req1 = min(int(req1), int(physical_max))
+        if int(effective_req0) >= int(source_h_start) and int(effective_req1) <= int(source_h_end):
+            best = int(mid)
+            lo = int(mid) + 1
+        else:
+            hi = int(mid) - 1
+    return int(best)
+
+
+def _source_stripes_from_storage_signature(
+    spec: NativeHaloConv2DSpec,
+    signature: Any,
+) -> tuple[NativeHaloStripe, ...]:
+    blocks = _normalise_source_storage_signature(signature, c_in=int(spec.c_in))
+    if not blocks:
+        raise ValueError(f"native halo source storage signature is empty for {spec.family_label}")
+    height_tiles = _channel_tile_by_height_from_signature(
+        blocks,
+        channels=int(spec.c_in),
+        label="source",
+    )
+    target_tiles = _channel_tile_candidates(int(spec.c_out), int(spec.gap_out))
+    stripes: list[NativeHaloStripe] = []
+    target_h = int(_output_physical_h_min(spec))
+    physical_min = int(_input_physical_h_min(spec))
+    physical_max = int(_input_physical_h_max(spec))
+    covered_source_h = int(physical_min)
+    for index, (source_h_start, source_h_end, source_tile) in enumerate(height_tiles):
+        if int(source_h_start) > int(covered_source_h):
+            raise ValueError("native halo source storage signature has a height gap")
+        covered_source_h = max(int(covered_source_h), int(source_h_end))
+        if int(source_h_start) < int(physical_min) or int(source_h_end) > int(physical_max):
+            raise ValueError(
+                f"native halo source storage signature height ({source_h_start}, {source_h_end}) "
+                f"is outside physical [{int(physical_min)}, {int(physical_max)}) for {spec.family_label}"
+            )
+        target_h_end = _target_h_end_for_source_range(
+            spec,
+            target_h_start=int(target_h),
+            source_h_start=int(source_h_start),
+            source_h_end=int(source_h_end),
+        )
+        if int(target_h_end) <= int(target_h):
+            raise ValueError("native halo source storage signature cannot cover the next target row")
+        best_target_tile = 0
+        best_score: tuple[int, int, int] | None = None
+        for target_tile in target_tiles:
+            if _packed_active_slots(int(target_tile), int(target_h_end - target_h), int(spec.w_out), int(spec.gap_out)) > int(spec.slot_count):
+                continue
+            score = (
+                int(_ceil_div(int(spec.c_in), int(source_tile))) * int(_ceil_div(int(spec.c_out), int(target_tile))),
+                int(_ceil_div(int(spec.c_out), int(target_tile))),
+                -int(target_tile),
+            )
+            if best_score is None or tuple(score) < tuple(best_score):
+                best_score = tuple(score)
+                best_target_tile = int(target_tile)
+        if int(best_target_tile) <= 0:
+            raise ValueError(f"native halo forced source target block does not fit {spec.family_label}")
+        stripes.append(
+            NativeHaloStripe(
+                index=int(index),
+                target_h_start=int(target_h),
+                target_h_end=int(target_h_end),
+                source_h_start=int(source_h_start),
+                source_h_end=int(source_h_end),
+                source_channel_tile=int(source_tile),
+                target_channel_tile=int(best_target_tile),
+            )
+        )
+        target_h = int(target_h_end)
+    if int(covered_source_h) != int(physical_max):
+        raise ValueError("native halo source storage signature does not cover all input rows")
+    if int(target_h) != int(_output_physical_h_max(spec)):
+        raise ValueError("native halo source storage signature does not cover all output rows")
+    return tuple(stripes)
+
+
+def _source_storage_stripes_from_signature(
+    spec: NativeHaloConv2DSpec,
+    signature: Any,
+) -> tuple[NativeHaloStripe, ...]:
+    blocks = _normalise_source_storage_signature(signature, c_in=int(spec.c_in))
+    if not blocks:
+        raise ValueError(f"native halo source storage signature is empty for {spec.family_label}")
+    height_tiles = _channel_tile_by_height_from_signature(
+        blocks,
+        channels=int(spec.c_in),
+        label="source",
+    )
+    physical_min = int(_input_physical_h_min(spec))
+    physical_max = int(_input_physical_h_max(spec))
+    covered_source_h = int(physical_min)
+    stripes: list[NativeHaloStripe] = []
+    for index, (source_h_start, source_h_end, source_tile) in enumerate(height_tiles):
+        if int(source_h_start) > int(covered_source_h):
+            raise ValueError("native halo source storage signature has a height gap")
+        covered_source_h = max(int(covered_source_h), int(source_h_end))
+        if int(source_h_start) < int(physical_min) or int(source_h_end) > int(physical_max):
+            raise ValueError(
+                f"native halo source storage signature height ({source_h_start}, {source_h_end}) "
+                f"is outside physical [{int(physical_min)}, {int(physical_max)}) for {spec.family_label}"
+            )
+        next_source_h_start = (
+            int(height_tiles[int(index) + 1][0])
+            if int(index) + 1 < len(height_tiles)
+            else int(source_h_end)
+        )
+        owner_h_start = int(source_h_start)
+        owner_h_end = min(int(source_h_end), max(int(owner_h_start), int(next_source_h_start)))
+        stripes.append(
+            NativeHaloStripe(
+                index=int(index),
+                target_h_start=int(_output_physical_h_min(spec)),
+                target_h_end=int(_output_physical_h_min(spec)),
+                source_h_start=int(source_h_start),
+                source_h_end=int(source_h_end),
+                source_channel_tile=int(source_tile),
+                target_channel_tile=0,
+                source_owner_h_start=int(owner_h_start),
+                source_owner_h_end=int(owner_h_end),
+            )
+        )
+    if int(covered_source_h) != int(physical_max):
+        raise ValueError("native halo source storage signature does not cover all input rows")
+    return tuple(stripes)
+
+
+def _target_stripes_from_storage_signature(
+    spec: NativeHaloConv2DSpec,
+    signature: Any,
+) -> tuple[NativeHaloStripe, ...]:
+    blocks = _normalise_target_storage_signature(signature, c_out=int(spec.c_out))
+    if not blocks:
+        raise ValueError(f"native halo target storage signature is empty for {spec.family_label}")
+    physical_min = int(_output_physical_h_min(spec))
+    physical_max = int(_output_physical_h_max(spec))
+    by_height: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
+    for block in blocks:
+        by_height.setdefault((int(block[0]), int(block[1])), []).append(block)
+    stripes: list[NativeHaloStripe] = []
+    source_tiles = _channel_tile_candidates(int(spec.c_in), int(spec.gap_in))
+    for index, ((h_start, h_end), height_blocks) in enumerate(
+        sorted(by_height.items(), key=lambda item: (int(item[0][0]), int(item[0][1])))
+    ):
+        if int(h_start) < int(physical_min) or int(h_end) > int(physical_max):
+            raise ValueError(
+                f"native halo target storage signature height ({h_start}, {h_end}) "
+                f"is outside physical [{int(physical_min)}, {int(physical_max)}) for {spec.family_label}"
+            )
+        ordered_blocks = sorted(height_blocks, key=lambda item: int(item[2]))
+        target_tile = int(ordered_blocks[0][3])
+        if int(ordered_blocks[0][2]) != 0 or int(target_tile) <= 0:
+            raise ValueError("native halo target storage signature must start at channel 0")
+        expected_start = 0
+        for block_index, (_h0, _h1, channel_start, channel_count) in enumerate(ordered_blocks):
+            expected_count = min(int(target_tile), int(spec.c_out) - int(expected_start))
+            if (
+                int(channel_start) != int(expected_start)
+                or int(channel_count) != int(expected_count)
+            ):
+                raise ValueError(
+                    "native halo target storage signature must be contiguous equal-width "
+                    "channel groups except for the final partial group"
+                )
+            expected_start += int(channel_count)
+            if int(block_index) + 1 < len(ordered_blocks) and int(channel_count) != int(target_tile):
+                raise ValueError("native halo target storage signature has an early partial channel group")
+        if int(expected_start) != int(spec.c_out):
+            raise ValueError("native halo target storage signature does not cover all output channels")
+        if _packed_active_slots(int(target_tile), int(h_end - h_start), int(spec.w_out), int(spec.gap_out)) > int(spec.slot_count):
+            raise ValueError(f"native halo forced target block does not fit {spec.family_label}")
+        req0, req1 = _source_h_range_for_target(
+            target_h_start=int(h_start),
+            target_h_end=int(h_end),
+            input_h_min=int(spec.input_h_min),
+            input_h_max=int(spec.input_h_max),
+            kernel=int(spec.kernel),
+            stride=int(spec.stride),
+            pad=int(spec.pad),
+            dilation=int(spec.dilation),
+        )
+        req0, req1 = _source_h_range_with_physical_input_halo(
+            spec,
+            required_start=int(req0),
+            required_end=int(req1),
+        )
+        req_h = int(req1 - req0)
+        best_source_tile = 0
+        best_score: tuple[int, int, int] | None = None
+        for source_tile in source_tiles:
+            if int(req_h) <= 0 or int(req_h) > int(_source_h_capacity_for_tile(spec, int(source_tile))):
+                continue
+            if _packed_active_slots(int(source_tile), int(req_h), int(spec.w_in), int(spec.gap_in)) > int(spec.slot_count):
+                continue
+            score = (
+                int(_ceil_div(int(spec.c_in), int(source_tile))) * int(_ceil_div(int(spec.c_out), int(target_tile))),
+                int(_ceil_div(int(spec.c_in), int(source_tile))),
+                -int(source_tile),
+            )
+            if best_score is None or tuple(score) < tuple(best_score):
+                best_score = tuple(score)
+                best_source_tile = int(source_tile)
+        if int(best_source_tile) <= 0:
+            raise ValueError(f"native halo forced target source block does not fit {spec.family_label}")
+        stripes.append(
+            NativeHaloStripe(
+                index=int(index),
+                target_h_start=int(h_start),
+                target_h_end=int(h_end),
+                source_h_start=int(req0),
+                source_h_end=int(req1),
+                source_channel_tile=int(best_source_tile),
+                target_channel_tile=int(target_tile),
+            )
+        )
+    covered_h = int(physical_min)
+    for stripe in stripes:
+        if int(stripe.target_h_start) > int(covered_h):
+            raise ValueError("native halo target storage signature has a height gap")
+        covered_h = max(int(covered_h), int(stripe.target_h_end))
+    if int(covered_h) != int(physical_max):
+        raise ValueError("native halo target storage signature does not cover all physical output rows")
+    return tuple(stripes)
+
+
+def _target_storage_stripes_from_signature(
+    spec: NativeHaloConv2DSpec,
+    signature: Any,
+) -> tuple[NativeHaloStripe, ...]:
+    blocks = _normalise_target_storage_signature(signature, c_out=int(spec.c_out))
+    if not blocks:
+        raise ValueError(f"native halo target storage signature is empty for {spec.family_label}")
+    physical_min = int(_output_physical_h_min(spec))
+    physical_max = int(_output_physical_h_max(spec))
+    by_height: dict[tuple[int, int], list[tuple[int, int, int, int]]] = {}
+    for block in blocks:
+        by_height.setdefault((int(block[0]), int(block[1])), []).append(block)
+    stripes: list[NativeHaloStripe] = []
+    covered_h = int(physical_min)
+    for index, ((h_start, h_end), height_blocks) in enumerate(
+        sorted(by_height.items(), key=lambda item: (int(item[0][0]), int(item[0][1])))
+    ):
+        if int(h_start) > int(covered_h):
+            raise ValueError("native halo target storage signature has a height gap")
+        covered_h = max(int(covered_h), int(h_end))
+        if int(h_start) < int(physical_min) or int(h_end) > int(physical_max):
+            raise ValueError(
+                f"native halo target storage signature height ({h_start}, {h_end}) "
+                f"is outside physical [{int(physical_min)}, {int(physical_max)}) for {spec.family_label}"
+            )
+        ordered_blocks = sorted(height_blocks, key=lambda item: int(item[2]))
+        target_tile = int(ordered_blocks[0][3])
+        if int(ordered_blocks[0][2]) != 0 or int(target_tile) <= 0:
+            raise ValueError("native halo target storage signature must start at channel 0")
+        expected_start = 0
+        for block_index, (_h0, _h1, channel_start, channel_count) in enumerate(ordered_blocks):
+            expected_count = min(int(target_tile), int(spec.c_out) - int(expected_start))
+            if (
+                int(channel_start) != int(expected_start)
+                or int(channel_count) != int(expected_count)
+            ):
+                raise ValueError(
+                    "native halo target storage signature must be contiguous equal-width "
+                    "channel groups except for the final partial group"
+                )
+            expected_start += int(channel_count)
+            if int(block_index) + 1 < len(ordered_blocks) and int(channel_count) != int(target_tile):
+                raise ValueError("native halo target storage signature has an early partial channel group")
+        if int(expected_start) != int(spec.c_out):
+            raise ValueError("native halo target storage signature does not cover all output channels")
+        if _packed_active_slots(
+            int(target_tile),
+            int(h_end - h_start),
+            int(spec.w_out),
+            int(spec.gap_out),
+        ) > int(spec.slot_count):
+            raise ValueError(f"native halo forced target block does not fit {spec.family_label}")
+        stripes.append(
+            NativeHaloStripe(
+                index=int(index),
+                target_h_start=int(h_start),
+                target_h_end=int(h_end),
+                source_h_start=int(_input_physical_h_min(spec)),
+                source_h_end=int(_input_physical_h_min(spec)),
+                source_channel_tile=0,
+                target_channel_tile=int(target_tile),
+            )
+        )
+    if int(covered_h) != int(physical_max):
+        raise ValueError("native halo target storage signature does not cover all physical output rows")
+    return tuple(stripes)
 
 
 def _per_stripe_fold_stripes(
@@ -3037,14 +3568,54 @@ def _per_stripe_fold_stripes(
     return result
 
 
+def _default_native_target_stripes(
+    spec: NativeHaloConv2DSpec,
+    *,
+    fold_mode: str,
+    source_tile: int,
+    target_tile: int,
+    source_h: int,
+) -> tuple[NativeHaloStripe, ...]:
+    if str(fold_mode) == "per_stripe":
+        return _per_stripe_fold_stripes(
+            spec,
+            base_source_tile=int(source_tile),
+            base_target_tile=int(target_tile),
+        )
+    return tuple(
+        _with_stripe_channel_tiles(
+            stripe,
+            source_tile=int(source_tile),
+            target_tile=int(target_tile),
+        )
+        for stripe in _stripes_for_source_h(spec, source_h=int(source_h))
+    )
+
+
 def native_halo_conv2d_plan(
     spec: NativeHaloConv2DSpec,
     *,
     require_native_target_fit: bool = True,
     channel_fold_mode: str | None = None,
+    source_storage_signature: Any = None,
+    target_storage_signature: Any = None,
 ) -> NativeHaloConv2DPlan:
     fold_mode = _normalise_channel_fold_mode(channel_fold_mode)
-    key = (_native_spec_structural_cache_key(spec), bool(require_native_target_fit), str(fold_mode))
+    source_signature = _normalise_source_storage_signature(
+        source_storage_signature,
+        c_in=int(spec.c_in),
+    ) if source_storage_signature else ()
+    target_signature = _normalise_target_storage_signature(
+        target_storage_signature,
+        c_out=int(spec.c_out),
+    ) if target_storage_signature else ()
+    key = (
+        _native_spec_structural_cache_key(spec),
+        bool(require_native_target_fit),
+        str(fold_mode),
+        tuple(source_signature),
+        tuple(target_signature),
+    )
     cached = _PLAN_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3054,20 +3625,48 @@ def native_halo_conv2d_plan(
     source_h = _source_h_capacity_for_tile(spec, int(source_tile))
     if _packed_active_slots(int(source_tile), int(source_h), int(spec.w_in), int(spec.gap_in)) > int(spec.slot_count):
         raise ValueError(f"native halo source tile does not fit {spec.family_label}")
-    if str(fold_mode) == "per_stripe":
-        stripes = _per_stripe_fold_stripes(
+    independent_source_stripes: tuple[NativeHaloStripe, ...] = ()
+    independent_target_stripes: tuple[NativeHaloStripe, ...] = ()
+    if source_signature and target_signature:
+        source_stripes = _source_storage_stripes_from_signature(spec, source_signature)
+        target_stripes = _target_storage_stripes_from_signature(spec, target_signature)
+        # A native producer can legitimately consume one source stripe layout
+        # while materializing a different target stripe layout for its
+        # consumer.  One target block may receive partial contributions from
+        # multiple source blocks, so keep independent source/target stripe
+        # tables for runtime compilation whenever both signatures are forced.
+        stripes = tuple(target_stripes)
+        independent_source_stripes = tuple(source_stripes)
+        independent_target_stripes = tuple(target_stripes)
+    elif source_signature:
+        source_stripes = _source_storage_stripes_from_signature(spec, source_signature)
+        target_stripes = _default_native_target_stripes(
             spec,
-            base_source_tile=int(source_tile),
-            base_target_tile=int(target_tile),
+            fold_mode=str(fold_mode),
+            source_tile=int(source_tile),
+            target_tile=int(target_tile),
+            source_h=int(source_h),
+        )
+        stripes = tuple(target_stripes)
+        independent_source_stripes = tuple(source_stripes)
+        independent_target_stripes = tuple(target_stripes)
+    elif target_signature:
+        stripes = _target_stripes_from_storage_signature(spec, target_signature)
+    elif str(fold_mode) == "per_stripe":
+        stripes = _default_native_target_stripes(
+            spec,
+            fold_mode=str(fold_mode),
+            source_tile=int(source_tile),
+            target_tile=int(target_tile),
+            source_h=int(source_h),
         )
     else:
-        stripes = tuple(
-            _with_stripe_channel_tiles(
-                stripe,
-                source_tile=int(source_tile),
-                target_tile=int(target_tile),
-            )
-            for stripe in _stripes_for_source_h(spec, source_h=int(source_h))
+        stripes = _default_native_target_stripes(
+            spec,
+            fold_mode=str(fold_mode),
+            source_tile=int(source_tile),
+            target_tile=int(target_tile),
+            source_h=int(source_h),
         )
     if bool(require_native_target_fit) and any(
         _packed_active_slots(
@@ -3089,54 +3688,136 @@ def native_halo_conv2d_plan(
     group_rots: list[int] = []
     group_baby: list[int] = []
     group_giant: list[int] = []
-    for stripe in stripes:
-        stripe_source_tile = int(stripe.source_channel_tile or source_tile)
-        stripe_target_tile = int(stripe.target_channel_tile or target_tile)
-        source_group_count = _ceil_div(int(spec.c_in), int(stripe_source_tile))
-        target_group_count = _ceil_div(int(spec.c_out), int(stripe_target_tile))
-        for source_group in range(int(source_group_count)):
-            source_start = int(source_group) * int(stripe_source_tile)
-            source_end = min(int(spec.c_in), int(source_start) + int(stripe_source_tile))
-            entries: list[set[int]] = []
-            entry_keys: list[tuple[int, ...]] = []
-            for target_group in range(int(target_group_count)):
-                target_start = int(target_group) * int(stripe_target_tile)
-                target_end = min(int(spec.c_out), int(target_start) + int(stripe_target_tile))
-                diag_key = (
-                    int(stripe.index),
-                    int(source_end - source_start),
-                    int(target_end - target_start),
-                )
-                if diag_key not in diag_cache:
-                    diag_cache[diag_key] = _diag_indices_for_task(
-                        spec,
-                        stripe,
-                        source_channel_count=int(source_end - source_start),
-                        target_channel_count=int(target_end - target_start),
+    def _source_target_composite_stripe(
+        *,
+        source_stripe: NativeHaloStripe,
+        target_stripe: NativeHaloStripe,
+    ) -> NativeHaloStripe:
+        return NativeHaloStripe(
+            index=int(target_stripe.index),
+            target_h_start=int(target_stripe.target_h_start),
+            target_h_end=int(target_stripe.target_h_end),
+            source_h_start=int(source_stripe.source_h_start),
+            source_h_end=int(source_stripe.source_h_end),
+            source_channel_tile=int(source_stripe.source_channel_tile or source_tile),
+            target_channel_tile=int(target_stripe.target_channel_tile or target_tile),
+            source_owner_h_start=int(_stripe_source_owner_h_start(source_stripe)),
+            source_owner_h_end=int(_stripe_source_owner_h_end(source_stripe)),
+        )
+
+    if independent_source_stripes and independent_target_stripes:
+        for source_stripe in independent_source_stripes:
+            stripe_source_tile = int(source_stripe.source_channel_tile or source_tile)
+            source_group_count = _ceil_div(int(spec.c_in), int(stripe_source_tile))
+            for source_group in range(int(source_group_count)):
+                source_start = int(source_group) * int(stripe_source_tile)
+                source_end = min(int(spec.c_in), int(source_start) + int(stripe_source_tile))
+                entries: list[set[int]] = []
+                entry_keys: list[tuple[int, ...]] = []
+                for target_stripe in independent_target_stripes:
+                    stripe_target_tile = int(target_stripe.target_channel_tile or target_tile)
+                    target_group_count = _ceil_div(int(spec.c_out), int(stripe_target_tile))
+                    composite = _source_target_composite_stripe(
+                        source_stripe=source_stripe,
+                        target_stripe=target_stripe,
                     )
-                diag_indices = set(diag_cache[diag_key])
-                entries.append(diag_indices)
-                bsgs_key = tuple(sorted(int(value) for value in diag_indices))
-                entry_keys.append(bsgs_key)
-                if bsgs_key not in program_bsgs_cache:
-                    program_bsgs_cache[bsgs_key] = _cached_native_best_common_bsgs(
-                        (diag_indices,),
+                    for target_group in range(int(target_group_count)):
+                        target_start = int(target_group) * int(stripe_target_tile)
+                        target_end = min(int(spec.c_out), int(target_start) + int(stripe_target_tile))
+                        diag_key = (
+                            int(source_stripe.index),
+                            int(target_stripe.index),
+                            int(source_stripe.source_h_start),
+                            int(source_stripe.source_h_end),
+                            int(target_stripe.target_h_start),
+                            int(target_stripe.target_h_end),
+                            int(source_end - source_start),
+                            int(target_end - target_start),
+                        )
+                        if diag_key not in diag_cache:
+                            diag_cache[diag_key] = _diag_indices_for_task(
+                                spec,
+                                composite,
+                                source_channel_count=int(source_end - source_start),
+                                target_channel_count=int(target_end - target_start),
+                            )
+                        diag_indices = set(diag_cache[diag_key])
+                        if not diag_indices:
+                            continue
+                        entries.append(diag_indices)
+                        bsgs_key = tuple(sorted(int(value) for value in diag_indices))
+                        entry_keys.append(bsgs_key)
+                        if bsgs_key not in program_bsgs_cache:
+                            program_bsgs_cache[bsgs_key] = _cached_native_best_common_bsgs(
+                                (diag_indices,),
+                                slots=int(spec.slot_count),
+                            )
+                        _n1, rotations, _baby, _giant = program_bsgs_cache[bsgs_key]
+                        program_diags.append(int(len(diag_indices)))
+                        program_rots.append(int(rotations))
+                group_key = tuple(entry_keys)
+                if group_key:
+                    if group_key not in group_bsgs_cache:
+                        group_bsgs_cache[group_key] = _cached_native_best_common_bsgs(
+                            tuple(entries),
+                            slots=int(spec.slot_count),
+                        )
+                    n1, rotations, baby, giant = group_bsgs_cache[group_key]
+                else:
+                    n1, rotations, baby, giant = 1, 0, 0, 0
+                group_n1s.append(int(n1))
+                group_rots.append(int(rotations))
+                group_baby.append(int(baby))
+                group_giant.append(int(giant))
+    else:
+        for stripe in stripes:
+            stripe_source_tile = int(stripe.source_channel_tile or source_tile)
+            stripe_target_tile = int(stripe.target_channel_tile or target_tile)
+            source_group_count = _ceil_div(int(spec.c_in), int(stripe_source_tile))
+            target_group_count = _ceil_div(int(spec.c_out), int(stripe_target_tile))
+            for source_group in range(int(source_group_count)):
+                source_start = int(source_group) * int(stripe_source_tile)
+                source_end = min(int(spec.c_in), int(source_start) + int(stripe_source_tile))
+                entries: list[set[int]] = []
+                entry_keys: list[tuple[int, ...]] = []
+                for target_group in range(int(target_group_count)):
+                    target_start = int(target_group) * int(stripe_target_tile)
+                    target_end = min(int(spec.c_out), int(target_start) + int(stripe_target_tile))
+                    diag_key = (
+                        int(stripe.index),
+                        int(source_end - source_start),
+                        int(target_end - target_start),
+                    )
+                    if diag_key not in diag_cache:
+                        diag_cache[diag_key] = _diag_indices_for_task(
+                            spec,
+                            stripe,
+                            source_channel_count=int(source_end - source_start),
+                            target_channel_count=int(target_end - target_start),
+                        )
+                    diag_indices = set(diag_cache[diag_key])
+                    entries.append(diag_indices)
+                    bsgs_key = tuple(sorted(int(value) for value in diag_indices))
+                    entry_keys.append(bsgs_key)
+                    if bsgs_key not in program_bsgs_cache:
+                        program_bsgs_cache[bsgs_key] = _cached_native_best_common_bsgs(
+                            (diag_indices,),
+                            slots=int(spec.slot_count),
+                        )
+                    _n1, rotations, _baby, _giant = program_bsgs_cache[bsgs_key]
+                    program_diags.append(int(len(diag_indices)))
+                    program_rots.append(int(rotations))
+                group_key = tuple(entry_keys)
+                if group_key not in group_bsgs_cache:
+                    group_bsgs_cache[group_key] = _cached_native_best_common_bsgs(
+                        tuple(entries),
                         slots=int(spec.slot_count),
                     )
-                _n1, rotations, _baby, _giant = program_bsgs_cache[bsgs_key]
-                program_diags.append(int(len(diag_indices)))
-                program_rots.append(int(rotations))
-            group_key = tuple(entry_keys)
-            if group_key not in group_bsgs_cache:
-                group_bsgs_cache[group_key] = _cached_native_best_common_bsgs(
-                    tuple(entries),
-                    slots=int(spec.slot_count),
-                )
-            n1, rotations, baby, giant = group_bsgs_cache[group_key]
-            group_n1s.append(int(n1))
-            group_rots.append(int(rotations))
-            group_baby.append(int(baby))
-            group_giant.append(int(giant))
+                n1, rotations, baby, giant = group_bsgs_cache[group_key]
+                group_n1s.append(int(n1))
+                group_rots.append(int(rotations))
+                group_baby.append(int(baby))
+                group_giant.append(int(giant))
 
     plan = NativeHaloConv2DPlan(
         spec=spec,
@@ -3150,6 +3831,10 @@ def native_halo_conv2d_plan(
         group_baby_rotations=tuple(group_baby),
         group_giant_rotations=tuple(group_giant),
         channel_fold_mode=str(fold_mode),
+        source_storage_signature=tuple(source_signature),
+        target_storage_signature=tuple(target_signature),
+        source_stripes=tuple(independent_source_stripes),
+        target_stripes=tuple(independent_target_stripes),
     )
     _PLAN_CACHE[key] = plan
     return plan
@@ -3484,6 +4169,9 @@ def _build_conv_transform(
     compact_target_block: int | None = None,
     diagonal_cache: _BlockDiagonalCache | None = None,
     force_payload: bool = False,
+    source_index_override: int | None = None,
+    target_index_override: int | None = None,
+    allow_cpp: bool = True,
 ) -> Any | None:
     slots = int(spec.slot_count)
     compact_output = compact_target_block is not None
@@ -3491,9 +4179,15 @@ def _build_conv_transform(
     target_index = (
         int(compact_target_block)
         if bool(compact_output)
+        else int(target_index_override)
+        if target_index_override is not None
         else int(plan.target_block_index(stripe, int(target_group)))
     )
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
+    source_index = (
+        int(source_index_override)
+        if source_index_override is not None
+        else int(plan.source_block_index(stripe, int(source_group)))
+    )
 
     def build_all_native_source_blocks(
         *,
@@ -3524,6 +4218,9 @@ def _build_conv_transform(
             group_n1=int(group_n1),
             compact_target_block=compact_target_block,
             force_payload=True,
+            source_index_override=int(source_index),
+            target_index_override=int(target_index),
+            allow_cpp=False,
         )
         if rebuilt is None:
             return {}
@@ -3543,7 +4240,7 @@ def _build_conv_transform(
         else _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA")
     )
     cpp_transform = _CPP_DIAG_BUILDER_FALLBACK
-    if not bool(single_slot_recipe) or bool(single_slot_cpp_metadata_enabled):
+    if bool(allow_cpp) and (not bool(single_slot_recipe) or bool(single_slot_cpp_metadata_enabled)):
         cpp_transform = _cpp_provider_native_source_transform(
             spec=spec,
             plan=plan,
@@ -3556,6 +4253,8 @@ def _build_conv_transform(
             scheme=scheme,
             group_n1=int(group_n1),
             compact_target_block=compact_target_block,
+            source_index_override=int(source_index),
+            target_index_override=int(target_index),
             path="native_source_compact_output" if bool(compact_output) else "native_source",
             env_gate=(
                 "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT"
@@ -3679,6 +4378,10 @@ def _build_conv_transform(
             valid_h = (
                 (in_h_values >= int(spec.input_h_min))
                 & (in_h_values < int(spec.input_h_max))
+                & (in_h_values >= int(_input_physical_h_min(spec)))
+                & (in_h_values < int(_input_physical_h_max(spec)))
+                & (in_h_values >= int(_stripe_source_owner_h_start(stripe)))
+                & (in_h_values < int(_stripe_source_owner_h_end(stripe)))
                 & (source_local_h_values >= 0)
                 & (source_local_h_values < int(stripe.source_h))
                 & (target_local_h_values >= 0)
@@ -3856,6 +4559,8 @@ def _build_conv_transform(
         source_group=int(source_group),
         target_group=int(target_group),
         compact_target_block=compact_target_block,
+        source_index_override=int(source_index),
+        target_index_override=int(target_index),
     )
 
 
@@ -3869,6 +4574,8 @@ def _build_conv_transform_payload_shadow(
     source_group: int,
     target_group: int,
     compact_target_block: int | None,
+    source_index_override: int | None = None,
+    target_index_override: int | None = None,
 ) -> Any | None:
     if transform is None:
         return None
@@ -3887,6 +4594,8 @@ def _build_conv_transform_payload_shadow(
             source_group=int(source_group),
             target_group=int(target_group),
             compact_target_block=compact_target_block,
+            source_index_override=source_index_override,
+            target_index_override=target_index_override,
         )
         if built is None:
             return None
@@ -3913,6 +4622,7 @@ def _build_conv_transforms_for_compact_output(
     scheme: Any,
     group_n1: int,
     force_payload: bool = False,
+    source_index_override: int | None = None,
 ) -> list[tuple[int, Any]]:
     slots = int(spec.slot_count)
     source_tile = int(plan.source_tile_for_stripe(stripe))
@@ -3926,7 +4636,11 @@ def _build_conv_transforms_for_compact_output(
     if source_count <= 0 or target_count <= 0:
         return []
     single_slot_recipe = bool(_single_slot_layer_cache_enabled_for_scheme(scheme) and not bool(force_payload))
-    source_index = int(plan.source_block_index(stripe, int(source_group)))
+    source_index = (
+        int(source_index_override)
+        if source_index_override is not None
+        else int(plan.source_block_index(stripe, int(source_group)))
+    )
 
     def build_all_compact_output_blocks(
         *,
@@ -3940,6 +4654,7 @@ def _build_conv_transforms_for_compact_output(
         scheme=scheme,
         group_n1=int(group_n1),
         source_index=int(source_index),
+        source_index_override=source_index_override,
     ) -> dict[tuple[int, int], dict[int, Any]]:
         rebuilt = _build_conv_transforms_for_compact_output(
             spec=spec,
@@ -3952,6 +4667,7 @@ def _build_conv_transforms_for_compact_output(
             scheme=scheme,
             group_n1=int(group_n1),
             force_payload=True,
+            source_index_override=source_index_override,
         )
         blocks: dict[tuple[int, int], dict[int, Any]] = {}
         for rebuilt_target, rebuilt_transform in rebuilt:
@@ -3990,6 +4706,7 @@ def _build_conv_transforms_for_compact_output(
                 scheme=scheme,
                 group_n1=int(group_n1),
                 compact_target_block=int(target_block),
+                source_index_override=int(source_index),
                 path="native_source_compact_output",
                 env_gate="ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT",
             )
@@ -4114,6 +4831,10 @@ def _build_conv_transforms_for_compact_output(
             valid_h = (
                 (in_h_values >= int(spec.input_h_min))
                 & (in_h_values < int(spec.input_h_max))
+                & (in_h_values >= int(_input_physical_h_min(spec)))
+                & (in_h_values < int(_input_physical_h_max(spec)))
+                & (in_h_values >= int(_stripe_source_owner_h_start(stripe)))
+                & (in_h_values < int(_stripe_source_owner_h_end(stripe)))
                 & (source_local_h_values >= 0)
                 & (source_local_h_values < int(stripe.source_h))
             )
@@ -4281,6 +5002,7 @@ def _build_conv_transforms_for_compact_output(
                     stripe=stripe,
                     source_group=int(source_group),
                     target_group=int(target_group),
+                    source_index_override=int(source_index),
                 ),
             )
         )
@@ -4296,6 +5018,7 @@ def _build_conv_compact_output_payload_shadow(
     stripe: NativeHaloStripe,
     source_group: int,
     target_group: int,
+    source_index_override: int | None = None,
 ) -> Any | None:
     if transform is None:
         return None
@@ -4314,6 +5037,7 @@ def _build_conv_compact_output_payload_shadow(
             source_group=int(source_group),
             target_group=int(target_group),
             compact_target_block=int(transform.target_index),
+            source_index_override=source_index_override,
         )
         if built is None:
             return None
@@ -4742,10 +5466,20 @@ class NativeHaloStripeNoRIConvExecutor:
         self.output_node_id = str(output_node_id)
         self._native_plan_require_target_fit = not self._uses_tight_compact_output_for_spec(spec)
         fold_mode = self._channel_fold_mode()
+        source_storage_signature = tuple(
+            tuple(int(value) for value in raw)
+            for raw in (getattr(self.module, "layout_policy_native_input_source_signature", ()) or ())
+        )
+        target_storage_signature = tuple(
+            tuple(int(value) for value in raw)
+            for raw in (getattr(self.module, "layout_policy_native_output_target_signature", ()) or ())
+        )
         self.native_plan = native_halo_conv2d_plan(
             spec,
             require_native_target_fit=bool(self._native_plan_require_target_fit),
             channel_fold_mode=str(fold_mode),
+            source_storage_signature=source_storage_signature,
+            target_storage_signature=target_storage_signature,
         )
         self.slots = int(spec.slot_count)
         self.rows = int(self._runtime_output_ct_count())
@@ -4885,16 +5619,30 @@ class NativeHaloStripeNoRIConvExecutor:
         runtime_spec = self._runtime_spec()
         require_native_target_fit = not self._uses_tight_compact_output_for_spec(runtime_spec)
         fold_mode = self._channel_fold_mode()
+        source_storage_signature = tuple(
+            tuple(int(value) for value in raw)
+            for raw in (getattr(self.module, "layout_policy_native_input_source_signature", ()) or ())
+        )
+        target_storage_signature = tuple(
+            tuple(int(value) for value in raw)
+            for raw in (getattr(self.module, "layout_policy_native_output_target_signature", ()) or ())
+        )
         changed = (
             tuple(runtime_spec.to_dict().items()) != tuple(self.native_plan.spec.to_dict().items())
             or bool(require_native_target_fit) != bool(self._native_plan_require_target_fit)
             or str(fold_mode) != str(self.native_plan.channel_fold_mode)
+            or tuple(source_storage_signature)
+            != tuple(getattr(self.native_plan, "source_storage_signature", ()) or ())
+            or tuple(target_storage_signature)
+            != tuple(getattr(self.native_plan, "target_storage_signature", ()) or ())
         )
         if bool(changed):
             self.native_plan = native_halo_conv2d_plan(
                 runtime_spec,
                 require_native_target_fit=bool(require_native_target_fit),
                 channel_fold_mode=str(fold_mode),
+                source_storage_signature=source_storage_signature,
+                target_storage_signature=target_storage_signature,
             )
             self._native_plan_require_target_fit = bool(require_native_target_fit)
         self.slots = int(self.native_plan.spec.slot_count)
@@ -4904,10 +5652,18 @@ class NativeHaloStripeNoRIConvExecutor:
         self.fhe_output_shape = getattr(self.module, "fhe_output_shape", self.fhe_output_shape)
         return bool(changed)
 
-    def _validate_module(self) -> None:
+    def _operator_weight(self) -> torch.Tensor:
         weight = getattr(self.module, "on_weight", None)
         if weight is None:
             raise RuntimeError(f"{self.output_node_id} has no fused Orion weight for native halo Conv2d")
+        if int(getattr(self.module, "groups", 1) or 1) > 1:
+            from orion.core import packing
+
+            weight = packing.resolve_grouped_conv(self.module)
+        return weight.detach().to(dtype=torch.float32)
+
+    def _validate_module(self) -> None:
+        weight = self._operator_weight()
         if tuple(int(v) for v in tuple(weight.shape)) != tuple(int(v) for v in self.spec.weight_shape):
             raise RuntimeError(f"{self.output_node_id} weight shape does not match native halo spec")
 
@@ -5616,7 +6372,7 @@ class NativeHaloStripeNoRIConvExecutor:
         self.last_runtime_counts = {}
         module_bias = getattr(self.module, "on_bias", None)
         self.bias_vector = None if module_bias is None else module_bias.detach().to(dtype=torch.float32)
-        weight = getattr(self.module, "on_weight").detach().to(dtype=torch.float32)
+        weight = self._operator_weight()
         input_level = int(self._level(scheme))
         conv_level = int(input_level)
         conv_output_level = max(0, int(input_level - 1))
@@ -5683,41 +6439,97 @@ class NativeHaloStripeNoRIConvExecutor:
                         retune_shared_group=True,
                     )
         else:
-            for stripe in self.native_plan.stripes:
-                for source_group in range(int(self.native_plan.source_group_count_for_stripe(stripe))):
-                    ordered: list[tuple[int, Any]] = []
-                    group_n1 = int(self.native_plan.group_n1s[int(group_index)])
-                    target_group_count = int(self.native_plan.target_group_count_for_stripe(stripe))
-                    if not bool(compact_output):
-                        build_started = time.time()
-                        ordered = _build_conv_transform_batch(
-                            spec=self.native_plan.spec,
-                            plan=self.native_plan,
-                            weight=weight,
-                            weight_np=provider_weight_np,
-                            stripe=stripe,
-                            source_group=int(source_group),
-                            target_groups=[int(value) for value in range(int(target_group_count))],
-                            level=int(conv_level),
-                            scheme=scheme,
-                            group_n1=int(group_n1),
-                        )
-                        self.last_runtime_timing["build_transform_s"] = float(
-                            self.last_runtime_timing.get("build_transform_s", 0.0)
-                        ) + float(time.time() - build_started)
-                        self.last_runtime_timing["built_transform_count"] = float(
-                            self.last_runtime_timing.get("built_transform_count", 0.0)
-                        ) + float(len(ordered))
-                    else:
-                        for target_group in range(int(target_group_count)):
+            if bool(self.native_plan.independent_source_target_stripes):
+                for source_stripe in self.native_plan.effective_source_stripes:
+                    for source_group in range(int(self.native_plan.source_group_count_for_stripe(source_stripe))):
+                        ordered: list[tuple[int, Any]] = []
+                        group_n1 = int(self.native_plan.group_n1s[int(group_index)])
+                        input_index = int(self.native_plan.source_block_index(source_stripe, int(source_group)))
+                        for target_stripe in self.native_plan.effective_target_stripes:
+                            target_group_count = int(self.native_plan.target_group_count_for_stripe(target_stripe))
+                            composite = NativeHaloStripe(
+                                index=int(target_stripe.index),
+                                target_h_start=int(target_stripe.target_h_start),
+                                target_h_end=int(target_stripe.target_h_end),
+                                source_h_start=int(source_stripe.source_h_start),
+                                source_h_end=int(source_stripe.source_h_end),
+                                source_channel_tile=int(self.native_plan.source_tile_for_stripe(source_stripe)),
+                                target_channel_tile=int(self.native_plan.target_tile_for_stripe(target_stripe)),
+                                source_owner_h_start=int(_stripe_source_owner_h_start(source_stripe)),
+                                source_owner_h_end=int(_stripe_source_owner_h_end(source_stripe)),
+                            )
+                            for target_group in range(int(target_group_count)):
+                                target_index = int(self.native_plan.target_block_index(target_stripe, int(target_group)))
+                                build_started = time.time()
+                                if bool(compact_output):
+                                    transforms = _build_conv_transforms_for_compact_output(
+                                        spec=self.native_plan.spec,
+                                        plan=self.native_plan,
+                                        weight=weight,
+                                        stripe=composite,
+                                        source_group=int(source_group),
+                                        target_group=int(target_group),
+                                        level=int(conv_level),
+                                        scheme=scheme,
+                                        group_n1=int(group_n1),
+                                        source_index_override=int(input_index),
+                                    )
+                                    self.last_runtime_timing["build_transform_s"] = float(
+                                        self.last_runtime_timing.get("build_transform_s", 0.0)
+                                    ) + float(time.time() - build_started)
+                                    for target_block, transform in transforms:
+                                        self.last_runtime_timing["built_transform_count"] = float(
+                                            self.last_runtime_timing.get("built_transform_count", 0.0)
+                                        ) + 1.0
+                                        ordered.append((int(target_block), transform))
+                                    continue
+                                transform = _build_conv_transform(
+                                    spec=self.native_plan.spec,
+                                    plan=self.native_plan,
+                                    weight=weight,
+                                    weight_np=provider_weight_np,
+                                    stripe=composite,
+                                    source_group=int(source_group),
+                                    target_group=int(target_group),
+                                    level=int(conv_level),
+                                    scheme=scheme,
+                                    group_n1=int(group_n1),
+                                    source_index_override=int(input_index),
+                                    target_index_override=int(target_index),
+                                )
+                                self.last_runtime_timing["build_transform_s"] = float(
+                                    self.last_runtime_timing.get("build_transform_s", 0.0)
+                                ) + float(time.time() - build_started)
+                                if transform is None:
+                                    continue
+                                self.last_runtime_timing["built_transform_count"] = float(
+                                    self.last_runtime_timing.get("built_transform_count", 0.0)
+                                ) + 1.0
+                                ordered.append((int(transform.target_index), transform))
+                        if ordered:
+                            self._compile_ordered_runtime_groups(
+                                scheme,
+                                input_index=int(input_index),
+                                ordered=ordered,
+                                retune_shared_group=False,
+                            )
+                        group_index += 1
+            else:
+                for stripe in self.native_plan.stripes:
+                    for source_group in range(int(self.native_plan.source_group_count_for_stripe(stripe))):
+                        ordered: list[tuple[int, Any]] = []
+                        group_n1 = int(self.native_plan.group_n1s[int(group_index)])
+                        target_group_count = int(self.native_plan.target_group_count_for_stripe(stripe))
+                        if not bool(compact_output):
                             build_started = time.time()
-                            transforms = _build_conv_transforms_for_compact_output(
+                            ordered = _build_conv_transform_batch(
                                 spec=self.native_plan.spec,
                                 plan=self.native_plan,
                                 weight=weight,
+                                weight_np=provider_weight_np,
                                 stripe=stripe,
                                 source_group=int(source_group),
-                                target_group=int(target_group),
+                                target_groups=[int(value) for value in range(int(target_group_count))],
                                 level=int(conv_level),
                                 scheme=scheme,
                                 group_n1=int(group_n1),
@@ -5725,20 +6537,40 @@ class NativeHaloStripeNoRIConvExecutor:
                             self.last_runtime_timing["build_transform_s"] = float(
                                 self.last_runtime_timing.get("build_transform_s", 0.0)
                             ) + float(time.time() - build_started)
-                            for target_index, transform in transforms:
-                                self.last_runtime_timing["built_transform_count"] = float(
-                                    self.last_runtime_timing.get("built_transform_count", 0.0)
-                                ) + 1.0
-                                ordered.append((int(target_index), transform))
-                    input_index = int(self.native_plan.source_block_index(stripe, int(source_group)))
-                    if ordered:
-                        self._compile_ordered_runtime_groups(
-                            scheme,
-                            input_index=int(input_index),
-                            ordered=ordered,
-                            retune_shared_group=False,
-                        )
-                    group_index += 1
+                            self.last_runtime_timing["built_transform_count"] = float(
+                                self.last_runtime_timing.get("built_transform_count", 0.0)
+                            ) + float(len(ordered))
+                        else:
+                            for target_group in range(int(target_group_count)):
+                                build_started = time.time()
+                                transforms = _build_conv_transforms_for_compact_output(
+                                    spec=self.native_plan.spec,
+                                    plan=self.native_plan,
+                                    weight=weight,
+                                    stripe=stripe,
+                                    source_group=int(source_group),
+                                    target_group=int(target_group),
+                                    level=int(conv_level),
+                                    scheme=scheme,
+                                    group_n1=int(group_n1),
+                                )
+                                self.last_runtime_timing["build_transform_s"] = float(
+                                    self.last_runtime_timing.get("build_transform_s", 0.0)
+                                ) + float(time.time() - build_started)
+                                for target_index, transform in transforms:
+                                    self.last_runtime_timing["built_transform_count"] = float(
+                                        self.last_runtime_timing.get("built_transform_count", 0.0)
+                                    ) + 1.0
+                                    ordered.append((int(target_index), transform))
+                        input_index = int(self.native_plan.source_block_index(stripe, int(source_group)))
+                        if ordered:
+                            self._compile_ordered_runtime_groups(
+                                scheme,
+                                input_index=int(input_index),
+                                ordered=ordered,
+                                retune_shared_group=False,
+                            )
+                        group_index += 1
 
         self.input_relayout_kernel = None
         self.output_relayout_kernel = None

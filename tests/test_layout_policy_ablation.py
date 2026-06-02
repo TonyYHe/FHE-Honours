@@ -18,7 +18,9 @@ from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement_candidate
 from orion.core.bootstrap_layout_compression import enumerate_bootstrap_aware_layout_refinement_candidates
 from orion.core.bootstrap_layout_compression import restore_layout_policy_compile_plan
+from orion.core.bootstrap_layout_compression import _apply_layout_policy_module_output_layouts
 from orion.core.bootstrap_layout_compression import _conv2d_unit_stride_radius_one
+from orion.core.bootstrap_layout_compression import _producer_native_output_plan_fits
 from orion.core.bootstrap_layout_compression import _producer_layout_growth_rotation_delta
 from orion.core.bootstrap_layout_compression import _row_is_native_source_stripe_relayout
 from orion.core.orion import _region_first_mode_options
@@ -26,6 +28,8 @@ from orion.core.orion import scheme
 from orion.core.network_dag import NetworkDAG
 from orion.core.tracer import OrionTracer, StatsTracker
 from orion.experimental.layout_policy_ablation import (
+    EdgeInfo,
+    PHYSICAL_NATIVE_SOURCE_STRIPE,
     attach_backend_runtime_anchors,
     attach_non_ckks_simulation,
     attach_runtime_anchor,
@@ -39,21 +43,27 @@ from orion.experimental.layout_policy_ablation import (
     run_non_ckks_layout_simulation,
     run_runtime_anchor,
     validate_layout_policy_compile_plan,
+    _dp_output_layout_candidates,
     _fill_beta_to_tile_capacity,
+    _incoming_add_options,
     _layout_for_shape,
     _layout_physical_bottom_beta,
     _layout_physical_top_beta,
     _output_gap_for_edge,
+    _output_physical_layout,
     _runtime_config,
+    _source_transitive_input_layout_candidates,
 )
 from orion.experimental.cir.native_halo_conv2d import (
     NativeHaloConv2DSpec,
+    NativeHaloStripeNoRIConvExecutor,
     _COMPACT_OUTPUT_DIAG_SET_CACHE,
     _compact_output_diag_sets_for_task,
     _compact_output_diag_sets_for_task_torch_oracle,
     _diag_indices_for_task,
     _diag_indices_for_task_torch_oracle,
     native_halo_conv2d_compact_output_rotation_stats,
+    native_halo_conv2d_spec_from_module,
     native_halo_conv2d_plan,
 )
 from orion.models.resnet import BasicBlock, ResNet
@@ -66,7 +76,9 @@ from orion.experimental.u22_phase1 import (
     LayoutPolicyProviderRuntimeExecutor,
     LayoutPolicyRelayoutKernel,
     U22CompileRegistry,
+    _layout_policy_attach_backend_producer_outputs,
     _layout_policy_runtime_compile_plan,
+    _layout_policy_wrap_provider_group,
     collect_layout_policy_provider_pressure,
 )
 from orion.core.auto_bootstrap import BootstrapSolver
@@ -103,11 +115,324 @@ def _build_u23_dim8_192_dag() -> NetworkDAG:
         gen.BASE_DIM, gen.ACTIVATION, gen.SILU_DEGREE = saved
 
 
+def test_dp_no_share_concat_forwards_matching_native_stripe_without_relayout() -> None:
+    slots = 64
+    compact = _layout_for_shape(shape=(1, 1, 4, 4), gap=1, top_beta=0, bottom_beta=0, stride=1, slots=slots)
+    native = _layout_for_shape(shape=(1, 1, 4, 4), gap=1, top_beta=1, bottom_beta=1, stride=1, slots=slots)
+    output_compact = _layout_for_shape(shape=(1, 2, 4, 4), gap=1, top_beta=0, bottom_beta=0, stride=1, slots=slots)
+    output_required = _layout_for_shape(shape=(1, 2, 4, 4), gap=1, top_beta=1, bottom_beta=1, stride=1, slots=slots)
+    incoming = (
+        EdgeInfo(
+            source="skip",
+            target="cat",
+            shape=(1, 1, 4, 4),
+            fhe_shape=(1, 1, 6, 4),
+            requirement=compact,
+            compact=compact,
+            op_kind="concat",
+            lt_rotation_base=0,
+            slots=slots,
+        ),
+        EdgeInfo(
+            source="up",
+            target="cat",
+            shape=(1, 1, 4, 4),
+            fhe_shape=(1, 1, 6, 4),
+            requirement=compact,
+            compact=compact,
+            op_kind="concat",
+            lt_rotation_base=0,
+            slots=slots,
+        ),
+    )
+    options = _incoming_add_options(
+        incoming,
+        {"skip": native, "up": native},
+        {"skip": PHYSICAL_NATIVE_SOURCE_STRIPE, "up": PHYSICAL_NATIVE_SOURCE_STRIPE},
+        force_compact_join=True,
+    )
+    native_options = [
+        (rows, relayouts)
+        for rows, relayouts in options
+        if all(str(row["physical_layout"]) == PHYSICAL_NATIVE_SOURCE_STRIPE for row in rows)
+    ]
+    assert len(native_options) == 1
+    rows, relayouts = native_options[0]
+    assert relayouts == []
+    assert all(row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE for row in rows)
+    assert all(row["target_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE for row in rows)
+    assert all(bool(row["relayout"]) is False for row in rows)
+
+    outgoing = (
+        EdgeInfo(
+            source="cat",
+            target="conv",
+            shape=(1, 2, 4, 4),
+            fhe_shape=(1, 2, 6, 4),
+            requirement=output_required,
+            compact=output_compact,
+            op_kind="conv2d",
+            lt_rotation_base=0,
+            slots=slots,
+        ),
+    )
+    output_layouts = _dp_output_layout_candidates(
+        Concat(dim=1),
+        incoming_rows=rows,
+        outgoing=outgoing,
+        global_alpha=1,
+        global_beta=1,
+        slots=slots,
+        force_compact_join=True,
+    )
+    assert output_layouts
+    assert int(output_layouts[0].top_beta) == 1
+    assert _output_physical_layout(
+        Concat(dim=1),
+        incoming_rows=rows,
+        output_layout=output_layouts[0],
+        producer_fused={"enabled": False},
+        slots=slots,
+    ) == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert validate_layout_policy_compile_plan(
+        {
+            "policy": "dp_no_share_fold",
+            "edge_layouts": list(rows),
+            "node_layouts": [
+                {
+                    "node": node,
+                    "shape": [1, 1, 4, 4],
+                    "selected_layout": native.to_dict(),
+                    "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                    "native_output_ct_count": 1,
+                }
+                for node in ("skip", "up")
+            ],
+        }
+    )["ok"] is True
+
+
+def test_no_share_validator_does_not_force_old_compact_provider_boundaries() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 32,
+        "tile_count": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+    }
+    beta1 = {
+        **compact,
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stored_slots": 48,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    plan = {
+        "policy": "dp_no_share_fold",
+        "edge_layouts": [
+            {
+                "edge": "skip->cat",
+                "source": "skip",
+                "target": "cat",
+                "op_kind": "concat",
+                "selected_layout": dict(beta1),
+                "physical_layout": "logical_halo_compact",
+                "source_physical_layout": "logical_halo_compact",
+                "target_physical_layout": "logical_halo_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "up->dec",
+                "source": "up",
+                "target": "dec",
+                "op_kind": "conv_transpose2d",
+                "selected_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "relayout": False,
+            },
+            {
+                "edge": "dec->conv",
+                "source": "dec",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "selected_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "relayout": False,
+                "layout_mode": "native_halo_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+                "native_halo_channel_aligned_stripe": True,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "up",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+                "native_output_ct_count": 1,
+            },
+            {
+                "node": "dec",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "native_output_ct_count": 1,
+            },
+        ],
+    }
+
+    assert validate_layout_policy_compile_plan(plan)["ok"] is True
+
+
+def test_no_share_validator_accepts_fixedmax_legacy_native_source_count() -> None:
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 48,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    plan = {
+        "policy": "fixed_max_no_share_fused",
+        "edge_layouts": [
+            {
+                "edge": "producer->consumer",
+                "source": "producer",
+                "target": "consumer",
+                "op_kind": "conv2d",
+                "selected_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "producer",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 4096],
+                "selected_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+            },
+        ],
+    }
+
+    assert validate_layout_policy_compile_plan(plan)["ok"] is True
+
+
+def test_no_share_validator_rejects_fake_native_source_output() -> None:
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 48,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    plan = {
+        "policy": "dp_no_share_fold",
+        "edge_layouts": [
+            {
+                "edge": "producer->consumer",
+                "source": "producer",
+                "target": "consumer",
+                "op_kind": "conv2d",
+                "selected_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "producer",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(beta1),
+                "physical_layout": "packed_compact",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="native source edge requires native source node output"):
+        validate_layout_policy_compile_plan(plan)
+
+
 def _policy(payload: dict, name: str) -> dict:
     for row in payload["policies"]:
         if row["policy"] == str(name):
             return row
     raise AssertionError(f"missing policy {name}")
+
+
+def _manual_edge(
+    source: str,
+    target: str,
+    *,
+    shape: tuple[int, int, int, int] = (1, 1, 64, 64),
+    beta: int = 1,
+    module: object | None = None,
+    slots: int = 1024,
+) -> EdgeInfo:
+    compact = _layout_for_shape(
+        shape=shape,
+        gap=1,
+        top_beta=0,
+        bottom_beta=0,
+        stride=1,
+        slots=int(slots),
+    )
+    requirement = _layout_for_shape(
+        shape=shape,
+        gap=1,
+        top_beta=int(beta),
+        bottom_beta=int(beta),
+        stride=1,
+        slots=int(slots),
+    )
+    return EdgeInfo(
+        source=str(source),
+        target=str(target),
+        shape=shape,
+        fhe_shape=shape,
+        requirement=requirement,
+        compact=compact,
+        op_kind="conv2d" if isinstance(module, Conv2d) else "identity",
+        lt_rotation_base=0,
+        output_shape=shape,
+        output_fhe_shape=shape,
+        kernel_size=(3, 3) if isinstance(module, Conv2d) else (1, 1),
+        stride=(1, 1),
+        padding=(1, 1) if isinstance(module, Conv2d) else (0, 0),
+        dilation=(1, 1),
+        groups=1,
+        input_channels=int(shape[1]),
+        output_channels=int(shape[1]),
+        slots=int(slots),
+        module=module,
+    )
 
 
 def test_layout_policy_runtime_config_uses_resnet_e2e_logq_budget() -> None:
@@ -154,8 +479,138 @@ class _FakeDepthModule:
         self.fhe_output_shape = torch.Size((1, 1, 1, int(elements)))
 
 
+class _NativeOutputProbeExecutor:
+    native_halo_output_capable = True
+
+    def __init__(
+        self,
+        module,
+        *,
+        depth: int = 2,
+        output_ct_count: int = 1,
+        tight_output: bool = False,
+    ) -> None:
+        self.module = module
+        self.depth = int(depth)
+        self.native_plan = SimpleNamespace(output_ct_count=int(output_ct_count))
+        self._output_ct_count = int(output_ct_count)
+        self._tight_output = bool(tight_output)
+
+    def _refresh_runtime_plan(self):
+        assert getattr(self.module, "layout_policy_output_materialization") == "native_halo_stripe"
+        self.native_plan = SimpleNamespace(output_ct_count=int(self._output_ct_count))
+        return True
+
+    def _uses_tight_compact_output(self):
+        return bool(self._tight_output)
+
+
+def _assert_native_output_count_map_only_names_native_nodes(compile_plan: dict) -> None:
+    nodes = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
+    counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+    for node in counts:
+        assert str(nodes[str(node)].get("physical_layout", "")) == "native_source_stripe"
+
+
 def _bootstrap_test_dag() -> NetworkDAG:
     return NetworkDAG(SimpleNamespace())
+
+
+def test_producer_native_output_plan_fit_probe_rejects_unsupported_outputs() -> None:
+    layout = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    dag = nx.DiGraph()
+    conv = Conv2d(1, 1, kernel_size=3, padding=1)
+    dag.add_node("conv", module=conv)
+
+    assert not _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+    )
+
+    conv.region_runtime = SimpleNamespace(
+        executor=_NativeOutputProbeExecutor(conv, output_ct_count=1, tight_output=True)
+    )
+    assert not _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+    )
+
+    conv.region_runtime = SimpleNamespace(
+        executor=_NativeOutputProbeExecutor(conv, output_ct_count=2)
+    )
+    assert not _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+    )
+    assert _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+        allow_output_ct_superset=True,
+    )
+
+    conv.region_runtime = SimpleNamespace(
+        executor=_NativeOutputProbeExecutor(conv, output_ct_count=0)
+    )
+    assert not _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+    )
+
+    class _MissingTightOutputProbeExecutor:
+        native_halo_output_capable = True
+
+        def __init__(self, module) -> None:
+            self.module = module
+            self.native_plan = SimpleNamespace(output_ct_count=1)
+
+        def _refresh_runtime_plan(self):
+            assert getattr(self.module, "layout_policy_output_materialization") == "native_halo_stripe"
+            self.native_plan = SimpleNamespace(output_ct_count=1)
+            return True
+
+    conv.region_runtime = SimpleNamespace(executor=_MissingTightOutputProbeExecutor(conv))
+    assert not _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+    )
+
+    conv.region_runtime = SimpleNamespace(
+        executor=_NativeOutputProbeExecutor(conv, output_ct_count=1)
+    )
+    assert _producer_native_output_plan_fits(
+        dag,
+        producer="conv",
+        layout=dict(layout),
+        native_ct_count=1,
+        slots=8,
+    )
+    assert not hasattr(conv, "layout_policy_output_materialization")
 
 
 def _assert_exact_trial_evaluator_matches_solver(dag: NetworkDAG, *, l_eff: int) -> None:
@@ -646,12 +1101,408 @@ def test_layout_policy_no_share_fold_keeps_conservative_boundaries() -> None:
     raw_input_rows = [row for row in plan["edge_layouts"] if row["source"] == "x"]
     assert raw_input_rows
     assert all(row["physical_layout"] == "packed_compact" for row in raw_input_rows)
+    enc1a_input = next(row for row in raw_input_rows if row["target"] == "enc1a")
+    enc1a_layout = dict(enc1a_input["selected_layout"])
+    assert int(enc1a_layout["top_beta"]) == 2
+    assert int(enc1a_layout["bottom_beta"]) == 2
+    assert int(enc1a_layout["physical_top_beta"]) == 0
+    assert int(enc1a_layout["physical_bottom_beta"]) == 0
+    assert bool(enc1a_layout["boundary_pruned"]) is True
+    assert enc1a_input["source_physical_layout"] == "packed_compact"
+    assert enc1a_input["layout_mode"] == "halo_local"
+    assert bool(enc1a_input["relayout"]) is False
+    assert bool(enc1a_input["consumer_fused_relayout"]) is False
 
     native_rows = [row for row in plan["edge_layouts"] if row["physical_layout"] == "native_source_stripe"]
     assert native_rows
     assert all(row["source"] != "x" for row in native_rows)
     assert all(row["provider_lt_grouping_mode"] == "individual" for row in native_rows)
     assert all(row["native_halo_channel_fold_mode"] == "per_stripe" for row in native_rows)
+
+
+def test_dp_no_share_fold_native_edges_have_materialized_boundary_pruned_sources() -> None:
+    plan = build_layout_policy_compile_plan(
+        _build_u23_dim8_192_dag(),
+        policy="dp_no_share_fold",
+    )
+
+    assert plan["validation"]["ok"] is True
+    edges = {str(row["edge"]): row for row in plan["edge_layouts"]}
+    nodes = {str(row["node"]): row for row in plan["node_layouts"]}
+
+    for edge_id, source in {
+        "enc1a_act->enc1b": "enc1a_act",
+        "pool1->enc2a": "pool1",
+        "enc2a_act->enc2b": "enc2a_act",
+        "pool2->enc3a": "pool2",
+        "enc3a_act->enc3b": "enc3a_act",
+    }.items():
+        row = edges[edge_id]
+        layout = dict(row["selected_layout"])
+        source_layout = dict(row["source_layout"])
+        source_row = nodes[source]
+        source_output_layout = dict(source_row["selected_layout"])
+
+        assert row["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["target_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert bool(row["relayout"]) is False
+        assert bool(row["producer_materialized_native_source_stripe"]) is True
+        assert int(layout["top_beta"]) >= 1
+        assert int(layout["bottom_beta"]) >= 1
+        assert int(layout["physical_top_beta"]) == 0
+        assert int(layout["physical_bottom_beta"]) == 0
+        assert int(source_layout["top_beta"]) == int(layout["top_beta"])
+        assert int(source_layout["bottom_beta"]) == int(layout["bottom_beta"])
+        assert int(source_layout["physical_top_beta"]) == 0
+        assert int(source_layout["physical_bottom_beta"]) == 0
+
+        assert source_row["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert bool(source_row["producer_materialized_native_source_stripe"]) is True
+        assert int(source_output_layout["top_beta"]) == int(layout["top_beta"])
+        assert int(source_output_layout["bottom_beta"]) == int(layout["bottom_beta"])
+        assert int(source_output_layout["physical_top_beta"]) == 0
+        assert int(source_output_layout["physical_bottom_beta"]) == 0
+        assert int(source_row["native_output_ct_count_estimate"]) == int(
+            row["native_input_ct_count_estimate"]
+        )
+
+    for edge_id, producer in {
+        "enc1a->enc1a_act": "enc1a",
+        "enc2a->enc2a_act": "enc2a",
+        "enc3a->enc3a_act": "enc3a",
+    }.items():
+        row = edges[edge_id]
+        producer_row = nodes[producer]
+        assert row["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["target_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert bool(row["relayout"]) is False
+        assert producer_row["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert bool(producer_row["producer_materialized_native_source_stripe"]) is True
+        assert int(producer_row["native_output_ct_count_estimate"]) == int(
+            row["native_input_ct_count_estimate"]
+        )
+
+
+def test_native_output_module_apply_uses_physical_beta_for_boundary_pruned_offset() -> None:
+    module = SimpleNamespace()
+    dag = nx.DiGraph()
+    dag.add_node("act", module=module)
+    compile_plan = {
+        "slots": 32768,
+        "edge_layouts": [],
+        "node_layouts": [
+            {
+                "node": "act",
+                "shape": [1, 8, 96, 96],
+                "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "selected_layout": {
+                    "top_beta": 1,
+                    "bottom_beta": 1,
+                    "physical_top_beta": 0,
+                    "physical_bottom_beta": 0,
+                    "stride": 1,
+                    "gap": 2,
+                    "tile_count": 3,
+                },
+                "native_output_ct_count_estimate": 3,
+                "producer_materialized_native_source_stripe": True,
+            },
+        ],
+    }
+
+    snapshot = _apply_layout_policy_module_output_layouts(dag, compile_plan)
+
+    assert module.layout_policy_output_materialization == "native_halo_stripe"
+    assert module.layout_policy_output_layout["top_beta"] == 1
+    assert module.layout_policy_output_layout["physical_top_beta"] == 0
+    assert int(module.layout_policy_output_row_offset) == 0
+    assert tuple(int(value) for value in module.fhe_output_shape) == (3, 32768)
+
+    restore_layout_policy_compile_plan(dag, compile_plan, module_layout_snapshot=snapshot)
+    assert not hasattr(module, "layout_policy_output_layout")
+    assert not hasattr(module, "layout_policy_output_row_offset")
+    assert not hasattr(module, "layout_policy_output_materialization")
+
+
+def test_backend_producer_attach_keeps_native_output_ct_shape_for_native_stripe() -> None:
+    conv = Conv2d(8, 8, kernel_size=3, padding=1)
+    conv.output_shape = torch.Size((1, 8, 192, 192))
+    conv.fhe_output_shape = torch.Size((1, 8, 192, 192))
+    conv.output_gap = 1
+    dag = nx.DiGraph()
+    dag.add_node("conv", module=conv)
+    compile_plan = {
+        "slots": 32768,
+        "edge_layouts": [],
+        "node_layouts": [
+            {
+                "node": "conv",
+                "shape": [1, 8, 192, 192],
+                "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "selected_layout": {
+                    "top_beta": 1,
+                    "bottom_beta": 1,
+                    "physical_top_beta": 0,
+                    "physical_bottom_beta": 0,
+                    "stride": 1,
+                    "gap": 1,
+                    "tile_count": 9,
+                },
+                "native_output_ct_count_estimate": 10,
+                "producer_materialized_native_source_stripe": True,
+            },
+        ],
+    }
+
+    attached = _layout_policy_attach_backend_producer_outputs(
+        dag,
+        compile_plan,
+        provider_nodes=set(),
+    )
+
+    assert attached
+    assert conv.layout_policy_output_materialization == "native_halo_stripe"
+    assert conv.layout_policy_output_layout["top_beta"] == 1
+    assert conv.layout_policy_output_layout["physical_top_beta"] == 0
+    assert int(conv.layout_policy_output_row_offset) == 0
+    assert tuple(int(value) for value in conv.fhe_output_shape) == (10, 32768)
+    assert attached[0]["fhe_output_shape"] == [10, 32768]
+
+
+def test_backend_producer_attach_carries_native_output_through_activation() -> None:
+    act = SiLU(degree=7)
+    act.output_shape = torch.Size((1, 8, 192, 192))
+    act.fhe_output_shape = torch.Size((1, 8, 192, 192))
+    dag = nx.DiGraph()
+    dag.add_node("act", module=act)
+    compile_plan = {
+        "slots": 32768,
+        "edge_layouts": [],
+        "node_layouts": [
+            {
+                "node": "act",
+                "shape": [1, 8, 192, 192],
+                "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "selected_layout": {
+                    "top_beta": 1,
+                    "bottom_beta": 1,
+                    "physical_top_beta": 0,
+                    "physical_bottom_beta": 0,
+                    "stride": 1,
+                    "gap": 1,
+                    "tile_count": 9,
+                },
+                "native_physical_output_ct_count": 10,
+                "producer_materialized_native_source_stripe": True,
+            },
+        ],
+    }
+
+    attached = _layout_policy_attach_backend_producer_outputs(
+        dag,
+        compile_plan,
+        provider_nodes=set(),
+    )
+
+    assert attached
+    assert act.layout_policy_output_materialization == "native_halo_stripe"
+    assert act.layout_policy_output_layout["top_beta"] == 1
+    assert act.layout_policy_output_layout["physical_top_beta"] == 0
+    assert int(act.layout_policy_output_row_offset) == 0
+    assert tuple(int(value) for value in act.fhe_output_shape) == (10, 32768)
+
+
+def test_concat_boundary_pruned_native_output_bias_matches_native_stripe_chunks() -> None:
+    spec = NativeHaloConv2DSpec(
+        family_label="concat_native_bias_test",
+        c_in=8,
+        h_in=192,
+        w_in=192,
+        c_out=8,
+        h_out=192,
+        w_out=192,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        dilation=1,
+        groups=1,
+        slot_count=32768,
+        input_top_beta=1,
+        input_bottom_beta=1,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        input_physical_top_beta=0,
+        input_physical_bottom_beta=0,
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    bias = torch.linspace(-0.5, 0.5, steps=8, dtype=torch.float32)
+    module = SimpleNamespace(
+        output_shape=torch.Size((1, 8, 192, 192)),
+        fhe_output_shape=torch.Size((10, 32768)),
+        output_gap=1,
+        on_bias=bias,
+        layout_policy_output_layout={
+            "top_beta": 1,
+            "bottom_beta": 1,
+            "physical_top_beta": 0,
+            "physical_bottom_beta": 0,
+            "gap": 1,
+        },
+        layout_policy_output_materialization="native_halo_stripe",
+    )
+    executor = NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="concat_native_bias_test",
+    )
+    executor.bias_vector = bias
+    conv = Conv2d(8, 8, kernel_size=3, padding=1)
+    conv.output_shape = module.output_shape
+    conv.output_gap = 1
+    conv.on_bias = bias
+    conv._concat_native_output_plan = executor.native_plan
+    conv._concat_unified_output_ct_count = int(executor.rows)
+
+    actual = conv._concat_native_output_bias(
+        {"layout_policy_output_materialization": "native_halo_stripe"}
+    )
+    expected = torch.stack(
+        [
+            executor._bias_chunk(block_index=int(index))
+            for index in range(int(executor.rows))
+        ]
+    )
+
+    assert actual is not None
+    assert tuple(int(value) for value in actual.shape) == (int(executor.rows), 32768)
+    assert int(executor.rows) == int(sum(executor.native_plan.target_channel_group_counts))
+    assert int(executor.rows) > int(executor.native_plan.output_ct_count)
+    assert torch.equal(actual, expected)
+
+
+def test_concat_native_output_single_slot_diagonal_proxy_keeps_real_native_shape() -> None:
+    conv = Conv2d(8, 8, kernel_size=3, padding=1)
+    conv.output_shape = torch.Size((1, 8, 192, 192))
+    conv.fhe_output_shape = torch.Size((16, 32768))
+    conv.output_gap = 1
+    conv.scheme = SimpleNamespace()
+    conv.level = 5
+    conv.bsgs_ratio = 1.0
+    conv.layout_policy_input_layout = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "gap": 1,
+    }
+    conv.layout_policy_output_layout = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "gap": 1,
+    }
+    conv.layout_policy_output_materialization = "native_halo_stripe"
+    native_attrs = conv._concat_output_layout_attrs()
+
+    dense_proxy_attrs = conv._concat_dense_proxy_output_attrs_for_diagonal_cache(native_attrs)
+    proxy = conv._concat_source_proxy(
+        {
+            "shape": [1, 8, 192, 192],
+            "fhe_shape": [1, 8, 192, 192],
+            "channels": 8,
+            "gap": 1,
+        },
+        weight=torch.zeros((8, 8, 3, 3), dtype=torch.float32),
+        name="concat_proxy",
+        output_attrs=dense_proxy_attrs,
+    )
+
+    assert tuple(int(value) for value in conv._concat_effective_fhe_output_shape(native_attrs)) == (16, 32768)
+    assert tuple(int(value) for value in proxy.fhe_output_shape) == (1, 8, 192, 192)
+    assert proxy.layout_policy_output_materialization == ""
+
+
+def test_layout_policy_source_transitive_input_candidate_is_guarded() -> None:
+    conv = Conv2d(1, 1, kernel_size=3, padding=1)
+    source_edge = _manual_edge("x", "conv1", module=conv)
+    output_edge = _manual_edge("conv1", "conv2", beta=1, module=conv)
+
+    assert (
+        _source_transitive_input_layout_candidates(
+            (source_edge,),
+            edges_by_source=None,
+            slots=1024,
+        )
+        == ()
+    )
+
+    candidates = _source_transitive_input_layout_candidates(
+        (source_edge,),
+        edges_by_source={"conv1": [output_edge]},
+        slots=1024,
+    )
+
+    assert candidates
+    candidate = candidates[0]
+    assert int(candidate.top_beta) == 2
+    assert int(candidate.bottom_beta) == 2
+    assert int(candidate.physical_top_beta) == 0
+    assert int(candidate.physical_bottom_beta) == 0
+    assert bool(candidate.boundary_pruned) is True
+
+    non_external_source_edge = _manual_edge("input", "conv1", module=conv)
+    assert (
+        _source_transitive_input_layout_candidates(
+            (non_external_source_edge,),
+            edges_by_source={"conv1": [output_edge]},
+            slots=1024,
+        )
+        == ()
+    )
+    zero_demand_output = _manual_edge("conv1", "conv2", beta=0, module=conv)
+    assert (
+        _source_transitive_input_layout_candidates(
+            (source_edge,),
+            edges_by_source={"conv1": [zero_demand_output]},
+            slots=1024,
+        )
+        == ()
+    )
+
+    other_source_edge = _manual_edge("x", "side", module=conv)
+    assert (
+        _source_transitive_input_layout_candidates(
+            (source_edge, other_source_edge),
+            edges_by_source={"conv1": [output_edge]},
+            slots=1024,
+        )
+        == ()
+    )
+    compact_fit_source = _manual_edge("x", "conv1", shape=(1, 1, 8, 8), module=conv)
+    compact_fit_output = _manual_edge("conv1", "conv2", shape=(1, 1, 8, 8), beta=1, module=conv)
+    assert (
+        _source_transitive_input_layout_candidates(
+            (compact_fit_source,),
+            edges_by_source={"conv1": [compact_fit_output]},
+            slots=1024,
+        )
+        == ()
+    )
+    second_output = _manual_edge("conv1", "side_consumer", beta=1, module=conv)
+    assert (
+        _source_transitive_input_layout_candidates(
+            (source_edge,),
+            edges_by_source={"conv1": [output_edge, second_output]},
+            slots=1024,
+        )
+        == ()
+    )
 
 
 def test_layout_policy_no_share_fold_native_rotation_estimate_uses_c_only_plan() -> None:
@@ -722,12 +1573,14 @@ def test_layout_policy_no_share_fold_native_rotation_estimate_uses_c_only_plan()
         assert row["native_halo_plan_channel_fold_mode"] == "per_stripe"
         assert row["native_halo_rotation_mode"] == "c_only"
         assert row["native_halo_rotation_exact_compact_output"] is True
-        assert int(row["planner_rotation_cost_estimate"]) == int(compact_stats.c_only_rotations)
-        assert int(row["lt_bsgs_rotation_estimate"]) == int(compact_stats.c_only_rotations)
-        assert int(row["native_c_only_rotation_estimate"]) == int(compact_stats.c_only_rotations)
-        assert int(row["native_cb_shared_rotation_estimate"]) == int(compact_stats.cb_shared_rotations)
+        assert int(row["planner_rotation_cost_estimate"]) == int(native_plan.c_only_rotations)
+        assert int(row["lt_bsgs_rotation_estimate"]) == int(native_plan.c_only_rotations)
+        assert int(row["native_c_only_rotation_estimate"]) == int(native_plan.c_only_rotations)
+        assert int(row["native_cb_shared_rotation_estimate"]) == int(native_plan.cb_shared_rotations)
         assert int(row["native_plan_c_only_rotation_estimate"]) == int(native_plan.c_only_rotations)
         assert int(row["native_plan_cb_shared_rotation_estimate"]) == int(native_plan.cb_shared_rotations)
+        assert int(row["native_compact_output_c_only_rotation_estimate"]) == int(compact_stats.c_only_rotations)
+        assert int(row["native_compact_output_cb_shared_rotation_estimate"]) == int(compact_stats.cb_shared_rotations)
 
 
 def test_native_halo_closed_form_diag_sets_match_torch_oracle() -> None:
@@ -955,8 +1808,8 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
         group.plan["provider_materializer"]
         for group in registry.groups
     } >= {
-        "u22_input_pair_conv_shared_rotations",
-        "u22_pool_input_pair_shared_rotations",
+        "native_halo_stripe_no_ri_conv2d",
+        "native_halo_stripe_no_ri_avgpool2d",
     }
     excluded = {row["node"]: row["reason"] for row in audit["graph_audit"]["excluded_nodes"]}
     assert {node: excluded[node] for node in ("up4", "up3", "up2", "up1")} == {
@@ -989,10 +1842,7 @@ def test_non_dp_layout_policy_eager_wraps_provider_with_relayout_depth() -> None
     assert {
         type(group.executor.base_executor).__name__
         for group in registry.groups
-    } >= {
-        "InputPairConvRuntimeExecutor",
-        "HaloLocalConvRuntimeExecutor",
-    }
+    } == {"HaloLocalConvRuntimeExecutor"}
     excluded = {row["node"]: row["reason"] for row in registry.graph_audit["excluded_nodes"]}
     assert {node: excluded[node] for node in ("up4", "up3", "up2", "up1")} == {
         node: "tconv_uses_common_dense_path" for node in ("up4", "up3", "up2", "up1")
@@ -1414,6 +2264,148 @@ def test_layout_policy_provider_rejects_lattigo_slot_mismatch() -> None:
 
     with pytest.raises(RuntimeError, match="32768 slots.*4096 slots"):
         executor.compile(fake_scheme)
+
+
+def test_layout_policy_provider_falls_back_for_unresolved_native_source_relayout() -> None:
+    beta1_gap8 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 8,
+        "core_slots": 128,
+        "stored_slots": 128,
+        "tile_count": 3,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 32768,
+        "edge_layouts": [
+            {
+                "edge": "cat->dec4a",
+                "source": "cat",
+                "target": "dec4a",
+                "op_kind": "conv2d",
+                "shape": [1, 2, 4, 4],
+                "fhe_shape": [1, 1, 32, 32],
+                "source_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 8, "tile_count": 2},
+                "selected_layout": dict(beta1_gap8),
+                "target_layout": dict(beta1_gap8),
+                "required_layout": dict(beta1_gap8),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "relayout": True,
+            }
+        ],
+        "node_layouts": [
+            {
+                "node": "dec4a",
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 8, "tile_count": 2},
+                "physical_layout": "packed_compact",
+            }
+        ],
+    }
+    base_executor = SimpleNamespace(
+        module=SimpleNamespace(input_gap=1, depth=3, fhe_output_shape=torch.Size([1, 1, 4, 4])),
+        native_halo_input_capable=True,
+        supports_scheme=lambda _scheme: True,
+    )
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="dec4a",
+        compile_plan=compile_plan,
+    )
+    assert not executor.native_physical_relayout_rows
+    assert executor.unsupported_layout_policy_reason == "layout_policy_unresolved_native_source_relayout"
+    assert executor.supports_scheme(SimpleNamespace(params=SimpleNamespace(get_backend=lambda: "clear_lattigo"))) is False
+
+    group = RegionFirstRuntimeGroup(
+        region_id="dec4a",
+        network="u22",
+        stage="layout_policy_conv",
+        module_prefix="dec4a",
+        conv_nodes=("dec4a",),
+        strategy="provider",
+        materializer="native",
+        depth=3,
+        solver_depth=3,
+        boundary_actions=(),
+        expected_stats={},
+        executable=True,
+        fallback_reason="",
+        executor=base_executor,
+        plan={},
+    )
+    wrapped = _layout_policy_wrap_provider_group(group, compile_plan=compile_plan)
+    assert wrapped.executable is False
+    assert wrapped.executor is None
+    assert wrapped.fallback_reason == "layout_policy_unresolved_native_source_relayout"
+    assert wrapped.plan["runtime_lowering"] == "provider_fallback+layout_policy_unsupported"
+    assert wrapped.plan["layout_policy_solver_depth_only"] is True
+
+    class _DepthProbe:
+        def __init__(self) -> None:
+            self.depth = 99
+
+        def set_depth(self, value: int) -> None:
+            self.depth = int(value)
+
+    depth_probe = _DepthProbe()
+    dag = nx.DiGraph()
+    dag.add_node("dec4a", module=depth_probe)
+    attach_audit = U22CompileRegistry(groups=(wrapped,), graph_audit={}).attach_to_dag(dag)
+    assert attach_audit["attached"][0]["executable"] is False
+    assert attach_audit["attached"][0]["solver_depth_only"] is True
+    assert depth_probe.region_first_skip_dense_pack is False
+    assert int(depth_probe.depth) == int(wrapped.effective_depth())
+
+
+def test_layout_policy_provider_rejects_concat_compact_source_without_layout_aware_materializer() -> None:
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 48,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "edge_layouts": [
+            {
+                "edge": "cat->conv",
+                "source": "cat",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 2, 4, 4],
+                "source_layout": dict(beta1),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "physical_layout": "logical_halo_compact",
+                "source_physical_layout": "logical_halo_compact",
+                "target_physical_layout": "logical_halo_compact",
+                "layout_mode": "concat_output_compact_halo_shared",
+                "concat_output_beta_lift": True,
+                "relayout": False,
+            }
+        ],
+        "node_layouts": [],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    assert executor.compact_source_rows
+    assert (
+        executor.unsupported_layout_policy_reason
+        == "layout_policy_concat_compact_source_requires_layout_aware_materializer"
+    )
+    assert executor.supports_scheme(SimpleNamespace(params=SimpleNamespace(get_backend=lambda: "clear_lattigo"))) is False
 
 
 def test_bootstrap_layout_compression_rewrites_profitable_layout_policy_boundary() -> None:
@@ -2018,6 +3010,7 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
         "policy": "dp_no_share_fold",
         "slots": 8,
         "summary": {},
+        "_native_physical_output_ct_counts": {str(producer_name): 1, "conv1": 1, "act": 1},
         "edge_layouts": [
             {
                 "edge": f"{producer_name}->conv1",
@@ -2078,6 +3071,8 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
                 "selected_layout": dict(compact),
                 "compact_layout": dict(compact),
                 "physical_layout": "packed_compact",
+                "native_physical_output_ct_count": 1,
+                "layout_policy_output_materialization": "native_halo_stripe",
             },
             {
                 "node": "conv1",
@@ -2086,6 +3081,8 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
                 "selected_layout": dict(compact),
                 "compact_layout": dict(compact),
                 "physical_layout": "packed_compact",
+                "native_physical_output_ct_count": 1,
+                "layout_policy_output_materialization": "native_halo_stripe",
             },
             {
                 "node": "act",
@@ -2094,6 +3091,8 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
                 "selected_layout": dict(compact),
                 "compact_layout": dict(compact),
                 "physical_layout": "packed_compact",
+                "native_physical_output_ct_count": 1,
+                "layout_policy_output_materialization": "native_halo_stripe",
             },
             {
                 "node": "conv2",
@@ -2117,6 +3116,9 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
     executor.relayout_rows = ()
     executor.output_relayout_rows = ()
     conv1 = Conv2d(1, 1, kernel_size=3, padding=1)
+    conv1.region_runtime = SimpleNamespace(
+        executor=_NativeOutputProbeExecutor(conv1, output_ct_count=1)
+    )
     act = SiLU(degree=7)
     conv2 = Conv2d(1, 1, kernel_size=3, padding=1)
     producer_module.region_runtime = SimpleNamespace(executor=executor)
@@ -2157,9 +3159,18 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
     assert nodes["act"]["selected_layout"]["top_beta"] == 1
     assert edges[f"{producer_name}->conv1"]["relayout"] is False
     assert edges[f"{producer_name}->conv1"]["physical_layout"] == "logical_halo_compact"
+    assert edges[f"{producer_name}->conv1"]["layout_mode"] == "compact_halo_shared"
+    assert not bool(edges[f"{producer_name}->conv1"].get("native_compact_source_fused", False))
+    assert nodes["conv1"]["physical_layout"] == "logical_halo_compact"
+    assert nodes["act"]["physical_layout"] == "logical_halo_compact"
     assert edges["conv1->act"]["physical_layout"] == "logical_halo_compact"
     assert edges["act->conv2"]["relayout"] is False
     assert edges["act->conv2"]["physical_layout"] == "logical_halo_compact"
+    assert "native_physical_output_ct_count" not in nodes["conv1"]
+    assert "native_physical_output_ct_count" not in nodes["act"]
+    assert "native_physical_output_ct_count" not in nodes[str(producer_name)]
+    _assert_native_output_count_map_only_names_native_nodes(updated)
+    assert not updated.get("_native_physical_output_ct_counts", {})
 
 
 def test_bootstrap_aware_refinement_rejects_transitive_mvm_beta_lift_gap_mismatch() -> None:
@@ -3075,6 +4086,365 @@ def test_bootstrap_aware_refinement_lifts_conv_to_conv_boot_boundary() -> None:
     assert not executor.native_physical_relayout_rows
 
 
+def test_bootstrap_refinement_keeps_no_share_native_stripe_conv_edge() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 8,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "conv1->conv2",
+                "source": "conv1",
+                "target": "conv2",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+                "relayout": True,
+                "relayout_reason": "dp_native_source_stripe_relayout",
+                "relayout_depth_estimate": 1,
+            }
+        ],
+        "node_layouts": [
+            {
+                "node": node,
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            }
+            for node in ("conv1", "conv2")
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(depth=2)),
+        output_node_id="conv2",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][0]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    conv1 = Conv2d(1, 1, kernel_size=3, padding=1)
+    conv1.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("conv1", module=conv1)
+    dag.add_node("conv2", module=Conv2d(1, 1, kernel_size=3, padding=1))
+    dag.add_edge("conv1", "conv2")
+
+    audit = apply_bootstrap_aware_layout_refinement(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "conv1", "target": "conv2"}]},
+    )
+
+    edge = executor.compile_plan["edge_layouts"][0]
+    assert audit["enabled"] is False
+    assert edge["physical_layout"] == "native_source_stripe"
+    assert edge["target_physical_layout"] == "native_source_stripe"
+    assert edge["relayout"] is True
+    assert executor.native_physical_relayout_rows
+
+
+def test_bootstrap_aware_refinement_lifts_activation_chain_to_true_native_output() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 64,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "conv1->act",
+                "source": "conv1",
+                "target": "act",
+                "op_kind": "silu",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(compact),
+                "target_layout": dict(compact),
+                "required_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "packed_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "act->conv2",
+                "source": "act",
+                "target": "conv2",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+                "native_input_ct_count_estimate": 2,
+                "relayout": True,
+                "relayout_reason": "dp_native_source_stripe_relayout",
+                "relayout_depth_estimate": 1,
+                "relayout_rotation_estimate": 11,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": node,
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            }
+            for node in ("conv1", "act", "conv2")
+        ],
+    }
+    base_executor = SimpleNamespace(
+        module=SimpleNamespace(depth=2, input_gap=1),
+        native_halo_input_capable=True,
+        native_halo_output_capable=True,
+        native_plan=SimpleNamespace(input_ct_count=2),
+    )
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="conv2",
+        compile_plan=compile_plan,
+    )
+    assert executor.native_physical_relayout_rows
+    conv1 = Conv2d(1, 1, kernel_size=3, padding=1)
+
+    class _NativeOutputProbeExecutor:
+        native_halo_output_capable = True
+
+        def __init__(self, module):
+            self.module = module
+            self.native_plan = SimpleNamespace(output_ct_count=1)
+
+        def _refresh_runtime_plan(self):
+            assert getattr(self.module, "layout_policy_output_materialization") == "native_halo_stripe"
+            self.native_plan = SimpleNamespace(output_ct_count=2)
+            return True
+
+        def _uses_tight_compact_output(self):
+            return False
+
+    conv1.region_runtime = SimpleNamespace(executor=_NativeOutputProbeExecutor(conv1))
+    act = SiLU(degree=7)
+    conv2 = Conv2d(1, 1, kernel_size=3, padding=1)
+    conv2.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("conv1", module=conv1)
+    dag.add_node("act", module=act)
+    dag.add_node("conv2", module=conv2)
+    dag.add_node("boot_src", module=SimpleNamespace(depth=1))
+    dag.add_node("boot_tgt", module=SimpleNamespace(depth=1))
+    dag.add_edge("conv1", "act")
+    dag.add_edge("act", "conv2")
+    dag.add_edge("boot_src", "boot_tgt")
+
+    first_pass_audit = {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]}
+    enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(dag, first_pass_audit)
+    native_candidates = [
+        row for row in enumeration["candidates"] if row["strategy"] == "local_activation_native_output_beta_lift"
+    ]
+    audit = apply_bootstrap_aware_layout_refinement(dag, first_pass_audit)
+    updated = executor.compile_plan
+    nodes = {str(row["node"]): dict(row) for row in updated["node_layouts"]}
+    edges = {str(row["edge"]): dict(row) for row in updated["edge_layouts"]}
+
+    assert len(native_candidates) == 1
+    assert audit["enabled"] is True
+    assert audit["strategy"] == "local_activation_native_output_beta_lift"
+    assert audit["require_bootstrap_count_unchanged"] is True
+    assert audit["require_bootstrap_shape_nonincrease"] is True
+    assert nodes["conv1"]["physical_layout"] == "native_source_stripe"
+    assert nodes["act"]["physical_layout"] == "native_source_stripe"
+    assert nodes["conv1"]["layout_policy_output_materialization"] == "native_halo_stripe"
+    assert nodes["act"]["layout_policy_output_materialization"] == "native_halo_stripe"
+    assert updated["_native_physical_output_ct_counts"]["act"] == 2
+    assert updated["_native_physical_output_ct_counts"]["conv1"] == 2
+    assert edges["conv1->act"]["physical_layout"] == "native_source_stripe"
+    assert edges["conv1->act"]["source_physical_layout"] == "native_source_stripe"
+    assert edges["act->conv2"]["physical_layout"] == "native_source_stripe"
+    assert edges["act->conv2"]["source_physical_layout"] == "native_source_stripe"
+    assert edges["act->conv2"]["target_physical_layout"] == "native_source_stripe"
+    assert edges["act->conv2"]["layout_mode"] == "native_halo_stripe"
+    assert edges["act->conv2"]["relayout"] is False
+    assert edges["act->conv2"]["consumer_fused_relayout"] is False
+    assert not executor.native_physical_relayout_rows
+    assert tuple(int(value) for value in act.fhe_output_shape) == (2, 64)
+    assert act.layout_policy_output_materialization == "native_halo_stripe"
+
+
+def test_bootstrap_aware_refinement_rejects_native_output_when_producer_cannot_emit_native() -> None:
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 64,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "conv1->act",
+                "source": "conv1",
+                "target": "act",
+                "op_kind": "silu",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(compact),
+                "target_layout": dict(compact),
+                "required_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "packed_compact",
+                "relayout": False,
+            },
+            {
+                "edge": "act->conv2",
+                "source": "act",
+                "target": "conv2",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "required_layout": dict(beta1),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+                "native_input_ct_count_estimate": 2,
+                "relayout": True,
+                "relayout_reason": "dp_native_source_stripe_relayout",
+                "relayout_depth_estimate": 1,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": node,
+                "shape": [1, 1, 4, 4],
+                "fhe_shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            }
+            for node in ("conv1", "act", "conv2")
+        ],
+    }
+    base_executor = SimpleNamespace(
+        module=SimpleNamespace(depth=2, input_gap=1),
+        native_halo_input_capable=True,
+        native_halo_output_capable=True,
+        native_plan=SimpleNamespace(input_ct_count=2),
+    )
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=base_executor,
+        output_node_id="conv2",
+        compile_plan=compile_plan,
+    )
+    executor.native_physical_relayout_rows = (dict(compile_plan["edge_layouts"][1]),)
+    executor.relayout_rows = ()
+    executor.output_relayout_rows = ()
+    conv2 = Conv2d(1, 1, kernel_size=3, padding=1)
+    conv2.region_runtime = SimpleNamespace(executor=executor)
+
+    dag = nx.DiGraph()
+    dag.add_node("conv1", module=Conv2d(1, 1, kernel_size=3, padding=1))
+    dag.add_node("act", module=SiLU(degree=7))
+    dag.add_node("conv2", module=conv2)
+    dag.add_node("boot_src", module=SimpleNamespace(depth=1))
+    dag.add_node("boot_tgt", module=SimpleNamespace(depth=1))
+    dag.add_edge("conv1", "act")
+    dag.add_edge("act", "conv2")
+    dag.add_edge("boot_src", "boot_tgt")
+
+    audit = apply_bootstrap_aware_layout_refinement(
+        dag,
+        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+    )
+
+    assert audit["enabled"] is False
+    assert audit["reason"] == "no_supported_boot_interval_native_physical_relayout"
+    assert executor.compile_plan["edge_layouts"][1]["source_physical_layout"] == "packed_compact"
+    assert executor.native_physical_relayout_rows
+
+
 def test_bootstrap_aware_refinement_lifts_local_activation_tail_cleanup() -> None:
     compact = {"top_beta": 0, "bottom_beta": 0, "stride": 1, "gap": 1, "core_slots": 16, "stored_slots": 16, "tile_count": 1}
     beta1 = {
@@ -3161,9 +4531,10 @@ def test_bootstrap_aware_refinement_lifts_local_activation_tail_cleanup() -> Non
     dag.add_edge("act", "conv2")
     dag.add_edge("boot_src", "boot_tgt")
 
+    first_pass_audit = {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]}
     enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(
         dag,
-        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+        first_pass_audit,
     )
     local_candidates = [
         row for row in enumeration["candidates"] if row["strategy"] == "local_activation_beta_lift"
@@ -3171,7 +4542,7 @@ def test_bootstrap_aware_refinement_lifts_local_activation_tail_cleanup() -> Non
 
     audit = apply_bootstrap_aware_layout_refinement(
         dag,
-        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+        first_pass_audit,
     )
     updated = executor.compile_plan
     nodes = {str(row["node"]): dict(row) for row in updated["node_layouts"]}
@@ -3477,8 +4848,6 @@ def test_bootstrap_aware_refinement_lifts_concat_output_for_local_conv_consumer(
                 "physical_layout": "native_source_stripe",
                 "source_physical_layout": "packed_compact",
                 "target_physical_layout": "native_source_stripe",
-                "provider_lt_grouping_mode": "individual",
-                "native_halo_channel_fold_mode": "per_stripe",
                 "relayout": False,
                 "relayout_reason": "native_halo_physical_source_stripe_relayout",
             },
@@ -3600,6 +4969,7 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
         "policy": "dp_no_share_fold",
         "slots": 8,
         "summary": {},
+        "_native_physical_output_ct_counts": {"cat": 1, "conv1": 1, "act": 1},
         "edge_layouts": [
             {
                 "edge": "skip->cat",
@@ -3647,8 +5017,6 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
                 "physical_layout": "native_source_stripe",
                 "source_physical_layout": "packed_compact",
                 "target_physical_layout": "native_source_stripe",
-                "provider_lt_grouping_mode": "individual",
-                "native_halo_channel_fold_mode": "per_stripe",
                 "relayout": False,
                 "relayout_reason": "native_halo_physical_source_stripe_relayout",
             },
@@ -3682,8 +5050,6 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
                 "physical_layout": "native_source_stripe",
                 "source_physical_layout": "logical_halo_compact",
                 "target_physical_layout": "native_source_stripe",
-                "provider_lt_grouping_mode": "individual",
-                "native_halo_channel_fold_mode": "per_stripe",
                 "relayout": False,
                 "relayout_reason": "native_halo_physical_source_stripe_relayout",
             },
@@ -3698,6 +5064,8 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
                 "physical_layout": "packed_compact",
                 "output_relayout": False,
                 "producer_materialized_halo": False,
+                "native_physical_output_ct_count": 1,
+                "layout_policy_output_materialization": "native_halo_stripe",
             },
             {
                 "node": "conv1",
@@ -3708,6 +5076,8 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
                 "physical_layout": "logical_halo_compact",
                 "output_relayout": False,
                 "producer_materialized_halo": True,
+                "native_physical_output_ct_count": 1,
+                "layout_policy_output_materialization": "native_halo_stripe",
             },
             {
                 "node": "act",
@@ -3718,6 +5088,8 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
                 "physical_layout": "logical_halo_compact",
                 "output_relayout": False,
                 "producer_materialized_halo": True,
+                "native_physical_output_ct_count": 1,
+                "layout_policy_output_materialization": "native_halo_stripe",
             },
             {
                 "node": "conv2",
@@ -3731,15 +5103,18 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
             },
         ],
     }
+    conv1 = Conv2d(2, 1, kernel_size=3, padding=1)
     executor = LayoutPolicyProviderRuntimeExecutor(
-        base_executor=SimpleNamespace(module=SimpleNamespace(depth=3)),
+        base_executor=_NativeOutputProbeExecutor(conv1, depth=3, output_ct_count=1),
         output_node_id="conv1",
         compile_plan=compile_plan,
     )
-    executor.native_physical_relayout_rows = ()
+    executor.native_physical_relayout_rows = (
+        dict(compile_plan["edge_layouts"][2]),
+        dict(compile_plan["edge_layouts"][4]),
+    )
     executor.relayout_rows = ()
     executor.output_relayout_rows = ()
-    conv1 = Conv2d(2, 1, kernel_size=3, padding=1)
     conv1.region_runtime = SimpleNamespace(executor=executor)
 
     dag = nx.DiGraph()
@@ -3760,9 +5135,18 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
     dag.add_edge("act", "conv2")
     dag.add_edge("boot_src", "boot_tgt")
 
-    audit = apply_bootstrap_aware_layout_refinement(
+    first_pass_audit = {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]}
+    enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(dag, first_pass_audit)
+    local_concat_candidates = [
+        dict(row)
+        for row in enumeration["candidates"]
+        if row["strategy"] == "local_concat_transitive_beta_lift"
+    ]
+    assert len(local_concat_candidates) == 1
+    audit = apply_bootstrap_aware_layout_refinement_candidate(
         dag,
-        {"bootstrap_count": 1, "boot_edges": [{"source": "boot_src", "target": "boot_tgt"}]},
+        local_concat_candidates[0],
+        first_pass_audit=first_pass_audit,
     )
     updated = executor.compile_plan
     nodes = {str(row["node"]): dict(row) for row in updated["node_layouts"]}
@@ -3781,9 +5165,17 @@ def test_bootstrap_aware_refinement_lifts_local_concat_output_through_activation
     assert nodes["conv1"]["selected_layout"]["top_beta"] == 1
     assert nodes["act"]["selected_layout"]["top_beta"] == 1
     assert edges["cat->conv1"]["physical_layout"] == "logical_halo_compact"
-    assert edges["cat->conv1"]["layout_mode"] == "concat_output_transitive_compact_halo_shared"
+    assert edges["cat->conv1"]["layout_mode"] == "compact_halo_shared"
+    assert not bool(edges["cat->conv1"].get("native_compact_source_fused", False))
+    assert nodes["conv1"]["physical_layout"] == "logical_halo_compact"
+    assert nodes["act"]["physical_layout"] == "logical_halo_compact"
     assert edges["conv1->act"]["physical_layout"] == "logical_halo_compact"
     assert edges["act->conv2"]["physical_layout"] == "logical_halo_compact"
+    assert "native_physical_output_ct_count" not in nodes["conv1"]
+    assert "native_physical_output_ct_count" not in nodes["act"]
+    assert "native_physical_output_ct_count" not in nodes["cat"]
+    _assert_native_output_count_map_only_names_native_nodes(updated)
+    assert not updated.get("_native_physical_output_ct_counts", {})
     assert not executor.native_physical_relayout_rows
 
 
@@ -3992,6 +5384,29 @@ def test_bootstrap_aware_refinement_rejects_beta_lift_non_conv_native_edge() -> 
 
     assert audit["enabled"] is False
     assert audit["reason"] == "no_supported_boot_interval_native_physical_relayout"
+
+
+def test_avgpool_native_halo_spec_uses_depthwise_expanded_weight() -> None:
+    pool = AvgPool2d(kernel_size=2, stride=2, padding=0)
+    pool.input_shape = torch.Size((1, 8, 16, 16))
+    pool.output_shape = torch.Size((1, 8, 8, 8))
+    pool.fhe_input_shape = torch.Size((1, 8, 16, 16))
+    pool.fhe_output_shape = torch.Size((1, 8, 8, 8))
+    pool.input_gap = 1
+    pool.output_gap = 1
+    pool.name = "pool_native_depthwise"
+    pool.update_params()
+
+    spec = native_halo_conv2d_spec_from_module(pool, output_node_id="pool")
+
+    assert spec is not None
+    assert spec.groups == 1
+    assert spec.weight_shape == (8, 8, 2, 2)
+    expanded = packing.resolve_grouped_conv(pool)
+    assert tuple(int(value) for value in expanded.shape) == spec.weight_shape
+    assert int(torch.count_nonzero(expanded).item()) == 8 * 2 * 2
+    assert torch.all(expanded[0, 1:] == 0)
+    assert torch.all(expanded[0, 0] == 0.25)
 
 
 @pytest.mark.parametrize("single_slot", [False, True])
