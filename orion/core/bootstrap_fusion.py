@@ -17,6 +17,15 @@ def bootstrap_prescale_fusion_disabled() -> bool:
 def runtime_fhe_output_shape(module: Any) -> torch.Size | Any:
     """Return the materialized FHE output shape seen by a bootstrap hook."""
 
+    materialization = str(getattr(module, "layout_policy_output_materialization", "") or "")
+    if materialization in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+        target_signature = tuple(getattr(module, "layout_policy_native_output_target_signature", ()) or ())
+        scheme = getattr(module, "scheme", None)
+        params = getattr(scheme, "params", None)
+        get_slots = getattr(params, "get_slots", None)
+        if target_signature and callable(get_slots):
+            return torch.Size((int(len(target_signature)), int(get_slots())))
+
     runtime = getattr(module, "region_runtime", None)
     executor = getattr(runtime, "executor", None) if runtime is not None else None
     for candidate in (

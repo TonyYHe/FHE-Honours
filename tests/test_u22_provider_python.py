@@ -26,6 +26,7 @@ from orion.experimental.u22_phase1 import (
 from orion.models.unet import UNet22
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.module import Module
+from orion.nn.operations import Concat
 from orion.nn.operations import ConcatCipherTensor
 
 
@@ -3938,6 +3939,122 @@ def test_layout_policy_relayout_reads_native_source_signature_for_compact_concat
         assert float((actual - source).abs().max().item()) <= 1.0e-6
     finally:
         scheme.delete_scheme()
+
+
+def test_concat_explicit_native_materialize_maps_branch_signatures_to_target_slots() -> None:
+    def pack_native_signature(
+        x: torch.Tensor,
+        signature: list[list[int]],
+        *,
+        gap: int,
+        slots: int,
+    ) -> torch.Tensor:
+        n, channels, _height, width = (int(value) for value in x.shape)
+        assert n == 1
+        out = torch.zeros((len(signature), int(slots)), dtype=x.dtype)
+        phases = int(gap * gap)
+        packed_w = int(width * gap)
+        for block_index, (h_start, h_end, channel_start, channel_count) in enumerate(signature):
+            block_h = int(h_end) - int(h_start)
+            group_block = int(block_h * gap * packed_w)
+            for local_channel in range(int(channel_count)):
+                channel = int(channel_start) + int(local_channel)
+                if int(channel) >= int(channels):
+                    continue
+                phase = int(local_channel) % int(phases)
+                group = int(local_channel) // int(phases)
+                phase_h = int(phase) // int(gap)
+                phase_w = int(phase) % int(gap)
+                for h in range(int(h_start), int(h_end)):
+                    if int(h) < 0 or int(h) >= int(x.shape[2]):
+                        continue
+                    local_h = int(h) - int(h_start)
+                    for w in range(int(width)):
+                        slot = (
+                            int(group) * int(group_block)
+                            + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                            + int(w) * int(gap)
+                            + int(phase_w)
+                        )
+                        out[int(block_index), int(slot)] = x[0, int(channel), int(h), int(w)]
+        return out
+
+    _init_python_scheme(logn=8)
+    try:
+        torch.manual_seed(3)
+        height = 6
+        width = 4
+        gap = 2
+        slots = int(scheme.params.get_slots())
+        left_signature = [[0, 6, 0, 4]]
+        right_signature = [[1, 6, 0, 4]]
+        target_signature = [[0, 6, 0, 4], [1, 6, 4, 4]]
+        level = len(scheme.params.get_logq()) - 1
+
+        left = torch.randn((1, 4, int(height), int(width)), dtype=torch.float32)
+        right = torch.randn((1, 4, int(height), int(width)), dtype=torch.float32)
+        concat_ref = torch.cat([left, right], dim=1)
+        expected = pack_native_signature(
+            concat_ref,
+            target_signature,
+            gap=int(gap),
+            slots=int(slots),
+        )
+
+        cat = Concat(dim=1)
+        cat.name = "cat_explicit_native_oracle"
+        cat.configure_from_stats(
+            input_shapes=(
+                torch.Size((1, 4, int(height), int(width))),
+                torch.Size((1, 4, int(height), int(width))),
+            ),
+            input_fhe_shapes=(
+                torch.Size((len(left_signature), int(slots))),
+                torch.Size((len(right_signature), int(slots))),
+            ),
+            input_gaps=(int(gap), int(gap)),
+            output_shape=torch.Size((1, 8, int(height), int(width))),
+            fhe_output_shape=torch.Size((len(target_signature), int(slots))),
+            output_gap=int(gap),
+        )
+        cat.layout_policy_output_materialization = "native_halo_stripe"
+        cat.layout_policy_concat_input_source_signatures = (left_signature, right_signature)
+        cat.layout_policy_native_output_target_signature = target_signature
+        cat.set_level(int(level))
+        cat.he()
+
+        left_ct = scheme.encrypt(
+            scheme.encode(pack_native_signature(left, left_signature, gap=int(gap), slots=int(slots)), int(level))
+        )
+        right_ct = scheme.encrypt(
+            scheme.encode(pack_native_signature(right, right_signature, gap=int(gap), slots=int(slots)), int(level))
+        )
+        out = cat(left_ct, right_ct)
+        decoded = out.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+
+        assert not isinstance(out, ConcatCipherTensor)
+        assert tuple(int(value) for value in out.on_shape) == (len(target_signature), int(slots))
+        assert float((decoded.to(dtype=torch.float32) - expected).abs().max().item()) <= 1.0e-6
+        assert cat._concat_native_runtime_io["runtime_lowering"] == "concat_explicit_native_materialize"
+        assert cat._concat_native_runtime_io["native_output_ct_count"] == len(target_signature)
+    finally:
+        scheme.delete_scheme()
+
+
+def test_bootstrap_shape_prefers_native_materialized_concat_signature() -> None:
+    from orion.core.bootstrap_fusion import runtime_fhe_output_shape
+
+    slots = 32768
+    stale_runtime = SimpleNamespace(runtime_fhe_output_shape=lambda: torch.Size((1, slots)))
+    cat = Concat(dim=1)
+    cat.scheme = SimpleNamespace(params=SimpleNamespace(get_slots=lambda: slots))
+    cat.layout_policy_concat_runtime = stale_runtime
+    cat.layout_policy_output_materialization = "native_halo_stripe"
+    cat.layout_policy_native_output_target_signature = [[0, 24, 0, 4], [1, 24, 4, 4]]
+
+    assert tuple(int(value) for value in runtime_fhe_output_shape(cat)) == (2, slots)
 
 
 def test_concat_fused_conv_compact_branches_to_native_signature_output_oracle(monkeypatch) -> None:

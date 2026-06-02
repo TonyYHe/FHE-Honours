@@ -693,6 +693,8 @@ def _layout_policy_provider_unsupported_reason(
             continue
         if bool(row.get("concat_native_runtime_materializer", False)):
             continue
+        if bool(row.get("concat_explicit_native_materialization", False)):
+            continue
         return "layout_policy_concat_native_source_requires_native_concat_fusion"
     unresolved_native = _layout_policy_unresolved_native_source_relayout_rows(
         compile_plan,
@@ -729,7 +731,11 @@ def _layout_policy_output_relayout_rows(compile_plan: dict[str, Any], *, node: s
         if str(row.get("node")) != str(node) or not bool(row.get("output_relayout", False)):
             continue
         layout = dict(row.get("selected_layout", {}))
-        if not _layout_policy_has_halo(layout):
+        explicit_native_concat = bool(
+            row.get("concat_explicit_native_materialization", False)
+            and str(row.get("physical_layout", "")) == "native_source_stripe"
+        )
+        if not _layout_policy_has_halo(layout) and not bool(explicit_native_concat):
             continue
         shape = [int(value) for value in row.get("shape", [])]
         if len(shape) != 4:
@@ -744,6 +750,7 @@ def _layout_policy_output_relayout_rows(compile_plan: dict[str, Any], *, node: s
             "selected_layout": dict(layout),
             "relayout": True,
             "relayout_reason": str(row.get("output_relayout_reason", "producer_materialized_halo")),
+            "native_output_materialization": bool(explicit_native_concat),
         }
         rows.append(updated)
     return tuple(rows)
@@ -774,7 +781,11 @@ def _layout_policy_attach_backend_producer_outputs(
         if not node or node in provider_nodes or node not in dag.nodes:
             continue
         module = dag.nodes[node].get("module")
-        if not isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d)) and not _layout_policy_preserving_output_module(module):
+        if (
+            not isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d))
+            and not _layout_policy_preserving_output_module(module)
+            and type(module).__name__ != "Concat"
+        ):
             continue
         layout = dict(row.get("selected_layout", {}) or {})
         gap = max(1, int(layout.get("gap", getattr(module, "output_gap", 1) or 1)))
@@ -2429,6 +2440,7 @@ class LayoutPolicyAddRuntimeExecutor:
         if len(self.input_rows) != len(self.input_sources):
             missing = [str(source) for source in self.input_sources if str(source) not in rows_by_source]
             raise ValueError(f"layout-policy Add runtime for {self.node} is missing input rows for {missing}")
+        self.output_relayout_rows = _layout_policy_output_relayout_rows(self.compile_plan, node=self.node)
         target_keys = {
             tuple(
                 (
@@ -2472,6 +2484,7 @@ class LayoutPolicyAddRuntimeExecutor:
             missing = [str(source) for source in self.input_sources if str(source) not in rows_by_source]
             raise ValueError(f"layout-policy Add runtime for {self.node} is missing input rows for {missing}")
         self.relayout_rows = tuple(row for row in self.input_rows if bool(row.get("relayout", False)))
+        self.output_relayout_rows = _layout_policy_output_relayout_rows(self.compile_plan, node=self.node)
         self.relayout_kernels = {}
         self._compiled = False
 
@@ -2615,6 +2628,17 @@ class LayoutPolicyAddRuntimeExecutor:
 class LayoutPolicyConcatRuntimeExecutor(LayoutPolicyAddRuntimeExecutor):
     def bootstrap_prescale_fusion_capable(self) -> bool:
         return False
+
+    def runtime_fhe_output_shape(self) -> Any:
+        if self.output_relayout_rows:
+            row = dict(self.output_relayout_rows[-1])
+            if bool(row.get("native_output_materialization", False)):
+                shape = row.get("fhe_shape", ())
+                if shape:
+                    return torch.Size([int(value) for value in shape])
+            layout = dict(row.get("target_layout", row.get("selected_layout", {})) or {})
+            return _layout_policy_on_shape(row, layout)
+        return super().runtime_fhe_output_shape()
 
     def __call__(self, *inputs: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         if len(inputs) == 1 and isinstance(inputs[0], (list, tuple)):
@@ -5146,12 +5170,15 @@ class U22CompileRegistry:
                     _layout_policy_has_halo(dict(row.get("selected_layout", {}) or {}))
                     for row in rows
                 )
-                if not bool(has_relayout or has_materialized_halo):
-                    continue
                 fx_node = dag.nodes[node].get("fx_node")
                 fx_inputs = tuple(str(value.name) for value in getattr(fx_node, "all_input_nodes", ()) or ())
                 input_sources = fx_inputs if fx_inputs else tuple(str(value) for value in dag.predecessors(node))
                 is_concat = type(module).__name__ == "Concat"
+                native_concat_output_row = (
+                    _layout_policy_native_output_row(compile_plan, node=str(node)) if bool(is_concat) else None
+                )
+                if not bool(has_relayout or has_materialized_halo or native_concat_output_row is not None):
+                    continue
                 runtime_cls = LayoutPolicyConcatRuntimeExecutor if bool(is_concat) else LayoutPolicyAddRuntimeExecutor
                 runtime = runtime_cls(
                     node=str(node),
@@ -5160,9 +5187,38 @@ class U22CompileRegistry:
                 )
                 if bool(is_concat):
                     module.layout_policy_concat_runtime = runtime
+                    output_row = native_concat_output_row
+                    if output_row is not None and str(output_row.get("physical_layout", "")) == "native_source_stripe":
+                        output_layout = dict(output_row.get("selected_layout", {}) or {})
+                        target_signature = output_row.get("native_halo_target_storage_signature") or ()
+                        module.layout_policy_output_layout = dict(output_layout)
+                        module.layout_policy_output_row_offset = int(
+                            _layout_physical_top_beta(output_layout) * max(1, int(output_layout.get("gap", 1) or 1))
+                        )
+                        module.layout_policy_output_materialization = "native_halo_stripe"
+                        module.layout_policy_native_output_target_signature = [
+                            [int(value) for value in item] for item in target_signature
+                        ]
+                        module.fhe_output_shape = _layout_policy_output_fhe_shape(
+                            compile_plan,
+                            node=str(node),
+                            row=output_row,
+                            layout=output_layout,
+                        )
+                        rows_by_source = {str(row.get("source", "")): dict(row) for row in rows}
+                        input_signatures = []
+                        for input_source in input_sources:
+                            source_row = rows_by_source.get(str(input_source), {})
+                            input_signatures.append(
+                                [
+                                    [int(value) for value in item]
+                                    for item in source_row.get("native_halo_source_storage_signature", ()) or ()
+                                ]
+                            )
+                        module.layout_policy_concat_input_source_signatures = input_signatures
                 else:
                     module.layout_policy_add_runtime = runtime
-                relayout_depth = max(
+                input_relayout_depth = max(
                     [0]
                     + [
                         int(row.get("relayout_depth_estimate", 0) or 0)
@@ -5170,12 +5226,22 @@ class U22CompileRegistry:
                         if bool(row.get("relayout", False))
                     ]
                 )
+                output_relayout_rows = _layout_policy_output_relayout_rows(compile_plan, node=str(node))
+                output_relayout_depth = sum(
+                    int(row.get("relayout_depth_estimate", 1) or 1)
+                    for row in output_relayout_rows
+                )
+                relayout_depth = int(input_relayout_depth + output_relayout_depth)
                 if hasattr(module, "set_depth"):
                     module.set_depth(max(int(getattr(module, "depth", 0) or 0), int(relayout_depth)))
                 row = {
                     "node": str(node),
                     "input_sources": [str(value) for value in input_sources],
                     "relayout_edge_count": int(sum(1 for row in rows if bool(row.get("relayout", False)))),
+                    "output_relayout_count": int(len(output_relayout_rows)),
+                    "native_output_materialization": bool(
+                        any(bool(row.get("native_output_materialization", False)) for row in output_relayout_rows)
+                    ),
                     "materialized_halo": bool(has_materialized_halo),
                 }
                 if bool(is_concat):

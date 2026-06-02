@@ -296,6 +296,253 @@ class Concat(Module):
                     self._add_diagonal_entries(diagonals, source[mask], output[mask], slots=int(slots))
         return diagonals
 
+    def _native_materialization_requested(self) -> bool:
+        materialization = str(getattr(self, "layout_policy_output_materialization", "") or "")
+        if materialization not in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+            return False
+        if not tuple(getattr(self, "layout_policy_native_output_target_signature", ()) or ()):
+            raise RuntimeError(
+                f"Concat {getattr(self, 'name', '')} requested native materialization without a target signature"
+            )
+        return True
+
+    @staticmethod
+    def _normalise_native_signature(raw, *, label: str):
+        rows = []
+        for item in tuple(raw or ()):
+            values = tuple(int(value) for value in tuple(item))
+            if len(values) != 4:
+                raise RuntimeError(f"Concat native {label} signature row must have 4 integers")
+            h_start, h_end, channel_start, channel_count = values
+            if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+                continue
+            if int(channel_start) < 0:
+                raise RuntimeError(f"Concat native {label} signature has a negative channel start")
+            rows.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+        return tuple(rows)
+
+    def _native_input_signatures(self):
+        raw = tuple(getattr(self, "layout_policy_concat_input_source_signatures", ()) or ())
+        if len(raw) != len(self.concat_input_shapes):
+            raise RuntimeError(
+                f"Concat {getattr(self, 'name', '')} native materialization expects "
+                f"{len(self.concat_input_shapes)} source signatures, got {len(raw)}"
+            )
+        signatures = []
+        for input_index, signature in enumerate(raw):
+            parsed = self._normalise_native_signature(signature, label=f"input{int(input_index)}")
+            if not parsed:
+                raise RuntimeError(
+                    f"Concat {getattr(self, 'name', '')} native input {int(input_index)} has no storage signature"
+                )
+            signatures.append(parsed)
+        return tuple(signatures)
+
+    def _native_output_signature(self):
+        signature = self._normalise_native_signature(
+            getattr(self, "layout_policy_native_output_target_signature", ()) or (),
+            label="target",
+        )
+        if not signature:
+            raise RuntimeError(f"Concat {getattr(self, 'name', '')} native target signature is empty")
+        return tuple(signature)
+
+    def _validate_native_concat_signatures(self, input_signatures, target_signature) -> None:
+        if len(self.concat_input_shapes) != len(input_signatures):
+            raise RuntimeError("Concat native materialization input signature count mismatch")
+        if int(getattr(self, "dim", 1)) != 1:
+            raise RuntimeError("Concat native materialization only supports channel dim=1")
+        if int(self.output_shape[0]) != 1:
+            raise RuntimeError("Concat native materialization currently requires batch size 1")
+        output_channels = int(self.output_shape[1])
+        output_height = int(self.output_shape[2])
+        channel_offsets = []
+        offset = 0
+        for shape in self.concat_input_shapes:
+            if int(shape[0]) != 1:
+                raise RuntimeError("Concat native materialization currently requires batch size 1")
+            channel_offsets.append(int(offset))
+            offset += int(shape[1])
+        if int(offset) != int(output_channels):
+            raise RuntimeError("Concat native materialization channel offsets do not match output channels")
+
+        covered: set[tuple[int, int, int]] = set()
+        for target_block, (target_h0, target_h1, target_c0, target_count) in enumerate(target_signature):
+            if int(target_c0 + target_count) > int(output_channels):
+                raise RuntimeError("Concat native target signature exceeds output channels")
+            for channel in range(int(target_c0), int(target_c0 + target_count)):
+                for row in range(int(target_h0), int(target_h1)):
+                    covered.add((int(target_block), int(channel), int(row)))
+
+        produced: set[tuple[int, int, int]] = set()
+        for input_index, signature in enumerate(input_signatures):
+            branch_offset = int(channel_offsets[int(input_index)])
+            branch_channels = int(self.concat_input_shapes[int(input_index)][1])
+            branch_height = int(self.concat_input_shapes[int(input_index)][2])
+            for source_h0, source_h1, source_c0, source_count in signature:
+                if int(source_c0 + source_count) > int(branch_channels):
+                    raise RuntimeError("Concat native source signature exceeds branch channels")
+                global_c0 = int(branch_offset + source_c0)
+                global_c1 = int(global_c0 + source_count)
+                for target_block, (target_h0, target_h1, target_c0, target_count) in enumerate(target_signature):
+                    h0 = max(int(source_h0), int(target_h0))
+                    h1 = min(int(source_h1), int(target_h1))
+                    c0 = max(int(global_c0), int(target_c0))
+                    c1 = min(int(global_c1), int(target_c0 + target_count))
+                    if int(h1) <= int(h0) or int(c1) <= int(c0):
+                        continue
+                    for channel in range(int(c0), int(c1)):
+                        for row in range(int(h0), int(h1)):
+                            key = (int(target_block), int(channel), int(row))
+                            if key in produced:
+                                raise RuntimeError("Concat native materialization target coverage overlaps")
+                            produced.add(key)
+        if produced != covered:
+            missing = len(covered - produced)
+            extra = len(produced - covered)
+            raise RuntimeError(
+                f"Concat native materialization target coverage mismatch: missing={int(missing)} extra={int(extra)}"
+            )
+
+    def _native_diagonals_for_input(self, input_index: int, *, slots: int, blocks=None):
+        input_signatures = self._native_input_signatures()
+        target_signature = self._native_output_signature()
+        source_signature = input_signatures[int(input_index)]
+        requested = None
+        if blocks is not None:
+            requested = {(int(row), int(col)) for row, col in tuple(blocks or ())}
+            if not requested:
+                return {}
+        channel_offset = sum(int(shape[1]) for shape in self.concat_input_shapes[: int(input_index)])
+        _n, channels, height, width = (int(value) for value in self.concat_input_shapes[int(input_index)])
+        output_gap = int(getattr(self, "output_gap", self.concat_input_gaps[int(input_index)]))
+        input_gap = int(self.concat_input_gaps[int(input_index)])
+        diagonals = {}
+        for source_block, (source_h0, source_h1, source_c0, source_count) in enumerate(source_signature):
+            source_height = int(source_h1) - int(source_h0)
+            source_global_c0 = int(channel_offset + source_c0)
+            source_global_c1 = int(source_global_c0 + source_count)
+            for target_block, (target_h0, target_h1, target_c0, target_count) in enumerate(target_signature):
+                if requested is not None and (int(target_block), int(source_block)) not in requested:
+                    continue
+                h0 = max(int(source_h0), int(target_h0))
+                h1 = min(int(source_h1), int(target_h1))
+                c0 = max(int(source_global_c0), int(target_c0))
+                c1 = min(int(source_global_c1), int(target_c0 + target_count))
+                if int(h1) <= int(h0) or int(c1) <= int(c0):
+                    continue
+                target_height = int(target_h1) - int(target_h0)
+                source_physical_height = int(source_height) * int(input_gap)
+                source_physical_width = int(width) * int(input_gap)
+                target_physical_height = int(target_height) * int(output_gap)
+                target_physical_width = int(width) * int(output_gap)
+                row_grid, col_grid = np.meshgrid(
+                    np.arange(int(h0), int(h1), dtype=np.int64),
+                    np.arange(int(width), dtype=np.int64),
+                    indexing="ij",
+                )
+                rows = row_grid.reshape(-1)
+                cols = col_grid.reshape(-1)
+                for global_channel in range(int(c0), int(c1)):
+                    source_channel = int(global_channel) - int(channel_offset)
+                    if int(source_channel) < 0 or int(source_channel) >= int(channels):
+                        continue
+                    source_local_channel = int(source_channel) - int(source_c0)
+                    target_local_channel = int(global_channel) - int(target_c0)
+                    source_indices = self._flat_index(
+                        int(source_local_channel),
+                        rows - int(source_h0),
+                        cols,
+                        gap=int(input_gap),
+                        height=int(source_physical_height),
+                        width=int(source_physical_width),
+                    ) + int(source_block) * int(slots)
+                    target_indices = self._flat_index(
+                        int(target_local_channel),
+                        rows - int(target_h0),
+                        cols,
+                        gap=int(output_gap),
+                        height=int(target_physical_height),
+                        width=int(target_physical_width),
+                    ) + int(target_block) * int(slots)
+                    self._add_diagonal_entries(diagonals, source_indices, target_indices, slots=int(slots))
+        return diagonals
+
+    def _ensure_native_materialize_transforms(self, scheme):
+        input_signatures = self._native_input_signatures()
+        target_signature = self._native_output_signature()
+        self._validate_native_concat_signatures(input_signatures, target_signature)
+        slots = int(scheme.params.get_slots())
+        cache_key = (
+            tuple(input_signatures),
+            tuple(target_signature),
+            tuple(tuple(int(value) for value in shape) for shape in self.concat_input_shapes),
+            tuple(int(value) for value in tuple(self.concat_input_gaps or ())),
+            int(getattr(self, "output_gap", 1) or 1),
+            int(slots),
+            int(self.level) if self.level is not None else int(len(scheme.params.get_logq()) - 1),
+        )
+        if (
+            self.transform_ids_by_input
+            and self._compiled_backend is getattr(scheme, "backend", None)
+            and getattr(self, "_native_materialize_cache_key", None) == cache_key
+        ):
+            return
+        self.cleanup(getattr(scheme, "backend", None))
+        level = int(self.level) if self.level is not None else int(len(scheme.params.get_logq()) - 1)
+        target_ct_count = int(len(target_signature))
+        self.fhe_output_shape = torch.Size([int(target_ct_count), int(slots)])
+        self.transform_ids_by_input = []
+        self.transform_sources_by_input = []
+        for input_index in range(len(self.concat_input_shapes)):
+            diagonals = self._native_diagonals_for_input(int(input_index), slots=int(slots))
+            if not diagonals:
+                raise RuntimeError(
+                    f"Concat {getattr(self, 'name', '')} native materialization produced no transforms "
+                    f"for input {int(input_index)}"
+                )
+            proxy = SimpleNamespace(
+                name=f"{getattr(self, 'name', 'concat')}_native_materialize_{int(input_index)}",
+                diagonals=diagonals,
+                level=int(level),
+                bsgs_ratio=float(self.bsgs_ratio),
+                scheme=scheme,
+                output_shape=self.output_shape,
+                fhe_output_shape=torch.Size([int(target_ct_count), int(slots)]),
+                allow_sparse_output_rows=True,
+                expected_output_rows=int(target_ct_count),
+            )
+            if scheme.lt_evaluator.single_slot_layer_cache_enabled():
+                self._install_materialize_single_slot_recipe(
+                    proxy,
+                    int(input_index),
+                    slots=int(slots),
+                    diagonals=diagonals,
+                )
+                proxy._single_slot_build_diagonals = (
+                    lambda input_index=int(input_index), slots=int(slots): self._native_diagonals_for_input(
+                        int(input_index),
+                        slots=int(slots),
+                    )
+                )
+                proxy._single_slot_build_block_diagonals = (
+                    lambda blocks, input_index=int(input_index), slots=int(slots): self._native_diagonals_for_input(
+                        int(input_index),
+                        slots=int(slots),
+                        blocks=blocks,
+                    )
+                )
+                proxy._dense_layer_cache_build_diagonals = proxy._single_slot_build_diagonals
+                proxy._dense_layer_cache_build_block_diagonals = proxy._single_slot_build_block_diagonals
+            transform_ids = dict(scheme.lt_evaluator.generate_transforms(proxy))
+            proxy.transform_ids = dict(transform_ids)
+            if not scheme.lt_evaluator.single_slot_layer_cache_enabled():
+                proxy.diagonals = {}
+            self.transform_ids_by_input.append(transform_ids)
+            self.transform_sources_by_input.append(proxy)
+        self._native_materialize_cache_key = cache_key
+        self._compiled_backend = getattr(scheme, "backend", None)
+
     def _install_materialize_single_slot_recipe(self, proxy, input_index: int, *, slots: int, diagonals) -> None:
         diag_indices_by_block = self._diag_indices_by_block(diagonals)
         build_diagonals = (
@@ -362,7 +609,11 @@ class Concat(Module):
         if not parts:
             raise ValueError("Concat requires at least one input")
         scheme = parts[0].scheme
-        self._ensure_materialize_transforms(scheme)
+        native_materialization = bool(self._native_materialization_requested())
+        if bool(native_materialization):
+            self._ensure_native_materialize_transforms(scheme)
+        else:
+            self._ensure_materialize_transforms(scheme)
         out = None
         for input_index, source in enumerate(parts):
             proxy = self.transform_sources_by_input[int(input_index)]
@@ -373,6 +624,20 @@ class Concat(Module):
             else:
                 lhs, rhs = _align_ciphertexts_for_add(out, partial)
                 out = lhs + rhs
+        if bool(native_materialization):
+            target_signature = self._native_output_signature()
+            input_signatures = self._native_input_signatures()
+            self._concat_native_runtime_io = {
+                "runtime_lowering": "concat_explicit_native_materialize",
+                "concat_native_runtime_materializer": True,
+                "native_input_signature_count": int(len(input_signatures)),
+                "native_input_ct_counts": [int(len(signature)) for signature in input_signatures],
+                "native_output_ct_count": int(len(target_signature)),
+                "native_output_target_signature": [
+                    [int(value) for value in item] for item in target_signature
+                ],
+                "compact_fallback": False,
+            }
         return out
 
     def cleanup(self, backend=None):
@@ -396,6 +661,7 @@ class Concat(Module):
         self.transform_ids_by_input = []
         self.transform_sources_by_input = []
         self._compiled_backend = None
+        self._native_materialize_cache_key = None
 
     def forward(self, *xs):
         if len(xs) == 1 and isinstance(xs[0], (list, tuple)):
@@ -407,6 +673,14 @@ class Concat(Module):
             owned_parts = ()
             if runtime is not None:
                 xs, owned_parts = runtime(*xs)
+            if self._native_materialization_requested():
+                try:
+                    return self.materialize(xs)
+                finally:
+                    for part in owned_parts:
+                        release = getattr(part, "release", None)
+                        if callable(release):
+                            release()
             return ConcatCipherTensor(self, xs, owned_parts=owned_parts)
         return torch.cat(tuple(xs), dim=int(self.dim))
 
