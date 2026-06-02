@@ -4377,6 +4377,36 @@ def test_conv_kernel_table_native_stripe_beta2_requests_output_halo() -> None:
     assert conv2.layout_policy_output_layout == {"top_beta": 1, "bottom_beta": 1}
 
 
+def test_conv_kernel_table_provider_boundary_halo_is_clipped_by_default() -> None:
+    from tools.run_conv_kernel_table import (
+        DEFAULT_CLIP_PROVIDER_BOUNDARY_HALO,
+        ConvKernelRow,
+        _apply_provider_input_halo,
+        _effective_provider_input_halo,
+    )
+
+    row = ConvKernelRow(
+        channels=32,
+        height=192,
+        width=192,
+        variant="provider_halo1_individual_lt",
+        input_level=2,
+    )
+
+    assert DEFAULT_CLIP_PROVIDER_BOUNDARY_HALO is True
+    assert _effective_provider_input_halo(row, clip_boundary_halo=True) == (0, 0)
+    assert _effective_provider_input_halo(row, clip_boundary_halo=False) == (1, 1)
+
+    clipped = SimpleNamespace(layout_policy_input_layout={})
+    legacy = SimpleNamespace(layout_policy_input_layout={})
+
+    assert _apply_provider_input_halo(clipped, row, clip_boundary_halo=True) == (0, 0)
+    assert clipped.layout_policy_input_layout == {"top_beta": 0, "bottom_beta": 0}
+
+    assert _apply_provider_input_halo(legacy, row, clip_boundary_halo=False) == (1, 1)
+    assert legacy.layout_policy_input_layout == {"top_beta": 1, "bottom_beta": 1}
+
+
 def test_conv_kernel_table_rejects_stale_native_stripe_beta2_reuse(tmp_path) -> None:
     from tools.run_conv_kernel_table import ConvKernelRow, reuse_existing_rows
 

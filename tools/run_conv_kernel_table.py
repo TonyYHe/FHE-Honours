@@ -48,6 +48,7 @@ DEFAULT_CHANNELS = (32, 64, 128, 256)
 DEFAULT_VARIANTS = ("orion", "provider_halo1_no_share", "provider_halo1_individual_lt")
 DEFAULT_KERNEL_CASES = ("conv32", "conv64", "conv128", "conv256", "dec1b", "dec2b", "dec3b", "dec4b", "bottleneckb")
 DEFAULT_INPUT_LEVEL = 2
+DEFAULT_CLIP_PROVIDER_BOUNDARY_HALO = True
 CONV_KERNEL_DEPTH = 1
 CKKS_PROFILE_ID = "resnet_e2e_logn16_logscale40_h192"
 E2E_LOGQ = (55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40)
@@ -1954,6 +1955,8 @@ def run_all(args: argparse.Namespace) -> int:
             ]
             if bool(args.clip_provider_boundary_halo):
                 command.append("--clip-provider-boundary-halo")
+            else:
+                command.append("--keep-provider-boundary-halo")
             log_path = result_path.with_suffix(".log")
             print(f"[{datetime.now().isoformat(timespec='seconds')}] start {row.row_id}", flush=True)
             print(" ".join(shlex.quote(part) for part in command), flush=True)
@@ -2130,8 +2133,19 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
         "--clip-provider-boundary-halo",
+        dest="clip_provider_boundary_halo",
         action="store_true",
-        help="For provider rows, keep the requested beta label but omit global top/bottom input halo at image boundaries.",
+        default=DEFAULT_CLIP_PROVIDER_BOUNDARY_HALO,
+        help=(
+            "For provider rows, keep the requested beta label but omit global top/bottom input halo at image "
+            "boundaries. This is the default operator-level convention; internal stripe halo is still preserved."
+        ),
+    )
+    parser.add_argument(
+        "--keep-provider-boundary-halo",
+        dest="clip_provider_boundary_halo",
+        action="store_false",
+        help="Legacy/debug mode: materialize global top/bottom provider input halo at image boundaries.",
     )
     parser.add_argument(
         "--provider-output-layout",
