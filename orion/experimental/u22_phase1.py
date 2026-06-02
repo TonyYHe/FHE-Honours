@@ -691,7 +691,7 @@ def _layout_policy_provider_unsupported_reason(
             continue
         if str(row.get("physical_layout", "")) != "native_source_stripe":
             continue
-        if str(row.get("source_physical_layout", "") or "") == "native_source_stripe":
+        if bool(row.get("concat_native_runtime_materializer", False)):
             continue
         return "layout_policy_concat_native_source_requires_native_concat_fusion"
     unresolved_native = _layout_policy_unresolved_native_source_relayout_rows(
@@ -1392,6 +1392,15 @@ class LayoutPolicyRelayoutKernel:
         self.output_scale = 1.0
         self.output_bias = 0.0
         self._bias_ptxt_cache: dict[tuple[int, int], Any] = {}
+        self.native_source_storage_signature: tuple[tuple[int, int, int, int], ...] = ()
+        if str(self.edge_row.get("source_physical_layout", "") or "") == "native_source_stripe":
+            try:
+                self.native_source_storage_signature = tuple(
+                    tuple(int(value) for value in raw)
+                    for raw in (self.edge_row.get("native_halo_source_storage_signature", ()) or ())
+                )
+            except Exception:
+                self.native_source_storage_signature = ()
         self.name = (
             f"layout_policy_relayout_{self.node}_{self.index}_"
             f"{self.direction}_{str(self.edge_row.get('source', 'src'))}_to_{str(self.edge_row.get('target', 'dst'))}"
@@ -1462,8 +1471,50 @@ class LayoutPolicyRelayoutKernel:
             "sparse_lt_count": 1,
         }
 
+    def _native_source_index(
+        self,
+        *,
+        channel: int,
+        h: int,
+        w: int,
+        slots: int,
+        gap: int,
+        width: int,
+    ) -> int | None:
+        signature = tuple(self.native_source_storage_signature)
+        if not signature:
+            return None
+        packed_w = int(width) * int(gap)
+        phases = int(gap) * int(gap)
+        for block_index, block in enumerate(signature):
+            h_start, h_end, channel_start, channel_count = (int(value) for value in block)
+            if not (int(h_start) <= int(h) < int(h_end)):
+                continue
+            if not (int(channel_start) <= int(channel) < int(channel_start + channel_count)):
+                continue
+            local_h = int(h) - int(h_start)
+            local_channel = int(channel) - int(channel_start)
+            phase = int(local_channel) % int(phases)
+            group = int(local_channel) // int(phases)
+            phase_h = int(phase) // int(gap)
+            phase_w = int(phase) % int(gap)
+            block_h = int(h_end) - int(h_start)
+            group_block = int(block_h) * int(gap) * int(packed_w)
+            slot = (
+                int(group) * int(group_block)
+                + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                + int(w) * int(gap)
+                + int(phase_w)
+            )
+            if int(slot) < 0 or int(slot) >= int(slots):
+                raise RuntimeError(
+                    "layout-policy native source relayout slot out of range: "
+                    f"slot={int(slot)} slots={int(slots)} block={block}"
+                )
+            return int(block_index) * int(slots) + int(slot)
+        return None
+
     def _iter_mappings(self, slots: int):
-        del slots
         source = _layout_policy_on_shape(self.edge_row, self.source_layout)
         target = _layout_policy_on_shape(self.edge_row, self.target_layout)
         source_gap = max(1, int(self.source_layout.get("gap", 1)))
@@ -1481,11 +1532,21 @@ class LayoutPolicyRelayoutKernel:
         if len(clear_shape) != 4:
             raise ValueError(f"layout-policy relayout edge has invalid shape: {clear_shape}")
         core_rows = int(clear_shape[2] * gap)
-        if int(source[0]) != int(target[0]) or int(source[1]) != int(target[1]) or int(source[3]) != int(target[3]):
+        native_source_signature = tuple(self.native_source_storage_signature)
+        if (
+            not native_source_signature
+            and (
+                int(source[0]) != int(target[0])
+                or int(source[1]) != int(target[1])
+                or int(source[3]) != int(target[3])
+            )
+        ):
             raise ValueError(
                 "layout-policy relayout requires matching batch/channel/width physical axes, "
                 f"got source {tuple(int(v) for v in source)} and target {tuple(int(v) for v in target)}"
             )
+        if native_source_signature and int(target[0]) != 1:
+            raise ValueError("layout-policy native source relayout currently supports batch=1")
         for n in range(int(target[0])):
             for c in range(int(target[1])):
                 for target_h in range(int(target[2])):
@@ -1504,7 +1565,31 @@ class LayoutPolicyRelayoutKernel:
                         int(source[2]) - 1,
                     )
                     for w in range(int(target[3])):
-                        source_index = _flat_nchw_index(int(n), int(c), int(source_h), int(w), source)
+                        if native_source_signature:
+                            logical_h = int(source_h) // int(gap) - int(_layout_physical_top_beta(self.source_layout))
+                            phase_h = int(source_h) % int(gap)
+                            logical_w = int(w) // int(gap)
+                            phase_w = int(w) % int(gap)
+                            logical_channel = int(c) * int(gap) * int(gap) + int(phase_h) * int(gap) + int(phase_w)
+                            if (
+                                int(logical_channel) < 0
+                                or int(logical_channel) >= int(clear_shape[1])
+                                or int(logical_w) < 0
+                                or int(logical_w) >= int(clear_shape[3])
+                            ):
+                                continue
+                            source_index = self._native_source_index(
+                                channel=int(logical_channel),
+                                h=int(logical_h),
+                                w=int(logical_w),
+                                slots=int(slots),
+                                gap=int(gap),
+                                width=int(clear_shape[3]),
+                            )
+                            if source_index is None:
+                                continue
+                        else:
+                            source_index = _flat_nchw_index(int(n), int(c), int(source_h), int(w), source)
                         target_index = _flat_nchw_index(int(n), int(c), int(target_h), int(w), target)
                         yield int(source_index), int(target_index)
 
