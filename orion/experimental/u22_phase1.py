@@ -282,6 +282,32 @@ def _u22_pool_group(*, node: str, module: Any) -> RegionFirstRuntimeGroup:
     )
 
 
+def _u22_tconv_group(*, node: str, module: Any) -> RegionFirstRuntimeGroup:
+    boundary_actions = ("halo_local_conv2d_provider", "native_halo_stripe_no_ri_tconv2d", "upsample_tconv")
+    return RegionFirstRuntimeGroup(
+        region_id=f"u22_tconv_upsample_{str(node)}",
+        network="U22",
+        stage="tconv_upsample",
+        module_prefix=str(node),
+        conv_nodes=(str(node),),
+        strategy="u22_tconv_native_halo_stripe_no_ri",
+        materializer="native_halo_stripe_no_ri_tconv2d",
+        depth=1,
+        solver_depth=1,
+        boundary_actions=boundary_actions,
+        expected_stats={},
+        executable=True,
+        fallback_reason="",
+        output_node_ids=(str(node),),
+        executor=HaloSupportedTConvRuntimeExecutor(
+            module=module,
+            output_node_id=str(node),
+            use_ct_pt_hybrid_packing=True,
+        ),
+        fused_weight_count=1,
+    )
+
+
 def _normalize_u22_layout_policy(value: str) -> str:
     normalized = str(value or "dp").strip().lower()
     if normalized in {"fixed", "fixedmax", "fixed-max", "fixed_max"}:
@@ -1177,9 +1203,61 @@ def _layout_policy_validate_native_provider_plans(
 ) -> dict[str, Any]:
     """Fail fast if a planner emits a native-provider layout that cannot compile."""
 
+    def _storage_signature_has_overlap(raw: Any) -> bool:
+        blocks: list[tuple[int, int, int, int]] = []
+        for item in tuple(raw or ()):
+            try:
+                h_start, h_end, channel_start, channel_count = (int(value) for value in tuple(item))
+            except Exception:
+                return True
+            if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+                continue
+            channel_end = int(channel_start + channel_count)
+            for other_h_start, other_h_end, other_channel_start, other_channel_count in blocks:
+                other_channel_end = int(other_channel_start + other_channel_count)
+                h_overlap = int(h_start) < int(other_h_end) and int(other_h_start) < int(h_end)
+                channel_overlap = int(channel_start) < int(other_channel_end) and int(other_channel_start) < int(channel_end)
+                if bool(h_overlap and channel_overlap):
+                    return True
+            blocks.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+        return False
+
     for group in groups:
         node = str(getattr(group, "module_prefix", ""))
         executor = getattr(group, "executor", None)
+        if isinstance(executor, HaloSupportedTConvRuntimeExecutor):
+            native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
+            output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
+            for row in native_rows:
+                if str(row.get("physical_layout", "")) != "native_source_stripe":
+                    continue
+                if not row.get("native_halo_source_storage_signature"):
+                    raise RuntimeError(
+                        "layout policy generated a native tconv input without a source storage signature "
+                        f"for node={str(node)!r}, edge={str(row.get('edge', ''))!r}"
+                    )
+                source_layout = dict(row.get("source_layout", row.get("selected_layout", {})) or {})
+                if _layout_physical_top_beta(source_layout) != 0 or _layout_physical_bottom_beta(source_layout) != 0:
+                    raise RuntimeError(
+                        "layout policy generated an overlapping native tconv input; current tconv native input "
+                        "supports only physical beta=0 source stripes "
+                        f"for node={str(node)!r}, edge={str(row.get('edge', ''))!r}"
+                    )
+                if _storage_signature_has_overlap(row.get("native_halo_source_storage_signature")):
+                    raise RuntimeError(
+                        "layout policy generated an overlapping native tconv input source signature "
+                        f"for node={str(node)!r}, edge={str(row.get('edge', ''))!r}"
+                    )
+            if (
+                output_row is not None
+                and str(output_row.get("physical_layout", "")) == "native_source_stripe"
+                and not output_row.get("native_halo_target_storage_signature")
+            ):
+                raise RuntimeError(
+                    "layout policy generated a native tconv output without a target storage signature "
+                    f"for node={str(node)!r}"
+                )
+            continue
         if not isinstance(executor, HaloLocalConvRuntimeExecutor):
             continue
         native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
@@ -1907,6 +1985,7 @@ class LayoutPolicyProviderRuntimeExecutor:
         attrs = {
             **self._native_halo_module_attrs(),
             **self._bootstrap_prescale_module_attrs(),
+            "compile_plan": dict(self.compile_plan),
         }
         module = getattr(self.base_executor, "module", None)
         if not attrs or module is None:
@@ -2682,6 +2761,11 @@ def _layout_policy_with_native_physical_output_counts(
         if executor is None or not bool(getattr(executor, "native_halo_output_capable", False)):
             continue
         node = str(getattr(group, "module_prefix", ""))
+        if isinstance(executor, HaloSupportedTConvRuntimeExecutor):
+            output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
+            if output_row is not None and output_row.get("native_halo_target_storage_signature"):
+                counts[str(node)] = int(len(output_row.get("native_halo_target_storage_signature") or ()))
+            continue
         native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
         compact_input_rows = _layout_policy_compact_input_rows_for_node(compile_plan, node=str(node))
         if (
@@ -3238,6 +3322,12 @@ class TconvK2S2PythonRuntimeExecutor:
             "fhe_output_shape": [int(value) for value in self.compiled_fhe_output_shape],
             "layout_policy_input_layout": dict(self.compiled_input_layout),
             "layout_policy_output_layout": dict(self.compiled_output_layout),
+            "layout_policy_native_input_source_signature": [
+                [int(value) for value in item] for item in self._native_input_storage_blocks()
+            ],
+            "layout_policy_native_output_target_signature": [
+                [int(value) for value in item] for item in self._native_output_storage_blocks()
+            ],
             "input_block_count": int(self.input_block_count),
             "output_block_count": int(self.output_block_count),
             "input_total_slots": int(self.input_total_slots),
@@ -3350,6 +3440,14 @@ class TconvK2S2PythonRuntimeExecutor:
             "fhe_output_shape": [int(value) for value in metadata.get("fhe_output_shape", [])],
             "layout_policy_input_layout": dict(metadata.get("layout_policy_input_layout", {}) or {}),
             "layout_policy_output_layout": dict(metadata.get("layout_policy_output_layout", {}) or {}),
+            "layout_policy_native_input_source_signature": [
+                [int(value) for value in item]
+                for item in metadata.get("layout_policy_native_input_source_signature", []) or []
+            ],
+            "layout_policy_native_output_target_signature": [
+                [int(value) for value in item]
+                for item in metadata.get("layout_policy_native_output_target_signature", []) or []
+            ],
         }
         if cached_signature["fhe_input_shape"] and cached_signature != expected_signature:
             return False
@@ -3486,24 +3584,38 @@ class TconvK2S2PythonRuntimeExecutor:
 
     def _block_layout(self, *, scheme: Any) -> dict[str, int]:
         slots = int(scheme.params.get_slots())
-        on_ci = int(getattr(self.module, "fhe_input_shape")[1])
-        on_hi = int(getattr(self.module, "fhe_input_shape")[2])
-        on_wi = int(getattr(self.module, "fhe_input_shape")[3])
-        on_co = int(getattr(self.module, "fhe_output_shape")[1])
-        on_ho = int(getattr(self.module, "fhe_output_shape")[2])
-        on_wo = int(getattr(self.module, "fhe_output_shape")[3])
-        input_plane = int(on_hi * on_wi)
-        output_plane = int(on_ho * on_wo)
-        input_channels_per_block = max(1, int(slots // input_plane))
-        output_channels_per_block = max(1, int(slots // output_plane))
-        input_total_slots = int(on_ci * on_hi * on_wi)
-        output_total_slots = int(on_co * on_ho * on_wo)
+        native_input_blocks = self._native_input_storage_blocks()
+        native_output_blocks = self._native_output_storage_blocks()
+        if native_input_blocks:
+            input_channels_per_block = max(int(block[3]) for block in native_input_blocks)
+            input_block_count = int(len(native_input_blocks))
+            input_total_slots = int(input_block_count * int(slots))
+        else:
+            on_ci = int(getattr(self.module, "fhe_input_shape")[1])
+            on_hi = int(getattr(self.module, "fhe_input_shape")[2])
+            on_wi = int(getattr(self.module, "fhe_input_shape")[3])
+            input_plane = int(on_hi * on_wi)
+            input_channels_per_block = max(1, int(slots // input_plane))
+            input_total_slots = int(on_ci * on_hi * on_wi)
+            input_block_count = int(math.ceil(int(input_total_slots) / int(slots)))
+        if native_output_blocks:
+            output_channels_per_block = max(int(block[3]) for block in native_output_blocks)
+            output_block_count = int(len(native_output_blocks))
+            output_total_slots = int(output_block_count * int(slots))
+        else:
+            on_co = int(getattr(self.module, "fhe_output_shape")[1])
+            on_ho = int(getattr(self.module, "fhe_output_shape")[2])
+            on_wo = int(getattr(self.module, "fhe_output_shape")[3])
+            output_plane = int(on_ho * on_wo)
+            output_channels_per_block = max(1, int(slots // output_plane))
+            output_total_slots = int(on_co * on_ho * on_wo)
+            output_block_count = int(math.ceil(int(output_total_slots) / int(slots)))
         return {
             "slots": int(slots),
             "input_channels_per_block": int(input_channels_per_block),
             "output_channels_per_block": int(output_channels_per_block),
-            "input_block_count": int(math.ceil(int(input_total_slots) / int(slots))),
-            "output_block_count": int(math.ceil(int(output_total_slots) / int(slots))),
+            "input_block_count": int(input_block_count),
+            "output_block_count": int(output_block_count),
             "input_total_slots": int(input_total_slots),
             "output_total_slots": int(output_total_slots),
         }
@@ -3530,12 +3642,60 @@ class TconvK2S2PythonRuntimeExecutor:
             "gap": max(1, int(layout.get("gap", getattr(self.module, "output_gap", 1)))),
         }
 
+    def _normalise_storage_signature(
+        self,
+        raw: Any,
+        *,
+        channels: int,
+        label: str,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        blocks: list[tuple[int, int, int, int]] = []
+        for item in tuple(raw or ()):
+            values = tuple(int(value) for value in tuple(item))
+            if len(values) != 4:
+                raise RuntimeError(f"{self.output_node_id} {label} signature row must have 4 integers")
+            h_start, h_end, channel_start, channel_count = values
+            if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+                continue
+            if int(channel_start) < 0 or int(channel_start + channel_count) > int(channels):
+                raise RuntimeError(
+                    f"{self.output_node_id} {label} signature channel range "
+                    f"[{int(channel_start)}, {int(channel_start + channel_count)}) exceeds {int(channels)}"
+                )
+            blocks.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+        return tuple(blocks)
+
+    def _native_input_storage_blocks(self) -> tuple[tuple[int, int, int, int], ...]:
+        if str(getattr(self.module, "layout_policy_input_physical_layout", "") or "") != "native_source_stripe":
+            return ()
+        return self._normalise_storage_signature(
+            getattr(self.module, "layout_policy_native_input_source_signature", ()) or (),
+            channels=int(getattr(self.module, "input_shape")[1]),
+            label="source",
+        )
+
+    def _native_output_storage_blocks(self) -> tuple[tuple[int, int, int, int], ...]:
+        materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
+        if materialization not in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+            return ()
+        return self._normalise_storage_signature(
+            getattr(self.module, "layout_policy_native_output_target_signature", ()) or (),
+            channels=int(getattr(self.module, "output_shape")[1]),
+            label="target",
+        )
+
     def _cache_layout_signature(self) -> dict[str, Any]:
         return {
             "fhe_input_shape": [int(value) for value in getattr(self.module, "fhe_input_shape")],
             "fhe_output_shape": [int(value) for value in getattr(self.module, "fhe_output_shape")],
             "layout_policy_input_layout": dict(self._input_halo_layout()),
             "layout_policy_output_layout": dict(self._output_halo_layout()),
+            "layout_policy_native_input_source_signature": [
+                [int(value) for value in item] for item in self._native_input_storage_blocks()
+            ],
+            "layout_policy_native_output_target_signature": [
+                [int(value) for value in item] for item in self._native_output_storage_blocks()
+            ],
         }
 
     def compile(self, scheme: Any) -> None:
@@ -3925,6 +4085,43 @@ class TconvK2S2PythonRuntimeExecutor:
         input_bottom_beta: int = 0,
         input_physical_h: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        native_blocks = self._native_input_storage_blocks()
+        if native_blocks:
+            if int(source_block) < 0 or int(source_block) >= len(native_blocks):
+                empty = torch.empty((0,), dtype=torch.int64)
+                return empty, empty, empty, empty
+            h_start, h_end, channel_start, channel_count = native_blocks[int(source_block)]
+            block_h = int(h_end - h_start)
+            if int(block_h) <= 0 or int(channel_count) <= 0:
+                empty = torch.empty((0,), dtype=torch.int64)
+                return empty, empty, empty, empty
+            local_c = torch.arange(int(channel_count), dtype=torch.int64)
+            local_h = torch.arange(int(block_h), dtype=torch.int64)
+            local_w = torch.arange(int(w_in), dtype=torch.int64)
+            local_c_grid, local_h_grid, local_w_grid = torch.meshgrid(local_c, local_h, local_w, indexing="ij")
+            source_slots = _idx_chw_gap_tensor(
+                local_c_grid.reshape(-1),
+                local_h_grid.reshape(-1),
+                local_w_grid.reshape(-1),
+                h=int(block_h),
+                w=int(w_in),
+                gap=int(input_gap),
+            )
+            ic = local_c_grid.reshape(-1) + int(channel_start)
+            ih = local_h_grid.reshape(-1) + int(h_start)
+            iw = local_w_grid.reshape(-1)
+            valid = (
+                (source_slots >= 0)
+                & (source_slots < int(slots))
+                & (ic >= 0)
+                & (ic < int(c_in))
+                & (ih >= -int(input_top_beta))
+                & (ih < int(h_in + input_bottom_beta))
+                & (iw >= 0)
+                & (iw < int(w_in))
+            )
+            return source_slots[valid], ic[valid], ih[valid], iw[valid]
+
         start = int(source_block) * int(slots)
         stop = min(int(start + int(slots)), int(self.input_total_slots))
         if int(stop) <= int(start):
@@ -3979,9 +4176,14 @@ class TconvK2S2PythonRuntimeExecutor:
         input_bottom_beta = _layout_physical_bottom_beta(input_layout)
         output_top_beta = _layout_physical_top_beta(output_layout)
         output_bottom_beta = _layout_physical_bottom_beta(output_layout)
+        native_output_blocks = self._native_output_storage_blocks()
         output_materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
         fused_output_relayout = output_materialization == "fused_relayout"
-        input_physical_h = int(getattr(self.module, "fhe_input_shape")[2])
+        input_physical_h = (
+            int(h_in + input_top_beta + input_bottom_beta)
+            if self._native_input_storage_blocks()
+            else int(getattr(self.module, "fhe_input_shape")[2])
+        )
         output_total_h = int(h_out + output_top_beta + output_bottom_beta)
 
         source_slots, ic, ih, iw = self._source_position_tensors_for_block(
@@ -4038,6 +4240,13 @@ class TconvK2S2PythonRuntimeExecutor:
                                     bottom_valid,
                                 )
                             )
+                    elif native_output_blocks:
+                        target_rows.append(
+                            (
+                                oh,
+                                (oh >= -int(output_top_beta)) & (oh < int(h_out + output_bottom_beta)),
+                            )
+                        )
                     else:
                         oh_total = oh + int(output_top_beta)
                         target_rows.append(
@@ -4048,6 +4257,48 @@ class TconvK2S2PythonRuntimeExecutor:
                         )
                     for target_h, row_valid in target_rows:
                         oh_grid = target_h.unsqueeze(1).expand_as(oc_grid)
+                        if native_output_blocks:
+                            for output_block_index, (
+                                block_h_start,
+                                block_h_end,
+                                block_channel_start,
+                                block_channel_count,
+                            ) in enumerate(native_output_blocks):
+                                local_h = oh_grid - int(block_h_start)
+                                local_c = oc_grid - int(block_channel_start)
+                                output_local = _idx_chw_gap_tensor(
+                                    local_c,
+                                    local_h,
+                                    ow_grid,
+                                    h=int(block_h_end - block_h_start),
+                                    w=int(w_out),
+                                    gap=int(output_gap),
+                                )
+                                diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                                output_positions = output_local
+                                valid = (
+                                    nonzero
+                                    & row_valid.unsqueeze(1)
+                                    & (oh_grid >= int(block_h_start))
+                                    & (oh_grid < int(block_h_end))
+                                    & (oc_grid >= int(block_channel_start))
+                                    & (oc_grid < int(block_channel_start + block_channel_count))
+                                    & (ow_grid >= 0)
+                                    & (ow_grid < int(w_out))
+                                    & (output_local >= 0)
+                                    & (output_local < int(slots))
+                                )
+                                if not bool(torch.any(valid).item()):
+                                    continue
+                                diagonal_parts[int(output_block_index)].append(
+                                    (
+                                        diag_idx[valid].to(dtype=torch.int64).clone(),
+                                        output_positions[valid].to(dtype=torch.int64).clone(),
+                                        coeff[valid].to(dtype=torch.float32).clone(),
+                                    )
+                                )
+                            continue
+
                         out_slot = _idx_chw_gap_tensor(
                             oc_grid,
                             oh_grid,
@@ -4154,6 +4405,40 @@ class TconvK2S2PythonRuntimeExecutor:
 
     def _construct_bias_vector(self) -> torch.Tensor:
         n, channels, height, width = (int(value) for value in getattr(self.module, "output_shape"))
+        native_output_blocks = self._native_output_storage_blocks()
+        if native_output_blocks:
+            slots = max(1, int(getattr(self, "output_total_slots", 0) or len(native_output_blocks)))
+            block_slots = max(1, int(slots // max(1, len(native_output_blocks))))
+            output_gap = max(1, int(getattr(self.module, "output_gap")))
+            bias = getattr(self.module, "on_bias").to(dtype=torch.float32)
+            bias_vector = torch.zeros((int(len(native_output_blocks) * block_slots),), dtype=torch.float32)
+            for block_index, (h_start, h_end, channel_start, channel_count) in enumerate(native_output_blocks):
+                block_h = int(h_end - h_start)
+                local_c = torch.arange(int(channel_count), dtype=torch.int64)
+                local_h = torch.arange(int(block_h), dtype=torch.int64)
+                local_w = torch.arange(int(width), dtype=torch.int64)
+                local_c_grid, local_h_grid, local_w_grid = torch.meshgrid(
+                    local_c,
+                    local_h,
+                    local_w,
+                    indexing="ij",
+                )
+                slot_index = _idx_chw_gap_tensor(
+                    local_c_grid.reshape(-1),
+                    local_h_grid.reshape(-1),
+                    local_w_grid.reshape(-1),
+                    h=int(block_h),
+                    w=int(width),
+                    gap=int(output_gap),
+                )
+                valid = (slot_index >= 0) & (slot_index < int(block_slots))
+                if not bool(torch.any(valid).item()):
+                    continue
+                channels_for_bias = local_c_grid.reshape(-1)[valid] + int(channel_start)
+                start = int(block_index * block_slots)
+                bias_vector[start + slot_index[valid]] = bias[channels_for_bias.to(dtype=torch.int64)]
+            return bias_vector.repeat(int(n))
+
         on_channels, on_height, on_width = (int(value) for value in getattr(self.module, "fhe_output_shape")[1:])
         output_gap = max(1, int(getattr(self.module, "output_gap")))
         output_layout = self._output_halo_layout()
@@ -4587,12 +4872,37 @@ class U22CompileRegistry:
         for node in dag.topological_sort():
             module = dag.nodes[node].get("module")
             if isinstance(module, ConvTranspose2d):
-                excluded_nodes.append(
-                    {
-                        "node": str(node),
-                        "reason": "tconv_uses_common_dense_path",
-                    }
+                if not bool(enable_conv_kernels):
+                    excluded_nodes.append(
+                        {
+                            "node": str(node),
+                            "reason": "tconv_provider_disabled",
+                        }
+                    )
+                    continue
+                if allowed is not None and str(node) not in allowed:
+                    excluded_nodes.append(
+                        {
+                            "node": str(node),
+                            "reason": "tconv_not_allowed",
+                        }
+                    )
+                    continue
+                if not _u22_tconv_module_supported(module):
+                    excluded_nodes.append(
+                        {
+                            "node": str(node),
+                            "reason": "u22_tconv_requires_k2s2_gap_halving",
+                        }
+                    )
+                    continue
+                groups.append(
+                    _u22_tconv_group(
+                        node=str(node),
+                        module=module,
+                    )
                 )
+                selected_tconv_count += 1
                 continue
             elif bool(enable_conv_kernels) and isinstance(module, AvgPool2d):
                 if not _u22_pool_module_supported(module):
@@ -4696,6 +5006,9 @@ class U22CompileRegistry:
                 module.region_runtime = group
                 module.region_output_id = str(node)
                 module.region_first_skip_dense_pack = bool(group.executable)
+                executor_plan = getattr(getattr(group, "executor", None), "compile_plan", None)
+                if isinstance(executor_plan, dict):
+                    module.compile_plan = dict(executor_plan)
                 if bool(group.executable):
                     provider_nodes.add(str(node))
                 if (bool(group.executable) or bool(solver_depth_only)) and hasattr(module, "set_depth"):
@@ -4720,6 +5033,12 @@ class U22CompileRegistry:
         backend_producer_attached: list[dict[str, Any]] = []
         backend_consumer_attached: list[dict[str, Any]] = []
         if compile_plan is not None:
+            for node in dag.topological_sort():
+                module = dag.nodes[node].get("module")
+                if module is None:
+                    continue
+                if getattr(module, "concat_fusion_specs", None):
+                    module.compile_plan = dict(compile_plan)
             backend_producer_attached = _layout_policy_attach_backend_producer_outputs(
                 dag,
                 compile_plan,

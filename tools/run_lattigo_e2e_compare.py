@@ -1508,6 +1508,59 @@ def _layer_mae_native_halo_executor(module: torch.nn.Module) -> Any | None:
     return base
 
 
+def _layer_mae_native_output_signature(
+    module: torch.nn.Module,
+    *,
+    module_name: str | None = None,
+) -> tuple[tuple[int, int, int, int], ...]:
+    def normalise(raw: Any) -> tuple[tuple[int, int, int, int], ...]:
+        blocks: list[tuple[int, int, int, int]] = []
+        for item in tuple(raw or ()):
+            try:
+                h_start, h_end, channel_start, channel_count = (int(value) for value in tuple(item))
+            except Exception:
+                return ()
+            if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+                continue
+            blocks.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+        return tuple(blocks)
+
+    signature = normalise(getattr(module, "layout_policy_native_output_target_signature", ()) or ())
+    if signature:
+        return signature
+    compile_plan = getattr(module, "compile_plan", None)
+    if not isinstance(compile_plan, dict) or not module_name:
+        return ()
+    for row in compile_plan.get("node_layouts", []) or []:
+        if str(row.get("node", "")) != str(module_name):
+            continue
+        signature = normalise(row.get("native_halo_target_storage_signature") or ())
+        if signature:
+            return signature
+    return ()
+
+
+def _layer_mae_should_decode_native_signature_output(
+    module: torch.nn.Module,
+    value: CipherTensor,
+    *,
+    module_name: str | None = None,
+    signature_module: torch.nn.Module | None = None,
+    signature_module_name: str | None = None,
+) -> bool:
+    if _layer_mae_output_relayout_present(module, None):
+        return False
+    owner = signature_module if signature_module is not None else module
+    owner_name = signature_module_name if signature_module_name is not None else module_name
+    signature = _layer_mae_native_output_signature(owner, module_name=owner_name)
+    if not signature:
+        return False
+    materialization = str(getattr(module, "layout_policy_output_materialization", "") or "")
+    if materialization and materialization not in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+        return False
+    return int(len(getattr(value, "ids", ()) or ())) == int(len(signature))
+
+
 def _layer_mae_native_halo_expected_ct_count(executor: Any) -> int:
     if _layer_mae_native_halo_uses_compact_physical_targets(executor):
         plan = executor.native_plan
@@ -1529,6 +1582,12 @@ def _layer_mae_native_halo_native_target_ct_count(executor: Any) -> int:
 
 def _layer_mae_native_halo_uses_compact_physical_targets(executor: Any) -> bool:
     module = getattr(executor, "module", None)
+    runtime_io = dict(getattr(executor, "last_runtime_io", {}) or {})
+    storage = str(runtime_io.get("native_output_storage_layout", "") or "")
+    if storage in {"tight_compact", "packed_compact", "logical_halo_compact"}:
+        return True
+    if storage in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+        return False
     storage = str(getattr(module, "native_halo_output_storage_layout", "") or "")
     if storage in {"tight_compact", "packed_compact", "logical_halo_compact"}:
         return True
@@ -1620,6 +1679,72 @@ def _layer_mae_decode_native_halo_output(decoded: torch.Tensor, executor: Any) -
                                 f"slot={int(slot)} values={int(values.numel())}"
                             )
                         result[0, int(channel), int(global_h), int(w_index)] = values[int(slot)]
+    return result
+
+
+def _layer_mae_decode_native_signature_output(
+    decoded: torch.Tensor,
+    *,
+    module: torch.nn.Module,
+    module_name: str | None = None,
+    signature_module: torch.nn.Module | None = None,
+    signature_module_name: str | None = None,
+) -> torch.Tensor:
+    values = _layer_mae_tensor(decoded).reshape(-1)
+    owner = signature_module if signature_module is not None else module
+    owner_name = signature_module_name if signature_module_name is not None else module_name
+    signature = _layer_mae_native_output_signature(owner, module_name=owner_name)
+    if not signature:
+        raise RuntimeError(f"native signature decode requested without a signature for {module_name or type(module).__name__}")
+    logical_shape = tuple(int(value) for value in tuple(getattr(module, "output_shape", ()) or ()))
+    if len(logical_shape) != 4:
+        raise RuntimeError(f"native signature decode requires a 4D logical shape for {module_name or type(module).__name__}")
+    n, channels, height, width = logical_shape
+    if int(n) != 1:
+        raise RuntimeError(f"native signature decode currently supports batch=1, got {int(n)}")
+    gap = max(1, int(getattr(module, "output_gap", 1) or 1))
+    slots = int(scheme.params.get_slots())
+    expected_values = int(len(signature)) * int(slots)
+    if int(values.numel()) < int(expected_values):
+        raise RuntimeError(
+            "native signature decode expected at least "
+            f"{int(expected_values)} slots, got {int(values.numel())}"
+        )
+    result = torch.zeros((int(n), int(channels), int(height), int(width)), dtype=torch.float32)
+    phases = int(gap * gap)
+    packed_w = int(width) * int(gap)
+    for block_index, (h_start, h_end, channel_start, channel_count) in enumerate(signature):
+        block_h = int(h_end - h_start)
+        if int(block_h) <= 0 or int(channel_count) <= 0:
+            continue
+        group_block = int(block_h) * int(gap) * int(packed_w)
+        block_base = int(block_index) * int(slots)
+        for local_channel in range(int(channel_count)):
+            channel = int(channel_start) + int(local_channel)
+            if int(channel) < 0 or int(channel) >= int(channels):
+                continue
+            group = int(local_channel) // int(phases)
+            phase = int(local_channel) % int(phases)
+            phase_h = int(phase) // int(gap)
+            phase_w = int(phase) % int(gap)
+            for global_h in range(int(h_start), int(h_end)):
+                if int(global_h) < 0 or int(global_h) >= int(height):
+                    continue
+                local_h = int(global_h) - int(h_start)
+                for w_index in range(int(width)):
+                    slot = (
+                        int(block_base)
+                        + int(group) * int(group_block)
+                        + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                        + int(w_index) * int(gap)
+                        + int(phase_w)
+                    )
+                    if int(slot) >= int(values.numel()):
+                        raise RuntimeError(
+                            "native signature decode target slot out of range: "
+                            f"slot={int(slot)} values={int(values.numel())}"
+                        )
+                    result[0, int(channel), int(global_h), int(w_index)] = values[int(slot)]
     return result
 
 
@@ -1820,6 +1945,9 @@ def _layer_mae_decode_cipher_output(
     *,
     decode_info: dict[str, Any] | None = None,
     native_executor_override: Any | None = None,
+    module_name: str | None = None,
+    native_signature_module_override: torch.nn.Module | None = None,
+    native_signature_module_name: str | None = None,
 ) -> torch.Tensor:
     plain = value.decrypt()
     plain_on_shape = None
@@ -1842,6 +1970,30 @@ def _layer_mae_decode_cipher_output(
             if bool(_layer_mae_native_halo_uses_compact_physical_targets(native_executor)):
                 return _layer_mae_decode_native_halo_compact_physical_output(raw_decoded, native_executor)
             return _layer_mae_decode_native_halo_output(raw_decoded, native_executor)
+        if _layer_mae_should_decode_native_signature_output(
+            module,
+            value,
+            module_name=module_name,
+            signature_module=native_signature_module_override,
+            signature_module_name=native_signature_module_name,
+        ):
+            raw_decoded = _layer_mae_decode_plain_raw(plain)
+            signature_owner = native_signature_module_override or module
+            signature_owner_name = native_signature_module_name or module_name
+            signature = _layer_mae_native_output_signature(signature_owner, module_name=signature_owner_name)
+            if decode_info is not None:
+                decode_info["decode_kind"] = "native_signature_stripe"
+                decode_info["raw_decoded_slot_count"] = int(raw_decoded.numel())
+                decode_info["native_signature_expected_ct_count"] = int(len(signature))
+                if signature_owner is not module or signature_owner_name != module_name:
+                    decode_info["native_signature_owner"] = str(signature_owner_name or "")
+            return _layer_mae_decode_native_signature_output(
+                raw_decoded,
+                module=module,
+                module_name=module_name,
+                signature_module=signature_owner,
+                signature_module_name=signature_owner_name,
+            )
         try:
             decoded = plain.decode()
             if decode_info is not None:
@@ -1934,10 +2086,18 @@ def _layer_mae_decode_model_output(net: torch.nn.Module, output: Any) -> tuple[t
     final = _layer_mae_final_module(net)
     if isinstance(output, CipherTensor) and final is not None:
         module_name, module = final
-        return _layer_mae_decode_cipher_output(module, output), {
+        decode_info: dict[str, Any] = {}
+        decoded = _layer_mae_decode_cipher_output(
+            module,
+            output,
+            decode_info=decode_info,
+            module_name=str(module_name),
+        )
+        return decoded, {
             "decode_kind": "module_aware_cipher_tensor",
             "module_path": str(module_name),
             "class": type(module).__name__,
+            **decode_info,
         }
     if isinstance(output, CipherTensor):
         plain = output.decrypt()
@@ -2264,6 +2424,28 @@ def _install_layer_mae_he_capture(
             return None, ""
         return native_executor, str(predecessor_name)
 
+    def native_signature_owner_for_layer_mae(
+        module_name: str,
+        module: torch.nn.Module,
+        output: CipherTensor,
+    ) -> tuple[torch.nn.Module | None, str]:
+        ct_count = int(len(getattr(output, "ids", ()) or ()))
+        signature = _layer_mae_native_output_signature(module, module_name=str(module_name))
+        if signature and int(len(signature)) == int(ct_count):
+            return module, str(module_name)
+        if _module_category(module) != "activation":
+            return None, ""
+        if not str(module_name).endswith("_act"):
+            return None, ""
+        predecessor_name = str(module_name)[: -len("_act")]
+        predecessor = module_by_name.get(predecessor_name)
+        if predecessor is None:
+            return None, ""
+        signature = _layer_mae_native_output_signature(predecessor, module_name=str(predecessor_name))
+        if not signature or int(len(signature)) != int(ct_count):
+            return None, ""
+        return predecessor, str(predecessor_name)
+
     def append_row(row: dict[str, Any]) -> None:
         rows.append(row)
         with jsonl_path.open("a", encoding="utf-8") as handle:
@@ -2339,12 +2521,20 @@ def _install_layer_mae_he_capture(
                     return
                 elif isinstance(output, CipherTensor):
                     native_executor, native_executor_owner = native_executor_for_layer_mae(str(module_name), module)
+                    native_signature_module, native_signature_owner = native_signature_owner_for_layer_mae(
+                        str(module_name),
+                        module,
+                        output,
+                    )
                     native_decode = _layer_mae_should_decode_native_halo_output(native_executor, output)
                     decoded = _layer_mae_decode_cipher_output(
                         module,
                         output,
                         decode_info=decode_info,
                         native_executor_override=native_executor,
+                        module_name=str(module_name),
+                        native_signature_module_override=native_signature_module,
+                        native_signature_module_name=native_signature_owner or None,
                     )
                     row["ciphertext_count"] = int(len(getattr(output, "ids", ()) or ()))
                     row["cipher_shape"] = _json_shape(getattr(output, "shape", ()))

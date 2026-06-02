@@ -585,6 +585,19 @@ class Conv2d(LinearTransform):
             return dict(row.get("selected_layout", {}) or {})
         return {}
 
+    def _concat_source_storage_signature(self, spec: dict) -> tuple[tuple[int, int, int, int], ...]:
+        join_row = self._concat_join_input_layout_row(spec)
+        raw = join_row.get("native_halo_source_storage_signature") if join_row else ()
+        if not raw:
+            return ()
+        try:
+            return tuple(
+                tuple(int(value) for value in item)
+                for item in raw
+            )
+        except Exception:
+            return ()
+
     def _concat_output_layout_attrs(self) -> dict:
         attrs = self._concat_layout_policy_module_attrs()
         conv_input_row = self._concat_conv_input_layout_row()
@@ -734,6 +747,33 @@ class Conv2d(LinearTransform):
                     )
                 )
         return tuple(rows)
+
+    @staticmethod
+    def _concat_native_plan_target_storage_signature(plan) -> tuple[tuple[int, int, int, int], ...]:
+        spec = getattr(plan, "spec", None)
+        if spec is None:
+            return ()
+        rows_by_block: dict[int, tuple[int, int, int, int]] = {}
+        for stripe in plan.effective_target_stripes:
+            target_tile = int(plan.target_tile_for_stripe(stripe))
+            for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                block_index = int(plan.target_block_index(stripe, int(target_group)))
+                channel_start = int(target_group) * int(target_tile)
+                channel_count = max(
+                    0,
+                    min(int(target_tile), int(getattr(spec, "c_out", 0) or 0) - int(channel_start)),
+                )
+                if int(channel_count) <= 0:
+                    continue
+                rows_by_block[int(block_index)] = (
+                    int(stripe.target_h_start),
+                    int(stripe.target_h_end),
+                    int(channel_start),
+                    int(channel_count),
+                )
+        if not rows_by_block:
+            return ()
+        return tuple(rows_by_block[index] for index in sorted(rows_by_block))
 
     def _concat_native_output_bias(self, output_attrs: dict | None = None) -> torch.Tensor | None:
         attrs = dict(output_attrs or self._concat_output_layout_attrs())
@@ -931,6 +971,8 @@ class Conv2d(LinearTransform):
 
         from orion.experimental.cir.native_halo_conv2d import (
             NativeHaloConv2DSpec,
+            NativeHaloStripe,
+            _build_conv_transform,
             _build_compact_source_conv_transform,
             _build_compact_source_concat_transforms_single_slot,
             _build_conv_transform_batch,
@@ -965,6 +1007,7 @@ class Conv2d(LinearTransform):
                 raise RuntimeError(f"concat-fused Conv2d {getattr(self, 'name', '')} has no concat specs")
             first_spec = dict(concat_specs[0])
             first_input_layout = self._concat_source_input_layout(first_spec)
+            first_source_signature = self._concat_source_storage_signature(first_spec)
             first_input_gap = max(
                 1,
                 int(dict(first_input_layout).get("gap", int(first_spec["gap"])) or int(first_spec["gap"])),
@@ -994,7 +1037,11 @@ class Conv2d(LinearTransform):
                 output_physical_top_beta=int(output_physical_top_beta),
                 output_physical_bottom_beta=int(output_physical_bottom_beta),
             )
-            native_output_plan = native_halo_conv2d_plan(first_native_spec, require_native_target_fit=False)
+            native_output_plan = native_halo_conv2d_plan(
+                first_native_spec,
+                require_native_target_fit=False,
+                source_storage_signature=first_source_signature or None,
+            )
             target_ct_count = int(self._concat_native_plan_target_ct_count(native_output_plan))
             native_output_signature = self._concat_native_plan_target_signature(native_output_plan)
             self._concat_native_output_plan = native_output_plan
@@ -1028,6 +1075,12 @@ class Conv2d(LinearTransform):
             input_layout = self._concat_source_input_layout(concat_spec)
             input_physical_layout = self._concat_source_input_physical_layout(concat_spec)
             native_source_input = bool(str(input_physical_layout) == "native_source_stripe")
+            source_storage_signature = self._concat_source_storage_signature(concat_spec)
+            if bool(native_source_input) and not source_storage_signature:
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} native branch "
+                    f"{int(input_index)} is missing a source storage signature"
+                )
             input_gap = max(1, int(dict(input_layout).get("gap", int(concat_spec["gap"])) or int(concat_spec["gap"])))
             input_top_beta = int(_layout_top_beta(input_layout))
             input_bottom_beta = int(_layout_bottom_beta(input_layout))
@@ -1068,7 +1121,11 @@ class Conv2d(LinearTransform):
                 output_physical_top_beta=int(output_physical_top_beta),
                 output_physical_bottom_beta=int(output_physical_bottom_beta),
             )
-            plan = native_halo_conv2d_plan(native_spec, require_native_target_fit=False)
+            plan = native_halo_conv2d_plan(
+                native_spec,
+                require_native_target_fit=False,
+                source_storage_signature=source_storage_signature or None,
+            )
             if bool(native_output_materialization):
                 branch_target_count = int(self._concat_native_plan_target_ct_count(plan))
                 branch_signature = self._concat_native_plan_target_signature(plan)
@@ -1113,47 +1170,118 @@ class Conv2d(LinearTransform):
                 )
                 built = []
                 group_index = 0
-                for stripe in plan.stripes:
-                    for source_group in range(int(plan.source_group_count_for_stripe(stripe))):
-                        group_n1 = (
-                            int(plan.group_n1s[int(group_index)])
-                            if int(group_index) < len(plan.group_n1s)
-                            else 1
-                        )
-                        target_group_count = int(plan.target_group_count_for_stripe(stripe))
-                        if bool(compact_output):
+                if bool(getattr(plan, "independent_source_target_stripes", False)):
+                    for source_stripe in plan.effective_source_stripes:
+                        for source_group in range(int(plan.source_group_count_for_stripe(source_stripe))):
+                            group_n1 = (
+                                int(plan.group_n1s[int(group_index)])
+                                if int(group_index) < len(plan.group_n1s)
+                                else 1
+                            )
+                            source_block = int(plan.source_block_index(source_stripe, int(source_group)))
                             ordered = []
-                            for target_group in range(int(target_group_count)):
-                                ordered.extend(
-                                    _build_conv_transforms_for_compact_output(
+                            source_owner_h_start = (
+                                int(source_stripe.source_h_start)
+                                if getattr(source_stripe, "source_owner_h_start", None) is None
+                                else int(source_stripe.source_owner_h_start)
+                            )
+                            source_owner_h_end = (
+                                int(source_stripe.source_h_end)
+                                if getattr(source_stripe, "source_owner_h_end", None) is None
+                                else int(source_stripe.source_owner_h_end)
+                            )
+                            for target_stripe in plan.effective_target_stripes:
+                                composite = NativeHaloStripe(
+                                    index=int(target_stripe.index),
+                                    target_h_start=int(target_stripe.target_h_start),
+                                    target_h_end=int(target_stripe.target_h_end),
+                                    source_h_start=int(source_stripe.source_h_start),
+                                    source_h_end=int(source_stripe.source_h_end),
+                                    source_channel_tile=int(plan.source_tile_for_stripe(source_stripe)),
+                                    target_channel_tile=int(plan.target_tile_for_stripe(target_stripe)),
+                                    source_owner_h_start=int(source_owner_h_start),
+                                    source_owner_h_end=int(source_owner_h_end),
+                                )
+                                target_group_count = int(plan.target_group_count_for_stripe(target_stripe))
+                                for target_group in range(int(target_group_count)):
+                                    target_index = int(plan.target_block_index(target_stripe, int(target_group)))
+                                    if bool(compact_output):
+                                        ordered.extend(
+                                            _build_conv_transforms_for_compact_output(
+                                                spec=native_spec,
+                                                plan=plan,
+                                                weight=branch_weight,
+                                                stripe=composite,
+                                                source_group=int(source_group),
+                                                target_group=int(target_group),
+                                                level=int(level),
+                                                scheme=self.scheme,
+                                                group_n1=int(group_n1),
+                                                source_index_override=int(source_block),
+                                            )
+                                        )
+                                        continue
+                                    transform = _build_conv_transform(
                                         spec=native_spec,
                                         plan=plan,
                                         weight=branch_weight,
-                                        stripe=stripe,
+                                        weight_np=None,
+                                        stripe=composite,
                                         source_group=int(source_group),
                                         target_group=int(target_group),
                                         level=int(level),
                                         scheme=self.scheme,
                                         group_n1=int(group_n1),
+                                        source_index_override=int(source_block),
+                                        target_index_override=int(target_index),
                                     )
-                                )
-                        else:
-                            ordered = _build_conv_transform_batch(
-                                spec=native_spec,
-                                plan=plan,
-                                weight=branch_weight,
-                                weight_np=None,
-                                stripe=stripe,
-                                source_group=int(source_group),
-                                target_groups=[int(value) for value in range(int(target_group_count))],
-                                level=int(level),
-                                scheme=self.scheme,
-                                group_n1=int(group_n1),
+                                    if transform is not None:
+                                        ordered.append((int(transform.target_index), transform))
+                            if ordered:
+                                built.append((int(source_block), list(ordered)))
+                            group_index += 1
+                else:
+                    for stripe in plan.stripes:
+                        for source_group in range(int(plan.source_group_count_for_stripe(stripe))):
+                            group_n1 = (
+                                int(plan.group_n1s[int(group_index)])
+                                if int(group_index) < len(plan.group_n1s)
+                                else 1
                             )
-                        source_block = int(plan.source_block_index(stripe, int(source_group)))
-                        if ordered:
-                            built.append((int(source_block), list(ordered)))
-                        group_index += 1
+                            target_group_count = int(plan.target_group_count_for_stripe(stripe))
+                            if bool(compact_output):
+                                ordered = []
+                                for target_group in range(int(target_group_count)):
+                                    ordered.extend(
+                                        _build_conv_transforms_for_compact_output(
+                                            spec=native_spec,
+                                            plan=plan,
+                                            weight=branch_weight,
+                                            stripe=stripe,
+                                            source_group=int(source_group),
+                                            target_group=int(target_group),
+                                            level=int(level),
+                                            scheme=self.scheme,
+                                            group_n1=int(group_n1),
+                                        )
+                                    )
+                            else:
+                                ordered = _build_conv_transform_batch(
+                                    spec=native_spec,
+                                    plan=plan,
+                                    weight=branch_weight,
+                                    weight_np=None,
+                                    stripe=stripe,
+                                    source_group=int(source_group),
+                                    target_groups=[int(value) for value in range(int(target_group_count))],
+                                    level=int(level),
+                                    scheme=self.scheme,
+                                    group_n1=int(group_n1),
+                                )
+                            source_block = int(plan.source_block_index(stripe, int(source_group)))
+                            if ordered:
+                                built.append((int(source_block), list(ordered)))
+                            group_index += 1
             elif bool(single_slot_layer_cache):
                 proxy = self._concat_source_proxy(
                     concat_spec,
@@ -1251,6 +1379,16 @@ class Conv2d(LinearTransform):
                     f"concat-fused Conv2d {getattr(self, 'name', '')} native output target coverage mismatch: "
                     f"missing={missing} extra={extra}"
                 )
+            target_storage_signature = self._concat_native_plan_target_storage_signature(native_output_plan)
+            if int(len(target_storage_signature)) != int(target_ct_count):
+                raise RuntimeError(
+                    f"concat-fused Conv2d {getattr(self, 'name', '')} native output storage signature "
+                    f"has {int(len(target_storage_signature))} rows, expected {int(target_ct_count)}"
+                )
+            self.layout_policy_native_output_target_signature = [
+                [int(value) for value in item] for item in target_storage_signature
+            ]
+            self.fhe_output_shape = torch.Size(runtime_fhe_output_shape)
 
         self.diagonals = {}
         self.transform_ids = {}
