@@ -139,12 +139,7 @@ def bootstrap_prescale_fusion_supported(module: Any) -> bool:
         return False
     if module is None or not module_uses_full_bootstrap_slots(module):
         return False
-    return bool(
-        _activation_fusion_capable(module)
-        or _relu_output_fusion_capable(module)
-        or _runtime_fusion_capable(module)
-        or _add_fusion_capable(module)
-    )
+    return bool(_runtime_fusion_capable(module) or _add_fusion_capable(module))
 
 
 def bootstrap_prescale_affine(bootstrapper: Any) -> dict[str, float]:

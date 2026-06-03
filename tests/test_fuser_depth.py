@@ -109,7 +109,7 @@ def test_orion_identity_can_anchor_relu_direct_branch_bootstrap() -> None:
     assert boots == 1
 
 
-def test_relu_output_bootstrap_fusion_scales_sign_and_biases_output_mult() -> None:
+def test_relu_output_bootstrap_fusion_requires_runtime_opt_in() -> None:
     class Params:
         def get_slots(self):
             return 8
@@ -119,11 +119,7 @@ def test_relu_output_bootstrap_fusion_scales_sign_and_biases_output_mult() -> No
     relu.mult2.fhe_output_shape = torch.Size([8])
     bootstrapper = SimpleNamespace(prescale=0.5, constant=1.25)
 
-    assert install_bootstrap_prescale_fusion(relu.mult2, bootstrapper) is True
-    assert relu.sign.acts[-1]._bootstrap_output_scale_fusion == 0.5
-    assert relu.mult2._bootstrap_output_bias_fusion == 0.625
-    assert bootstrapper.preprocess_fused is True
-
-    relu.mult2.he_mode = True
-    out = relu.mult2(torch.tensor([2.0]), torch.tensor([3.0]))
-    assert torch.equal(out, torch.tensor([6.625]))
+    assert install_bootstrap_prescale_fusion(relu.mult2, bootstrapper) is False
+    assert not hasattr(relu.sign.acts[-1], "_bootstrap_output_scale_fusion")
+    assert not hasattr(relu.mult2, "_bootstrap_output_bias_fusion")
+    assert not hasattr(bootstrapper, "preprocess_fused")
