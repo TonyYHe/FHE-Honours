@@ -40,6 +40,10 @@ _NATIVE_DIAG_CACHE_MAX_ENTRIES = 50000
 _MISSING_ATTR = object()
 
 
+class NativeHaloLogicalMiddleHaloError(ValueError):
+    """Raised when a native storage signature would drop logical middle halo."""
+
+
 def _env_enabled(name: str, default: bool = False) -> bool:
     value = os.environ.get(str(name))
     if value is None:
@@ -818,6 +822,7 @@ class NativeHaloConv2DPlan:
     target_storage_signature: tuple[tuple[int, int, int, int], ...] = ()
     source_stripes: tuple[NativeHaloStripe, ...] = ()
     target_stripes: tuple[NativeHaloStripe, ...] = ()
+    target_internal_halo_overlap: int = 0
 
     @property
     def effective_source_stripes(self) -> tuple[NativeHaloStripe, ...]:
@@ -898,7 +903,11 @@ class NativeHaloConv2DPlan:
 
     @property
     def output_ct_count(self) -> int:
-        if not _spec_has_physical_output_halo(self.spec):
+        if (
+            not self.target_storage_signature
+            and not _spec_has_physical_output_halo(self.spec)
+            and int(self.target_internal_halo_overlap) <= 0
+        ):
             return _compact_ct_count(
                 int(self.spec.c_out),
                 _spec_physical_output_h(self.spec),
@@ -939,7 +948,11 @@ class NativeHaloConv2DPlan:
             "channel_fold_mode": str(self.channel_fold_mode),
             "output_storage_layout": (
                 "native_halo_stripe"
-                if _spec_has_physical_output_halo(self.spec)
+                if (
+                    self.target_storage_signature
+                    or _spec_has_physical_output_halo(self.spec)
+                    or int(self.target_internal_halo_overlap) > 0
+                )
                 else ("logical_halo_compact" if _spec_has_semantic_output_halo(self.spec) else "tight_compact")
             ),
             "spec": self.spec.to_dict(),
@@ -957,6 +970,7 @@ class NativeHaloConv2DPlan:
             "target_storage_signature": [
                 [int(value) for value in item] for item in self.target_storage_signature
             ],
+            "target_internal_halo_overlap": int(self.target_internal_halo_overlap),
             "stripe_count": int(len(self.stripes)),
             "independent_source_target_stripes": bool(self.independent_source_target_stripes),
             "input_ct_count": int(self.input_ct_count),
@@ -2821,9 +2835,15 @@ def _target_h_end_for_source_h(
     return int(best)
 
 
-def _stripes_for_source_h(spec: NativeHaloConv2DSpec, *, source_h: int) -> tuple[NativeHaloStripe, ...]:
+def _stripes_for_source_h(
+    spec: NativeHaloConv2DSpec,
+    *,
+    source_h: int,
+    target_internal_halo_overlap: int = 0,
+) -> tuple[NativeHaloStripe, ...]:
     stripes: list[NativeHaloStripe] = []
     target_h = int(_output_physical_h_min(spec))
+    overlap = max(0, int(target_internal_halo_overlap))
     while int(target_h) < int(_output_physical_h_max(spec)):
         th0 = int(target_h)
         th1 = _target_h_end_for_source_h(spec, target_h_start=int(th0), source_h=int(source_h))
@@ -2858,7 +2878,10 @@ def _stripes_for_source_h(spec: NativeHaloConv2DSpec, *, source_h: int) -> tuple
                 source_h_end=int(sh1),
             )
         )
-        target_h = int(th1)
+        if int(th1) >= int(_output_physical_h_max(spec)):
+            target_h = int(th1)
+        else:
+            target_h = max(int(th0) + 1, int(th1) - int(overlap))
     return tuple(stripes)
 
 
@@ -2982,6 +3005,7 @@ _CACHE_PLAN_GUARD_KEYS = (
     "target_stripes",
     "source_storage_signature",
     "target_storage_signature",
+    "target_internal_halo_overlap",
 )
 
 
@@ -3074,6 +3098,87 @@ def _normalise_source_storage_signature(
             raise ValueError("native halo source storage signature channel block exceeds input channels")
         blocks.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
     return tuple(sorted(blocks, key=lambda item: (int(item[0]), int(item[1]), int(item[2]))))
+
+
+def _storage_signature_height_ranges(
+    blocks: tuple[tuple[int, int, int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted(
+            {(int(h_start), int(h_end)) for h_start, h_end, _channel_start, _channel_count in blocks},
+            key=lambda item: (int(item[0]), int(item[1])),
+        )
+    )
+
+
+def _validate_storage_signature_preserves_logical_middle_halo(
+    blocks: tuple[tuple[int, int, int, int], ...],
+    *,
+    top_beta: int,
+    bottom_beta: int,
+    label: str,
+) -> None:
+    required_overlap = max(0, int(top_beta)) + max(0, int(bottom_beta))
+    if int(required_overlap) <= 0:
+        return
+    ranges = _storage_signature_height_ranges(blocks)
+    if len(ranges) <= 1:
+        return
+    bad: list[tuple[int, int, int, int, int]] = []
+    previous_start, previous_end = (int(value) for value in ranges[0])
+    for current_start, current_end in ranges[1:]:
+        overlap = int(previous_end) - int(current_start)
+        if int(overlap) < int(required_overlap):
+            bad.append(
+                (
+                    int(previous_start),
+                    int(previous_end),
+                    int(current_start),
+                    int(current_end),
+                    int(overlap),
+                )
+            )
+        if int(current_end) > int(previous_end):
+            previous_start, previous_end = int(current_start), int(current_end)
+    if not bad:
+        return
+    preview = ", ".join(
+        f"[{left_start},{left_end})/[{right_start},{right_end}) overlap={overlap}"
+        for left_start, left_end, right_start, right_end, overlap in bad[:4]
+    )
+    suffix = "" if len(bad) <= 4 else f", ... (+{len(bad) - 4})"
+    raise NativeHaloLogicalMiddleHaloError(
+        f"{label} storage signature does not preserve logical middle halo: "
+        f"required adjacent overlap >= {int(required_overlap)} rows from "
+        f"top_beta={int(top_beta)}, bottom_beta={int(bottom_beta)}, got {preview}{suffix}"
+    )
+
+
+def _target_storage_signature_from_stripes(
+    spec: NativeHaloConv2DSpec,
+    stripes: tuple[NativeHaloStripe, ...],
+    *,
+    default_target_tile: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    blocks: list[tuple[int, int, int, int]] = []
+    for stripe in stripes:
+        target_tile = int(stripe.target_channel_tile or default_target_tile)
+        if int(target_tile) <= 0:
+            continue
+        for target_group in range(_ceil_div(int(spec.c_out), int(target_tile))):
+            channel_start = int(target_group) * int(target_tile)
+            channel_count = min(int(target_tile), int(spec.c_out) - int(channel_start))
+            if int(channel_count) <= 0:
+                continue
+            blocks.append(
+                (
+                    int(stripe.target_h_start),
+                    int(stripe.target_h_end),
+                    int(channel_start),
+                    int(channel_count),
+                )
+            )
+    return tuple(blocks)
 
 
 def _channel_tile_by_height_from_signature(
@@ -3434,16 +3539,97 @@ def _target_storage_stripes_from_signature(
     return tuple(stripes)
 
 
+def _paired_stripes_from_storage_signatures(
+    spec: NativeHaloConv2DSpec,
+    source_signature: Any,
+    target_signature: Any,
+) -> tuple[NativeHaloStripe, ...]:
+    source_blocks = _normalise_source_storage_signature(source_signature, c_in=int(spec.c_in))
+    target_blocks = _normalise_target_storage_signature(target_signature, c_out=int(spec.c_out))
+    if not source_blocks or not target_blocks:
+        return ()
+    source_height_tiles = _channel_tile_by_height_from_signature(
+        source_blocks,
+        channels=int(spec.c_in),
+        label="source",
+    )
+    target_height_tiles = _channel_tile_by_height_from_signature(
+        target_blocks,
+        channels=int(spec.c_out),
+        label="target",
+    )
+    if len(source_height_tiles) != len(target_height_tiles):
+        return ()
+    source_physical_min = int(_input_physical_h_min(spec))
+    source_physical_max = int(_input_physical_h_max(spec))
+    target_physical_min = int(_output_physical_h_min(spec))
+    target_physical_max = int(_output_physical_h_max(spec))
+    stripes: list[NativeHaloStripe] = []
+    for index, ((source_h_start, source_h_end, source_tile), (target_h_start, target_h_end, target_tile)) in enumerate(
+        zip(source_height_tiles, target_height_tiles, strict=True)
+    ):
+        if int(source_h_start) < int(source_physical_min) or int(source_h_end) > int(source_physical_max):
+            return ()
+        if int(target_h_start) < int(target_physical_min) or int(target_h_end) > int(target_physical_max):
+            return ()
+        req0, req1 = _source_h_range_for_target(
+            target_h_start=int(target_h_start),
+            target_h_end=int(target_h_end),
+            input_h_min=int(spec.input_h_min),
+            input_h_max=int(spec.input_h_max),
+            kernel=int(spec.kernel),
+            stride=int(spec.stride),
+            pad=int(spec.pad),
+            dilation=int(spec.dilation),
+        )
+        req0, req1 = _source_h_range_with_physical_input_halo(
+            spec,
+            required_start=int(req0),
+            required_end=int(req1),
+        )
+        if int(req0) < int(source_h_start) or int(req1) > int(source_h_end):
+            return ()
+        if _packed_active_slots(
+            int(source_tile),
+            int(source_h_end - source_h_start),
+            int(spec.w_in),
+            int(spec.gap_in),
+        ) > int(spec.slot_count):
+            return ()
+        if _packed_active_slots(
+            int(target_tile),
+            int(target_h_end - target_h_start),
+            int(spec.w_out),
+            int(spec.gap_out),
+        ) > int(spec.slot_count):
+            return ()
+        stripes.append(
+            NativeHaloStripe(
+                index=int(index),
+                target_h_start=int(target_h_start),
+                target_h_end=int(target_h_end),
+                source_h_start=int(source_h_start),
+                source_h_end=int(source_h_end),
+                source_channel_tile=int(source_tile),
+                target_channel_tile=int(target_tile),
+            )
+        )
+    return tuple(stripes)
+
+
 def _per_stripe_fold_stripes(
     spec: NativeHaloConv2DSpec,
     *,
     base_source_tile: int,
     base_target_tile: int,
+    target_internal_halo_overlap: int = 0,
 ) -> tuple[NativeHaloStripe, ...]:
+    overlap = max(0, int(target_internal_halo_overlap))
     cache_key = (
         _native_spec_structural_cache_key(spec),
         int(base_source_tile),
         int(base_target_tile),
+        int(overlap),
     )
     cached = _PER_STRIPE_FOLD_STRIPES_CACHE.get(cache_key)
     if cached is not None:
@@ -3451,7 +3637,11 @@ def _per_stripe_fold_stripes(
     if len(_PER_STRIPE_FOLD_STRIPES_CACHE) > 20000:
         _PER_STRIPE_FOLD_STRIPES_CACHE.clear()
     base_source_h = _source_h_capacity_for_tile(spec, int(base_source_tile))
-    target_stripes = _stripes_for_source_h(spec, source_h=int(base_source_h))
+    target_stripes = _stripes_for_source_h(
+        spec,
+        source_h=int(base_source_h),
+        target_internal_halo_overlap=int(overlap),
+    )
     source_tiles = _channel_tile_candidates(int(spec.c_in), int(spec.gap_in))
     target_tiles = _channel_tile_candidates(int(spec.c_out), int(spec.gap_out))
     diag_cache: dict[tuple[int, int, int, int, int], set[int]] = {}
@@ -3575,12 +3765,15 @@ def _default_native_target_stripes(
     source_tile: int,
     target_tile: int,
     source_h: int,
+    target_internal_halo_overlap: int = 0,
 ) -> tuple[NativeHaloStripe, ...]:
+    overlap = max(0, int(target_internal_halo_overlap))
     if str(fold_mode) == "per_stripe":
         return _per_stripe_fold_stripes(
             spec,
             base_source_tile=int(source_tile),
             base_target_tile=int(target_tile),
+            target_internal_halo_overlap=int(overlap),
         )
     return tuple(
         _with_stripe_channel_tiles(
@@ -3588,7 +3781,11 @@ def _default_native_target_stripes(
             source_tile=int(source_tile),
             target_tile=int(target_tile),
         )
-        for stripe in _stripes_for_source_h(spec, source_h=int(source_h))
+        for stripe in _stripes_for_source_h(
+            spec,
+            source_h=int(source_h),
+            target_internal_halo_overlap=int(overlap),
+        )
     )
 
 
@@ -3599,6 +3796,7 @@ def native_halo_conv2d_plan(
     channel_fold_mode: str | None = None,
     source_storage_signature: Any = None,
     target_storage_signature: Any = None,
+    target_internal_halo_overlap: int = 0,
 ) -> NativeHaloConv2DPlan:
     fold_mode = _normalise_channel_fold_mode(channel_fold_mode)
     source_signature = _normalise_source_storage_signature(
@@ -3609,12 +3807,28 @@ def native_halo_conv2d_plan(
         target_storage_signature,
         c_out=int(spec.c_out),
     ) if target_storage_signature else ()
+    internal_overlap = 0 if target_signature else max(0, int(target_internal_halo_overlap))
+    if source_signature:
+        _validate_storage_signature_preserves_logical_middle_halo(
+            source_signature,
+            top_beta=int(spec.input_top_beta),
+            bottom_beta=int(spec.input_bottom_beta),
+            label=f"{spec.family_label} source",
+        )
+    if target_signature:
+        _validate_storage_signature_preserves_logical_middle_halo(
+            target_signature,
+            top_beta=int(spec.output_top_beta),
+            bottom_beta=int(spec.output_bottom_beta),
+            label=f"{spec.family_label} target",
+        )
     key = (
         _native_spec_structural_cache_key(spec),
         bool(require_native_target_fit),
         str(fold_mode),
         tuple(source_signature),
         tuple(target_signature),
+        int(internal_overlap),
     )
     cached = _PLAN_CACHE.get(key)
     if cached is not None:
@@ -3628,28 +3842,33 @@ def native_halo_conv2d_plan(
     independent_source_stripes: tuple[NativeHaloStripe, ...] = ()
     independent_target_stripes: tuple[NativeHaloStripe, ...] = ()
     if source_signature and target_signature:
-        source_stripes = _source_storage_stripes_from_signature(spec, source_signature)
-        target_stripes = _target_storage_stripes_from_signature(spec, target_signature)
-        # A native producer can legitimately consume one source stripe layout
-        # while materializing a different target stripe layout for its
-        # consumer.  One target block may receive partial contributions from
-        # multiple source blocks, so keep independent source/target stripe
-        # tables for runtime compilation whenever both signatures are forced.
-        stripes = tuple(target_stripes)
-        independent_source_stripes = tuple(source_stripes)
-        independent_target_stripes = tuple(target_stripes)
-    elif source_signature:
-        source_stripes = _source_storage_stripes_from_signature(spec, source_signature)
-        target_stripes = _default_native_target_stripes(
+        paired_stripes = _paired_stripes_from_storage_signatures(
             spec,
-            fold_mode=str(fold_mode),
-            source_tile=int(source_tile),
-            target_tile=int(target_tile),
-            source_h=int(source_h),
+            source_signature,
+            target_signature,
         )
-        stripes = tuple(target_stripes)
-        independent_source_stripes = tuple(source_stripes)
-        independent_target_stripes = tuple(target_stripes)
+        if paired_stripes:
+            stripes = tuple(paired_stripes)
+        else:
+            source_stripes = _source_storage_stripes_from_signature(spec, source_signature)
+            target_stripes = _target_storage_stripes_from_signature(spec, target_signature)
+            # A native producer can legitimately consume one source stripe
+            # layout while materializing a different target stripe layout for
+            # its consumer.  One target block may receive partial contributions
+            # from multiple source blocks, so keep independent source/target
+            # stripe tables only when the forced signatures are not pairable.
+            stripes = tuple(target_stripes)
+            independent_source_stripes = tuple(source_stripes)
+            independent_target_stripes = tuple(target_stripes)
+    elif source_signature:
+        # A forced native source signature already tells us which stored rows
+        # are resident in each source block.  When no target signature is
+        # forced, keep the kernel-table no-share contract: each target stripe
+        # consumes the one source stripe whose local halo window covers it.
+        # Treating the source storage blocks and generated target stripes as
+        # independent tables would form a source x target cross product and
+        # count boundary MVMs that the resident halo window was meant to avoid.
+        stripes = _source_stripes_from_storage_signature(spec, source_signature)
     elif target_signature:
         stripes = _target_stripes_from_storage_signature(spec, target_signature)
     elif str(fold_mode) == "per_stripe":
@@ -3659,6 +3878,7 @@ def native_halo_conv2d_plan(
             source_tile=int(source_tile),
             target_tile=int(target_tile),
             source_h=int(source_h),
+            target_internal_halo_overlap=int(internal_overlap),
         )
     else:
         stripes = _default_native_target_stripes(
@@ -3667,6 +3887,18 @@ def native_halo_conv2d_plan(
             source_tile=int(source_tile),
             target_tile=int(target_tile),
             source_h=int(source_h),
+            target_internal_halo_overlap=int(internal_overlap),
+        )
+    if not target_signature and int(internal_overlap) > 0:
+        _validate_storage_signature_preserves_logical_middle_halo(
+            _target_storage_signature_from_stripes(
+                spec,
+                tuple(stripes),
+                default_target_tile=int(target_tile),
+            ),
+            top_beta=int(spec.output_top_beta),
+            bottom_beta=int(spec.output_bottom_beta),
+            label=f"{spec.family_label} generated target",
         )
     if bool(require_native_target_fit) and any(
         _packed_active_slots(
@@ -3835,6 +4067,7 @@ def native_halo_conv2d_plan(
         target_storage_signature=tuple(target_signature),
         source_stripes=tuple(independent_source_stripes),
         target_stripes=tuple(independent_target_stripes),
+        target_internal_halo_overlap=int(internal_overlap),
     )
     _PLAN_CACHE[key] = plan
     return plan
@@ -5528,12 +5761,17 @@ class NativeHaloStripeNoRIConvExecutor:
             tuple(int(value) for value in raw)
             for raw in (getattr(self.module, "layout_policy_native_output_target_signature", ()) or ())
         )
+        target_internal_halo_overlap = self._target_internal_halo_overlap_for_spec(
+            spec,
+            target_storage_signature=target_storage_signature,
+        )
         self.native_plan = native_halo_conv2d_plan(
             spec,
             require_native_target_fit=bool(self._native_plan_require_target_fit),
             channel_fold_mode=str(fold_mode),
             source_storage_signature=source_storage_signature,
             target_storage_signature=target_storage_signature,
+            target_internal_halo_overlap=int(target_internal_halo_overlap),
         )
         self.slots = int(spec.slot_count)
         self.rows = int(self._runtime_output_ct_count())
@@ -5594,6 +5832,16 @@ class NativeHaloStripeNoRIConvExecutor:
 
     def _uses_tight_compact_output(self) -> bool:
         return self._uses_tight_compact_output_for_spec(self.native_plan.spec)
+
+    def _target_internal_halo_overlap_for_spec(
+        self,
+        spec: NativeHaloConv2DSpec,
+        *,
+        target_storage_signature: tuple[tuple[int, int, int, int], ...] = (),
+    ) -> int:
+        if target_storage_signature or self._uses_tight_compact_output_for_spec(spec):
+            return 0
+        return max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
 
     def _compact_output_storage_layout(self) -> str:
         if _spec_has_semantic_output_halo(self.native_plan.spec):
@@ -5682,6 +5930,10 @@ class NativeHaloStripeNoRIConvExecutor:
             tuple(int(value) for value in raw)
             for raw in (getattr(self.module, "layout_policy_native_output_target_signature", ()) or ())
         )
+        target_internal_halo_overlap = self._target_internal_halo_overlap_for_spec(
+            runtime_spec,
+            target_storage_signature=target_storage_signature,
+        )
         changed = (
             tuple(runtime_spec.to_dict().items()) != tuple(self.native_plan.spec.to_dict().items())
             or bool(require_native_target_fit) != bool(self._native_plan_require_target_fit)
@@ -5690,6 +5942,8 @@ class NativeHaloStripeNoRIConvExecutor:
             != tuple(getattr(self.native_plan, "source_storage_signature", ()) or ())
             or tuple(target_storage_signature)
             != tuple(getattr(self.native_plan, "target_storage_signature", ()) or ())
+            or int(target_internal_halo_overlap)
+            != int(getattr(self.native_plan, "target_internal_halo_overlap", 0) or 0)
         )
         if bool(changed):
             self.native_plan = native_halo_conv2d_plan(
@@ -5698,6 +5952,7 @@ class NativeHaloStripeNoRIConvExecutor:
                 channel_fold_mode=str(fold_mode),
                 source_storage_signature=source_storage_signature,
                 target_storage_signature=target_storage_signature,
+                target_internal_halo_overlap=int(target_internal_halo_overlap),
             )
             self._native_plan_require_target_fit = bool(require_native_target_fit)
         self.slots = int(self.native_plan.spec.slot_count)

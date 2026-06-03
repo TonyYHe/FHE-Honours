@@ -638,7 +638,9 @@ class Concat(Module):
         if bool(native_materialization):
             target_signature = self._native_output_signature()
             input_signatures = self._native_input_signatures()
+            compile_io = dict(getattr(self, "_concat_native_compile_rotation_io", {}) or {})
             self._concat_native_runtime_io = {
+                **compile_io,
                 "runtime_lowering": "concat_explicit_native_materialize",
                 "concat_native_runtime_materializer": True,
                 "native_input_signature_count": int(len(input_signatures)),

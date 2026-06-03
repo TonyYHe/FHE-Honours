@@ -70,7 +70,17 @@ class TrackingScaledSiLU(nn.Module):
 
 
 class ScaledChebyshevSiLU(nn.Module):
-    def __init__(self, coeffs: Iterable[float], *, postscale: float, trainable_coeffs: bool = False) -> None:
+    def __init__(
+        self,
+        coeffs: Iterable[float],
+        *,
+        postscale: float,
+        trainable_coeffs: bool = False,
+        trainable_scale: bool = False,
+        blend_alpha: float = 1.0,
+        reference_activation: str = "plain-silu",
+        reference_postscale: float | None = None,
+    ) -> None:
         super().__init__()
         coeff_tensor = torch.tensor(list(coeffs), dtype=torch.float32)
         if bool(trainable_coeffs):
@@ -79,15 +89,37 @@ class ScaledChebyshevSiLU(nn.Module):
             self.register_buffer("coeffs", coeff_tensor)
         self.postscale = float(postscale)
         self.prescale = 1.0 / self.postscale if self.postscale != 0.0 else 1.0
+        if bool(trainable_scale):
+            self.log_postscale = nn.Parameter(torch.log(torch.tensor(float(max(self.postscale, 1.0)), dtype=torch.float32)))
+        else:
+            self.register_buffer("postscale_tensor", torch.tensor(float(self.postscale), dtype=torch.float32))
+        self.register_buffer("blend_alpha", torch.tensor(float(blend_alpha), dtype=torch.float32))
+        self.reference_activation = str(reference_activation)
+        reference_postscale_value = float(self.postscale if reference_postscale is None else reference_postscale)
+        self.register_buffer("reference_postscale_tensor", torch.tensor(reference_postscale_value, dtype=torch.float32))
+
+    def _reference(self, x: torch.Tensor, postscale: torch.Tensor) -> torch.Tensor:
+        if self.reference_activation in {"scaled-silu", "scaled_silu"}:
+            reference_postscale = self.reference_postscale_tensor.to(device=x.device, dtype=x.dtype)
+            return reference_postscale * F.silu(x / reference_postscale)
+        return F.silu(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = x * self.prescale
+        if hasattr(self, "log_postscale"):
+            postscale = torch.exp(self.log_postscale).to(device=x.device, dtype=x.dtype).clamp_min(1.0e-6)
+        else:
+            postscale = self.postscale_tensor.to(device=x.device, dtype=x.dtype)
+        z = x / postscale
         coeffs = self.coeffs.to(device=z.device, dtype=z.dtype)
         if coeffs.numel() == 0:
-            return torch.zeros_like(z)
+            cheb = torch.zeros_like(z)
+            alpha = self.blend_alpha.to(device=x.device, dtype=x.dtype)
+            return (1.0 - alpha) * self._reference(x, postscale) + alpha * (postscale * cheb)
         out = coeffs[0].expand_as(z)
         if coeffs.numel() == 1:
-            return self.postscale * out
+            cheb = postscale * out
+            alpha = self.blend_alpha.to(device=x.device, dtype=x.dtype)
+            return (1.0 - alpha) * self._reference(x, postscale) + alpha * cheb
         t0 = torch.ones_like(z)
         t1 = z
         out = out + coeffs[1] * t1
@@ -95,22 +127,56 @@ class ScaledChebyshevSiLU(nn.Module):
             t2 = 2.0 * z * t1 - t0
             out = out + coeffs[index] * t2
             t0, t1 = t1, t2
-        return self.postscale * out
+        cheb = postscale * out
+        alpha = self.blend_alpha.to(device=x.device, dtype=x.dtype)
+        return (1.0 - alpha) * self._reference(x, postscale) + alpha * cheb
 
 
 def fit_unit_chebyshev_silu(*, degree: int) -> list[float]:
     nodes = np.polynomial.chebyshev.chebpts1(int(degree) + 1)
     values = F.silu(torch.tensor(nodes, dtype=torch.float64)).numpy()
-    poly = np.polynomial.Chebyshev.fit(nodes, values, int(degree))
-    return [float(v) for v in poly.coef.tolist()]
+    coeffs = np.polynomial.chebyshev.chebfit(nodes, values, int(degree))
+    return [float(v) for v in coeffs.tolist()]
 
 
 def fit_scaled_domain_chebyshev_silu(*, degree: int, postscale: float) -> list[float]:
     scale = max(1.0, float(postscale))
     nodes = np.polynomial.chebyshev.chebpts1(int(degree) + 1)
     values = (F.silu(torch.tensor(nodes, dtype=torch.float64) * scale) / scale).numpy()
-    poly = np.polynomial.Chebyshev.fit(nodes, values, int(degree))
-    return [float(v) for v in poly.coef.tolist()]
+    coeffs = np.polynomial.chebyshev.chebfit(nodes, values, int(degree))
+    return [float(v) for v in coeffs.tolist()]
+
+
+def fit_scaled_target_domain_chebyshev_silu(*, degree: int, domain_postscale: float, target_postscale: float) -> list[float]:
+    domain_scale = max(1.0, float(domain_postscale))
+    target_scale = max(1.0e-6, float(target_postscale))
+    nodes = np.polynomial.chebyshev.chebpts1(int(degree) + 1)
+    inputs = torch.tensor(nodes, dtype=torch.float64) * domain_scale
+    values = (target_scale * F.silu(inputs / target_scale) / domain_scale).numpy()
+    coeffs = np.polynomial.chebyshev.chebfit(nodes, values, int(degree))
+    return [float(v) for v in coeffs.tolist()]
+
+
+def parse_poly_degree_overrides(value: str) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    text = str(value or "").strip()
+    if not text:
+        return overrides
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"invalid --poly-degree-overrides entry {item!r}; expected module=degree")
+        name, degree_text = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"invalid --poly-degree-overrides entry {item!r}; empty module name")
+        degree = int(degree_text.strip())
+        if degree < 0:
+            raise ValueError(f"invalid polynomial degree for {name!r}: {degree}")
+        overrides[name] = degree
+    return overrides
 
 
 def make_activation(kind: str, *, scale_margin: float) -> nn.Module:
@@ -131,6 +197,14 @@ def make_pool(kind: str) -> nn.Module:
     if normalized == "avg":
         return nn.AvgPool2d(kernel_size=2, stride=2)
     raise ValueError(f"unsupported pool {kind!r}")
+
+
+def replace_silu_with_tracking_scaled(model: nn.Module, *, scale_margin: float) -> None:
+    for child_name, child in list(model.named_children()):
+        if isinstance(child, (nn.SiLU, on.SiLU)):
+            setattr(model, child_name, TrackingScaledSiLU(margin=float(scale_margin)))
+        else:
+            replace_silu_with_tracking_scaled(child, scale_margin=float(scale_margin))
 
 
 class ConvBlock(nn.Module):
@@ -241,9 +315,7 @@ def make_stage_model(
             scale_margin=float(scale_margin),
         )
     if normalized in {"unet22-plus-output", "u22-plus-output", "u23"}:
-        if str(activation) == "scaled-silu":
-            raise ValueError("UNet22PlusOutput supports exact ReLU/SiLU training; use --stage2-activation plain-silu")
-        orion_activation = "silu" if str(activation) in {"plain-silu", "plain_silu", "silu"} else str(activation)
+        orion_activation = "silu" if str(activation) in {"plain-silu", "plain_silu", "scaled-silu", "scaled_silu", "silu"} else str(activation)
         model = UNet22PlusOutput(
             in_channels=int(in_channels),
             out_channels=int(out_channels),
@@ -251,12 +323,14 @@ def make_stage_model(
             activation=orion_activation,
             silu_degree=int(silu_degree),
         )
+        if str(activation) in {"scaled-silu", "scaled_silu"}:
+            replace_silu_with_tracking_scaled(model, scale_margin=float(scale_margin))
         model.config = {
             "architecture": "unet22-plus-output",
             "in_channels": int(in_channels),
             "out_channels": int(out_channels),
             "base_dim": int(base_dim),
-            "activation": str(orion_activation),
+            "activation": str(activation),
             "silu_degree": int(silu_degree),
             "pool": "avg",
             "skip": "concat",
@@ -285,6 +359,29 @@ def set_scaled_silu_updates(model: nn.Module, *, enabled: bool) -> None:
     for module in model.modules():
         if isinstance(module, TrackingScaledSiLU):
             module.track_scale_updates = bool(enabled)
+        if isinstance(module, ScaledChebyshevSiLU) and hasattr(module, "log_postscale"):
+            module.log_postscale.requires_grad_(bool(enabled))
+
+
+def cheb_scale_parameters(model: nn.Module) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
+    for module in model.modules():
+        if isinstance(module, ScaledChebyshevSiLU) and hasattr(module, "log_postscale"):
+            params.append(module.log_postscale)
+    return params
+
+
+def set_cheb_scale_only_updates(model: nn.Module, *, enabled: bool) -> dict[int, bool]:
+    previous = {id(param): bool(param.requires_grad) for param in model.parameters()}
+    scale_ids = {id(param) for param in cheb_scale_parameters(model)}
+    for param in model.parameters():
+        param.requires_grad_(bool(enabled) and id(param) in scale_ids)
+    return previous
+
+
+def restore_requires_grad(model: nn.Module, previous: dict[int, bool]) -> None:
+    for param in model.parameters():
+        param.requires_grad_(bool(previous.get(id(param), param.requires_grad)))
 
 
 def collect_scaled_silu_meta(model: nn.Module) -> dict[str, dict[str, float]]:
@@ -306,29 +403,128 @@ def replace_scaled_silu_with_poly(
     model: nn.Module,
     *,
     degree: int,
+    degree_overrides: dict[str, int] | None = None,
     trainable_coeffs: bool = False,
+    trainable_scale: bool = False,
 ) -> dict[str, dict[str, float]]:
     metadata: dict[str, dict[str, float]] = {}
-    coeffs = fit_unit_chebyshev_silu(degree=int(degree))
+    overrides = dict(degree_overrides or {})
+    used_overrides: set[str] = set()
+    coeff_cache: dict[int, list[float]] = {}
+
+    def coeffs_for(module_name: str) -> tuple[int, list[float]]:
+        module_degree = int(overrides.get(module_name, int(degree)))
+        used_overrides.add(module_name) if module_name in overrides else None
+        if module_degree not in coeff_cache:
+            coeff_cache[module_degree] = fit_unit_chebyshev_silu(degree=module_degree)
+        return module_degree, coeff_cache[module_degree]
 
     def visit(parent: nn.Module, prefix: str = "") -> None:
         for child_name, child in list(parent.named_children()):
             full_name = f"{prefix}.{child_name}" if prefix else child_name
             if isinstance(child, TrackingScaledSiLU):
                 postscale = float(child.postscale.detach().cpu().item())
-                setattr(parent, child_name, ScaledChebyshevSiLU(coeffs, postscale=postscale, trainable_coeffs=bool(trainable_coeffs)))
+                module_degree, coeffs = coeffs_for(full_name)
+                setattr(
+                    parent,
+                    child_name,
+                    ScaledChebyshevSiLU(
+                        coeffs,
+                        postscale=postscale,
+                        trainable_coeffs=bool(trainable_coeffs),
+                        trainable_scale=bool(trainable_scale),
+                        reference_activation="scaled-silu",
+                    ),
+                )
                 metadata[full_name] = {
                     "observed_min": float(child.input_min.detach().cpu().item()),
                     "observed_max": float(child.input_max.detach().cpu().item()),
                     "postscale": postscale,
                     "prescale": float(1.0 / postscale if postscale != 0.0 else 1.0),
-                    "degree": int(degree),
+                    "degree": int(module_degree),
                     "trainable_coeffs": bool(trainable_coeffs),
+                    "trainable_scale": bool(trainable_scale),
+                    "reference_activation": "scaled-silu",
                 }
             else:
                 visit(child, full_name)
 
     visit(model)
+    unused = sorted(set(overrides) - used_overrides)
+    if unused:
+        raise ValueError(f"--poly-degree-overrides did not match activation modules: {', '.join(unused)}")
+    return metadata
+
+
+def replace_scaled_silu_with_range_poly(
+    model: nn.Module,
+    *,
+    ranges: dict[str, dict[str, float]],
+    degree: int,
+    degree_overrides: dict[str, int] | None = None,
+    scale_margin: float,
+    trainable_coeffs: bool = False,
+    trainable_scale: bool = False,
+) -> dict[str, dict[str, float]]:
+    metadata: dict[str, dict[str, float]] = {}
+    overrides = dict(degree_overrides or {})
+    used_overrides: set[str] = set()
+    coeff_cache: dict[tuple[int, float, float], list[float]] = {}
+
+    def coeffs_for(module_name: str, domain_postscale: float, target_postscale: float) -> tuple[int, list[float]]:
+        module_degree = int(overrides.get(module_name, int(degree)))
+        used_overrides.add(module_name) if module_name in overrides else None
+        key = (module_degree, float(domain_postscale), float(target_postscale))
+        if key not in coeff_cache:
+            coeff_cache[key] = fit_scaled_target_domain_chebyshev_silu(
+                degree=module_degree,
+                domain_postscale=domain_postscale,
+                target_postscale=target_postscale,
+            )
+        return module_degree, coeff_cache[key]
+
+    def visit(parent: nn.Module, prefix: str = "") -> None:
+        for child_name, child in list(parent.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, TrackingScaledSiLU):
+                target_postscale = float(child.postscale.detach().cpu().item())
+                row = ranges.get(full_name, {})
+                observed_min = float(row.get("observed_min", child.input_min.detach().cpu().item()))
+                observed_max = float(row.get("observed_max", child.input_max.detach().cpu().item()))
+                absmax = max(abs(observed_min), abs(observed_max)) * float(scale_margin)
+                domain_postscale = float(max(1.0, math.ceil(absmax)))
+                module_degree, coeffs = coeffs_for(full_name, domain_postscale, target_postscale)
+                setattr(
+                    parent,
+                    child_name,
+                    ScaledChebyshevSiLU(
+                        coeffs,
+                        postscale=domain_postscale,
+                        trainable_coeffs=bool(trainable_coeffs),
+                        trainable_scale=bool(trainable_scale),
+                        reference_activation="scaled-silu",
+                        reference_postscale=target_postscale,
+                    ),
+                )
+                metadata[full_name] = {
+                    "observed_min": observed_min,
+                    "observed_max": observed_max,
+                    "target_postscale": target_postscale,
+                    "domain_postscale": domain_postscale,
+                    "domain_prescale": float(1.0 / domain_postscale if domain_postscale != 0.0 else 1.0),
+                    "degree": int(module_degree),
+                    "fit": "scaled_silu_target_on_range_domain",
+                    "trainable_coeffs": bool(trainable_coeffs),
+                    "trainable_scale": bool(trainable_scale),
+                    "reference_activation": "scaled-silu",
+                }
+            else:
+                visit(child, full_name)
+
+    visit(model)
+    unused = sorted(set(overrides) - used_overrides)
+    if unused:
+        raise ValueError(f"--poly-degree-overrides did not match activation modules: {', '.join(unused)}")
     return metadata
 
 
@@ -369,41 +565,112 @@ def collect_plain_silu_input_ranges(
     return ranges
 
 
+@torch.no_grad()
+def collect_tracking_scaled_silu_input_ranges(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+) -> dict[str, dict[str, float]]:
+    ranges: dict[str, dict[str, float]] = {}
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def make_hook(name: str):
+        def hook(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+            if not inputs:
+                return
+            x = inputs[0].detach()
+            current_min = x.min()
+            current_max = x.max()
+            if not (bool(torch.isfinite(current_min)) and bool(torch.isfinite(current_max))):
+                return
+            row = ranges.setdefault(name, {"observed_min": math.inf, "observed_max": -math.inf})
+            row["observed_min"] = min(float(row["observed_min"]), float(current_min.cpu().item()))
+            row["observed_max"] = max(float(row["observed_max"]), float(current_max.cpu().item()))
+
+        return hook
+
+    for name, module in model.named_modules():
+        if isinstance(module, TrackingScaledSiLU):
+            handles.append(module.register_forward_pre_hook(make_hook(name)))
+    model.eval()
+    for images, _masks in tqdm(loader, desc="calibrate", leave=False):
+        images = images.to(device=device, dtype=torch.float32, non_blocking=True)
+        _ = model(images)
+    for handle in handles:
+        handle.remove()
+    return ranges
+
+
 def replace_plain_silu_with_range_poly(
     model: nn.Module,
     *,
     ranges: dict[str, dict[str, float]],
     degree: int,
+    degree_overrides: dict[str, int] | None = None,
     scale_margin: float,
     trainable_coeffs: bool = False,
+    trainable_scale: bool = False,
 ) -> dict[str, dict[str, float]]:
     metadata: dict[str, dict[str, float]] = {}
+    overrides = dict(degree_overrides or {})
+    used_overrides: set[str] = set()
+    coeff_cache: dict[tuple[int, float], list[float]] = {}
+
+    def coeffs_for(module_name: str, postscale: float) -> tuple[int, list[float]]:
+        module_degree = int(overrides.get(module_name, int(degree)))
+        used_overrides.add(module_name) if module_name in overrides else None
+        key = (module_degree, float(postscale))
+        if key not in coeff_cache:
+            coeff_cache[key] = fit_scaled_domain_chebyshev_silu(degree=module_degree, postscale=postscale)
+        return module_degree, coeff_cache[key]
 
     def visit(parent: nn.Module, prefix: str = "") -> None:
         for child_name, child in list(parent.named_children()):
             full_name = f"{prefix}.{child_name}" if prefix else child_name
-            if isinstance(child, nn.SiLU):
+            if isinstance(child, (nn.SiLU, on.SiLU)):
                 row = ranges.get(full_name, {})
                 observed_min = float(row.get("observed_min", 0.0))
                 observed_max = float(row.get("observed_max", 0.0))
                 absmax = max(abs(observed_min), abs(observed_max)) * float(scale_margin)
                 postscale = float(max(1.0, math.ceil(absmax)))
-                coeffs = fit_scaled_domain_chebyshev_silu(degree=int(degree), postscale=postscale)
-                setattr(parent, child_name, ScaledChebyshevSiLU(coeffs, postscale=postscale, trainable_coeffs=bool(trainable_coeffs)))
+                module_degree, coeffs = coeffs_for(full_name, postscale)
+                setattr(
+                    parent,
+                    child_name,
+                    ScaledChebyshevSiLU(
+                        coeffs,
+                        postscale=postscale,
+                        trainable_coeffs=bool(trainable_coeffs),
+                        trainable_scale=bool(trainable_scale),
+                        reference_activation="plain-silu",
+                    ),
+                )
                 metadata[full_name] = {
                     "observed_min": observed_min,
                     "observed_max": observed_max,
                     "postscale": postscale,
                     "prescale": float(1.0 / postscale if postscale != 0.0 else 1.0),
-                    "degree": int(degree),
+                    "degree": int(module_degree),
                     "fit": "silu_x_on_scaled_domain",
                     "trainable_coeffs": bool(trainable_coeffs),
+                    "trainable_scale": bool(trainable_scale),
+                    "reference_activation": "plain-silu",
                 }
             else:
                 visit(child, full_name)
 
     visit(model)
+    unused = sorted(set(overrides) - used_overrides)
+    if unused:
+        raise ValueError(f"--poly-degree-overrides did not match activation modules: {', '.join(unused)}")
     return metadata
+
+
+def set_poly_blend_alpha(model: nn.Module, *, alpha: float) -> None:
+    for module in model.modules():
+        if isinstance(module, ScaledChebyshevSiLU):
+            module.blend_alpha.copy_(torch.tensor(float(alpha), device=module.blend_alpha.device, dtype=module.blend_alpha.dtype))
 
 
 def run_epoch(
@@ -413,6 +680,8 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip_norm: float = 0.0,
+    teacher: nn.Module | None = None,
+    distill_weight: float = 0.0,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -421,6 +690,8 @@ def run_epoch(
     total_iou = 0.0
     total_items = 0
     label = "train" if training else "valid"
+    if teacher is not None:
+        teacher.eval()
     for images, masks in tqdm(loader, desc=label, leave=False):
         images = images.to(device=device, dtype=torch.float32, non_blocking=True)
         masks = masks.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -429,6 +700,10 @@ def run_epoch(
         with torch.set_grad_enabled(training):
             logits = model(images)
             loss = segmentation_loss(logits, masks)
+            if training and teacher is not None and float(distill_weight) > 0.0:
+                with torch.no_grad():
+                    teacher_logits = teacher(images)
+                loss = loss + float(distill_weight) * F.mse_loss(logits, teacher_logits)
         if training:
             loss.backward()
             if float(grad_clip_norm) > 0.0:
@@ -513,12 +788,36 @@ def train_stage(
     checkpoint_path: Path,
     stage_name: str,
     freeze_scale_after_epoch: int = 0,
+    initial_metrics: dict[str, float] | None = None,
+    teacher_model: nn.Module | None = None,
+    distill_weight: float = 0.0,
+    homotopy_epochs: int = 0,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
     best_metrics: dict[str, float] | None = None
     best_dice = -math.inf
     history: list[dict[str, object]] = []
+    if initial_metrics is not None and int(homotopy_epochs) <= 0:
+        initial_values = [initial_metrics["dice"], initial_metrics["iou"], initial_metrics["loss"]]
+        if all(math.isfinite(float(value)) for value in initial_values):
+            best_metrics = dict(initial_metrics)
+            best_dice = float(initial_metrics["dice"])
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "stage": str(stage_name),
+                    "epoch": 0,
+                    "valid": best_metrics,
+                    "model": getattr(model, "config", {}),
+                },
+                checkpoint_path,
+            )
     for epoch in range(1, int(epochs) + 1):
+        blend_alpha = 1.0
+        if int(homotopy_epochs) > 0:
+            blend_alpha = min(1.0, max(0.0, float(epoch - 1) / float(max(1, int(homotopy_epochs)))))
+            set_poly_blend_alpha(model, alpha=blend_alpha)
         if int(freeze_scale_after_epoch) > 0:
             set_scaled_silu_updates(model, enabled=int(epoch) <= int(freeze_scale_after_epoch))
         train_metrics = run_epoch(
@@ -527,17 +826,30 @@ def train_stage(
             device=device,
             optimizer=optimizer,
             grad_clip_norm=float(grad_clip_norm),
+            teacher=teacher_model,
+            distill_weight=float(distill_weight),
         )
         val_metrics = run_epoch(model, val_loader, device=device, optimizer=None)
         row = {
             "stage": str(stage_name),
             "epoch": int(epoch),
+            "blend_alpha": float(blend_alpha),
             "train": train_metrics,
             "valid": val_metrics,
         }
         history.append(row)
         print("epoch", json.dumps(row, sort_keys=True), flush=True)
-        if float(val_metrics["dice"]) >= best_dice:
+        metric_values = [
+            train_metrics["dice"],
+            train_metrics["iou"],
+            train_metrics["loss"],
+            val_metrics["dice"],
+            val_metrics["iou"],
+            val_metrics["loss"],
+        ]
+        metrics_are_finite = all(math.isfinite(float(value)) for value in metric_values)
+        save_allowed = int(homotopy_epochs) <= 0 or float(blend_alpha) >= 1.0
+        if metrics_are_finite and save_allowed and float(val_metrics["dice"]) >= best_dice:
             best_dice = float(val_metrics["dice"])
             best_metrics = val_metrics
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -551,6 +863,21 @@ def train_stage(
                 },
                 checkpoint_path,
             )
+        if not metrics_are_finite:
+            print(
+                "event",
+                json.dumps(
+                    {
+                        "event": "early_stop_nonfinite_metrics",
+                        "stage": str(stage_name),
+                        "epoch": int(epoch),
+                        "best_dice": float(best_dice),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            break
     if best_metrics is None:
         best_metrics = evaluate_with_reference(model, val_loader, device=device)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -620,12 +947,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-margin", type=float, default=2.0)
     parser.add_argument("--silu-degree", type=int, default=31)
     parser.add_argument("--poly-degree", type=int, default=7)
+    parser.add_argument(
+        "--poly-degree-overrides",
+        default="",
+        help="Comma-separated activation degree overrides, e.g. dec1a_act=15,enc3b_act=15.",
+    )
     parser.add_argument("--poly-finetune-epochs", type=int, default=0)
     parser.add_argument("--poly-lr", type=float, default=1.0e-5)
     parser.add_argument(
         "--train-poly-coeffs",
         action="store_true",
         help="Make polynomial coefficients trainable during optional polynomial fine-tuning.",
+    )
+    parser.add_argument(
+        "--train-poly-scale",
+        action="store_true",
+        help="Make per-activation Chebyshev postscale trainable during optional polynomial fine-tuning.",
+    )
+    parser.add_argument(
+        "--range-fit-scaled-poly",
+        action="store_true",
+        help="For scaled-SiLU replacement, fit Chebyshev on observed activation ranges while preserving trained target scales.",
+    )
+    parser.add_argument(
+        "--poly-distill-weight",
+        type=float,
+        default=0.0,
+        help="Optional MSE distillation weight against the exact SiLU stage during polynomial fine-tuning.",
+    )
+    parser.add_argument(
+        "--poly-homotopy-epochs",
+        type=int,
+        default=0,
+        help="Ramp polynomial modules from exact SiLU to pure Chebyshev over this many fine-tuning epochs.",
     )
     parser.add_argument(
         "--eval-poly-only",
@@ -695,7 +1049,11 @@ def main() -> int:
     stage2_prefix = "scaled_silu" if stage2_activation == "scaled-silu" else "silu"
     stage2_suffix = "finetune" if stage2_init == "stage1" else "retrain"
     stage2_name = f"{stage2_prefix}_avgpool_{stage2_suffix}"
-    poly_stage_name = f"{stage2_prefix}_avgpool_degree_{int(args.poly_degree)}"
+    poly_degree_overrides = parse_poly_degree_overrides(str(args.poly_degree_overrides))
+    poly_stage_label = f"degree_{int(args.poly_degree)}"
+    if poly_degree_overrides:
+        poly_stage_label += "_mixed"
+    poly_stage_name = f"{stage2_prefix}_avgpool_{poly_stage_label}"
     stage1_path = Path(args.out_dir) / f"{tag}_{stage1_name}_best.pt"
     stage2_path = Path(args.out_dir) / f"{tag}_{stage2_name}_best.pt"
     started = time.time()
@@ -785,6 +1143,7 @@ def main() -> int:
 
     skip_poly = bool(args.skip_poly)
     plain_silu_ranges: dict[str, dict[str, float]] = {}
+    scaled_silu_ranges: dict[str, dict[str, float]] = {}
     poly_meta: dict[str, dict[str, float]] = {}
     poly_metrics: dict[str, float] | None = None
     poly_history: list[dict[str, object]] = []
@@ -799,17 +1158,35 @@ def main() -> int:
                 poly_model,
                 ranges=plain_silu_ranges,
                 degree=int(args.poly_degree),
+                degree_overrides=poly_degree_overrides,
                 scale_margin=float(args.scale_margin),
                 trainable_coeffs=bool(args.train_poly_coeffs),
+                trainable_scale=bool(args.train_poly_scale),
             )
         else:
-            poly_meta = replace_scaled_silu_with_poly(
-                poly_model,
-                degree=int(args.poly_degree),
-                trainable_coeffs=bool(args.train_poly_coeffs),
-            )
+            if bool(args.range_fit_scaled_poly):
+                scaled_silu_ranges = collect_tracking_scaled_silu_input_ranges(stage2_model, train_loader, device=device)
+                poly_meta = replace_scaled_silu_with_range_poly(
+                    poly_model,
+                    ranges=scaled_silu_ranges,
+                    degree=int(args.poly_degree),
+                    degree_overrides=poly_degree_overrides,
+                    scale_margin=float(args.scale_margin),
+                    trainable_coeffs=bool(args.train_poly_coeffs),
+                    trainable_scale=bool(args.train_poly_scale),
+                )
+            else:
+                poly_meta = replace_scaled_silu_with_poly(
+                    poly_model,
+                    degree=int(args.poly_degree),
+                    degree_overrides=poly_degree_overrides,
+                    trainable_coeffs=bool(args.train_poly_coeffs),
+                    trainable_scale=bool(args.train_poly_scale),
+                )
         poly_metrics = evaluate_with_reference(poly_model, val_loader, device=device, reference=stage2_model)
         if int(args.poly_finetune_epochs) > 0:
+            if int(args.poly_homotopy_epochs) > 0:
+                set_poly_blend_alpha(poly_model, alpha=0.0)
             poly_finetune_metrics, poly_history = train_stage(
                 poly_model,
                 train_loader,
@@ -821,10 +1198,16 @@ def main() -> int:
                 grad_clip_norm=float(args.grad_clip_norm),
                 checkpoint_path=poly_finetune_path,
                 stage_name=poly_finetune_name,
+                initial_metrics=poly_metrics,
+                teacher_model=stage2_model if float(args.poly_distill_weight) > 0.0 else None,
+                distill_weight=float(args.poly_distill_weight),
+                homotopy_epochs=int(args.poly_homotopy_epochs),
+                freeze_scale_after_epoch=int(args.freeze_scale_after_epoch),
             )
             poly_checkpoint = torch.load(poly_finetune_path, map_location="cpu", weights_only=False)
             poly_model.load_state_dict(poly_checkpoint["state_dict"])
             poly_model.to(device)
+            set_poly_blend_alpha(poly_model, alpha=1.0)
             poly_finetune_metrics = evaluate_with_reference(poly_model, val_loader, device=device, reference=stage2_model)
 
     drops = {
@@ -836,11 +1219,11 @@ def main() -> int:
     if poly_metrics is not None:
         drops.update(
             {
-                f"{stage2_name}_to_degree_{int(args.poly_degree)}": {
+                f"{stage2_name}_to_{poly_stage_label}": {
                     "dice_drop": float(stage2_metrics["dice"] - poly_metrics["dice"]),
                     "iou_drop": float(stage2_metrics["iou"] - poly_metrics["iou"]),
                 },
-                f"{stage1_name}_to_degree_{int(args.poly_degree)}": {
+                f"{stage1_name}_to_{poly_stage_label}": {
                     "dice_drop": float(stage1_metrics["dice"] - poly_metrics["dice"]),
                     "iou_drop": float(stage1_metrics["iou"] - poly_metrics["iou"]),
                 },
@@ -896,9 +1279,14 @@ def main() -> int:
             "scale_margin": float(args.scale_margin),
             "silu_degree": int(args.silu_degree),
             "poly_degree": int(args.poly_degree),
+            "poly_degree_overrides": poly_degree_overrides,
             "poly_finetune_epochs": int(args.poly_finetune_epochs),
             "poly_lr": float(args.poly_lr),
             "train_poly_coeffs": bool(args.train_poly_coeffs),
+            "train_poly_scale": bool(args.train_poly_scale),
+            "range_fit_scaled_poly": bool(args.range_fit_scaled_poly),
+            "poly_distill_weight": float(args.poly_distill_weight),
+            "poly_homotopy_epochs": int(args.poly_homotopy_epochs),
             "eval_poly_only": bool(args.eval_poly_only),
             "skip_poly": skip_poly,
             "freeze_scale_after_epoch": int(args.freeze_scale_after_epoch),
@@ -916,6 +1304,7 @@ def main() -> int:
         "poly_history": poly_history,
         "scaled_silu_replacements": collect_scaled_silu_meta(stage2_model),
         "plain_silu_fit_ranges": plain_silu_ranges,
+        "scaled_silu_fit_ranges": scaled_silu_ranges,
         "degree_replacements": poly_meta,
         "load_notes": incompatible,
         "wall_s": float(time.time() - started),

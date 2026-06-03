@@ -4690,6 +4690,56 @@ def test_native_halo_per_stripe_beta2_preserves_surplus_input_and_output_halo() 
     assert plan2.c_only_rotations != plan1.c_only_rotations
 
 
+def test_native_halo_executor_uses_internal_output_halo_without_boundary_halo() -> None:
+    from orion.experimental.cir import native_halo_conv2d
+
+    spec = native_halo_conv2d.NativeHaloConv2DSpec(
+        family_label="native_output_internal_halo_boundary_pruned",
+        c_in=1,
+        h_in=8,
+        w_in=4,
+        c_out=1,
+        h_out=8,
+        w_out=4,
+        gap_in=1,
+        gap_out=1,
+        kernel=3,
+        stride=1,
+        pad=1,
+        slot_count=24,
+        output_top_beta=1,
+        output_bottom_beta=1,
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    module = SimpleNamespace(
+        layout_policy_output_materialization="native_halo_stripe",
+        layout_policy_output_layout={
+            "top_beta": 1,
+            "bottom_beta": 1,
+            "physical_top_beta": 0,
+            "physical_bottom_beta": 0,
+            "boundary_pruned": True,
+        },
+        layout_policy_native_halo_channel_fold_mode="per_stripe",
+    )
+
+    executor = native_halo_conv2d.NativeHaloStripeNoRIConvExecutor(
+        module=module,
+        spec=spec,
+        output_node_id="conv",
+    )
+    plan = executor.native_plan
+
+    assert plan.target_internal_halo_overlap == 2
+    assert plan.spec.output_physical_top_beta == 0
+    assert plan.spec.output_physical_bottom_beta == 0
+    assert [(stripe.target_h_start, stripe.target_h_end) for stripe in plan.stripes] == [(0, 5), (3, 8)]
+    assert plan.stripes[0].target_h_end - plan.stripes[1].target_h_start == 2
+    assert min(stripe.target_h_start for stripe in plan.stripes) == 0
+    assert max(stripe.target_h_end for stripe in plan.stripes) == 8
+
+
 def test_native_halo_beta2_materializes_surplus_physical_input_halo() -> None:
     from orion.experimental.cir.native_halo_conv2d import (
         NativeHaloConv2DSpec,
@@ -4734,33 +4784,6 @@ def test_native_halo_beta2_materializes_surplus_physical_input_halo() -> None:
     assert torch.equal(materialized_rows[6:], torch.zeros((2, 4), dtype=torch.float32))
 
 
-def test_conv_kernel_table_native_stripe_beta2_requests_output_halo() -> None:
-    from tools.run_conv_kernel_table import ConvKernelRow, _apply_provider_output_layout
-
-    beta1 = ConvKernelRow(
-        channels=32,
-        height=192,
-        width=192,
-        variant="provider_halo1_individual_lt",
-        input_level=2,
-    )
-    beta2 = ConvKernelRow(
-        channels=32,
-        height=192,
-        width=192,
-        variant="provider_halo2_individual_lt",
-        input_level=2,
-    )
-    conv1 = SimpleNamespace(layout_policy_output_materialization="", layout_policy_output_layout={})
-    conv2 = SimpleNamespace(layout_policy_output_materialization="", layout_policy_output_layout={})
-
-    assert _apply_provider_output_layout(conv1, beta1, output_layout="native_stripe") == "native_halo_stripe"
-    assert _apply_provider_output_layout(conv2, beta2, output_layout="native_stripe") == "native_halo_stripe"
-
-    assert conv1.layout_policy_output_layout == {"top_beta": 0, "bottom_beta": 0}
-    assert conv2.layout_policy_output_layout == {"top_beta": 1, "bottom_beta": 1}
-
-
 def test_conv_kernel_table_provider_boundary_halo_is_clipped_by_default() -> None:
     from tools.run_conv_kernel_table import (
         DEFAULT_CLIP_PROVIDER_BOUNDARY_HALO,
@@ -4789,6 +4812,28 @@ def test_conv_kernel_table_provider_boundary_halo_is_clipped_by_default() -> Non
 
     assert _apply_provider_input_halo(legacy, row, clip_boundary_halo=False) == (1, 1)
     assert legacy.layout_policy_input_layout == {"top_beta": 1, "bottom_beta": 1}
+
+
+def test_conv_kernel_table_native_stripe_beta2_uses_boundary_pruned_internal_output_halo() -> None:
+    from tools.run_conv_kernel_table import ConvKernelRow, _apply_provider_output_layout
+
+    row = ConvKernelRow(
+        channels=32,
+        height=192,
+        width=192,
+        variant="provider_halo2_individual_lt",
+        input_level=2,
+    )
+    conv = SimpleNamespace(layout_policy_output_materialization="", layout_policy_output_layout={})
+
+    assert _apply_provider_output_layout(conv, row, output_layout="native_stripe") == "native_halo_stripe"
+    assert conv.layout_policy_output_layout == {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "boundary_pruned": True,
+    }
 
 
 def test_conv_kernel_table_rejects_stale_native_stripe_beta2_reuse(tmp_path) -> None:

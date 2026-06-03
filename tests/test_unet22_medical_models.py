@@ -10,6 +10,13 @@ from orion.models.unet import (
     get_unet22_medical_spec,
     list_unet22_medical_specs,
 )
+from tools.train_fhelipe_medseg_staged_unet import (
+    ScaledChebyshevSiLU,
+    fit_scaled_domain_chebyshev_silu,
+    parse_poly_degree_overrides,
+    replace_plain_silu_with_range_poly,
+    set_poly_blend_alpha,
+)
 
 
 def test_unet22_accepts_base_dim_alias() -> None:
@@ -101,6 +108,67 @@ def test_unet22_plus_output_forward_shape_on_small_base() -> None:
     out = model(torch.randn(1, 1, 32, 32))
 
     assert tuple(out.shape) == (1, 4, 32, 32)
+
+
+def test_range_poly_replacement_handles_orion_silu_modules() -> None:
+    model = UNet22PlusOutput(dataset="tiny", in_channels=1, out_channels=1, base_dim=4, activation="silu", silu_degree=7)
+    ranges = {
+        name: {"observed_min": -2.0, "observed_max": 3.0}
+        for name, module in model.named_modules()
+        if type(module).__name__ == "SiLU"
+    }
+
+    metadata = replace_plain_silu_with_range_poly(model, ranges=ranges, degree=7, scale_margin=1.0)
+
+    assert metadata
+    assert all(type(module).__name__ != "SiLU" for module in model.modules())
+    assert any(isinstance(module, ScaledChebyshevSiLU) for module in model.modules())
+
+
+def test_range_poly_replacement_accepts_per_layer_degree_overrides() -> None:
+    model = UNet22PlusOutput(dataset="tiny", in_channels=1, out_channels=1, base_dim=4, activation="silu", silu_degree=7)
+    ranges = {
+        name: {"observed_min": -2.0, "observed_max": 3.0}
+        for name, module in model.named_modules()
+        if type(module).__name__ == "SiLU"
+    }
+
+    metadata = replace_plain_silu_with_range_poly(
+        model,
+        ranges=ranges,
+        degree=7,
+        degree_overrides=parse_poly_degree_overrides("enc3b_act=15,dec1a_act=15"),
+        scale_margin=1.0,
+    )
+
+    assert metadata["enc3b_act"]["degree"] == 15
+    assert metadata["dec1a_act"]["degree"] == 15
+    assert metadata["enc1a_act"]["degree"] == 7
+
+
+def test_scaled_chebyshev_silu_coefficients_match_runtime_basis() -> None:
+    coeffs = fit_scaled_domain_chebyshev_silu(degree=7, postscale=2.0)
+    approx = ScaledChebyshevSiLU(coeffs, postscale=2.0)
+    x = torch.linspace(-2.0, 2.0, 101)
+
+    max_error = (approx(x) - torch.nn.functional.silu(x)).abs().max().item()
+
+    assert max_error < 5.0e-4
+
+
+def test_scaled_chebyshev_silu_homotopy_can_fall_back_to_exact_silu() -> None:
+    coeffs = fit_scaled_domain_chebyshev_silu(degree=7, postscale=2.0)
+    approx = ScaledChebyshevSiLU(coeffs, postscale=2.0, trainable_scale=True)
+    x = torch.linspace(-4.0, 4.0, 33)
+
+    set_poly_blend_alpha(approx, alpha=0.0)
+    exact_error = (approx(x) - torch.nn.functional.silu(x)).abs().max().item()
+    set_poly_blend_alpha(approx, alpha=1.0)
+    pure_poly_error = (approx(x) - torch.nn.functional.silu(x)).abs().max().item()
+
+    assert exact_error < 1.0e-6
+    assert pure_poly_error > exact_error
+    assert any(parameter.requires_grad for parameter in approx.parameters())
 
 
 @pytest.mark.parametrize(

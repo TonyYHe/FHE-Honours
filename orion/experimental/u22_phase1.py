@@ -581,6 +581,17 @@ def _layout_policy_incoming_native_rows(compile_plan: dict[str, Any], *, node: s
     for row in compile_plan.get("edge_layouts", []):
         if str(row.get("target")) != str(node):
             continue
+        if str(row.get("source", "")) == "x" and str(row.get("op_kind", "conv2d")) in {
+            "conv2d",
+            "avgpool2d",
+            "conv_transpose2d",
+        }:
+            updated = dict(row)
+            updated["physical_layout"] = "native_source_stripe"
+            updated["source_physical_layout"] = "native_source_stripe"
+            updated["target_physical_layout"] = "native_source_stripe"
+            rows.append(updated)
+            continue
         if str(row.get("physical_layout", "")) != "native_source_stripe":
             continue
         if str(row.get("op_kind", "conv2d")) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
@@ -619,6 +630,8 @@ def _layout_policy_incoming_compact_source_rows(
             continue
         if str(row.get("op_kind", "conv2d")) not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
             continue
+        if str(row.get("source", "")) == "x":
+            continue
         if str(row.get("physical_layout", "")) not in {"packed_compact", "logical_halo_compact"}:
             continue
         rows.append(dict(row))
@@ -655,6 +668,26 @@ def _layout_policy_unresolved_native_source_relayout_rows(
             continue
         source = str(row.get("source", ""))
         source_physical = str(row.get("source_physical_layout", "") or "")
+        source_signature = tuple(
+            tuple(int(value) for value in item)
+            for item in (row.get("native_halo_source_storage_signature", ()) or ())
+        )
+        source_row = _layout_policy_native_output_row(compile_plan, node=str(source))
+        source_target_signature = tuple(
+            tuple(int(value) for value in item)
+            for item in (
+                (source_row or {}).get("native_halo_target_storage_signature", ())
+                if source_row is not None
+                else ()
+            )
+        )
+        if (
+            source_physical == "native_source_stripe"
+            and source_signature
+            and source_target_signature
+            and tuple(source_signature) == tuple(source_target_signature)
+        ):
+            continue
         native_count = _layout_policy_native_output_ct_count(compile_plan, node=str(source), row=dict(row))
         if (
             source
@@ -697,6 +730,13 @@ def _layout_policy_provider_unsupported_reason(
         if bool(row.get("concat_native_runtime_materializer", False)):
             continue
         if bool(row.get("concat_explicit_native_materialization", False)):
+            continue
+        source_row = _layout_policy_native_output_row(compile_plan, node=str(row.get("source", "")))
+        if (
+            source_row is not None
+            and str(source_row.get("physical_layout", "")) == "native_source_stripe"
+            and source_row.get("native_halo_target_storage_signature")
+        ):
             continue
         return "layout_policy_concat_native_source_requires_native_concat_fusion"
     unresolved_native = _layout_policy_unresolved_native_source_relayout_rows(
@@ -751,12 +791,55 @@ def _layout_policy_output_relayout_rows(compile_plan: dict[str, Any], *, node: s
             "shape": shape,
             "fhe_shape": [int(value) for value in row.get("fhe_shape", shape)],
             "selected_layout": dict(layout),
+            "target_layout": dict(row.get("target_layout", layout) or layout),
             "relayout": True,
             "relayout_reason": str(row.get("output_relayout_reason", "producer_materialized_halo")),
             "native_output_materialization": bool(explicit_native_concat),
+            "relayout_rotation_estimate": int(row.get("relayout_rotation_estimate", 0) or 0),
+            "relayout_mask_mult_estimate": int(row.get("relayout_mask_mult_estimate", 0) or 0),
+            "relayout_sparse_lt_estimate": int(row.get("relayout_sparse_lt_estimate", 0) or 0),
+            "relayout_depth_estimate": int(row.get("relayout_depth_estimate", 0) or 0),
         }
         rows.append(updated)
     return tuple(rows)
+
+
+def _layout_policy_concat_native_compile_rotation_io(
+    *,
+    node: str,
+    output_row: dict[str, Any],
+    input_signatures: list[list[list[int]]],
+    target_signature: list[list[int]],
+) -> dict[str, Any]:
+    rotations = int(output_row.get("relayout_rotation_estimate", 0) or 0)
+    sparse_lts = int(output_row.get("relayout_sparse_lt_estimate", 0) or 0)
+    if int(sparse_lts) <= 0:
+        sparse_lts = max(1, int(len(target_signature)))
+    return {
+        "source": "compile_io_explicit_concat_native_materialization",
+        "runtime_lowering": "concat_explicit_native_materialize",
+        "concat_native_runtime_materializer": True,
+        "concat_explicit_native_materialization": True,
+        "node": str(node),
+        "runtime_group_count": int(sparse_lts),
+        "runtime_transform_count": int(sparse_lts),
+        "transform_rotation_key_count_total": int(rotations),
+        "shared_rotation_eval_count_total": int(rotations),
+        "unique_rotation_key_count": int(rotations),
+        "unique_rotation_keys": [],
+        "output_rotations": 0,
+        "output_rotation_eval_count": 0,
+        "rotation_eval_count_estimate": int(rotations),
+        "rotation_eval_count_mode": "independent_transform_bsgs",
+        "native_output_storage_layout": "native_source_stripe",
+        "native_input_signature_count": int(len(input_signatures)),
+        "native_input_ct_counts": [int(len(signature)) for signature in input_signatures],
+        "native_output_ct_count": int(len(target_signature)),
+        "native_output_target_signature": [
+            [int(value) for value in item] for item in target_signature
+        ],
+        "compact_fallback": False,
+    }
 
 
 def _layout_policy_backend_producer_output_rows(compile_plan: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -940,7 +1023,7 @@ def _layout_policy_physical_compact_input_layout(row: dict[str, Any], logical_la
     source_layout = dict(row.get("source_layout", {}) or {})
     source_physical = str(row.get("source_physical_layout", "") or "")
     if str(row.get("source", "")) == "x":
-        return _layout_policy_zero_halo_layout(logical_layout)
+        return _layout_policy_physical_compact_layout(logical_layout)
     if source_physical == "packed_compact":
         return _layout_policy_zero_halo_layout(source_layout or logical_layout)
     if source_physical == "logical_halo_compact":
@@ -1039,6 +1122,9 @@ def _layout_policy_native_module_attrs(
         )
         physical_input_layout = dict(layout)
         input_physical_layout = str(row.get("physical_layout", "") or "")
+        native_boundary_input = bool(
+            str(row.get("source", "")) == "x" and str(input_physical_layout) == "native_source_stripe"
+        )
         if compact_input_rows and not native_input_rows:
             source_physical_layout = str(row.get("source_physical_layout", "") or "")
             if source_physical_layout:
@@ -1049,13 +1135,26 @@ def _layout_policy_native_module_attrs(
             elif not bool(trust_selected_compact_layout):
                 physical_input_layout = dict(row.get("source_layout", {}) or {})
                 if not physical_input_layout or str(row.get("source", "")) == "x":
-                    physical_input_layout = _layout_policy_zero_halo_layout(layout)
+                    physical_input_layout = (
+                        _layout_policy_physical_compact_layout(layout)
+                        if str(row.get("source", "")) == "x"
+                        else _layout_policy_zero_halo_layout(layout)
+                    )
         gap = max(1, int(layout.get("gap", 1)))
         physical_gap = max(1, int(physical_input_layout.get("gap", gap)))
         top_beta = _layout_physical_top_beta(physical_input_layout)
+        fhe_input_shape = _layout_policy_on_shape(row, physical_input_layout)
+        if bool(native_boundary_input):
+            native_input_ct_count = int(row.get("native_input_ct_count_estimate", 0) or 0)
+            native_plan = getattr(base_executor, "native_plan", None)
+            if int(native_input_ct_count) <= 0 and native_plan is not None:
+                native_input_ct_count = int(getattr(native_plan, "input_ct_count", 0) or 0)
+            slots = int(plan_slots or getattr(base_executor, "slots", 0) or 0)
+            if int(native_input_ct_count) > 0 and int(slots) > 0:
+                fhe_input_shape = torch.Size([int(native_input_ct_count), int(slots)])
         attrs.update(
             {
-                "fhe_input_shape": _layout_policy_on_shape(row, physical_input_layout),
+                "fhe_input_shape": fhe_input_shape,
                 "layout_policy_input_row_offset": int(top_beta * physical_gap),
                 "layout_policy_input_layout": dict(physical_input_layout),
                 "layout_policy_selected_input_layout": dict(layout),
@@ -1104,6 +1203,29 @@ def _layout_policy_native_module_attrs(
                 _layout_physical_top_beta(output_layout) > 0 or _layout_physical_bottom_beta(output_layout) > 0
             ):
                 attrs["layout_policy_output_materialization"] = "fused_relayout"
+        elif not any(str(row.get("source")) == str(node) for row in compile_plan.get("edge_layouts", [])):
+            boundary_row = dict(input_rows[0]) if input_rows else {}
+            output_layout = dict(
+                boundary_row.get("target_layout", boundary_row.get("selected_layout", {})) or {}
+            )
+            if output_layout:
+                output_gap = max(1, int(output_layout.get("gap", 1)))
+                output_top_beta = _layout_physical_top_beta(output_layout)
+                slots = int(compile_plan.get("slots", 0) or getattr(base_executor, "slots", 0) or 0)
+                native_count = int(getattr(base_executor, "rows", 0) or 0)
+                attrs.update(
+                    {
+                        **(
+                            {"fhe_output_shape": torch.Size([int(native_count), int(slots)])}
+                            if int(native_count) > 0 and int(slots) > 0
+                            else {}
+                        ),
+                        "layout_policy_output_row_offset": int(output_top_beta * output_gap),
+                        "layout_policy_output_layout": dict(output_layout),
+                        "layout_policy_output_materialization": "native_halo_stripe",
+                        "layout_policy_native_output_target_signature": [],
+                    }
+                )
     if str(compile_plan.get("policy", "")) in {
         "dp_no_share_fold",
         "fixed_max_no_share",
@@ -1279,6 +1401,18 @@ def _layout_policy_validate_native_provider_plans(
         output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
         if not native_rows and not compact_input_rows and output_row is None:
             continue
+        if output_row is not None and str(output_row.get("physical_layout", "")) == "native_source_stripe":
+            output_layout = dict(output_row.get("selected_layout", {}) or {})
+            if (
+                _layout_top_beta(output_layout) + _layout_bottom_beta(output_layout) > 0
+                and not output_row.get("native_halo_target_storage_signature")
+            ):
+                raise RuntimeError(
+                    "layout policy generated a native halo output with logical middle halo but without "
+                    "a target storage signature "
+                    f"for node={str(node)!r}, top_beta={_layout_top_beta(output_layout)}, "
+                    f"bottom_beta={_layout_bottom_beta(output_layout)}"
+                )
         try:
             _layout_policy_native_halo_plan(
                 executor,
@@ -1484,6 +1618,16 @@ class LayoutPolicyRelayoutKernel:
             "mask_mult_count": int(halo_sides if bool(target_has_halo) else max(1, tile_count)),
             "sparse_lt_count": 1,
         }
+
+    def is_identity(self) -> bool:
+        return str(self.operation_estimate().get("kind", "")) == "layout_identity"
+
+    def is_noop(self) -> bool:
+        return (
+            bool(self.is_identity())
+            and float(self.output_scale) == 1.0
+            and float(self.output_bias) == 0.0
+        )
 
     def _native_source_index(
         self,
@@ -1703,6 +1847,14 @@ class LayoutPolicyRelayoutKernel:
         return ptxt
 
     def apply(self, source_ct: Any) -> Any:
+        if self.is_identity():
+            out = source_ct
+            if float(self.output_scale) != 1.0:
+                out = out * float(self.output_scale)
+            bias_ptxt = self._bias_plaintext(out)
+            if bias_ptxt is not None:
+                out = _add_plaintext_for_add(out, bias_ptxt)
+            return out
         if not self.transform_ids and not getattr(self, "_dense_layer_cache_deferred", False):
             raise RuntimeError(f"layout-policy relayout kernel {self.name} has not been compiled")
         out = source_ct.scheme.lt_evaluator.evaluate_transforms(self, source_ct)
@@ -2223,9 +2375,10 @@ class LayoutPolicyProviderRuntimeExecutor:
                 direction="compact_to_halo",
                 index=int(row_index * 2),
             )
-            pad_kernel.compile(scheme, level=int(current_level))
-            self.relayout_kernels.append(pad_kernel)
-            current_level = max(0, int(current_level - 1))
+            if not pad_kernel.is_noop():
+                pad_kernel.compile(scheme, level=int(current_level))
+                self.relayout_kernels.append(pad_kernel)
+                current_level = max(0, int(current_level - 1))
             if bool(self.native_halo_input):
                 continue
             trim_kernel = LayoutPolicyRelayoutKernel(
@@ -2234,9 +2387,10 @@ class LayoutPolicyProviderRuntimeExecutor:
                 direction="halo_to_compact",
                 index=int(row_index * 2 + 1),
             )
-            trim_kernel.compile(scheme, level=int(current_level))
-            self.relayout_kernels.append(trim_kernel)
-            current_level = max(0, int(current_level - 1))
+            if not trim_kernel.is_noop():
+                trim_kernel.compile(scheme, level=int(current_level))
+                self.relayout_kernels.append(trim_kernel)
+                current_level = max(0, int(current_level - 1))
         if self.native_physical_relayout_rows:
             native_plan = self._native_halo_plan()
             slots = int(scheme.params.get_slots())
@@ -2268,9 +2422,10 @@ class LayoutPolicyProviderRuntimeExecutor:
             if fusion is not None and int(row_index) == int(len(self.output_relayout_rows) - 1):
                 post_kernel.output_scale = float(fusion["scale"])
                 post_kernel.output_bias = float(fusion["bias"])
-            post_kernel.compile(scheme, level=int(post_level))
-            self.output_relayout_kernels.append(post_kernel)
-            post_level = max(0, int(post_level - 1))
+            if not post_kernel.is_noop():
+                post_kernel.compile(scheme, level=int(post_level))
+                self.output_relayout_kernels.append(post_kernel)
+                post_level = max(0, int(post_level - 1))
         self.compile_count += 1
         self._compiled = True
         self._compiled_backend = getattr(scheme, "backend", None)
@@ -2303,7 +2458,7 @@ class LayoutPolicyProviderRuntimeExecutor:
                 for kernel in self.output_relayout_kernels:
                     next_ct = kernel.apply(output_ct)
                     release = getattr(output_ct, "release", None)
-                    if callable(release):
+                    if next_ct is not output_ct and callable(release):
                         release()
                     output_ct = next_ct
                 outputs[self.output_node_id] = output_ct
@@ -3492,6 +3647,8 @@ class TconvK2S2PythonRuntimeExecutor:
         self.compiled_output_layout: dict[str, int] = {}
         self.output_fold_block_height = 0
         self.output_fold_rotations = 0
+        self.structured_native_source_rotation_stats: dict[str, Any] = {}
+        self.native_source_tconv_output_assignments: dict[int, tuple[int, ...]] = {}
         self.compile_count = 0
         self.block_evaluate_count = 0
         self.real_projection_count = 0
@@ -3568,6 +3725,10 @@ class TconvK2S2PythonRuntimeExecutor:
             "output_total_slots": int(self.output_total_slots),
             "output_fold_block_height": int(self.output_fold_block_height),
             "output_fold_rotations": int(self.output_fold_rotations),
+            "native_source_tconv_output_assignments": {
+                str(int(source_block)): [int(value) for value in output_blocks]
+                for source_block, output_blocks in dict(self.native_source_tconv_output_assignments).items()
+            },
             "hybrid_pair_count": int(self.hybrid_pair_count),
             "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
             "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
@@ -3932,11 +4093,175 @@ class TconvK2S2PythonRuntimeExecutor:
             ],
         }
 
+    def _structured_native_source_rotation_snapshot(self) -> dict[str, Any] | None:
+        source_signature = tuple(self._native_input_storage_blocks())
+        target_signature = tuple(self._native_output_storage_blocks())
+        if not source_signature or not target_signature:
+            return None
+        if not _u22_tconv_module_supported(self.module):
+            return None
+        c_in = int(getattr(self.module, "input_shape")[1])
+        h_in = int(getattr(self.module, "input_shape")[2])
+        w_in = int(getattr(self.module, "input_shape")[3])
+        c_out = int(getattr(self.module, "output_shape")[1])
+        h_out = int(getattr(self.module, "output_shape")[2])
+        w_out = int(getattr(self.module, "output_shape")[3])
+        if min(int(c_in), int(h_in), int(w_in), int(c_out), int(h_out), int(w_out)) <= 0:
+            return None
+        input_gap = max(1, int(self._input_halo_layout().get("gap", getattr(self.module, "input_gap", 1))))
+        phase_group_width = max(1, int(input_gap) * int(input_gap))
+        phase_shift_count = len({1, int(w_out), int(w_out) + 1} - {0})
+        sampled_block_count = 0
+        multiplied_channel_count = 0
+        packed_channel_group_count = 0
+        for h_start, h_end, channel_start, channel_count in source_signature:
+            if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+                continue
+            if int(channel_start) < 0 or int(channel_start) >= int(c_in):
+                continue
+            active_channels = min(int(channel_count), int(c_in) - int(channel_start))
+            if int(active_channels) <= 0:
+                continue
+            sampled_block_count += 1
+            multiplied_channel_count += int(active_channels)
+            packed_channel_group_count += int(math.ceil(int(active_channels) / int(phase_group_width)))
+        rotations = int(sampled_block_count) * int(phase_shift_count) + int(packed_channel_group_count)
+        output_rotation_eval_count = int(
+            max(0, int(self.output_block_count)) * max(0, int(self.output_fold_rotations))
+        )
+        selected_total = int(rotations + output_rotation_eval_count)
+        transforms = int(sampled_block_count + packed_channel_group_count)
+        return {
+            "source": "runtime_io_tconv_k2s2_native_source_single_channel_model",
+            "runtime_lowering": "tconv_k2s2_native_source_structured_rotation_model",
+            "runtime_executor": type(self).__name__,
+            "runtime_group_count": int(transforms),
+            "runtime_transform_count": int(transforms),
+            "transform_rotation_key_count_total": int(rotations),
+            "shared_rotation_eval_count_total": int(rotations),
+            "unique_rotation_key_count": int(rotations),
+            "unique_rotation_keys": [],
+            "output_rotations": int(max(0, int(self.output_fold_rotations))),
+            "output_rotation_eval_count": int(output_rotation_eval_count),
+            "rotation_eval_count_estimate": int(selected_total),
+            "rotation_eval_count_mode": "native_source_single_channel_model",
+            "runtime_rotation_groups": [],
+            "tconv_structured_native_source_ct_count": int(len(source_signature)),
+            "tconv_structured_target_ct_count": int(len(target_signature)),
+            "tconv_structured_sampled_source_block_count": int(sampled_block_count),
+            "tconv_structured_multiplied_channel_count": int(multiplied_channel_count),
+            "tconv_structured_packed_channel_group_count": int(packed_channel_group_count),
+            "tconv_structured_phase_shift_count": int(phase_shift_count),
+            "tconv_structured_runtime_executes_legacy_unified_groups": True,
+        }
+
+    def _legacy_native_source_tconv_allowed(self) -> bool:
+        return _env_truthy("ORION_TCONV_ALLOW_LEGACY_NATIVE_SOURCE") or _env_truthy(
+            "ORION_U22_ALLOW_LEGACY_NATIVE_SOURCE_TCONV"
+        )
+
+    def _assert_structured_native_source_tconv_runtime(self) -> None:
+        stats = dict(self._structured_native_source_rotation_snapshot() or {})
+        if not stats:
+            return
+        if self._native_source_tconv_output_assignments():
+            return
+        self.structured_native_source_rotation_stats = dict(stats)
+        if not bool(stats.get("tconv_structured_runtime_executes_legacy_unified_groups", False)):
+            return
+        if bool(self._legacy_native_source_tconv_allowed()):
+            return
+        raise RuntimeError(
+            f"{self.output_node_id} requested native-source/native-target k2s2 tconv lowering, "
+            "but the runtime still executes legacy source-by-target unified transforms. "
+            "Refusing to compile because the structured tconv rotation estimate would not match forward(). "
+            "Implement the phase-scatter executor before running this plan, or set "
+            "ORION_TCONV_ALLOW_LEGACY_NATIVE_SOURCE=1 for an explicit legacy-debug run."
+        )
+
+    def _native_source_tconv_output_assignments(self) -> dict[int, tuple[int, ...]]:
+        source_blocks = tuple(self._native_input_storage_blocks())
+        target_blocks = tuple(self._native_output_storage_blocks())
+        if not source_blocks or not target_blocks:
+            return {}
+        if not _u22_tconv_module_supported(self.module):
+            return {}
+        assignments: dict[int, tuple[int, ...]] = {}
+        for source_index, (source_h0, source_h1, _source_c0, _source_count) in enumerate(source_blocks):
+            output_h0 = int(source_h0) * 2
+            output_h1 = int(source_h1) * 2
+            output_blocks: list[int] = []
+            for target_index, (target_h0, target_h1, _target_c0, _target_count) in enumerate(target_blocks):
+                if int(target_h1) <= int(output_h0) or int(target_h0) >= int(output_h1):
+                    continue
+                output_blocks.append(int(target_index))
+            if output_blocks:
+                assignments[int(source_index)] = tuple(int(value) for value in output_blocks)
+        covered = {
+            int(output_block)
+            for output_blocks in assignments.values()
+            for output_block in tuple(output_blocks)
+        }
+        missing = sorted(set(range(len(target_blocks))) - set(covered))
+        if missing:
+            raise RuntimeError(
+                f"{self.output_node_id} native-source tconv output assignment does not cover "
+                f"target blocks {missing}; source_blocks={len(source_blocks)} target_blocks={len(target_blocks)}"
+            )
+        return dict(assignments)
+
+    def _compile_native_source_assigned_tconv(
+        self,
+        *,
+        scheme: Any,
+        level: int,
+        assignments: dict[int, tuple[int, ...]],
+    ) -> tuple[float, float]:
+        prepare_total = 0.0
+        compile_total = 0.0
+        self.native_source_tconv_output_assignments = {
+            int(source_block): tuple(int(value) for value in output_blocks)
+            for source_block, output_blocks in dict(assignments).items()
+        }
+        for source_block in range(int(self.input_block_count)):
+            allowed_output_blocks = tuple(
+                int(value)
+                for value in self.native_source_tconv_output_assignments.get(int(source_block), ())
+            )
+            if not allowed_output_blocks:
+                continue
+            prepare_started = time.time()
+            transforms, empty_count = self._build_source_block_transforms(
+                scheme=scheme,
+                level=int(level),
+                source_block=int(source_block),
+                allowed_output_blocks=allowed_output_blocks,
+            )
+            self.skipped_empty_transform_count += int(empty_count)
+            entries = [
+                (int(output_block), transforms[int(output_block)])
+                for output_block in allowed_output_blocks
+                if int(output_block) < len(transforms) and transforms[int(output_block)] is not None
+            ]
+            prepare_total += float(time.time() - prepare_started)
+            if not entries:
+                continue
+            compile_total += self._compile_entry_groups(
+                scheme=scheme,
+                pair=(int(source_block), None),
+                is_complex=False,
+                entries=entries,
+            )
+            del transforms, entries
+        return float(prepare_total), float(compile_total)
+
     def compile(self, scheme: Any) -> None:
         if self._compiled:
             return
         if not self.supports_scheme(scheme):
             raise RuntimeError("U22 experimental tconv kernel requires a compatible Python or Lattigo backend")
+        self._set_block_layout(scheme=scheme)
+        self._assert_structured_native_source_tconv_runtime()
         if self._compile_from_cache_metadata(scheme):
             return
         self.last_runtime_timing = {
@@ -3954,7 +4279,9 @@ class TconvK2S2PythonRuntimeExecutor:
             "total_call_s": 0.0,
         }
         level = int(self.assigned_level) if self.assigned_level is not None else len(scheme.params.get_logq()) - 1
-        self._set_block_layout(scheme=scheme)
+        self.structured_native_source_rotation_stats = dict(
+            self._structured_native_source_rotation_snapshot() or {}
+        )
         self.groups = []
         self.target_indices_by_input_unit = []
         self.input_block_pairs = []
@@ -3974,6 +4301,25 @@ class TconvK2S2PythonRuntimeExecutor:
 
         prepare_total = 0.0
         compile_total = 0.0
+        native_assignments = self._native_source_tconv_output_assignments()
+        if native_assignments:
+            prepare_total, compile_total = self._compile_native_source_assigned_tconv(
+                scheme=scheme,
+                level=int(level),
+                assignments=native_assignments,
+            )
+            bias_level = max(
+                0,
+                int(level) - max(0, int(self.assigned_depth) if self.assigned_depth is not None else 1),
+            )
+            bias_started = time.time()
+            self._compile_bias_plaintexts(scheme=scheme, level=int(bias_level))
+            compile_total += float(time.time() - bias_started)
+            self.compile_count += 1
+            self.last_runtime_timing["prepare_transforms_s"] = float(prepare_total)
+            self.last_runtime_timing["compile_unified_s"] = float(compile_total)
+            self._compiled = bool(self.groups)
+            return
         single_slot_enabled = False
         evaluator = getattr(scheme, "lt_evaluator", None)
         enabled_fn = getattr(evaluator, "single_slot_layer_cache_enabled", None)
@@ -4704,6 +5050,13 @@ class TconvK2S2PythonRuntimeExecutor:
         return self._rotation_report_snapshot_for_scheme(scheme=None, individual_eval=bool(individual_eval))
 
     def _rotation_report_snapshot_for_scheme(self, *, scheme: Any | None, individual_eval: bool) -> dict[str, Any]:
+        structured = (
+            self._structured_native_source_rotation_snapshot()
+            if scheme is not None
+            else dict(self.structured_native_source_rotation_stats or {})
+        )
+        if structured:
+            return dict(structured)
         backend = getattr(scheme, "backend", None) if scheme is not None else None
         try:
             slots = int(scheme.params.get_slots()) if scheme is not None else 32768
@@ -4845,6 +5198,7 @@ class TconvK2S2PythonRuntimeExecutor:
         self.compiled_output_layout = {}
         self.output_fold_block_height = 0
         self.output_fold_rotations = 0
+        self.native_source_tconv_output_assignments = {}
         self._bias_ptxt_cache = {}
         self._compiled = False
 
@@ -4986,6 +5340,7 @@ class TconvK2S2PythonRuntimeExecutor:
         scheme: Any,
         level: int,
         source_block: int,
+        allowed_output_blocks: tuple[int, ...] | None = None,
     ) -> tuple[list[Any | None], int]:
         c_in = int(getattr(self.module, "input_shape")[1])
         h_in = int(getattr(self.module, "input_shape")[2])
@@ -5005,6 +5360,11 @@ class TconvK2S2PythonRuntimeExecutor:
         output_top_beta = _layout_physical_top_beta(output_layout)
         output_bottom_beta = _layout_physical_bottom_beta(output_layout)
         native_output_blocks = self._native_output_storage_blocks()
+        allowed_output_block_set = (
+            None
+            if allowed_output_blocks is None
+            else {int(value) for value in tuple(allowed_output_blocks)}
+        )
         output_materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
         fused_output_relayout = output_materialization == "fused_relayout"
         input_physical_h = (
@@ -5078,6 +5438,11 @@ class TconvK2S2PythonRuntimeExecutor:
                                 block_channel_start,
                                 block_channel_count,
                             ) in enumerate(native_output_blocks):
+                                if (
+                                    allowed_output_block_set is not None
+                                    and int(output_block_index) not in allowed_output_block_set
+                                ):
+                                    continue
                                 local_h = oh_grid - int(block_h_start)
                                 local_c = oc_grid - int(block_channel_start)
                                 output_local = _idx_chw_gap_tensor(
@@ -5137,6 +5502,8 @@ class TconvK2S2PythonRuntimeExecutor:
                         flat_diags = diag_idx[valid].to(dtype=torch.int64)
                         for block in torch.unique(flat_blocks).tolist():
                             block_value = int(block)
+                            if allowed_output_block_set is not None and int(block_value) not in allowed_output_block_set:
+                                continue
                             block_mask = flat_blocks == int(block_value)
                             diagonal_keys[int(block_value)].update(
                                 int(value) for value in torch.unique(flat_diags[block_mask]).tolist()
@@ -5145,6 +5512,10 @@ class TconvK2S2PythonRuntimeExecutor:
         block_transforms: list[Any | None] = []
         empty_transform_count = 0
         for output_block in range(int(self.output_block_count)):
+            if allowed_output_block_set is not None and int(output_block) not in allowed_output_block_set:
+                empty_transform_count += 1
+                block_transforms.append(None)
+                continue
             keys = tuple(sorted(int(value) for value in diagonal_keys[int(output_block)]))
             if not keys:
                 empty_transform_count += 1
@@ -5179,6 +5550,7 @@ class TconvK2S2PythonRuntimeExecutor:
         level: int,
         source_block: int,
         attach_single_slot_recipe: bool = True,
+        allowed_output_blocks: tuple[int, ...] | None = None,
     ) -> tuple[list[Any | None], int]:
         c_in = int(getattr(self.module, "input_shape")[1])
         h_in = int(getattr(self.module, "input_shape")[2])
@@ -5198,6 +5570,11 @@ class TconvK2S2PythonRuntimeExecutor:
         output_top_beta = _layout_physical_top_beta(output_layout)
         output_bottom_beta = _layout_physical_bottom_beta(output_layout)
         native_output_blocks = self._native_output_storage_blocks()
+        allowed_output_block_set = (
+            None
+            if allowed_output_blocks is None
+            else {int(value) for value in tuple(allowed_output_blocks)}
+        )
         output_materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
         fused_output_relayout = output_materialization == "fused_relayout"
         input_physical_h = (
@@ -5217,6 +5594,7 @@ class TconvK2S2PythonRuntimeExecutor:
                 scheme=scheme,
                 level=int(level),
                 source_block=int(source_block),
+                allowed_output_blocks=allowed_output_blocks,
             )
             recipe_diagonal_cache: dict[str, Any] = {}
             recipe_cache_lock = threading.Lock()
@@ -5240,6 +5618,7 @@ class TconvK2S2PythonRuntimeExecutor:
                     scheme: Any = scheme,
                     level: int = int(level),
                     slots: int = int(slots),
+                    transform_ref: dict[str, Any] = transform_ref,
                 ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
                     with recipe_cache_lock:
                         rebuilt = recipe_diagonal_cache.get("rebuilt")
@@ -5249,6 +5628,7 @@ class TconvK2S2PythonRuntimeExecutor:
                                 level=int(level),
                                 source_block=int(source_block),
                                 attach_single_slot_recipe=False,
+                                allowed_output_blocks=allowed_output_blocks,
                             )
                             recipe_diagonal_cache["rebuilt"] = rebuilt
                     payload_transform = rebuilt[int(output_block)] if int(output_block) < len(rebuilt) else None
@@ -5359,6 +5739,11 @@ class TconvK2S2PythonRuntimeExecutor:
                                 block_channel_start,
                                 block_channel_count,
                             ) in enumerate(native_output_blocks):
+                                if (
+                                    allowed_output_block_set is not None
+                                    and int(output_block_index) not in allowed_output_block_set
+                                ):
+                                    continue
                                 local_h = oh_grid - int(block_h_start)
                                 local_c = oc_grid - int(block_channel_start)
                                 output_local = _idx_chw_gap_tensor(
@@ -5429,6 +5814,8 @@ class TconvK2S2PythonRuntimeExecutor:
                         flat_values = coeff[valid].to(dtype=torch.float32)
                         for block in torch.unique(flat_blocks).tolist():
                             block_value = int(block)
+                            if allowed_output_block_set is not None and int(block_value) not in allowed_output_block_set:
+                                continue
                             block_mask = flat_blocks == int(block_value)
                             diagonal_parts[int(block_value)].append(
                                 (
@@ -5448,6 +5835,10 @@ class TconvK2S2PythonRuntimeExecutor:
                 recipe_diagonal_cache.clear()
 
         for output_block in range(int(self.output_block_count)):
+            if allowed_output_block_set is not None and int(output_block) not in allowed_output_block_set:
+                empty_transform_count += 1
+                block_transforms.append(None)
+                continue
             diagonals: dict[int, torch.Tensor] = {}
             if diagonal_parts[int(output_block)]:
                 block_diag_idx = torch.cat([part[0] for part in diagonal_parts[int(output_block)]]).to(dtype=torch.int64)
@@ -5481,6 +5872,7 @@ class TconvK2S2PythonRuntimeExecutor:
                     scheme: Any = scheme,
                     level: int = int(level),
                     slots: int = int(slots),
+                    transform_ref: dict[str, Any] = transform_ref,
                 ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
                     with recipe_cache_lock:
                         rebuilt = recipe_diagonal_cache.get("rebuilt")
@@ -5490,6 +5882,7 @@ class TconvK2S2PythonRuntimeExecutor:
                                 level=int(level),
                                 source_block=int(source_block),
                                 attach_single_slot_recipe=False,
+                                allowed_output_blocks=allowed_output_blocks,
                             )
                             recipe_diagonal_cache["rebuilt"] = rebuilt
                     transform = rebuilt[int(output_block)] if int(output_block) < len(rebuilt) else None
@@ -5692,6 +6085,10 @@ class TconvK2S2PythonRuntimeExecutor:
         self.last_runtime_io["complex_input_block_flags"] = [bool(value) for value in self.complex_input_block_flags]
         self.last_runtime_io["output_fold_block_height"] = int(self.output_fold_block_height)
         self.last_runtime_io["output_fold_rotations"] = int(self.output_fold_rotations)
+        self.last_runtime_io["native_source_tconv_output_assignments"] = {
+            str(int(source_block)): [int(value) for value in output_blocks]
+            for source_block, output_blocks in dict(self.native_source_tconv_output_assignments).items()
+        }
         self.last_runtime_io.update(
             self._rotation_report_snapshot_for_scheme(
                 scheme=scheme,
@@ -5729,7 +6126,7 @@ class TconvK2S2PythonRuntimeExecutor:
 
         fuse_output_rescale = bool(_unified_output_fusion_enabled()) and not any(
             bool(value) for value in self.complex_input_block_flags
-        )
+        ) and not bool(self.native_source_tconv_output_assignments)
         target_sum_output_ids: list[int] | None = None
         if fuse_output_rescale:
             evaluate_started = time.time()
@@ -6295,6 +6692,14 @@ class U22CompileRegistry:
                                 f"available row sources={sorted(rows_by_source)}"
                             )
                         module.layout_policy_concat_input_source_signatures = input_signatures
+                        module._concat_native_compile_rotation_io = _layout_policy_concat_native_compile_rotation_io(
+                            node=str(node),
+                            output_row=output_row,
+                            input_signatures=input_signatures,
+                            target_signature=[
+                                [int(value) for value in item] for item in target_signature
+                            ],
+                        )
                 else:
                     module.layout_policy_add_runtime = runtime
                 input_relayout_depth = max(

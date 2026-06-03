@@ -124,10 +124,8 @@ def _tex_int(value: int | str) -> str:
 
 def _paper_case_label(case: str) -> str:
     labels = {
-        "192x192_IBSR_BRAIN_2D": "M1 $192{\\times}192$, $1{\\to}4$ (IBSR)",
-        "224x224_HanCo_Hand": "M2 $224{\\times}224$, $3{\\to}1$ (HanCo)",
-        "384x288_CVC_ClinicDB": "M3 $384{\\times}288$, $3{\\to}1$ (CVC)",
-        "384x384_Satellite_cloud": "M4 $384{\\times}384$, $4{\\to}1$ (Cloud)",
+        "256x256_COVID19_lung": "M1 $256{\\times}256$, $1{\\to}1$ (COVID-19)",
+        "384x384_NuSegMSBench": "M2 $384{\\times}384$, $1{\\to}1$ (NuSeg)",
     }
     return labels[str(case)]
 
@@ -165,10 +163,9 @@ def render_operator_plan_table(rows: list[dict[str, Any]]) -> str:
     caption = (
         "Per-operator layout and compile-plan summary for U\\text{-}Net workloads with "
         "23 learned/linear layers plus four pooling transition operators. Model groups "
-        "correspond to M1: IBSR Brain 2D, $192{\\times}192$, $C_{\\mathrm{in}}{=}1$, "
-        "$C_{\\mathrm{out}}{=}4$; M2: HanCo hand segmentation, $224{\\times}224$, "
-        "$3{\\to}1$; M3: CVC-ClinicDB, $384{\\times}288$, $3{\\to}1$; and M4: "
-        "satellite cloud segmentation, $384{\\times}384$, $4{\\to}1$. Each group "
+        "correspond to M1: COVID-19 lung segmentation, $256{\\times}256$, "
+        "$C_{\\mathrm{in}}{=}1$, $C_{\\mathrm{out}}{=}1$; and M2: NuSegMSBench "
+        "nuclei segmentation, $384{\\times}384$, $1{\\to}1$. Each group "
         "reports output-layout interior rows $\\alpha$, averaged actual output-layout "
         "halo rows $\\beta$, output ciphertext count (CT), estimated rotations (R), "
         "diagonal/CT--PT multiplication count (M), and bootstrap count inserted after "
@@ -777,7 +774,7 @@ def _parse_args() -> argparse.Namespace:
         "--out-csv",
         type=Path,
         default=None,
-        help="CSV output path. Defaults to .tmp/results/unet22_plus_output_dim{base}_real_trace_compile_plan_4cases.csv.",
+        help="CSV output path. Defaults to .tmp/results/unet22_plus_output_dim{base}_real_trace_compile_plan_2cases.csv.",
     )
     parser.add_argument("--out-tex", type=Path, default=None, help="Optional LaTeX table output path.")
     return parser.parse_args()
@@ -789,35 +786,19 @@ def main() -> None:
     BASE_DIM = int(args.base_dim)
     cases = [
         {
-            "case": "192x192_IBSR_BRAIN_2D",
-            "dataset": "IBSR BRAIN 2D",
-            "height": 192,
-            "width": 192,
+            "case": "256x256_COVID19_lung",
+            "dataset": "COVID-19 lung",
+            "height": 256,
+            "width": 256,
             "input_channels": 1,
-            "output_channels": 4,
-        },
-        {
-            "case": "224x224_HanCo_Hand",
-            "dataset": "HanCo Hand Segmentation Dataset",
-            "height": 224,
-            "width": 224,
-            "input_channels": 3,
             "output_channels": 1,
         },
         {
-            "case": "384x288_CVC_ClinicDB",
-            "dataset": "CVC-ClinicDB",
-            "height": 384,
-            "width": 288,
-            "input_channels": 3,
-            "output_channels": 1,
-        },
-        {
-            "case": "384x384_Satellite_cloud",
-            "dataset": "Satellite cloud segmentation",
+            "case": "384x384_NuSegMSBench",
+            "dataset": "NuSegMSBench",
             "height": 384,
             "width": 384,
-            "input_channels": 4,
+            "input_channels": 1,
             "output_channels": 1,
         },
     ]
@@ -825,7 +806,7 @@ def main() -> None:
     for case in cases:
         rows.extend(_rows_for_case(case))
     out = Path(args.out_csv) if args.out_csv is not None else Path(
-        f".tmp/results/unet22_plus_output_dim{int(BASE_DIM)}_real_trace_compile_plan_4cases.csv"
+        f".tmp/results/unet22_plus_output_dim{int(BASE_DIM)}_real_trace_compile_plan_2cases.csv"
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as handle:

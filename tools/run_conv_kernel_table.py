@@ -378,8 +378,8 @@ def _explicit_output_halo(result: dict[str, Any]) -> tuple[int | None, int | Non
         metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
         native_plan = metadata.get("native_halo_conv2d_plan") if isinstance(metadata.get("native_halo_conv2d_plan"), dict) else {}
         spec = native_plan.get("spec") if isinstance(native_plan.get("spec"), dict) else {}
-        top = spec.get("output_top_beta")
-        bottom = spec.get("output_bottom_beta")
+        top = spec.get("output_physical_top_beta")
+        bottom = spec.get("output_physical_bottom_beta")
     if top is None or bottom is None:
         return None, None
     try:
@@ -487,6 +487,10 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
             row,
             output_layout=_provider_result_output_layout(result),
         )
+    output_internal_halo_top, output_internal_halo_bottom = _provider_output_internal_halo(
+        row,
+        output_layout=_provider_result_output_layout(result),
+    )
     metadata = result.get("provider_metadata") if isinstance(result.get("provider_metadata"), dict) else {}
     provider_lt_grouping_mode = ""
     if row.path == "provider":
@@ -528,6 +532,8 @@ def _normalise_reused_result(row: ConvKernelRow, result: dict[str, Any], source_
         "input_halo_bottom": input_halo_bottom,
         "output_halo_top": output_halo_top if row.path == "provider" else None,
         "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
+        "output_internal_halo_top": output_internal_halo_top if row.path == "provider" else None,
+        "output_internal_halo_bottom": output_internal_halo_bottom if row.path == "provider" else None,
         "provider_output_storage_layout": _provider_result_output_layout(result) if row.path == "provider" else "",
         "kernel": "3x3/pad1/stride1",
         "compile_s": float(result.get("compile_s") or 0.0),
@@ -863,6 +869,17 @@ def _expected_provider_output_halo(row: ConvKernelRow, *, output_layout: str) ->
         return None, None
     layout = str(output_layout or "tight_compact")
     if layout in {"native_stripe", "native_halo_stripe"}:
+        return 0, 0
+    if layout == "tight_compact":
+        return 0, 0
+    return None, None
+
+
+def _provider_output_internal_halo(row: ConvKernelRow, *, output_layout: str) -> tuple[int | None, int | None]:
+    if row.path != "provider":
+        return None, None
+    layout = str(output_layout or "tight_compact")
+    if layout in {"native_stripe", "native_halo_stripe"}:
         halo = max(0, int(row.halo or 0) - 1)
         return int(halo), int(halo)
     if layout == "tight_compact":
@@ -887,9 +904,16 @@ def _apply_provider_output_layout(conv: Conv2d, row: ConvKernelRow, *, output_la
         return ""
     layout = str(output_layout or "tight_compact")
     if layout == "native_stripe":
+        internal_top, internal_bottom = _provider_output_internal_halo(row, output_layout=layout)
         output_top, output_bottom = _expected_provider_output_halo(row, output_layout=layout)
         conv.layout_policy_output_materialization = "native_halo_stripe"
-        conv.layout_policy_output_layout = {"top_beta": int(output_top or 0), "bottom_beta": int(output_bottom or 0)}
+        conv.layout_policy_output_layout = {
+            "top_beta": int(internal_top or 0),
+            "bottom_beta": int(internal_bottom or 0),
+            "physical_top_beta": int(output_top or 0),
+            "physical_bottom_beta": int(output_bottom or 0),
+            "boundary_pruned": bool(int(internal_top or 0) or int(internal_bottom or 0)),
+        }
         return "native_halo_stripe"
     if layout == "tight_compact":
         conv.layout_policy_output_materialization = "fused_relayout"
@@ -1156,6 +1180,10 @@ def _run_row(
             row,
             output_layout=str(provider_output_layout),
         )
+        output_internal_halo_top, output_internal_halo_bottom = _provider_output_internal_halo(
+            row,
+            output_layout=str(provider_output_layout),
+        )
         if row.path == "provider":
             _attach_provider_runtime(conv, row)
         with _capture_stdout() as buffer:
@@ -1283,6 +1311,8 @@ def _run_row(
             "input_halo_bottom": input_halo_bottom,
             "output_halo_top": output_halo_top if row.path == "provider" else None,
             "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
+            "output_internal_halo_top": output_internal_halo_top if row.path == "provider" else None,
+            "output_internal_halo_bottom": output_internal_halo_bottom if row.path == "provider" else None,
             "kernel": "3x3/pad1/stride1",
             "compile_s": float(generate_diagonals_s + compile_backend_s),
             "generate_diagonals_s": float(generate_diagonals_s),
@@ -1684,9 +1714,14 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
     )
     provider_output_layout = ""
     output_halo_top, output_halo_bottom = None, None
+    output_internal_halo_top, output_internal_halo_bottom = None, None
     if row.path == "provider":
         provider_output_layout = "native_halo_stripe" if str(args.provider_output_layout) == "native_stripe" else "tight_compact"
         output_halo_top, output_halo_bottom = _expected_provider_output_halo(
+            row,
+            output_layout=str(args.provider_output_layout),
+        )
+        output_internal_halo_top, output_internal_halo_bottom = _provider_output_internal_halo(
             row,
             output_layout=str(args.provider_output_layout),
         )
@@ -1726,6 +1761,8 @@ def _write_running_placeholder(path: Path, row: ConvKernelRow, args: argparse.Na
             "input_halo_bottom": input_halo_bottom,
             "output_halo_top": output_halo_top,
             "output_halo_bottom": output_halo_bottom,
+            "output_internal_halo_top": output_internal_halo_top,
+            "output_internal_halo_bottom": output_internal_halo_bottom,
             "ckks_params": {
                 "LogN": 16,
                 "LogQ": list(E2E_LOGQ),
@@ -1753,6 +1790,10 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             row,
             output_layout=str(provider_output_layout or provider_output_storage_layout),
         )
+    output_internal_halo_top, output_internal_halo_bottom = _provider_output_internal_halo(
+        row,
+        output_layout=str(provider_output_layout or provider_output_storage_layout),
+    )
     payload.update(
         {
             "status": "error",
@@ -1785,6 +1826,8 @@ def _mark_worker_failure(path: Path, row: ConvKernelRow, *, failure_kind: str, m
             "input_halo_bottom": input_halo_bottom,
             "output_halo_top": output_halo_top if row.path == "provider" else None,
             "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
+            "output_internal_halo_top": output_internal_halo_top if row.path == "provider" else None,
+            "output_internal_halo_bottom": output_internal_halo_bottom if row.path == "provider" else None,
             "ckks_params": {
                 "LogN": 16,
                 "LogQ": list(E2E_LOGQ),
@@ -2042,9 +2085,19 @@ def run_one(args: argparse.Namespace) -> int:
             clip_boundary_halo=bool(args.clip_provider_boundary_halo and row.path == "provider"),
         )
         provider_output_layout = ""
+        output_halo_top, output_halo_bottom = None, None
+        output_internal_halo_top, output_internal_halo_bottom = None, None
         if row.path == "provider":
             provider_output_layout = (
                 "native_halo_stripe" if str(args.provider_output_layout) == "native_stripe" else "tight_compact"
+            )
+            output_halo_top, output_halo_bottom = _expected_provider_output_halo(
+                row,
+                output_layout=str(args.provider_output_layout),
+            )
+            output_internal_halo_top, output_internal_halo_bottom = _provider_output_internal_halo(
+                row,
+                output_layout=str(args.provider_output_layout),
             )
         payload = {
             "status": "error",
@@ -2077,6 +2130,10 @@ def run_one(args: argparse.Namespace) -> int:
             "provider_output_storage_layout": provider_output_layout,
             "input_halo_top": input_halo_top,
             "input_halo_bottom": input_halo_bottom,
+            "output_halo_top": output_halo_top if row.path == "provider" else None,
+            "output_halo_bottom": output_halo_bottom if row.path == "provider" else None,
+            "output_internal_halo_top": output_internal_halo_top if row.path == "provider" else None,
+            "output_internal_halo_bottom": output_internal_halo_bottom if row.path == "provider" else None,
             "ckks_params": {
                 "LogN": 16,
                 "LogQ": list(E2E_LOGQ),

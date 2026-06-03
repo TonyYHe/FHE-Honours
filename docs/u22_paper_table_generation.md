@@ -14,7 +14,7 @@ diagonal/CT-PT counts, and compile-time bootstrap placement:
 ```bash
 .venv/bin/python tools/generate_unet22_compile_plan_csv.py \
   --base-dim 64 \
-  --out-csv .tmp/results/unet22_plus_output_dim64_real_trace_compile_plan_4cases.csv \
+  --out-csv .tmp/results/unet22_plus_output_dim64_real_trace_compile_plan_2cases.csv \
   --out-tex .tmp/results/unet22_operator_plan_dim64.tex
 ```
 
@@ -23,16 +23,14 @@ For the base-channel-32 variant, change only the dimension and output names:
 ```bash
 .venv/bin/python tools/generate_unet22_compile_plan_csv.py \
   --base-dim 32 \
-  --out-csv .tmp/results/unet22_plus_output_dim32_real_trace_compile_plan_4cases.csv \
+  --out-csv .tmp/results/unet22_plus_output_dim32_real_trace_compile_plan_2cases.csv \
   --out-tex .tmp/results/unet22_operator_plan_dim32.tex
 ```
 
-The four built-in cases are:
+The two retained built-in cases are:
 
-- `192x192_IBSR_BRAIN_2D`: IBSR Brain 2D, `C_in=1`, `C_out=4`.
-- `224x224_HanCo_Hand`: HanCo hand segmentation, `C_in=3`, `C_out=1`.
-- `384x288_CVC_ClinicDB`: CVC-ClinicDB, `C_in=3`, `C_out=1`.
-- `384x384_Satellite_cloud`: satellite cloud segmentation, `C_in=4`, `C_out=1`.
+- `256x256_COVID19_lung`: COVID-19 lung segmentation, `C_in=1`, `C_out=1`.
+- `384x384_NuSegMSBench`: NuSegMSBench nuclei segmentation, `C_in=1`, `C_out=1`.
 
 The LaTeX table reports output-layout interior rows `alpha`, averaged actual
 output halo `beta=floor((beta_top+beta_bottom)/2)`, ciphertext count,
@@ -52,8 +50,8 @@ counts:
   --out-tex .tmp/results/layout_policy_ablation_u22_320_base32_paper.tex
 ```
 
-The same script can be pointed at `u22_192_base32`, `u22_224_base32`, or
-`u22_256_base32` if the paper should use a different ablation size:
+The same script can be pointed at `u22_256_base32` when the ablation should
+align with the retained COVID-19 input size:
 
 ```bash
 .venv/bin/python tools/generate_unet22_layout_ablation_table.py \

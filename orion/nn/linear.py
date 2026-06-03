@@ -1003,6 +1003,15 @@ class Conv2d(LinearTransform):
         output_bottom_beta = int(output_attrs.get("_semantic_output_bottom_beta", _layout_bottom_beta(output_layout)) or 0)
         output_physical_top_beta = int(_layout_physical_top_beta(output_layout))
         output_physical_bottom_beta = int(_layout_physical_bottom_beta(output_layout))
+        concat_policy_attrs = self._concat_layout_policy_module_attrs()
+        concat_input_row = self._concat_conv_input_layout_row()
+        native_channel_fold_mode = str(
+            getattr(self, "layout_policy_native_halo_channel_fold_mode", "")
+            or output_attrs.get("layout_policy_native_halo_channel_fold_mode", "")
+            or concat_policy_attrs.get("layout_policy_native_halo_channel_fold_mode", "")
+            or concat_input_row.get("native_halo_channel_fold_mode", "")
+            or ""
+        )
         native_output_signature: tuple[tuple[int, ...], ...] | None = None
         raw_target_signature = getattr(self, "layout_policy_native_output_target_signature", ()) or ()
         try:
@@ -1012,6 +1021,11 @@ class Conv2d(LinearTransform):
             )
         except Exception:
             native_output_target_storage_signature = ()
+        native_output_internal_halo_overlap = (
+            0
+            if native_output_target_storage_signature or not bool(native_output_materialization)
+            else max(0, int(output_top_beta)) + max(0, int(output_bottom_beta))
+        )
         self._concat_native_output_plan = None
         self._concat_native_compile_rotation_io = None
         self._concat_native_runtime_io = None
@@ -1053,8 +1067,10 @@ class Conv2d(LinearTransform):
             native_output_plan = native_halo_conv2d_plan(
                 first_native_spec,
                 require_native_target_fit=False,
+                channel_fold_mode=native_channel_fold_mode or None,
                 source_storage_signature=first_source_signature or None,
                 target_storage_signature=native_output_target_storage_signature or None,
+                target_internal_halo_overlap=int(native_output_internal_halo_overlap),
             )
             target_ct_count = int(self._concat_native_plan_target_ct_count(native_output_plan))
             native_output_signature = self._concat_native_plan_target_signature(native_output_plan)
@@ -1139,8 +1155,10 @@ class Conv2d(LinearTransform):
             plan = native_halo_conv2d_plan(
                 native_spec,
                 require_native_target_fit=False,
+                channel_fold_mode=native_channel_fold_mode or None,
                 source_storage_signature=source_storage_signature or None,
                 target_storage_signature=native_output_target_storage_signature or None,
+                target_internal_halo_overlap=int(native_output_internal_halo_overlap),
             )
             if bool(native_source_input) and bool(native_output_materialization):
                 native_rotation_branches.append(
@@ -1831,15 +1849,6 @@ class Conv2d(LinearTransform):
         if bool(getattr(self, "region_first_probe_dense_bypass", False)):
             self.transform_ids = {}
             return
-        native_concat_fusion = bool(self._concat_fusion_uses_native_source_inputs())
-        if bool(native_concat_fusion):
-            if self._compile_concat_fusion_transforms():
-                return
-            self._concat_fusion_native_source_inputs = False
-            raise RuntimeError(
-                f"native-source concat fusion is required for Conv2d {getattr(self, 'name', '')}, "
-                "but no executable concat-fusion plan was produced"
-            )
         runtime = self._region_runtime_if_ready(require_skip_dense_pack=True)
         if runtime is not None:
             runtime.assigned_level = int(self.level)
@@ -1853,6 +1862,15 @@ class Conv2d(LinearTransform):
                 runtime.compile(self.scheme)
             self.transform_ids = {}
             return
+        native_concat_fusion = bool(self._concat_fusion_uses_native_source_inputs())
+        if bool(native_concat_fusion):
+            if self._compile_concat_fusion_transforms():
+                return
+            self._concat_fusion_native_source_inputs = False
+            raise RuntimeError(
+                f"native-source concat fusion is required for Conv2d {getattr(self, 'name', '')}, "
+                "but no executable concat-fusion plan was produced"
+            )
         self._concat_fusion_native_source_inputs = False
         if self._compile_concat_fusion_transforms():
             return

@@ -1280,6 +1280,8 @@ def _configure_lattigo_runtime_defaults() -> dict[str, str]:
         "ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS": workers,
         "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS": workers,
         "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS": workers,
+        "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA": "1",
+        "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA": "1",
         "ORION_LATTIGO_COMPILE_WORKERS": workers,
         "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": diagonal_encode_workers,
         "ORION_SINGLE_SLOT_ENCODE_WORKERS": diagonal_encode_workers,
@@ -1563,13 +1565,20 @@ def _layer_mae_should_decode_native_signature_output(
 
 def _layer_mae_native_halo_expected_ct_count(executor: Any) -> int:
     if _layer_mae_native_halo_uses_compact_physical_targets(executor):
-        plan = executor.native_plan
+        plan = _layer_mae_native_halo_plan(executor)
         return int(getattr(plan, "output_ct_count", 0) or 0)
     return int(_layer_mae_native_halo_native_target_ct_count(executor))
 
 
+def _layer_mae_native_halo_plan(executor: Any) -> Any:
+    runtime_plan = getattr(executor, "_last_runtime_native_plan", None)
+    if runtime_plan is not None:
+        return runtime_plan
+    return executor.native_plan
+
+
 def _layer_mae_native_halo_native_target_ct_count(executor: Any) -> int:
-    plan = executor.native_plan
+    plan = _layer_mae_native_halo_plan(executor)
     max_block_index = -1
     for stripe in plan.stripes:
         for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
@@ -1632,7 +1641,7 @@ def _layer_mae_native_layout_preserving_no_decoder(module: torch.nn.Module) -> b
 
 
 def _layer_mae_decode_native_halo_output(decoded: torch.Tensor, executor: Any) -> torch.Tensor:
-    plan = executor.native_plan
+    plan = _layer_mae_native_halo_plan(executor)
     spec = plan.spec
     values = _layer_mae_tensor(decoded).reshape(-1)
     expected_values = int(_layer_mae_native_halo_native_target_ct_count(executor)) * int(spec.slot_count)
@@ -1751,7 +1760,7 @@ def _layer_mae_decode_native_signature_output(
 def _layer_mae_decode_native_halo_compact_physical_output(decoded: torch.Tensor, executor: Any) -> torch.Tensor:
     from orion.experimental.cir.native_halo_conv2d import _idx_chw_gap_channel_positions
 
-    plan = executor.native_plan
+    plan = _layer_mae_native_halo_plan(executor)
     spec = plan.spec
     values = _layer_mae_tensor(decoded).reshape(-1)
     expected_values = int(_layer_mae_native_halo_expected_ct_count(executor)) * int(spec.slot_count)
@@ -4414,7 +4423,146 @@ def _rotation_report_stats_key(stats: dict[str, Any]) -> tuple[str, tuple[int, .
     return ("stats", (int(id(stats)),))
 
 
+def _provider_native_halo_rotation_stats_from_io(
+    executor: Any,
+    stats_io: dict[str, Any],
+    *,
+    default_source: str,
+) -> dict[str, Any] | None:
+    if not isinstance(stats_io, dict):
+        return None
+    if stats_io.get("native_c_only_rotations") is None:
+        return None
+    group_mode = str(
+        stats_io.get("provider_lt_grouping_mode")
+        or stats_io.get("lt_grouping_mode")
+        or ""
+    ).strip().lower().replace("-", "_")
+    individual = group_mode in {
+        "individual",
+        "individual_lt",
+        "per_lt",
+        "per_linear_transform",
+        "no_share",
+        "no_shared_rotation",
+        "disable_shared_rotation",
+    } or bool(stats_io.get("provider_disable_shared_rotation", False))
+    transform_total = int(stats_io.get("native_c_only_rotations") or 0)
+    shared_total = int(stats_io.get("native_cb_shared_rotations") or 0)
+    runtime_counts = getattr(executor, "last_runtime_counts", {}) or {}
+    runtime_timing = getattr(executor, "last_runtime_timing", {}) or {}
+    transform_count = int(
+        stats_io.get("runtime_transform_count")
+        or stats_io.get("conv_lt_raw_submatrix_tasks")
+        or stats_io.get("conv_lt_effective_submatrix_tasks")
+        or runtime_counts.get("partial_count", 0)
+        or runtime_timing.get("built_transform_count", 0)
+        or stats_io.get("runtime_group_count", 0)
+        or 0
+    )
+    group_count = int(
+        stats_io.get("runtime_group_count")
+        or stats_io.get("conv_lt_effective_submatrix_tasks")
+        or stats_io.get("conv_lt_raw_submatrix_tasks")
+        or 0
+    )
+    return {
+        "source": str(stats_io.get("source", default_source)),
+        "group_count": int(group_count),
+        "transform_count": int(transform_count),
+        "transform_rotation_key_count_total": int(transform_total),
+        "shared_rotation_eval_count_total": int(shared_total),
+        "unique_rotation_key_count": 0,
+        "output_rotations_per_output_ct": 0,
+        "output_rotation_eval_count": 0,
+        "rotation_eval_count_estimate": int(transform_total if individual else shared_total),
+        "rotation_eval_count_mode": "independent_transform_bsgs" if individual else "shared_group_bsgs",
+        "unique_rotation_keys": [],
+        "native_plan_c_only_rotation_estimate": (
+            None
+            if stats_io.get("native_plan_c_only_rotations") is None
+            else int(stats_io.get("native_plan_c_only_rotations") or 0)
+        ),
+        "native_plan_cb_shared_rotation_estimate": (
+            None
+            if stats_io.get("native_plan_cb_shared_rotations") is None
+            else int(stats_io.get("native_plan_cb_shared_rotations") or 0)
+        ),
+        "native_halo_channel_fold_mode": str(stats_io.get("native_halo_channel_fold_mode", "")),
+        "native_output_storage_layout": str(
+            stats_io.get("native_output_storage_layout")
+            or stats_io.get("runtime_output_storage_layout")
+            or ""
+        ),
+        "per_group": list(stats_io.get("runtime_rotation_groups", []) or []),
+    }
+
+
+def _provider_compile_metadata_rotation_stats(executor: Any) -> dict[str, Any] | None:
+    for owner in _walk_executor_objects(executor):
+        get_metadata = getattr(owner, "compile_cache_metadata", None)
+        if not callable(get_metadata):
+            continue
+        try:
+            metadata = dict(get_metadata() or {})
+        except Exception:
+            continue
+        for stats_io in (metadata, metadata.get("delegate_metadata")):
+            if not isinstance(stats_io, dict):
+                continue
+            stats = _provider_native_halo_rotation_stats_from_io(
+                owner,
+                stats_io,
+                default_source="compile_metadata_native_halo_rotation_estimate",
+            )
+            if stats is not None:
+                return stats
+    return None
+
+
 def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
+    kernel_kind = str(getattr(executor, "kernel_kind", "") or "")
+    base_executor = getattr(executor, "base_executor", None)
+    delegate = getattr(executor, "delegate", None)
+    base_kind = str(getattr(base_executor, "kernel_kind", "") or "") if base_executor is not None else ""
+    delegate_kind = str(getattr(delegate, "kernel_kind", "") or "") if delegate is not None else ""
+    legacy_structured_tconv_requested = False
+    if {
+        str(kernel_kind),
+        str(base_kind),
+        str(delegate_kind),
+    } & {"tconv_k2s2_gap_halving_experimental", "halo_supported_tconv"}:
+        for owner in (executor, base_executor, delegate):
+            raw_snapshot_fn = getattr(owner, "_structured_native_source_rotation_snapshot", None)
+            if not callable(raw_snapshot_fn):
+                continue
+            try:
+                raw_snapshot = dict(raw_snapshot_fn() or {})
+            except Exception:
+                raw_snapshot = {}
+            if bool(raw_snapshot.get("tconv_structured_runtime_executes_legacy_unified_groups", False)):
+                legacy_structured_tconv_requested = True
+                break
+        snapshot_fn = getattr(executor, "_rotation_report_snapshot", None)
+        if callable(snapshot_fn):
+            try:
+                snapshot = dict(snapshot_fn() or {})
+            except Exception:
+                snapshot = {}
+            if snapshot.get("rotation_eval_count_estimate") is not None:
+                return snapshot
+    for owner in _walk_executor_objects(executor):
+        runtime_io = dict(getattr(owner, "last_runtime_io", {}) or {})
+        stats = _provider_native_halo_rotation_stats_from_io(
+            owner,
+            runtime_io,
+            default_source="runtime_io_native_halo_rotation_estimate",
+        )
+        if stats is not None:
+            return stats
+    metadata_stats = _provider_compile_metadata_rotation_stats(executor)
+    if metadata_stats is not None:
+        return metadata_stats
     groups = _executor_unified_groups(executor)
     if groups:
         return _unified_group_rotation_stats(groups)
@@ -4467,58 +4615,9 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
             ],
             "per_group": list(runtime_io.get("runtime_rotation_groups", []) or []),
         }
-    if runtime_io.get("native_c_only_rotations") is not None:
-        group_mode = str(
-            runtime_io.get("provider_lt_grouping_mode")
-            or runtime_io.get("lt_grouping_mode")
-            or ""
-        ).strip().lower().replace("-", "_")
-        individual = group_mode in {
-            "individual",
-            "individual_lt",
-            "per_lt",
-            "per_linear_transform",
-            "no_share",
-            "no_shared_rotation",
-            "disable_shared_rotation",
-        } or bool(runtime_io.get("provider_disable_shared_rotation", False))
-        transform_total = int(runtime_io.get("native_c_only_rotations") or 0)
-        shared_total = int(runtime_io.get("native_cb_shared_rotations") or 0)
-        transform_count = int(
-            runtime_io.get("runtime_transform_count")
-            or getattr(executor, "last_runtime_counts", {}).get("partial_count", 0)
-            or getattr(executor, "last_runtime_timing", {}).get("built_transform_count", 0)
-            or runtime_io.get("runtime_group_count", 0)
-            or 0
-        )
-        return {
-            "source": "runtime_io_native_halo_rotation_estimate",
-            "group_count": int(runtime_io.get("runtime_group_count") or 0),
-            "transform_count": int(transform_count),
-            "transform_rotation_key_count_total": int(transform_total),
-            "shared_rotation_eval_count_total": int(shared_total),
-            "unique_rotation_key_count": 0,
-            "output_rotations_per_output_ct": 0,
-            "output_rotation_eval_count": 0,
-            "rotation_eval_count_estimate": int(transform_total if individual else shared_total),
-            "rotation_eval_count_mode": "independent_transform_bsgs" if individual else "shared_group_bsgs",
-            "unique_rotation_keys": [],
-            "native_plan_c_only_rotation_estimate": (
-                None
-                if runtime_io.get("native_plan_c_only_rotations") is None
-                else int(runtime_io.get("native_plan_c_only_rotations") or 0)
-            ),
-            "native_plan_cb_shared_rotation_estimate": (
-                None
-                if runtime_io.get("native_plan_cb_shared_rotations") is None
-                else int(runtime_io.get("native_plan_cb_shared_rotations") or 0)
-            ),
-            "native_halo_channel_fold_mode": str(runtime_io.get("native_halo_channel_fold_mode", "")),
-            "native_output_storage_layout": str(runtime_io.get("native_output_storage_layout", "")),
-        }
     transform_ids = dict(getattr(executor, "transform_ids", {}) or {})
     if not transform_ids:
-        return {
+        stats = {
             "source": "no_backend_unified_transform_ids",
             "group_count": 0,
             "transform_count": 0,
@@ -4529,6 +4628,10 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
             "rotation_eval_count_estimate": 0,
             "unique_rotation_keys": [],
         }
+        if bool(legacy_structured_tconv_requested):
+            stats["tconv_structured_runtime_executes_legacy_unified_groups"] = True
+            stats["rotation_report_missing_structured_tconv_snapshot"] = True
+        return stats
 
     unique_keys: set[int] = set()
     per_transform: list[dict[str, Any]] = []
@@ -4581,13 +4684,66 @@ def _provider_rotation_stats(executor: Any) -> dict[str, Any]:
     }
 
 
+def _concat_native_rotation_stats(module: Any) -> dict[str, Any] | None:
+    compile_io = getattr(module, "_concat_native_compile_rotation_io", None)
+    runtime_io = getattr(module, "_concat_native_runtime_io", None)
+    if isinstance(compile_io, dict):
+        stats_io = dict(compile_io)
+    else:
+        stats_io = {}
+    if isinstance(runtime_io, dict):
+        stats_io.update(dict(runtime_io))
+    if not stats_io:
+        return None
+    if stats_io.get("rotation_eval_count_estimate") is None:
+        return None
+    return {
+        "source": str(stats_io.get("source", "runtime_io_native_concat_fused_source_signature_plan")),
+        "group_count": int(stats_io.get("runtime_group_count") or 0),
+        "transform_count": int(stats_io.get("runtime_transform_count") or 0),
+        "transform_rotation_key_count_total": int(stats_io.get("transform_rotation_key_count_total") or 0),
+        "shared_rotation_eval_count_total": int(stats_io.get("shared_rotation_eval_count_total") or 0),
+        "unique_rotation_key_count": int(stats_io.get("unique_rotation_key_count") or 0),
+        "output_rotations_per_output_ct": int(stats_io.get("output_rotations") or 0),
+        "output_rotation_eval_count": int(stats_io.get("output_rotation_eval_count") or 0),
+        "rotation_eval_count_estimate": int(stats_io.get("rotation_eval_count_estimate") or 0),
+        "rotation_eval_count_mode": str(stats_io.get("rotation_eval_count_mode", "shared_native_source_bsgs")),
+        "unique_rotation_keys": [
+            int(key)
+            for key in list(stats_io.get("unique_rotation_keys", []) or [])
+        ],
+        "native_c_only_rotations": int(stats_io.get("native_c_only_rotations") or 0),
+        "native_cb_shared_rotations": int(stats_io.get("native_cb_shared_rotations") or 0),
+        "native_shared_baby_rotations": int(stats_io.get("native_shared_baby_rotations") or 0),
+        "native_shared_giant_rotations": int(stats_io.get("native_shared_giant_rotations") or 0),
+        "native_halo_channel_fold_mode": str(stats_io.get("native_halo_channel_fold_mode", "")),
+        "native_output_storage_layout": str(stats_io.get("native_output_storage_layout", "")),
+        "target_sum_source_count": int(stats_io.get("target_sum_source_count") or 0),
+        "fallback_source_count": int(stats_io.get("fallback_source_count") or 0),
+        "native_concat_branch_count": int(stats_io.get("native_concat_branch_count") or 0),
+        "per_group": list(stats_io.get("native_concat_branches", []) or []),
+    }
+
+
 def _collect_rotation_report(net: torch.nn.Module, *, mode: str) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     seen_runtime_ids: set[int] = set()
     for name, module in net.named_modules():
+        concat_native_stats = _concat_native_rotation_stats(module)
+        if concat_native_stats is not None:
+            rows.append(
+                {
+                    "node": str(name),
+                    "module_path": str(name),
+                    "kind": f"{type(module).__name__}_concat_native_materializer",
+                    "stage": "concat_native_materializer",
+                    "nodes": [str(name)],
+                    "stats": concat_native_stats,
+                }
+            )
         if not isinstance(module, LinearTransform):
             continue
-        module_unified_groups = _executor_unified_groups(module)
+        module_unified_groups = [] if concat_native_stats is not None else _executor_unified_groups(module)
         if module_unified_groups:
             rows.append(
                 {

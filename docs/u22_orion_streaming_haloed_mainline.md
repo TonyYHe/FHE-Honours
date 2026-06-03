@@ -210,6 +210,31 @@ not reproducible and should not be cited.
 | `dec1b 192x192` | 1.021 | 1.004 | effectively flat/noise |
 | `dec3b 192x192` | 1.033 | 1.201 | aligned with rotations; no large beta=2 speedup reproduced |
 
+### AMD 256x256 internal-halo beta sweep
+
+Run root:
+`.tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z`.
+This 256x256 operator-level sweep uses input level 2, `native_halo_stripe`
+provider output layout, `per_stripe` channel fold, individual LT grouping, and
+shared provider rotations disabled.  Provider rows keep the requested beta label
+but clip global top/bottom boundary input halo (`input halo T/B = 0/0`), so the
+reported halo/ct counts reflect internal stripe halo only.
+
+| kernel | path | rotations | LT+acc s | hot s | speed vs dense (LT) | speed vs dense (hot) | input/output ct | input halo T/B | result file |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| conv1 (Conv 32,32) | dense | 16,384 | 221.0 | 227.0 | 1.00x | 1.00x | 64/64 | - | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv32_256x256_orion.json |
+| conv1 (Conv 32,32) | beta=1 stripe | 10,278 | 123.5 | 132.9 | 1.79x | 1.71x | 65/65 | 0/0 (beta=1, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv32_256x256_provider_halo1_individual_lt.json |
+| conv1 (Conv 32,32) | beta=2 stripe | 10,272 | 113.5 | 122.9 | 1.95x | 1.85x | 65/65 | 0/0 (beta=2, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv32_256x256_provider_halo2_individual_lt.json |
+| conv2 (Conv 64,64) | dense | 11,264 | 173.6 | 175.1 | 1.00x | 1.00x | 32/32 | - | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv64_256x256_orion.json |
+| conv2 (Conv 64,64) | beta=1 stripe | 6,714 | 89.1 | 91.3 | 1.95x | 1.92x | 33/33 | 0/0 (beta=1, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv64_256x256_provider_halo1_individual_lt.json |
+| conv2 (Conv 64,64) | beta=2 stripe | 6,714 | 92.3 | 94.9 | 1.88x | 1.85x | 33/33 | 0/0 (beta=2, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv64_256x256_provider_halo2_individual_lt.json |
+| conv3 (Conv 128,128) | dense | 6,400 | 112.1 | 112.3 | 1.00x | 1.00x | 16/16 | - | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv128_256x256_orion.json |
+| conv3 (Conv 128,128) | beta=1 stripe | 3,802 | 66.4 | 67.0 | 1.69x | 1.68x | 17/17 | 0/0 (beta=1, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv128_256x256_provider_halo1_individual_lt.json |
+| conv3 (Conv 128,128) | beta=2 stripe | 3,802 | 72.6 | 73.2 | 1.54x | 1.53x | 17/17 | 0/0 (beta=2, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv128_256x256_provider_halo2_individual_lt.json |
+| conv4 (Conv 256,256) | dense | 3,392 | 96.0 | 96.1 | 1.00x | 1.00x | 8/8 | - | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv256_256x256_orion.json |
+| conv4 (Conv 256,256) | beta=1 stripe | 2,076 | 52.8 | 52.9 | 1.82x | 1.82x | 9/9 | 0/0 (beta=1, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv256_256x256_provider_halo1_individual_lt.json |
+| conv4 (Conv 256,256) | beta=2 stripe | 2,076 | 55.6 | 55.7 | 1.73x | 1.73x | 9/9 | 0/0 (beta=2, clipped=True) | .tmp/results/conv_kernel_table_256_dense_beta1_beta2_internal_halo_amd_20260602T055202Z/rows/conv256_256x256_provider_halo2_individual_lt.json |
+
 <!-- CONV_KERNEL_TABLE_START -->
 | HW | kernel | logical input | multiplex | channels/group | packed FHE input | path / beta | status | input level | expected output level | actual output level | input halo T/B | output layout | channel fold | LT grouping | rotations | LT+accumulate s | hot run s | compile s | diag build s | diag shadow s | input ct | output ct | peak RSS GiB | runtime mode | result file | note |
 | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |

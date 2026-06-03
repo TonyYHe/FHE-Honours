@@ -744,42 +744,26 @@ def _rows_for_case(case: dict[str, Any]) -> list[dict[str, Any]]:
 def main() -> None:
     cases = [
         {
-            "case": "192x192_IBSR_BRAIN_2D",
-            "dataset": "IBSR BRAIN 2D",
-            "height": 192,
-            "width": 192,
+            "case": "256x256_COVID19_lung",
+            "dataset": "COVID-19 lung",
+            "height": 256,
+            "width": 256,
             "input_channels": 1,
-            "output_channels": 4,
-        },
-        {
-            "case": "224x224_HanCo_Hand",
-            "dataset": "HanCo Hand Segmentation Dataset",
-            "height": 224,
-            "width": 224,
-            "input_channels": 3,
             "output_channels": 1,
         },
         {
-            "case": "384x288_CVC_ClinicDB",
-            "dataset": "CVC-ClinicDB",
-            "height": 384,
-            "width": 288,
-            "input_channels": 3,
-            "output_channels": 1,
-        },
-        {
-            "case": "384x384_Satellite_cloud",
-            "dataset": "Satellite cloud segmentation",
+            "case": "384x384_NuSegMSBench",
+            "dataset": "NuSegMSBench",
             "height": 384,
             "width": 384,
-            "input_channels": 4,
+            "input_channels": 1,
             "output_channels": 1,
         },
     ]
     rows: list[dict[str, Any]] = []
     for case in cases:
         rows.extend(_rows_for_case(case))
-    out = Path(".tmp/results/unet22_plus_output_dim32_real_trace_edge_compile_plan_4cases.csv")
+    out = Path(".tmp/results/unet22_plus_output_dim32_real_trace_edge_compile_plan_2cases.csv")
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
