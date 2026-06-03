@@ -101,7 +101,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
-    "ORION_CONCAT_FUSION": "1",
+    "ORION_CONCAT_FUSION": "auto",
     "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
@@ -128,7 +128,7 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] = "1"
     updated["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] = "0"
     updated["ORION_LATTIGO_UNIFIED_NO_BSGS"] = "0"
-    updated["ORION_CONCAT_FUSION"] = "1"
+    updated["ORION_CONCAT_FUSION"] = "auto"
     return updated
 
 

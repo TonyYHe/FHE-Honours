@@ -90,6 +90,19 @@ def _iter_diagonal_keys(diagonals: Any):
             yield key
 
 
+def _iter_transform_diagonal_keys(transform: Any):
+    indices_by_block = getattr(transform, "_single_slot_diag_indices_by_block", None)
+    yielded = False
+    if indices_by_block is not None:
+        for diag_indices in dict(indices_by_block or {}).values():
+            for value in diag_indices:
+                yielded = True
+                yield value
+    if yielded:
+        return
+    yield from _iter_diagonal_keys(getattr(transform, "diagonals", {}))
+
+
 def hybrid_schedule_signature(transform: Any, slots: int) -> HybridScheduleSignature:
     """Conservative provider-level schedule signature for real/imag packing.
 
@@ -100,7 +113,7 @@ def hybrid_schedule_signature(transform: Any, slots: int) -> HybridScheduleSigna
     slot_count = int(slots)
     if slot_count <= 0:
         raise ValueError("slots must be positive")
-    keys = tuple(sorted({int(key) % int(slot_count) for key in _iter_diagonal_keys(getattr(transform, "diagonals", {}))}))
+    keys = tuple(sorted({int(key) % int(slot_count) for key in _iter_transform_diagonal_keys(transform)}))
     return HybridScheduleSignature(
         slots=int(slot_count),
         normalized_diagonal_keys=keys,
@@ -429,8 +442,7 @@ def _primary_diagonal_map(transform: Any) -> MutableMapping[int, Any]:
 def _normalized_key_map(transform: Any | None, slots: int) -> dict[int, int]:
     if transform is None:
         return {}
-    block = dict(getattr(transform, "diagonals", {}).get((0, 0), {}))
-    return {int(key) % int(slots): int(key) % int(slots) for key in block.keys()}
+    return {int(key) % int(slots): int(key) % int(slots) for key in _iter_transform_diagonal_keys(transform)}
 
 
 def _zero_diag_like(sample: Any | None, slots: int) -> torch.Tensor:
@@ -471,6 +483,20 @@ def _zero_transform_like(anchor: Any, *, keys: tuple[int, ...], slots: int, name
     if family:
         mark_hybrid_schedule_padding_allowed(transform, family=family)
     return transform
+
+
+def _sync_single_slot_diag_indices(transform: Any | None) -> None:
+    if transform is None or not hasattr(transform, "_single_slot_diag_indices_by_block"):
+        return
+    try:
+        block = dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
+        if block:
+            keys = tuple(sorted(int(key) for key in block))
+        else:
+            keys = tuple(sorted(int(key) for key in _iter_transform_diagonal_keys(transform)))
+        setattr(transform, "_single_slot_diag_indices_by_block", {(0, 0): keys})
+    except Exception:
+        pass
 
 
 def pad_hybrid_pair_to_common_schedule(
@@ -514,6 +540,7 @@ def pad_hybrid_pair_to_common_schedule(
         block = _primary_diagonal_map(left)
         for key in left_missing:
             block[int(key)] = _zero_diag_like(_sample_diag_for_key(left, right, int(key)), int(slot_count))
+        _sync_single_slot_diag_indices(left)
 
     if right is None:
         right = _zero_transform_like(left, keys=common_keys, slots=int(slot_count), name=f"{name}_right_zero_schedule")
@@ -522,6 +549,7 @@ def pad_hybrid_pair_to_common_schedule(
         block = _primary_diagonal_map(right)
         for key in right_missing:
             block[int(key)] = _zero_diag_like(_sample_diag_for_key(left, right, int(key)), int(slot_count))
+        _sync_single_slot_diag_indices(right)
 
     if left_missing or right_missing or left_was_empty or right_was_empty:
         return (

@@ -122,6 +122,52 @@ def _bootstrap_shape_nonincrease_safe(
     return bool(int(bootstrap_ct_delta) <= 0 and int(bootstrap_slots_delta) <= 0)
 
 
+def _bootstrap_refinement_trial_score(
+    *,
+    current_boot_count: int,
+    target_bootstrap_count: int | None,
+    post_target_cleanup_round: bool,
+    boot_delta: int,
+    trial_boot_count: int,
+    rotation_delta: int,
+    candidate_priority: int,
+    bootstrap_ct_count: int,
+    bootstrap_slots_total: int,
+    depth_delta: int,
+    accepted_count_for_score: int,
+    trial_number: int,
+    candidate_id: str,
+) -> tuple[Any, ...]:
+    if (
+        target_bootstrap_count is not None
+        and not bool(post_target_cleanup_round)
+        and int(current_boot_count) > int(target_bootstrap_count)
+    ):
+        return (
+            0 if int(boot_delta) < 0 else 1,
+            int(trial_boot_count),
+            int(rotation_delta),
+            int(candidate_priority),
+            int(bootstrap_ct_count),
+            int(bootstrap_slots_total),
+            int(depth_delta),
+            -int(accepted_count_for_score),
+            int(trial_number),
+            str(candidate_id),
+        )
+    return (
+        int(boot_delta),
+        int(candidate_priority),
+        int(rotation_delta),
+        int(bootstrap_ct_count),
+        int(bootstrap_slots_total),
+        int(depth_delta),
+        -int(accepted_count_for_score),
+        int(trial_number),
+        str(candidate_id),
+    )
+
+
 def _dense_pack_worker_budget(target_workers: int) -> tuple[int, int | None, int, int]:
     reserve_raw = os.environ.get("ORION_DENSE_PACK_MEMORY_RESERVE_BYTES")
     if reserve_raw is None:
@@ -1570,6 +1616,14 @@ class Scheme:
                                 and int(candidate.get("rotation_delta", 0) or 0) <= 0
                             ]
                             if not post_target_candidates:
+                                post_target_candidates = [
+                                    dict(candidate)
+                                    for candidate in candidates
+                                    if str(candidate.get("kind", "")) == "explicit_concat_native_materialization"
+                                    and int(candidate.get("output_tile_delta", 0) or 0) <= 0
+                                    and int(candidate.get("rotation_delta", 0) or 0) < 0
+                                ]
+                            if not post_target_candidates:
                                 round_audit = {
                                     **dict(round_audit),
                                     "enabled": False,
@@ -1665,7 +1719,22 @@ class Scheme:
                             and int(rotation_delta) <= 0
                             and int(output_tile_delta) <= 0
                         )
-                        relayout_depth_safe = bool(int(depth_delta) < 0 or bool(allow_depth_unchanged))
+                        max_allowed_depth_increase = int(
+                            candidate.get("max_relayout_depth_increase_without_boot_increase", 0) or 0
+                        )
+                        allow_depth_increase = bool(
+                            bool(candidate.get("allow_relayout_depth_increase_without_boot_increase", False))
+                            and int(depth_delta) > 0
+                            and int(depth_delta) <= int(max_allowed_depth_increase)
+                            and int(boot_delta) == 0
+                            and int(rotation_delta) < 0
+                            and int(output_tile_delta) <= 0
+                            and int(bootstrap_ct_delta) <= 0
+                            and int(bootstrap_slots_delta) <= 0
+                        )
+                        relayout_depth_safe = bool(
+                            int(depth_delta) < 0 or bool(allow_depth_unchanged) or bool(allow_depth_increase)
+                        )
                         acceptable = bool(
                             bool(bootstrap_count_safe)
                             and bool(relayout_depth_safe)
@@ -1688,21 +1757,31 @@ class Scheme:
                             "allow_relayout_depth_unchanged": bool(
                                 candidate.get("allow_relayout_depth_unchanged", False)
                             ),
+                            "allow_relayout_depth_increase_without_boot_increase": bool(
+                                candidate.get("allow_relayout_depth_increase_without_boot_increase", False)
+                            ),
+                            "max_relayout_depth_increase_without_boot_increase": int(max_allowed_depth_increase),
                             "output_tile_delta": int(output_tile_delta),
                             "trial_boot_edges": list(trial_final_audit.get("boot_edges", [])),
                         }
                         if not bool(acceptable):
                             return trial_audit, None, None
-                        score = (
-                            int(boot_delta),
-                            int(candidate.get("candidate_priority", 0) or 0),
-                            int(rotation_delta),
-                            int(bootstrap_ct_count),
-                            int(bootstrap_slots_total),
-                            int(depth_delta),
-                            -int(accepted_count_for_score),
-                            int(trial_number),
-                            str(candidate.get("candidate_id", "")),
+                        score = _bootstrap_refinement_trial_score(
+                            current_boot_count=int(current_boot_count),
+                            target_bootstrap_count=(
+                                None if target_bootstrap_count is None else int(target_bootstrap_count)
+                            ),
+                            post_target_cleanup_round=bool(post_target_cleanup_round),
+                            boot_delta=int(boot_delta),
+                            trial_boot_count=int(trial_boot_count),
+                            rotation_delta=int(rotation_delta),
+                            candidate_priority=int(candidate.get("candidate_priority", 0) or 0),
+                            bootstrap_ct_count=int(bootstrap_ct_count),
+                            bootstrap_slots_total=int(bootstrap_slots_total),
+                            depth_delta=int(depth_delta),
+                            accepted_count_for_score=int(accepted_count_for_score),
+                            trial_number=int(trial_number),
+                            candidate_id=str(candidate.get("candidate_id", "")),
                         )
                         payload = {
                             "candidate": dict(candidate),

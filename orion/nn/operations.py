@@ -612,10 +612,21 @@ class Concat(Module):
         native_materialization = bool(self._native_materialization_requested())
         if bool(native_materialization):
             self._ensure_native_materialize_transforms(scheme)
+            input_signatures = self._native_input_signatures()
         else:
             self._ensure_materialize_transforms(scheme)
+            input_signatures = ()
         out = None
         for input_index, source in enumerate(parts):
+            if bool(native_materialization):
+                expected_ct_count = int(len(input_signatures[int(input_index)]))
+                actual_ct_count = int(len(getattr(source, "ids", ()) or ()))
+                if int(actual_ct_count) != int(expected_ct_count):
+                    raise ValueError(
+                        f"Concat {getattr(self, 'name', '')} native materialization input "
+                        f"{int(input_index)} expected {int(expected_ct_count)} ciphertexts from its "
+                        f"source signature, got {int(actual_ct_count)}"
+                    )
             proxy = self.transform_sources_by_input[int(input_index)]
             proxy.transform_ids = dict(self.transform_ids_by_input[int(input_index)])
             partial = scheme.lt_evaluator.evaluate_transforms(proxy, source)

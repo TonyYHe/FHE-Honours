@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from types import SimpleNamespace
 from dataclasses import dataclass, replace
@@ -10,9 +11,11 @@ from typing import Any
 import torch
 
 from orion.core import packing
+from orion.core.bsgs_rotation_stats import identity_galois_element, unified_bsgs_rotation_stats
 from orion.experimental.cir.hybrid_schedule import (
     hybrid_pair_schedule_compatible,
     hybrid_pair_schedule_reject_reason,
+    hybrid_schedule_padding_allowed,
     mark_hybrid_schedule_padding_allowed,
     materialize_hybrid_pair_layout_schedules,
     optimize_hybrid_pair_layout,
@@ -1634,13 +1637,48 @@ class LayoutPolicyRelayoutKernel:
             diag[int(output_local)] = float(self.output_scale)
         return diagonals
 
+    def _build_block_diagonals(
+        self,
+        slots: int,
+        blocks: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
+        requested = {(int(row), int(col)) for row, col in blocks}
+        if not requested:
+            return {}
+        diagonals: dict[tuple[int, int], dict[int, torch.Tensor]] = {}
+        for source_index, output_index in self._iter_mappings(int(slots)):
+            input_block = int(source_index // int(slots))
+            output_block = int(output_index // int(slots))
+            block_key = (int(output_block), int(input_block))
+            if block_key not in requested:
+                continue
+            source_local = int(source_index % int(slots))
+            output_local = int(output_index % int(slots))
+            diag_index = int((source_local - output_local) % int(slots))
+            block = diagonals.setdefault(block_key, {})
+            diag = block.get(int(diag_index))
+            if diag is None:
+                diag = torch.zeros((int(slots),), dtype=torch.float32)
+                block[int(diag_index)] = diag
+            diag[int(output_local)] = float(self.output_scale)
+        return diagonals
+
     def compile(self, scheme: Any, *, level: int) -> None:
         self.cleanup(getattr(scheme, "backend", None))
         slots = int(scheme.params.get_slots())
         self.level = int(level)
         if scheme.lt_evaluator.single_slot_layer_cache_enabled():
-            self._dense_layer_cache_diag_indices_by_block = self._diag_indices_by_block(int(slots))
-            self._dense_layer_cache_build_diagonals = lambda self=self, slots=int(slots): self._build_diagonals(int(slots))
+            diag_indices_by_block = self._diag_indices_by_block(int(slots))
+            build_diagonals = lambda self=self, slots=int(slots): self._build_diagonals(int(slots))
+            build_block_diagonals = (
+                lambda blocks, self=self, slots=int(slots): self._build_block_diagonals(int(slots), blocks)
+            )
+            self._dense_layer_cache_diag_indices_by_block = dict(diag_indices_by_block)
+            self._dense_layer_cache_build_diagonals = build_diagonals
+            self._dense_layer_cache_build_block_diagonals = build_block_diagonals
+            self._single_slot_diag_indices_by_block = dict(diag_indices_by_block)
+            self._single_slot_build_diagonals = build_diagonals
+            self._single_slot_build_block_diagonals = build_block_diagonals
             self.diagonals = {}
         else:
             self.diagonals = self._build_diagonals(int(slots))
@@ -1685,6 +1723,10 @@ class LayoutPolicyRelayoutKernel:
         self.diagonals = {}
         self._dense_layer_cache_diag_indices_by_block = {}
         self._dense_layer_cache_build_diagonals = None
+        self._dense_layer_cache_build_block_diagonals = None
+        self._single_slot_diag_indices_by_block = {}
+        self._single_slot_build_diagonals = None
+        self._single_slot_build_block_diagonals = None
         for ptxt in self._bias_ptxt_cache.values():
             release = getattr(ptxt, "release", None)
             if callable(release):
@@ -2399,6 +2441,52 @@ def _layout_policy_add_rows(compile_plan: dict[str, Any], *, node: str) -> tuple
             continue
         rows.append(dict(row))
     return tuple(rows)
+
+
+def _layout_policy_join_input_sources(
+    dag: Any,
+    *,
+    node: str,
+    rows: tuple[dict[str, Any], ...],
+) -> tuple[str, ...]:
+    def ordered_fx_input_names(fx_node: Any) -> tuple[str, ...]:
+        names: list[str] = []
+
+        def visit(value: Any) -> None:
+            if value is None:
+                return
+            name = getattr(value, "name", None)
+            if name is not None:
+                names.append(str(name))
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+                return
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    visit(item)
+
+        visit(getattr(fx_node, "args", None))
+        visit(getattr(fx_node, "kwargs", None))
+        return tuple(names)
+
+    row_sources = tuple(str(row.get("source", "")) for row in rows if str(row.get("source", "")))
+    row_source_set = set(row_sources)
+    fx_node = dag.nodes[node].get("fx_node") if str(node) in getattr(dag, "nodes", {}) else None
+    fx_arg_inputs = ordered_fx_input_names(fx_node)
+    if len(fx_arg_inputs) == len(row_sources) and set(fx_arg_inputs) == row_source_set:
+        return tuple(str(value) for value in fx_arg_inputs)
+    fx_inputs = tuple(str(value.name) for value in getattr(fx_node, "all_input_nodes", ()) or ())
+    if len(fx_inputs) == len(row_sources) and set(fx_inputs) == row_source_set:
+        return tuple(str(value) for value in fx_inputs)
+    try:
+        dag_inputs = tuple(str(value) for value in dag.predecessors(node))
+    except Exception:
+        dag_inputs = ()
+    if len(dag_inputs) == len(row_sources) and set(dag_inputs) == row_source_set:
+        return tuple(str(value) for value in dag_inputs)
+    return tuple(str(value) for value in row_sources)
 
 
 def _layout_policy_relayout_direction(row: dict[str, Any]) -> str:
@@ -3286,34 +3374,71 @@ def _merge_optional_tconv_source_block_transforms_to_complex(
     left_diags = dict(getattr(left, "diagonals", {}).get((0, 0), {})) if left is not None else {}
     right_diags = dict(getattr(right, "diagonals", {}).get((0, 0), {})) if right is not None else {}
     all_keys = sorted({int(key) for key in left_diags.keys()} | {int(key) for key in right_diags.keys()})
-    merged: dict[int, torch.Tensor] = {}
-    for key in all_keys:
-        left_diag = left_diags.get(int(key))
-        right_diag = right_diags.get(int(key))
-        left_tensor = (
-            left_diag.detach().clone().reshape(-1).to(dtype=torch.float32)
-            if isinstance(left_diag, torch.Tensor)
-            else torch.tensor(left_diag, dtype=torch.float32)
-        ) if left_diag is not None else torch.zeros((int(slots),), dtype=torch.float32)
-        right_tensor = (
-            right_diag.detach().clone().reshape(-1).to(dtype=torch.float32)
-            if isinstance(right_diag, torch.Tensor)
-            else torch.tensor(right_diag, dtype=torch.float32)
-        ) if right_diag is not None else torch.zeros((int(slots),), dtype=torch.float32)
-        scale = float(real_lane_input_scale)
-        merged[int(key)] = (
-            left_tensor.to(dtype=torch.complex64) * float(scale)
-            - 1j * right_tensor.to(dtype=torch.complex64) * float(scale)
-        )
-    return SimpleNamespace(
+    scale = float(real_lane_input_scale)
+
+    def _primary_diagonal_block(transform: Any | None) -> dict[int, Any]:
+        if transform is None:
+            return {}
+        build_diagonals = getattr(transform, "_single_slot_build_diagonals", None)
+        if callable(build_diagonals):
+            source_diagonals = build_diagonals()
+        else:
+            source_diagonals = getattr(transform, "diagonals", {})
+        return dict(dict(source_diagonals or {}).get((0, 0), {}) or {})
+
+    def _merge_blocks(left_block: dict[int, Any], right_block: dict[int, Any]) -> dict[int, torch.Tensor]:
+        merged: dict[int, torch.Tensor] = {}
+        for key in all_keys:
+            left_diag = left_block.get(int(key))
+            right_diag = right_block.get(int(key))
+            left_tensor = (
+                left_diag.detach().clone().reshape(-1).to(dtype=torch.float32)
+                if isinstance(left_diag, torch.Tensor)
+                else torch.tensor(left_diag, dtype=torch.float32)
+            ) if left_diag is not None else torch.zeros((int(slots),), dtype=torch.float32)
+            right_tensor = (
+                right_diag.detach().clone().reshape(-1).to(dtype=torch.float32)
+                if isinstance(right_diag, torch.Tensor)
+                else torch.tensor(right_diag, dtype=torch.float32)
+            ) if right_diag is not None else torch.zeros((int(slots),), dtype=torch.float32)
+            merged[int(key)] = (
+                left_tensor.to(dtype=torch.complex64) * float(scale)
+                - 1j * right_tensor.to(dtype=torch.complex64) * float(scale)
+            )
+        return merged
+
+    def build_diagonals() -> dict[tuple[int, int], dict[int, torch.Tensor]]:
+        return {(0, 0): _merge_blocks(_primary_diagonal_block(left), _primary_diagonal_block(right))}
+
+    has_recipe = callable(getattr(left, "_single_slot_build_diagonals", None)) or callable(
+        getattr(right, "_single_slot_build_diagonals", None)
+    )
+    if bool(has_recipe):
+        diagonals = {(0, 0): {int(key): None for key in all_keys}}
+    else:
+        diagonals = {(0, 0): _merge_blocks(left_diags, right_diags)}
+
+    def release_diagonal_cache() -> None:
+        for transform in (left, right):
+            release_cache = getattr(transform, "_single_slot_release_diagonal_cache", None)
+            if callable(release_cache):
+                release_cache()
+
+    transform = SimpleNamespace(
         name=str(name),
-        diagonals={(0, 0): merged},
+        diagonals=diagonals,
         level=int(getattr(anchor, "level")),
         scheme=getattr(anchor, "scheme"),
         fhe_output_shape=getattr(anchor, "fhe_output_shape"),
         output_shape=getattr(anchor, "output_shape"),
         target_index=int(getattr(anchor, "target_index", 0)),
+        _single_slot_has_complex_diagonals=True,
     )
+    if bool(has_recipe):
+        setattr(transform, "_single_slot_diag_indices_by_block", {(0, 0): tuple(int(key) for key in all_keys)})
+        setattr(transform, "_single_slot_build_diagonals", build_diagonals)
+        setattr(transform, "_single_slot_release_diagonal_cache", release_diagonal_cache)
+    return transform
 
 
 class TconvK2S2PythonRuntimeExecutor:
@@ -3849,6 +3974,11 @@ class TconvK2S2PythonRuntimeExecutor:
 
         prepare_total = 0.0
         compile_total = 0.0
+        single_slot_enabled = False
+        evaluator = getattr(scheme, "lt_evaluator", None)
+        enabled_fn = getattr(evaluator, "single_slot_layer_cache_enabled", None)
+        if callable(enabled_fn):
+            single_slot_enabled = bool(enabled_fn())
         if bool(self.use_ct_pt_hybrid_packing) and int(self.input_block_count) > 1:
             block_transforms_by_source: dict[int, list[Any | None]] = {}
             for source_block in range(int(self.input_block_count)):
@@ -3867,24 +3997,35 @@ class TconvK2S2PythonRuntimeExecutor:
                 int(scheme.params.get_slots()),
                 allow_schedule_materialization=True,
             )
-            materialization = materialize_hybrid_pair_layout_schedules(
-                block_transforms_by_source,
-                layout_plan,
-                int(scheme.params.get_slots()),
-                name_prefix=f"{self.output_node_id}_global_hybrid_layout",
-            )
+            if bool(single_slot_enabled):
+                materialized_pair_count, materialized_reasons = (
+                    self._materialize_key_only_hybrid_pair_layout_schedules(
+                        block_transforms_by_source,
+                        layout_plan,
+                        slots=int(scheme.params.get_slots()),
+                    )
+                )
+            else:
+                materialization = materialize_hybrid_pair_layout_schedules(
+                    block_transforms_by_source,
+                    layout_plan,
+                    int(scheme.params.get_slots()),
+                    name_prefix=f"{self.output_node_id}_global_hybrid_layout",
+                )
+                materialized_pair_count = int(materialization.pair_count)
+                materialized_reasons = tuple(str(value) for value in materialization.reasons)
             self.hybrid_pair_layout_strict_pair_count = int(layout_plan.strict_pair_count)
             self.hybrid_pair_layout_covered_output_count = int(layout_plan.covered_output_count)
             self.hybrid_pair_layout_reject_reasons = [
                 str(value) for value in layout_plan.rejected_adjacent_pair_reasons
             ]
-            self.hybrid_pair_schedule_padded_count += int(materialization.pair_count)
-            self.hybrid_pair_schedule_pad_reasons.extend(str(value) for value in materialization.reasons)
+            self.hybrid_pair_schedule_padded_count += int(materialized_pair_count)
+            self.hybrid_pair_schedule_pad_reasons.extend(str(value) for value in materialized_reasons)
             use_strict_layout = int(layout_plan.strict_pair_count) > 0
             if bool(use_strict_layout):
                 self.hybrid_pair_layout_strategy = (
                     "global_schedule_layout"
-                    if int(materialization.pair_count) > 0
+                    if int(materialized_pair_count) > 0
                     else "strict_schedule_dp"
                 )
                 layout_items = [
@@ -4098,6 +4239,578 @@ class TconvK2S2PythonRuntimeExecutor:
             self.hybrid_group_reject_reasons.append(str(reject_reason))
         return float(elapsed)
 
+    def _transform_diag_indices(self, transform: Any | None) -> tuple[int, ...]:
+        if transform is None:
+            return ()
+        values: set[int] = set()
+        try:
+            blocks = dict(getattr(transform, "diagonals", {}) or {})
+        except Exception:
+            return ()
+        for block in blocks.values():
+            try:
+                values.update(int(index) for index in dict(block or {}).keys())
+            except Exception:
+                continue
+        return tuple(sorted(int(value) for value in values))
+
+    def _merge_optional_tconv_source_block_key_transforms_to_complex(
+        self,
+        left: Any | None,
+        right: Any | None,
+        *,
+        name: str,
+        slots: int,
+    ) -> Any:
+        if left is None and right is None:
+            raise ValueError("at least one source-block transform is required")
+        anchor = left if left is not None else right
+        if not hybrid_pair_schedule_compatible(left, right, int(slots)):
+            reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+            raise ValueError(f"tconv source-block hybrid merge requires identical schedules: {reason}")
+        keys = sorted(
+            set(self._transform_diag_indices(left))
+            | set(self._transform_diag_indices(right))
+        )
+        return SimpleNamespace(
+            name=str(name),
+            diagonals={(0, 0): {int(key): None for key in keys}},
+            level=int(getattr(anchor, "level")),
+            scheme=getattr(anchor, "scheme"),
+            fhe_output_shape=getattr(anchor, "fhe_output_shape"),
+            output_shape=getattr(anchor, "output_shape"),
+            target_index=int(getattr(anchor, "target_index", 0)),
+        )
+
+    def _zero_key_transform_like(self, anchor: Any, *, keys: tuple[int, ...], name: str) -> Any:
+        slots = int(getattr(anchor, "fhe_output_shape")[-1])
+
+        def build_diagonals(
+            *,
+            keys: tuple[int, ...] = tuple(int(key) for key in keys),
+            slots: int = int(slots),
+        ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
+            return {
+                (0, 0): {
+                    int(key): torch.zeros((int(slots),), dtype=torch.float32)
+                    for key in keys
+                }
+            }
+
+        transform = SimpleNamespace(
+            name=str(name),
+            diagonals={(0, 0): {int(key): None for key in keys}},
+            level=int(getattr(anchor, "level")),
+            scheme=getattr(anchor, "scheme"),
+            fhe_output_shape=getattr(anchor, "fhe_output_shape"),
+            output_shape=getattr(anchor, "output_shape"),
+            target_index=int(getattr(anchor, "target_index", 0)),
+            input_id=str(getattr(anchor, "input_id", "hybrid_zero_schedule_pad")),
+            _single_slot_diag_indices_by_block={(0, 0): tuple(int(key) for key in keys)},
+            _single_slot_build_diagonals=build_diagonals,
+        )
+        family = str(getattr(anchor, "hybrid_schedule_family", ""))
+        if family:
+            mark_hybrid_schedule_padding_allowed(transform, family=family)
+        return transform
+
+    def _pad_key_transform_pair_to_common_schedule(
+        self,
+        left: Any | None,
+        right: Any | None,
+        *,
+        name: str,
+    ) -> tuple[Any | None, Any | None, str]:
+        if left is None and right is None:
+            return left, right, ""
+        if not hybrid_schedule_padding_allowed(left, right):
+            return left, right, ""
+        left_keys = set(self._transform_diag_indices(left))
+        right_keys = set(self._transform_diag_indices(right))
+        common_keys = tuple(sorted(int(key) for key in (left_keys | right_keys)))
+        if not common_keys:
+            return left, right, ""
+        left_missing = tuple(int(key) for key in common_keys if int(key) not in left_keys)
+        right_missing = tuple(int(key) for key in common_keys if int(key) not in right_keys)
+        left_was_empty = left is None
+        right_was_empty = right is None
+        if left is None:
+            left = self._zero_key_transform_like(right, keys=common_keys, name=f"{name}_left_zero_schedule")
+            left_missing = common_keys
+        elif left_missing:
+            block = getattr(left, "diagonals").setdefault((0, 0), {})
+            for key in left_missing:
+                block[int(key)] = None
+        if right is None:
+            right = self._zero_key_transform_like(left, keys=common_keys, name=f"{name}_right_zero_schedule")
+            right_missing = common_keys
+        elif right_missing:
+            block = getattr(right, "diagonals").setdefault((0, 0), {})
+            for key in right_missing:
+                block[int(key)] = None
+        reasons: list[str] = []
+        if left_was_empty:
+            reasons.append("materialized_empty_left")
+        elif left_missing:
+            reasons.append(f"left_added={len(left_missing)}")
+        if right_was_empty:
+            reasons.append("materialized_empty_right")
+        elif right_missing:
+            reasons.append(f"right_added={len(right_missing)}")
+        return left, right, ",".join(reasons)
+
+    def _materialize_key_only_hybrid_pair_layout_schedules(
+        self,
+        transforms_by_block: dict[int, list[Any | None]],
+        layout_plan: Any,
+        *,
+        slots: int,
+    ) -> tuple[int, tuple[str, ...]]:
+        pair_reasons: list[str] = []
+        pair_count = 0
+        for item in layout_plan.items:
+            if item.right_index is None or not bool(item.schedule_materialized):
+                continue
+            left_index = int(item.left_index)
+            right_index = int(item.right_index)
+            left_transforms = list(transforms_by_block[int(left_index)])
+            right_transforms = list(transforms_by_block[int(right_index)])
+            width = max(len(left_transforms), len(right_transforms))
+            if len(left_transforms) < int(width):
+                left_transforms.extend([None] * int(int(width) - len(left_transforms)))
+            if len(right_transforms) < int(width):
+                right_transforms.extend([None] * int(int(width) - len(right_transforms)))
+            reasons: list[str] = []
+            for output_index in range(int(width)):
+                left = left_transforms[int(output_index)]
+                right = right_transforms[int(output_index)]
+                if left is None and right is None:
+                    continue
+                before_reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+                if not before_reason:
+                    continue
+                left, right, pad_reason = self._pad_key_transform_pair_to_common_schedule(
+                    left,
+                    right,
+                    name=(
+                        f"{self.output_node_id}_global_hybrid_layout"
+                        f"_src{left_index}_{right_index}_out{int(output_index)}"
+                    ),
+                )
+                left_transforms[int(output_index)] = left
+                right_transforms[int(output_index)] = right
+                after_reason = hybrid_pair_schedule_reject_reason(left, right, int(slots))
+                if after_reason:
+                    reasons.append(f"output={int(output_index)}:{after_reason}")
+                elif pad_reason:
+                    reasons.append(f"output={int(output_index)}:{pad_reason}")
+            transforms_by_block[int(left_index)] = left_transforms
+            transforms_by_block[int(right_index)] = right_transforms
+            if reasons:
+                pair_count += 1
+                pair_reasons.append(f"input_pair=({left_index},{right_index}):" + "; ".join(reasons))
+        return int(pair_count), tuple(pair_reasons)
+
+    def plan_rotation_stats_from_transforms(
+        self,
+        *,
+        scheme: Any,
+        level: int,
+        individual_eval: bool = True,
+    ) -> dict[str, Any]:
+        self._set_block_layout(scheme=scheme)
+        self.groups = []
+        self.target_indices_by_input_unit = []
+        self.input_block_pairs = []
+        self.complex_input_block_flags = []
+        self.hybrid_group_reject_reasons = []
+        self.hybrid_pair_count = 0
+        self.hybrid_pair_rejected_count = 0
+        self.hybrid_pair_reject_reasons = []
+        self.hybrid_pair_schedule_padded_count = 0
+        self.hybrid_pair_schedule_pad_reasons = []
+        self.hybrid_pair_layout_strategy = ""
+        self.hybrid_pair_layout_strict_pair_count = 0
+        self.hybrid_pair_layout_covered_output_count = 0
+        self.hybrid_pair_layout_reject_reasons = []
+        self.compiled_transform_count = 0
+        self.skipped_empty_transform_count = 0
+
+        slots = int(scheme.params.get_slots())
+        transform_total = 0
+        shared_total = 0
+        baby_total = 0
+        giant_total = 0
+        transform_count = 0
+        unique_keys: set[int] = set()
+        per_group: list[dict[str, Any]] = []
+
+        def record_entry_groups(
+            *,
+            pair: tuple[int, int | None],
+            is_complex: bool,
+            entries: list[tuple[int, Any]],
+            reject_reason: str = "",
+        ) -> None:
+            nonlocal transform_total, shared_total, baby_total, giant_total, transform_count
+            entry_groups = (
+                [[entry] for entry in sorted(entries, key=lambda item: int(item[0]))]
+                if bool(self.disable_tile_family_sharing)
+                else [sorted(entries, key=lambda item: int(item[0]))]
+            )
+            for ordered in entry_groups:
+                transforms = [transform for _target_index, transform in ordered]
+                diag_sets = [self._transform_diag_indices(transform) for transform in transforms]
+                stats = unified_bsgs_rotation_stats(
+                    diag_sets,
+                    slots=int(slots),
+                    individual_eval=bool(individual_eval),
+                )
+                group_transform_total = int(stats.get("transform_rotation_eval_count_total", 0) or 0)
+                group_shared_total = int(stats.get("shared_rotation_eval_count_total", 0) or 0)
+                transform_total += int(group_transform_total)
+                shared_total += int(group_shared_total)
+                baby_total += int(stats.get("baby_rotations", 0) or 0)
+                giant_total += int(stats.get("giant_rotations", 0) or 0)
+                transform_count += int(stats.get("transforms", 0) or 0)
+                unique_keys.update(int(value) for value in list(stats.get("unique_rotation_keys", []) or []))
+                per_group.append(
+                    {
+                        "group_index": int(len(per_group)),
+                        "transform_count": int(stats.get("transforms", 0) or 0),
+                        "rotation_key_count_total": int(group_transform_total),
+                        "transform_rotation_eval_count_total": int(group_transform_total),
+                        "shared_rotation_eval_count": int(group_shared_total),
+                        "unique_rotation_key_count": int(stats.get("unique_rotation_key_count", 0) or 0),
+                        "target_indices": [int(target_index) for target_index, _transform in ordered],
+                        "input_block_pair": [
+                            int(pair[0]),
+                            None if pair[1] is None else int(pair[1]),
+                        ],
+                        "complex_input_block": bool(is_complex),
+                        "hybrid_pair_reject_reason": str(reject_reason),
+                        "per_transform": list(stats.get("per_transform", []) or []),
+                        "source": "planned_tconv_runtime_transform_groups",
+                    }
+                )
+
+        if bool(self.use_ct_pt_hybrid_packing) and int(self.input_block_count) > 1:
+            block_transforms_by_source: dict[int, list[Any | None]] = {}
+            for source_block in range(int(self.input_block_count)):
+                transforms, empty_count = self._build_source_block_diag_key_transforms(
+                    scheme=scheme,
+                    level=int(level),
+                    source_block=int(source_block),
+                )
+                self.skipped_empty_transform_count += int(empty_count)
+                block_transforms_by_source[int(source_block)] = list(transforms)
+
+            layout_plan = optimize_hybrid_pair_layout(
+                block_transforms_by_source,
+                int(slots),
+                allow_schedule_materialization=True,
+            )
+            materialized_pair_count, materialized_pair_reasons = (
+                self._materialize_key_only_hybrid_pair_layout_schedules(
+                    block_transforms_by_source,
+                    layout_plan,
+                    slots=int(slots),
+                )
+            )
+            self.hybrid_pair_layout_strict_pair_count = int(layout_plan.strict_pair_count)
+            self.hybrid_pair_layout_covered_output_count = int(layout_plan.covered_output_count)
+            self.hybrid_pair_layout_reject_reasons = [
+                str(value) for value in layout_plan.rejected_adjacent_pair_reasons
+            ]
+            self.hybrid_pair_schedule_padded_count += int(materialized_pair_count)
+            self.hybrid_pair_schedule_pad_reasons.extend(str(value) for value in materialized_pair_reasons)
+            if int(layout_plan.strict_pair_count) > 0:
+                self.hybrid_pair_layout_strategy = (
+                    "global_schedule_layout"
+                    if int(materialized_pair_count) > 0
+                    else "strict_schedule_dp"
+                )
+                layout_items = [
+                    (int(item.left_index), None if item.right_index is None else int(item.right_index), True)
+                    for item in layout_plan.items
+                ]
+            else:
+                self.hybrid_pair_layout_strategy = "adjacent_strict_reject_fallback"
+                layout_items = []
+                for left_block in range(0, int(self.input_block_count), 2):
+                    right_block = int(left_block + 1)
+                    has_right = int(right_block) < int(self.input_block_count)
+                    layout_items.append((int(left_block), int(right_block) if bool(has_right) else None, False))
+
+            for left_block, maybe_right_block, _layout_pair_planned in layout_items:
+                left_transforms = block_transforms_by_source[int(left_block)]
+                has_right = maybe_right_block is not None
+                right_block = int(maybe_right_block) if maybe_right_block is not None else int(left_block + 1)
+                right_transforms = block_transforms_by_source.get(int(right_block)) if bool(has_right) else None
+                if bool(has_right) and right_transforms is not None:
+                    candidates: list[tuple[int, Any | None, Any | None]] = []
+                    reject_reasons: list[str] = []
+                    pair_pad_reasons: list[str] = []
+                    for output_block in range(int(self.output_block_count)):
+                        left_transform = left_transforms[int(output_block)]
+                        right_transform = (
+                            right_transforms[int(output_block)]
+                            if right_transforms is not None
+                            else None
+                        )
+                        if left_transform is None and right_transform is None:
+                            continue
+                        candidates.append((int(output_block), left_transform, right_transform))
+                        reason = hybrid_pair_schedule_reject_reason(
+                            left_transform,
+                            right_transform,
+                            int(slots),
+                        )
+                        if reason:
+                            reject_reasons.append(f"output_block={int(output_block)}:{reason}")
+                    if not candidates:
+                        entries = []
+                        reason = ""
+                        left_entries = []
+                        right_entries = []
+                    elif reject_reasons:
+                        reason = "; ".join(reject_reasons)
+                        self.hybrid_pair_rejected_count += 1
+                        self.hybrid_pair_reject_reasons.append(
+                            f"input_pair=({int(left_block)},{int(right_block)}):{reason}"
+                        )
+                        left_entries = [
+                            (int(output_block), left_transform)
+                            for output_block, left_transform, _right_transform in candidates
+                            if left_transform is not None
+                        ]
+                        right_entries = [
+                            (int(output_block), right_transform)
+                            for output_block, _left_transform, right_transform in candidates
+                            if right_transform is not None
+                        ]
+                        entries = []
+                    else:
+                        entries = [
+                            (
+                                int(output_block),
+                                self._merge_optional_tconv_source_block_key_transforms_to_complex(
+                                    left_transform,
+                                    right_transform,
+                                    name=(
+                                        f"{self.output_node_id}_ctpt_hybrid_src"
+                                        f"{int(left_block)}_{int(right_block)}_out{int(output_block)}"
+                                    ),
+                                    slots=int(slots),
+                                ),
+                            )
+                            for output_block, left_transform, right_transform in candidates
+                        ]
+                        self.hybrid_pair_count += 1
+                        if pair_pad_reasons:
+                            self.hybrid_pair_schedule_padded_count += 1
+                            self.hybrid_pair_schedule_pad_reasons.append(
+                                f"input_pair=({int(left_block)},{int(right_block)}):" + "; ".join(pair_pad_reasons)
+                            )
+                        reason = ""
+                        left_entries = []
+                        right_entries = []
+                else:
+                    entries = [
+                        (int(output_block), transform)
+                        for output_block, transform in enumerate(left_transforms)
+                        if transform is not None
+                    ]
+                    reason = ""
+                    left_entries = []
+                    right_entries = []
+                if entries:
+                    record_entry_groups(
+                        pair=(int(left_block), int(right_block) if bool(has_right) else None),
+                        is_complex=bool(has_right),
+                        entries=entries,
+                    )
+                if left_entries:
+                    record_entry_groups(
+                        pair=(int(left_block), None),
+                        is_complex=False,
+                        entries=left_entries,
+                        reject_reason=reason,
+                    )
+                if right_entries:
+                    record_entry_groups(
+                        pair=(int(right_block), None),
+                        is_complex=False,
+                        entries=right_entries,
+                        reject_reason=reason,
+                    )
+            del block_transforms_by_source
+        else:
+            for source_block in range(int(self.input_block_count)):
+                transforms, empty_count = self._build_source_block_diag_key_transforms(
+                    scheme=scheme,
+                    level=int(level),
+                    source_block=int(source_block),
+                )
+                self.skipped_empty_transform_count += int(empty_count)
+                entries = [
+                    (int(output_block), transform)
+                    for output_block, transform in enumerate(transforms)
+                    if transform is not None
+                ]
+                if entries:
+                    record_entry_groups(
+                        pair=(int(source_block), None),
+                        is_complex=False,
+                        entries=entries,
+                    )
+
+        output_rotation_eval_count = int(
+            max(0, int(self.output_block_count)) * max(0, int(self.output_fold_rotations))
+        )
+        selected_total = int((transform_total if bool(individual_eval) else shared_total) + output_rotation_eval_count)
+        return {
+            "source": "planned_tconv_runtime_transform_groups",
+            "rotations": int(selected_total),
+            "baby_rotations": int(baby_total),
+            "giant_rotations": int(giant_total),
+            "transforms": int(transform_count),
+            "bsgs_groups": int(len(per_group)),
+            "runtime_group_count": int(len(per_group)),
+            "runtime_transform_count": int(transform_count),
+            "skipped_empty_transform_count": int(self.skipped_empty_transform_count),
+            "transform_rotation_key_count_total": int(transform_total),
+            "shared_rotation_eval_count_total": int(shared_total),
+            "unique_rotation_key_count": int(len(unique_keys)),
+            "unique_rotation_keys": sorted(int(value) for value in unique_keys),
+            "output_rotations": int(max(0, int(self.output_fold_rotations))),
+            "output_rotation_eval_count": int(output_rotation_eval_count),
+            "rotation_eval_count_estimate": int(selected_total),
+            "rotation_eval_count_mode": "independent_transform_bsgs" if bool(individual_eval) else "shared_group_bsgs",
+            "runtime_rotation_groups": per_group,
+            "hybrid_pair_count": int(self.hybrid_pair_count),
+            "hybrid_pair_rejected_count": int(self.hybrid_pair_rejected_count),
+            "hybrid_pair_reject_reasons": [str(value) for value in self.hybrid_pair_reject_reasons],
+            "hybrid_pair_schedule_padded_count": int(self.hybrid_pair_schedule_padded_count),
+            "hybrid_pair_schedule_pad_reasons": [str(value) for value in self.hybrid_pair_schedule_pad_reasons],
+            "hybrid_pair_layout_strategy": str(self.hybrid_pair_layout_strategy),
+            "hybrid_pair_layout_strict_pair_count": int(self.hybrid_pair_layout_strict_pair_count),
+            "hybrid_pair_layout_covered_output_count": int(self.hybrid_pair_layout_covered_output_count),
+            "hybrid_pair_layout_reject_reasons": [str(value) for value in self.hybrid_pair_layout_reject_reasons],
+        }
+
+    def _rotation_report_snapshot(self) -> dict[str, Any]:
+        individual_eval = _env_truthy("ORION_UNIFIED_LT_INDIVIDUAL_EVAL")
+        return self._rotation_report_snapshot_for_scheme(scheme=None, individual_eval=bool(individual_eval))
+
+    def _rotation_report_snapshot_for_scheme(self, *, scheme: Any | None, individual_eval: bool) -> dict[str, Any]:
+        backend = getattr(scheme, "backend", None) if scheme is not None else None
+        try:
+            slots = int(scheme.params.get_slots()) if scheme is not None else 32768
+        except Exception:
+            slots = 32768
+
+        def _nonidentity_keys(raw_keys: Any) -> list[int]:
+            try:
+                identity = int(identity_galois_element(slots=int(slots)))
+            except Exception:
+                identity = 1
+            return sorted(int(key) for key in list(raw_keys or []) if int(key) != int(identity))
+
+        def _transform_rotation_eval_count(transform_id: int, *, keys: list[int]) -> int:
+            getter = getattr(backend, "GetLinearTransformRotationEvalCount", None)
+            if callable(getter):
+                try:
+                    return int(getter(int(transform_id)))
+                except Exception:
+                    pass
+            return int(len(_nonidentity_keys(keys)))
+
+        transform_total = 0
+        shared_total = 0
+        transform_count = 0
+        unique_keys: set[int] = set()
+        per_group: list[dict[str, Any]] = []
+        for group_index, group in enumerate(self.groups):
+            cached = dict(getattr(group, "_single_slot_rotation_stats", {}) or {})
+            source = str(cached.get("source", "planned_single_slot_unified_bsgs_eval_rotations"))
+            per_transform = list(cached.get("per_transform", []) or [])
+            if cached:
+                group_transform_total = int(
+                    cached.get(
+                        "transform_rotation_eval_count_total",
+                        cached.get("transform_rotation_key_count_total", 0),
+                    )
+                    or 0
+                )
+                group_shared_total = int(
+                    cached.get("shared_rotation_eval_count", cached.get("shared_rotation_eval_count_total", 0))
+                    or 0
+                )
+                group_transform_count = int(cached.get("transform_count", 0) or 0)
+                group_keys = {int(value) for value in list(cached.get("unique_rotation_keys", []) or [])}
+            else:
+                ids = [int(value) for value in (getattr(group, "unified_ids", None) or [])]
+                if not ids or backend is None:
+                    continue
+                group_keys = set()
+                group_transform_total = 0
+                per_transform = []
+                for transform_index, transform_id in enumerate(ids):
+                    key_getter = getattr(backend, "GetLinearTransformRotationKeys", None)
+                    try:
+                        keys = [int(value) for value in key_getter(int(transform_id))] if callable(key_getter) else []
+                    except Exception:
+                        keys = []
+                    nonidentity = _nonidentity_keys(keys)
+                    rotation_eval_count = _transform_rotation_eval_count(int(transform_id), keys=keys)
+                    group_keys.update(int(value) for value in nonidentity)
+                    group_transform_total += int(rotation_eval_count)
+                    per_transform.append(
+                        {
+                            "transform_index": int(transform_index),
+                            "transform_id": int(transform_id),
+                            "rotation_eval_count": int(rotation_eval_count),
+                            "rotation_key_count": int(len(nonidentity)),
+                            "rotation_key_request_count": int(len(keys)),
+                        }
+                    )
+                group_shared_total = int(len(group_keys))
+                group_transform_count = int(len(ids))
+                source = "compiled_backend_unified_transform_rotation_keys"
+            transform_total += int(group_transform_total)
+            shared_total += int(group_shared_total)
+            transform_count += int(group_transform_count)
+            unique_keys.update(group_keys)
+            per_group.append(
+                {
+                    "group_index": int(group_index),
+                    "transform_count": int(group_transform_count),
+                    "rotation_key_count_total": int(group_transform_total),
+                    "transform_rotation_eval_count_total": int(group_transform_total),
+                    "shared_rotation_eval_count": int(group_shared_total),
+                    "unique_rotation_key_count": int(len(group_keys)),
+                    "per_transform": per_transform,
+                    "source": str(source),
+                }
+            )
+        output_rotation_eval_count = int(max(0, int(self.output_block_count)) * max(0, int(self.output_fold_rotations)))
+        rotation_estimate = int((transform_total if bool(individual_eval) else shared_total) + output_rotation_eval_count)
+        return {
+            "source": "runtime_io_tconv_unified_rotation_estimate",
+            "runtime_group_count": int(len(per_group)),
+            "runtime_transform_count": int(transform_count),
+            "transform_rotation_key_count_total": int(transform_total),
+            "shared_rotation_eval_count_total": int(shared_total),
+            "unique_rotation_key_count": int(len(unique_keys)),
+            "output_rotations": int(max(0, int(self.output_fold_rotations))),
+            "output_rotation_eval_count": int(output_rotation_eval_count),
+            "rotation_eval_count_estimate": int(rotation_estimate),
+            "rotation_eval_count_mode": "independent_transform_bsgs" if bool(individual_eval) else "shared_group_bsgs",
+            "unique_rotation_keys": sorted(int(value) for value in unique_keys),
+            "runtime_rotation_groups": per_group,
+        }
+
     def _clear_transform_diagonals(self, transform: Any | None) -> None:
         if transform is None:
             return
@@ -4267,7 +4980,13 @@ class TconvK2S2PythonRuntimeExecutor:
         valid = (ih >= -int(top_beta)) & (ih < int(h_in + bottom_beta)) & (iw < int(w_in)) & (ic < int(c_in))
         return source_slots[valid], ic[valid], ih[valid], iw[valid]
 
-    def _build_source_block_transforms(self, *, scheme: Any, level: int, source_block: int) -> tuple[list[Any | None], int]:
+    def _build_source_block_diag_key_transforms(
+        self,
+        *,
+        scheme: Any,
+        level: int,
+        source_block: int,
+    ) -> tuple[list[Any | None], int]:
         c_in = int(getattr(self.module, "input_shape")[1])
         h_in = int(getattr(self.module, "input_shape")[2])
         w_in = int(getattr(self.module, "input_shape")[3])
@@ -4294,6 +5013,273 @@ class TconvK2S2PythonRuntimeExecutor:
             else int(getattr(self.module, "fhe_input_shape")[2])
         )
         output_total_h = int(h_out + output_top_beta + output_bottom_beta)
+        source_slots, ic, ih, iw = self._source_position_tensors_for_block(
+            source_block=int(source_block),
+            slots=int(slots),
+            c_in=int(c_in),
+            h_in=int(h_in),
+            w_in=int(w_in),
+            input_gap=int(input_gap),
+            input_top_beta=int(input_top_beta),
+            input_bottom_beta=int(input_bottom_beta),
+            input_physical_h=int(input_physical_h),
+        )
+        diagonal_keys: list[set[int]] = [set() for _output_block in range(int(self.output_block_count))]
+        if int(source_slots.numel()) > 0:
+            source_local = torch.remainder(source_slots, int(slots))
+            oc = torch.arange(int(c_out), dtype=torch.int64)
+            oc_grid = oc.unsqueeze(0).expand(int(source_slots.numel()), int(c_out))
+            source_grid = source_local.unsqueeze(1)
+            for kh in range(2):
+                oh = ih * 2 + int(kh)
+                for kw in range(2):
+                    ow = iw * 2 + int(kw)
+                    coeff = weight[
+                        ic.to(dtype=torch.int64).unsqueeze(1),
+                        oc.unsqueeze(0),
+                        int(kh),
+                        int(kw),
+                    ].to(dtype=torch.float32)
+                    nonzero = coeff != 0
+                    if not bool(torch.any(nonzero).item()):
+                        continue
+                    ow_grid = ow.unsqueeze(1).expand_as(oc_grid)
+                    target_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+                    if bool(fused_output_relayout):
+                        core_valid = (oh >= 0) & (oh < int(h_out))
+                        target_rows.append((oh + int(output_top_beta), core_valid))
+                        top_valid = core_valid & (oh == 0)
+                        for top_row in range(int(output_top_beta)):
+                            target_rows.append((torch.full_like(oh, int(top_row)), top_valid))
+                        bottom_valid = core_valid & (oh == int(h_out) - 1)
+                        for bottom_row in range(int(output_bottom_beta)):
+                            target_rows.append(
+                                (
+                                    torch.full_like(oh, int(output_top_beta + h_out + bottom_row)),
+                                    bottom_valid,
+                                )
+                            )
+                    elif native_output_blocks:
+                        target_rows.append(
+                            (
+                                oh,
+                                (oh >= -int(output_top_beta)) & (oh < int(h_out + output_bottom_beta)),
+                            )
+                        )
+                    else:
+                        oh_total = oh + int(output_top_beta)
+                        target_rows.append((oh_total, (oh_total >= 0) & (oh_total < int(output_total_h))))
+                    for target_h, row_valid in target_rows:
+                        oh_grid = target_h.unsqueeze(1).expand_as(oc_grid)
+                        if native_output_blocks:
+                            for output_block_index, (
+                                block_h_start,
+                                block_h_end,
+                                block_channel_start,
+                                block_channel_count,
+                            ) in enumerate(native_output_blocks):
+                                local_h = oh_grid - int(block_h_start)
+                                local_c = oc_grid - int(block_channel_start)
+                                output_local = _idx_chw_gap_tensor(
+                                    local_c,
+                                    local_h,
+                                    ow_grid,
+                                    h=int(block_h_end - block_h_start),
+                                    w=int(w_out),
+                                    gap=int(output_gap),
+                                )
+                                diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                                valid = (
+                                    nonzero
+                                    & row_valid.unsqueeze(1)
+                                    & (oh_grid >= int(block_h_start))
+                                    & (oh_grid < int(block_h_end))
+                                    & (oc_grid >= int(block_channel_start))
+                                    & (oc_grid < int(block_channel_start + block_channel_count))
+                                    & (ow_grid >= 0)
+                                    & (ow_grid < int(w_out))
+                                    & (output_local >= 0)
+                                    & (output_local < int(slots))
+                                )
+                                if bool(torch.any(valid).item()):
+                                    diagonal_keys[int(output_block_index)].update(
+                                        int(value) for value in torch.unique(diag_idx[valid]).tolist()
+                                    )
+                            continue
+                        out_slot = _idx_chw_gap_tensor(
+                            oc_grid,
+                            oh_grid,
+                            ow_grid,
+                            h=int(output_total_h),
+                            w=int(w_out),
+                            gap=int(output_gap),
+                        )
+                        output_block = torch.div(out_slot, int(slots), rounding_mode="floor")
+                        output_local = torch.remainder(out_slot, int(slots))
+                        if int(self.output_fold_rotations) > 0 and int(self.output_block_count) == 1:
+                            diag_idx = torch.remainder(
+                                source_grid - output_local,
+                                int(self.output_fold_block_height),
+                            )
+                        else:
+                            diag_idx = torch.remainder(source_grid - output_local, int(slots))
+                        valid = (
+                            nonzero
+                            & row_valid.unsqueeze(1)
+                            & (ow_grid >= 0)
+                            & (ow_grid < int(w_out))
+                            & (output_block >= 0)
+                            & (output_block < int(self.output_block_count))
+                        )
+                        if not bool(torch.any(valid).item()):
+                            continue
+                        flat_blocks = output_block[valid].to(dtype=torch.int64)
+                        flat_diags = diag_idx[valid].to(dtype=torch.int64)
+                        for block in torch.unique(flat_blocks).tolist():
+                            block_value = int(block)
+                            block_mask = flat_blocks == int(block_value)
+                            diagonal_keys[int(block_value)].update(
+                                int(value) for value in torch.unique(flat_diags[block_mask]).tolist()
+                            )
+
+        block_transforms: list[Any | None] = []
+        empty_transform_count = 0
+        for output_block in range(int(self.output_block_count)):
+            keys = tuple(sorted(int(value) for value in diagonal_keys[int(output_block)]))
+            if not keys:
+                empty_transform_count += 1
+                block_transforms.append(None)
+                continue
+            block_transforms.append(
+                mark_hybrid_schedule_padding_allowed(
+                    SimpleNamespace(
+                        name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
+                        diagonals={(0, 0): {int(key): None for key in keys}},
+                        level=int(level),
+                        scheme=scheme,
+                        fhe_output_shape=torch.Size([1, int(slots)]),
+                        output_shape=torch.Size([1, int(slots)]),
+                    ),
+                    family=(
+                        f"u22_tconv_k2s2:"
+                        f"in_gap={int(input_gap)}:out_gap={int(output_gap)}:"
+                        f"in={int(c_in)}x{int(h_in)}x{int(w_in)}:"
+                        f"out={int(c_out)}x{int(h_out)}x{int(w_out)}:"
+                        f"in_halo={int(input_top_beta)},{int(input_bottom_beta)}:"
+                        f"out_halo={int(output_top_beta)},{int(output_bottom_beta)}"
+                    ),
+                )
+            )
+        return block_transforms, int(empty_transform_count)
+
+    def _build_source_block_transforms(
+        self,
+        *,
+        scheme: Any,
+        level: int,
+        source_block: int,
+        attach_single_slot_recipe: bool = True,
+    ) -> tuple[list[Any | None], int]:
+        c_in = int(getattr(self.module, "input_shape")[1])
+        h_in = int(getattr(self.module, "input_shape")[2])
+        w_in = int(getattr(self.module, "input_shape")[3])
+        c_out = int(getattr(self.module, "output_shape")[1])
+        h_out = int(getattr(self.module, "output_shape")[2])
+        w_out = int(getattr(self.module, "output_shape")[3])
+        input_gap = int(getattr(self.module, "input_gap"))
+        weight = getattr(self.module, "on_weight").detach().to(dtype=torch.float32)
+        output_gap = int(getattr(self.module, "output_gap"))
+        layout = self._block_layout(scheme=scheme)
+        slots = int(layout["slots"])
+        input_layout = self._input_halo_layout()
+        output_layout = self._output_halo_layout()
+        input_top_beta = _layout_physical_top_beta(input_layout)
+        input_bottom_beta = _layout_physical_bottom_beta(input_layout)
+        output_top_beta = _layout_physical_top_beta(output_layout)
+        output_bottom_beta = _layout_physical_bottom_beta(output_layout)
+        native_output_blocks = self._native_output_storage_blocks()
+        output_materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
+        fused_output_relayout = output_materialization == "fused_relayout"
+        input_physical_h = (
+            int(h_in + input_top_beta + input_bottom_beta)
+            if self._native_input_storage_blocks()
+            else int(getattr(self.module, "fhe_input_shape")[2])
+        )
+        output_total_h = int(h_out + output_top_beta + output_bottom_beta)
+
+        single_slot_enabled = False
+        evaluator = getattr(scheme, "lt_evaluator", None)
+        enabled_fn = getattr(evaluator, "single_slot_layer_cache_enabled", None)
+        if callable(enabled_fn):
+            single_slot_enabled = bool(enabled_fn())
+        if bool(attach_single_slot_recipe) and bool(single_slot_enabled):
+            block_transforms, empty_transform_count = self._build_source_block_diag_key_transforms(
+                scheme=scheme,
+                level=int(level),
+                source_block=int(source_block),
+            )
+            recipe_diagonal_cache: dict[str, Any] = {}
+            recipe_cache_lock = threading.Lock()
+
+            def release_recipe_diagonal_cache() -> None:
+                with recipe_cache_lock:
+                    recipe_diagonal_cache.clear()
+
+            for output_block, transform in enumerate(block_transforms):
+                if transform is None:
+                    continue
+                diag_block = dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
+                diag_keys = tuple(sorted(int(key) for key in diag_block.keys()))
+                transform_ref: dict[str, Any] = {"transform": transform}
+
+                def build_diagonals(
+                    *,
+                    source_block: int = int(source_block),
+                    output_block: int = int(output_block),
+                    original_keys: tuple[int, ...] = tuple(int(key) for key in diag_keys),
+                    scheme: Any = scheme,
+                    level: int = int(level),
+                    slots: int = int(slots),
+                ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
+                    with recipe_cache_lock:
+                        rebuilt = recipe_diagonal_cache.get("rebuilt")
+                        if rebuilt is None:
+                            rebuilt, _empty_count = self._build_source_block_transforms(
+                                scheme=scheme,
+                                level=int(level),
+                                source_block=int(source_block),
+                                attach_single_slot_recipe=False,
+                            )
+                            recipe_diagonal_cache["rebuilt"] = rebuilt
+                    payload_transform = rebuilt[int(output_block)] if int(output_block) < len(rebuilt) else None
+                    if payload_transform is None:
+                        raise RuntimeError(
+                            f"tconv single-slot recipe rebuilt no transform for "
+                            f"source_block={int(source_block)} output_block={int(output_block)}"
+                        )
+                    block = dict(getattr(payload_transform, "diagonals", {}).get((0, 0), {}) or {})
+                    actual_keys = tuple(sorted(int(key) for key in block.keys()))
+                    if not set(int(key) for key in original_keys).issubset(set(int(key) for key in actual_keys)):
+                        raise RuntimeError(
+                            "tconv single-slot recipe diagonal key mismatch: "
+                            f"expected_at_least={list(original_keys)} actual={list(actual_keys)}"
+                        )
+                    requested_keys = tuple(int(key) for key in original_keys)
+                    current_transform = transform_ref.get("transform")
+                    if current_transform is not None:
+                        current_block = dict(getattr(current_transform, "diagonals", {}).get((0, 0), {}) or {})
+                        if current_block:
+                            requested_keys = tuple(sorted(int(key) for key in current_block.keys()))
+                    for key in requested_keys:
+                        if int(key) not in block:
+                            block[int(key)] = torch.zeros((int(slots),), dtype=torch.float32)
+                    return {(0, 0): {int(key): block[int(key)] for key in requested_keys}}
+
+                setattr(transform, "_single_slot_diag_indices_by_block", {(0, 0): tuple(int(key) for key in diag_keys)})
+                setattr(transform, "_single_slot_build_diagonals", build_diagonals)
+                setattr(transform, "_single_slot_diagonal_cache", recipe_diagonal_cache)
+                setattr(transform, "_single_slot_release_diagonal_cache", release_recipe_diagonal_cache)
+            return block_transforms, int(empty_transform_count)
 
         source_slots, ic, ih, iw = self._source_position_tensors_for_block(
             source_block=int(source_block),
@@ -4454,6 +5440,13 @@ class TconvK2S2PythonRuntimeExecutor:
 
         block_transforms: list[Any | None] = []
         empty_transform_count = 0
+        recipe_diagonal_cache: dict[str, Any] = {}
+        recipe_cache_lock = threading.Lock()
+
+        def release_recipe_diagonal_cache() -> None:
+            with recipe_cache_lock:
+                recipe_diagonal_cache.clear()
+
         for output_block in range(int(self.output_block_count)):
             diagonals: dict[int, torch.Tensor] = {}
             if diagonal_parts[int(output_block)]:
@@ -4473,26 +5466,86 @@ class TconvK2S2PythonRuntimeExecutor:
                 empty_transform_count += 1
                 block_transforms.append(None)
                 continue
-            block_transforms.append(
-                mark_hybrid_schedule_padding_allowed(
-                    SimpleNamespace(
-                        name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
-                        diagonals={(0, 0): diagonals},
-                        level=int(level),
-                        scheme=scheme,
-                        fhe_output_shape=torch.Size([1, int(slots)]),
-                        output_shape=torch.Size([1, int(slots)]),
-                    ),
-                    family=(
-                        f"u22_tconv_k2s2:"
-                        f"in_gap={int(input_gap)}:out_gap={int(output_gap)}:"
-                        f"in={int(c_in)}x{int(h_in)}x{int(w_in)}:"
-                        f"out={int(c_out)}x{int(h_out)}x{int(w_out)}:"
-                        f"in_halo={int(input_top_beta)},{int(input_bottom_beta)}:"
-                        f"out_halo={int(output_top_beta)},{int(output_bottom_beta)}"
-                    ),
-                )
+            diag_keys = tuple(sorted(int(key) for key in diagonals.keys()))
+            diagonal_payload: dict[int, Any]
+            transform_kwargs: dict[str, Any] = {}
+            if bool(attach_single_slot_recipe):
+                diagonal_payload = {int(key): None for key in diag_keys}
+                transform_ref: dict[str, Any] = {}
+
+                def build_diagonals(
+                    *,
+                    source_block: int = int(source_block),
+                    output_block: int = int(output_block),
+                    original_keys: tuple[int, ...] = tuple(int(key) for key in diag_keys),
+                    scheme: Any = scheme,
+                    level: int = int(level),
+                    slots: int = int(slots),
+                ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
+                    with recipe_cache_lock:
+                        rebuilt = recipe_diagonal_cache.get("rebuilt")
+                        if rebuilt is None:
+                            rebuilt, _empty_count = self._build_source_block_transforms(
+                                scheme=scheme,
+                                level=int(level),
+                                source_block=int(source_block),
+                                attach_single_slot_recipe=False,
+                            )
+                            recipe_diagonal_cache["rebuilt"] = rebuilt
+                    transform = rebuilt[int(output_block)] if int(output_block) < len(rebuilt) else None
+                    if transform is None:
+                        raise RuntimeError(
+                            f"tconv single-slot recipe rebuilt no transform for "
+                            f"source_block={int(source_block)} output_block={int(output_block)}"
+                        )
+                    block = dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
+                    actual_keys = tuple(sorted(int(key) for key in block.keys()))
+                    if not set(int(key) for key in original_keys).issubset(set(int(key) for key in actual_keys)):
+                        raise RuntimeError(
+                            "tconv single-slot recipe diagonal key mismatch: "
+                            f"expected_at_least={list(original_keys)} actual={list(actual_keys)}"
+                        )
+                    requested_keys = tuple(int(key) for key in original_keys)
+                    current_transform = transform_ref.get("transform")
+                    if current_transform is not None:
+                        current_block = dict(getattr(current_transform, "diagonals", {}).get((0, 0), {}) or {})
+                        if current_block:
+                            requested_keys = tuple(sorted(int(key) for key in current_block.keys()))
+                    for key in requested_keys:
+                        if int(key) not in block:
+                            block[int(key)] = torch.zeros((int(slots),), dtype=torch.float32)
+                    return {(0, 0): {int(key): block[int(key)] for key in requested_keys}}
+
+                transform_kwargs = {
+                    "_single_slot_diag_indices_by_block": {(0, 0): tuple(int(key) for key in diag_keys)},
+                    "_single_slot_build_diagonals": build_diagonals,
+                    "_single_slot_diagonal_cache": recipe_diagonal_cache,
+                    "_single_slot_release_diagonal_cache": release_recipe_diagonal_cache,
+                }
+            else:
+                diagonal_payload = diagonals
+            transform = mark_hybrid_schedule_padding_allowed(
+                SimpleNamespace(
+                    name=f"{self.output_node_id}_experimental_tconv_src{int(source_block)}_out{int(output_block)}",
+                    diagonals={(0, 0): diagonal_payload},
+                    level=int(level),
+                    scheme=scheme,
+                    fhe_output_shape=torch.Size([1, int(slots)]),
+                    output_shape=torch.Size([1, int(slots)]),
+                    **transform_kwargs,
+                ),
+                family=(
+                    f"u22_tconv_k2s2:"
+                    f"in_gap={int(input_gap)}:out_gap={int(output_gap)}:"
+                    f"in={int(c_in)}x{int(h_in)}x{int(w_in)}:"
+                    f"out={int(c_out)}x{int(h_out)}x{int(w_out)}:"
+                    f"in_halo={int(input_top_beta)},{int(input_bottom_beta)}:"
+                    f"out_halo={int(output_top_beta)},{int(output_bottom_beta)}"
+                ),
             )
+            if bool(attach_single_slot_recipe):
+                transform_ref["transform"] = transform
+            block_transforms.append(transform)
         return block_transforms, int(empty_transform_count)
 
     def _bias_plaintext(self, *, scheme: Any, level: int, output_block: int):
@@ -4639,6 +5692,12 @@ class TconvK2S2PythonRuntimeExecutor:
         self.last_runtime_io["complex_input_block_flags"] = [bool(value) for value in self.complex_input_block_flags]
         self.last_runtime_io["output_fold_block_height"] = int(self.output_fold_block_height)
         self.last_runtime_io["output_fold_rotations"] = int(self.output_fold_rotations)
+        self.last_runtime_io.update(
+            self._rotation_report_snapshot_for_scheme(
+                scheme=scheme,
+                individual_eval=_env_truthy("ORION_UNIFIED_LT_INDIVIDUAL_EVAL"),
+            )
+        )
         if len(ids) < int(self.input_block_count):
             raise RuntimeError(
                 "U22 experimental tconv kernel requires one ciphertext per packed input block: "
@@ -5170,9 +6229,11 @@ class U22CompileRegistry:
                     _layout_policy_has_halo(dict(row.get("selected_layout", {}) or {}))
                     for row in rows
                 )
-                fx_node = dag.nodes[node].get("fx_node")
-                fx_inputs = tuple(str(value.name) for value in getattr(fx_node, "all_input_nodes", ()) or ())
-                input_sources = fx_inputs if fx_inputs else tuple(str(value) for value in dag.predecessors(node))
+                input_sources = _layout_policy_join_input_sources(
+                    dag,
+                    node=str(node),
+                    rows=tuple(rows),
+                )
                 is_concat = type(module).__name__ == "Concat"
                 native_concat_output_row = (
                     _layout_policy_native_output_row(compile_plan, node=str(node)) if bool(is_concat) else None
@@ -5214,6 +6275,24 @@ class U22CompileRegistry:
                                     [int(value) for value in item]
                                     for item in source_row.get("native_halo_source_storage_signature", ()) or ()
                                 ]
+                            )
+                        missing_signature_sources = [
+                            str(source)
+                            for source, signature in zip(input_sources, input_signatures, strict=False)
+                            if not signature
+                        ]
+                        if len(input_signatures) != len(getattr(module, "concat_input_shapes", ()) or ()):
+                            raise ValueError(
+                                f"layout-policy Concat native materialization for {node} expected "
+                                f"{len(getattr(module, 'concat_input_shapes', ()) or ())} input signatures, "
+                                f"got {len(input_signatures)} from sources {list(input_sources)}; "
+                                f"available row sources={sorted(rows_by_source)}"
+                            )
+                        if missing_signature_sources:
+                            raise ValueError(
+                                f"layout-policy Concat native materialization for {node} is missing "
+                                f"native source signatures for {missing_signature_sources}; "
+                                f"available row sources={sorted(rows_by_source)}"
                             )
                         module.layout_policy_concat_input_source_signatures = input_signatures
                 else:

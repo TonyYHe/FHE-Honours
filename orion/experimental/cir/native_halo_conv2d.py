@@ -4084,13 +4084,48 @@ class NativeHaloRelayoutKernel:
             diag[int(output_local)] = 1.0
         return diagonals
 
+    def _build_block_diagonals(
+        self,
+        slots: int,
+        blocks: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    ) -> dict[tuple[int, int], dict[int, torch.Tensor]]:
+        requested = {(int(row), int(col)) for row, col in blocks}
+        if not requested:
+            return {}
+        diagonals: dict[tuple[int, int], dict[int, torch.Tensor]] = {}
+        for source_index, output_index in self._iter_mappings():
+            input_block = int(source_index // int(slots))
+            output_block = int(output_index // int(slots))
+            block_key = (int(output_block), int(input_block))
+            if block_key not in requested:
+                continue
+            source_local = int(source_index % int(slots))
+            output_local = int(output_index % int(slots))
+            diag_index = int((source_local - output_local) % int(slots))
+            block = diagonals.setdefault(block_key, {})
+            diag = block.get(int(diag_index))
+            if diag is None:
+                diag = torch.zeros((int(slots),), dtype=torch.float32)
+                block[int(diag_index)] = diag
+            diag[int(output_local)] = 1.0
+        return diagonals
+
     def compile(self, scheme: Any, *, level: int) -> None:
         self.cleanup(getattr(scheme, "backend", None))
         slots = int(self.spec.slot_count)
         self.level = int(level)
         if scheme.lt_evaluator.single_slot_layer_cache_enabled():
-            self._dense_layer_cache_diag_indices_by_block = self._diag_indices_by_block(int(slots))
-            self._dense_layer_cache_build_diagonals = lambda self=self, slots=int(slots): self._build_diagonals(int(slots))
+            diag_indices_by_block = self._diag_indices_by_block(int(slots))
+            build_diagonals = lambda self=self, slots=int(slots): self._build_diagonals(int(slots))
+            build_block_diagonals = (
+                lambda blocks, self=self, slots=int(slots): self._build_block_diagonals(int(slots), blocks)
+            )
+            self._dense_layer_cache_diag_indices_by_block = dict(diag_indices_by_block)
+            self._dense_layer_cache_build_diagonals = build_diagonals
+            self._dense_layer_cache_build_block_diagonals = build_block_diagonals
+            self._single_slot_diag_indices_by_block = dict(diag_indices_by_block)
+            self._single_slot_build_diagonals = build_diagonals
+            self._single_slot_build_block_diagonals = build_block_diagonals
             self.diagonals = {}
         else:
             self.diagonals = self._build_diagonals(int(slots))
@@ -4152,6 +4187,10 @@ class NativeHaloRelayoutKernel:
         self.diagonals = {}
         self._dense_layer_cache_diag_indices_by_block = {}
         self._dense_layer_cache_build_diagonals = None
+        self._dense_layer_cache_build_block_diagonals = None
+        self._single_slot_diag_indices_by_block = {}
+        self._single_slot_build_diagonals = None
+        self._single_slot_build_block_diagonals = None
 
 
 def _build_conv_transform(
@@ -4235,9 +4274,21 @@ def _build_conv_transform(
         return {(int(target_index), int(source_index)): block} if block else {}
 
     single_slot_cpp_metadata_enabled = (
-        _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA")
+        _env_enabled(
+            "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA",
+            default=(
+                _provider_diag_builder_enabled()
+                and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT")
+            ),
+        )
         if bool(compact_output)
-        else _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA")
+        else _env_enabled(
+            "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA",
+            default=(
+                _provider_diag_builder_enabled()
+                and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE")
+            ),
+        )
     )
     cpp_transform = _CPP_DIAG_BUILDER_FALLBACK
     if bool(allow_cpp) and (not bool(single_slot_recipe) or bool(single_slot_cpp_metadata_enabled)):
@@ -4689,7 +4740,10 @@ def _build_conv_transforms_for_compact_output(
         and not _provider_diag_builder_shadow()
         and (
             not bool(single_slot_recipe)
-            or _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA")
+            or _env_enabled(
+                "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA",
+                default=True,
+            )
         )
     ):
         transforms: list[tuple[int, Any]] = []
@@ -5524,6 +5578,7 @@ class NativeHaloStripeNoRIConvExecutor:
         }
         self.last_runtime_counts: dict[str, int] = {}
         self._compile_cache_metadata: dict[str, Any] = {}
+        self._last_runtime_native_plan: NativeHaloConv2DPlan | None = None
 
     def supports_scheme(self, scheme: Any | None) -> bool:
         return scheme is not None
@@ -6580,6 +6635,7 @@ class NativeHaloStripeNoRIConvExecutor:
     def __call__(self, source_ct: Any) -> dict[str, Any]:
         scheme = source_ct.scheme
         self.compile(scheme)
+        self._last_runtime_native_plan = self.native_plan
         self.last_runtime_timing["input_relayout_s"] = 0.0
         self.last_runtime_timing["output_relayout_s"] = 0.0
         self.last_runtime_timing["evaluate_unified_s"] = 0.0

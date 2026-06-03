@@ -13,10 +13,12 @@ import torch
 import orion.core.orion as orion_core
 from orion.core import packing
 from orion.core.orion import _bootstrap_shape_nonincrease_safe
+from orion.core.orion import _bootstrap_refinement_trial_score
 from orion.core.bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement
 from orion.core.bootstrap_layout_compression import apply_bootstrap_aware_layout_refinement_candidate
 from orion.core.bootstrap_layout_compression import enumerate_bootstrap_aware_layout_refinement_candidates
+from orion.core.bootstrap_layout_compression import enumerate_final_boot_boundary_halo0_cleanup_candidate
 from orion.core.bootstrap_layout_compression import restore_layout_policy_compile_plan
 from orion.core.bootstrap_layout_compression import _apply_layout_policy_module_output_layouts
 from orion.core.bootstrap_layout_compression import _conv2d_unit_stride_radius_one
@@ -53,6 +55,7 @@ from orion.experimental.layout_policy_ablation import (
     _output_physical_layout,
     _runtime_config,
     _source_transitive_input_layout_candidates,
+    _with_concat_transitive_future_layouts,
 )
 from orion.experimental.cir.native_halo_conv2d import (
     NativeHaloConv2DSpec,
@@ -863,6 +866,44 @@ def test_post_target_cleanup_forces_bootstrap_shape_nonincrease() -> None:
     )
 
 
+def test_bootstrap_refinement_trial_score_prioritizes_frontier_then_rotation() -> None:
+    base = {
+        "current_boot_count": 10,
+        "target_bootstrap_count": 8,
+        "post_target_cleanup_round": False,
+        "candidate_priority": 0,
+        "bootstrap_ct_count": 10,
+        "bootstrap_slots_total": 100,
+        "depth_delta": -1,
+        "accepted_count_for_score": 1,
+        "trial_number": 1,
+    }
+    reduce_one_low_rotation = _bootstrap_refinement_trial_score(
+        **base,
+        boot_delta=-1,
+        trial_boot_count=9,
+        rotation_delta=1,
+        candidate_id="reduce_one",
+    )
+    reduce_two_high_rotation = _bootstrap_refinement_trial_score(
+        **base,
+        boot_delta=-2,
+        trial_boot_count=8,
+        rotation_delta=10,
+        candidate_id="reduce_two",
+    )
+    same_frontier_low_rotation = _bootstrap_refinement_trial_score(
+        **base,
+        boot_delta=-2,
+        trial_boot_count=8,
+        rotation_delta=2,
+        candidate_id="reduce_two_low_rotation",
+    )
+
+    assert reduce_two_high_rotation < reduce_one_low_rotation
+    assert same_frontier_low_rotation < reduce_two_high_rotation
+
+
 def _init_python_scheme(provider_mode: str) -> None:
     config = {
         "ckks_params": {
@@ -1080,23 +1121,25 @@ def test_layout_policy_dp_allows_only_native_compact_align_shared_fallback() -> 
     assert all(row.get("physical_layout") == "native_source_stripe" for row in native_conv_halo)
 
 
-def test_layout_policy_no_share_fold_keeps_conservative_boundaries() -> None:
-    plan = build_layout_policy_compile_plan(
-        build_u22_dag(network_spec("u22_256_base32")),
-        policy="dp_no_share_fold",
-    )
+def test_layout_policy_no_share_fold_keeps_concat_boundaries_explicit() -> None:
+    dag = build_u22_dag(network_spec("u22_256_base32"))
+    plan = build_layout_policy_compile_plan(dag, policy="dp_no_share_fold")
 
     assert plan["validation"]["ok"] is True
     concat_rows = [row for row in plan["edge_layouts"] if row["op_kind"] == "concat"]
     assert concat_rows
-    assert all(row["physical_layout"] == "packed_compact" for row in concat_rows)
-    assert all(row["target_physical_layout"] == "packed_compact" for row in concat_rows)
-    assert all(int(row["selected_layout"]["top_beta"]) == 0 for row in concat_rows)
-    assert all(int(row["selected_layout"]["bottom_beta"]) == 0 for row in concat_rows)
-
-    tconv_rows = [row for row in plan["edge_layouts"] if row["op_kind"] == "conv_transpose2d"]
-    assert tconv_rows
-    assert all(row["physical_layout"] != "native_source_stripe" for row in tconv_rows)
+    for row in concat_rows:
+        source_physical = str(row.get("source_physical_layout", ""))
+        physical = str(row.get("physical_layout", ""))
+        target_physical = str(row.get("target_physical_layout", physical))
+        if physical == "native_source_stripe" or target_physical == "native_source_stripe":
+            assert source_physical == "native_source_stripe"
+            assert physical == "native_source_stripe"
+            assert target_physical == "native_source_stripe"
+            assert (not bool(row.get("relayout"))) or row.get("relayout_reason") == "dp_native_source_stripe_relayout"
+        elif source_physical == "native_source_stripe":
+            assert bool(row.get("relayout")) is True
+            assert row.get("relayout_reason") == "dp_add_input_alignment"
 
     raw_input_rows = [row for row in plan["edge_layouts"] if row["source"] == "x"]
     assert raw_input_rows
@@ -1116,8 +1159,38 @@ def test_layout_policy_no_share_fold_keeps_conservative_boundaries() -> None:
     native_rows = [row for row in plan["edge_layouts"] if row["physical_layout"] == "native_source_stripe"]
     assert native_rows
     assert all(row["source"] != "x" for row in native_rows)
-    assert all(row["provider_lt_grouping_mode"] == "individual" for row in native_rows)
-    assert all(row["native_halo_channel_fold_mode"] == "per_stripe" for row in native_rows)
+    native_conv_rows = [row for row in native_rows if row["op_kind"] == "conv2d"]
+    assert native_conv_rows
+    assert all(row["provider_lt_grouping_mode"] == "individual" for row in native_conv_rows)
+    assert all(row["native_halo_channel_fold_mode"] == "per_stripe" for row in native_conv_rows)
+
+    edges = _with_concat_transitive_future_layouts(
+        dag,
+        build_edge_infos(dag, slots=32768),
+        slots=32768,
+    )
+    cat4_inputs = [edge for edge in edges if edge.target == "cat4"]
+    live = {
+        edge.source: (edge.future_layouts[0] if edge.future_layouts else edge.requirement)
+        for edge in cat4_inputs
+    }
+    live_physical = {edge.source: "native_source_stripe" for edge in cat4_inputs}
+    concat_options = _incoming_add_options(cat4_inputs, live, live_physical, force_compact_join=True)
+    compact_options = [
+        rows
+        for rows, _relayouts in concat_options
+        if all(row["physical_layout"] == "packed_compact" for row in rows)
+    ]
+    native_options = [
+        rows
+        for rows, _relayouts in concat_options
+        if all(row["physical_layout"] == "native_source_stripe" for row in rows)
+    ]
+    assert compact_options
+    assert native_options
+    assert all(bool(row["relayout"]) is True for row in compact_options[0])
+    assert all(row["relayout_reason"] == "dp_add_input_alignment" for row in compact_options[0])
+    assert all(bool(row["relayout"]) is False for row in native_options[0])
 
 
 def test_dp_no_share_fold_native_edges_have_materialized_boundary_pruned_sources() -> None:
@@ -1185,6 +1258,139 @@ def test_dp_no_share_fold_native_edges_have_materialized_boundary_pruned_sources
         )
 
 
+def test_dp_no_share_fold_native_source_compact_handoff_carries_producer_signature() -> None:
+    plan = build_layout_policy_compile_plan(
+        _build_u23_dim8_192_dag(),
+        policy="dp_no_share_fold",
+    )
+
+    assert plan["validation"]["ok"] is True
+    edges = {str(row["edge"]): row for row in plan["edge_layouts"]}
+    nodes = {str(row["node"]): row for row in plan["node_layouts"]}
+
+    row = edges["enc1b_act->pool1"]
+    producer_row = nodes["enc1b_act"]
+    producer_signature = producer_row.get("native_halo_target_storage_signature")
+    assert producer_signature
+    assert row["physical_layout"] == "packed_compact"
+    assert row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert row["target_physical_layout"] == "packed_compact"
+    assert row["native_halo_source_storage_signature"] == producer_signature
+    assert int(row["native_input_ct_count"]) == len(producer_signature)
+    assert int(row["native_input_ct_count_estimate"]) == len(producer_signature)
+
+
+def test_dp_no_share_fold_auto_selects_concat_materialization_when_cheaper(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_CONCAT_FUSION", "auto")
+    plan = build_layout_policy_compile_plan(
+        _build_u23_dim8_192_dag(),
+        policy="dp_no_share_fold",
+    )
+
+    assert plan["validation"]["ok"] is True
+    edges = {str(row["edge"]): row for row in plan["edge_layouts"]}
+    concat_edges = ("cat4->dec4a", "cat3->dec3a", "cat2->dec2a", "cat1->dec1a")
+    explicit_edges: list[str] = []
+
+    for edge_id in concat_edges:
+        row = edges[edge_id]
+        assert row["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["target_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert row["concat_fusion_mode"] == "auto"
+        assert row["concat_fusion_auto_decision"] in {"explicit", "fused"}
+        assert int(row["concat_fusion_fused_rotation_estimate"]) > 0
+        assert int(row["concat_fusion_normal_rotation_estimate"]) > 0
+        assert int(row["concat_fusion_materialize_rotation_estimate"]) > 0
+        assert int(row["concat_fusion_explicit_total_rotation_estimate"]) == (
+            int(row["concat_fusion_normal_rotation_estimate"])
+            + int(row["concat_fusion_materialize_rotation_estimate"])
+        )
+        if row["concat_fusion_auto_decision"] == "explicit":
+            explicit_edges.append(str(edge_id))
+            assert bool(row["concat_explicit_native_materialization"]) is True
+            assert bool(row.get("concat_native_runtime_materializer", False)) is False
+            assert bool(row["consumer_fused_relayout"]) is False
+            assert int(row["concat_fusion_explicit_total_rotation_estimate"]) < int(
+                row["concat_fusion_fused_rotation_estimate"]
+            )
+            assert row["lt_estimator"] == "native_halo_plan_explicit_concat_materialization"
+        else:
+            assert bool(row["concat_native_runtime_materializer"]) is True
+            assert bool(row["concat_fused_native_output_signature_projected"]) is True
+            assert bool(row["consumer_fused_relayout"]) is True
+            assert int(row["concat_fusion_fused_rotation_estimate"]) <= int(
+                row["concat_fusion_explicit_total_rotation_estimate"]
+            )
+            assert row["lt_estimator"] == "concat_fused_native_source_stripe_unified_plan"
+        assert bool(row["relayout"]) is False
+        assert row["relayout_reason"] == ""
+        assert int(row["relayout_depth_estimate"]) == 0
+        assert int(row["relayout_mask_mult_estimate"]) == 0
+        assert row["rotation_eval_count_mode"] == "independent_transform_bsgs"
+        assert row["native_halo_rotation_mode"] == "c_only"
+        assert bool(row["native_halo_source_storage_signature"])
+        assert bool(row["native_halo_target_storage_signature"])
+
+    assert explicit_edges
+    relayout_edges = {str(row["edge"]) for row in plan["relayout_edges"]}
+    assert relayout_edges.isdisjoint(concat_edges)
+
+
+def test_dp_no_share_fold_attach_explicit_concat_carries_all_input_signatures(monkeypatch) -> None:
+    monkeypatch.setenv("ORION_CONCAT_FUSION", "auto")
+    dag = _build_u23_dim8_192_dag()
+    registry = U22CompileRegistry.for_dag(
+        dag,
+        allowed_nodes=None,
+        enable_conv_kernels=True,
+        layout_policy="dp_no_share_fold",
+    )
+    registry.attach_to_dag(dag)
+
+    checked: list[str] = []
+    for node in ("cat4", "cat3", "cat2", "cat1"):
+        module = dag.nodes[node]["module"]
+        if str(getattr(module, "layout_policy_output_materialization", "")) != "native_halo_stripe":
+            continue
+        signatures = tuple(getattr(module, "layout_policy_concat_input_source_signatures", ()) or ())
+        runtime = getattr(module, "layout_policy_concat_runtime", None)
+        assert runtime is not None
+        assert len(runtime.input_rows) == len(module.concat_input_shapes)
+        assert len(signatures) == len(module.concat_input_shapes)
+        assert all(tuple(signature) for signature in signatures)
+        checked.append(str(node))
+
+    assert checked
+
+
+def test_dp_no_share_fold_layout_preserving_activation_does_not_claim_unmaterialized_compact_relayout() -> None:
+    plan = build_layout_policy_compile_plan(
+        _build_u23_dim8_192_dag(),
+        policy="dp_no_share_fold",
+    )
+
+    assert plan["validation"]["ok"] is True
+    edges = {str(row["edge"]): row for row in plan["edge_layouts"]}
+    nodes = {str(row["node"]): row for row in plan["node_layouts"]}
+
+    activation_row = edges["bottleneckb->bottleneckb_act"]
+    activation_node = nodes["bottleneckb_act"]
+    producer_signature = nodes["bottleneckb"]["native_halo_target_storage_signature"]
+
+    assert activation_row["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert activation_row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert activation_row["target_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert bool(activation_row["relayout"]) is False
+    assert activation_row["native_halo_source_storage_signature"] == producer_signature
+    assert activation_node["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert activation_node["native_halo_target_storage_signature"] == producer_signature
+
+    tconv_row = edges["bottleneckb_act->up4"]
+    assert tconv_row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert tconv_row["native_halo_source_storage_signature"] == producer_signature
+
+
 def test_native_output_module_apply_uses_physical_beta_for_boundary_pruned_offset() -> None:
     module = SimpleNamespace()
     dag = nx.DiGraph()
@@ -1224,6 +1430,159 @@ def test_native_output_module_apply_uses_physical_beta_for_boundary_pruned_offse
     assert not hasattr(module, "layout_policy_output_layout")
     assert not hasattr(module, "layout_policy_output_row_offset")
     assert not hasattr(module, "layout_policy_output_materialization")
+
+
+def test_native_concat_output_apply_preserves_all_ordered_input_signatures() -> None:
+    cat = Concat(dim=1)
+    cat.configure_from_stats(
+        input_shapes=(
+            torch.Size((1, 4, 24, 24)),
+            torch.Size((1, 4, 24, 24)),
+        ),
+        input_fhe_shapes=(
+            torch.Size((1, 32768)),
+            torch.Size((1, 32768)),
+        ),
+        input_gaps=(2, 2),
+        output_shape=torch.Size((1, 8, 24, 24)),
+        fhe_output_shape=torch.Size((2, 32768)),
+        output_gap=2,
+    )
+    dag = nx.DiGraph()
+    dag.add_node("left", module=SimpleNamespace())
+    dag.add_node("right", module=SimpleNamespace())
+    dag.add_edge("right", "cat")
+    dag.add_node(
+        "cat",
+        module=cat,
+        fx_node=SimpleNamespace(
+            args=(SimpleNamespace(name="left"), SimpleNamespace(name="right")),
+        ),
+    )
+    dag.add_edge("left", "cat")
+    left_signature = [[0, 24, 0, 4]]
+    right_signature = [[0, 24, 0, 4], [1, 24, 0, 4]]
+    target_signature = [[0, 24, 0, 4], [1, 24, 4, 4]]
+    layout = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "stride": 1,
+        "gap": 2,
+        "tile_count": 2,
+    }
+    compile_plan = {
+        "slots": 32768,
+        "edge_layouts": [
+            {
+                "source": "right",
+                "target": "cat",
+                "op_kind": "concat",
+                "native_halo_source_storage_signature": right_signature,
+            },
+            {
+                "source": "left",
+                "target": "cat",
+                "op_kind": "concat",
+                "native_halo_source_storage_signature": left_signature,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "cat",
+                "shape": [1, 8, 24, 24],
+                "fhe_shape": [2, 32768],
+                "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "selected_layout": dict(layout),
+                "native_halo_target_storage_signature": target_signature,
+                "output_relayout": True,
+                "concat_explicit_native_materialization": True,
+            }
+        ],
+    }
+
+    snapshot = _apply_layout_policy_module_output_layouts(dag, compile_plan)
+
+    assert cat.layout_policy_concat_input_source_signatures == [left_signature, right_signature]
+    assert cat.layout_policy_native_output_target_signature == target_signature
+    restore_layout_policy_compile_plan(dag, compile_plan, module_layout_snapshot=snapshot)
+
+
+def test_native_concat_output_apply_falls_back_to_all_input_nodes_order() -> None:
+    cat = Concat(dim=1)
+    cat.configure_from_stats(
+        input_shapes=(
+            torch.Size((1, 4, 24, 24)),
+            torch.Size((1, 4, 24, 24)),
+        ),
+        input_fhe_shapes=(
+            torch.Size((1, 32768)),
+            torch.Size((1, 32768)),
+        ),
+        input_gaps=(2, 2),
+        output_shape=torch.Size((1, 8, 24, 24)),
+        fhe_output_shape=torch.Size((2, 32768)),
+        output_gap=2,
+    )
+    dag = nx.DiGraph()
+    dag.add_node("left", module=SimpleNamespace())
+    dag.add_node("right", module=SimpleNamespace())
+    dag.add_edge("right", "cat")
+    dag.add_node(
+        "cat",
+        module=cat,
+        fx_node=SimpleNamespace(
+            all_input_nodes=(SimpleNamespace(name="left"), SimpleNamespace(name="right")),
+        ),
+    )
+    dag.add_edge("left", "cat")
+    left_signature = [[0, 24, 0, 4]]
+    right_signature = [[0, 24, 0, 4], [1, 24, 0, 4]]
+    target_signature = [[0, 24, 0, 4], [1, 24, 4, 4]]
+    layout = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "stride": 1,
+        "gap": 2,
+        "tile_count": 2,
+    }
+    compile_plan = {
+        "slots": 32768,
+        "edge_layouts": [
+            {
+                "source": "right",
+                "target": "cat",
+                "op_kind": "concat",
+                "native_halo_source_storage_signature": right_signature,
+            },
+            {
+                "source": "left",
+                "target": "cat",
+                "op_kind": "concat",
+                "native_halo_source_storage_signature": left_signature,
+            },
+        ],
+        "node_layouts": [
+            {
+                "node": "cat",
+                "shape": [1, 8, 24, 24],
+                "fhe_shape": [2, 32768],
+                "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "selected_layout": dict(layout),
+                "native_halo_target_storage_signature": target_signature,
+                "output_relayout": True,
+                "concat_explicit_native_materialization": True,
+            }
+        ],
+    }
+
+    snapshot = _apply_layout_policy_module_output_layouts(dag, compile_plan)
+
+    assert cat.layout_policy_concat_input_source_signatures == [left_signature, right_signature]
+    restore_layout_policy_compile_plan(dag, compile_plan, module_layout_snapshot=snapshot)
 
 
 def test_backend_producer_attach_keeps_native_output_ct_shape_for_native_stripe() -> None:
@@ -1536,6 +1895,19 @@ def test_layout_policy_no_share_fold_native_rotation_estimate_uses_c_only_plan()
         )
         kernel_h, kernel_w = (int(value) for value in edge.kernel_size)
         assert kernel_h == kernel_w
+        target_layout = dict(row.get("target_layout", {}) or {})
+        source_storage_signature = tuple(
+            tuple(int(value) for value in item)
+            for item in tuple(row.get("native_halo_source_storage_signature", ()) or ())
+        )
+        target_storage_signature = tuple(
+            tuple(int(value) for value in item)
+            for item in tuple(
+                row.get("native_halo_target_storage_signature")
+                or row.get("consumer_native_source_stripe_target_signature")
+                or ()
+            )
+        )
         spec = NativeHaloConv2DSpec(
             family_label=f"test_{str(row['edge']).replace('->', '_')}",
             c_in=int(edge.input_channels or edge.shape[1]),
@@ -1554,17 +1926,27 @@ def test_layout_policy_no_share_fold_native_rotation_estimate_uses_c_only_plan()
             slot_count=int(edge.slots),
             input_top_beta=int(layout.top_beta),
             input_bottom_beta=int(layout.bottom_beta),
-            output_top_beta=0,
-            output_bottom_beta=0,
+            output_top_beta=int(target_layout.get("top_beta", 0) or 0),
+            output_bottom_beta=int(target_layout.get("bottom_beta", target_layout.get("beta", 0)) or 0),
             input_physical_top_beta=_layout_physical_top_beta(layout),
             input_physical_bottom_beta=_layout_physical_bottom_beta(layout),
-            output_physical_top_beta=0,
-            output_physical_bottom_beta=0,
+            output_physical_top_beta=int(
+                target_layout.get("physical_top_beta", target_layout.get("top_beta", 0)) or 0
+            ),
+            output_physical_bottom_beta=int(
+                target_layout.get(
+                    "physical_bottom_beta",
+                    target_layout.get("bottom_beta", target_layout.get("beta", 0)),
+                )
+                or 0
+            ),
         )
         native_plan = native_halo_conv2d_plan(
             spec,
-            require_native_target_fit=False,
+            require_native_target_fit=bool(target_storage_signature),
             channel_fold_mode="per_stripe",
+            source_storage_signature=tuple(source_storage_signature) or None,
+            target_storage_signature=tuple(target_storage_signature) or None,
         )
         compact_stats = native_halo_conv2d_compact_output_rotation_stats(native_plan)
 
@@ -1572,15 +1954,18 @@ def test_layout_policy_no_share_fold_native_rotation_estimate_uses_c_only_plan()
         assert row["native_halo_channel_fold_mode"] == "per_stripe"
         assert row["native_halo_plan_channel_fold_mode"] == "per_stripe"
         assert row["native_halo_rotation_mode"] == "c_only"
-        assert row["native_halo_rotation_exact_compact_output"] is True
+        assert row["native_halo_rotation_exact_compact_output"] is False
+        assert row["native_halo_output_storage_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
         assert int(row["planner_rotation_cost_estimate"]) == int(native_plan.c_only_rotations)
         assert int(row["lt_bsgs_rotation_estimate"]) == int(native_plan.c_only_rotations)
         assert int(row["native_c_only_rotation_estimate"]) == int(native_plan.c_only_rotations)
         assert int(row["native_cb_shared_rotation_estimate"]) == int(native_plan.cb_shared_rotations)
         assert int(row["native_plan_c_only_rotation_estimate"]) == int(native_plan.c_only_rotations)
         assert int(row["native_plan_cb_shared_rotation_estimate"]) == int(native_plan.cb_shared_rotations)
-        assert int(row["native_compact_output_c_only_rotation_estimate"]) == int(compact_stats.c_only_rotations)
-        assert int(row["native_compact_output_cb_shared_rotation_estimate"]) == int(compact_stats.cb_shared_rotations)
+        if row.get("native_compact_output_c_only_rotation_estimate") is not None:
+            assert int(row["native_compact_output_c_only_rotation_estimate"]) == int(compact_stats.c_only_rotations)
+        if row.get("native_compact_output_cb_shared_rotation_estimate") is not None:
+            assert int(row["native_compact_output_cb_shared_rotation_estimate"]) == int(compact_stats.cb_shared_rotations)
 
 
 def test_native_halo_closed_form_diag_sets_match_torch_oracle() -> None:
@@ -2408,6 +2793,121 @@ def test_layout_policy_provider_rejects_concat_compact_source_without_layout_awa
     assert executor.supports_scheme(SimpleNamespace(params=SimpleNamespace(get_backend=lambda: "clear_lattigo"))) is False
 
 
+def test_layout_policy_provider_rejects_concat_native_source_without_materializer() -> None:
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 32,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 32768,
+        "edge_layouts": [
+            {
+                "edge": "cat->conv",
+                "source": "cat",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 2, 4, 4],
+                "source_layout": dict(beta1),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "relayout": False,
+                "native_halo_source_storage_signature": [[0, 4, 0, 2]],
+                "native_input_ct_count": 1,
+            }
+        ],
+        "node_layouts": [
+            {
+                "node": "cat",
+                "shape": [1, 2, 4, 4],
+                "physical_layout": "native_source_stripe",
+                "selected_layout": dict(beta1),
+                "native_halo_target_storage_signature": [[0, 4, 0, 2]],
+                "native_output_ct_count_estimate": 1,
+            }
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    assert executor.native_input_rows
+    assert (
+        executor.unsupported_layout_policy_reason
+        == "layout_policy_concat_native_source_requires_native_concat_fusion"
+    )
+    assert executor.supports_scheme(SimpleNamespace(params=SimpleNamespace(get_backend=lambda: "clear_lattigo"))) is False
+
+
+def test_layout_policy_provider_accepts_marked_concat_native_source_materializer() -> None:
+    beta1 = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 32,
+        "stored_slots": 32,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 32768,
+        "edge_layouts": [
+            {
+                "edge": "cat->conv",
+                "source": "cat",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 2, 4, 4],
+                "source_layout": dict(beta1),
+                "selected_layout": dict(beta1),
+                "target_layout": dict(beta1),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "relayout": False,
+                "concat_native_runtime_materializer": True,
+                "native_halo_source_storage_signature": [[0, 4, 0, 2]],
+                "native_halo_target_storage_signature": [[0, 4, 0, 2]],
+                "native_input_ct_count": 1,
+            }
+        ],
+        "node_layouts": [
+            {
+                "node": "cat",
+                "shape": [1, 2, 4, 4],
+                "physical_layout": "native_source_stripe",
+                "selected_layout": dict(beta1),
+                "native_halo_target_storage_signature": [[0, 4, 0, 2]],
+                "native_output_ct_count_estimate": 1,
+            }
+        ],
+    }
+    executor = LayoutPolicyProviderRuntimeExecutor(
+        base_executor=SimpleNamespace(module=SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))),
+        output_node_id="conv",
+        compile_plan=compile_plan,
+    )
+    assert executor.native_input_rows
+    assert executor.unsupported_layout_policy_reason == ""
+    assert executor.supports_scheme(SimpleNamespace(params=SimpleNamespace(get_backend=lambda: "clear_lattigo"))) is True
+
+
 def test_bootstrap_layout_compression_rewrites_profitable_layout_policy_boundary() -> None:
     conv_module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
     act_module = type("SiLU", (), {})()
@@ -2534,7 +3034,7 @@ def test_bootstrap_layout_compression_rewrites_profitable_layout_policy_boundary
     assert tuple(int(value) for value in conv_module.fhe_output_shape) == (1, 1, 4, 4)
 
 
-def test_no_share_fold_bootstrap_compression_forces_compact_without_tile_savings() -> None:
+def test_bootstrap_aware_policy_skips_legacy_bootstrap_compression() -> None:
     conv_module = SimpleNamespace(fhe_output_shape=torch.Size([1, 1, 4, 4]))
     compact = {
         "top_beta": 0,
@@ -2583,10 +3083,9 @@ def test_no_share_fold_bootstrap_compression_forces_compact_without_tile_savings
     audit = apply_bootstrap_layout_compression(dag)
     updated = executor.compile_plan["node_layouts"][0]
 
-    assert audit["enabled"] is True
-    assert audit["nodes"][0]["forced_compact_boundary"] is True
-    assert audit["nodes"][0]["saved_ciphertexts_per_bootstrap"] == 0
-    assert updated["physical_layout"] == "packed_compact"
+    assert audit["enabled"] is False
+    assert audit["reason"] == "bootstrap_aware_policy_uses_refinement_final_halo0_cleanup"
+    assert updated["physical_layout"] == "logical_halo_compact"
     assert updated["selected_layout"]["tile_count"] == 1
     assert tuple(int(value) for value in conv_module.fhe_output_shape) == (1, 1, 4, 4)
 
@@ -2604,7 +3103,7 @@ def test_bootstrap_compression_does_not_materialize_lazy_delegate() -> None:
             return getattr(self.delegate, name)
 
     compile_plan = {
-        "policy": "dp_no_share_fold",
+        "policy": "dp",
         "summary": {},
         "edge_layouts": [],
         "node_layouts": [
@@ -2670,10 +3169,10 @@ def test_bootstrap_compression_finds_materialized_private_delegate() -> None:
         "gap": 1,
         "core_slots": 16,
         "stored_slots": 24,
-        "tile_count": 1,
+        "tile_count": 2,
     }
     compile_plan = {
-        "policy": "dp_no_share_fold",
+        "policy": "dp",
         "summary": {},
         "edge_layouts": [],
         "node_layouts": [
@@ -2696,6 +3195,189 @@ def test_bootstrap_compression_finds_materialized_private_delegate() -> None:
 
     assert audit["enabled"] is True
     assert child.compile_plan["node_layouts"][0]["physical_layout"] == "packed_compact"
+
+
+def test_final_halo0_cleanup_rejects_compact_source_native_relayout() -> None:
+    conv_module = torch.nn.Conv2d(1, 1, kernel_size=3, padding=1)
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 32768,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "src->conv",
+                "source": "src",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(compact),
+                "selected_layout": dict(halo),
+                "target_layout": dict(halo),
+                "required_layout": dict(halo),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "packed_compact",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "relayout": True,
+                "relayout_reason": "dp_native_source_stripe_relayout",
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+            }
+        ],
+        "node_layouts": [
+            {
+                "node": "src",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(compact),
+                "compact_layout": dict(compact),
+                "physical_layout": "packed_compact",
+            },
+            {
+                "node": "conv",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+            },
+        ],
+    }
+    executor = SimpleNamespace(
+        compile_plan=compile_plan,
+        native_physical_relayout_rows=[compile_plan["edge_layouts"][0]],
+    )
+    src_module = SimpleNamespace(region_runtime=SimpleNamespace(executor=executor))
+    conv_module.region_runtime = SimpleNamespace(executor=executor)
+    dag = nx.DiGraph()
+    dag.add_node("src", module=src_module, bootstrap=False)
+    dag.add_node("conv", module=conv_module, bootstrap=True)
+    dag.add_node("boot", module=SimpleNamespace(), bootstrap=False)
+    dag.add_edge("src", "conv")
+    dag.add_edge("conv", "boot")
+
+    candidate = enumerate_final_boot_boundary_halo0_cleanup_candidate(
+        dag,
+        {"boot_edges": [{"source": "conv", "target": "boot"}]},
+    )
+
+    assert candidate["enabled"] is False
+    assert candidate["reason"] == "no_final_boot_boundary_halo0_cleanup_candidates"
+
+
+def test_final_halo0_cleanup_preserves_native_input_and_compresses_only_output() -> None:
+    conv_module = torch.nn.Conv2d(1, 1, kernel_size=3, padding=1)
+    compact = {
+        "top_beta": 0,
+        "bottom_beta": 0,
+        "physical_top_beta": 0,
+        "physical_bottom_beta": 0,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 16,
+        "tile_count": 1,
+    }
+    halo = {
+        "top_beta": 1,
+        "bottom_beta": 1,
+        "physical_top_beta": 1,
+        "physical_bottom_beta": 1,
+        "stride": 1,
+        "gap": 1,
+        "core_slots": 16,
+        "stored_slots": 24,
+        "tile_count": 1,
+    }
+    compile_plan = {
+        "policy": "dp_no_share_fold",
+        "slots": 32768,
+        "summary": {},
+        "edge_layouts": [
+            {
+                "edge": "src->conv",
+                "source": "src",
+                "target": "conv",
+                "op_kind": "conv2d",
+                "shape": [1, 1, 4, 4],
+                "source_layout": dict(halo),
+                "selected_layout": dict(halo),
+                "target_layout": dict(halo),
+                "required_layout": dict(halo),
+                "physical_layout": "native_source_stripe",
+                "source_physical_layout": "native_source_stripe",
+                "target_physical_layout": "native_source_stripe",
+                "layout_mode": "native_halo_stripe",
+                "relayout": False,
+                "provider_lt_grouping_mode": "individual",
+                "native_halo_channel_fold_mode": "per_stripe",
+            }
+        ],
+        "node_layouts": [
+            {
+                "node": "src",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+            },
+            {
+                "node": "conv",
+                "shape": [1, 1, 4, 4],
+                "selected_layout": dict(halo),
+                "compact_layout": dict(compact),
+                "physical_layout": "native_source_stripe",
+            },
+        ],
+    }
+    executor = SimpleNamespace(compile_plan=compile_plan, native_physical_relayout_rows=[])
+    src_module = SimpleNamespace(region_runtime=SimpleNamespace(executor=executor))
+    conv_module.region_runtime = SimpleNamespace(executor=executor)
+    dag = nx.DiGraph()
+    dag.add_node("src", module=src_module, bootstrap=False)
+    dag.add_node("conv", module=conv_module, bootstrap=True)
+    dag.add_node("boot", module=SimpleNamespace(), bootstrap=False)
+    dag.add_edge("src", "conv")
+    dag.add_edge("conv", "boot")
+
+    candidate = enumerate_final_boot_boundary_halo0_cleanup_candidate(
+        dag,
+        {"boot_edges": [{"source": "conv", "target": "boot"}]},
+    )
+
+    assert candidate["enabled"] is True
+    updated_edges = {str(row["edge"]): row for row in candidate["plan"]["edge_layouts"]}
+    updated_nodes = {str(row["node"]): row for row in candidate["plan"]["node_layouts"]}
+    updated_edge = updated_edges["src->conv"]
+
+    assert updated_edge["boot_refined_halo0_native_output_only"] is True
+    assert updated_edge["selected_layout"]["top_beta"] == 1
+    assert updated_edge["selected_layout"]["bottom_beta"] == 1
+    assert updated_edge["source_layout"]["top_beta"] == 1
+    assert updated_edge["source_physical_layout"] == "native_source_stripe"
+    assert updated_nodes["src"]["selected_layout"]["top_beta"] == 1
+    assert updated_nodes["conv"]["selected_layout"]["top_beta"] == 0
+    assert updated_nodes["conv"]["physical_layout"] == "native_source_stripe"
 
 
 def test_bootstrap_solver_audit_and_reset_allow_independent_second_solve() -> None:
@@ -3158,19 +3840,19 @@ def test_bootstrap_aware_refinement_lifts_transitive_mvm_to_two_consumer_convs(
     assert nodes["conv1"]["selected_layout"]["top_beta"] == 1
     assert nodes["act"]["selected_layout"]["top_beta"] == 1
     assert edges[f"{producer_name}->conv1"]["relayout"] is False
-    assert edges[f"{producer_name}->conv1"]["physical_layout"] == "logical_halo_compact"
-    assert edges[f"{producer_name}->conv1"]["layout_mode"] == "compact_halo_shared"
+    assert edges[f"{producer_name}->conv1"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert edges[f"{producer_name}->conv1"]["layout_mode"] == "native_halo_stripe"
     assert not bool(edges[f"{producer_name}->conv1"].get("native_compact_source_fused", False))
-    assert nodes["conv1"]["physical_layout"] == "logical_halo_compact"
-    assert nodes["act"]["physical_layout"] == "logical_halo_compact"
-    assert edges["conv1->act"]["physical_layout"] == "logical_halo_compact"
+    assert nodes["conv1"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert nodes["act"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert edges["conv1->act"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
     assert edges["act->conv2"]["relayout"] is False
-    assert edges["act->conv2"]["physical_layout"] == "logical_halo_compact"
-    assert "native_physical_output_ct_count" not in nodes["conv1"]
-    assert "native_physical_output_ct_count" not in nodes["act"]
-    assert "native_physical_output_ct_count" not in nodes[str(producer_name)]
+    assert edges["act->conv2"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert int(nodes["conv1"]["native_physical_output_ct_count"]) == 1
+    assert int(nodes["act"]["native_physical_output_ct_count"]) == 1
+    assert int(nodes[str(producer_name)]["native_physical_output_ct_count"]) == 1
     _assert_native_output_count_map_only_names_native_nodes(updated)
-    assert not updated.get("_native_physical_output_ct_counts", {})
+    assert set(updated.get("_native_physical_output_ct_counts", {})) == {str(producer_name)}
 
 
 def test_bootstrap_aware_refinement_rejects_transitive_mvm_beta_lift_gap_mismatch() -> None:
@@ -3678,7 +4360,10 @@ def test_bootstrap_aware_refinement_lifts_direct_pool_to_conv_relayout() -> None
     assert nodes["pool"]["producer_materialized_halo"] is True
     assert nodes["pool"]["selected_layout"]["top_beta"] == beta1["top_beta"]
     assert nodes["pool"]["selected_layout"]["bottom_beta"] == beta1["bottom_beta"]
-    assert edges["pool->conv"]["physical_layout"] == "logical_halo_compact"
+    assert edges["pool->conv"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert edges["pool->conv"]["layout_mode"] == "native_halo_stripe"
+    assert nodes["pool"]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert int(nodes["pool"]["native_physical_output_ct_count"]) == 1
     assert edges["pool->conv"]["relayout"] is False
 
 
@@ -6437,7 +7122,7 @@ def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
         assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
         assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
         assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
-        assert env["ORION_CONCAT_FUSION"] == "1"
+        assert env["ORION_CONCAT_FUSION"] == "auto"
     assert matrix_runner._apply_env_defaults(dict(bad_env))["ORION_PACK_CONV_WORKERS"] == "240"
 
 

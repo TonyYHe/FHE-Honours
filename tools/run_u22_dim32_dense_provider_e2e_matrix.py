@@ -28,24 +28,14 @@ DEFAULT_RUN_ROOT_BASE = REPO_ROOT / ".tmp" / "results"
 LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_u22_dim32_dense_provider_e2e_matrix.txt"
 
 CASES: dict[str, dict[str, Any]] = {
-    "192x192": {
-        "dataset": "IBSR BRAIN 2D",
-        "input_shape": (1, 1, 192, 192),
-        "out_channels": 4,
-    },
-    "224x224": {
-        "dataset": "HanCo Hand",
-        "input_shape": (1, 3, 224, 224),
-        "out_channels": 1,
-    },
-    "384x288": {
-        "dataset": "CVC-ClinicDB",
-        "input_shape": (1, 3, 384, 288),
+    "256x256": {
+        "dataset": "COVID-19 lung",
+        "input_shape": (1, 1, 256, 256),
         "out_channels": 1,
     },
     "384x384": {
-        "dataset": "Satellite cloud",
-        "input_shape": (1, 4, 384, 384),
+        "dataset": "NuSegMSBench",
+        "input_shape": (1, 1, 384, 384),
         "out_channels": 1,
     },
 }
@@ -160,6 +150,8 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_CPP_DIAG_BUILDER_PROVIDER": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT": "1",
+    "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA": "1",
+    "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_SOURCE": "1",
     "ORION_PACK_CONV_WORKERS": str(CPU_COUNT),
     "ORION_DIRECT_PACK_WORKERS": str(CPU_COUNT),
@@ -175,7 +167,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
-    "ORION_CONCAT_FUSION": "1",
+    "ORION_CONCAT_FUSION": "auto",
 }
 
 REQUIRED_MAINLINE_ENV: dict[str, str] = {
@@ -188,10 +180,11 @@ REQUIRED_MAINLINE_ENV: dict[str, str] = {
     "ORION_CPP_DIAG_BUILDER_DENSE": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER": "1",
     "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE": "1",
+    "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA": "1",
     "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
-    "ORION_CONCAT_FUSION": "1",
+    "ORION_CONCAT_FUSION": "auto",
 }
 
 DENSE_MODE_ENV: dict[str, str] = {
@@ -379,10 +372,7 @@ def _annotate_result(
 def run_one(args: argparse.Namespace) -> int:
     mode = str(args.mode)
     os.environ.update(_apply_mode_env(_apply_env_defaults(os.environ), mode))
-    if mode == "dense":
-        os.environ["ORION_CONCAT_FUSION"] = "1"
-    else:
-        os.environ.setdefault("ORION_CONCAT_FUSION", "1")
+    os.environ.setdefault("ORION_CONCAT_FUSION", "auto")
     env_snapshot = dict(os.environ)
     base = _register_networks()
     out_path = Path(args.out)
@@ -1565,7 +1555,7 @@ def run_all(args: argparse.Namespace) -> int:
             "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
             "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
             "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_lt": "independent Orion LT; concat fusion is common via ORION_CONCAT_FUSION=1",
+            "dense_lt": "independent Orion LT; concat fusion/default explicit materialization is chosen by ORION_CONCAT_FUSION=auto",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
         },
     }
@@ -1699,7 +1689,7 @@ def main() -> int:
     parser.add_argument("--layer-mae", action="store_true")
     parser.add_argument("--update-doc-only", action="store_true")
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--case", choices=tuple(CASES), default="192x192", help=argparse.SUPPRESS)
+    parser.add_argument("--case", choices=tuple(CASES), default="256x256", help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("dense", "provider"), default="dense", help=argparse.SUPPRESS)
     parser.add_argument("--out", type=Path, default=Path("/tmp/u22_dim32_matrix_case.json"), help=argparse.SUPPRESS)
     args = parser.parse_args()

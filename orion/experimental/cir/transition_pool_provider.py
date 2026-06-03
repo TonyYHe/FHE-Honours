@@ -234,6 +234,39 @@ def _runtime_primary_diagonals(transform: Any | None) -> dict[int, Any]:
     return dict(getattr(transform, "diagonals", {}).get((0, 0), {}) or {})
 
 
+def _conv2d_compile_diagonal_metadata(module: Any, *, single_slot: bool) -> tuple[dict[tuple[int, int], Any], int]:
+    if bool(single_slot):
+        diagonals, output_rotations = _with_compact_physical_output_module_attrs(
+            module,
+            lambda: packing.pack_conv2d_diagonal_indices(module, last=False),
+        )
+        return {
+            (int(row), int(col)): tuple(int(index) for index in diag_indices)
+            for (row, col), diag_indices in dict(diagonals or {}).items()
+        }, int(output_rotations)
+    diagonals, output_rotations = _with_compact_physical_output_module_attrs(
+        module,
+        lambda: packing.pack_conv2d(module, last=False),
+    )
+    diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
+    return {
+        (int(row), int(col)): dict(diag or {})
+        for (row, col), diag in dict(diagonals or {}).items()
+    }, int(output_rotations)
+
+
+def _diag_indices_for_transform_source(diag_source: Any, *, single_slot: bool) -> tuple[int, ...]:
+    if bool(single_slot):
+        return tuple(sorted(int(index) for index in tuple(diag_source or ())))
+    return tuple(sorted(int(index) for index in dict(diag_source or {}).keys()))
+
+
+def _diag_payload_for_transform_source(diag_source: Any, *, single_slot: bool) -> dict[int, Any]:
+    if bool(single_slot):
+        return {}
+    return dict(diag_source or {})
+
+
 def _conv2d_block_runtime_recipe(module: Any):
     cache: dict[str, Any] = {}
 
@@ -733,13 +766,12 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
         self.hybrid_pair_layout_reject_reasons = []
         self.hybrid_group_reject_reasons = []
         prepare_started = time.perf_counter()
-        diagonals, output_rotations = _with_compact_physical_output_module_attrs(
+        single_slot = bool(_single_slot_layer_cache_enabled(scheme))
+        diagonals, output_rotations = _conv2d_compile_diagonal_metadata(
             self.module,
-            lambda: packing.pack_conv2d(self.module, last=False),
+            single_slot=bool(single_slot),
         )
         diag_builder_metadata = dict(getattr(self.module, "_last_diag_builder_metadata", {}) or {})
-        diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
-        single_slot = bool(_single_slot_layer_cache_enabled(scheme))
         runtime_block_builder, release_runtime_cache = (
             _conv2d_block_runtime_recipe(self.module)
             if bool(single_slot)
@@ -765,7 +797,7 @@ class InputPairConvRuntimeExecutor(_BiasCacheMixin):
                 input_id=f"input_{int(col)}",
                 slots=int(slots),
                 scheme=scheme,
-                diag_indices=tuple(sorted(int(index) for index in dict(diag).keys())),
+                diag_indices=_diag_indices_for_transform_source(diag, single_slot=bool(single_slot)),
                 build_diagonals=(
                     (
                         lambda row=int(row), col=int(col), runtime_block_builder=runtime_block_builder: runtime_block_builder(
@@ -1174,15 +1206,15 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
             return
         self.last_runtime_timing.update({"prepare_transforms_s": 0.0, "compile_unified_s": 0.0})
         prepare_started = time.perf_counter()
-        conv_diags, conv_output_rotations = _with_compact_physical_output_module_attrs(
-            self.conv_module,
-            lambda: packing.pack_conv2d(self.conv_module, last=False),
-        )
-        shortcut_diags, shortcut_output_rotations = _with_compact_physical_output_module_attrs(
-            self.shortcut_module,
-            lambda: packing.pack_conv2d(self.shortcut_module, last=False),
-        )
         single_slot = bool(_single_slot_layer_cache_enabled(scheme))
+        conv_diags, conv_output_rotations = _conv2d_compile_diagonal_metadata(
+            self.conv_module,
+            single_slot=bool(single_slot),
+        )
+        shortcut_diags, shortcut_output_rotations = _conv2d_compile_diagonal_metadata(
+            self.shortcut_module,
+            single_slot=bool(single_slot),
+        )
         conv_runtime_block_builder, conv_release_runtime_cache = (
             _conv2d_block_runtime_recipe(self.conv_module)
             if bool(single_slot)
@@ -1214,7 +1246,7 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 input_id=f"input_{int(col)}",
                 slots=int(slots),
                 scheme=scheme,
-                diag_indices=tuple(sorted(int(index) for index in dict(diag).keys())),
+                diag_indices=_diag_indices_for_transform_source(diag, single_slot=bool(single_slot)),
                 build_diagonals=(
                     (
                         lambda row=int(row), col=int(col), conv_runtime_block_builder=conv_runtime_block_builder: conv_runtime_block_builder(
@@ -1239,7 +1271,7 @@ class BranchPairConvRuntimeExecutor(_BiasCacheMixin):
                 input_id=f"input_{int(col)}",
                 slots=int(slots),
                 scheme=scheme,
-                diag_indices=tuple(sorted(int(index) for index in dict(diag).keys())),
+                diag_indices=_diag_indices_for_transform_source(diag, single_slot=bool(single_slot)),
                 build_diagonals=(
                     (
                         lambda row=int(row), col=int(col), shortcut_runtime_block_builder=shortcut_runtime_block_builder: shortcut_runtime_block_builder(

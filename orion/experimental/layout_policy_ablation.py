@@ -39,6 +39,29 @@ PHYSICAL_COMPACT = "packed_compact"
 PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
 PHYSICAL_NATIVE_SOURCE_STRIPE = "native_source_stripe"
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
+CONCAT_NATIVE_TARGET_RELAYOUT_EXPERIMENTAL = (
+    os.environ.get("ORION_CONCAT_NATIVE_TARGET_RELAYOUT", "1").strip().lower()
+    not in _FALSE_ENV_VALUES
+)
+TRANSITIVE_PRODUCER_OUTPUT_EXPERIMENTAL = (
+    os.environ.get("ORION_LAYOUT_POLICY_TRANSITIVE_PRODUCER_OUTPUT", "1").strip().lower()
+    not in _FALSE_ENV_VALUES
+)
+
+
+def _concat_fusion_runtime_mode() -> str:
+    raw = os.environ.get("ORION_CONCAT_FUSION", "auto").strip().lower()
+    if raw in _FALSE_ENV_VALUES:
+        return "off"
+    if raw in {"1", "true", "yes", "on", "force", "forced", "fused"}:
+        return "force"
+    return "auto"
+
+
+def _concat_fusion_runtime_enabled() -> bool:
+    return _concat_fusion_runtime_mode() != "off"
+
+
 POLICY_ALIASES = {
     "fixed": "fixed_max",
     "fixedmax": "fixed_max",
@@ -880,6 +903,67 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
     return tuple(sorted(edges, key=lambda edge: (topo_index.get(edge.source, 10**9), topo_index.get(edge.target, 10**9))))
 
 
+def _with_concat_transitive_future_layouts(
+    dag: NetworkDAG,
+    edges: Sequence[EdgeInfo],
+    *,
+    slots: int,
+) -> tuple[EdgeInfo, ...]:
+    edges_by_id = {str(edge.edge_id): edge for edge in edges}
+    incoming_by_target: dict[str, list[str]] = {}
+    outgoing_by_source: dict[str, list[str]] = {}
+    for edge in edges:
+        incoming_by_target.setdefault(str(edge.target), []).append(str(edge.edge_id))
+        outgoing_by_source.setdefault(str(edge.source), []).append(str(edge.edge_id))
+    for node in reversed([str(value) for value in dag.topological_sort()]):
+        module = dag.nodes[node].get("module")
+        if type(module).__name__ != "Concat":
+            continue
+        outgoing = [edges_by_id[edge_id] for edge_id in outgoing_by_source.get(str(node), [])]
+        incoming_edge_ids = list(incoming_by_target.get(str(node), []))
+        if len(outgoing) != 1 or len(incoming_edge_ids) < 2:
+            continue
+        current_edges_by_source: dict[str, list[EdgeInfo]] = {}
+        for current in edges_by_id.values():
+            current_edges_by_source.setdefault(str(current.source), []).append(current)
+        output_candidates = _producer_transitive_output_layout_candidates(
+            outgoing,
+            edges_by_source=current_edges_by_source,
+            slots=int(slots),
+        )
+        if not output_candidates:
+            continue
+        for edge_id in incoming_edge_ids:
+            edge = edges_by_id[str(edge_id)]
+            branch_layouts: list[LayoutState] = []
+            for layout in output_candidates:
+                branch_layout = _layout_for_shape(
+                    shape=edge.shape,
+                    gap=int(edge.compact.gap),
+                    top_beta=int(layout.top_beta),
+                    bottom_beta=int(layout.bottom_beta),
+                    stride=max(int(edge.requirement.stride), int(layout.stride)),
+                    slots=int(slots),
+                )
+                if int(branch_layout.tile_count) <= int(edge.requirement.tile_count) + 1:
+                    branch_layouts.append(branch_layout)
+            if not branch_layouts:
+                continue
+            future_layouts = tuple(
+                layout for layout in _dedupe_layouts((*tuple(edge.future_layouts), *branch_layouts))
+                if not _same_layout(layout, edge.requirement)
+            )
+            if tuple(edge.future_layouts) != future_layouts:
+                edges_by_id[str(edge_id)] = replace(edge, future_layouts=future_layouts)
+    topo_index = {str(node): index for index, node in enumerate(dag.topological_sort())}
+    return tuple(
+        sorted(
+            edges_by_id.values(),
+            key=lambda edge: (topo_index.get(edge.source, 10**9), topo_index.get(edge.target, 10**9)),
+        )
+    )
+
+
 def _same_layout(left: LayoutState, right: LayoutState) -> bool:
     return left.key() == right.key()
 
@@ -964,10 +1048,11 @@ def _input_demand_for_output_layout(
     output_demand: LayoutState | None,
     *,
     slots: int,
+    single_ct_shortcut: bool = True,
 ) -> LayoutState:
     if output_demand is None:
         return edge.requirement
-    if isinstance(module, (AvgPool2d, Conv2d)) and _compact_height_strip_fits_single_ct(
+    if bool(single_ct_shortcut) and isinstance(module, (AvgPool2d, Conv2d)) and _compact_height_strip_fits_single_ct(
         shape=edge.shape,
         gap=int(edge.compact.gap),
         slots=int(slots),
@@ -1851,6 +1936,103 @@ def _output_gap_for_edge(edge: EdgeInfo) -> int:
     return max(1, min(max(1, int(round(fhe_h / clear_h))), max(1, int(round(fhe_w / clear_w)))))
 
 
+def _storage_signature_cache_key(raw: Any) -> tuple[tuple[int, int, int, int], ...]:
+    if not raw:
+        return ()
+    try:
+        parsed = tuple(tuple(int(value) for value in item) for item in raw)
+    except Exception:
+        return ()
+    return tuple(item for item in parsed if len(item) == 4)
+
+
+def _concat_native_materialize_rotation_estimate_for_rows(
+    *,
+    input_rows: Sequence[dict[str, Any]],
+    target_signature: Any,
+    input_sources: Sequence[str] = (),
+    input_shapes: Sequence[Any] = (),
+    slots: int,
+) -> int:
+    target_blocks = tuple(
+        block
+        for block in _storage_signature_cache_key(target_signature)
+        if int(block[1]) > int(block[0]) and int(block[3]) > 0
+    )
+    if not target_blocks:
+        return 0
+    rows_by_source = {str(row.get("source", "")): dict(row) for row in input_rows}
+    ordered_sources = [str(value) for value in input_sources] or [str(row.get("source", "")) for row in input_rows]
+    total = 0
+    channel_offset = 0
+    for input_index, source in enumerate(ordered_sources):
+        row = rows_by_source.get(str(source), {})
+        source_signature = tuple(
+            block
+            for block in _storage_signature_cache_key(row.get("native_halo_source_storage_signature") or ())
+            if int(block[1]) > int(block[0]) and int(block[3]) > 0
+        )
+        if not source_signature:
+            return 0
+        branch_channels = 0
+        if int(input_index) < len(input_shapes):
+            try:
+                branch_channels = int(tuple(input_shapes[int(input_index)])[1])
+            except Exception:
+                branch_channels = 0
+        if int(branch_channels) <= 0:
+            branch_channels = max(
+                (int(channel_start) + int(channel_count) for _h0, _h1, channel_start, channel_count in source_signature),
+                default=0,
+            )
+        block_pair_diagonal_counts: dict[tuple[int, int], int] = {}
+        for source_block, (source_h0, source_h1, source_c0, source_count) in enumerate(source_signature):
+            source_global_c0 = int(channel_offset + int(source_c0))
+            source_global_c1 = int(source_global_c0 + int(source_count))
+            for target_block, (target_h0, target_h1, target_c0, target_count) in enumerate(target_blocks):
+                h0 = max(int(source_h0), int(target_h0))
+                h1 = min(int(source_h1), int(target_h1))
+                c0 = max(int(source_global_c0), int(target_c0))
+                c1 = min(int(source_global_c1), int(target_c0 + target_count))
+                if int(h1) <= int(h0) or int(c1) <= int(c0):
+                    continue
+                key = (int(target_block), int(source_block))
+                block_pair_diagonal_counts[key] = int(
+                    block_pair_diagonal_counts.get(key, 0) + max(1, int(c1 - c0))
+                )
+        for diagonal_count in block_pair_diagonal_counts.values():
+            total += int(
+                _bsgs_hat_from_diagonal_count(
+                    int(diagonal_count),
+                    slots=int(slots),
+                )["rotations"]
+            )
+        channel_offset += int(branch_channels)
+    return int(total)
+
+
+def _layout_rotation_cache_key(raw: Any) -> tuple[Any, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, LayoutState):
+        return ("layout_state", raw.key())
+    try:
+        values = dict(raw)
+    except Exception:
+        return (repr(raw),)
+    return (
+        "layout_dict",
+        int(values.get("top_beta", values.get("alpha", 0)) or 0),
+        int(values.get("bottom_beta", values.get("beta", 0)) or 0),
+        int(values.get("physical_top_beta", values.get("top_beta", values.get("alpha", 0))) or 0),
+        int(values.get("physical_bottom_beta", values.get("bottom_beta", values.get("beta", 0))) or 0),
+        int(values.get("gap", 1) or 1),
+        int(values.get("stride", 1) or 1),
+        int(values.get("stored_slots", 0) or 0),
+        int(values.get("tile_count", 0) or 0),
+    )
+
+
 def _native_halo_stripe_rotation_stats_cache_key(
     edge: EdgeInfo,
     layout: LayoutState,
@@ -1858,6 +2040,10 @@ def _native_halo_stripe_rotation_stats_cache_key(
     provider_lt_grouping_mode: str,
     native_halo_channel_fold_mode: str,
     exact_compact_output: bool,
+    output_layout: Any = None,
+    source_storage_signature: Any = None,
+    target_storage_signature: Any = None,
+    require_native_target_fit: bool = True,
 ) -> tuple[Any, ...]:
     return (
         str(edge.op_kind),
@@ -1876,6 +2062,10 @@ def _native_halo_stripe_rotation_stats_cache_key(
         str(provider_lt_grouping_mode or "").strip().lower().replace("-", "_"),
         str(native_halo_channel_fold_mode or "").strip().lower().replace("-", "_"),
         bool(exact_compact_output),
+        _layout_rotation_cache_key(output_layout),
+        _storage_signature_cache_key(source_storage_signature),
+        _storage_signature_cache_key(target_storage_signature),
+        bool(require_native_target_fit),
     )
 
 
@@ -1903,6 +2093,10 @@ def _native_halo_stripe_rotation_stats(
     provider_lt_grouping_mode: str = "",
     native_halo_channel_fold_mode: str = "",
     exact_compact_output: bool = True,
+    output_layout: Any = None,
+    source_storage_signature: Any = None,
+    target_storage_signature: Any = None,
+    require_native_target_fit: bool = True,
 ) -> dict[str, dict[str, Any]] | None:
     cache_key = _native_halo_stripe_rotation_stats_cache_key(
         edge,
@@ -1910,11 +2104,15 @@ def _native_halo_stripe_rotation_stats(
         provider_lt_grouping_mode=str(provider_lt_grouping_mode),
         native_halo_channel_fold_mode=str(native_halo_channel_fold_mode),
         exact_compact_output=bool(exact_compact_output),
+        output_layout=output_layout,
+        source_storage_signature=source_storage_signature,
+        target_storage_signature=target_storage_signature,
+        require_native_target_fit=bool(require_native_target_fit),
     )
     if cache_key in _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE:
         return _copy_native_halo_stripe_rotation_stats(_NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key])
 
-    if str(edge.op_kind) != "conv2d":
+    if str(edge.op_kind) not in {"conv2d", "avgpool2d"}:
         _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
         return None
     if edge.output_shape is None:
@@ -1925,6 +2123,8 @@ def _native_halo_stripe_rotation_stats(
     padding = tuple(int(value) for value in edge.padding)
     dilation = tuple(int(value) for value in edge.dilation)
     groups = max(1, int(edge.groups or 1))
+    if str(edge.op_kind) == "avgpool2d":
+        groups = 1
     if len(kernel) < 2 or len(stride) < 2 or len(padding) < 2 or len(dilation) < 2:
         _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
         return None
@@ -1949,7 +2149,20 @@ def _native_halo_stripe_rotation_stats(
 
     c_in = max(1, int(edge.input_channels or edge.shape[1]))
     c_out = max(1, int(edge.output_channels or edge.output_shape[1]))
-    output_gap = _output_gap_for_edge(edge)
+    if isinstance(output_layout, LayoutState):
+        output_layout_dict: dict[str, Any] | None = output_layout.to_dict()
+    elif output_layout is not None:
+        try:
+            output_layout_dict = dict(output_layout)
+        except Exception:
+            output_layout_dict = None
+    else:
+        output_layout_dict = None
+    output_gap = (
+        max(1, int(dict(output_layout_dict).get("gap", _output_gap_for_edge(edge)) or _output_gap_for_edge(edge)))
+        if output_layout_dict is not None
+        else _output_gap_for_edge(edge)
+    )
     spec = NativeHaloConv2DSpec(
         family_label=(
             f"layout_policy_native_rotation_{edge.source}_{edge.target}"
@@ -1973,12 +2186,28 @@ def _native_halo_stripe_rotation_stats(
         slot_count=int(edge.slots),
         input_top_beta=int(layout.top_beta),
         input_bottom_beta=int(layout.bottom_beta),
-        output_top_beta=0,
-        output_bottom_beta=0,
+        output_top_beta=(
+            _layout_dict_top_beta(dict(output_layout_dict))
+            if output_layout_dict is not None
+            else 0
+        ),
+        output_bottom_beta=(
+            _layout_dict_bottom_beta(dict(output_layout_dict))
+            if output_layout_dict is not None
+            else 0
+        ),
         input_physical_top_beta=_layout_physical_top_beta(layout),
         input_physical_bottom_beta=_layout_physical_bottom_beta(layout),
-        output_physical_top_beta=0,
-        output_physical_bottom_beta=0,
+        output_physical_top_beta=(
+            _layout_dict_physical_top_beta(dict(output_layout_dict))
+            if output_layout_dict is not None
+            else 0
+        ),
+        output_physical_bottom_beta=(
+            _layout_dict_physical_bottom_beta(dict(output_layout_dict))
+            if output_layout_dict is not None
+            else 0
+        ),
     )
     requested_fold_mode = str(native_halo_channel_fold_mode or "heuristic")
     fold_mode = _native_halo_fast_fold_mode(
@@ -1988,8 +2217,10 @@ def _native_halo_stripe_rotation_stats(
     try:
         plan = native_halo_conv2d_plan(
             spec,
-            require_native_target_fit=True,
+            require_native_target_fit=bool(require_native_target_fit),
             channel_fold_mode=str(fold_mode),
+            source_storage_signature=source_storage_signature,
+            target_storage_signature=target_storage_signature,
         )
     except ValueError:
         _NATIVE_HALO_STRIPE_ROTATION_STATS_CACHE[cache_key] = None
@@ -2263,6 +2494,111 @@ def _pool_provider_single_slot_rotation_stats(edge: EdgeInfo) -> dict[str, int] 
     }
 
 
+class _TconvRotationParams:
+    def __init__(self, *, slots: int) -> None:
+        self._slots = int(slots)
+
+    def get_slots(self) -> int:
+        return int(self._slots)
+
+    def get_embedding_method(self) -> str:
+        return "hybrid"
+
+
+class _TconvRotationScheme:
+    def __init__(self, *, slots: int) -> None:
+        self.params = _TconvRotationParams(slots=int(slots))
+
+
+def _tconv_runtime_grouped_rotation_stats(
+    edge: EdgeInfo,
+    row: dict[str, Any],
+    *,
+    target_row: dict[str, Any],
+    individual_eval: bool = True,
+) -> dict[str, Any] | None:
+    if str(edge.op_kind) != "conv_transpose2d" or edge.module is None or edge.output_shape is None:
+        return None
+    source_signature = _storage_signature_cache_key(
+        row.get("native_halo_source_storage_signature") or ()
+    )
+    target_signature = _storage_signature_cache_key(
+        target_row.get("native_halo_target_storage_signature")
+        or row.get("consumer_native_source_stripe_target_signature")
+        or row.get("native_halo_target_storage_signature")
+        or ()
+    )
+    try:
+        input_layout = LayoutState(**dict(row.get("selected_layout", {}) or edge.compact.to_dict()))
+    except Exception:
+        input_layout = edge.compact
+    try:
+        output_layout = LayoutState(**dict(target_row.get("selected_layout", {}) or {}))
+    except Exception:
+        output_layout = _layout_for_shape(
+            shape=tuple(int(value) for value in edge.output_shape),
+            gap=_output_gap_for_edge(edge),
+            top_beta=0,
+            bottom_beta=0,
+            stride=1,
+            slots=int(edge.slots),
+        )
+
+    module = edge.module
+    attrs: dict[str, Any] = {
+        "input_shape": torch.Size(tuple(int(value) for value in edge.shape)),
+        "output_shape": torch.Size(tuple(int(value) for value in edge.output_shape)),
+        "fhe_input_shape": torch.Size(_fhe_shape_for_layout(shape=edge.shape, layout=input_layout)),
+        "fhe_output_shape": torch.Size(_fhe_shape_for_layout(shape=edge.output_shape, layout=output_layout)),
+        "input_gap": int(input_layout.gap),
+        "output_gap": int(output_layout.gap),
+        "layout_policy_input_layout": input_layout.to_dict(),
+        "layout_policy_output_layout": output_layout.to_dict(),
+        "layout_policy_input_physical_layout": (
+            PHYSICAL_NATIVE_SOURCE_STRIPE if source_signature else str(row.get("source_physical_layout", "") or "")
+        ),
+        "layout_policy_native_input_source_signature": [
+            [int(value) for value in item] for item in source_signature
+        ],
+        "layout_policy_output_materialization": (
+            "native_halo_stripe" if target_signature else str(target_row.get("native_halo_output_storage_layout", "") or "")
+        ),
+        "layout_policy_native_output_target_signature": [
+            [int(value) for value in item] for item in target_signature
+        ],
+    }
+    sentinel = object()
+    previous = {name: getattr(module, name, sentinel) for name in attrs}
+    try:
+        for name, value in attrs.items():
+            setattr(module, name, value)
+        from orion.experimental.u22_phase1 import TconvK2S2PythonRuntimeExecutor
+
+        executor = TconvK2S2PythonRuntimeExecutor(
+            module=module,
+            output_node_id=str(row.get("target", edge.target)),
+            use_ct_pt_hybrid_packing=True,
+            project_complex_inputs_to_real=True,
+        )
+        return executor.plan_rotation_stats_from_transforms(
+            scheme=_TconvRotationScheme(slots=int(edge.slots)),
+            level=0,
+            individual_eval=bool(individual_eval),
+        )
+    except Exception as exc:
+        row["tconv_runtime_grouped_rotation_stats_error"] = f"{type(exc).__name__}: {exc}"
+        return None
+    finally:
+        for name, value in previous.items():
+            if value is sentinel:
+                try:
+                    delattr(module, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(module, name, value)
+
+
 def _join_input_physical_layout(row: dict[str, Any]) -> dict[str, Any]:
     selected = dict(row.get("selected_layout", {}) or {})
     source_layout = dict(row.get("source_layout", {}) or selected)
@@ -2304,6 +2640,16 @@ def _concat_fused_conv_rotation_stats(
         int(edge.groups),
         int(edge.slots),
         str(row.get("source", "")),
+        _layout_rotation_cache_key(getattr(edge.module, "layout_policy_output_layout", None)),
+        str(getattr(edge.module, "layout_policy_output_materialization", "") or ""),
+        _storage_signature_cache_key(row.get("native_halo_source_storage_signature") or ()),
+        _storage_signature_cache_key(
+            row.get("native_halo_target_storage_signature")
+            or row.get("consumer_native_source_stripe_target_signature")
+            or ()
+        ),
+        str(row.get("provider_lt_grouping_mode", "")),
+        str(row.get("native_halo_channel_fold_mode", "")),
         tuple(
             (
                 str(spec.get("source", "")),
@@ -2325,6 +2671,8 @@ def _concat_fused_conv_rotation_stats(
                 str(candidate.get("source_physical_layout", "")),
                 str(candidate.get("target_physical_layout", "")),
                 str(candidate.get("physical_layout", "")),
+                repr(candidate.get("native_halo_source_storage_signature") or ()),
+                repr(candidate.get("native_halo_target_storage_signature") or ()),
                 bool(candidate.get("relayout", False)),
             )
             for candidate in edge_rows
@@ -2343,6 +2691,15 @@ def _concat_fused_conv_rotation_stats(
     except Exception:
         _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = None
         return None
+
+    def _parse_native_signature(raw: Any) -> tuple[tuple[int, int, int, int], ...]:
+        if not raw:
+            return ()
+        try:
+            parsed = tuple(tuple(int(value) for value in item) for item in raw)
+        except Exception:
+            return ()
+        return tuple(item for item in parsed if len(item) == 4)
 
     weight = getattr(module, "on_weight", None)
     if weight is None:
@@ -2418,6 +2775,38 @@ def _concat_fused_conv_rotation_stats(
             output_top_beta=int(output_top_beta),
             output_bottom_beta=int(output_bottom_beta),
         )
+        source_physical_layout = str(
+            join_row.get("source_physical_layout", join_row.get("physical_layout", "")) or ""
+        )
+        source_storage_signature = _parse_native_signature(
+            join_row.get("native_halo_source_storage_signature")
+            or join_row.get("consumer_native_source_stripe_signature")
+            or ()
+        )
+        target_storage_signature = _parse_native_signature(
+            row.get("native_halo_target_storage_signature")
+            or row.get("consumer_native_source_stripe_target_signature")
+            or ()
+        )
+        if source_physical_layout == PHYSICAL_NATIVE_SOURCE_STRIPE and source_storage_signature:
+            try:
+                plan = native_halo_conv2d_plan(
+                    native_spec,
+                    require_native_target_fit=False,
+                    source_storage_signature=tuple(source_storage_signature),
+                    target_storage_signature=tuple(target_storage_signature) or None,
+                )
+            except Exception:
+                if _cpp_diag_builder_strict_enabled():
+                    raise
+                _CONCAT_FUSED_ROTATION_STATS_CACHE[cache_key] = None
+                return None
+            total += int(plan.c_only_rotations)
+            baby += int(sum(int(value) for value in plan.program_rotation_counts))
+            giant += 0
+            transforms += int(plan.submatrix_program_count)
+            groups += int(plan.submatrix_program_count)
+            continue
         try:
             plan = native_halo_conv2d_plan(native_spec, require_native_target_fit=False)
             scheme = getattr(module, "scheme", None)
@@ -4143,18 +4532,19 @@ def _promote_no_share_native_stripe_producer_outputs(
         count = int(len(signature)) if signature else int(_node_native_ct_count(str(node)))
         if int(count) <= 0:
             return
+        source_node_native = (
+            str(dict(node_by_id.get(str(node), {}) or {}).get("physical_layout", ""))
+            == PHYSICAL_NATIVE_SOURCE_STRIPE
+        )
+        source_node_row = dict(node_by_id.get(str(node), {}) or {})
+        source_node_explicit_concat = bool(source_node_row.get("concat_explicit_native_materialization", False))
         for out_row in outgoing_by_source.get(str(node), []):
             source_native = (
-                str(out_row.get("source_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
-                or str(out_row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
-            )
-            target_native = (
-                str(out_row.get("target_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+                bool(source_node_native)
+                or str(out_row.get("source_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
                 or str(out_row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
             )
             if not bool(source_native):
-                continue
-            if not bool(target_native):
                 continue
             out_row["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
             if signature:
@@ -4163,6 +4553,9 @@ def _promote_no_share_native_stripe_producer_outputs(
             out_row["native_input_ct_count_estimate"] = int(count)
             out_row["native_ct_count"] = int(count)
             out_row["native_ct_count_estimate"] = int(count)
+            if bool(source_node_explicit_concat):
+                out_row["concat_explicit_native_materialization"] = True
+                out_row["concat_explicit_native_materialization_reason"] = "dp_concat_native_source_stripe_materialize"
 
     def _native_plan_target_ct_count(plan: Any | None) -> int:
         if plan is None:
@@ -4320,6 +4713,46 @@ def _promote_no_share_native_stripe_producer_outputs(
         return tuple(expected_storage_signature)
 
     def _project_concat_fused_native_output_signatures() -> None:
+        def _mark_concat_node_explicit_materialization(
+            concat_node: str,
+            *,
+            signature: tuple[tuple[int, int, int, int], ...],
+            reason: str,
+            materialize_rotation_estimate: int | None = None,
+        ) -> None:
+            if not signature:
+                return
+            rotations = int(
+                materialize_rotation_estimate
+                if materialize_rotation_estimate is not None
+                else max(1, len(signature))
+            )
+            existing = dict(node_by_id.get(str(concat_node), {}) or {})
+            updated = {
+                **existing,
+                "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "native_halo_output_storage_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
+                "native_halo_target_storage_signature": [
+                    [int(value) for value in item] for item in signature
+                ],
+                "native_physical_output_ct_count": int(len(signature)),
+                "native_output_ct_count": int(len(signature)),
+                "native_output_ct_count_estimate": int(len(signature)),
+                "fhe_shape": [int(len(signature)), int(slots)],
+                "output_relayout": True,
+                "output_relayout_reason": str(reason),
+                "concat_explicit_native_materialization": True,
+                "concat_explicit_native_materialization_reason": str(reason),
+                "producer_materialized_native_source_stripe": True,
+                "producer_native_source_stripe_reason": str(reason),
+                "layout_policy_output_materialization": "native_halo_stripe",
+                "relayout_rotation_estimate": int(max(0, rotations)),
+                "relayout_mask_mult_estimate": 0,
+                "relayout_sparse_lt_estimate": int(max(1, len(signature))),
+                "relayout_depth_estimate": 1,
+            }
+            node_by_id[str(concat_node)] = updated
+
         for row in rows:
             if str(row.get("op_kind", "")) != "conv2d":
                 continue
@@ -4330,7 +4763,11 @@ def _promote_no_share_native_stripe_producer_outputs(
             source_module = dag.nodes.get(source, {}).get("module")
             if type(source_module).__name__ != "Concat":
                 continue
+            source_node_row = dict(node_by_id.get(str(source), {}) or {})
+            source_node_explicit = bool(source_node_row.get("concat_explicit_native_materialization", False))
             if (
+                not bool(source_node_explicit)
+                and
                 str(row.get("source_physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE
                 and str(row.get("physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE
             ):
@@ -4344,6 +4781,27 @@ def _promote_no_share_native_stripe_producer_outputs(
             )
             if not target_signature:
                 continue
+            concat_output_signature = _parse_storage_signature(
+                row.get("native_halo_source_storage_signature")
+                or source_node_row.get("native_halo_target_storage_signature")
+                or ()
+            )
+            if not concat_output_signature:
+                row["producer_native_source_stripe_promotion_skipped_reason"] = (
+                    "concat_native_source_signature_unavailable"
+                )
+                continue
+            concat_inputs = tuple(incoming_by_target.get(str(source), ()))
+            if not concat_inputs or any(
+                str(input_row.get("source_physical_layout", input_row.get("physical_layout", "")) or "")
+                != PHYSICAL_NATIVE_SOURCE_STRIPE
+                or not _parse_storage_signature(input_row.get("native_halo_source_storage_signature") or ())
+                for input_row in concat_inputs
+            ):
+                row["producer_native_source_stripe_promotion_skipped_reason"] = (
+                    "concat_native_materializer_requires_all_native_source_inputs"
+                )
+                continue
             _set_row_native_target_signature(row, tuple(target_signature))
             _mark_node_native_target_signature(
                 target,
@@ -4351,7 +4809,155 @@ def _promote_no_share_native_stripe_producer_outputs(
                 reason="dp_concat_fused_native_source_stripe_output",
             )
             _sync_outgoing_native_source_rows_from_node(target)
+            edge = edge_by_id.get(str(row.get("edge", "")))
+            concat_fusion_mode = _concat_fusion_runtime_mode()
+            fused_stats = _concat_fused_conv_rotation_stats(edge, row, rows) if edge is not None else None
+            fused_rotation = int(
+                dict(fused_stats).get(
+                    "rotations",
+                    int(row.get("planner_rotation_cost_estimate", row.get("lt_bsgs_rotation_estimate", 0)) or 0),
+                )
+                if fused_stats is not None
+                else int(row.get("planner_rotation_cost_estimate", row.get("lt_bsgs_rotation_estimate", 0)) or 0)
+            )
+            normal_plan = _native_conv_plan_for_layouts(
+                edge,
+                input_layout=dict(row.get("selected_layout", {}) or {}),
+                output_layout=dict(target_row.get("selected_layout", row.get("target_layout", {})) or {}),
+                source_storage_signature=tuple(concat_output_signature),
+                target_storage_signature=tuple(target_signature) or None,
+                require_native_target_fit=bool(target_signature),
+            )
+            normal_rotation = int(getattr(normal_plan, "c_only_rotations", 0) or 0)
+            normal_transforms = int(getattr(normal_plan, "submatrix_program_count", 0) or 0)
+            if int(normal_rotation) <= 0:
+                normal_rotation = int(row.get("planner_rotation_cost_estimate", row.get("lt_bsgs_rotation_estimate", 0)) or 0)
+            if int(normal_transforms) <= 0:
+                normal_transforms = int(row.get("lt_transform_count_estimate", 0) or 0)
+            try:
+                input_sources = [str(value) for value in dag.predecessors(str(source))]
+            except Exception:
+                input_sources = [str(input_row.get("source", "")) for input_row in concat_inputs]
+            materialize_rotation = _concat_native_materialize_rotation_estimate_for_rows(
+                input_rows=concat_inputs,
+                target_signature=tuple(concat_output_signature),
+                input_sources=input_sources,
+                input_shapes=tuple(getattr(source_module, "concat_input_shapes", ()) or ()),
+                slots=int(slots),
+            )
+            if int(materialize_rotation) <= 0:
+                materialize_rotation = int(max(1, len(concat_output_signature)))
+            explicit_total = int(normal_rotation + materialize_rotation)
+            choose_explicit = bool(
+                bool(source_node_explicit)
+                or str(concat_fusion_mode) == "off"
+                or (
+                    str(concat_fusion_mode) == "auto"
+                    and int(fused_rotation) > 0
+                    and int(explicit_total) < int(fused_rotation)
+                )
+            )
+            if bool(choose_explicit):
+                reason = (
+                    "dp_concat_native_source_stripe_materialize"
+                    if bool(source_node_explicit)
+                    else (
+                        "dp_concat_native_source_stripe_materialize_fusion_disabled"
+                        if str(concat_fusion_mode) == "off"
+                        else "dp_concat_native_source_stripe_materialize_auto_cheaper"
+                    )
+                )
+                _mark_concat_node_explicit_materialization(
+                    source,
+                    signature=tuple(concat_output_signature),
+                    reason=reason,
+                    materialize_rotation_estimate=int(materialize_rotation),
+                )
+                _sync_outgoing_native_source_rows_from_node(source)
+                for key in (
+                    "concat_native_runtime_materializer",
+                    "concat_native_runtime_materializer_reason",
+                    "concat_fused_native_output_signature_projected",
+                    "concat_fusion_runtime_estimate",
+                    "concat_fusion_native_source_runtime_estimate",
+                ):
+                    row.pop(key, None)
+                row["concat_explicit_native_materialization"] = True
+                row["concat_explicit_native_materialization_reason"] = str(reason)
+                row["consumer_fused_relayout"] = False
+                row["consumer_fused_relayout_reason"] = ""
+                row["consumer_fused_rotation_estimate"] = 0
+                row["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                row["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                row["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                row["layout_mode"] = "native_halo_stripe"
+                row["relayout"] = False
+                row["relayout_reason"] = ""
+                row["relayout_rotation_estimate"] = 0
+                row["relayout_mask_mult_estimate"] = 0
+                row["relayout_sparse_lt_estimate"] = 0
+                row["relayout_depth_estimate"] = 0
+                if int(normal_rotation) > 0:
+                    _row_set_rotation_stats(
+                        row,
+                        rotations=int(normal_rotation),
+                        transform_count=int(normal_transforms),
+                        estimator="native_halo_plan_explicit_concat_materialization",
+                        extra={
+                            "rotation_report_source": "explicit_concat_native_materialization_auto_plan",
+                            "rotation_eval_count_mode": "independent_transform_bsgs",
+                            "native_halo_rotation_estimator": "native_halo_plan_explicit_concat_materialization",
+                            "native_halo_rotation_mode": "c_only",
+                            "native_halo_runtime_signature_estimate": True,
+                        },
+                    )
+                row["concat_fusion_auto_decision"] = "explicit"
+                row["concat_fusion_mode"] = str(concat_fusion_mode)
+                row["concat_fusion_fused_rotation_estimate"] = int(fused_rotation)
+                row["concat_fusion_normal_rotation_estimate"] = int(normal_rotation)
+                row["concat_fusion_materialize_rotation_estimate"] = int(materialize_rotation)
+                row["concat_fusion_explicit_total_rotation_estimate"] = int(explicit_total)
+                row.pop("producer_native_source_stripe_promotion_skipped_reason", None)
+                continue
             row["concat_fused_native_output_signature_projected"] = True
+            row["concat_native_runtime_materializer"] = True
+            row["concat_native_runtime_materializer_reason"] = "dp_concat_fused_native_source_stripe_output"
+            row["consumer_fused_relayout"] = True
+            row["consumer_fused_relayout_reason"] = "dp_concat_fused_native_source_stripe_output"
+            row["relayout"] = False
+            row["relayout_reason"] = ""
+            row["relayout_rotation_estimate"] = 0
+            row["relayout_mask_mult_estimate"] = 0
+            row["relayout_sparse_lt_estimate"] = 0
+            row["relayout_depth_estimate"] = 0
+            row["concat_fusion_auto_decision"] = "fused"
+            row["concat_fusion_mode"] = str(concat_fusion_mode)
+            row["concat_fusion_fused_rotation_estimate"] = int(fused_rotation)
+            row["concat_fusion_normal_rotation_estimate"] = int(normal_rotation)
+            row["concat_fusion_materialize_rotation_estimate"] = int(materialize_rotation)
+            row["concat_fusion_explicit_total_rotation_estimate"] = int(explicit_total)
+            if edge is not None:
+                concat_stats = fused_stats
+                if concat_stats is not None:
+                    _row_set_rotation_stats(
+                        row,
+                        rotations=int(concat_stats["rotations"]),
+                        transform_count=int(concat_stats["transforms"]),
+                        baby_rotations=int(concat_stats["baby_rotations"]),
+                        giant_rotations=int(concat_stats["giant_rotations"]),
+                        bsgs_groups=int(concat_stats["bsgs_groups"]),
+                        estimator="concat_fused_native_source_stripe_unified_plan",
+                        extra={
+                            "rotation_report_source": "native_concat_fused_source_signature_plan",
+                            "rotation_eval_count_mode": "independent_transform_bsgs",
+                            "concat_fusion_runtime_estimate": True,
+                            "concat_fusion_native_source_runtime_estimate": True,
+                            "native_halo_rotation_estimator": "concat_fused_native_source_stripe_unified_plan",
+                            "native_halo_rotation_exact_native_output": True,
+                            "native_halo_rotation_mode": "c_only",
+                            "native_halo_rotation_search_surrogate": "",
+                        },
+                    )
             row.pop("producer_native_source_stripe_promotion_skipped_reason", None)
 
     def _propagate_layout_preserving_native_signatures() -> None:
@@ -4359,11 +4965,7 @@ def _promote_no_share_native_stripe_producer_outputs(
         while bool(changed):
             changed = False
             for row in rows:
-                if bool(row.get("relayout", False)):
-                    continue
                 if str(row.get("source_physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
-                    continue
-                if str(row.get("target_physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
                     continue
                 target = str(row.get("target", ""))
                 source = str(row.get("source", ""))
@@ -4377,27 +4979,46 @@ def _promote_no_share_native_stripe_producer_outputs(
                     continue
                 current_count = _node_native_ct_count(target)
                 existing = dict(node_by_id.get(target, {}) or {})
-                if str(existing.get("physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
-                    continue
                 source_signature = _node_target_storage_signature(source)
                 current_signature = _node_target_storage_signature(target)
                 if (
-                    int(current_count) == int(source_count)
+                    str(existing.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+                    and int(current_count) == int(source_count)
                     and (not source_signature or tuple(current_signature) == tuple(source_signature))
                 ):
                     continue
                 updated = {
                     **existing,
+                    "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
                     "native_halo_output_storage_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
                     "native_physical_output_ct_count": int(source_count),
                     "native_output_ct_count": int(source_count),
                     "native_output_ct_count_estimate": int(source_count),
+                    "producer_materialized_native_source_stripe": True,
+                    "producer_native_source_stripe_reason": "dp_transparent_native_source_stripe_carry",
                 }
                 if source_signature:
                     updated["native_halo_target_storage_signature"] = [
                         [int(value) for value in item] for item in source_signature
                     ]
                 node_by_id[str(target)] = dict(updated)
+                row["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                row["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                row["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                row["relayout"] = False
+                row["relayout_reason"] = ""
+                row["relayout_rotation_estimate"] = 0
+                row["relayout_mask_mult_estimate"] = 0
+                row["relayout_sparse_lt_estimate"] = 0
+                row["relayout_depth_estimate"] = 0
+                row["producer_materialized_native_source_stripe"] = True
+                if source_signature:
+                    _set_row_native_source_signature(row, tuple(source_signature))
+                elif int(source_count) > 0:
+                    row["native_input_ct_count"] = int(source_count)
+                    row["native_input_ct_count_estimate"] = int(source_count)
+                    row["native_ct_count"] = int(source_count)
+                    row["native_ct_count_estimate"] = int(source_count)
                 _sync_outgoing_native_source_rows_from_node(target)
                 changed = True
 
@@ -4740,6 +5361,7 @@ def _promote_no_share_native_stripe_producer_outputs(
         if not parsed_signature:
             continue
         existing = dict(node_by_id.get(source, {}) or {})
+        explicit_concat_materialization = bool(existing.get("concat_explicit_native_materialization", False))
         node_by_id[str(source)] = {
             **existing,
             "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
@@ -4751,11 +5373,175 @@ def _promote_no_share_native_stripe_producer_outputs(
             "native_output_ct_count": int(len(parsed_signature)),
             "native_output_ct_count_estimate": int(len(parsed_signature)),
             "producer_materialized_native_source_stripe": True,
-            "producer_native_source_stripe_reason": "dp_concat_native_source_stripe_forward",
+            "producer_native_source_stripe_reason": (
+                "dp_concat_native_source_stripe_materialize"
+                if bool(explicit_concat_materialization)
+                else "dp_concat_native_source_stripe_forward"
+            ),
         }
 
     _project_concat_fused_native_output_signatures()
     _propagate_layout_preserving_native_signatures()
+    for node in tuple(node_by_id):
+        _sync_outgoing_native_source_rows_from_node(str(node))
+
+    def _recount_native_conv_rotation_rows_with_signatures() -> None:
+        for row in rows:
+            op_kind = str(row.get("op_kind", ""))
+            if op_kind not in {"conv2d", "avgpool2d"}:
+                continue
+            if op_kind == "conv2d" and str(row.get("layout_mode", "")) != "native_halo_stripe":
+                continue
+            if bool(row.get("concat_native_runtime_materializer", False)):
+                continue
+            source = str(row.get("source", ""))
+            source_module = (
+                dag.nodes.get(source, {}).get("module")
+                if source in getattr(dag, "nodes", {})
+                else None
+            )
+            if (
+                op_kind == "conv2d"
+                and type(source_module).__name__ == "Concat"
+                and not bool(row.get("concat_explicit_native_materialization", False))
+            ):
+                continue
+            edge = edge_by_id.get(str(row.get("edge", "")))
+            if edge is None:
+                continue
+            try:
+                input_layout = LayoutState(**dict(row.get("selected_layout", {}) or {}))
+            except Exception:
+                continue
+            target = str(row.get("target", ""))
+            target_row = dict(node_by_id.get(target, {}) or {})
+            output_layout = dict(target_row.get("selected_layout", {}) or {})
+            source_signature = _parse_storage_signature(
+                row.get("native_halo_source_storage_signature") or ()
+            )
+            target_signature = _parse_storage_signature(
+                target_row.get("native_halo_target_storage_signature")
+                or row.get("consumer_native_source_stripe_target_signature")
+                or row.get("native_halo_target_storage_signature")
+                or ()
+            )
+            if not output_layout and not source_signature and not target_signature:
+                continue
+            if op_kind == "avgpool2d" and not target_signature:
+                continue
+            stats = _native_halo_stripe_rotation_stats(
+                edge,
+                input_layout,
+                provider_lt_grouping_mode=str(row.get("provider_lt_grouping_mode", "individual") or "individual"),
+                native_halo_channel_fold_mode=str(row.get("native_halo_channel_fold_mode", "per_stripe") or "per_stripe"),
+                exact_compact_output=not bool(target_signature),
+                output_layout=output_layout if output_layout else None,
+                source_storage_signature=source_signature,
+                target_storage_signature=target_signature,
+                require_native_target_fit=bool(target_signature),
+            )
+            if stats is None:
+                continue
+            lt_stats = dict(stats["lt_stats"])
+            explicit_concat_materialization = bool(row.get("concat_explicit_native_materialization", False))
+            estimator = (
+                "native_halo_plan_explicit_concat_materialization"
+                if bool(explicit_concat_materialization)
+                else "native_halo_plan_runtime_signature"
+            )
+            _row_set_rotation_stats(
+                row,
+                rotations=int(lt_stats["rotations"]),
+                transform_count=int(lt_stats["transforms"]),
+                baby_rotations=int(lt_stats["baby_rotations"]),
+                giant_rotations=int(lt_stats["giant_rotations"]),
+                bsgs_groups=int(lt_stats["bsgs_groups"]),
+                local_programs=int(lt_stats["local_programs"]),
+                ct_pt_mults=int(lt_stats["ct_pt_mults"]),
+                estimator=str(estimator),
+                extra={
+                    **dict(stats["audit"]),
+                    "native_halo_rotation_mode": str(dict(stats["audit"]).get("native_halo_rotation_mode", "c_only")),
+                    "native_halo_runtime_signature_estimate": True,
+                    "native_halo_runtime_signature_source_ct_count": int(len(source_signature)),
+                    "native_halo_runtime_signature_target_ct_count": int(len(target_signature)),
+                },
+            )
+            if bool(explicit_concat_materialization):
+                materialize_rotation = int(row.get("concat_fusion_materialize_rotation_estimate", 0) or 0)
+                row["concat_fusion_normal_rotation_estimate"] = int(lt_stats["rotations"])
+                row["concat_fusion_explicit_total_rotation_estimate"] = int(
+                    int(lt_stats["rotations"]) + int(materialize_rotation)
+                )
+
+    _recount_native_conv_rotation_rows_with_signatures()
+
+    def _recount_native_tconv_rotation_rows_with_signatures() -> None:
+        for row in rows:
+            if str(row.get("op_kind", "")) != "conv_transpose2d":
+                continue
+            edge = edge_by_id.get(str(row.get("edge", "")))
+            if edge is None:
+                continue
+            target = str(row.get("target", ""))
+            target_row = dict(node_by_id.get(target, {}) or {})
+            if not target_row:
+                continue
+            stats = _tconv_runtime_grouped_rotation_stats(
+                edge,
+                row,
+                target_row=target_row,
+                individual_eval=True,
+            )
+            if stats is None:
+                continue
+            source_signature = _parse_storage_signature(
+                row.get("native_halo_source_storage_signature") or ()
+            )
+            target_signature = _parse_storage_signature(
+                target_row.get("native_halo_target_storage_signature")
+                or row.get("consumer_native_source_stripe_target_signature")
+                or row.get("native_halo_target_storage_signature")
+                or ()
+            )
+            _row_set_rotation_stats(
+                row,
+                rotations=int(stats["rotations"]),
+                transform_count=int(stats["transforms"]),
+                baby_rotations=int(stats["baby_rotations"]),
+                giant_rotations=int(stats["giant_rotations"]),
+                bsgs_groups=int(stats["bsgs_groups"]),
+                estimator="tconv_runtime_grouped_bsgs_plan",
+                extra={
+                    "rotation_report_source": str(stats.get("source", "planned_tconv_runtime_transform_groups")),
+                    "rotation_eval_count_mode": str(stats.get("rotation_eval_count_mode", "independent_transform_bsgs")),
+                    "tconv_runtime_signature_estimate": True,
+                    "tconv_runtime_signature_source_ct_count": int(len(source_signature)),
+                    "tconv_runtime_signature_target_ct_count": int(len(target_signature)),
+                    "tconv_runtime_group_count": int(stats.get("runtime_group_count", 0) or 0),
+                    "tconv_runtime_transform_count": int(stats.get("runtime_transform_count", 0) or 0),
+                    "tconv_transform_rotation_key_count_total": int(
+                        stats.get("transform_rotation_key_count_total", 0) or 0
+                    ),
+                    "tconv_shared_rotation_eval_count_total": int(
+                        stats.get("shared_rotation_eval_count_total", 0) or 0
+                    ),
+                    "tconv_unique_rotation_key_count": int(stats.get("unique_rotation_key_count", 0) or 0),
+                    "tconv_output_rotations_per_output_ct": int(stats.get("output_rotations", 0) or 0),
+                    "tconv_output_rotation_eval_count": int(stats.get("output_rotation_eval_count", 0) or 0),
+                    "tconv_hybrid_pair_count": int(stats.get("hybrid_pair_count", 0) or 0),
+                    "tconv_hybrid_pair_rejected_count": int(stats.get("hybrid_pair_rejected_count", 0) or 0),
+                    "tconv_hybrid_pair_layout_strategy": str(stats.get("hybrid_pair_layout_strategy", "")),
+                    "tconv_hybrid_pair_layout_strict_pair_count": int(
+                        stats.get("hybrid_pair_layout_strict_pair_count", 0) or 0
+                    ),
+                    "tconv_hybrid_pair_layout_covered_output_count": int(
+                        stats.get("hybrid_pair_layout_covered_output_count", 0) or 0
+                    ),
+                },
+            )
+
+    _recount_native_tconv_rotation_rows_with_signatures()
 
     ordered_nodes: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -5467,6 +6253,7 @@ def _plan_non_dp_topological(
                         output_layout=output_layout,
                         producer_fused=producer_fused,
                         slots=int(slots),
+                        allow_tconv_native_output=False,
                     )
                     logical_halo_materialized = bool(
                         str(output_physical) == PHYSICAL_LOGICAL_HALO
@@ -5741,8 +6528,14 @@ def _prune_dp_frontier(
     return dict(ranked[: int(DP_FRONTIER_STATE_LIMIT)])
 
 
-def _layout_halo_slot_cost(layout: LayoutState | None) -> float:
+def _layout_halo_slot_cost(layout: LayoutState | None, *, physical_layout: str = "") -> float:
     if layout is None:
+        return 0.0
+    if (
+        str(physical_layout) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and int(_layout_physical_top_beta(layout)) == 0
+        and int(_layout_physical_bottom_beta(layout)) == 0
+    ):
         return 0.0
     return float(max(0, int(layout.stored_slots) - int(layout.core_slots)))
 
@@ -5751,6 +6544,12 @@ def _row_layout_halo_slot_cost(row: dict[str, Any]) -> float:
     layout = dict(row.get("selected_layout", {}) or {})
     if not layout:
         return 0.0
+    if (
+        str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        and int(layout.get("physical_top_beta", layout.get("top_beta", 0)) or 0) == 0
+        and int(layout.get("physical_bottom_beta", layout.get("bottom_beta", 0)) or 0) == 0
+    ):
+        return 0.0
     return float(max(0, int(layout.get("stored_slots", 0) or 0) - int(layout.get("core_slots", 0) or 0)))
 
 
@@ -5758,12 +6557,20 @@ def _dp_layout_secondary_cost(
     *,
     incoming_rows: Sequence[dict[str, Any]],
     output_layout: LayoutState | None,
+    output_physical_layout: str = "",
     output_relayouts: Sequence[LayoutState],
+    producer_fused_materialization: bool = False,
 ) -> float:
     return (
         float(sum(_row_layout_halo_slot_cost(row) for row in incoming_rows))
-        + _layout_halo_slot_cost(output_layout)
+        + _layout_halo_slot_cost(output_layout, physical_layout=str(output_physical_layout))
         + float(sum(_layout_halo_slot_cost(layout) for layout in output_relayouts))
+        + (
+            1.0
+            if bool(producer_fused_materialization)
+            and str(output_physical_layout) == PHYSICAL_NATIVE_SOURCE_STRIPE
+            else 0.0
+        )
     )
 
 
@@ -5828,6 +6635,7 @@ def _input_layout_for_output_demand(
     output_layout: LayoutState,
     *,
     slots: int,
+    single_ct_shortcut: bool = True,
 ) -> LayoutState | None:
     if not isinstance(module, (AvgPool2d, Conv2d, ConvTranspose2d)):
         return None
@@ -5836,6 +6644,7 @@ def _input_layout_for_output_demand(
         input_edge,
         output_layout,
         slots=int(slots),
+        single_ct_shortcut=bool(single_ct_shortcut),
     )
 
 
@@ -5870,6 +6679,49 @@ def _source_transitive_input_layout_candidates(
         )
         if candidate is not None and not _same_layout(candidate, edge.requirement):
             candidates.append(candidate)
+    return _dedupe_layouts(candidates)
+
+
+def _producer_transitive_output_layout_candidates(
+    outgoing: Sequence[EdgeInfo],
+    *,
+    edges_by_source: dict[str, list[EdgeInfo]] | None,
+    slots: int,
+) -> tuple[LayoutState, ...]:
+    """Offer producer layouts for a single producer -> consumer -> successor chain."""
+
+    if edges_by_source is None or len(outgoing) != 1:
+        return ()
+    edge = outgoing[0]
+    consumer_module = edge.module
+    if not isinstance(consumer_module, (AvgPool2d, Conv2d, ConvTranspose2d)):
+        return ()
+    consumer_outgoing = tuple(edges_by_source.get(str(edge.target), ()))
+    if len(consumer_outgoing) != 1:
+        return ()
+    output_edge = consumer_outgoing[0]
+    output_demands = _dedupe_layouts((output_edge.requirement, *tuple(output_edge.future_layouts)))
+    candidates: list[LayoutState] = []
+    base_tile_count = max(1, int(edge.requirement.tile_count))
+    for demand in output_demands:
+        if int(demand.top_beta) == 0 and int(demand.bottom_beta) == 0:
+            continue
+        candidate = _input_layout_for_output_demand(
+            consumer_module,
+            edge,
+            demand,
+            slots=int(slots),
+            single_ct_shortcut=False,
+        )
+        if candidate is None or _same_layout(candidate, edge.requirement):
+            continue
+        if int(candidate.top_beta) > 2 or int(candidate.bottom_beta) > 2:
+            continue
+        if int(candidate.gap) != int(edge.compact.gap):
+            continue
+        if int(candidate.tile_count) > int(base_tile_count) + 1:
+            continue
+        candidates.append(candidate)
     return _dedupe_layouts(candidates)
 
 
@@ -5948,6 +6800,8 @@ def _producer_fused_output_layout_candidates(
     module: Any | None,
     *,
     outgoing: Sequence[EdgeInfo],
+    edges_by_source: dict[str, list[EdgeInfo]] | None = None,
+    source_transitive_output_candidates: bool = False,
     slots: int,
 ) -> tuple[LayoutState, ...]:
     if not outgoing or not _producer_fused_output_allowed(module):
@@ -5955,6 +6809,14 @@ def _producer_fused_output_layout_candidates(
     edge = outgoing[0]
     layouts: list[LayoutState] = []
     local_need = _max_layout(outgoing, slots=int(slots))
+    if bool(source_transitive_output_candidates) and bool(TRANSITIVE_PRODUCER_OUTPUT_EXPERIMENTAL):
+        layouts.extend(
+            _producer_transitive_output_layout_candidates(
+                outgoing,
+                edges_by_source=edges_by_source,
+                slots=int(slots),
+            )
+        )
     if int(local_need.top_beta) > 0 or int(local_need.bottom_beta) > 0:
         # Producer fusion may materialize consumer-demanded halo, but DP should
         # not inflate that halo merely to fill otherwise unused tile capacity.
@@ -5981,6 +6843,8 @@ def _tconv_output_layout_candidates(
     *,
     incoming_rows: Sequence[dict[str, Any]],
     outgoing: Sequence[EdgeInfo],
+    edges_by_source: dict[str, list[EdgeInfo]] | None = None,
+    source_transitive_output_candidates: bool = False,
     slots: int,
 ) -> tuple[LayoutState, ...]:
     if not outgoing:
@@ -6001,7 +6865,15 @@ def _tconv_output_layout_candidates(
     # placement, write compact output, or explicitly materialize additional
     # halo beyond the natural output layout.
     layouts.append(edge.compact)
-    layouts.extend(_producer_fused_output_layout_candidates(module, outgoing=outgoing, slots=int(slots)))
+    layouts.extend(
+        _producer_fused_output_layout_candidates(
+            module,
+            outgoing=outgoing,
+            edges_by_source=edges_by_source,
+            source_transitive_output_candidates=bool(source_transitive_output_candidates),
+            slots=int(slots),
+        )
+    )
     return _dedupe_layouts(layouts)
 
 
@@ -6010,6 +6882,8 @@ def _operator_output_layout_candidates(
     *,
     incoming_rows: Sequence[dict[str, Any]],
     outgoing: Sequence[EdgeInfo],
+    edges_by_source: dict[str, list[EdgeInfo]] | None = None,
+    source_transitive_output_candidates: bool = False,
     slots: int,
 ) -> tuple[LayoutState, ...]:
     if not outgoing:
@@ -6032,7 +6906,15 @@ def _operator_output_layout_candidates(
         for row in incoming_rows
     ):
         layouts.append(edge.compact)
-    layouts.extend(_producer_fused_output_layout_candidates(module, outgoing=outgoing, slots=int(slots)))
+    layouts.extend(
+        _producer_fused_output_layout_candidates(
+            module,
+            outgoing=outgoing,
+            edges_by_source=edges_by_source,
+            source_transitive_output_candidates=bool(source_transitive_output_candidates),
+            slots=int(slots),
+        )
+    )
     return _dedupe_layouts(layouts)
 
 
@@ -6069,7 +6951,10 @@ def _dp_output_layout_candidates(
                 and str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
                 and str(row.get("source_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
                 and str(row.get("target_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
-                and not bool(row.get("relayout", False))
+                and (
+                    not bool(row.get("relayout", False))
+                    or str(row.get("relayout_reason", "")) == "dp_native_source_stripe_relayout"
+                )
                 for row in incoming_rows
             )
         )
@@ -6090,12 +6975,16 @@ def _dp_output_layout_candidates(
             module,
             incoming_rows=incoming_rows,
             outgoing=outgoing,
+            edges_by_source=edges_by_source,
+            source_transitive_output_candidates=bool(source_transitive_input_candidates),
             slots=int(slots),
         )
     return _operator_output_layout_candidates(
         module,
         incoming_rows=incoming_rows,
         outgoing=outgoing,
+        edges_by_source=edges_by_source,
+        source_transitive_output_candidates=bool(source_transitive_input_candidates),
         slots=int(slots),
     )
 
@@ -6107,6 +6996,7 @@ def _output_physical_layout(
     output_layout: LayoutState,
     producer_fused: dict[str, Any],
     slots: int,
+    allow_tconv_native_output: bool = False,
 ) -> str:
     if type(module).__name__ == "Concat" and incoming_rows:
         physicals = {
@@ -6133,14 +7023,17 @@ def _output_physical_layout(
                 return PHYSICAL_LOGICAL_HALO
             return PHYSICAL_NATIVE_SOURCE_STRIPE
     if isinstance(module, ConvTranspose2d):
-        if any(str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE for row in incoming_rows):
-            output_shape = tuple(int(value) for value in getattr(module, "output_shape", ()) or ())
-            if len(output_shape) == 4 and _tconv_native_target_storage_signature(
-                shape=output_shape,
-                layout=output_layout.to_dict(),
-                slots=int(slots),
-            ):
-                return PHYSICAL_NATIVE_SOURCE_STRIPE
+        output_shape = tuple(int(value) for value in getattr(module, "output_shape", ()) or ())
+        if (
+            bool(allow_tconv_native_output)
+            and len(output_shape) == 4
+            and _tconv_native_target_storage_signature(
+            shape=output_shape,
+            layout=output_layout.to_dict(),
+            slots=int(slots),
+            )
+        ):
+            return PHYSICAL_NATIVE_SOURCE_STRIPE
     if int(output_layout.top_beta) == 0 and int(output_layout.bottom_beta) == 0:
         return PHYSICAL_COMPACT
     if bool(producer_fused.get("enabled", False)):
@@ -6405,13 +7298,18 @@ def enumerate_execution_candidates(
                     )
                 )
         else:
+            target_physical = (
+                _physical_for_candidate(selected_layout, layout_mode="halo_local")
+                if str(edge.op_kind) in {"avgpool2d", "conv_transpose2d"}
+                else str(source_physical)
+            )
             candidates.append(
                 ExecutionCandidate(
                     edge=edge,
                     source_layout=source_layout,
                     target_layout=selected_layout,
                     source_physical=str(source_physical),
-                    target_physical=str(source_physical),
+                    target_physical=str(target_physical),
                     )
                 )
     if str(edge.source) == "x":
@@ -6614,6 +7512,7 @@ def _incoming_add_options(
     candidates: list[LayoutState] = []
     if incoming:
         candidates.append(incoming[0].compact)
+    native_target_keys: set[tuple[int, ...]] = set()
     native_concat_layout: LayoutState | None = None
     if source_layouts and all(str(edge.op_kind) == "concat" for edge in incoming):
         native_concat_sources = [
@@ -6623,6 +7522,30 @@ def _incoming_add_options(
         first_layout = source_layouts[0]
         if all(native_concat_sources) and all(_same_physical_layout(first_layout, layout) for layout in source_layouts):
             native_concat_layout = first_layout
+        if bool(CONCAT_NATIVE_TARGET_RELAYOUT_EXPERIMENTAL) and bool(force_compact_join) and all(native_concat_sources):
+            common_future_layouts: list[LayoutState] = []
+            first_futures = tuple(incoming[0].future_layouts)
+            for layout in first_futures:
+                if int(layout.top_beta) > 2 or int(layout.bottom_beta) > 2:
+                    continue
+                if int(layout.tile_count) > int(incoming[0].requirement.tile_count) + 1:
+                    continue
+                if any(int(live[edge.source].tile_count) <= 0 for edge in incoming):
+                    continue
+                if all(
+                    any(
+                        _same_physical_layout(layout, other)
+                        and int(layout.stride) == int(other.stride)
+                        and int(layout.gap) == int(other.gap)
+                        and int(other.tile_count) <= int(edge.requirement.tile_count) + 1
+                        for other in edge.future_layouts
+                    )
+                    for edge in incoming[1:]
+                ):
+                    common_future_layouts.append(layout)
+            for layout in common_future_layouts:
+                candidates.append(layout)
+                native_target_keys.add(layout.key())
     if native_concat_layout is not None:
         candidates.append(native_concat_layout)
     if source_layouts and not bool(force_compact_join) and native_concat_layout is None:
@@ -6655,30 +7578,47 @@ def _incoming_add_options(
                 target_layout,
                 op_kind=str(edge.op_kind),
             )
+            native_concat_target = bool(
+                str(edge.op_kind) == "concat"
+                and str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE
+                and target_layout.key() in native_target_keys
+            )
             native_concat_passthrough = bool(
                 str(edge.op_kind) == "concat"
                 and str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE
                 and not bool(relayout)
             )
+            if (
+                str(edge.op_kind) == "concat"
+                and str(source_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE
+                and not bool(native_concat_passthrough or native_concat_target)
+            ):
+                relayout = True
             if bool(relayout):
                 relayouts.append(target_layout)
-            rows.append(
-                _edge_row(
-                    edge,
-                    target_layout,
-                    relayout=bool(relayout),
-                    relayout_reason="dp_add_input_alignment" if bool(relayout) else "",
-                    lt_rotations=_lt_rotations(edge, target_layout),
-                    layout_mode="native_halo_stripe" if bool(native_concat_passthrough) else "halo_local",
-                    source_layout=physical_source_layout,
-                    source_physical_layout=str(source_physical),
-                    physical_layout=(
-                        PHYSICAL_NATIVE_SOURCE_STRIPE
-                        if bool(native_concat_passthrough)
-                        else _compact_packing_for_layout(target_layout)
-                    ),
-                )
+            row = _edge_row(
+                edge,
+                target_layout,
+                relayout=bool(relayout),
+                relayout_reason=(
+                    "dp_native_source_stripe_relayout"
+                    if bool(native_concat_target) and bool(relayout)
+                    else ("dp_add_input_alignment" if bool(relayout) else "")
+                ),
+                lt_rotations=_lt_rotations(edge, target_layout),
+                layout_mode="native_halo_stripe" if bool(native_concat_passthrough or native_concat_target) else "halo_local",
+                source_layout=physical_source_layout,
+                source_physical_layout=str(source_physical),
+                physical_layout=(
+                    PHYSICAL_NATIVE_SOURCE_STRIPE
+                    if bool(native_concat_passthrough or native_concat_target)
+                    else _compact_packing_for_layout(target_layout)
+                ),
             )
+            if bool(native_concat_target):
+                row["concat_explicit_native_materialization"] = True
+                row["concat_explicit_native_materialization_reason"] = "dp_concat_native_target_relayout_candidate"
+            rows.append(row)
         options.append((rows, relayouts))
     return tuple(options)
 
@@ -6691,6 +7631,12 @@ def _plan_dp(
     estimator: str | None = None,
     no_share_fold: bool = False,
 ) -> PolicyPlan:
+    if (
+        bool(no_share_fold)
+        and bool(TRANSITIVE_PRODUCER_OUTPUT_EXPERIMENTAL)
+        and bool(CONCAT_NATIVE_TARGET_RELAYOUT_EXPERIMENTAL)
+    ):
+        edges = _with_concat_transitive_future_layouts(dag, edges, slots=int(slots))
     edges_by_source: dict[str, list[EdgeInfo]] = {}
     edges_by_target: dict[str, list[EdgeInfo]] = {}
     for edge in edges:
@@ -6801,8 +7747,6 @@ def _plan_dp(
                             and not _is_join_module(module)
                             and not _direct_output_layout_without_relayout(module)
                         )
-                        if bool(output_relayout):
-                            output_relayouts.append(output_layout)
                         if not incoming and str(node) == "x":
                             output_physical = PHYSICAL_COMPACT
                         else:
@@ -6812,7 +7756,23 @@ def _plan_dp(
                                 output_layout=output_layout,
                                 producer_fused=producer_fused,
                                 slots=int(slots),
+                                allow_tconv_native_output=(
+                                    bool(no_share_fold) and bool(TRANSITIVE_PRODUCER_OUTPUT_EXPERIMENTAL)
+                                ),
                             )
+                        concat_explicit_native_materialization = bool(
+                            bool(no_share_fold)
+                            and type(module).__name__ == "Concat"
+                            and str(output_physical) == PHYSICAL_NATIVE_SOURCE_STRIPE
+                            and any(
+                                bool(row.get("concat_explicit_native_materialization", False))
+                                for row in incoming_rows
+                            )
+                        )
+                        if bool(concat_explicit_native_materialization):
+                            output_relayout = True
+                        if bool(output_relayout):
+                            output_relayouts.append(output_layout)
                         candidate_storage = dict(next_physical)
                         candidate_storage[str(node)] = str(output_physical)
                         logical_halo_materialized = bool(
@@ -6829,21 +7789,28 @@ def _plan_dp(
                             if bool(producer_fused["enabled"]) or bool(logical_halo_materialized)
                             else ""
                         )
-                        output_layout_rows.append(
-                            _node_layout_row(
-                                str(node),
-                                output_layout,
-                                compact,
-                                relayout=bool(output_relayout),
-                                reason="dp_producer_materialized_halo" if bool(output_relayout) else "",
-                                producer_materialized_halo=bool(materialized_halo),
-                                producer_materialized_halo_reason=str(materialized_reason),
-                                producer_fused_rotation_estimate=int(producer_fused["rotation_count"]),
-                                physical_layout=str(output_physical),
-                                shape=outgoing[0].shape if outgoing else None,
-                                fhe_shape=outgoing[0].fhe_shape if outgoing else None,
-                            )
+                        node_row = _node_layout_row(
+                            str(node),
+                            output_layout,
+                            compact,
+                            relayout=bool(output_relayout),
+                            reason=(
+                                "dp_concat_native_source_stripe_materialize"
+                                if bool(concat_explicit_native_materialization)
+                                else ("dp_producer_materialized_halo" if bool(output_relayout) else "")
+                            ),
+                            producer_materialized_halo=bool(materialized_halo),
+                            producer_materialized_halo_reason=str(materialized_reason),
+                            producer_fused_rotation_estimate=int(producer_fused["rotation_count"]),
+                            physical_layout=str(output_physical),
+                            shape=outgoing[0].shape if outgoing else None,
+                            fhe_shape=outgoing[0].fhe_shape if outgoing else None,
                         )
+                        if bool(concat_explicit_native_materialization):
+                            node_row["concat_explicit_native_materialization"] = True
+                            node_row["producer_materialized_native_source_stripe"] = True
+                            node_row["producer_native_source_stripe_reason"] = "dp_concat_native_source_stripe_materialize"
+                        output_layout_rows.append(node_row)
                     else:
                         producer_fused = {"enabled": False, "rotation_count": 0}
                         candidate_storage = dict(next_physical)
@@ -6862,7 +7829,9 @@ def _plan_dp(
                     candidate_layout_score = float(state.layout_score) + _dp_layout_secondary_cost(
                         incoming_rows=incoming_rows,
                         output_layout=output_layout,
+                        output_physical_layout=str(candidate_storage.get(str(node), "")),
                         output_relayouts=output_relayouts,
+                        producer_fused_materialization=bool(producer_fused.get("enabled", False)),
                     )
                     key = _frontier_key(candidate_live, candidate_storage)
                     existing = next_states.get(key)
@@ -7050,6 +8019,15 @@ def validate_layout_policy_compile_plan(compile_plan: dict[str, Any]) -> dict[st
                     value = 0
                 if int(value) > 0:
                     return int(value)
+            for shape_key in ("fhe_output_shape", "fhe_shape"):
+                shape = row.get(shape_key)
+                if isinstance(shape, (list, tuple)) and shape:
+                    try:
+                        value = int(shape[0])
+                    except Exception:
+                        value = 0
+                    if int(value) > 0:
+                        return int(value)
             return 0
 
         for row in compile_plan.get("edge_layouts", []):
@@ -7067,13 +8045,28 @@ def validate_layout_policy_compile_plan(compile_plan: dict[str, Any]) -> dict[st
                     or target_physical == PHYSICAL_NATIVE_SOURCE_STRIPE
                 )
                 if bool(touches_native):
+                    native_concat_input_relayout = bool(
+                        physical == PHYSICAL_NATIVE_SOURCE_STRIPE
+                        and source_physical == PHYSICAL_NATIVE_SOURCE_STRIPE
+                        and target_physical == PHYSICAL_NATIVE_SOURCE_STRIPE
+                        and bool(row.get("relayout", False))
+                        and str(row.get("relayout_reason", "")) == "dp_native_source_stripe_relayout"
+                    )
                     if not (
                         physical == PHYSICAL_NATIVE_SOURCE_STRIPE
                         and source_physical == PHYSICAL_NATIVE_SOURCE_STRIPE
                         and target_physical == PHYSICAL_NATIVE_SOURCE_STRIPE
-                        and not bool(row.get("relayout", False))
+                        and (not bool(row.get("relayout", False)) or bool(native_concat_input_relayout))
                     ):
-                        errors.append(f"{edge}: native concat boundary must forward native stripe without relayout")
+                        native_to_compact_join_relayout = bool(
+                            source_physical == PHYSICAL_NATIVE_SOURCE_STRIPE
+                            and physical != PHYSICAL_NATIVE_SOURCE_STRIPE
+                            and target_physical != PHYSICAL_NATIVE_SOURCE_STRIPE
+                            and bool(row.get("relayout", False))
+                            and str(row.get("relayout_reason", "")) == "dp_add_input_alignment"
+                        )
+                        if not bool(native_to_compact_join_relayout):
+                            errors.append(f"{edge}: native concat boundary must forward native stripe without relayout")
             if str(row.get("source", "")) == "x" and physical == PHYSICAL_NATIVE_SOURCE_STRIPE:
                 errors.append(f"{edge}: raw input must stay compact encoded")
             if source and source != "x" and source_physical == PHYSICAL_NATIVE_SOURCE_STRIPE:

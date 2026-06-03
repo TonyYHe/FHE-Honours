@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -32,6 +33,52 @@ _LAYOUT_PRESERVING_MODULES = {
 _MISSING = object()
 
 
+def _ordered_fx_input_names(fx_node: Any) -> tuple[str, ...]:
+    names: list[str] = []
+
+    def visit(value: Any) -> None:
+        if value is None:
+            return
+        name = getattr(value, "name", None)
+        if name is not None:
+            names.append(str(name))
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+            return
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+
+    visit(getattr(fx_node, "args", None))
+    visit(getattr(fx_node, "kwargs", None))
+    return tuple(names)
+
+
+def _ordered_join_input_sources(
+    network_dag: Any,
+    *,
+    node: str,
+    row_sources: list[str],
+) -> list[str]:
+    row_source_set = set(row_sources)
+    fx_node = network_dag.nodes[str(node)].get("fx_node") if str(node) in getattr(network_dag, "nodes", {}) else None
+    fx_inputs = list(_ordered_fx_input_names(fx_node))
+    if len(fx_inputs) == len(row_sources) and set(fx_inputs) == row_source_set:
+        return list(fx_inputs)
+    fx_all_inputs = [str(value.name) for value in getattr(fx_node, "all_input_nodes", ()) or ()]
+    if len(fx_all_inputs) == len(row_sources) and set(fx_all_inputs) == row_source_set:
+        return list(fx_all_inputs)
+    try:
+        graph_predecessors = [str(value) for value in network_dag.predecessors(str(node))]
+    except Exception:
+        graph_predecessors = []
+    if len(graph_predecessors) == len(row_sources) and set(graph_predecessors) == row_source_set:
+        return list(graph_predecessors)
+    return list(row_sources)
+
+
 def _env_truthy(name: str, default: str = "0") -> bool:
     return str(os.environ.get(str(name), str(default))).strip().lower() not in {
         "",
@@ -48,6 +95,23 @@ def _bootstrap_halo0_channel_aligned_stripe_enabled() -> bool:
 
 def _ceil_div(left: int, right: int) -> int:
     return -(-int(left) // int(right))
+
+
+def _bsgs_hat_from_diagonal_count(diagonal_count: int, *, slots: int) -> dict[str, int]:
+    diagonals = max(0, int(diagonal_count))
+    if int(diagonals) == 0:
+        return {"rotations": 0, "baby": 0, "giant": 0}
+    best: dict[str, int] | None = None
+    n1 = 1
+    while int(n1) < max(2, int(slots)):
+        baby = min(int(diagonals), max(1, int(n1) - 1))
+        giant = _ceil_div(int(diagonals), max(1, int(n1)))
+        rotations = int(baby + giant)
+        candidate = {"rotations": int(rotations), "baby": int(baby), "giant": int(giant)}
+        if best is None or int(candidate["rotations"]) < int(best["rotations"]):
+            best = candidate
+        n1 *= 2
+    return dict(best or {"rotations": int(diagonals), "baby": int(diagonals), "giant": 0})
 
 
 def _layout_top_beta(layout: dict[str, Any]) -> int:
@@ -403,6 +467,16 @@ def _layout_policy_module_layout_snapshot(network_dag: Any, nodes: set[str] | No
                     "layout_policy_output_materialization",
                     _MISSING,
                 ),
+                "layout_policy_native_output_target_signature": getattr(
+                    module,
+                    "layout_policy_native_output_target_signature",
+                    _MISSING,
+                ),
+                "layout_policy_concat_input_source_signatures": getattr(
+                    module,
+                    "layout_policy_concat_input_source_signatures",
+                    _MISSING,
+                ),
             }
         )
     return rows
@@ -418,6 +492,8 @@ def _restore_layout_policy_module_layout_snapshot(snapshot: list[dict[str, Any]]
             "layout_policy_output_layout",
             "layout_policy_output_row_offset",
             "layout_policy_output_materialization",
+            "layout_policy_native_output_target_signature",
+            "layout_policy_concat_input_source_signatures",
         ):
             value = row.get(attr, _MISSING)
             if value is _MISSING:
@@ -465,13 +541,79 @@ def _apply_layout_policy_module_output_layouts(network_dag: Any, compile_plan: d
         module.layout_policy_output_row_offset = int(top_beta * gap)
         if str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE:
             module.layout_policy_output_materialization = NATIVE_OUTPUT_MATERIALIZATION
+            target_signature = row.get("native_halo_target_storage_signature") or ()
+            module.layout_policy_native_output_target_signature = [
+                [int(value) for value in item] for item in target_signature
+            ]
+            if type(module).__name__ == "Concat":
+                input_rows = [
+                    dict(edge_row)
+                    for edge_row in compile_plan.get("edge_layouts", [])
+                    if str(edge_row.get("target", "")) == str(node)
+                    and str(edge_row.get("op_kind", "")) == "concat"
+                ]
+                input_rows_by_source = {
+                    str(edge_row.get("source", "")): dict(edge_row) for edge_row in input_rows
+                }
+                row_sources = [str(edge_row.get("source", "")) for edge_row in input_rows]
+                input_sources = _ordered_join_input_sources(
+                    network_dag,
+                    node=str(node),
+                    row_sources=row_sources,
+                )
+                input_signatures = [
+                    [
+                        [int(value) for value in item]
+                        for item in input_rows_by_source.get(str(source), {}).get(
+                            "native_halo_source_storage_signature",
+                            (),
+                        )
+                        or ()
+                    ]
+                    for source in input_sources
+                ]
+                expected_signature_count = len(getattr(module, "concat_input_shapes", ()) or ())
+                missing_signature_sources = [
+                    str(source)
+                    for source, signature in zip(input_sources, input_signatures, strict=False)
+                    if not signature
+                ]
+                if int(expected_signature_count) > 0 and len(input_signatures) != int(expected_signature_count):
+                    raise ValueError(
+                        f"layout-policy Concat native materialization for {node} expected "
+                        f"{int(expected_signature_count)} input signatures, got {len(input_signatures)} "
+                        f"from sources {list(input_sources)}; available row sources={sorted(input_rows_by_source)}"
+                    )
+                if missing_signature_sources:
+                    raise ValueError(
+                        f"layout-policy Concat native materialization for {node} is missing "
+                        f"native source signatures for {missing_signature_sources}; "
+                        f"available row sources={sorted(input_rows_by_source)}"
+                    )
+                module.layout_policy_concat_input_source_signatures = input_signatures
         elif bool(row.get("producer_materialized_halo", False)) or _layout_has_halo(layout):
             module.layout_policy_output_materialization = "fused_relayout"
+            for attr in (
+                "layout_policy_native_output_target_signature",
+                "layout_policy_concat_input_source_signatures",
+            ):
+                try:
+                    delattr(module, attr)
+                except AttributeError:
+                    pass
         else:
             try:
                 delattr(module, "layout_policy_output_materialization")
             except AttributeError:
                 pass
+            for attr in (
+                "layout_policy_native_output_target_signature",
+                "layout_policy_concat_input_source_signatures",
+            ):
+                try:
+                    delattr(module, attr)
+                except AttributeError:
+                    pass
     return snapshot
 
 
@@ -514,20 +656,27 @@ def _refresh_layout_policy_depths(
         runtime = binding.get("runtime")
         module = binding.get("module")
         executor = binding.get("executor")
-        if runtime is None or module is None or executor is None:
+        if module is None or executor is None:
             continue
         previous = previous_by_executor.get(id(executor), {})
-        old_runtime_depth = getattr(runtime, "solver_depth", None)
+        old_runtime_depth = None
+        if runtime is not None:
+            old_runtime_depth = getattr(runtime, "solver_depth", None)
+            if old_runtime_depth is None:
+                old_runtime_depth = getattr(runtime, "depth", None)
         if old_runtime_depth is None:
-            old_runtime_depth = getattr(runtime, "depth", None)
+            old_runtime_depth = previous.get("module_depth", getattr(module, "depth", None))
         if old_runtime_depth is None:
             continue
         old_relayout_depth = int(previous.get("relayout_depth", _executor_relayout_depth(executor)) or 0)
         base_depth = max(0, int(old_runtime_depth) - int(old_relayout_depth))
         new_relayout_depth = _executor_relayout_depth(executor)
         new_depth = int(base_depth + int(new_relayout_depth))
-        runtime.depth = int(new_depth)
-        runtime.solver_depth = int(new_depth)
+        if runtime is not None:
+            runtime.depth = int(new_depth)
+            runtime.solver_depth = int(new_depth)
+        if hasattr(executor, "assigned_depth"):
+            executor.assigned_depth = int(new_depth)
         if hasattr(module, "set_depth"):
             module.set_depth(int(new_depth))
         else:
@@ -599,9 +748,16 @@ def _refresh_layout_policy_plan_summary(compile_plan: dict[str, Any]) -> dict[st
     }
     relayout_edges = _rebuild_relayout_edges(edge_layouts)
     output_nodes = [
-        dict(row)
-        for row in compile_plan.get("output_relayout_nodes", [])
-        if bool(row.get("selected_layout", {}))
+        {
+            "node": str(row.get("node", "")),
+            "reason": str(row.get("output_relayout_reason", "")),
+            "selected_layout": dict(row.get("selected_layout", {}) or {}),
+            "rotation_estimate": int(row.get("relayout_rotation_estimate", 0) or 0),
+            "mask_mult_estimate": int(row.get("relayout_mask_mult_estimate", 0) or 0),
+            "depth_estimate": int(row.get("relayout_depth_estimate", 0) or 0),
+        }
+        for row in node_layouts
+        if bool(row.get("output_relayout", False)) and bool(row.get("selected_layout", {}))
     ]
     summary = dict(compile_plan.get("summary", {}) or {})
     summary["relayouts"] = int(len(relayout_edges) + len(output_nodes))
@@ -663,6 +819,11 @@ def _plan_rotation_cost(compile_plan: dict[str, Any]) -> int:
     if not edge_layouts and "reported_rotation_estimate" in summary:
         return int(summary.get("reported_rotation_estimate", 0) or 0)
     relayout_edges = _rebuild_relayout_edges(edge_layouts)
+    output_nodes = [
+        dict(row)
+        for row in compile_plan.get("output_relayout_nodes", [])
+        if bool(row.get("selected_layout", {}))
+    ]
     producer_nodes = [
         dict(row)
         for row in compile_plan.get("node_layouts", [])
@@ -674,6 +835,7 @@ def _plan_rotation_cost(compile_plan: dict[str, Any]) -> int:
             for row in edge_layouts
         )
         + sum(int(row.get("rotation_estimate", 0) or 0) for row in relayout_edges)
+        + sum(int(row.get("rotation_estimate", 0) or 0) for row in output_nodes)
         + sum(int(row.get("producer_fused_rotation_estimate", 0) or 0) for row in producer_nodes)
     )
 
@@ -1081,6 +1243,16 @@ def _linear_interval_path(network_dag: Any, interval: dict[str, Any]) -> list[st
 
 
 def _native_source_stripe_compact_rewrite_blocked(row: dict[str, Any]) -> bool:
+    if bool(row.get("concat_explicit_native_materialization", False)) or bool(
+        row.get("concat_native_runtime_materializer", False)
+    ):
+        return True
+    if str(row.get("op_kind", "")) == "concat" and (
+        str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        or str(row.get("source_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+        or str(row.get("target_physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+    ):
+        return True
     return bool(
         str(row.get("op_kind", "")) == "conv2d"
         and str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
@@ -1135,6 +1307,160 @@ def _native_input_ct_count_from_edge(row: dict[str, Any]) -> int:
             return int(value)
     layout = dict(row.get("selected_layout", {}) or {})
     return _positive_int(layout.get("tile_count", 0), 0)
+
+
+def _parse_storage_signature(raw: Any) -> tuple[tuple[int, int, int, int], ...]:
+    rows: list[tuple[int, int, int, int]] = []
+    for item in tuple(raw or ()):
+        try:
+            h_start, h_end, channel_start, channel_count = (
+                int(value) for value in tuple(item)
+            )
+        except Exception:
+            return ()
+        if int(h_end) <= int(h_start) or int(channel_count) <= 0:
+            continue
+        rows.append((int(h_start), int(h_end), int(channel_start), int(channel_count)))
+    return tuple(rows)
+
+
+def _serialise_storage_signature(
+    signature: tuple[tuple[int, int, int, int], ...],
+) -> list[list[int]]:
+    return [[int(value) for value in item] for item in signature]
+
+
+def _concat_native_materialize_rotation_estimate(
+    network_dag: Any,
+    *,
+    concat_node: str,
+    input_rows: list[dict[str, Any]],
+    target_signature: tuple[tuple[int, int, int, int], ...],
+    slots: int,
+) -> int:
+    module = network_dag.nodes[str(concat_node)].get("module") if str(concat_node) in network_dag.nodes else None
+    input_shapes = tuple(getattr(module, "concat_input_shapes", ()) or ()) if module is not None else ()
+    if not input_shapes:
+        return int(len(target_signature))
+    rows_by_source = {str(row.get("source", "")): dict(row) for row in input_rows}
+    input_sources = _ordered_join_input_sources(
+        network_dag,
+        node=str(concat_node),
+        row_sources=[str(row.get("source", "")) for row in input_rows],
+    )
+    total = 0
+    channel_offset = 0
+    for input_index, source in enumerate(input_sources):
+        row = rows_by_source.get(str(source), {})
+        source_signature = _parse_storage_signature(row.get("native_halo_source_storage_signature") or ())
+        if not source_signature:
+            return 0
+        if int(input_index) < len(input_shapes):
+            try:
+                branch_channels = int(tuple(input_shapes[int(input_index)])[1])
+            except Exception:
+                branch_channels = 0
+        else:
+            branch_channels = 0
+        block_pair_diagonal_counts: dict[tuple[int, int], int] = {}
+        for source_block, (source_h0, source_h1, source_c0, source_count) in enumerate(source_signature):
+            source_global_c0 = int(channel_offset + int(source_c0))
+            source_global_c1 = int(source_global_c0 + int(source_count))
+            for target_block, (target_h0, target_h1, target_c0, target_count) in enumerate(target_signature):
+                h0 = max(int(source_h0), int(target_h0))
+                h1 = min(int(source_h1), int(target_h1))
+                c0 = max(int(source_global_c0), int(target_c0))
+                c1 = min(int(source_global_c1), int(target_c0 + target_count))
+                if int(h1) <= int(h0) or int(c1) <= int(c0):
+                    continue
+                key = (int(target_block), int(source_block))
+                # A native concat materializer is a sparse permutation.  Use
+                # the overlapping channel count as a conservative diagonal-set
+                # proxy; exact payload construction still happens at runtime.
+                block_pair_diagonal_counts[key] = int(block_pair_diagonal_counts.get(key, 0) + max(1, int(c1 - c0)))
+        for diagonal_count in block_pair_diagonal_counts.values():
+            total += int(_bsgs_hat_from_diagonal_count(int(diagonal_count), slots=int(slots))["rotations"])
+        channel_offset += int(branch_channels)
+    return int(total)
+
+
+def _pair_tuple(value: Any, default: tuple[int, int]) -> tuple[int, int]:
+    try:
+        values = tuple(int(item) for item in tuple(value))
+    except Exception:
+        values = tuple(int(item) for item in default)
+    if len(values) == 0:
+        return tuple(int(item) for item in default)
+    if len(values) == 1:
+        return (int(values[0]), int(values[0]))
+    return (int(values[0]), int(values[1]))
+
+
+def _recompute_normal_native_conv_rotation_estimate(
+    network_dag: Any,
+    row: dict[str, Any],
+    *,
+    source_storage_signature: tuple[tuple[int, int, int, int], ...],
+    target_storage_signature: tuple[tuple[int, int, int, int], ...],
+    slots: int,
+) -> dict[str, int] | None:
+    """Recompute the non-fused native Conv2d cost for an explicit concat trial."""
+
+    target = str(row.get("target", ""))
+    module = network_dag.nodes.get(target, {}).get("module") if target in getattr(network_dag, "nodes", {}) else None
+    input_shape = _shape_tuple(row.get("shape", ()) or getattr(module, "input_shape", ()))
+    output_shape = _shape_tuple(getattr(module, "output_shape", ()) or row.get("output_shape", ()))
+    if module is None or input_shape is None or output_shape is None:
+        return None
+    try:
+        from orion.experimental.layout_policy_ablation import _native_conv_plan_for_layouts
+    except Exception:
+        return None
+
+    kernel = _pair_tuple(getattr(module, "kernel_size", (1, 1)), (1, 1))
+    stride = _pair_tuple(getattr(module, "stride", (1, 1)), (1, 1))
+    padding = _pair_tuple(getattr(module, "padding", (0, 0)), (0, 0))
+    dilation = _pair_tuple(getattr(module, "dilation", (1, 1)), (1, 1))
+    groups = max(1, int(getattr(module, "groups", 1) or 1))
+    input_layout = dict(row.get("selected_layout", {}) or {})
+    output_layout = dict(row.get("target_layout", {}) or getattr(module, "layout_policy_output_layout", {}) or {})
+    if not input_layout or not output_layout:
+        return None
+
+    edge = SimpleNamespace(
+        op_kind="conv2d",
+        source=str(row.get("source", "")),
+        target=str(target),
+        shape=tuple(int(value) for value in input_shape),
+        output_shape=tuple(int(value) for value in output_shape),
+        output_fhe_shape=tuple(int(value) for value in getattr(module, "fhe_output_shape", ()) or ()),
+        kernel_size=tuple(int(value) for value in kernel),
+        stride=tuple(int(value) for value in stride),
+        padding=tuple(int(value) for value in padding),
+        dilation=tuple(int(value) for value in dilation),
+        groups=int(groups),
+        input_channels=int(input_shape[1]),
+        output_channels=int(output_shape[1]),
+        slots=int(slots),
+    )
+    plan = _native_conv_plan_for_layouts(
+        edge,
+        input_layout=dict(input_layout),
+        output_layout=dict(output_layout),
+        source_storage_signature=tuple(source_storage_signature),
+        target_storage_signature=tuple(target_storage_signature) or None,
+        require_native_target_fit=bool(target_storage_signature),
+    )
+    if plan is None:
+        return None
+    return {
+        "rotations": int(getattr(plan, "c_only_rotations", 0) or 0),
+        "cb_shared_rotations": int(getattr(plan, "cb_shared_rotations", 0) or 0),
+        "transforms": int(getattr(plan, "submatrix_program_count", 0) or 0),
+        "input_ct_count": int(getattr(plan, "input_ct_count", 0) or 0),
+        "output_ct_count": int(sum(int(value) for value in getattr(plan, "target_channel_group_counts", ()) or ())),
+        "sharing_group_count": int(getattr(plan, "sharing_group_count", 0) or 0),
+    }
 
 
 def _rewrite_row_as_native_source(
@@ -2319,11 +2645,8 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
         edge_id = str(current.get("edge", ""))
         source = str(current.get("source", ""))
         target = str(current.get("target", ""))
-        native_relayout_candidate = bool(_row_is_native_source_stripe_relayout(current))
         already_native_candidate = bool(_row_is_already_native_source_boot_boundary(current))
-        if edge_id not in actual_native_physical_edges and not already_native_candidate:
-            continue
-        if not bool(native_relayout_candidate or already_native_candidate):
+        if not bool(already_native_candidate):
             continue
         boundary_boot_edges = list(boot_boundary_candidate_edges.get(edge_id, []) or [])
         if not boundary_boot_edges:
@@ -2341,32 +2664,7 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
         if str(source) == "x" or _row_is_concat_like_source(current, network_dag):
             rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "unsupported_source"})
             continue
-        source_physical = str(current.get("source_physical_layout", "") or "")
-        if not bool(already_native_candidate) and source_physical not in {PHYSICAL_COMPACT, PHYSICAL_LOGICAL_HALO}:
-            rejected.append(
-                {
-                    "edge": edge_id,
-                    "source": source,
-                    "target": target,
-                    "reason": "source_not_compact_physical",
-                    "source_physical_layout": source_physical,
-                }
-            )
-            continue
         source_layout = dict(current.get("source_layout", {}) or {})
-        if not bool(already_native_candidate) and (
-            _layout_physical_top_beta(source_layout) != 0 or _layout_physical_bottom_beta(source_layout) != 0
-        ):
-            rejected.append(
-                {
-                    "edge": edge_id,
-                    "source": source,
-                    "target": target,
-                    "reason": "source_materializes_physical_halo",
-                    "source_layout": dict(source_layout),
-                }
-            )
-            continue
         selected = dict(current.get("selected_layout", {}) or {})
         required = dict(current.get("required_layout", selected) or selected)
         if int(selected.get("stride", 1) or 1) != int(required.get("stride", selected.get("stride", 1)) or 1):
@@ -2381,23 +2679,16 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
         if int(compact_layout.get("gap", 1) or 1) != int(required.get("gap", compact_layout.get("gap", 1)) or 1):
             rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "gap_mismatch"})
             continue
-        source_row = node_rows_by_node.get(source)
-        source_module = network_dag.nodes[source].get("module") if source in network_dag.nodes else None
-        source_shape = _shape_tuple(source_row.get("shape", ())) if source_row else None
-        edge_source_shape = _shape_tuple(current.get("shape", ()))
-        if source_row is None or source_shape != edge_source_shape:
-            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "source_node_shape_mismatch"})
-            continue
-        source_successors = [str(value) for value in network_dag.successors(source)]
-        if len(source_successors) != 1 or set(source_successors) != {target}:
-            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "source_external_fanout"})
+        target_output_row = node_rows_by_node.get(target)
+        if target_output_row is None:
+            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "target_node_row_missing"})
             continue
         native_stats = _conv2d_module_halo0_channel_aligned_native_stats(
             network_dag,
             compile_plan,
             current,
             compact_layout=dict(compact_layout),
-            input_layout=dict(selected) if bool(already_native_candidate) else None,
+            input_layout=dict(selected),
             node_rows_by_node=node_rows_by_node,
         )
         if native_stats is None:
@@ -2411,108 +2702,21 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
         if int(native_input_ct_count) <= 0:
             rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "native_input_count_unavailable"})
             continue
-        source_compact_layout = _compact_layout_for_row(source_row)
-        source_promoted_nodes: list[dict[str, Any]] = []
-        source_promoted_edges: list[dict[str, Any]] = []
-        if bool(already_native_candidate):
-            pass
-        elif _layout_preserving_module(network_dag, source):
-            predecessors = [str(value) for value in network_dag.predecessors(source)]
-            if len(predecessors) != 1:
-                rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "layout_preserving_source_predecessor_count"})
-                continue
-            upstream = str(predecessors[0])
-            upstream_row = node_rows_by_node.get(upstream)
-            upstream_module = network_dag.nodes[upstream].get("module") if upstream in network_dag.nodes else None
-            upstream_edge_id = f"{upstream}->{source}"
-            upstream_edge_row = edge_rows_by_edge.get(upstream_edge_id)
-            upstream_successors = [str(value) for value in network_dag.successors(upstream)]
-            upstream_shape = _shape_tuple(upstream_row.get("shape", ())) if upstream_row else None
-            upstream_compact_layout = _compact_layout_for_row(upstream_row) if upstream_row else {}
-            if (
-                upstream_row is None
-                or upstream_edge_row is None
-                or not _producer_beta_lift_allowed(upstream_module)
-                or len(upstream_successors) != 1
-                or set(upstream_successors) != {source}
-                or upstream_shape != source_shape
-                or _layout_storage_key(upstream_compact_layout) != _layout_storage_key(source_compact_layout)
-            ):
-                rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "unsafe_layout_preserving_source_promotion"})
-                continue
-            updated_by_node[upstream] = _rewrite_node_as_halo0_boot_boundary_output(
-                upstream_row,
-                compact_layout=dict(upstream_compact_layout),
-                native_ct_count=int(native_input_ct_count),
-                slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
-                reason="boot_boundary_halo0_channel_aligned_source",
-            )
-            updated_by_edge[upstream_edge_id] = _rewrite_layout_preserving_edge_as_halo0_compact(
-                upstream_edge_row,
-                compact_layout=dict(source_compact_layout),
-                native_ct_count=int(native_input_ct_count),
-                reason="boot_boundary_halo0_channel_aligned_source_carry",
-            )
-            source_promoted_nodes.append(
-                {
-                    "node": upstream,
-                    "old_physical_layout": str(upstream_row.get("physical_layout", "")),
-                    "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
-                    "native_ct_count": int(native_input_ct_count),
-                }
-            )
-            source_promoted_edges.append(
-                {
-                    "edge": upstream_edge_id,
-                    "old_physical_layout": str(upstream_edge_row.get("physical_layout", "")),
-                    "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
-                }
-            )
-        elif not _producer_beta_lift_allowed(source_module):
-            rejected.append({"edge": edge_id, "source": source, "target": target, "reason": "unsupported_source_producer"})
-            continue
-        if not bool(already_native_candidate):
-            updated_by_node[source] = _rewrite_node_as_halo0_boot_boundary_output(
-                source_row,
-                compact_layout=dict(source_compact_layout),
-                native_ct_count=int(native_input_ct_count),
-                slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
-                reason="boot_boundary_halo0_channel_aligned_source",
-            )
-            source_promoted_nodes.append(
-                {
-                    "node": source,
-                    "old_physical_layout": str(source_row.get("physical_layout", "")),
-                    "new_physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
-                    "native_ct_count": int(native_input_ct_count),
-                }
-            )
-        rewritten = (
-            _rewrite_row_as_halo0_channel_aligned_native_output(
-                current,
-                native_stats=dict(native_stats),
-                reason="boot_boundary_halo0_channel_aligned_output",
-            )
-            if bool(already_native_candidate)
-            else _rewrite_row_as_halo0_channel_aligned_native_stripe(
-                current,
-                compact_layout=dict(compact_layout),
-                native_stats=dict(native_stats),
-                reason="boot_boundary_halo0_channel_aligned_stripe",
-            )
+        rewritten = _rewrite_row_as_halo0_channel_aligned_native_output(
+            current,
+            native_stats=dict(native_stats),
+            reason="boot_boundary_halo0_channel_aligned_output",
         )
         updated_by_edge[edge_id] = dict(rewritten)
-        target_output_row = node_rows_by_node.get(target)
         target_output_compact_layout: dict[str, Any] | None = None
-        if target_output_row:
-            target_output_compact_layout = _compact_layout_for_row(target_output_row)
-            updated_by_node[target] = _rewrite_node_as_halo0_boot_boundary_output(
-                target_output_row,
-                compact_layout=dict(target_output_compact_layout),
-                native_ct_count=int(native_output_ct_count),
-                slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
-                reason="boot_boundary_halo0_channel_aligned_stripe",
-            )
+        target_output_compact_layout = _compact_layout_for_row(target_output_row)
+        updated_by_node[target] = _rewrite_node_as_halo0_boot_boundary_output(
+            target_output_row,
+            compact_layout=dict(target_output_compact_layout),
+            native_ct_count=int(native_output_ct_count),
+            slots=int(compile_plan.get("slots", current.get("slots", 32768)) or 32768),
+            reason="boot_boundary_halo0_channel_aligned_stripe",
+        )
         boot_source_nodes: list[dict[str, Any]] = []
         passthrough_edges: list[dict[str, Any]] = []
         carry_rewrite_failed = False
@@ -2568,6 +2772,7 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
                 updated_by_edge[passthrough_edge_id] = _rewrite_layout_preserving_edge_as_halo0_compact(
                     passthrough_row,
                     compact_layout=dict(target_output_compact_layout),
+                    native_ct_count=int(native_output_ct_count),
                     reason="boot_boundary_halo0_channel_aligned_stripe",
                 )
                 passthrough_edges.append(
@@ -2582,11 +2787,7 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
         boot_source, boot_target = boundary_boot_edges[0]
         accepted.append(
             {
-                "kind": (
-                    "halo0_channel_aligned_native_output"
-                    if bool(already_native_candidate)
-                    else "halo0_channel_aligned_stripe"
-                ),
+                "kind": "halo0_channel_aligned_native_output",
                 "edge": edge_id,
                 "source": source,
                 "target": target,
@@ -2606,9 +2807,9 @@ def _halo0_channel_aligned_stripe_refinement_candidates(
                 "source_layout": dict(source_layout),
                 "selected_layout": dict(selected if bool(already_native_candidate) else compact_layout),
                 "output_layout": dict(target_output_compact_layout or compact_layout),
-                "input_layout_preserved": bool(already_native_candidate),
-                "source_promoted_nodes": source_promoted_nodes,
-                "source_promoted_edges": source_promoted_edges,
+                "input_layout_preserved": True,
+                "source_promoted_nodes": [],
+                "source_promoted_edges": [],
                 "updated_boot_source_nodes": boot_source_nodes,
                 "updated_passthrough_edges": passthrough_edges,
             }
@@ -2813,7 +3014,6 @@ def _concat_output_beta_lift_refinement_candidates(
                 source_layout=selected,
                 target_layout=selected,
                 reason="boot_interval_concat_output_beta_lift",
-                allow_protected_native_source=True,
             )
             if updated is None:
                 rewrite_failed = True
@@ -3076,7 +3276,6 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                     source_layout=producer_layout,
                     target_layout=producer_layout,
                     reason="local_concat_transitive_beta_lift",
-                    allow_protected_native_source=True,
                 )
                 if updated is None:
                     rewrite_failed = True
@@ -3101,7 +3300,6 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                     source_layout=final_selected,
                     target_layout=final_selected,
                     reason="local_concat_transitive_activation_carry",
-                    allow_protected_native_source=True,
                 )
                 if updated is None:
                     rewrite_failed = True
@@ -3126,7 +3324,6 @@ def _local_concat_transitive_beta_lift_refinement_candidates(
                     source_layout=final_selected,
                     target_layout=final_selected,
                     reason="local_concat_transitive_beta_lift",
-                    allow_protected_native_source=True,
                 )
                 if updated is None:
                     rewrite_failed = True
@@ -4252,6 +4449,234 @@ def _batched_activation_native_output_beta_lift_refinement_candidates(
     ]
 
 
+def _explicit_concat_native_materialization_refinement_candidates(
+    network_dag: Any,
+    compile_plan: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Try replacing fused cat-conv with explicit native concat materialization.
+
+    The default DP keeps concat lazy and fuses it into the consuming Conv2d.
+    In individual-provider mode that fused row can be much more expensive than
+    materializing the native concat once and then running a normal native Conv.
+    This candidate is deliberately narrow and relies on the official trial
+    BootstrapSolver to reject any depth-induced boot increase.
+    """
+
+    edge_rows = [dict(row) for row in compile_plan.get("edge_layouts", [])]
+    node_rows = [dict(row) for row in compile_plan.get("node_layouts", [])]
+    node_rows_by_node = {str(row.get("node", "")): dict(row) for row in node_rows}
+    incoming_by_target: dict[str, list[dict[str, Any]]] = {}
+    for row in edge_rows:
+        incoming_by_target.setdefault(str(row.get("target", "")), []).append(dict(row))
+
+    slots = max(1, int(compile_plan.get("slots", 32768) or 32768))
+    candidates: list[dict[str, Any]] = []
+    for current in edge_rows:
+        source = str(current.get("source", ""))
+        target = str(current.get("target", ""))
+        edge_id = str(current.get("edge", ""))
+        if str(current.get("op_kind", "")) != "conv2d":
+            continue
+        if not source or source not in getattr(network_dag, "nodes", {}):
+            continue
+        if type(network_dag.nodes[source].get("module")).__name__ != "Concat":
+            continue
+        if not bool(current.get("concat_native_runtime_materializer", False)):
+            continue
+        if str(current.get("physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
+            continue
+        if str(current.get("provider_lt_grouping_mode", "")) != "individual":
+            continue
+        if str(current.get("native_halo_channel_fold_mode", "")) != "per_stripe":
+            continue
+
+        input_rows = [dict(row) for row in incoming_by_target.get(str(source), []) if str(row.get("op_kind", "")) == "concat"]
+        if not input_rows:
+            continue
+        if any(str(row.get("source_physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE for row in input_rows):
+            continue
+        if any(not _parse_storage_signature(row.get("native_halo_source_storage_signature") or ()) for row in input_rows):
+            continue
+
+        source_node_row = dict(node_rows_by_node.get(str(source), {}) or {})
+        if str(source_node_row.get("physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
+            continue
+        target_signature = _parse_storage_signature(
+            source_node_row.get("native_halo_target_storage_signature")
+            or current.get("native_halo_source_storage_signature")
+            or ()
+        )
+        if not target_signature:
+            continue
+
+        consumer_target_signature = _parse_storage_signature(
+            current.get("native_halo_target_storage_signature")
+            or current.get("consumer_native_source_stripe_target_signature")
+            or ()
+        )
+        normal_stats = _recompute_normal_native_conv_rotation_estimate(
+            network_dag,
+            current,
+            source_storage_signature=tuple(target_signature),
+            target_storage_signature=tuple(consumer_target_signature),
+            slots=int(slots),
+        )
+        if normal_stats is None:
+            continue
+        normal_rotation = _positive_int(normal_stats.get("rotations", 0), 0)
+        fused_rotation = _positive_int(current.get("planner_rotation_cost_estimate", 0), 0)
+        if int(normal_rotation) <= 0 or int(fused_rotation) <= 0:
+            continue
+        materialize_rotation = _concat_native_materialize_rotation_estimate(
+            network_dag,
+            concat_node=str(source),
+            input_rows=input_rows,
+            target_signature=tuple(target_signature),
+            slots=int(slots),
+        )
+        if int(materialize_rotation) <= 0:
+            materialize_rotation = int(len(target_signature))
+        rotation_delta = int(int(normal_rotation) + int(materialize_rotation) - int(fused_rotation))
+        if int(rotation_delta) >= 0:
+            continue
+
+        updated_edge_rows: list[dict[str, Any]] = []
+        accepted_input_edges: list[dict[str, Any]] = []
+        for row in edge_rows:
+            row_edge_id = str(row.get("edge", ""))
+            if row_edge_id == edge_id:
+                updated = dict(row)
+                for key in (
+                    "concat_native_runtime_materializer",
+                    "concat_native_runtime_materializer_reason",
+                    "concat_fused_native_output_signature_projected",
+                    "concat_fusion_runtime_estimate",
+                    "concat_fusion_native_source_runtime_estimate",
+                ):
+                    updated.pop(key, None)
+                updated["concat_explicit_native_materialization"] = True
+                updated["concat_explicit_native_materialization_reason"] = (
+                    "bootstrap_refine_explicit_concat_native_materialization"
+                )
+                updated["consumer_fused_relayout"] = False
+                updated["consumer_fused_relayout_reason"] = ""
+                updated["consumer_fused_rotation_estimate"] = 0
+                updated["layout_mode"] = "native_halo_stripe"
+                updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                updated["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                updated["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                updated["lt_estimator"] = "native_halo_plan_runtime_signature"
+                updated["planner_rotation_cost_estimate"] = int(normal_rotation)
+                updated["lt_bsgs_rotation_estimate"] = int(normal_rotation)
+                updated["lt_baby_rotation_estimate"] = int(normal_rotation)
+                updated["lt_giant_rotation_estimate"] = 0
+                updated["lt_local_submatrix_rotation_estimate"] = int(normal_rotation)
+                updated["native_halo_rotation_estimator"] = "native_halo_plan_runtime_signature"
+                updated["native_halo_rotation_mode"] = "c_only"
+                updated["native_halo_runtime_signature_estimate"] = True
+                updated["rotation_report_source"] = "explicit_concat_native_materialization_candidate"
+                updated["rotation_eval_count_mode"] = "independent_transform_bsgs"
+                updated_edge_rows.append(updated)
+                continue
+            if str(row.get("target", "")) == str(source) and str(row.get("op_kind", "")) == "concat":
+                updated = dict(row)
+                updated["concat_explicit_native_materialization"] = True
+                updated["concat_explicit_native_materialization_reason"] = (
+                    "bootstrap_refine_explicit_concat_native_materialization"
+                )
+                updated_edge_rows.append(updated)
+                accepted_input_edges.append(
+                    {
+                        "edge": str(row_edge_id),
+                        "source": str(row.get("source", "")),
+                        "target": str(row.get("target", "")),
+                        "native_source_signature_count": int(
+                            len(_parse_storage_signature(row.get("native_halo_source_storage_signature") or ()))
+                        ),
+                    }
+                )
+                continue
+            updated_edge_rows.append(dict(row))
+
+        updated_node_rows: list[dict[str, Any]] = []
+        for row in node_rows:
+            if str(row.get("node", "")) != str(source):
+                updated_node_rows.append(dict(row))
+                continue
+            updated = dict(row)
+            updated["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+            updated["output_relayout"] = True
+            updated["output_relayout_reason"] = "bootstrap_refine_explicit_concat_native_materialization"
+            updated["concat_explicit_native_materialization"] = True
+            updated["producer_materialized_native_source_stripe"] = True
+            updated["producer_native_source_stripe_reason"] = (
+                "bootstrap_refine_explicit_concat_native_materialization"
+            )
+            updated["layout_policy_output_materialization"] = NATIVE_OUTPUT_MATERIALIZATION
+            updated["native_halo_output_storage_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+            updated["native_halo_target_storage_signature"] = _serialise_storage_signature(tuple(target_signature))
+            updated["native_physical_output_ct_count"] = int(len(target_signature))
+            updated["native_output_ct_count"] = int(len(target_signature))
+            updated["native_output_ct_count_estimate"] = int(len(target_signature))
+            updated["fhe_shape"] = [int(len(target_signature)), int(slots)]
+            updated["relayout_rotation_estimate"] = int(materialize_rotation)
+            updated["relayout_mask_mult_estimate"] = 0
+            updated["relayout_depth_estimate"] = 1
+            updated_node_rows.append(updated)
+
+        native_output_counts = dict(compile_plan.get("_native_physical_output_ct_counts", {}) or {})
+        native_output_counts[str(source)] = int(len(target_signature))
+        updated_plan = _refresh_layout_policy_plan_summary(
+            {
+                **dict(compile_plan),
+                "edge_layouts": updated_edge_rows,
+                "node_layouts": updated_node_rows,
+                "_native_physical_output_ct_counts": native_output_counts,
+            }
+        )
+        summary = dict(updated_plan.get("summary", {}) or {})
+        summary["boot_refined_explicit_concat_native_materialization_count"] = (
+            int(summary.get("boot_refined_explicit_concat_native_materialization_count", 0) or 0) + 1
+        )
+        updated_plan["summary"] = summary
+        candidates.append(
+            {
+                "kind": "explicit_concat_native_materialization",
+                "strategy": "explicit_concat_native_materialization",
+                "plan": updated_plan,
+                "rotation_delta": int(rotation_delta),
+                "candidate_priority": 1,
+                "allow_relayout_depth_increase_without_boot_increase": True,
+                "max_relayout_depth_increase_without_boot_increase": 1,
+                "allow_after_bootstrap_target": True,
+                "output_tile_delta": 0,
+                "require_bootstrap_count_unchanged": True,
+                "require_bootstrap_shape_nonincrease": True,
+                "accepted": [
+                    {
+                        "kind": "explicit_concat_native_materialization",
+                        "concat": str(source),
+                        "consumer": str(target),
+                        "edge": str(edge_id),
+                        "fused_rotation": int(fused_rotation),
+                        "normal_native_rotation": int(normal_rotation),
+                        "normal_native_rotation_source": "recomputed_native_plan",
+                        "normal_native_transform_count": int(normal_stats.get("transforms", 0) or 0),
+                        "normal_native_source_signature_count": int(len(target_signature)),
+                        "normal_native_target_signature_count": int(len(consumer_target_signature)),
+                        "materialize_rotation_estimate": int(materialize_rotation),
+                        "rotation_delta": int(rotation_delta),
+                        "native_output_ct_count": int(len(target_signature)),
+                        "input_edges": accepted_input_edges,
+                        "covered_edge_count": 1,
+                    }
+                ],
+                "rejected": [],
+            }
+        )
+    return candidates
+
+
 def enumerate_bootstrap_aware_layout_refinement_candidates(
     network_dag: Any,
     first_pass_audit: dict[str, Any],
@@ -4581,6 +5006,53 @@ def enumerate_bootstrap_aware_layout_refinement_candidates(
                 "boot_intervals": boot_interval_rows,
             }
         )
+    for concat_materialize in _explicit_concat_native_materialization_refinement_candidates(
+        network_dag,
+        compile_plan,
+    ):
+        accepted = [dict(row) for row in concat_materialize.get("accepted", [])]
+        candidate_kind = str(concat_materialize.get("kind", "explicit_concat_native_materialization"))
+        candidate_strategy = str(concat_materialize.get("strategy", candidate_kind))
+        candidates.append(
+            {
+                "candidate_id": f"bootstrap_refine_explicit_concat_{len(candidates) + 1}",
+                "kind": candidate_kind,
+                "strategy": candidate_strategy,
+                "plan": dict(concat_materialize["plan"]),
+                "accepted": accepted,
+                "rejected": list(concat_materialize.get("rejected", [])),
+                "accepted_count": int(
+                    sum(int(row.get("covered_edge_count", 1) or 1) for row in accepted)
+                ),
+                "rotation_delta": int(
+                    concat_materialize.get(
+                        "rotation_delta",
+                        _candidate_rotation_delta(compile_plan, dict(concat_materialize["plan"])),
+                    )
+                    or 0
+                ),
+                "candidate_priority": int(concat_materialize.get("candidate_priority", 1) or 1),
+                "allow_relayout_depth_unchanged": bool(
+                    concat_materialize.get("allow_relayout_depth_unchanged", False)
+                ),
+                "allow_relayout_depth_increase_without_boot_increase": bool(
+                    concat_materialize.get("allow_relayout_depth_increase_without_boot_increase", True)
+                ),
+                "max_relayout_depth_increase_without_boot_increase": int(
+                    concat_materialize.get("max_relayout_depth_increase_without_boot_increase", 1) or 1
+                ),
+                "allow_after_bootstrap_target": bool(concat_materialize.get("allow_after_bootstrap_target", True)),
+                "output_tile_delta": int(concat_materialize.get("output_tile_delta", 0) or 0),
+                "require_bootstrap_count_unchanged": bool(
+                    concat_materialize.get("require_bootstrap_count_unchanged", True)
+                ),
+                "require_bootstrap_shape_nonincrease": bool(
+                    concat_materialize.get("require_bootstrap_shape_nonincrease", True)
+                ),
+                "boot_interval_count": int(len(intervals)),
+                "boot_intervals": boot_interval_rows,
+            }
+        )
     native_candidate = _native_physical_relayout_refinement_candidate(
         compile_plan,
         intervals=intervals,
@@ -4692,6 +5164,12 @@ def apply_bootstrap_aware_layout_refinement_candidate(
         "rotation_delta": int(candidate.get("rotation_delta", 0) or 0),
         "candidate_priority": int(candidate.get("candidate_priority", 0) or 0),
         "allow_relayout_depth_unchanged": bool(candidate.get("allow_relayout_depth_unchanged", False)),
+        "allow_relayout_depth_increase_without_boot_increase": bool(
+            candidate.get("allow_relayout_depth_increase_without_boot_increase", False)
+        ),
+        "max_relayout_depth_increase_without_boot_increase": int(
+            candidate.get("max_relayout_depth_increase_without_boot_increase", 0) or 0
+        ),
         "allow_after_bootstrap_target": bool(candidate.get("allow_after_bootstrap_target", False)),
         "output_tile_delta": int(candidate.get("output_tile_delta", 0) or 0),
         "require_bootstrap_count_unchanged": bool(candidate.get("require_bootstrap_count_unchanged", False)),
@@ -4717,7 +5195,7 @@ def apply_bootstrap_aware_layout_refinement(
     network_dag: Any,
     first_pass_audit: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compatibility wrapper that applies the first enumerated candidate."""
+    """Compatibility wrapper that applies the lowest-rotation candidate."""
 
     enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(
         network_dag,
@@ -4735,9 +5213,18 @@ def apply_bootstrap_aware_layout_refinement(
         }
         network_dag.bootstrap_layout_refinement_audit = dict(audit)
         return audit
+    selected = min(
+        (dict(candidate) for candidate in candidates),
+        key=lambda candidate: (
+            int(candidate.get("rotation_delta", 0) or 0),
+            int(candidate.get("candidate_priority", 0) or 0),
+            -int(candidate.get("accepted_count", 0) or 0),
+            str(candidate.get("candidate_id", "")),
+        ),
+    )
     audit = apply_bootstrap_aware_layout_refinement_candidate(
         network_dag,
-        dict(candidates[0]),
+        dict(selected),
         first_pass_audit=first_pass_audit,
     )
     return {
@@ -4757,6 +5244,14 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
     *,
     bootstrap_nodes: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    policy = str(compile_plan.get("policy", ""))
+    if policy in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES:
+        return dict(compile_plan), {
+            "enabled": False,
+            "policy": policy,
+            "reason": "bootstrap_aware_policy_uses_refinement_final_halo0_cleanup",
+        }
+
     node_rows = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
     if not node_rows:
         return dict(compile_plan), {"enabled": False, "reason": "no_layout_policy_node_rows"}
@@ -4764,10 +5259,18 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
     compressed_nodes: set[str] = set()
     audit_nodes: list[dict[str, Any]] = []
     queue: list[str] = []
-    force_compact = str(compile_plan.get("policy", "")) in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES
     for node in sorted(str(value) for value in bootstrap_nodes):
         row = node_rows.get(str(node))
         if row is None:
+            continue
+        module = network_dag.nodes.get(str(node), {}).get("module") if str(node) in getattr(network_dag, "nodes", {}) else None
+        if (
+            bool(row.get("concat_explicit_native_materialization", False))
+            or (
+                type(module).__name__ == "Concat"
+                and str(row.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
+            )
+        ):
             continue
         selected = dict(row.get("selected_layout", {}) or {})
         compact = _compact_layout_for_row(row)
@@ -4779,7 +5282,7 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
         )
         if bool(already_compact):
             continue
-        if int(current_tiles) <= int(compact_tiles) and not bool(force_compact):
+        if int(current_tiles) <= int(compact_tiles):
             continue
         node_rows[str(node)] = _copy_node_with_compact_layout(row)
         compressed_nodes.add(str(node))
@@ -4790,7 +5293,7 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
                 "current_tile_count": int(current_tiles),
                 "compact_tile_count": int(compact_tiles),
                 "saved_ciphertexts_per_bootstrap": int(max(0, int(current_tiles - compact_tiles))),
-                "forced_compact_boundary": bool(force_compact),
+                "forced_compact_boundary": False,
                 "current_layout": dict(selected),
                 "compact_layout": dict(compact),
             }
@@ -4805,6 +5308,8 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
         source_layout = dict(node_rows[source].get("selected_layout", {}) or {})
         for row in edge_rows:
             if str(row.get("source", "")) != str(source):
+                continue
+            if _native_source_stripe_compact_rewrite_blocked(row):
                 continue
             compact_edge = _copy_row_with_compact_layout(row, source_layout=source_layout)
             row.clear()

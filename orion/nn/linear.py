@@ -384,6 +384,9 @@ class Conv2d(LinearTransform):
         if raw_enabled in ("", "0", "false", "no", "off"):
             return False
         specs = self._concat_fusion_specs()
+        conv_input_row = self._concat_conv_input_layout_row() if specs else {}
+        if bool(dict(conv_input_row).get("concat_explicit_native_materialization", False)):
+            return False
         return bool(specs and int(getattr(self, "groups", 1)) == 1)
 
     def _concat_fusion_unified_supported(self) -> bool:
@@ -1001,7 +1004,17 @@ class Conv2d(LinearTransform):
         output_physical_top_beta = int(_layout_physical_top_beta(output_layout))
         output_physical_bottom_beta = int(_layout_physical_bottom_beta(output_layout))
         native_output_signature: tuple[tuple[int, ...], ...] | None = None
+        raw_target_signature = getattr(self, "layout_policy_native_output_target_signature", ()) or ()
+        try:
+            native_output_target_storage_signature = tuple(
+                tuple(int(value) for value in item)
+                for item in raw_target_signature
+            )
+        except Exception:
+            native_output_target_storage_signature = ()
         self._concat_native_output_plan = None
+        self._concat_native_compile_rotation_io = None
+        self._concat_native_runtime_io = None
         if bool(native_output_materialization):
             if not concat_specs:
                 raise RuntimeError(f"concat-fused Conv2d {getattr(self, 'name', '')} has no concat specs")
@@ -1041,6 +1054,7 @@ class Conv2d(LinearTransform):
                 first_native_spec,
                 require_native_target_fit=False,
                 source_storage_signature=first_source_signature or None,
+                target_storage_signature=native_output_target_storage_signature or None,
             )
             target_ct_count = int(self._concat_native_plan_target_ct_count(native_output_plan))
             native_output_signature = self._concat_native_plan_target_signature(native_output_plan)
@@ -1057,6 +1071,7 @@ class Conv2d(LinearTransform):
         self._concat_output_rotations = 0
         self._concat_fusion_native_source_inputs = bool(self._concat_fusion_uses_native_source_inputs())
         native_output_target_coverage: set[int] = set()
+        native_rotation_branches: list[dict[str, int | str | list[list[int]]]] = []
 
         effective_weight, effective_bias = self._concat_effective_weight_and_bias()
         with _temporary_attrs(self, on_bias=effective_bias):
@@ -1125,7 +1140,27 @@ class Conv2d(LinearTransform):
                 native_spec,
                 require_native_target_fit=False,
                 source_storage_signature=source_storage_signature or None,
+                target_storage_signature=native_output_target_storage_signature or None,
             )
+            if bool(native_source_input) and bool(native_output_materialization):
+                native_rotation_branches.append(
+                    {
+                        "input_index": int(input_index),
+                        "input_ct_count": int(plan.input_ct_count),
+                        "target_ct_count": int(self._concat_native_plan_target_ct_count(plan)),
+                        "sharing_group_count": int(plan.sharing_group_count),
+                        "transform_count": int(plan.submatrix_program_count),
+                        "native_c_only_rotations": int(plan.c_only_rotations),
+                        "native_cb_shared_rotations": int(plan.cb_shared_rotations),
+                        "native_shared_baby_rotations": int(plan.shared_baby_rotations),
+                        "native_shared_giant_rotations": int(plan.shared_giant_rotations),
+                        "native_halo_channel_fold_mode": str(plan.channel_fold_mode),
+                        "source_storage_signature": [
+                            [int(value) for value in item]
+                            for item in tuple(source_storage_signature or ())
+                        ],
+                    }
+                )
             if bool(native_output_materialization):
                 branch_target_count = int(self._concat_native_plan_target_ct_count(plan))
                 branch_signature = self._concat_native_plan_target_signature(plan)
@@ -1141,7 +1176,12 @@ class Conv2d(LinearTransform):
                 ordered: list[tuple[int, object]] = []
                 for stripe in plan.stripes:
                     for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
-                        for target_block in range(int(target_ct_count)):
+                        target_blocks = (
+                            (None,)
+                            if bool(native_output_materialization)
+                            else tuple(int(value) for value in range(int(target_ct_count)))
+                        )
+                        for target_block in target_blocks:
                             transform = _build_compact_source_conv_transform(
                                 spec=native_spec,
                                 plan=plan,
@@ -1153,10 +1193,12 @@ class Conv2d(LinearTransform):
                                 scheme=self.scheme,
                                 source_layout=dict(input_layout),
                                 group_n1=1,
-                                compact_target_block=int(target_block),
+                                compact_target_block=(
+                                    None if target_block is None else int(target_block)
+                                ),
                             )
                             if transform is not None:
-                                ordered.append((int(target_block), transform))
+                                ordered.append((int(transform.target_index), transform))
                 return int(source_block), ordered
 
             if bool(native_source_input):
@@ -1389,6 +1431,51 @@ class Conv2d(LinearTransform):
                 [int(value) for value in item] for item in target_storage_signature
             ]
             self.fhe_output_shape = torch.Size(runtime_fhe_output_shape)
+            if (
+                bool(self._concat_fusion_native_source_inputs)
+                and int(len(native_rotation_branches)) == int(len(concat_specs))
+            ):
+                transform_total = int(sum(int(row["native_c_only_rotations"]) for row in native_rotation_branches))
+                shared_total = int(sum(int(row["native_cb_shared_rotations"]) for row in native_rotation_branches))
+                self._concat_native_compile_rotation_io = {
+                    "source": "compiled_native_concat_fused_source_signature_plan",
+                    "runtime_lowering": "native_concat_fused_source_stripe",
+                    "provider_executor": "ConcatNativeFusedConv2d",
+                    "native_halo_input_capable": True,
+                    "native_halo_output_capable": True,
+                    "runtime_group_count": int(
+                        sum(int(row["sharing_group_count"]) for row in native_rotation_branches)
+                    ),
+                    "runtime_transform_count": int(
+                        sum(int(row["transform_count"]) for row in native_rotation_branches)
+                    ),
+                    "native_c_only_rotations": int(transform_total),
+                    "native_cb_shared_rotations": int(shared_total),
+                    "native_shared_baby_rotations": int(
+                        sum(int(row["native_shared_baby_rotations"]) for row in native_rotation_branches)
+                    ),
+                    "native_shared_giant_rotations": int(
+                        sum(int(row["native_shared_giant_rotations"]) for row in native_rotation_branches)
+                    ),
+                    "transform_rotation_key_count_total": int(transform_total),
+                    "shared_rotation_eval_count_total": int(shared_total),
+                    "unique_rotation_key_count": 0,
+                    "output_rotations": 0,
+                    "output_rotation_eval_count": 0,
+                    "rotation_eval_count_estimate": int(transform_total),
+                    "rotation_eval_count_mode": "independent_transform_bsgs",
+                    "native_output_storage_layout": "native_halo_stripe",
+                    "native_halo_channel_fold_mode": str(
+                        native_rotation_branches[0].get("native_halo_channel_fold_mode", "")
+                        if native_rotation_branches
+                        else ""
+                    ),
+                    "native_concat_branch_count": int(len(native_rotation_branches)),
+                    "native_concat_branches": list(native_rotation_branches),
+                    "native_output_target_signature": [
+                        [int(value) for value in item] for item in target_storage_signature
+                    ],
+                }
 
         self.diagonals = {}
         self.transform_ids = {}
@@ -1566,6 +1653,9 @@ class Conv2d(LinearTransform):
         target_count = int(getattr(self, "_concat_unified_output_ct_count", self._concat_output_ct_count()))
         output_blocks: list[object | None] = [None for _ in range(int(target_count))]
         fuse_output_rescale = bool(_unified_output_fusion_enabled())
+        self._concat_native_runtime_io = None
+        native_target_sum_source_count = 0
+        native_fallback_source_count = 0
         wrapper_accumulate_s = 0.0
         wrapper_rescale_s = 0.0
         wrapper_bias_s = 0.0
@@ -1601,6 +1691,7 @@ class Conv2d(LinearTransform):
                         self.scheme.backend,
                     )
                 if target_sum_ids is not None:
+                    native_target_sum_source_count += 1
                     for target_index, output_id in enumerate(target_sum_ids):
                         partial = CipherTensor(
                             self.scheme,
@@ -1610,6 +1701,8 @@ class Conv2d(LinearTransform):
                         )
                         add_partial(int(target_index), partial)
                     continue
+                if sorted_items:
+                    native_fallback_source_count += 1
                 for source_index, group in sorted_items:
                     output_ids = group.evaluate_unified(int(source.ids[int(source_index)]), self.scheme.backend)
                     for target_index, output_id in zip(targets_by_source[int(source_index)], output_ids):
@@ -1653,6 +1746,17 @@ class Conv2d(LinearTransform):
                 bias_started = time.perf_counter()
                 out += self.on_bias_ptxt
                 wrapper_bias_s += float(time.perf_counter() - bias_started)
+            native_compile_io = getattr(self, "_concat_native_compile_rotation_io", None)
+            if (
+                isinstance(native_compile_io, dict)
+                and int(native_target_sum_source_count) == int(len(groups_by_input))
+                and int(native_fallback_source_count) == 0
+            ):
+                runtime_io = dict(native_compile_io)
+                runtime_io["source"] = "runtime_io_native_concat_fused_source_signature_plan"
+                runtime_io["target_sum_source_count"] = int(native_target_sum_source_count)
+                runtime_io["fallback_source_count"] = 0
+                self._concat_native_runtime_io = runtime_io
             self._publish_linear_wrapper_timing(
                 {},
                 accumulate_s=float(wrapper_accumulate_s),
