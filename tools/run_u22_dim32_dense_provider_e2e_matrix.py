@@ -28,6 +28,16 @@ DEFAULT_RUN_ROOT_BASE = REPO_ROOT / ".tmp" / "results"
 LATEST_POINTER = REPO_ROOT / ".tmp" / "latest_u22_dim32_dense_provider_e2e_matrix.txt"
 
 CASES: dict[str, dict[str, Any]] = {
+    "192x192": {
+        "dataset": "IBSR BRAIN 2D",
+        "input_shape": (1, 1, 192, 192),
+        "out_channels": 4,
+    },
+    "224x224": {
+        "dataset": "HanCo Hand",
+        "input_shape": (1, 3, 224, 224),
+        "out_channels": 1,
+    },
     "256x256": {
         "dataset": "COVID-19 lung",
         "input_shape": (1, 1, 256, 256),
@@ -168,6 +178,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
     "ORION_CONCAT_FUSION": "auto",
+    "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
 
 REQUIRED_MAINLINE_ENV: dict[str, str] = {
@@ -184,17 +195,22 @@ REQUIRED_MAINLINE_ENV: dict[str, str] = {
     "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
-    "ORION_CONCAT_FUSION": "auto",
 }
 
 DENSE_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
     "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
+    "ORION_CONCAT_FUSION": "0",
+    "ORION_UNIFIED_LT_OUTPUT_FUSION": "0",
+    "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "1",
 }
 
 PROVIDER_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "layer",
     "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
+    "ORION_CONCAT_FUSION": "auto",
+    "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
+    "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
 
 ENV_TUNING_KEYS = (
@@ -217,6 +233,8 @@ ENV_TUNING_KEYS = (
     "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
     "ORION_LATTIGO_BOOTSTRAP_WORKERS",
     "ORION_CONCAT_FUSION",
+    "ORION_UNIFIED_LT_OUTPUT_FUSION",
+    "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION",
     "ORION_LATTIGO_CLEAR_BACKEND",
     "ORION_CPP_DIAG_BUILDER",
     "ORION_CPP_DIAG_BUILDER_DENSE",
@@ -239,12 +257,22 @@ def _network_name(case: str) -> str:
     return f"u23_dim32_{_safe_case(case)}_full"
 
 
-def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
+def _backend_clear_value(backend: str) -> str:
+    value = str(backend).strip().lower()
+    if value == "clear":
+        return "1"
+    if value == "ckks":
+        return "0"
+    raise ValueError(f"unknown backend {backend!r}; expected 'ckks' or 'clear'")
+
+
+def _apply_env_defaults(env: dict[str, str], *, backend: str = "ckks") -> dict[str, str]:
     updated = dict(env)
     for key, value in ENV_DEFAULTS.items():
         updated.setdefault(key, value)
     for key, value in REQUIRED_MAINLINE_ENV.items():
         updated[key] = value
+    updated["ORION_LATTIGO_CLEAR_BACKEND"] = _backend_clear_value(str(backend))
     return updated
 
 
@@ -255,6 +283,14 @@ def _apply_mode_env(env: dict[str, str], mode: str) -> dict[str, str]:
     else:
         updated.update(DENSE_MODE_ENV)
     return updated
+
+
+def _mode_layer_mae_enabled(args: argparse.Namespace, mode: str) -> bool:
+    if bool(getattr(args, "layer_mae", False)):
+        return True
+    if str(mode) == "provider":
+        return bool(getattr(args, "provider_layer_mae", False))
+    return bool(getattr(args, "dense_layer_mae", False))
 
 
 def _provider_mode(policy: str) -> str:
@@ -336,6 +372,7 @@ def _annotate_result(
     *,
     case: str,
     mode: str,
+    backend: str,
     policy: str,
     provider_mode: str,
     run_root: Path,
@@ -349,6 +386,7 @@ def _annotate_result(
         "run_root": str(run_root),
         "case": str(case),
         "mode": str(mode),
+        "backend": str(backend),
         "policy": str(policy),
         "provider_mode": str(provider_mode),
         "local_time": datetime.now().isoformat(timespec="seconds"),
@@ -371,8 +409,7 @@ def _annotate_result(
 
 def run_one(args: argparse.Namespace) -> int:
     mode = str(args.mode)
-    os.environ.update(_apply_mode_env(_apply_env_defaults(os.environ), mode))
-    os.environ.setdefault("ORION_CONCAT_FUSION", "auto")
+    os.environ.update(_apply_mode_env(_apply_env_defaults(os.environ, backend=str(args.backend)), mode))
     env_snapshot = dict(os.environ)
     base = _register_networks()
     out_path = Path(args.out)
@@ -392,7 +429,7 @@ def run_one(args: argparse.Namespace) -> int:
             profile_lt=bool(args.profile_lt),
             trace_forward_memory=bool(args.trace_forward_memory),
             operator_breakdown=bool(args.operator_breakdown),
-            layer_mae=bool(args.layer_mae),
+            layer_mae=_mode_layer_mae_enabled(args, mode),
             provider_mode_override=provider_mode if mode == "provider" else None,
             io_mode="none",
             io_dir=None,
@@ -409,6 +446,7 @@ def run_one(args: argparse.Namespace) -> int:
             out_path,
             case=str(args.case),
             mode=mode,
+            backend=str(args.backend),
             policy=str(args.policy),
             provider_mode=provider_mode,
             run_root=Path(args.run_root),
@@ -455,6 +493,12 @@ def _fmt_int(value: Any) -> str:
         return f"{int(value):,}"
     except (TypeError, ValueError):
         return ""
+
+
+def _fmt_bool(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    return "yes" if bool(value) else "no"
 
 
 def _gib(value: Any) -> str:
@@ -1029,6 +1073,9 @@ def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
     if encrypt_s is not None and he_forward_s is not None and decode_s is not None:
         hot_s = float(encrypt_s + he_forward_s + decode_s)
     totals = _breakdown_totals(payload)
+    mae = payload.get("mae_vs_clear") if isinstance(payload.get("mae_vs_clear"), dict) else {}
+    layer_mae = _metric(payload, ("layer_mae_after_forward", "summary"))
+    layer_mae = layer_mae if isinstance(layer_mae, dict) else {}
     mvm_lt_s = _summary_total(totals, "mvm_kernel_s")
     activation_s = _summary_total(totals, "activation_excluding_bootstrap_s", "activation_s")
     bootstrap_s = _summary_total(totals, "bootstrap_s")
@@ -1073,6 +1120,15 @@ def _case_summary(run_root: Path, case: str, mode: str) -> dict[str, Any]:
         ),
         "rotations": _rotation_count(payload) if has_payload else None,
         "boots": _bootstrap_count(payload) if has_payload else None,
+        "e2e_mae": mae.get("mae"),
+        "e2e_max_abs": mae.get("max_abs"),
+        "layer_mae_overall_ok": (
+            layer_mae.get("overall_ok")
+            if "overall_ok" in layer_mae
+            else payload.get("layer_mae_overall_ok")
+        ),
+        "layer_mae_max_mae": layer_mae.get("max_mae"),
+        "layer_mae_max_abs": layer_mae.get("max_abs"),
         "peak_rss_gib": _metric(payload, ("runner", "maxrss_bytes")),
         "runtime_mode": _runtime_mode(payload),
         "result_path": str(result_path),
@@ -1124,6 +1180,13 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
         "Halo rotations",
         "dense boots",
         "Halo boots",
+        "dense e2e MAE",
+        "Halo e2e MAE",
+        "dense e2e max abs",
+        "Halo e2e max abs",
+        "Halo layer-MAE ok",
+        "Halo layer max MAE",
+        "Halo layer max abs",
         "dense RSS GiB",
         "Halo RSS GiB",
         "runtime mode",
@@ -1173,6 +1236,13 @@ def _network_summary_table(run_root: Path, cases: list[str]) -> str:
                 _fmt_int(provider["rotations"]),
                 _fmt_int(dense["boots"]),
                 _fmt_int(provider["boots"]),
+                _fmt_float(dense["e2e_mae"], digits=6),
+                _fmt_float(provider["e2e_mae"], digits=6),
+                _fmt_float(dense["e2e_max_abs"], digits=6),
+                _fmt_float(provider["e2e_max_abs"], digits=6),
+                _fmt_bool(provider["layer_mae_overall_ok"]),
+                _fmt_float(provider["layer_mae_max_mae"], digits=6),
+                _fmt_float(provider["layer_mae_max_abs"], digits=6),
                 _gib(dense["peak_rss_gib"]),
                 _gib(provider["peak_rss_gib"]),
                 str(provider["runtime_mode"] or dense["runtime_mode"]),
@@ -1222,6 +1292,13 @@ def _network_summary_table_from_rows(rows: list[list[str]]) -> str:
         "Halo rotations",
         "dense boots",
         "Halo boots",
+        "dense e2e MAE",
+        "Halo e2e MAE",
+        "dense e2e max abs",
+        "Halo e2e max abs",
+        "Halo layer-MAE ok",
+        "Halo layer max MAE",
+        "Halo layer max abs",
         "dense RSS GiB",
         "Halo RSS GiB",
         "runtime mode",
@@ -1338,11 +1415,14 @@ def _join_result_file_parts(parts: dict[str, str]) -> str:
 
 
 def _upgrade_summary_row(row: list[str]) -> list[str] | None:
+    if len(row) == 46:
+        return _pad_row(row, 46)
+    legacy: list[str] | None = None
     if len(row) == 39:
-        return _pad_row(row, 39)
-    if len(row) == 37:
-        return _pad_row(row[:22] + ["", ""] + row[22:], 39)
-    if len(row) == 29:
+        legacy = _pad_row(row, 39)
+    elif len(row) == 37:
+        legacy = _pad_row(row[:22] + ["", ""] + row[22:], 39)
+    elif len(row) == 29:
         dense_compute = _fmt_float(
             _summary_sum(
                 _cell_float(row[10]),
@@ -1357,7 +1437,7 @@ def _upgrade_summary_row(row: list[str]) -> list[str] | None:
                 _cell_float(row[15]),
             )
         )
-        return [
+        legacy = [
             row[0],
             row[1],
             row[2],
@@ -1398,8 +1478,8 @@ def _upgrade_summary_row(row: list[str]) -> list[str] | None:
             row[27],
             row[28],
         ]
-    if len(row) == 19:
-        return [
+    elif len(row) == 19:
+        legacy = [
             row[0],
             row[1],
             row[2],
@@ -1440,18 +1520,20 @@ def _upgrade_summary_row(row: list[str]) -> list[str] | None:
             row[17],
             row[18],
         ]
+    if legacy is not None:
+        return _pad_row(legacy[:34] + [""] * 7 + legacy[34:], 46)
     return None
 
 
 def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], modes: list[str]) -> list[list[str]]:
-    width = 39
+    width = 46
     by_case = {}
     for row in existing:
         upgraded = _upgrade_summary_row(list(row))
         if upgraded is not None:
             by_case[str(upgraded[0])] = upgraded
-    dense_cols = (3, 5, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34)
-    provider_cols = (4, 6, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35)
+    dense_cols = (3, 5, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 41)
+    provider_cols = (4, 6, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 38, 39, 40, 42)
     for new_row in new_rows:
         new_row = _pad_row(new_row, width)
         case = str(new_row[0])
@@ -1470,16 +1552,16 @@ def _merge_summary_rows(existing: list[list[str]], new_rows: list[list[str]], mo
                 merged[index] = new_row[index]
         ratio = _ratio(merged[5].replace(",", ""), merged[6].replace(",", ""))
         merged[7] = _fmt_float(ratio)
-        if new_row[36]:
-            merged[36] = new_row[36]
-        files = _result_file_parts(merged[37])
-        new_files = _result_file_parts(new_row[37])
+        if new_row[43]:
+            merged[43] = new_row[43]
+        files = _result_file_parts(merged[44])
+        new_files = _result_file_parts(new_row[44])
         for mode in modes:
             if new_files.get(mode):
                 files[mode] = new_files[mode]
-        merged[37] = _join_result_file_parts(files)
-        if new_row[38]:
-            merged[38] = new_row[38]
+        merged[44] = _join_result_file_parts(files)
+        if new_row[45]:
+            merged[45] = new_row[45]
         by_case[case] = merged
     case_order = {case: index for index, case in enumerate(CASES)}
     return [by_case[key] for key in sorted(by_case, key=lambda case: case_order.get(case, 100))]
@@ -1535,9 +1617,16 @@ def run_all(args: argparse.Namespace) -> int:
 
     cases = [str(case) for case in args.cases]
     modes = [str(mode) for mode in args.modes]
-    env = _apply_env_defaults(os.environ)
+    env = _apply_env_defaults(os.environ, backend=str(args.backend))
     env["TMPDIR"] = str(run_root / "tmp")
     env.setdefault("XDG_CACHE_HOME", str(run_root / "xdg-cache"))
+    mode_env = {
+        str(mode): {
+            key: str(_apply_mode_env(dict(env), str(mode)).get(key, ""))
+            for key in ENV_SNAPSHOT_KEYS
+        }
+        for mode in modes
+    }
 
     manifest = {
         "script": str(Path(__file__).relative_to(REPO_ROOT)),
@@ -1545,17 +1634,20 @@ def run_all(args: argparse.Namespace) -> int:
         "doc": str(args.doc),
         "cases": cases,
         "modes": modes,
+        "backend": str(args.backend),
         "policy": str(args.policy),
         "provider_mode": _provider_mode(str(args.policy)),
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "command": " ".join(shlex.quote(part) for part in sys.argv),
         "env": {key: str(env.get(key, "")) for key in ENV_SNAPSHOT_KEYS},
+        "mode_env": mode_env,
         "model_variant": "UNet22PlusOutput dim32, 22 body layers plus explicit output layer",
         "measurement": {
             "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
             "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
             "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_lt": "independent Orion LT; concat fusion/default explicit materialization is chosen by ORION_CONCAT_FUSION=auto",
+            "dense_lt": "independent Orion LT; dense mode disables concat fusion, unified output fusion, and bootstrap prescale fusion",
+            "provider_lt": "HaloED/provider mode keeps concat fusion on auto and unified output/bootstrap prescale fusion enabled",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
         },
     }
@@ -1574,7 +1666,7 @@ def run_all(args: argparse.Namespace) -> int:
     try:
         for case in cases:
             for mode in modes:
-                env = _apply_mode_env(_apply_env_defaults(os.environ), mode)
+                env = _apply_mode_env(_apply_env_defaults(os.environ, backend=str(args.backend)), mode)
                 env["TMPDIR"] = str(run_root / "tmp")
                 env.setdefault("XDG_CACHE_HOME", str(run_root / "xdg-cache"))
                 out_path, log_path = _case_paths(run_root, case, mode)
@@ -1599,6 +1691,7 @@ def run_all(args: argparse.Namespace) -> int:
                             "run_root": str(run_root),
                             "case": str(case),
                             "mode": str(mode),
+                            "backend": str(args.backend),
                             "policy": str(args.policy),
                             "provider_mode": provider_mode,
                             "local_time": datetime.now().isoformat(timespec="seconds"),
@@ -1617,6 +1710,8 @@ def run_all(args: argparse.Namespace) -> int:
                     str(case),
                     "--mode",
                     str(mode),
+                    "--backend",
+                    str(args.backend),
                     "--policy",
                     str(args.policy),
                     "--run-root",
@@ -1638,6 +1733,10 @@ def run_all(args: argparse.Namespace) -> int:
                     command.append("--operator-breakdown")
                 if bool(args.layer_mae):
                     command.append("--layer-mae")
+                if bool(args.dense_layer_mae):
+                    command.append("--dense-layer-mae")
+                if bool(args.provider_layer_mae):
+                    command.append("--provider-layer-mae")
                 print(f"[{datetime.now().isoformat(timespec='seconds')}] start {case} {mode}", flush=True)
                 print(" ".join(shlex.quote(part) for part in command), flush=True)
                 with log_path.open("w", encoding="utf-8") as log_file:
@@ -1675,6 +1774,7 @@ def main() -> int:
     parser.add_argument("--doc", type=Path, default=REPO_ROOT / "docs" / "u22_orion_streaming_haloed_mainline.md")
     parser.add_argument("--cases", nargs="+", choices=tuple(CASES), default=list(CASES))
     parser.add_argument("--modes", nargs="+", choices=("dense", "provider"), default=["dense", "provider"])
+    parser.add_argument("--backend", choices=("ckks", "clear"), default="ckks")
     parser.add_argument("--policy", choices=tuple(PROVIDER_MODES), default="dp_no_share_fold")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--forward-runs", type=int, default=1)
@@ -1686,10 +1786,12 @@ def main() -> int:
     parser.add_argument("--operator-breakdown", dest="operator_breakdown", action="store_true")
     parser.add_argument("--no-operator-breakdown", dest="operator_breakdown", action="store_false")
     parser.set_defaults(operator_breakdown=True)
-    parser.add_argument("--layer-mae", action="store_true")
+    parser.add_argument("--layer-mae", action="store_true", help="enable layer-MAE checks for all modes")
+    parser.add_argument("--dense-layer-mae", action="store_true", help="enable layer-MAE checks for dense mode")
+    parser.add_argument("--provider-layer-mae", action="store_true", help="enable layer-MAE checks for provider mode")
     parser.add_argument("--update-doc-only", action="store_true")
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--case", choices=tuple(CASES), default="256x256", help=argparse.SUPPRESS)
+    parser.add_argument("--case", choices=tuple(CASES), default="192x192", help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("dense", "provider"), default="dense", help=argparse.SUPPRESS)
     parser.add_argument("--out", type=Path, default=Path("/tmp/u22_dim32_matrix_case.json"), help=argparse.SUPPRESS)
     args = parser.parse_args()

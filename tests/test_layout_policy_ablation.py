@@ -7083,6 +7083,15 @@ def test_u22_dim32_runners_accept_no_share_fold_policy() -> None:
     from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
     from tools import run_u22_dim32_encoder4_noshare_e2e as encoder4_runner
 
+    assert list(matrix_runner.CASES) == ["192x192", "224x224", "256x256", "384x384"]
+    assert tuple(matrix_runner.CASES["192x192"]["input_shape"]) == (1, 1, 192, 192)
+    assert int(matrix_runner.CASES["192x192"]["out_channels"]) == 4
+    assert tuple(matrix_runner.CASES["224x224"]["input_shape"]) == (1, 3, 224, 224)
+    assert int(matrix_runner.CASES["224x224"]["out_channels"]) == 1
+    assert tuple(matrix_runner.CASES["256x256"]["input_shape"]) == (1, 1, 256, 256)
+    assert int(matrix_runner.CASES["256x256"]["out_channels"]) == 1
+    assert tuple(matrix_runner.CASES["384x384"]["input_shape"]) == (1, 1, 384, 384)
+    assert int(matrix_runner.CASES["384x384"]["out_channels"]) == 1
     assert matrix_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert matrix_runner._provider_mode("dp_noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert matrix_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
@@ -7112,8 +7121,23 @@ def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
             "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
             "ORION_LATTIGO_UNIFIED_NO_BSGS": "1",
             "ORION_CONCAT_FUSION": "0",
+            "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
+            "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
             "ORION_PACK_CONV_WORKERS": "240",
     }
+    matrix_base = matrix_runner._apply_env_defaults(dict(bad_env))
+    assert matrix_base["ORION_LATTIGO_CLEAR_BACKEND"] == "0"
+    assert matrix_runner._apply_env_defaults(dict(bad_env), backend="clear")["ORION_LATTIGO_CLEAR_BACKEND"] == "1"
+    dense_env = matrix_runner._apply_mode_env(dict(matrix_base), "dense")
+    provider_env = matrix_runner._apply_mode_env(dict(matrix_base), "provider")
+    assert dense_env["ORION_CONCAT_FUSION"] == "0"
+    assert dense_env["ORION_UNIFIED_LT_OUTPUT_FUSION"] == "0"
+    assert dense_env["ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION"] == "1"
+    assert provider_env["ORION_CONCAT_FUSION"] == "auto"
+    assert provider_env["ORION_UNIFIED_LT_OUTPUT_FUSION"] == "1"
+    assert provider_env["ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION"] == "0"
+    assert matrix_base["ORION_PACK_CONV_WORKERS"] == "240"
+
     for runner in (matrix_runner, encoder4_runner):
         env = runner._apply_env_defaults(dict(bad_env))
         assert env["GOMAXPROCS"] == "1"
@@ -7122,8 +7146,80 @@ def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
         assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
         assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
         assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
-        assert env["ORION_CONCAT_FUSION"] == "auto"
-    assert matrix_runner._apply_env_defaults(dict(bad_env))["ORION_PACK_CONV_WORKERS"] == "240"
+    assert encoder4_runner._apply_env_defaults(dict(bad_env))["ORION_CONCAT_FUSION"] == "auto"
+
+    args = SimpleNamespace(layer_mae=False, dense_layer_mae=False, provider_layer_mae=False)
+    assert matrix_runner._mode_layer_mae_enabled(args, "dense") is False
+    assert matrix_runner._mode_layer_mae_enabled(args, "provider") is False
+    args.provider_layer_mae = True
+    assert matrix_runner._mode_layer_mae_enabled(args, "provider") is True
+    args.layer_mae = True
+    assert matrix_runner._mode_layer_mae_enabled(args, "dense") is True
+
+
+def test_u22_dim32_matrix_summary_reports_mae_columns(tmp_path: Path) -> None:
+    from tools import run_u22_dim32_dense_provider_e2e_matrix as matrix_runner
+
+    for mode in ("dense", "provider"):
+        out_path, _log_path = matrix_runner._case_paths(tmp_path, "192x192", mode)
+        payload = {
+            "status": "ok",
+            "timing_s": {"compile": 1.2},
+            "measured_forward_mean_timing_s": {
+                "encrypt": 0.1,
+                "he_forward": 2.0,
+                "decrypt_decode": 0.2,
+            },
+            "rotation_report_after_forward": {
+                "total_rotation_eval_count_estimate": 123 if mode == "dense" else 45,
+            },
+            "bootstrap_report_after_forward": {"count": 8 if mode == "dense" else 9, "rows": []},
+            "operator_breakdown_after_forward": {
+                "totals": {
+                    "mvm_kernel_s": 1.0,
+                    "activation_excluding_bootstrap_s": 0.3,
+                    "bootstrap_s": 0.7,
+                    "lt_layer_cache_encode_s": 0.4,
+                    "lt_layer_cache_turnover_s": 0.5,
+                },
+            },
+            "mae_vs_clear": {"mae": 1.23e-6, "max_abs": 4.56e-6, "shape_match": True},
+            "runner": {"maxrss_bytes": 1024**3},
+            "runtime_fairness_mode": "mock",
+        }
+        if mode == "provider":
+            payload["layer_mae_after_forward"] = {
+                "summary": {"overall_ok": True, "max_mae": 2e-7, "max_abs": 3e-6},
+            }
+        matrix_runner._write_json(out_path, payload)
+
+    table = matrix_runner._network_summary_table(tmp_path, ["192x192"])
+    rows = [
+        matrix_runner._split_markdown_row(line)
+        for line in table.splitlines()
+        if matrix_runner._split_markdown_row(line)
+    ]
+
+    assert all(len(row) == 46 for row in rows)
+    assert rows[0][34:41] == [
+        "dense e2e MAE",
+        "Halo e2e MAE",
+        "dense e2e max abs",
+        "Halo e2e max abs",
+        "Halo layer-MAE ok",
+        "Halo layer max MAE",
+        "Halo layer max abs",
+    ]
+    assert rows[2][34:41] == [
+        "0.000001",
+        "0.000001",
+        "0.000005",
+        "0.000005",
+        "yes",
+        "0.000000",
+        "0.000003",
+    ]
+    assert len(matrix_runner._upgrade_summary_row(["x"] * 39) or []) == 46
 
 
 def test_layout_policy_cli_non_ckks_simulation_smoke(tmp_path: Path) -> None:
