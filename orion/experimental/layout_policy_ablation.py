@@ -4691,6 +4691,7 @@ def _promote_no_share_native_stripe_producer_outputs(
                 plan = native_halo_conv2d_plan(
                     native_spec,
                     require_native_target_fit=False,
+                    channel_fold_mode="per_stripe",
                     source_storage_signature=tuple(source_storage_signature) or None,
                 )
             except Exception:
