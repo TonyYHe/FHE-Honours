@@ -2355,7 +2355,11 @@ def _cpp_diag_builder_strict_enabled() -> bool:
     return str(value).strip().lower() not in _FALSE_ENV_VALUES
 
 
-def _exact_dense_diag_indices_by_block(edge: EdgeInfo) -> tuple[dict[tuple[int, int], tuple[int, ...]], int] | None:
+def _exact_dense_diag_indices_by_block(
+    edge: EdgeInfo,
+    *,
+    last: bool = False,
+) -> tuple[dict[tuple[int, int], tuple[int, ...]], int] | None:
     module = edge.module
     if module is None:
         return None
@@ -2366,7 +2370,6 @@ def _exact_dense_diag_indices_by_block(edge: EdgeInfo) -> tuple[dict[tuple[int, 
         from orion.core import packing
     except Exception:
         return None
-    last = False
     if str(edge.op_kind) == "conv_transpose2d":
         slots = int(module_scheme.params.get_slots())
         embed_method = str(module_scheme.params.get_embedding_method())
@@ -2390,7 +2393,7 @@ def _exact_dense_diag_indices_by_block(edge: EdgeInfo) -> tuple[dict[tuple[int, 
             allow_hybrid=True,
         )
     elif str(edge.op_kind) in {"conv2d", "avgpool2d"}:
-        diagonals, output_rotations = packing.pack_conv2d(module, last=last, allow_hybrid=True)
+        diagonals, output_rotations = packing.pack_conv2d(module, last=bool(last), allow_hybrid=True)
         diagonals = packing.prune_zero_diagonal_blocks(diagonals, preserve_empty_rows=True)
         indices = {
             (int(row), int(col)): tuple(sorted(int(index) for index in dict(block or {}).keys()))
@@ -2404,7 +2407,12 @@ def _exact_dense_diag_indices_by_block(edge: EdgeInfo) -> tuple[dict[tuple[int, 
     }, int(output_rotations)
 
 
-def _dense_single_slot_rotation_stats(edge: EdgeInfo, *, include_identity: bool = False) -> dict[str, int] | None:
+def _dense_single_slot_rotation_stats(
+    edge: EdgeInfo,
+    *,
+    include_identity: bool = False,
+    last: bool = False,
+) -> dict[str, int] | None:
     cache_key = (
         str(edge.edge_id),
         str(edge.op_kind),
@@ -2418,11 +2426,12 @@ def _dense_single_slot_rotation_stats(edge: EdgeInfo, *, include_identity: bool 
         int(edge.groups),
         int(edge.slots),
         bool(include_identity),
+        bool(last),
     )
     if cache_key in _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE:
         cached = _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE[cache_key]
         return None if cached is None else dict(cached)
-    packed = _exact_dense_diag_indices_by_block(edge)
+    packed = _exact_dense_diag_indices_by_block(edge, last=bool(last))
     if packed is None:
         _DENSE_SINGLE_SLOT_ROTATION_STATS_CACHE[cache_key] = None
         return None
@@ -3757,6 +3766,66 @@ def _dp_no_share_fold_runtime_rotation_row_adjustments(
                 },
             )
             continue
+
+
+def _orion_dense_runtime_rotation_row_adjustments(
+    *,
+    edge_rows: list[dict[str, Any]],
+    edge_by_id: dict[str, EdgeInfo],
+    final_targets: set[str],
+) -> None:
+    for row in edge_rows:
+        edge = edge_by_id.get(str(row.get("edge", "")))
+        if edge is None:
+            continue
+        op_kind = str(row.get("op_kind", ""))
+        if op_kind not in {"conv2d", "avgpool2d", "conv_transpose2d"}:
+            continue
+        concat_stats = _concat_fused_conv_rotation_stats(edge, row, edge_rows)
+        if concat_stats is not None:
+            _row_set_rotation_stats(
+                row,
+                rotations=int(concat_stats["rotations"]),
+                transform_count=int(concat_stats["transforms"]),
+                baby_rotations=int(concat_stats["baby_rotations"]),
+                giant_rotations=int(concat_stats["giant_rotations"]),
+                bsgs_groups=int(concat_stats["bsgs_groups"]),
+                estimator="concat_fused_module_unified_plan",
+                extra={
+                    "rotation_report_source": "compiled_backend_unified_transform_rotation_keys",
+                    "rotation_eval_count_mode": "independent_transform_bsgs",
+                    "concat_fusion_runtime_estimate": True,
+                    "dense_runtime_rotation_estimate": True,
+                },
+            )
+            continue
+        stats = _dense_single_slot_rotation_stats(
+            edge,
+            include_identity=True,
+            last=str(row.get("target", "")) in final_targets,
+        )
+        if stats is None:
+            continue
+        transform_rotations = int(stats["rotations"]) - int(stats["output_rotation_evals"])
+        _row_set_rotation_stats(
+            row,
+            rotations=int(stats["rotations"]),
+            transform_count=int(stats["transforms"]),
+            baby_rotations=int(stats["baby_rotations"]),
+            giant_rotations=int(stats["giant_rotations"]),
+            bsgs_groups=int(stats["bsgs_groups"]),
+            estimator="dense_single_slot_bsgs_ratio_plan",
+            extra={
+                "rotation_report_source": "planned_single_slot_dense_bsgs_eval_rotations",
+                "rotation_eval_count_mode": "independent_transform_bsgs",
+                "dense_runtime_rotation_estimate": True,
+                "dense_single_slot_transform_rotation_eval_count": int(transform_rotations),
+                "dense_single_slot_output_rotations_per_output_ct": int(stats["output_rotations"]),
+                "dense_single_slot_output_rotation_eval_count": int(stats["output_rotation_evals"]),
+                "dense_single_slot_rows": int(stats["rows"]),
+                "dense_single_slot_cols": int(stats["cols"]),
+            },
+        )
 
 
 def _native_source_stripe_output_capable(module: Any | None) -> bool:
@@ -6448,6 +6517,11 @@ def _plan_orion_dense(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int)
             )
 
     rows.sort(key=lambda row: (topo_index.get(str(row["source"]), 10**9), topo_index.get(str(row["target"]), 10**9)))
+    _orion_dense_runtime_rotation_row_adjustments(
+        edge_rows=rows,
+        edge_by_id={str(edge.edge_id): edge for edge in edges},
+        final_targets={str(node) for node in topo if str(node) not in edges_by_source},
+    )
     return _finalize_policy(
         policy="orion_dense",
         edge_rows=rows,
