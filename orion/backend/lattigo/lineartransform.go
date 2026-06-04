@@ -1234,6 +1234,56 @@ func newUnifiedLoadTransformations(params []lintrans.Parameters) []lintrans.Line
 	return transforms
 }
 
+func groupedUnifiedOffsets(numTransforms int, groupOffsetsC *C.int, groupOffsetsLen C.int) []int {
+	if groupOffsetsC == nil || int(groupOffsetsLen) <= 0 {
+		return []int{0, numTransforms}
+	}
+	offsets := CArrayToSlice(groupOffsetsC, groupOffsetsLen, convertCIntToInt)
+	if len(offsets) < 2 {
+		panic(fmt.Errorf("grouped unified transform generation requires at least two group offsets, got %d", len(offsets)))
+	}
+	if offsets[0] != 0 {
+		panic(fmt.Errorf("grouped unified transform offsets must start at 0, got %d", offsets[0]))
+	}
+	if offsets[len(offsets)-1] != numTransforms {
+		panic(fmt.Errorf("grouped unified transform offsets must end at %d, got %d", numTransforms, offsets[len(offsets)-1]))
+	}
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] <= offsets[i-1] {
+			panic(fmt.Errorf("grouped unified transform offsets must be strictly increasing: offsets[%d]=%d <= offsets[%d]=%d", i, offsets[i], i-1, offsets[i-1]))
+		}
+		if offsets[i] > numTransforms {
+			panic(fmt.Errorf("grouped unified transform offset %d exceeds transform count %d", offsets[i], numTransforms))
+		}
+	}
+	return offsets
+}
+
+func newGroupedUnifiedLoadTransformations(params []lintrans.Parameters, offsets []int) []lintrans.LinearTransformation {
+	transforms := make([]lintrans.LinearTransformation, 0, len(params))
+	for groupIndex := 0; groupIndex+1 < len(offsets); groupIndex++ {
+		start := offsets[groupIndex]
+		end := offsets[groupIndex+1]
+		transforms = append(transforms, newUnifiedLoadTransformations(params[start:end])...)
+	}
+	return transforms
+}
+
+func newGroupedUnifiedTransformations(params []lintrans.Parameters, offsets []int) []lintrans.LinearTransformation {
+	transforms := make([]lintrans.LinearTransformation, 0, len(params))
+	for groupIndex := 0; groupIndex+1 < len(offsets); groupIndex++ {
+		start := offsets[groupIndex]
+		end := offsets[groupIndex+1]
+		if unifiedNoBSGSEnabled() {
+			transforms = append(transforms, newUnifiedNoBSGSTransformations(params[start:end])...)
+		} else {
+			applyOptimalUnifiedBSGSRatio(params[start:end])
+			transforms = append(transforms, lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params[start:end])...)
+		}
+	}
+	return transforms
+}
+
 func AddLinearTransform(lt lintrans.LinearTransformation) int {
 	return ltHeap.Add(lt)
 }
@@ -2107,6 +2157,112 @@ func GenerateLinearTransformsUnified(
 	return SliceToCArray(ids, convertIntToCInt)
 }
 
+//export GenerateLinearTransformsUnifiedGrouped
+func GenerateLinearTransformsUnifiedGrouped(
+	numTransforms C.int,
+	groupOffsetsC *C.int, groupOffsetsLen C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	diagDataArray **C.float, diagDataLens *C.int,
+	levels *C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	slots := scheme.Params.MaxSlots()
+	offsets := groupedUnifiedOffsets(n, groupOffsetsC, groupOffsetsLen)
+
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	diagDataArraySlice := unsafe.Slice(diagDataArray, n)
+	diagDataLensSlice := unsafe.Slice(diagDataLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	params := make([]lintrans.Parameters, n)
+	diagIdxsList := make([][]int, n)
+
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		diagIdxsList[i] = diagIdxs
+
+		params[i] = lintrans.Parameters{
+			DiagonalsIndexList:        diagIdxs,
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: 1,
+		}
+	}
+
+	transforms := make([]lintrans.LinearTransformation, n)
+	streamingStates := make([]*lattigoStreamingLTState, n)
+	encodeTransforms := make([]lintrans.LinearTransformation, 0, n)
+	encodeDiagonals := make([]lintrans.Diagonals[float64], 0, n)
+	encodeIndices := make([]int, 0, n)
+	for groupIndex := 0; groupIndex+1 < len(offsets); groupIndex++ {
+		start := offsets[groupIndex]
+		end := offsets[groupIndex+1]
+		loadTransforms := newUnifiedLoadTransformations(params[start:end])
+		totalPlaintexts := 0
+		streamingGroup := false
+		for _, transform := range loadTransforms {
+			totalPlaintexts += len(transform.Vec)
+		}
+		if lattigoStreamingLTEnabled("none", totalPlaintexts) {
+			streamingGroup = true
+		} else {
+			for _, transform := range loadTransforms {
+				if lattigoStreamingLTEnabled("none", len(transform.Vec)) {
+					streamingGroup = true
+					break
+				}
+			}
+		}
+		if streamingGroup {
+			for i, transform := range loadTransforms {
+				globalIndex := start + i
+				transforms[globalIndex] = transform
+				streamingStates[globalIndex] = newStreamingLTStateFromC(
+					transform,
+					diagIdxsList[globalIndex],
+					diagDataArraySlice[globalIndex],
+					diagDataLensSlice[globalIndex],
+				)
+			}
+			continue
+		}
+		groupTransforms := newGroupedUnifiedTransformations(params[start:end], []int{0, end - start})
+		for i, transform := range groupTransforms {
+			globalIndex := start + i
+			transforms[globalIndex] = transform
+			encodeTransforms = append(encodeTransforms, transform)
+			encodeDiagonals = append(
+				encodeDiagonals,
+				buildFloatDiagonalsFromC(
+					diagIdxsList[globalIndex],
+					diagDataArraySlice[globalIndex],
+					diagDataLensSlice[globalIndex],
+					slots,
+				),
+			)
+			encodeIndices = append(encodeIndices, globalIndex)
+		}
+	}
+	if len(encodeTransforms) > 0 {
+		if err := encodeUnifiedFloatTransformsParallel(encodeDiagonals, encodeTransforms); err != nil {
+			panic(err)
+		}
+		for i, transform := range encodeTransforms {
+			transforms[encodeIndices[i]] = transform
+		}
+	}
+
+	ids := make([]int, n)
+	for i, lt := range transforms {
+		ids[i] = AddLinearTransform(lt)
+		registerStreamingLTState(ids[i], streamingStates[i])
+	}
+	return SliceToCArray(ids, convertIntToCInt)
+}
+
 //export PlanLinearTransformsUnifiedRotationKeys
 func PlanLinearTransformsUnifiedRotationKeys(
 	numTransforms C.int,
@@ -2198,6 +2354,63 @@ func GenerateLinearTransformsUnifiedComplex(
 		applyOptimalUnifiedBSGSRatio(params)
 		transforms = lintrans.NewTransformationsWithUnifiedBSGS(scheme.Params, params)
 	}
+	if err := encodeUnifiedComplexTransformsParallel(diagonalsList, transforms); err != nil {
+		panic(err)
+	}
+
+	ids := make([]int, n)
+	for i, lt := range transforms {
+		ids[i] = AddLinearTransform(lt)
+	}
+	return SliceToCArray(ids, convertIntToCInt)
+}
+
+//export GenerateLinearTransformsUnifiedGroupedComplex
+func GenerateLinearTransformsUnifiedGroupedComplex(
+	numTransforms C.int,
+	groupOffsetsC *C.int, groupOffsetsLen C.int,
+	diagIdxsArray **C.int, diagIdxsLens *C.int,
+	diagDataArray **C.double, diagDataLens *C.int,
+	levels *C.int,
+) (*C.int, C.ulong) {
+	n := int(numTransforms)
+	slots := scheme.Params.MaxSlots()
+	offsets := groupedUnifiedOffsets(n, groupOffsetsC, groupOffsetsLen)
+
+	diagIdxsArraySlice := unsafe.Slice(diagIdxsArray, n)
+	diagIdxsLensSlice := unsafe.Slice(diagIdxsLens, n)
+	diagDataArraySlice := unsafe.Slice(diagDataArray, n)
+	diagDataLensSlice := unsafe.Slice(diagDataLens, n)
+	levelsSlice := unsafe.Slice(levels, n)
+
+	params := make([]lintrans.Parameters, n)
+	diagonalsList := make([]lintrans.Diagonals[complex128], n)
+
+	for i := 0; i < n; i++ {
+		diagIdxs := CArrayToSlice(diagIdxsArraySlice[i], diagIdxsLensSlice[i], convertCIntToInt)
+		raw := unsafe.Slice(diagDataArraySlice[i], int(diagDataLensSlice[i]))
+		diagonals := make(lintrans.Diagonals[complex128])
+		for j, key := range diagIdxs {
+			start := j * slots * 2
+			values := make([]complex128, slots)
+			for k := 0; k < slots; k++ {
+				values[k] = complex(float64(raw[start+2*k]), float64(raw[start+2*k+1]))
+			}
+			diagonals[key] = values
+		}
+		diagonalsList[i] = diagonals
+
+		params[i] = lintrans.Parameters{
+			DiagonalsIndexList:        diagonals.DiagonalsIndexList(),
+			LevelQ:                    int(levelsSlice[i]),
+			LevelP:                    scheme.Params.MaxLevelP(),
+			Scale:                     rlwe.NewScale(scheme.Params.Q()[int(levelsSlice[i])]),
+			LogDimensions:             ring.Dimensions{Rows: 0, Cols: scheme.Params.LogMaxSlots()},
+			LogBabyStepGiantStepRatio: 1,
+		}
+	}
+
+	transforms := newGroupedUnifiedTransformations(params, offsets)
 	if err := encodeUnifiedComplexTransformsParallel(diagonalsList, transforms); err != nil {
 		panic(err)
 	}

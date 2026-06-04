@@ -915,6 +915,23 @@ class LattigoLibrary:
             restype=ArrayResultInt
         )
 
+        generate_unified_grouped = getattr(self.lib, "GenerateLinearTransformsUnifiedGrouped", None)
+        if generate_unified_grouped is not None:
+            self.GenerateLinearTransformsUnifiedGrouped = LattigoFunction(
+                generate_unified_grouped,
+                argtypes=[
+                    ctypes.c_int,  # numTransforms
+                    ctypes.POINTER(ctypes.c_int),  # groupOffsets
+                    ctypes.c_int,  # groupOffsetsLen
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
+                    ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),  # diagDataArray
+                    ctypes.POINTER(ctypes.c_int),  # diagDataLens
+                    ctypes.POINTER(ctypes.c_int),  # levels
+                ],
+                restype=ArrayResultInt
+            )
+
         plan_unified_rotation_keys = getattr(self.lib, "PlanLinearTransformsUnifiedRotationKeys", None)
         if plan_unified_rotation_keys is not None:
             self.PlanLinearTransformsUnifiedRotationKeys = LattigoFunction(
@@ -940,6 +957,23 @@ class LattigoLibrary:
             ],
             restype=ArrayResultInt
         )
+
+        generate_unified_grouped_complex = getattr(self.lib, "GenerateLinearTransformsUnifiedGroupedComplex", None)
+        if generate_unified_grouped_complex is not None:
+            self.GenerateLinearTransformsUnifiedGroupedComplex = LattigoFunction(
+                generate_unified_grouped_complex,
+                argtypes=[
+                    ctypes.c_int,  # numTransforms
+                    ctypes.POINTER(ctypes.c_int),  # groupOffsets
+                    ctypes.c_int,  # groupOffsetsLen
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # diagIdxsArray
+                    ctypes.POINTER(ctypes.c_int),  # diagIdxsLens
+                    ctypes.POINTER(ctypes.POINTER(ctypes.c_double)),  # interleaved real/imag diagDataArray
+                    ctypes.POINTER(ctypes.c_int),  # diagDataLens
+                    ctypes.POINTER(ctypes.c_int),  # levels
+                ],
+                restype=ArrayResultInt
+            )
 
         generate_unified_load = getattr(self.lib, "GenerateLinearTransformsUnifiedLoad", None)
         if generate_unified_load is not None:

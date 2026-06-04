@@ -2627,6 +2627,245 @@ class UnifiedTransformGroup:
         )
         return ids
 
+    @staticmethod
+    def _generate_unified_backend_grouped_batch(
+        backend,
+        payloads: list[tuple[np.ndarray, np.ndarray, int]],
+        *,
+        group_offsets: tuple[int, ...],
+        has_complex: bool,
+        storage_key: str,
+    ) -> list[int]:
+        num_transforms = len(payloads)
+        if int(num_transforms) <= 0:
+            return []
+        generate = (
+            getattr(backend, "GenerateLinearTransformsUnifiedGroupedComplex", None)
+            if bool(has_complex)
+            else getattr(backend, "GenerateLinearTransformsUnifiedGrouped", None)
+        )
+        if not callable(generate):
+            raise NotImplementedError("backend does not expose grouped unified single-slot generation")
+
+        pointer_started = time.perf_counter()
+        diag_idxs_ptrs = (ctypes.POINTER(ctypes.c_int) * num_transforms)()
+        diag_idxs_lens = (ctypes.c_int * num_transforms)()
+        array_type = ctypes.c_double if bool(has_complex) else ctypes.c_float
+        diag_data_ptrs = (ctypes.POINTER(array_type) * num_transforms)()
+        diag_data_lens = (ctypes.c_int * num_transforms)()
+
+        owned_arrays: list[object] = []
+        for idx, (diag_idxs, diag_data, _level) in enumerate(payloads):
+            idx_array = np.ascontiguousarray(diag_idxs, dtype=np.int32)
+            data_array = np.ascontiguousarray(diag_data, dtype=np.float64 if bool(has_complex) else np.float32)
+            owned_arrays.extend((idx_array, data_array))
+            diag_idxs_ptrs[idx] = idx_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+            diag_idxs_lens[idx] = int(idx_array.size)
+            diag_data_ptrs[idx] = data_array.ctypes.data_as(ctypes.POINTER(array_type))
+            diag_data_lens[idx] = int(data_array.size)
+
+        levels_array = (ctypes.c_int * num_transforms)(*[int(level) for _diag_idxs, _diag_data, level in payloads])
+        group_offsets_array = np.ascontiguousarray(group_offsets, dtype=np.int32)
+        owned_arrays.extend((levels_array, group_offsets_array))
+        _unified_compile_trace(
+            "backend_generate_grouped_start",
+            group=str(storage_key),
+            transforms=num_transforms,
+            group_count=max(0, int(len(group_offsets) - 1)),
+            has_complex=int(bool(has_complex)),
+            diag_data_total=sum(int(payload[1].size) for payload in payloads),
+            pointer_pack_s=f"{time.perf_counter() - pointer_started:.6f}",
+        )
+        started = time.perf_counter()
+        ids = list(
+            generate(
+                int(num_transforms),
+                group_offsets_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                int(group_offsets_array.size),
+                diag_idxs_ptrs,
+                diag_idxs_lens,
+                diag_data_ptrs,
+                diag_data_lens,
+                levels_array,
+            )
+        )
+        _unified_compile_trace(
+            "backend_generate_grouped_done",
+            group=str(storage_key),
+            transforms=num_transforms,
+            group_count=max(0, int(len(group_offsets) - 1)),
+            seconds=f"{time.perf_counter() - started:.6f}",
+        )
+        del owned_arrays
+        return [int(value) for value in ids]
+
+    @classmethod
+    def materialize_single_slot_groups_for_eval(cls, groups: Iterable["UnifiedTransformGroup"], backend) -> dict[str, Any] | None:
+        candidates = list(groups)
+        if not candidates:
+            return {
+                "layer_cache_encode_s": 0.0,
+                "layer_cache_key_prepare_s": 0.0,
+                "materialized_group_count": 0,
+                "backend_transform_count": 0,
+            }
+        selected = [
+            group
+            for group in candidates
+            if bool(getattr(group, "_single_slot_layer_cache", False))
+            and getattr(group, "unified_ids", None) is None
+            and bool(getattr(group, "transforms", None))
+        ]
+        if len(selected) != len(candidates):
+            return None
+        if len({int(id(group)) for group in selected}) != len(selected):
+            return None
+
+        group_recipes: list[list[tuple[np.ndarray, int, Any]]] = []
+        group_complex_flags: list[bool] = []
+        has_complex = False
+        for group in selected:
+            recipes = getattr(group, "_single_slot_recipes", None)
+            if recipes is None:
+                recipes, group_has_complex, _raw_profile, _plan_s = group._prepare_single_slot_recipes()
+                group._single_slot_recipes = recipes
+                group._single_slot_has_complex = bool(group_has_complex)
+            else:
+                group_has_complex = bool(getattr(group, "_single_slot_has_complex", False))
+            group_recipes.append(list(recipes or ()))
+            group_complex_flags.append(bool(group_has_complex))
+            has_complex = bool(has_complex or group_has_complex)
+        if bool(any(group_complex_flags)) and not bool(all(group_complex_flags)):
+            return None
+
+        generate_name = "GenerateLinearTransformsUnifiedGroupedComplex" if bool(has_complex) else "GenerateLinearTransformsUnifiedGrouped"
+        if not callable(getattr(backend, generate_name, None)):
+            return None
+
+        flat_entries: list[tuple[UnifiedTransformGroup, Any]] = []
+        group_offsets: list[int] = [0]
+        for group in selected:
+            for transform in group.transforms:
+                flat_entries.append((group, transform))
+            group_offsets.append(int(len(flat_entries)))
+        if not flat_entries:
+            return {
+                "layer_cache_encode_s": 0.0,
+                "layer_cache_key_prepare_s": 0.0,
+                "materialized_group_count": 0,
+                "backend_transform_count": 0,
+            }
+
+        for group in selected:
+            group._write_progress(
+                "start",
+                "diag_encode",
+                grouped_single_slot_materialize=True,
+                grouped_single_slot_group_count=int(len(selected)),
+            )
+
+        started = time.perf_counter()
+        flatten_workers = int(_single_slot_encode_workers(len(flat_entries)))
+        try:
+            if flatten_workers > 1 and len(flat_entries) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=int(flatten_workers),
+                    thread_name_prefix="orion-single-slot-grouped-materialize",
+                ) as executor:
+                    payloads = list(
+                        executor.map(
+                            lambda entry: entry[0]._flatten_transform_diagonals(
+                                entry[1],
+                                has_complex=bool(has_complex),
+                                require_recipe=True,
+                            ),
+                            flat_entries,
+                        )
+                    )
+            else:
+                payloads = [
+                    group._flatten_transform_diagonals(
+                        transform,
+                        has_complex=bool(has_complex),
+                        require_recipe=True,
+                    )
+                    for group, transform in flat_entries
+                ]
+        finally:
+            for group in selected:
+                group._release_single_slot_diagonal_caches()
+
+        ids = cls._generate_unified_backend_grouped_batch(
+            backend,
+            payloads,
+            group_offsets=tuple(int(value) for value in group_offsets),
+            has_complex=bool(has_complex),
+            storage_key="provider_single_slot_grouped",
+        )
+        if len(ids) != len(payloads):
+            raise RuntimeError(
+                "grouped unified single-slot generation returned "
+                f"{len(ids)} transform ids for {len(payloads)} payloads"
+            )
+
+        encode_s = float(time.perf_counter() - started)
+        cursor = 0
+        for group, recipes in zip(selected, group_recipes):
+            count = int(len(group.transforms))
+            group_ids = [int(value) for value in ids[int(cursor): int(cursor + count)]]
+            group_payloads = payloads[int(cursor): int(cursor + count)]
+            cursor += int(count)
+            group.unified_ids = list(group_ids)
+            group._diag_indices_by_transform = {
+                int(transform_id): tuple(int(idx) for idx in diag_idxs)
+                for transform_id, (diag_idxs, _diag_data, _level) in zip(group_ids, group_payloads)
+            }
+            group._storage_name_by_transform = {
+                int(transform_id): str(int(transform_id))
+                for transform_id in group_ids
+            }
+            group.last_compile_profile = group._empty_compile_profile()
+            group._set_compile_profile("mode", "single_slot_grouped_materialize")
+            group._set_compile_profile("has_complex", bool(has_complex))
+            group._set_compile_profile("worker_count", int(flatten_workers))
+            group._set_compile_profile("diag_index_count", int(sum(int(recipe[0].size) for recipe in recipes)))
+            group._set_compile_profile("backend_generate_calls", 1)
+            group._set_compile_profile("total_s", float(encode_s))
+            group.is_compiled = True
+            group._single_slot_deferred = False
+            group._single_slot_active_backend = backend
+            group._record_memory_event(
+                "after_single_slot_grouped_layer_encode",
+                backend,
+                group.unified_ids or (),
+                timing={
+                    "layer_cache_encode_s": 0.0,
+                    "layer_cache_key_prepare_s": 0.0,
+                    "grouped_layer_cache_encode_s": float(encode_s),
+                    "grouped_single_slot_group_count": int(len(selected)),
+                },
+            )
+            group._write_progress(
+                "end",
+                "diag_encode",
+                layer_cache_encode_s=0.0,
+                layer_cache_key_prepare_s=0.0,
+                grouped_layer_cache_encode_s=float(encode_s),
+                grouped_single_slot_materialize=True,
+                grouped_single_slot_group_count=int(len(selected)),
+                backend_transform_count=int(len(group_ids)),
+            )
+
+        del payloads
+        gc.collect()
+        return {
+            "layer_cache_encode_s": float(encode_s),
+            "layer_cache_key_prepare_s": 0.0,
+            "materialized_group_count": int(len(selected)),
+            "backend_transform_count": int(len(ids)),
+            "grouped_single_slot": True,
+        }
+
     def _cached_transform_descriptors(self) -> list[tuple[str, list[int], int]]:
         handle, root = self._storage_group("r")
         try:

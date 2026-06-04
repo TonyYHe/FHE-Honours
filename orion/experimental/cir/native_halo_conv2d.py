@@ -6908,6 +6908,8 @@ class NativeHaloStripeNoRIConvExecutor:
             "provider_layer_cache_encode_s",
             "provider_layer_cache_key_prepare_s",
             "provider_layer_cache_group_estimated_bytes_max",
+            "provider_layer_cache_grouped_materialize_count",
+            "provider_layer_cache_grouped_backend_transform_count",
         ):
             self.last_runtime_timing[str(key)] = 0.0
         ids = tuple(int(value) for value in getattr(source_ct, "ids", ()))
@@ -7048,16 +7050,32 @@ class NativeHaloStripeNoRIConvExecutor:
                         reason=f"provider_single_slot_materialize:{self.output_node_id}",
                         estimated_bytes=int(estimated),
                     )
-                for runtime_group in materializable_batch:
-                    group = runtime_group.group
-                    if (
-                        bool(getattr(group, "_single_slot_layer_cache", False))
-                        and getattr(group, "unified_ids", None) is None
-                    ):
-                        timing = group._materialize_single_slot_for_eval(scheme.backend)
-                        setattr(group, "_single_slot_prematerialized_timing", dict(timing))
-                        encoded += float(timing.get("layer_cache_encode_s", 0.0) or 0.0)
-                        key_prepare += float(timing.get("layer_cache_key_prepare_s", 0.0) or 0.0)
+                grouped_timing = None
+                if len(materializable_batch) > 1:
+                    grouped_timing = UnifiedTransformGroup.materialize_single_slot_groups_for_eval(
+                        [runtime_group.group for runtime_group in materializable_batch],
+                        scheme.backend,
+                    )
+                if isinstance(grouped_timing, dict):
+                    encoded += float(grouped_timing.get("layer_cache_encode_s", 0.0) or 0.0)
+                    key_prepare += float(grouped_timing.get("layer_cache_key_prepare_s", 0.0) or 0.0)
+                    self.last_runtime_timing["provider_layer_cache_grouped_materialize_count"] = float(
+                        self.last_runtime_timing.get("provider_layer_cache_grouped_materialize_count", 0.0)
+                    ) + 1.0
+                    self.last_runtime_timing["provider_layer_cache_grouped_backend_transform_count"] = float(
+                        self.last_runtime_timing.get("provider_layer_cache_grouped_backend_transform_count", 0.0)
+                    ) + float(grouped_timing.get("backend_transform_count", 0.0) or 0.0)
+                else:
+                    for runtime_group in materializable_batch:
+                        group = runtime_group.group
+                        if (
+                            bool(getattr(group, "_single_slot_layer_cache", False))
+                            and getattr(group, "unified_ids", None) is None
+                        ):
+                            timing = group._materialize_single_slot_for_eval(scheme.backend)
+                            setattr(group, "_single_slot_prematerialized_timing", dict(timing))
+                            encoded += float(timing.get("layer_cache_encode_s", 0.0) or 0.0)
+                            key_prepare += float(timing.get("layer_cache_key_prepare_s", 0.0) or 0.0)
                 self.last_runtime_timing["provider_layer_cache_batch_count"] = float(
                     self.last_runtime_timing.get("provider_layer_cache_batch_count", 0.0)
                 ) + 1.0
@@ -7091,6 +7109,7 @@ class NativeHaloStripeNoRIConvExecutor:
             def cleanup_materialized_provider_batch(batch: list[Any]) -> None:
                 if not bool(provider_auto_group):
                     return
+                evict_s = 0.0
                 for runtime_group in batch:
                     group = runtime_group.group
                     if (
@@ -7098,15 +7117,36 @@ class NativeHaloStripeNoRIConvExecutor:
                         and getattr(group, "unified_ids", None) is not None
                     ):
                         try:
-                            group._evict_single_slot_after_eval(scheme.backend)
+                            evict_s += float(group._evict_single_slot_after_eval(scheme.backend) or 0.0)
                         finally:
                             setattr(group, "_single_slot_prematerialized_timing", None)
+                if float(evict_s) > 0.0:
+                    self.last_runtime_timing["layer_cache_evict_s"] = float(
+                        self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
+                    ) + float(evict_s)
+                    self.last_runtime_timing["layer_cache_turnover_s"] = float(
+                        self.last_runtime_timing.get("layer_cache_encode_s", 0.0)
+                        + self.last_runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                        + self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
+                    )
 
             def evaluate_runtime_group(runtime_group) -> None:
                 nonlocal evaluated_group_count, partial_count, rescale_count, accumulate_count
+                group = runtime_group.group
                 group_started = time.time()
-                output_ids = runtime_group.group.evaluate_unified(int(ids[int(runtime_group.input_index)]), scheme.backend)
+                output_ids = group.evaluate_unified(int(ids[int(runtime_group.input_index)]), scheme.backend)
                 self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
+                group_timing = dict(getattr(group, "last_runtime_timing", {}) or {})
+                group_evict_s = float(group_timing.get("layer_cache_evict_s", 0.0) or 0.0)
+                if bool(provider_auto_group) and float(group_evict_s) > 0.0:
+                    self.last_runtime_timing["layer_cache_evict_s"] = float(
+                        self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
+                    ) + float(group_evict_s)
+                    self.last_runtime_timing["layer_cache_turnover_s"] = float(
+                        self.last_runtime_timing.get("layer_cache_encode_s", 0.0)
+                        + self.last_runtime_timing.get("layer_cache_key_prepare_s", 0.0)
+                        + self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
+                    )
                 evaluated_group_count += 1
                 for target_index, output_id in zip(runtime_group.target_indices, output_ids):
                     wrap_started = time.time()
