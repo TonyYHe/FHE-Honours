@@ -4370,6 +4370,7 @@ def _promote_no_share_native_stripe_producer_outputs(
     incoming_by_target: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         incoming_by_target.setdefault(str(row.get("target", "")), []).append(row)
+    handoff_target_probe_cache: dict[tuple[str, tuple[tuple[str, int], ...]], bool] = {}
 
     def _parse_storage_signature(raw: Any) -> tuple[tuple[int, int, int, int], ...]:
         if not raw:
@@ -4700,6 +4701,62 @@ def _promote_no_share_native_stripe_producer_outputs(
         )
         return True
 
+    def _clamp_native_handoff_layout(
+        row: dict[str, Any],
+        *,
+        layout: dict[str, Any],
+    ) -> dict[str, Any]:
+        def handoff_target_probe(candidate: dict[str, Any]) -> bool:
+            cache_key = (
+                str(row.get("edge", "")),
+                tuple(sorted((str(key), int(value)) for key, value in dict(candidate).items() if isinstance(value, int))),
+            )
+            if cache_key in handoff_target_probe_cache:
+                return bool(handoff_target_probe_cache[cache_key])
+            try:
+                ok = bool(_native_handoff_target_signature(dict(row), layout=dict(candidate)))
+            except Exception:
+                ok = False
+            handoff_target_probe_cache[cache_key] = bool(ok)
+            return bool(ok)
+
+        if handoff_target_probe(dict(layout)):
+            return dict(layout)
+        edge = edge_by_id.get(str(row.get("edge", "")))
+        if edge is None:
+            return dict(layout)
+        try:
+            target = LayoutState(**dict(layout))
+        except Exception:
+            return dict(layout)
+        minimum = edge.requirement
+        min_top = min(int(target.top_beta), int(minimum.top_beta))
+        min_bottom = min(int(target.bottom_beta), int(minimum.bottom_beta))
+        min_budget = int(min_top + min_bottom)
+        max_budget = int(target.top_beta + target.bottom_beta)
+        if int(max_budget) <= int(min_budget):
+            return dict(layout)
+        top_room = max(0, int(target.top_beta) - int(min_top))
+        bottom_room = max(0, int(target.bottom_beta) - int(min_bottom))
+
+        feasible = _max_feasible_logical_halo_layout(
+            target,
+            shape=edge.shape,
+            min_top=int(min_top),
+            min_bottom=int(min_bottom),
+            top_room=int(top_room),
+            bottom_room=int(bottom_room),
+            min_budget=int(min_budget),
+            max_budget=int(max_budget),
+            slots=int(slots),
+            feasible=lambda candidate: bool(
+                handoff_target_probe(candidate.to_dict())
+            ),
+        )
+        if feasible is not None:
+            return feasible.to_dict()
+        return minimum.to_dict()
+
     for row in rows:
         if str(row.get("physical_layout", "")) != PHYSICAL_NATIVE_SOURCE_STRIPE:
             continue
@@ -4714,6 +4771,12 @@ def _promote_no_share_native_stripe_producer_outputs(
         shape = [int(value) for value in row.get("shape", [])]
         if len(shape) != 4 or not layout:
             continue
+        clamped_layout = _clamp_native_handoff_layout(row, layout=dict(layout))
+        if dict(clamped_layout) != dict(layout):
+            layout = dict(clamped_layout)
+            row["selected_layout"] = dict(layout)
+            row["target_layout"] = dict(layout)
+            row["fixed_max_native_handoff_clamped"] = True
         native_ct_count = _native_source_stripe_output_ct_count_from_edge(row)
         if int(native_ct_count) <= 0:
             continue
@@ -4722,10 +4785,25 @@ def _promote_no_share_native_stripe_producer_outputs(
                 "tight_compact_consumer_output"
             )
             continue
-        source_storage_signature = _native_handoff_target_signature(row, layout=dict(layout))
+        try:
+            source_storage_signature = _native_handoff_target_signature(row, layout=dict(layout))
+        except Exception:
+            edge = edge_by_id.get(str(row.get("edge", "")))
+            if edge is None:
+                source_storage_signature = None
+            else:
+                layout = edge.requirement.to_dict()
+                row["selected_layout"] = dict(layout)
+                row["target_layout"] = dict(layout)
+                row["fixed_max_native_handoff_fallback_to_requirement"] = True
+                try:
+                    source_storage_signature = _native_handoff_target_signature(row, layout=dict(layout))
+                except Exception:
+                    source_storage_signature = None
         if not source_storage_signature:
             continue
         source_storage_signature, producer_target_signature = source_storage_signature
+        native_ct_count = int(len(tuple(source_storage_signature)) or native_ct_count)
         if not _promote_source_chain(
             source,
             layout=dict(layout),
@@ -4920,6 +4998,7 @@ def _promote_no_share_native_stripe_producer_outputs(
         )
         source_node_row = dict(node_by_id.get(str(node), {}) or {})
         source_node_explicit_concat = bool(source_node_row.get("concat_explicit_native_materialization", False))
+        source_node_layout = dict(source_node_row.get("selected_layout", {}) or {})
         for out_row in outgoing_by_source.get(str(node), []):
             source_native = (
                 bool(source_node_native)
@@ -4929,6 +5008,24 @@ def _promote_no_share_native_stripe_producer_outputs(
             if not bool(source_native):
                 continue
             out_row["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+            if source_node_layout:
+                out_row["source_layout"] = dict(source_node_layout)
+                try:
+                    current_layout = LayoutState(**dict(out_row.get("selected_layout", {}) or {}))
+                    node_layout = LayoutState(**dict(source_node_layout))
+                    required_layout = LayoutState(
+                        **dict(out_row.get("required_layout", current_layout.to_dict()) or current_layout.to_dict())
+                    )
+                    if node_layout.covers(required_layout):
+                        if (
+                            int(current_layout.top_beta) > int(node_layout.top_beta)
+                            or int(current_layout.bottom_beta) > int(node_layout.bottom_beta)
+                        ):
+                            out_row["selected_layout"] = dict(source_node_layout)
+                            out_row["target_layout"] = dict(source_node_layout)
+                            out_row["fixed_max_native_source_layout_clamped"] = True
+                except Exception:
+                    pass
             if signature:
                 _set_row_native_source_signature(out_row, signature)
             out_row["native_input_ct_count"] = int(count)
@@ -5426,16 +5523,20 @@ def _promote_no_share_native_stripe_producer_outputs(
                     continue
                 current_count = _node_native_ct_count(target)
                 existing = dict(node_by_id.get(target, {}) or {})
+                source_node_row = dict(node_by_id.get(source, {}) or {})
+                source_layout = dict(source_node_row.get("selected_layout", {}) or {})
                 source_signature = _node_target_storage_signature(source)
                 current_signature = _node_target_storage_signature(target)
                 if (
                     str(existing.get("physical_layout", "")) == PHYSICAL_NATIVE_SOURCE_STRIPE
                     and int(current_count) == int(source_count)
                     and (not source_signature or tuple(current_signature) == tuple(source_signature))
+                    and (not source_layout or dict(existing.get("selected_layout", {}) or {}) == dict(source_layout))
                 ):
                     continue
                 updated = {
                     **existing,
+                    **({"selected_layout": dict(source_layout)} if source_layout else {}),
                     "physical_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
                     "native_halo_output_storage_layout": PHYSICAL_NATIVE_SOURCE_STRIPE,
                     "native_physical_output_ct_count": int(source_count),
@@ -5452,6 +5553,10 @@ def _promote_no_share_native_stripe_producer_outputs(
                 row["source_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
                 row["target_physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
                 row["physical_layout"] = PHYSICAL_NATIVE_SOURCE_STRIPE
+                if source_layout:
+                    row["source_layout"] = dict(source_layout)
+                    row["selected_layout"] = dict(source_layout)
+                    row["target_layout"] = dict(source_layout)
                 row["relayout"] = False
                 row["relayout_reason"] = ""
                 row["relayout_rotation_estimate"] = 0
@@ -6763,6 +6868,14 @@ def _plan_non_dp_topological(
                 if fused_output is not None:
                     output_layout, producer_materialized_halo_reason = fused_output
                 if output_layout is not None:
+                    if str(base_policy) == "fixed_max" and _non_dp_policy_is_no_share(str(policy)):
+                        output_layout = _fixed_max_native_feasible_output_layout(
+                            module,
+                            incoming_rows=incoming_rows,
+                            outgoing=outgoing,
+                            output_layout=output_layout,
+                            slots=int(slots),
+                        )
                     producer_fused = _producer_fused_materialization_estimate(
                         module,
                         incoming=incoming,
@@ -6827,6 +6940,14 @@ def _plan_non_dp_topological(
                 )
             )
 
+    if _non_dp_policy_is_no_share(str(policy)):
+        rows, node_layouts = _promote_no_share_native_stripe_producer_outputs(
+            dag,
+            edge_rows=rows,
+            node_layouts=node_layouts,
+            edge_by_id={str(edge.edge_id): edge for edge in edges},
+            slots=int(slots),
+        )
     rows.sort(key=lambda row: (topo_index.get(str(row["source"]), 10**9), topo_index.get(str(row["target"]), 10**9)))
     return _finalize_policy(
         policy=str(policy),
@@ -7570,12 +7691,118 @@ def _output_physical_layout(
     return PHYSICAL_LOGICAL_HALO
 
 
+def _layout_with_logical_halo_budget(
+    template: LayoutState,
+    *,
+    shape: tuple[int, int, int, int],
+    top_beta: int,
+    bottom_beta: int,
+    slots: int,
+) -> LayoutState:
+    return _layout_for_shape(
+        shape=shape,
+        gap=int(template.gap),
+        top_beta=max(0, int(top_beta)),
+        bottom_beta=max(0, int(bottom_beta)),
+        stride=max(1, int(template.stride)),
+        slots=int(slots),
+    )
+
+
+def _logical_halo_budget_candidate_layouts(
+    template: LayoutState,
+    *,
+    shape: tuple[int, int, int, int],
+    min_top: int,
+    min_bottom: int,
+    top_room: int,
+    bottom_room: int,
+    budget: int,
+    slots: int,
+) -> tuple[LayoutState, ...]:
+    min_top = max(0, int(min_top))
+    min_bottom = max(0, int(min_bottom))
+    top_room = max(0, int(top_room))
+    bottom_room = max(0, int(bottom_room))
+    budget = max(0, int(budget))
+    low_top = max(int(min_top), int(budget) - int(min_bottom) - int(bottom_room))
+    high_top = min(int(min_top + top_room), int(budget) - int(min_bottom))
+    if int(low_top) > int(high_top):
+        return ()
+    room = max(1, int(top_room + bottom_room))
+    preferred_extra = int(round(float(max(0, int(budget) - int(min_top + min_bottom))) * float(top_room) / float(room)))
+    preferred_top = min(int(high_top), max(int(low_top), int(min_top + preferred_extra)))
+    candidate_tops: list[int] = [int(preferred_top)]
+    for delta in range(1, 5):
+        candidate_tops.extend((int(preferred_top) - int(delta), int(preferred_top) + int(delta)))
+    candidate_tops.extend((int(low_top), int(high_top)))
+    seen_tops: set[int] = set()
+    ordered_tops: list[int] = []
+    for top in candidate_tops:
+        top = int(top)
+        if int(top) < int(low_top) or int(top) > int(high_top) or int(top) in seen_tops:
+            continue
+        seen_tops.add(int(top))
+        ordered_tops.append(int(top))
+    return tuple(
+        _layout_with_logical_halo_budget(
+            template,
+            shape=shape,
+            top_beta=int(top),
+            bottom_beta=int(budget) - int(top),
+            slots=int(slots),
+        )
+        for top in ordered_tops
+    )
+
+
+def _max_feasible_logical_halo_layout(
+    template: LayoutState,
+    *,
+    shape: tuple[int, int, int, int],
+    min_top: int,
+    min_bottom: int,
+    top_room: int,
+    bottom_room: int,
+    min_budget: int,
+    max_budget: int,
+    slots: int,
+    feasible: Callable[[LayoutState], bool],
+) -> LayoutState | None:
+    best: LayoutState | None = None
+    lo = int(min_budget)
+    hi = int(max_budget) - 1
+    while int(lo) <= int(hi):
+        mid = (int(lo) + int(hi)) // 2
+        found: LayoutState | None = None
+        for candidate in _logical_halo_budget_candidate_layouts(
+            template,
+            shape=shape,
+            min_top=int(min_top),
+            min_bottom=int(min_bottom),
+            top_room=int(top_room),
+            bottom_room=int(bottom_room),
+            budget=int(mid),
+            slots=int(slots),
+        ):
+            if feasible(candidate):
+                found = candidate
+                break
+        if found is not None:
+            best = found
+            lo = int(mid) + 1
+        else:
+            hi = int(mid) - 1
+    return best
+
+
 def _native_conv_output_target_fits(
     module: Any,
     *,
     incoming_rows: Sequence[dict[str, Any]],
     output_layout: LayoutState,
     slots: int,
+    channel_fold_mode: str = "",
 ) -> bool:
     if not incoming_rows:
         return False
@@ -7630,7 +7857,7 @@ def _native_conv_output_target_fits(
             output_physical_top_beta=_layout_physical_top_beta(output_layout),
             output_physical_bottom_beta=_layout_physical_bottom_beta(output_layout),
         )
-        fold_mode = next(
+        fold_mode = str(channel_fold_mode or "") or next(
             (
                 str(row.get("native_halo_channel_fold_mode", ""))
                 for row in incoming_rows
@@ -7648,12 +7875,68 @@ def _native_conv_output_target_fits(
         )
         return True
     except NativeHaloLogicalMiddleHaloError:
-        raise
+        # This is a feasibility predicate.  A too-large logical middle halo
+        # means "do not choose native target storage for this layout"; actual
+        # native plan construction still hard-fails if an impossible signature
+        # reaches the executor.
+        return False
     except ValueError as exc:
         message = str(exc)
         if "native halo" in message and "does not fit" in message:
             return False
         return False
+
+
+def _fixed_max_native_feasible_output_layout(
+    module: Any | None,
+    *,
+    incoming_rows: Sequence[dict[str, Any]],
+    outgoing: Sequence[EdgeInfo],
+    output_layout: LayoutState,
+    slots: int,
+) -> LayoutState:
+    if not outgoing or not isinstance(module, Conv2d) or isinstance(module, ConvTranspose2d):
+        return output_layout
+    if _native_conv_output_target_fits(
+        module,
+        incoming_rows=incoming_rows,
+        output_layout=output_layout,
+        slots=int(slots),
+        channel_fold_mode="per_stripe",
+    ):
+        return output_layout
+
+    min_layout = _max_layout(outgoing, slots=int(slots))
+    min_top = min(int(output_layout.top_beta), int(min_layout.top_beta))
+    min_bottom = min(int(output_layout.bottom_beta), int(min_layout.bottom_beta))
+    min_budget = int(min_top + min_bottom)
+    max_budget = int(output_layout.top_beta + output_layout.bottom_beta)
+    if int(max_budget) <= int(min_budget):
+        return output_layout
+
+    top_room = max(0, int(output_layout.top_beta) - int(min_top))
+    bottom_room = max(0, int(output_layout.bottom_beta) - int(min_bottom))
+    edge = outgoing[0]
+
+    feasible = _max_feasible_logical_halo_layout(
+        output_layout,
+        shape=edge.shape,
+        min_top=int(min_top),
+        min_bottom=int(min_bottom),
+        top_room=int(top_room),
+        bottom_room=int(bottom_room),
+        min_budget=int(min_budget),
+        max_budget=int(max_budget),
+        slots=int(slots),
+        feasible=lambda candidate: _native_conv_output_target_fits(
+                module,
+                incoming_rows=incoming_rows,
+                output_layout=candidate,
+                slots=int(slots),
+                channel_fold_mode="per_stripe",
+        ),
+    )
+    return feasible if feasible is not None else min_layout
 
 
 def _native_operator_output_layout(module: Any | None) -> bool:
