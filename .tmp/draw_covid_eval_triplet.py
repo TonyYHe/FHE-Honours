@@ -21,7 +21,7 @@ from tools.verify_medseg_cheb7_orion_clear_adapter import _build_training_refere
 INDICES = (1937, 1946, 1948)
 IMAGE_SIZE = 256
 THRESHOLD = 0.5
-OUTPUT_DIR = Path("/home/anakano/CLionProjects/fhelipe/scripts/unet/covid_scaled_eval_candidates")
+OUTPUT_DIR = ROOT / "checkpoints/medseg_figures_20260603/covid_scaled_eval_candidates"
 SILU_CHECKPOINT = (
     ROOT
     / "checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603"

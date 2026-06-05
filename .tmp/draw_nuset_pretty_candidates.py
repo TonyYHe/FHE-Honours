@@ -21,7 +21,7 @@ from tools.verify_medseg_cheb7_orion_clear_adapter import _build_training_refere
 
 IMAGE_SIZE = 384
 THRESHOLD = 0.5
-OUTPUT_DIR = Path("/home/anakano/CLionProjects/fhelipe/scripts/unet/nuset_scaled_pretty_candidates")
+OUTPUT_DIR = ROOT / "checkpoints/medseg_figures_20260603/nuset_scaled_pretty_candidates"
 SILU_CHECKPOINT = (
     ROOT
     / "checkpoints/fhelipe_medseg_staged_nusetmsb_384_scaled_silu_freeze15_cheb7_20260603"
