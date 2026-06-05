@@ -26,7 +26,7 @@ from orion.models.unet import UNet22PlusOutput
 from orion.nn.module import Module
 
 
-DEFAULT_POLICIES = ("dp_no_share_fold", "fixed_max_no_share", "always_no_share")
+DEFAULT_POLICIES = ("dp_no_share_fold", "fixed_max_no_share", "always_no_share_producer_fused")
 PROVIDER_SUFFIX = {
     "dp_no_share_fold": "dp_no_share_fold",
     "dp_noshare_fold": "dp_no_share_fold",
@@ -43,14 +43,22 @@ PROVIDER_SUFFIX = {
     "fixedmax_no_share_unfused": "fixedmax_no_share_unfused",
     "fixed_noshare_unfused": "fixedmax_no_share_unfused",
     "fixedmax_noshare_unfused": "fixedmax_no_share_unfused",
-    "always_no_share": "always_no_share",
-    "always_noshare": "always_no_share",
-    "always_relayout_no_share": "always_no_share",
-    "always_relayout_noshare": "always_no_share",
-    "always_no_share_fused": "always_no_share",
-    "always_noshare_fused": "always_no_share",
-    "always_relayout_no_share_fused": "always_no_share",
-    "always_relayout_noshare_fused": "always_no_share",
+    "always_no_share": "always_no_share_producer",
+    "always_noshare": "always_no_share_producer",
+    "always_relayout_no_share": "always_no_share_producer",
+    "always_relayout_noshare": "always_no_share_producer",
+    "always_no_share_producer": "always_no_share_producer",
+    "always_noshare_producer": "always_no_share_producer",
+    "always_relayout_no_share_producer": "always_no_share_producer",
+    "always_relayout_noshare_producer": "always_no_share_producer",
+    "always_no_share_producer_fused": "always_no_share_producer",
+    "always_noshare_producer_fused": "always_no_share_producer",
+    "always_relayout_no_share_producer_fused": "always_no_share_producer",
+    "always_relayout_noshare_producer_fused": "always_no_share_producer",
+    "always_no_share_fused": "always_no_share_fused",
+    "always_noshare_fused": "always_no_share_fused",
+    "always_relayout_no_share_fused": "always_no_share_fused",
+    "always_relayout_noshare_fused": "always_no_share_fused",
     "always_no_share_unfused": "always_no_share_unfused",
     "always_noshare_unfused": "always_no_share_unfused",
     "always_relayout_no_share_unfused": "always_no_share_unfused",
@@ -131,6 +139,7 @@ def _provider_mode(policy: str) -> str:
 def _env_snapshot() -> dict[str, str]:
     keys = [
         "ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS",
+        "ORION_BOOTSTRAP_LAYOUT_REFINEMENT",
         "ORION_BOOTSTRAP_LAYOUT_REFINEMENT_AUTO_TARGET",
         "ORION_BOOTSTRAP_LAYOUT_REFINEMENT_TARGET_BOOTSTRAPS",
         "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL",

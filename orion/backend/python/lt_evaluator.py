@@ -643,7 +643,7 @@ class NewEvaluator:
         total = int(info.get("total_bytes", 0) or 0)
         if total < int(128 * 1024**3):
             return 0
-        return int(min(256 * 1024**3, max(1, total // 4)))
+        return int(100 * 1024**3)
 
     def _dense_layer_cache_check_auto_memory_cap(self, *, reason: str, estimated_bytes: int) -> None:
         if not self.dense_layer_cache_auto_group_enabled():

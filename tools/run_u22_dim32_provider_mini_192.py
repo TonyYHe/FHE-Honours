@@ -132,7 +132,8 @@ def _apply_env_defaults(*, workers: int) -> dict[str, str]:
         "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "1",
         "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
         "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
-        "ORION_CONCAT_FUSION": "auto",
+        "ORION_CONCAT_FUSION": "0",
+        "ORION_BOOTSTRAP_LAYOUT_REFINEMENT": "0",
     }
     for key, value in defaults.items():
         os.environ.setdefault(str(key), str(value))

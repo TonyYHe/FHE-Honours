@@ -50,7 +50,7 @@ TRANSITIVE_PRODUCER_OUTPUT_EXPERIMENTAL = (
 
 
 def _concat_fusion_runtime_mode() -> str:
-    raw = os.environ.get("ORION_CONCAT_FUSION", "auto").strip().lower()
+    raw = os.environ.get("ORION_CONCAT_FUSION", "off").strip().lower()
     if raw in _FALSE_ENV_VALUES:
         return "off"
     if raw in {"1", "true", "yes", "on", "force", "forced", "fused"}:
@@ -133,14 +133,14 @@ POLICY_ALIASES = {
     "always-fused": "always_fused",
     "always_relayout_fused": "always_fused",
     "always-relayout-fused": "always_fused",
-    "always_no_share": "always_no_share_fused",
-    "always-no-share": "always_no_share_fused",
-    "always_noshare": "always_no_share_fused",
-    "always-noshare": "always_no_share_fused",
-    "always_relayout_no_share": "always_no_share_fused",
-    "always-relayout-no-share": "always_no_share_fused",
-    "always_relayout_noshare": "always_no_share_fused",
-    "always-relayout-noshare": "always_no_share_fused",
+    "always_no_share": "always_no_share_producer_fused",
+    "always-no-share": "always_no_share_producer_fused",
+    "always_noshare": "always_no_share_producer_fused",
+    "always-noshare": "always_no_share_producer_fused",
+    "always_relayout_no_share": "always_no_share_producer_fused",
+    "always-relayout-no-share": "always_no_share_producer_fused",
+    "always_relayout_noshare": "always_no_share_producer_fused",
+    "always-relayout-noshare": "always_no_share_producer_fused",
     "always_no_share_fused": "always_no_share_fused",
     "always-no-share-fused": "always_no_share_fused",
     "always_noshare_fused": "always_no_share_fused",
@@ -149,6 +149,14 @@ POLICY_ALIASES = {
     "always-relayout-no-share-fused": "always_no_share_fused",
     "always_relayout_noshare_fused": "always_no_share_fused",
     "always-relayout-noshare-fused": "always_no_share_fused",
+    "always_no_share_producer": "always_no_share_producer_fused",
+    "always-no-share-producer": "always_no_share_producer_fused",
+    "always_noshare_producer": "always_no_share_producer_fused",
+    "always-noshare-producer": "always_no_share_producer_fused",
+    "always_no_share_producer_fused": "always_no_share_producer_fused",
+    "always-no-share-producer-fused": "always_no_share_producer_fused",
+    "always_noshare_producer_fused": "always_no_share_producer_fused",
+    "always-noshare-producer-fused": "always_no_share_producer_fused",
     "always_no_share_unfused": "always_no_share_unfused",
     "always-no-share-unfused": "always_no_share_unfused",
     "always_noshare_unfused": "always_no_share_unfused",
@@ -184,7 +192,8 @@ POLICY_LABELS = {
     "greedy_fused": "Greedy-Local+Fusion",
     "always": "Always-Re-Layout",
     "always_fused": "Always-Re-Layout+Fusion",
-    "always_no_share_fused": "Always-Re-Layout-NoShare-Fold+Fusion",
+    "always_no_share_fused": "Always-Re-Layout-NoShare-Fold+ConsumerFusion",
+    "always_no_share_producer_fused": "Always-Re-Layout-NoShare-Fold+ProducerFusion",
     "always_no_share_unfused": "Always-Re-Layout-NoShare-Fold-Unfused",
     "orion_dense": "Orion-Dense-No-Halo",
     "dp": "DP-Global",
@@ -6381,7 +6390,12 @@ def _base_non_dp_policy(policy: str) -> str:
         return "fixed_max"
     if normalized == "fixed_max_fused":
         return "fixed_max"
-    if normalized in {"always_no_share", "always_no_share_fused", "always_no_share_unfused"}:
+    if normalized in {
+        "always_no_share",
+        "always_no_share_fused",
+        "always_no_share_producer_fused",
+        "always_no_share_unfused",
+    }:
         return "always"
     if normalized == "eager_fused":
         return "eager"
@@ -6402,6 +6416,19 @@ def _non_dp_policy_uses_fusion(policy: str) -> bool:
         "always_fused",
         "always_no_share",
         "always_no_share_fused",
+        "always_no_share_producer_fused",
+    }
+
+
+def _non_dp_policy_uses_consumer_fusion(policy: str) -> bool:
+    return _non_dp_policy_uses_fusion(str(policy)) and str(policy) not in {
+        "always_no_share_producer_fused",
+    }
+
+
+def _non_dp_policy_uses_native_producer_promotion(policy: str) -> bool:
+    return str(policy) not in {
+        "always_no_share_producer_fused",
     }
 
 
@@ -6412,6 +6439,7 @@ def _non_dp_policy_is_no_share(policy: str) -> bool:
         "fixed_max_no_share_unfused",
         "always_no_share",
         "always_no_share_fused",
+        "always_no_share_producer_fused",
         "always_no_share_unfused",
     }
 
@@ -6608,6 +6636,22 @@ def _non_dp_no_share_native_row(
     )
 
 
+def _materialized_physical_halo_layout(layout: LayoutState, *, shape: tuple[int, int, int, int], slots: int) -> LayoutState:
+    if int(layout.top_beta) == 0 and int(layout.bottom_beta) == 0:
+        return layout
+    return _layout_for_shape(
+        shape=shape,
+        gap=int(layout.gap),
+        top_beta=int(layout.top_beta),
+        bottom_beta=int(layout.bottom_beta),
+        stride=max(1, int(layout.stride)),
+        slots=int(slots),
+        physical_top_beta=int(layout.top_beta),
+        physical_bottom_beta=int(layout.bottom_beta),
+        boundary_pruned=False,
+    )
+
+
 def _non_dp_producer_fused_output_preference(
     policy: str,
     module: Any | None,
@@ -6660,6 +6704,12 @@ def _non_dp_producer_fused_output_preference(
             max_demand_layouts=max_demand_layouts,
             slots=int(slots),
         )
+    if str(policy) == "always_no_share_producer_fused":
+        target_layout = _materialized_physical_halo_layout(
+            target_layout,
+            shape=edge.shape,
+            slots=int(slots),
+        )
     if int(target_layout.gap) != int(edge.compact.gap):
         return None
     if _same_physical_layout(semantic, target_layout):
@@ -6691,7 +6741,8 @@ def _plan_non_dp_topological(
     base_policy = _base_non_dp_policy(str(policy))
     max_demand_layouts = _backward_max_demand_layouts(dag, edges, slots=int(slots))
     fuse_local_relayouts = _non_dp_policy_uses_fusion(str(policy))
-    force_every_relayout = str(base_policy) == "always"
+    fuse_consumer_relayouts = _non_dp_policy_uses_consumer_fusion(str(policy))
+    force_every_relayout = str(base_policy) == "always" and str(policy) != "always_no_share_producer_fused"
     live: dict[str, LayoutState] = {}
     live_physical: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
@@ -6785,6 +6836,7 @@ def _plan_non_dp_topological(
                         source_physical=str(source_physical),
                     )
                     if bool(relayout) and bool(fuse_local_relayouts)
+                    and bool(fuse_consumer_relayouts)
                     else None
                 )
                 native_row = (
@@ -6940,7 +6992,7 @@ def _plan_non_dp_topological(
                 )
             )
 
-    if _non_dp_policy_is_no_share(str(policy)):
+    if _non_dp_policy_is_no_share(str(policy)) and _non_dp_policy_uses_native_producer_promotion(str(policy)):
         rows, node_layouts = _promote_no_share_native_stripe_producer_outputs(
             dag,
             edge_rows=rows,
@@ -7002,11 +7054,15 @@ def _plan_always_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int
 
 
 def _plan_always_no_share(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
-    return _plan_always_no_share_fused(dag, edges, slots=int(slots))
+    return _plan_always_no_share_producer_fused(dag, edges, slots=int(slots))
 
 
 def _plan_always_no_share_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
     return _plan_non_dp_topological(dag, edges, policy="always_no_share_fused", slots=int(slots))
+
+
+def _plan_always_no_share_producer_fused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
+    return _plan_non_dp_topological(dag, edges, policy="always_no_share_producer_fused", slots=int(slots))
 
 
 def _plan_always_no_share_unfused(dag: NetworkDAG, edges: Sequence[EdgeInfo], *, slots: int) -> PolicyPlan:
@@ -8793,6 +8849,8 @@ def plan_policy(
         return _plan_always_no_share(dag, edges, slots=int(slots))
     if normalized == "always_no_share_fused":
         return _plan_always_no_share_fused(dag, edges, slots=int(slots))
+    if normalized == "always_no_share_producer_fused":
+        return _plan_always_no_share_producer_fused(dag, edges, slots=int(slots))
     if normalized == "always_no_share_unfused":
         return _plan_always_no_share_unfused(dag, edges, slots=int(slots))
     if normalized == "orion_dense":
@@ -8816,6 +8874,7 @@ def validate_layout_policy_compile_plan(compile_plan: dict[str, Any]) -> dict[st
         "fixed_max_no_share_unfused",
         "always_no_share",
         "always_no_share_fused",
+        "always_no_share_producer_fused",
         "always_no_share_unfused",
     }
     if policy in no_share_native_policies:
@@ -9225,8 +9284,9 @@ def _provider_mode_for_policy(spec: NetworkSpec, policy: str) -> str:
         "fixed_max_no_share": "fixedmax_no_share",
         "fixed_max_no_share_fused": "fixedmax_no_share",
         "fixed_max_no_share_unfused": "fixedmax_no_share_unfused",
-        "always_no_share": "always_no_share",
-        "always_no_share_fused": "always_no_share",
+        "always_no_share": "always_no_share_producer",
+        "always_no_share_fused": "always_no_share_fused",
+        "always_no_share_producer_fused": "always_no_share_producer",
         "always_no_share_unfused": "always_no_share_unfused",
         "orion_dense": "oriondense",
     }

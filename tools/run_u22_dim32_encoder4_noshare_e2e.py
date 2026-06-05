@@ -62,14 +62,18 @@ PROVIDER_MODES = {
     "fixed_max_no_share_unfused": "u22_256_base32_layout_fixedmax_no_share_unfused",
     "fixedmax_no_share_unfused": "u22_256_base32_layout_fixedmax_no_share_unfused",
     "always": "u22_256_base32_layout_always",
-    "always_no_share": "u22_256_base32_layout_always_no_share",
-    "always_noshare": "u22_256_base32_layout_always_no_share",
-    "always_relayout_no_share": "u22_256_base32_layout_always_no_share",
-    "always_relayout_noshare": "u22_256_base32_layout_always_no_share",
-    "always_no_share_fused": "u22_256_base32_layout_always_no_share",
-    "always_noshare_fused": "u22_256_base32_layout_always_no_share",
-    "always_relayout_no_share_fused": "u22_256_base32_layout_always_no_share",
-    "always_relayout_noshare_fused": "u22_256_base32_layout_always_no_share",
+    "always_no_share": "u22_256_base32_layout_always_no_share_producer",
+    "always_noshare": "u22_256_base32_layout_always_no_share_producer",
+    "always_relayout_no_share": "u22_256_base32_layout_always_no_share_producer",
+    "always_relayout_noshare": "u22_256_base32_layout_always_no_share_producer",
+    "always_no_share_producer": "u22_256_base32_layout_always_no_share_producer",
+    "always_noshare_producer": "u22_256_base32_layout_always_no_share_producer",
+    "always_no_share_producer_fused": "u22_256_base32_layout_always_no_share_producer",
+    "always_noshare_producer_fused": "u22_256_base32_layout_always_no_share_producer",
+    "always_no_share_fused": "u22_256_base32_layout_always_no_share_fused",
+    "always_noshare_fused": "u22_256_base32_layout_always_no_share_fused",
+    "always_relayout_no_share_fused": "u22_256_base32_layout_always_no_share_fused",
+    "always_relayout_noshare_fused": "u22_256_base32_layout_always_no_share_fused",
     "always_no_share_unfused": "u22_256_base32_layout_always_no_share_unfused",
     "always_noshare_unfused": "u22_256_base32_layout_always_no_share_unfused",
     "dp": "u22_256_base32_layout_dp",
@@ -101,7 +105,8 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
-    "ORION_CONCAT_FUSION": "auto",
+    "ORION_CONCAT_FUSION": "0",
+    "ORION_BOOTSTRAP_LAYOUT_REFINEMENT": "0",
     "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
@@ -128,7 +133,8 @@ def _apply_env_defaults(env: dict[str, str]) -> dict[str, str]:
     updated["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] = "1"
     updated["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] = "0"
     updated["ORION_LATTIGO_UNIFIED_NO_BSGS"] = "0"
-    updated["ORION_CONCAT_FUSION"] = "auto"
+    updated["ORION_CONCAT_FUSION"] = "0"
+    updated["ORION_BOOTSTRAP_LAYOUT_REFINEMENT"] = "0"
     return updated
 
 

@@ -380,7 +380,7 @@ class Conv2d(LinearTransform):
         return tuple(getattr(self, "concat_fusion_specs", ()) or ())
 
     def _concat_fusion_supported(self) -> bool:
-        raw_enabled = os.environ.get("ORION_CONCAT_FUSION", "1").strip().lower()
+        raw_enabled = os.environ.get("ORION_CONCAT_FUSION", "0").strip().lower()
         if raw_enabled in ("", "0", "false", "no", "off"):
             return False
         specs = self._concat_fusion_specs()

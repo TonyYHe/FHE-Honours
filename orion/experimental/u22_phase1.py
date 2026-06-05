@@ -24,6 +24,7 @@ from orion.experimental.cir.lattigo_block import _idx_chw_gap_tensor
 from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
 from orion.experimental.cir.native_halo_conv2d import NativeHaloRelayoutKernel
 from orion.experimental.cir.runtime_group import RegionFirstRuntimeGroup
+from orion.nn.activation import Activation, Chebyshev, Quad, ReLU
 from orion.nn.linear import Conv2d, ConvTranspose2d
 from orion.nn.pooling import AvgPool2d
 from orion.nn.unified_transform import UnifiedTransformGroup
@@ -378,7 +379,26 @@ def _normalize_u22_layout_policy(value: str) -> str:
         "always_relayout_noshare",
         "always-relayout-noshare",
     }:
-        return "always_no_share_fused"
+        return "always_no_share_producer_fused"
+    if normalized in {
+        "always_no_share_producer",
+        "always-no-share-producer",
+        "always_noshare_producer",
+        "always-noshare-producer",
+        "always_relayout_no_share_producer",
+        "always-relayout-no-share-producer",
+        "always_relayout_noshare_producer",
+        "always-relayout-noshare-producer",
+        "always_no_share_producer_fused",
+        "always-no-share-producer-fused",
+        "always_noshare_producer_fused",
+        "always-noshare-producer-fused",
+        "always_relayout_no_share_producer_fused",
+        "always-relayout-no-share-producer-fused",
+        "always_relayout_noshare_producer_fused",
+        "always-relayout-noshare-producer-fused",
+    }:
+        return "always_no_share_producer_fused"
     if normalized in {
         "always_no_share_fused",
         "always-no-share-fused",
@@ -545,7 +565,10 @@ def _layout_policy_join_module(module: Any | None) -> bool:
 
 
 def _layout_policy_preserving_output_module(module: Any | None) -> bool:
-    return type(module).__name__ in _LAYOUT_POLICY_PRESERVING_MODULES
+    return bool(
+        isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+        or type(module).__name__ in _LAYOUT_POLICY_PRESERVING_MODULES
+    )
 
 
 def _layout_policy_incoming_relayout_rows(compile_plan: dict[str, Any], *, node: str) -> tuple[dict[str, Any], ...]:
@@ -1233,6 +1256,7 @@ def _layout_policy_native_module_attrs(
         "fixed_max_no_share_unfused",
         "always_no_share",
         "always_no_share_fused",
+        "always_no_share_producer_fused",
         "always_no_share_unfused",
     }:
         attrs["layout_policy_provider_lt_grouping_mode"] = "individual"
@@ -6346,6 +6370,7 @@ class U22CompileRegistry:
                 "always_fused",
                 "always_no_share",
                 "always_no_share_fused",
+                "always_no_share_producer_fused",
                 "always_no_share_unfused",
                 "orion_dense",
                 "dp",
@@ -6361,6 +6386,7 @@ class U22CompileRegistry:
                     "fixed_max_no_share_unfused",
                     "always_no_share",
                     "always_no_share_fused",
+                    "always_no_share_producer_fused",
                     "always_no_share_unfused",
                 }
                 else "dp"

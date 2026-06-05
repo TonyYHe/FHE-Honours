@@ -1673,8 +1673,10 @@ class _FakeProviderAutoGroup:
         self.events = events
         self.fail = bool(fail)
         self._single_slot_layer_cache = True
+        transform = SimpleNamespace(name=str(name))
+        self.transforms = (transform,)
         self._single_slot_recipes = [
-            (tuple(range(int(diag_count))), 3, SimpleNamespace(name=str(name))),
+            (tuple(range(int(diag_count))), 3, transform),
         ]
         self._single_slot_prematerialized_timing = None
         self.unified_ids = None
@@ -1694,12 +1696,14 @@ class _FakeProviderAutoGroup:
         self.unified_ids = None
         return 0.005
 
-    def evaluate_unified(self, ct_input_id: int, backend):
+    def evaluate_unified(self, ct_input_id: int, backend, *, evict_single_slot_after_eval: bool = True):
         self.events.append(("evaluate", self.name))
         if self.fail:
-            self._evict_single_slot_after_eval(backend)
+            if bool(evict_single_slot_after_eval):
+                self._evict_single_slot_after_eval(backend)
             raise RuntimeError(f"{self.name} failed")
-        self._evict_single_slot_after_eval(backend)
+        if bool(evict_single_slot_after_eval):
+            self._evict_single_slot_after_eval(backend)
         return [int(self.output_id)]
 
 
@@ -1820,8 +1824,8 @@ def test_provider_single_slot_auto_batches_materialization_preserving_eval_order
         ("materialize", "g0"),
         ("materialize", "g1"),
         ("evaluate", "g0"),
-        ("evict", "g0"),
         ("evaluate", "g1"),
+        ("evict", "g0"),
         ("evict", "g1"),
         ("materialize", "g2"),
         ("evaluate", "g2"),

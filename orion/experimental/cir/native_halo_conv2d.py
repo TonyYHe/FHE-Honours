@@ -6908,6 +6908,10 @@ class NativeHaloStripeNoRIConvExecutor:
             "provider_layer_cache_encode_s",
             "provider_layer_cache_key_prepare_s",
             "provider_layer_cache_group_estimated_bytes_max",
+            "provider_layer_cache_batch_evict_s",
+            "provider_layer_cache_batch_evict_count",
+            "provider_layer_cache_batch_evict_transform_count",
+            "provider_layer_cache_no_evict_eval_count",
             "provider_layer_cache_grouped_materialize_count",
             "provider_layer_cache_grouped_backend_transform_count",
         ):
@@ -6982,8 +6986,11 @@ class NativeHaloStripeNoRIConvExecutor:
                 if not bool(provider_auto_group):
                     return False
                 group = runtime_group.group
-                return bool(getattr(group, "_single_slot_layer_cache", False)) and bool(
-                    getattr(group, "_single_slot_recipes", None)
+                return (
+                    bool(getattr(group, "_single_slot_layer_cache", False))
+                    and bool(getattr(group, "_single_slot_recipes", None))
+                    and len(tuple(getattr(group, "transforms", ()) or ())) == 1
+                    and len(tuple(getattr(runtime_group, "target_indices", ()) or ())) == 1
                 )
 
             def runtime_group_estimated_bytes(runtime_group) -> int:
@@ -7013,26 +7020,37 @@ class NativeHaloStripeNoRIConvExecutor:
                 batches: list[list[Any]] = []
                 current: list[Any] = []
                 current_bytes = 0
+                current_input_index: int | None = None
                 for runtime_group in sorted_groups:
                     group_bytes = int(runtime_group_estimated_bytes(runtime_group))
-                    if current and int(current_bytes + group_bytes) > int(provider_group_budget_bytes):
+                    input_index = int(runtime_group.input_index)
+                    crosses_source = current_input_index is not None and int(input_index) != int(current_input_index)
+                    exceeds_budget = int(current_bytes + group_bytes) > int(provider_group_budget_bytes)
+                    if current and (bool(crosses_source) or bool(exceeds_budget)):
                         batches.append(list(current))
                         current = []
                         current_bytes = 0
+                        current_input_index = None
                     current.append(runtime_group)
                     current_bytes += int(group_bytes)
+                    current_input_index = int(input_index)
                 if current:
                     batches.append(list(current))
                 return batches
 
-            def materialize_provider_batch(batch: list[Any]) -> None:
+            def materialize_provider_batch(batch: list[Any]) -> set[int]:
                 if not bool(provider_auto_group):
-                    return
+                    return set()
+                if len({int(runtime_group.input_index) for runtime_group in batch}) > 1:
+                    raise RuntimeError(
+                        f"{self.output_node_id} provider layer-cache batch crossed source input_index; "
+                        "refusing to defer single-slot evict across sources"
+                    )
                 materializable_batch = [
                     runtime_group for runtime_group in batch if bool(runtime_group_can_pre_materialize(runtime_group))
                 ]
                 if not materializable_batch:
-                    return
+                    return set()
                 batch_started = time.time()
                 encoded = 0.0
                 key_prepare = 0.0
@@ -7051,7 +7069,12 @@ class NativeHaloStripeNoRIConvExecutor:
                         estimated_bytes=int(estimated),
                     )
                 grouped_timing = None
-                if len(materializable_batch) > 1:
+                can_group_materialize = all(
+                    callable(getattr(runtime_group.group, "_flatten_transform_diagonals", None))
+                    and callable(getattr(runtime_group.group, "_write_progress", None))
+                    for runtime_group in materializable_batch
+                )
+                if len(materializable_batch) > 1 and bool(can_group_materialize):
                     grouped_timing = UnifiedTransformGroup.materialize_single_slot_groups_for_eval(
                         [runtime_group.group for runtime_group in materializable_batch],
                         scheme.backend,
@@ -7105,22 +7128,52 @@ class NativeHaloStripeNoRIConvExecutor:
                         float(estimated),
                     )
                 )
+                for runtime_group in materializable_batch:
+                    group = runtime_group.group
+                    if len(tuple(getattr(group, "unified_ids", ()) or ())) != 1:
+                        raise RuntimeError(
+                            f"{self.output_node_id} provider single-slot batch expected one materialized "
+                            "transform per runtime group"
+                        )
+                return {
+                    int(id(runtime_group.group))
+                    for runtime_group in materializable_batch
+                    if getattr(runtime_group.group, "unified_ids", None) is not None
+                }
 
-            def cleanup_materialized_provider_batch(batch: list[Any]) -> None:
+            def cleanup_materialized_provider_batch(batch: list[Any], materialized_group_ids: set[int]) -> None:
                 if not bool(provider_auto_group):
                     return
                 evict_s = 0.0
+                evict_transform_count = 0
+                first_error: BaseException | None = None
+                unexpected_resident_groups: list[int] = []
                 for runtime_group in batch:
                     group = runtime_group.group
                     if (
                         bool(getattr(group, "_single_slot_layer_cache", False))
                         and getattr(group, "unified_ids", None) is not None
                     ):
+                        if int(id(group)) not in materialized_group_ids:
+                            unexpected_resident_groups.append(int(id(group)))
+                        evict_transform_count += int(len(getattr(group, "unified_ids", ()) or ()))
                         try:
                             evict_s += float(group._evict_single_slot_after_eval(scheme.backend) or 0.0)
+                        except BaseException as exc:
+                            if first_error is None:
+                                first_error = exc
                         finally:
                             setattr(group, "_single_slot_prematerialized_timing", None)
                 if float(evict_s) > 0.0:
+                    self.last_runtime_timing["provider_layer_cache_batch_evict_s"] = float(
+                        self.last_runtime_timing.get("provider_layer_cache_batch_evict_s", 0.0)
+                    ) + float(evict_s)
+                    self.last_runtime_timing["provider_layer_cache_batch_evict_count"] = float(
+                        self.last_runtime_timing.get("provider_layer_cache_batch_evict_count", 0.0)
+                    ) + 1.0
+                    self.last_runtime_timing["provider_layer_cache_batch_evict_transform_count"] = float(
+                        self.last_runtime_timing.get("provider_layer_cache_batch_evict_transform_count", 0.0)
+                    ) + float(evict_transform_count)
                     self.last_runtime_timing["layer_cache_evict_s"] = float(
                         self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
                     ) + float(evict_s)
@@ -7129,13 +7182,36 @@ class NativeHaloStripeNoRIConvExecutor:
                         + self.last_runtime_timing.get("layer_cache_key_prepare_s", 0.0)
                         + self.last_runtime_timing.get("layer_cache_evict_s", 0.0)
                     )
+                if unexpected_resident_groups and first_error is None:
+                    first_error = RuntimeError(
+                        f"{self.output_node_id} provider batch cleanup found resident single-slot "
+                        "transform group(s) that were not materialized by the current batch"
+                    )
+                if first_error is not None:
+                    raise first_error
 
-            def evaluate_runtime_group(runtime_group) -> None:
+            def evaluate_runtime_group(runtime_group, *, defer_single_slot_evict: bool = False) -> None:
                 nonlocal evaluated_group_count, partial_count, rescale_count, accumulate_count
                 group = runtime_group.group
+                if bool(defer_single_slot_evict) and (
+                    not bool(getattr(group, "_single_slot_layer_cache", False))
+                    or getattr(group, "unified_ids", None) is None
+                ):
+                    raise RuntimeError(
+                        f"{self.output_node_id} cannot defer provider single-slot evict for an "
+                        "unmaterialized or non-single-slot runtime group"
+                    )
                 group_started = time.time()
-                output_ids = group.evaluate_unified(int(ids[int(runtime_group.input_index)]), scheme.backend)
+                output_ids = group.evaluate_unified(
+                    int(ids[int(runtime_group.input_index)]),
+                    scheme.backend,
+                    evict_single_slot_after_eval=not bool(defer_single_slot_evict),
+                )
                 self.last_runtime_timing["group_eval_s"] += float(time.time() - group_started)
+                if bool(defer_single_slot_evict):
+                    self.last_runtime_timing["provider_layer_cache_no_evict_eval_count"] = float(
+                        self.last_runtime_timing.get("provider_layer_cache_no_evict_eval_count", 0.0)
+                    ) + 1.0
                 group_timing = dict(getattr(group, "last_runtime_timing", {}) or {})
                 group_evict_s = float(group_timing.get("layer_cache_evict_s", 0.0) or 0.0)
                 if bool(provider_auto_group) and float(group_evict_s) > 0.0:
@@ -7172,12 +7248,16 @@ class NativeHaloStripeNoRIConvExecutor:
                         self.last_runtime_timing["partial_accumulate_s"] += float(time.time() - accumulate_started)
                         accumulate_count += 1
             for batch in provider_runtime_batches():
+                materialized_group_ids: set[int] = set()
                 try:
-                    materialize_provider_batch(batch)
+                    materialized_group_ids = materialize_provider_batch(batch)
                     for runtime_group in batch:
-                        evaluate_runtime_group(runtime_group)
+                        evaluate_runtime_group(
+                            runtime_group,
+                            defer_single_slot_evict=int(id(runtime_group.group)) in materialized_group_ids,
+                        )
                 finally:
-                    cleanup_materialized_provider_batch(batch)
+                    cleanup_materialized_provider_batch(batch, materialized_group_ids)
         if fuse_output_rescale:
             for block_index, block_ct in enumerate(output_blocks):
                 if block_ct is None:

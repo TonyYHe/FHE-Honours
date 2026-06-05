@@ -682,6 +682,7 @@ def test_exact_bootstrap_trial_evaluator_matches_level_dag_residual() -> None:
 
 
 def _compile_tiny_u22_with_trial_evaluator_env(monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.setenv("ORION_BOOTSTRAP_LAYOUT_REFINEMENT", "1")
     monkeypatch.setenv("ORION_BOOTSTRAP_LAYOUT_REFINEMENT_MAX_ROUNDS", "1")
     config = _runtime_config(
         backend="python",
@@ -2069,11 +2070,11 @@ def test_layout_policy_non_dp_no_share_variants_use_individual_native_stripe(pol
     (
         ("fixed_max_no_share", "fixed_max_no_share_fused"),
         ("fixedmax_no_share", "fixed_max_no_share_fused"),
-        ("always_no_share", "always_no_share_fused"),
-        ("always_relayout_no_share", "always_no_share_fused"),
+        ("always_no_share", "always_no_share_producer_fused"),
+        ("always_relayout_no_share", "always_no_share_producer_fused"),
     ),
 )
-def test_layout_policy_no_share_defaults_to_fused(public_policy: str, canonical: str) -> None:
+def test_layout_policy_no_share_defaults_to_current_canonical(public_policy: str, canonical: str) -> None:
     assert normalize_policy(public_policy) == canonical
     plan = build_layout_policy_compile_plan(
         _prepared_one_down_one_up_dag(image_size=128, base_channels=8),
@@ -2090,6 +2091,7 @@ def test_layout_policy_no_share_defaults_to_fused(public_policy: str, canonical:
         "fixed_max_no_share_fused",
         "fixed_max_no_share_unfused",
         "always_no_share_fused",
+        "always_no_share_producer_fused",
         "always_no_share_unfused",
     ),
 )
@@ -2155,7 +2157,8 @@ def test_layout_policy_parser_marks_non_dp_u22_modes_as_provider_executable() ->
     assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share")["u22_layout_policy"] == "fixed_max_no_share_fused"
     assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share_fused")["u22_layout_policy"] == "fixed_max_no_share_fused"
     assert _region_first_mode_options("u22_256_base32_layout_fixedmax_no_share_unfused")["u22_layout_policy"] == "fixed_max_no_share_unfused"
-    assert _region_first_mode_options("u22_256_base32_layout_always_no_share")["u22_layout_policy"] == "always_no_share_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_always_no_share")["u22_layout_policy"] == "always_no_share_producer_fused"
+    assert _region_first_mode_options("u22_256_base32_layout_always_no_share_producer")["u22_layout_policy"] == "always_no_share_producer_fused"
     assert _region_first_mode_options("u22_256_base32_layout_always_no_share_fused")["u22_layout_policy"] == "always_no_share_fused"
     assert _region_first_mode_options("u22_256_base32_layout_always_no_share_unfused")["u22_layout_policy"] == "always_no_share_unfused"
     assert _region_first_mode_options("u22_256_base32_layout_dp_no_share_fold")["u22_layout_policy"] == "dp_no_share_fold"
@@ -7059,8 +7062,8 @@ def test_u22_224_silu7_provider_runner_accepts_always_fused_policy() -> None:
     assert runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
     assert runner._provider_mode("fixed_max_no_share_fused") == "u22_256_base32_layout_fixedmax_no_share"
     assert runner._provider_mode("fixed_max_no_share_unfused") == "u22_256_base32_layout_fixedmax_no_share_unfused"
-    assert runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share"
-    assert runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share"
+    assert runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share_producer"
+    assert runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share_fused"
     assert runner._provider_mode("always_no_share_unfused") == "u22_256_base32_layout_always_no_share_unfused"
 
     env = runner._apply_env_defaults(
@@ -7097,16 +7100,16 @@ def test_u22_dim32_runners_accept_no_share_fold_policy() -> None:
     assert matrix_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
     assert matrix_runner._provider_mode("fixed_max_no_share_fused") == "u22_256_base32_layout_fixedmax_no_share"
     assert matrix_runner._provider_mode("fixed_max_no_share_unfused") == "u22_256_base32_layout_fixedmax_no_share_unfused"
-    assert matrix_runner._provider_mode("always_no_share") == "u22_256_base32_layout_always_no_share"
-    assert matrix_runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share"
+    assert matrix_runner._provider_mode("always_no_share") == "u22_256_base32_layout_always_no_share_producer"
+    assert matrix_runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share_fused"
     assert matrix_runner._provider_mode("always_no_share_unfused") == "u22_256_base32_layout_always_no_share_unfused"
     assert encoder4_runner._provider_mode("dp_no_share_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert encoder4_runner._provider_mode("noshare_fold") == "u22_256_base32_layout_dp_no_share_fold"
     assert encoder4_runner._provider_mode("fixed_max") == "u22_256_base32_layout_fixedmax_no_share"
     assert encoder4_runner._provider_mode("fixed_max_no_share_fused") == "u22_256_base32_layout_fixedmax_no_share"
     assert encoder4_runner._provider_mode("fixed_max_no_share_unfused") == "u22_256_base32_layout_fixedmax_no_share_unfused"
-    assert encoder4_runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share"
-    assert encoder4_runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share"
+    assert encoder4_runner._provider_mode("always_relayout_no_share") == "u22_256_base32_layout_always_no_share_producer"
+    assert encoder4_runner._provider_mode("always_no_share_fused") == "u22_256_base32_layout_always_no_share_fused"
     assert encoder4_runner._provider_mode("always_no_share_unfused") == "u22_256_base32_layout_always_no_share_unfused"
 
 
@@ -7131,9 +7134,9 @@ def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
     dense_env = matrix_runner._apply_mode_env(dict(matrix_base), "dense")
     provider_env = matrix_runner._apply_mode_env(dict(matrix_base), "provider")
     assert dense_env["ORION_CONCAT_FUSION"] == "0"
-    assert dense_env["ORION_UNIFIED_LT_OUTPUT_FUSION"] == "0"
-    assert dense_env["ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION"] == "1"
-    assert provider_env["ORION_CONCAT_FUSION"] == "auto"
+    assert dense_env["ORION_UNIFIED_LT_OUTPUT_FUSION"] == "1"
+    assert dense_env["ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION"] == "0"
+    assert provider_env["ORION_CONCAT_FUSION"] == "0"
     assert provider_env["ORION_UNIFIED_LT_OUTPUT_FUSION"] == "1"
     assert provider_env["ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION"] == "0"
     assert matrix_base["ORION_PACK_CONV_WORKERS"] == "240"
@@ -7146,7 +7149,7 @@ def test_u22_dim32_matrix_runner_forces_noshare_mainline_env() -> None:
         assert env["ORION_UNIFIED_LT_INDIVIDUAL_EVAL"] == "1"
         assert env["ORION_UNIFIED_LT_SHARED_ROTATION_KEYS"] == "0"
         assert env["ORION_LATTIGO_UNIFIED_NO_BSGS"] == "0"
-    assert encoder4_runner._apply_env_defaults(dict(bad_env))["ORION_CONCAT_FUSION"] == "auto"
+    assert encoder4_runner._apply_env_defaults(dict(bad_env))["ORION_CONCAT_FUSION"] == "0"
 
     args = SimpleNamespace(layer_mae=False, dense_layer_mae=False, provider_layer_mae=False)
     assert matrix_runner._mode_layer_mae_enabled(args, "dense") is False

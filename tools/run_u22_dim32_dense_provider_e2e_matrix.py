@@ -117,14 +117,18 @@ PROVIDER_MODES = {
     "greedy": "u22_256_base32_layout_greedy",
     "always": "u22_256_base32_layout_always",
     "always_fused": "u22_256_base32_layout_always_fused",
-    "always_no_share": "u22_256_base32_layout_always_no_share",
-    "always_noshare": "u22_256_base32_layout_always_no_share",
-    "always_relayout_no_share": "u22_256_base32_layout_always_no_share",
-    "always_relayout_noshare": "u22_256_base32_layout_always_no_share",
-    "always_no_share_fused": "u22_256_base32_layout_always_no_share",
-    "always_noshare_fused": "u22_256_base32_layout_always_no_share",
-    "always_relayout_no_share_fused": "u22_256_base32_layout_always_no_share",
-    "always_relayout_noshare_fused": "u22_256_base32_layout_always_no_share",
+    "always_no_share": "u22_256_base32_layout_always_no_share_producer",
+    "always_noshare": "u22_256_base32_layout_always_no_share_producer",
+    "always_relayout_no_share": "u22_256_base32_layout_always_no_share_producer",
+    "always_relayout_noshare": "u22_256_base32_layout_always_no_share_producer",
+    "always_no_share_producer": "u22_256_base32_layout_always_no_share_producer",
+    "always_noshare_producer": "u22_256_base32_layout_always_no_share_producer",
+    "always_no_share_producer_fused": "u22_256_base32_layout_always_no_share_producer",
+    "always_noshare_producer_fused": "u22_256_base32_layout_always_no_share_producer",
+    "always_no_share_fused": "u22_256_base32_layout_always_no_share_fused",
+    "always_noshare_fused": "u22_256_base32_layout_always_no_share_fused",
+    "always_relayout_no_share_fused": "u22_256_base32_layout_always_no_share_fused",
+    "always_relayout_noshare_fused": "u22_256_base32_layout_always_no_share_fused",
     "always_no_share_unfused": "u22_256_base32_layout_always_no_share_unfused",
     "always_noshare_unfused": "u22_256_base32_layout_always_no_share_unfused",
     "fixed_max": "u22_256_base32_layout_fixedmax_no_share",
@@ -177,7 +181,8 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
-    "ORION_CONCAT_FUSION": "auto",
+    "ORION_CONCAT_FUSION": "0",
+    "ORION_BOOTSTRAP_LAYOUT_REFINEMENT": "0",
     "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
 
@@ -201,14 +206,14 @@ DENSE_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
     "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
     "ORION_CONCAT_FUSION": "0",
-    "ORION_UNIFIED_LT_OUTPUT_FUSION": "0",
-    "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "1",
+    "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
+    "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
 
 PROVIDER_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "layer",
     "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
-    "ORION_CONCAT_FUSION": "auto",
+    "ORION_CONCAT_FUSION": "0",
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
@@ -233,6 +238,7 @@ ENV_TUNING_KEYS = (
     "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
     "ORION_LATTIGO_BOOTSTRAP_WORKERS",
     "ORION_CONCAT_FUSION",
+    "ORION_BOOTSTRAP_LAYOUT_REFINEMENT",
     "ORION_UNIFIED_LT_OUTPUT_FUSION",
     "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION",
     "ORION_LATTIGO_CLEAR_BACKEND",
@@ -282,6 +288,15 @@ def _apply_mode_env(env: dict[str, str], mode: str) -> dict[str, str]:
         updated.update(PROVIDER_MODE_ENV)
     else:
         updated.update(DENSE_MODE_ENV)
+    return updated
+
+
+def _apply_layer_cache_override(env: dict[str, str], *, single_slot_layer_cache: bool = True) -> dict[str, str]:
+    updated = dict(env)
+    if not bool(single_slot_layer_cache):
+        updated["ORION_SINGLE_SLOT_LAYER_CACHE"] = "0"
+        updated["ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA"] = "0"
+        updated["ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA"] = "0"
     return updated
 
 
@@ -409,7 +424,12 @@ def _annotate_result(
 
 def run_one(args: argparse.Namespace) -> int:
     mode = str(args.mode)
-    os.environ.update(_apply_mode_env(_apply_env_defaults(os.environ, backend=str(args.backend)), mode))
+    env = _apply_mode_env(_apply_env_defaults(os.environ, backend=str(args.backend)), mode)
+    env = _apply_layer_cache_override(
+        env,
+        single_slot_layer_cache=not bool(getattr(args, "no_single_slot_layer_cache", False)),
+    )
+    os.environ.update(env)
     env_snapshot = dict(os.environ)
     base = _register_networks()
     out_path = Path(args.out)
@@ -1618,11 +1638,20 @@ def run_all(args: argparse.Namespace) -> int:
     cases = [str(case) for case in args.cases]
     modes = [str(mode) for mode in args.modes]
     env = _apply_env_defaults(os.environ, backend=str(args.backend))
+    env = _apply_layer_cache_override(
+        env,
+        single_slot_layer_cache=not bool(getattr(args, "no_single_slot_layer_cache", False)),
+    )
     env["TMPDIR"] = str(run_root / "tmp")
     env.setdefault("XDG_CACHE_HOME", str(run_root / "xdg-cache"))
     mode_env = {
         str(mode): {
-            key: str(_apply_mode_env(dict(env), str(mode)).get(key, ""))
+            key: str(
+                _apply_layer_cache_override(
+                    _apply_mode_env(dict(env), str(mode)),
+                    single_slot_layer_cache=not bool(getattr(args, "no_single_slot_layer_cache", False)),
+                ).get(key, "")
+            )
             for key in ENV_SNAPSHOT_KEYS
         }
         for mode in modes
@@ -1646,8 +1675,8 @@ def run_all(args: argparse.Namespace) -> int:
             "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
             "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
             "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_lt": "independent Orion LT; dense mode disables concat fusion, unified output fusion, and bootstrap prescale fusion",
-            "provider_lt": "HaloED/provider mode keeps concat fusion on auto and unified output/bootstrap prescale fusion enabled",
+            "dense_lt": "independent Orion LT; dense mode keeps concat fusion disabled and unified output/bootstrap prescale fusion enabled",
+            "provider_lt": "HaloED/provider mode keeps concat fusion disabled and unified output/bootstrap prescale fusion enabled",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
         },
     }
@@ -1667,6 +1696,10 @@ def run_all(args: argparse.Namespace) -> int:
         for case in cases:
             for mode in modes:
                 env = _apply_mode_env(_apply_env_defaults(os.environ, backend=str(args.backend)), mode)
+                env = _apply_layer_cache_override(
+                    env,
+                    single_slot_layer_cache=not bool(getattr(args, "no_single_slot_layer_cache", False)),
+                )
                 env["TMPDIR"] = str(run_root / "tmp")
                 env.setdefault("XDG_CACHE_HOME", str(run_root / "xdg-cache"))
                 out_path, log_path = _case_paths(run_root, case, mode)
@@ -1737,6 +1770,8 @@ def run_all(args: argparse.Namespace) -> int:
                     command.append("--dense-layer-mae")
                 if bool(args.provider_layer_mae):
                     command.append("--provider-layer-mae")
+                if bool(args.no_single_slot_layer_cache):
+                    command.append("--no-single-slot-layer-cache")
                 print(f"[{datetime.now().isoformat(timespec='seconds')}] start {case} {mode}", flush=True)
                 print(" ".join(shlex.quote(part) for part in command), flush=True)
                 with log_path.open("w", encoding="utf-8") as log_file:
@@ -1789,6 +1824,11 @@ def main() -> int:
     parser.add_argument("--layer-mae", action="store_true", help="enable layer-MAE checks for all modes")
     parser.add_argument("--dense-layer-mae", action="store_true", help="enable layer-MAE checks for dense mode")
     parser.add_argument("--provider-layer-mae", action="store_true", help="enable layer-MAE checks for provider mode")
+    parser.add_argument(
+        "--no-single-slot-layer-cache",
+        action="store_true",
+        help="disable single-slot layer-cache materialization; useful for clear-backend correctness smoke runs",
+    )
     parser.add_argument("--update-doc-only", action="store_true")
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--case", choices=tuple(CASES), default="192x192", help=argparse.SUPPRESS)

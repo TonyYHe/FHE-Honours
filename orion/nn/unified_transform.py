@@ -3543,6 +3543,7 @@ class UnifiedTransformGroup:
         backend,
         *,
         single_slot_timing: dict[str, float] | None = None,
+        evict_single_slot_after_eval: bool = True,
     ) -> list[int]:
         if self.unified_ids is None:
             raise RuntimeError("UnifiedTransformGroup must be materialized before individual evaluation")
@@ -3626,15 +3627,27 @@ class UnifiedTransformGroup:
             if bundle is not None:
                 bundle.clear()
             active_ids = tuple(int(value) for value in transform_ids)
-            evict_s = self._evict_single_slot_after_eval(backend)
+            evict_s = (
+                self._evict_single_slot_after_eval(backend)
+                if bool(evict_single_slot_after_eval)
+                else 0.0
+            )
             timing["layer_cache_evict_s"] = float(timing.get("layer_cache_evict_s", 0.0) + float(evict_s))
             timing["layer_cache_turnover_s"] = float(
                 timing.get("layer_cache_encode_s", 0.0)
                 + timing.get("layer_cache_key_prepare_s", 0.0)
                 + timing.get("layer_cache_evict_s", 0.0)
             )
-            guard_ids = () if bool(self._single_slot_layer_cache) else active_ids
-            evicted_ids = active_ids if bool(self._single_slot_layer_cache) else ()
+            guard_ids = (
+                ()
+                if bool(self._single_slot_layer_cache) and bool(evict_single_slot_after_eval)
+                else active_ids
+            )
+            evicted_ids = (
+                active_ids
+                if bool(self._single_slot_layer_cache) and bool(evict_single_slot_after_eval)
+                else ()
+            )
             trim_event = self._forward_memory_guard(
                 backend,
                 reason=f"after_unified_individual_unload:{self._storage_key}",
@@ -3659,7 +3672,19 @@ class UnifiedTransformGroup:
             )
         return [int(value) for value in output_ids]
 
-    def evaluate_unified(self, ct_input_id: int, backend) -> list[int]:
+    def evaluate_unified(
+        self,
+        ct_input_id: int,
+        backend,
+        *,
+        evict_single_slot_after_eval: bool = True,
+    ) -> list[int]:
+        if not bool(evict_single_slot_after_eval):
+            if not bool(self._single_slot_layer_cache) or self.unified_ids is None:
+                raise RuntimeError(
+                    "deferred single-slot evict is only valid for already-materialized "
+                    "single-slot UnifiedTransformGroup instances"
+                )
         single_slot_timing = {
             "layer_cache_encode_s": 0.0,
             "layer_cache_key_prepare_s": 0.0,
@@ -3679,10 +3704,15 @@ class UnifiedTransformGroup:
                 int(ct_input_id),
                 backend,
                 single_slot_timing=single_slot_timing,
+                evict_single_slot_after_eval=bool(evict_single_slot_after_eval),
             )
         if self._memory_bounded_eval_enabled(backend):
             chunks = self._memory_bounded_chunks(backend)
             if chunks:
+                if not bool(evict_single_slot_after_eval):
+                    raise RuntimeError(
+                        "deferred single-slot evict is not supported for memory-bounded unified eval"
+                    )
                 return self._evaluate_unified_memory_bounded(int(ct_input_id), backend)
         if (
             len(self.unified_ids) == 1
@@ -3710,7 +3740,11 @@ class UnifiedTransformGroup:
                 timing["eval_s"] = max(0.0, float(eval_total_s) - float(trim_s))
                 return output
             finally:
-                evict_s = self._evict_single_slot_after_eval(backend)
+                evict_s = (
+                    self._evict_single_slot_after_eval(backend)
+                    if bool(evict_single_slot_after_eval)
+                    else 0.0
+                )
                 timing["layer_cache_evict_s"] = float(timing.get("layer_cache_evict_s", 0.0) + float(evict_s))
                 timing["layer_cache_turnover_s"] = float(
                     timing.get("layer_cache_encode_s", 0.0)
@@ -3806,15 +3840,27 @@ class UnifiedTransformGroup:
             if bundle is not None:
                 bundle.clear()
             active_ids = tuple(int(value) for value in (self.unified_ids or ()))
-            evict_s = self._evict_single_slot_after_eval(backend)
+            evict_s = (
+                self._evict_single_slot_after_eval(backend)
+                if bool(evict_single_slot_after_eval)
+                else 0.0
+            )
             timing["layer_cache_evict_s"] = float(timing.get("layer_cache_evict_s", 0.0) + float(evict_s))
             timing["layer_cache_turnover_s"] = float(
                 timing.get("layer_cache_encode_s", 0.0)
                 + timing.get("layer_cache_key_prepare_s", 0.0)
                 + timing.get("layer_cache_evict_s", 0.0)
             )
-            guard_ids = () if bool(self._single_slot_layer_cache) else active_ids
-            evicted_ids = active_ids if bool(self._single_slot_layer_cache) else ()
+            guard_ids = (
+                ()
+                if bool(self._single_slot_layer_cache) and bool(evict_single_slot_after_eval)
+                else active_ids
+            )
+            evicted_ids = (
+                active_ids
+                if bool(self._single_slot_layer_cache) and bool(evict_single_slot_after_eval)
+                else ()
+            )
             trim_event = self._forward_memory_guard(
                 backend,
                 reason=f"after_unified_group_unload:{self._storage_key}",

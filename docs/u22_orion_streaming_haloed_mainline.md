@@ -1064,3 +1064,150 @@ computes the residual from HE forward minus the displayed split columns.
 | 384x384 | Satellite cloud | 4->256 | provider | pending | enc4a |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | /home/anakano/PycharmProjects/orion/.tmp/results/u22_dim32_encoder4_noshare_e2e_qiuchu_20260528T161318Z_noshare/384_384/provider_encoder4_e2e.json |  |
 | 384x384 | Satellite cloud | 4->256 | provider | pending | enc4b |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | /home/anakano/PycharmProjects/orion/.tmp/results/u22_dim32_encoder4_noshare_e2e_qiuchu_20260528T161318Z_noshare/384_384/provider_encoder4_e2e.json |  |
 <!-- U22_BASE32_ENCODER4_NOSHARE_E2E_TABLE_END -->
+
+## DP layout-planner generalization stress case
+
+This section records a planner-only stress case for reviewer discussion about
+why the layout planner is formulated as a graph-level DP rather than a
+U-Net-specific heuristic.  The example is deliberately not U-Net22 and does
+not use U-Net layer names.  It is a pure convolutional multi-branch DAG with
+Inception-style fanout: the same source feature is consumed by `1x1`, `3x3`,
+`5x5`, `7x7`, and pooling branches, then later by another multi-kernel branch
+after downsample/upsample exchange and an `Add`.  Such Inception-style
+multi-branch convolutional blocks are a common pattern inside U-Net encoders
+and U-Net variants for multi-scale feature extraction; the purpose here is to
+show that the same DP planner consumes generic graph/operator metadata
+(`Conv2d`, `AvgPool2d`, `ConvTranspose2d`, `Concat`, `Add`, shape, gap, and
+required halo beta), not architecture-specific U-Net rules.
+
+Rebuttal phrasing:
+
+> The DP planner is not introduced because the U-Net topology is uniquely
+> complex. It is introduced because halo layout selection is a graph-level
+> optimization problem. Even in U-Net, skip connections create non-local
+> dependencies between producer materialization, consumer-fused re-layout, and
+> later concat alignment. We use U-Net as the primary medical workload, and
+> additionally verify the same planner on nested/multi-branch convolutional DAGs
+> without architecture-specific rules. The planner consumes only traced graph
+> metadata and operator layout requirements, so it generalizes to any supported
+> convolutional DAG.
+
+Generator:
+
+```bash
+.venv/bin/python tools/generate_conv_dag_stress_layout.py
+```
+
+Artifacts:
+
+```text
+tools/generate_conv_dag_stress_layout.py
+.tmp/results/convdag_stress_base8_256_silu7_dp_detail.csv
+.tmp/results/convdag_stress_base8_256_silu7_dp_layout.md
+.tmp/results/convdag_stress_base8_256_silu7_dp_summary.json
+```
+
+Planner-only summary:
+
+| model | image | base | policy | edges | nodes | CT | rotations | CT-PT mult | re-layouts | relayout depth | consumer-fused | producer halo | required beta distribution |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| ConvDAGStressNet | 256x256 | 8 | dp | 37 | 27 | 766 | 16,750 | 111,816 | 5 | 5 | 6 | 3 | beta0: 25; beta1: 5; beta2: 4; beta3: 3 |
+
+DP detail table:
+
+| # | node | op | sources | out | gap | CT | req beta | in beta | out beta | transition | mode | physical | R | M |
+| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: |
+| 1 | stem | Conv2d | x | 8x256x256 | 1 | 16 | 1 | 1 | 0 | - | native_halo_stripe | native_source_stripe | 102 | 576 |
+| 2 | stem_act | SiLU | stem | 8x256x256 | 1 | 16 | 0 | 0 | 0 | - | halo_local | native_source_stripe | 0 | 48 |
+| 3 | b1 | Conv2d | stem_act | 8x256x256 | 1 | 16 | 0 | 0 | 0 | - | halo_local | native_source_stripe | 272 | 128 |
+| 4 | b3 | Conv2d | stem_act | 8x256x256 | 1 | 16 | 1 | 1 | 0 | edge:1 | halo_local | packed_compact | 272 | 1,552 |
+| 5 | b5 | Conv2d | stem_act | 8x256x256 | 1 | 16 | 2 | 2 | 0 | edge:1 | halo_local | packed_compact | 496 | 4,496 |
+| 6 | b7 | Conv2d | stem_act | 8x256x256 | 1 | 16 | 3 | 3 | 0 | edge:1 | halo_local | packed_compact | 624 | 8,976 |
+| 7 | bp | AvgPool2d | stem_act | 8x256x256 | 1 | 16 | 2 | 2 | 0 | edge:1 | halo_local | packed_compact | 104 | 208 |
+| 8 | cat0 | Concat | b1;b3;b5;b7;bp | 40x256x256 | 1 | 80 | 0 | 0 | 0 | - | halo_local;native_halo_stripe | packed_compact | 0 | 0 |
+| 9 | mix0 | Conv2d | cat0 | 16x256x256 | 1 | 32 | 0 | 0 | 0 | - | halo_local | packed_compact | 2,640 | 1,280 |
+| 10 | mix0_act | SiLU | mix0 | 16x256x256 | 1 | 32 | 0 | 0 | 0 | - | halo_local | packed_compact | 0 | 96 |
+| 11 | down | AvgPool2d | mix0_act | 16x128x128 | 2 | 8 | 0 | 0 | 3 | producer-halo | halo_local | logical_halo_compact | 64 | 128 |
+| 12 | l3 | Conv2d | down | 16x128x128 | 2 | 8 | 1 | 3 | 2 | consumer-fused:1 | compact_halo_shared | logical_halo_compact | 928 | 6,144 |
+| 13 | l5 | Conv2d | down | 16x128x128 | 2 | 8 | 2 | 3 | 2 | consumer-fused:1;producer-halo | compact_halo_shared | logical_halo_compact | 1,376 | 17,920 |
+| 14 | l7 | Conv2d | down | 16x128x128 | 2 | 8 | 3 | 3 | 2 | consumer-fused:1;producer-halo | compact_halo_shared | logical_halo_compact | 1,632 | 35,840 |
+| 15 | cat1 | Concat | l3;l5;l7 | 48x128x128 | 2 | 24 | 0 | 2 | 2 | - | halo_local | logical_halo_compact | 0 | 0 |
+| 16 | mix1 | Conv2d | cat1 | 16x128x128 | 2 | 8 | 0 | 2 | 2 | - | halo_local | logical_halo_compact | 3,168 | 1,536 |
+| 17 | mix1_act | SiLU | mix1 | 16x128x128 | 2 | 8 | 1 | 2 | 2 | - | halo_local | logical_halo_compact | 0 | 24 |
+| 18 | up | ConvTranspose2d | mix1_act | 16x256x256 | 1 | 32 | 0 | 2 | 4 | - | halo_local | logical_halo_compact | 608 | 2,048 |
+| 19 | add | Add | mix0_act;up | 16x256x256 | 1 | 32 | 0 | 4 | 4 | edge:1 | halo_local | logical_halo_compact | 0 | 32 |
+| 20 | c1 | Conv2d | add | 8x256x256 | 1 | 16 | 0 | 4 | 2 | - | halo_local | logical_halo_compact | 544 | 256 |
+| 21 | c3 | Conv2d | add | 8x256x256 | 1 | 16 | 1 | 4 | 0 | consumer-fused:1 | compact_halo_shared | packed_compact | 544 | 3,072 |
+| 22 | c5 | Conv2d | add | 8x256x256 | 1 | 16 | 2 | 4 | 0 | consumer-fused:1 | compact_halo_shared | packed_compact | 992 | 8,960 |
+| 23 | c7 | Conv2d | add | 8x256x256 | 1 | 16 | 3 | 4 | 0 | consumer-fused:1 | compact_halo_shared | packed_compact | 1,248 | 17,920 |
+| 24 | cat2 | Concat | c1;c3;c5;c7 | 32x256x256 | 1 | 64 | 0 | 0 | 0 | - | halo_local | packed_compact | 0 | 0 |
+| 25 | mix2 | Conv2d | cat2 | 8x256x256 | 1 | 16 | 0 | 0 | 0 | - | halo_local | packed_compact | 1,088 | 512 |
+| 26 | mix2_act | SiLU | mix2 | 8x256x256 | 1 | 16 | 0 | 0 | 0 | - | halo_local | packed_compact | 0 | 48 |
+| 27 | out | Conv2d | mix2_act | 1x256x256 | 1 | 2 | 0 | 0 | 0 | - | halo_local | packed_compact | 48 | 16 |
+
+## Legacy 224x224 Re-Layout Ablation Provenance
+
+The earlier 224x224 re-layout scheduling comparison with rotations
+`7,507,030`, `22,050,490`, and `135,484` came from the compile-lite policy
+probe, not from the older `generate_unet22_layout_ablation_table.py` paper
+table generator.
+
+Script:
+
+```text
+tools/run_u22_224_policy_compile_probe.py
+```
+
+Equivalent command:
+
+```bash
+mkdir -p .tmp/results .tmp/logs
+env ORION_COMPILE_SKIP_BOOTSTRAPPER_GENERATION=1 \
+  timeout 900s .venv/bin/python tools/run_u22_224_policy_compile_probe.py \
+  --backend lattigo \
+  --image-size 224 \
+  --base-channels 32 \
+  --silu-degree 7 \
+  --logn 16 \
+  --max-rounds 16 \
+  --auto-target 1 \
+  --skip-layer-compile \
+  --policies dp_no_share_fold fixed_max_no_share always_no_share \
+  --out .tmp/results/u22_224_policy_compile_lite_current_after_fixedmax_clamp.json \
+  --csv .tmp/results/u22_224_policy_compile_lite_current_after_fixedmax_clamp.csv \
+  | tee .tmp/logs/u22_224_policy_compile_lite_current_after_fixedmax_clamp.log
+```
+
+Historical note: this artifact predates the default eager baseline switch.  At
+that time, `always_no_share` normalized to the consumer-fused eager policy.  In
+the current code, bare `always_no_share` normalizes to the producer-fused eager
+policy; the legacy consumer-fused row is available only by explicitly selecting
+`always_no_share_fused`.
+
+Artifacts:
+
+```text
+.tmp/results/u22_224_policy_compile_lite_current_after_fixedmax_clamp.csv
+.tmp/results/u22_224_policy_compile_lite_current_after_fixedmax_clamp.json
+.tmp/logs/u22_224_policy_compile_lite_current_after_fixedmax_clamp.log
+```
+
+Recorded compile-lite rows:
+
+| policy | status | rotations | re-layouts | relayout depth | relayout mask mult | consumer-fused relayouts | native physical relayout edges | provider mode |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `fixed_max_no_share` | ok | 7,507,030 | 12 | 12 | 328 | 0 | 5 | `u22_256_base32_layout_fixedmax_no_share` |
+| `always_no_share` (legacy consumer-fused) | ok | 22,050,490 | 30 | 30 | 666 | 22 | 0 | `u22_256_base32_layout_always_no_share` |
+| `dp_no_share_fold` | ok | 135,484 | 4 | 4 | 0 | 0 | 0 | `u22_256_base32_layout_dp_no_share_fold` |
+
+Notes:
+
+- The probe model is `UNet22PlusOutput` with a 22-layer body plus explicit
+  `1x1` output, `224x224`, base channels `32`, SiLU degree `7`, LogN `16`.
+- The run used layout-policy provider native halo and re-layout kernels, with
+  `ORION_UNIFIED_LT_INDIVIDUAL_EVAL=1`,
+  `ORION_UNIFIED_LT_SHARED_ROTATION_KEYS=0`, and
+  `ORION_LATTIGO_UNIFIED_NO_BSGS=0`.
+- The legacy consumer-fused eager row should not be used as the default
+  `\eagerrelayout` baseline.  Current default probes use producer-fused eager
+  for bare `always_no_share`; the old row is only a debug/provenance reference.

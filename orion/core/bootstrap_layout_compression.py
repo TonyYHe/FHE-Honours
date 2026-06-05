@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from orion.nn.activation import Activation, Chebyshev, Quad, ReLU
+
 PHYSICAL_COMPACT = "packed_compact"
 PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
 PHYSICAL_NATIVE_SOURCE_STRIPE = "native_source_stripe"
@@ -15,6 +17,7 @@ BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES = {
     "dp_no_share_fold",
     "fixed_max_no_share_fused",
     "always_no_share_fused",
+    "always_no_share_producer_fused",
 }
 
 _LAYOUT_PRESERVING_MODULES = {
@@ -406,6 +409,8 @@ def _layout_policy_compile_plan_for_dag(network_dag: Any) -> dict[str, Any] | No
 
 
 def bootstrap_aware_layout_refinement_applicable(network_dag: Any) -> bool:
+    if not _env_truthy("ORION_BOOTSTRAP_LAYOUT_REFINEMENT", "0"):
+        return False
     plan = _layout_policy_compile_plan_for_dag(network_dag)
     if not isinstance(plan, dict):
         return False
@@ -5235,7 +5240,10 @@ def apply_bootstrap_aware_layout_refinement(
 
 def _layout_preserving_module(network_dag: Any, node: str) -> bool:
     module = network_dag.nodes[node].get("module") if node in network_dag.nodes else None
-    return type(module).__name__ in _LAYOUT_PRESERVING_MODULES
+    return bool(
+        isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+        or type(module).__name__ in _LAYOUT_PRESERVING_MODULES
+    )
 
 
 def rewrite_layout_policy_plan_for_bootstrap_compression(
@@ -5246,10 +5254,15 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     policy = str(compile_plan.get("policy", ""))
     if policy in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES:
+        reason = (
+            "bootstrap_aware_policy_refinement_disabled"
+            if not _env_truthy("ORION_BOOTSTRAP_LAYOUT_REFINEMENT", "0")
+            else "bootstrap_aware_policy_uses_refinement_final_halo0_cleanup"
+        )
         return dict(compile_plan), {
             "enabled": False,
             "policy": policy,
-            "reason": "bootstrap_aware_policy_uses_refinement_final_halo0_cleanup",
+            "reason": reason,
         }
 
     node_rows = {str(row.get("node", "")): dict(row) for row in compile_plan.get("node_layouts", [])}
