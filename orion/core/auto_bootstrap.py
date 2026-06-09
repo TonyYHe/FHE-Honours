@@ -1,3 +1,5 @@
+import os
+import time
 import networkx as nx
 import matplotlib.pyplot as plt
 from typing import Any
@@ -7,9 +9,9 @@ from .bootstrap_fusion import (
     install_bootstrap_prescale_fusion,
     module_bootstrap_ct_count,
     module_bootstrap_slots,
+    native_bootstrap_active_mask,
     runtime_fhe_output_shape,
 )
-from .bootstrap_layout_compression import apply_bootstrap_layout_compression
 from orion.nn.operations import Bootstrap
 
 
@@ -162,6 +164,26 @@ class BootstrapSolver:
         self.l_eff = l_eff
         self.full_level_dag = LevelDAG(l_eff=l_eff, network_dag=network_dag)
 
+    def _trace_enabled(self) -> bool:
+        return str(os.environ.get("ORION_BOOTSTRAP_SOLVER_TRACE", "0") or "0").strip().lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
+    def _trace(self, message: str) -> None:
+        if self._trace_enabled():
+            print(f"[bootstrap-solver] {message}", flush=True)
+
+    def _timed(self, label: str, callback):
+        started = time.perf_counter()
+        try:
+            return callback()
+        finally:
+            self._trace(f"{label} took {time.perf_counter() - started:.3f}s")
+
     def extract_all_residual_subgraphs(self):
         all_residual_subgraphs = []
         for fork in self.network_dag.residuals.keys():
@@ -178,6 +200,7 @@ class BootstrapSolver:
         residuals = []
         for i, (fork, join) in enumerate(self.network_dag.residuals.items()):
             subgraph = all_residual_subgraphs[i]
+            started = time.perf_counter()
             paths = list(nx.all_simple_paths(subgraph, fork, join))
 
             unique_paths = []
@@ -186,6 +209,12 @@ class BootstrapSolver:
                 if path[1] not in visited_children:
                     unique_paths.append(path)
                     visited_children.add(path[1])
+            self._trace(
+                "residual "
+                f"{fork}->{join} nodes={subgraph.number_of_nodes()} "
+                f"edges={subgraph.number_of_edges()} paths={len(paths)} "
+                f"unique_paths={len(unique_paths)} took {time.perf_counter() - started:.3f}s"
+            )
 
             residuals.append((fork, paths, unique_paths))
 
@@ -208,10 +237,13 @@ class BootstrapSolver:
         self.network_dag.solved_residual_level_dags = {}
         
         for (fork, _, paths) in sorted_residual_subgraphs:
+            residual_started = time.perf_counter()
+            self._trace(f"solve_residual_start fork={fork} path_count={len(paths)}")
             aggregate_level_dag = LevelDAG(
                 l_eff=self.l_eff, network_dag=self.network_dag, path=None
             )
-            for path in paths:
+            for path_index, path in enumerate(paths):
+                path_started = time.perf_counter()
                 path_dag = nx.DiGraph()
 
                 # Then we'll just create a new DAG by extracting the 
@@ -232,8 +264,21 @@ class BootstrapSolver:
                 aggregate_level_dag += LevelDAG(
                     l_eff=self.l_eff, network_dag=self.network_dag, path=path_dag
                 )
+                self._trace(
+                    f"solve_residual_path fork={fork} "
+                    f"path_index={int(path_index)} path_len={len(path)} "
+                    f"aggregate_nodes={aggregate_level_dag.number_of_nodes()} "
+                    f"aggregate_edges={aggregate_level_dag.number_of_edges()} "
+                    f"took {time.perf_counter() - path_started:.3f}s"
+                )
 
             self.network_dag.solved_residual_level_dags[fork] = aggregate_level_dag
+            self._trace(
+                f"solve_residual_done fork={fork} "
+                f"aggregate_nodes={aggregate_level_dag.number_of_nodes()} "
+                f"aggregate_edges={aggregate_level_dag.number_of_edges()} "
+                f"took {time.perf_counter() - residual_started:.3f}s"
+            )
 
         return self.network_dag.solved_residual_level_dags
 
@@ -309,21 +354,50 @@ class BootstrapSolver:
     def _reset_full_level_dag(self):
         self.full_level_dag = LevelDAG(l_eff=self.l_eff, network_dag=self.network_dag)
 
-    def _solve_once(self, *, apply_layout_compression: bool = True):
-        self._reset_full_level_dag()
-        solved_residual_dags = self.first_solve_residual_subgraphs()
-        self.then_build_full_level_dag(solved_residual_dags)
-        input_level = self.finally_solve_full_level_dag()
+    def _solve_once(self, *, apply_layout_compression: bool = False):
+        if bool(apply_layout_compression):
+            raise RuntimeError(
+                "bootstrap_layout_compression has been removed from the U22 "
+                "native-stripe mainline; bootstrap placement must not rewrite "
+                "layout policy plans around bootstrap boundaries."
+            )
+        solve_started = time.perf_counter()
+        self._trace(
+            "start "
+            f"nodes={self.network_dag.number_of_nodes()} "
+            f"edges={self.network_dag.number_of_edges()} "
+            f"residuals={len(getattr(self.network_dag, 'residuals', {}) or {})} "
+            f"l_eff={self.l_eff}"
+        )
+        self._timed("reset_full_level_dag", self._reset_full_level_dag)
+        solved_residual_dags = self._timed(
+            "first_solve_residual_subgraphs",
+            self.first_solve_residual_subgraphs,
+        )
+        self._timed(
+            "then_build_full_level_dag",
+            lambda: self.then_build_full_level_dag(solved_residual_dags),
+        )
+        input_level = self._timed("finally_solve_full_level_dag", self.finally_solve_full_level_dag)
 
-        self.assign_levels_to_layers()
-        num_bootstraps, bootstrapper_slots = self.mark_bootstrap_locations(
-            apply_layout_compression=bool(apply_layout_compression)
+        self._timed("assign_levels_to_layers", self.assign_levels_to_layers)
+        num_bootstraps, bootstrapper_slots = self._timed(
+            "mark_bootstrap_locations",
+            lambda: self.mark_bootstrap_locations(
+                apply_layout_compression=bool(apply_layout_compression)
+            ),
+        )
+        self._trace(
+            "done "
+            f"input_level={int(input_level)} bootstraps={int(num_bootstraps)} "
+            f"slots={[int(v) for v in bootstrapper_slots]} "
+            f"took {time.perf_counter() - solve_started:.3f}s"
         )
 
         return input_level, num_bootstraps, bootstrapper_slots
 
     def solve(self):
-        return self._solve_once(apply_layout_compression=True)
+        return self._solve_once(apply_layout_compression=False)
     
     def assign_levels_to_layers(self):
         # Set each Orion module's attribute with it's level found by this
@@ -397,12 +471,14 @@ class BootstrapSolver:
 
         return total_bootstraps, bootstrapper_slots
 
-    def mark_bootstrap_locations(self, *, apply_layout_compression: bool = True):
+    def mark_bootstrap_locations(self, *, apply_layout_compression: bool = False):
         node_map = self._mark_bootstrap_flags()
         self._last_bootstrap_node_map = dict(node_map)
         if bool(apply_layout_compression):
-            self.network_dag.bootstrap_layout_compression_audit = apply_bootstrap_layout_compression(
-                self.network_dag
+            raise RuntimeError(
+                "bootstrap_layout_compression has been removed from the U22 "
+                "native-stripe mainline; remove the caller instead of "
+                "re-enabling layout compression."
             )
         return self._count_marked_bootstraps(node_map)
 
@@ -485,6 +561,9 @@ class BootstrapPlacer:
         bootstrapper.scheme = self.net.scheme
         bootstrapper.margin = self.net.margin
         bootstrapper.fhe_input_shape = self._runtime_fhe_output_shape(module)
+        active_mask = native_bootstrap_active_mask(module)
+        if active_mask is not None:
+            bootstrapper._bootstrap_prescale_active_mask = active_mask
         bootstrapper.fit()
         bootstrapper.compile()
         install_bootstrap_prescale_fusion(module, bootstrapper)

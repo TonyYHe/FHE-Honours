@@ -41,7 +41,6 @@ from .auto_bootstrap import reset_bootstrap_solver_assignments
 from .auto_bootstrap import snapshot_bootstrap_solver_assignments
 from .bootstrap_layout_compression import (
     apply_bootstrap_aware_layout_refinement_candidate,
-    apply_bootstrap_layout_compression,
     bootstrap_aware_layout_refinement_applicable,
     enumerate_final_boot_boundary_halo0_cleanup_candidate,
     enumerate_bootstrap_aware_layout_refinement_candidates,
@@ -1037,6 +1036,17 @@ class Scheme:
             if not self._generate_matrix_diagonals_parallel_save(network_dag, topo_sort, last_linear):
                 self._generate_matrix_diagonals_sequential(network_dag, topo_sort, last_linear)
 
+        stop_after_diag_metadata = str(os.environ.get("ORION_STOP_AFTER_DIAG_METADATA", "")).strip().lower()
+        if stop_after_diag_metadata in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            self.diag_metadata_network_dag = network_dag
+            self.diag_metadata_topo_sort = tuple(topo_sort)
+            raise RuntimeError("ORION_STOP_AFTER_DIAG_METADATA")
+
         #------------------------------#
         #   Find and place bootstraps  # 
         #------------------------------#
@@ -1053,9 +1063,10 @@ class Scheme:
                 network_dag,
                 compile_manifest["bootstrap_plan"],
             )
-            network_dag.bootstrap_layout_compression_audit = apply_bootstrap_layout_compression(
-                network_dag
-            )
+            network_dag.bootstrap_layout_compression_audit = {
+                "enabled": False,
+                "reason": "removed_from_native_stripe_mainline",
+            }
             print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
         else:
             print("\n{4} Running bootstrap placement... ", end="", flush=True)
@@ -2279,6 +2290,7 @@ class Scheme:
         #   Compile Orion modules in the network   #
         #------------------------------------------#
 
+        stop_after_layer_compile = str(os.environ.get("ORION_STOP_AFTER_LAYER_COMPILE", "")).strip()
         print("\n{5} Compiling network layers...", flush=True)
         compiled_linear_layers = []
         for node in topo_sort:
@@ -2289,10 +2301,27 @@ class Scheme:
                 module.compile()
                 if isinstance(module, LinearTransform):
                     compiled_linear_layers.append(module)
+                if stop_after_layer_compile and str(node) == stop_after_layer_compile:
+                    self.partial_compile_network_dag = network_dag
+                    self.partial_compile_topo_sort = tuple(topo_sort)
+                    self.partial_compile_input_level = int(input_level)
+                    self.partial_compile_stop_layer = str(node)
+                    self.partial_compiled_linear_layers = tuple(compiled_linear_layers)
+                    raise RuntimeError(f"ORION_STOP_AFTER_LAYER_COMPILE:{node}")
 
         register_saved_io_schedule = getattr(self.lt_evaluator, "register_saved_io_schedule", None)
         if callable(register_saved_io_schedule):
             register_saved_io_schedule(compiled_linear_layers)
+
+        if stop_after_diag_metadata in {
+            "after_layers",
+            "layers",
+            "layer_compile",
+            "after_compile",
+        }:
+            self.diag_metadata_network_dag = network_dag
+            self.diag_metadata_topo_sort = tuple(topo_sort)
+            raise RuntimeError("ORION_STOP_AFTER_DIAG_METADATA")
 
         if io_mode == "load" and compile_manifest is not None:
             compile_cache.validate_transform_metadata(compile_manifest, compiled_linear_layers)

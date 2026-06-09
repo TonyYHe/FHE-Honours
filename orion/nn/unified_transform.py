@@ -343,12 +343,14 @@ class UnifiedTransformGroup:
             planned = self._plan_single_slot_rotation_keys(backend, (recipe,))
             key_request_total += int(len(planned))
             transform = recipe[2] if len(recipe) >= 3 else None
+            diag_index_count = int(recipe[0].size)
             transform_stats = dict(per_stats[transform_index]) if transform_index < len(per_stats) else {}
             per_transform.append(
                 {
                     "transform_index": int(transform_index),
                     "transform_id": None,
                     "name": str(getattr(transform, "name", "")),
+                    "diag_index_count": int(diag_index_count),
                     "rotation_eval_count": int(transform_stats.get("rotation_eval_count", 0) or 0),
                     "baby_rotation_eval_count": int(transform_stats.get("baby_rotation_eval_count", 0) or 0),
                     "giant_rotation_eval_count": int(transform_stats.get("giant_rotation_eval_count", 0) or 0),
@@ -369,6 +371,7 @@ class UnifiedTransformGroup:
         return {
             "source": "planned_single_slot_unified_bsgs_eval_rotations",
             "transform_count": int(len(recipes or ())),
+            "diag_index_count": int(sum(int(recipe[0].size) for recipe in (recipes or ()))),
             "transform_rotation_eval_count_total": int(stats["transform_rotation_eval_count_total"]),
             "transform_rotation_key_request_count_total": int(key_request_total),
             "transform_rotation_key_count_total": int(stats["transform_rotation_eval_count_total"]),
@@ -3406,6 +3409,8 @@ class UnifiedTransformGroup:
         target_count: int,
         backend,
     ) -> list[int] | None:
+        if _env_bool("ORION_DISABLE_SOURCES_TARGET_SUM_FUSION"):
+            return None
         evaluate = getattr(backend, "EvaluateLinearTransformSourcesWithSharedCacheAdd", None)
         if not callable(evaluate):
             return None

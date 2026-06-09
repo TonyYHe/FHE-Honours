@@ -36,6 +36,14 @@ _LAYOUT_PRESERVING_MODULES = {
 _MISSING = object()
 
 
+def _removed_layout_rewrite_error(name: str) -> RuntimeError:
+    return RuntimeError(
+        f"{name} has been removed from the U22 native-stripe mainline. "
+        "Native-stripe compilation must keep layout policy decisions explicit "
+        "end-to-end; remove the caller instead of re-enabling this rewrite path."
+    )
+
+
 def _ordered_fx_input_names(fx_node: Any) -> tuple[str, ...]:
     names: list[str] = []
 
@@ -409,12 +417,9 @@ def _layout_policy_compile_plan_for_dag(network_dag: Any) -> dict[str, Any] | No
 
 
 def bootstrap_aware_layout_refinement_applicable(network_dag: Any) -> bool:
-    if not _env_truthy("ORION_BOOTSTRAP_LAYOUT_REFINEMENT", "0"):
-        return False
-    plan = _layout_policy_compile_plan_for_dag(network_dag)
-    if not isinstance(plan, dict):
-        return False
-    return str(plan.get("policy", "")) in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES
+    if _env_truthy("ORION_BOOTSTRAP_LAYOUT_REFINEMENT", "0"):
+        raise _removed_layout_rewrite_error("bootstrap_aware_layout_refinement")
+    return False
 
 
 def _executor_relayout_depth(executor: Any) -> int:
@@ -5122,6 +5127,7 @@ def apply_bootstrap_aware_layout_refinement_candidate(
     first_pass_audit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply one enumerated boot-aware refinement candidate."""
+    raise _removed_layout_rewrite_error("bootstrap_aware_layout_refinement_candidate")
 
     updated_plan = dict(candidate.get("plan", {}) or {})
     if not isinstance(updated_plan, dict) or not updated_plan:
@@ -5201,6 +5207,7 @@ def apply_bootstrap_aware_layout_refinement(
     first_pass_audit: dict[str, Any],
 ) -> dict[str, Any]:
     """Compatibility wrapper that applies the lowest-rotation candidate."""
+    raise _removed_layout_rewrite_error("bootstrap_aware_layout_refinement")
 
     enumeration = enumerate_bootstrap_aware_layout_refinement_candidates(
         network_dag,
@@ -5252,6 +5259,8 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
     *,
     bootstrap_nodes: set[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    raise _removed_layout_rewrite_error("bootstrap_layout_compression")
+
     policy = str(compile_plan.get("policy", ""))
     if policy in BOOTSTRAP_AWARE_LAYOUT_REFINEMENT_POLICIES:
         reason = (
@@ -5364,6 +5373,8 @@ def rewrite_layout_policy_plan_for_bootstrap_compression(
 
 
 def apply_bootstrap_layout_compression(network_dag: Any) -> dict[str, Any]:
+    raise _removed_layout_rewrite_error("bootstrap_layout_compression")
+
     bootstrap_nodes = {
         str(node)
         for node in network_dag.nodes

@@ -1163,16 +1163,78 @@ def test_native_stripe_output_rows_cover_target_block_offsets_without_output_hal
         for target_group in range(int(plan.target_group_count_for_stripe(stripe)))
     )
 
-    assert int(plan.output_ct_count) == 1
-    assert int(native_target_count) == 2
+    assert int(plan.output_ct_count) == int(native_target_count)
+    assert int(native_target_count) > 1
     assert int(max_target_index) == int(native_target_count) - 1
     assert int(executor.rows) == int(native_target_count)
     assert tuple(int(value) for value in executor.runtime_native_fhe_output_shape()) == (int(native_target_count), 32)
 
     metadata = executor.compile_cache_metadata()
     assert int(metadata["runtime_output_ct_count"]) == int(native_target_count)
-    assert int(metadata["native_halo_conv2d_plan"]["output_ct_count"]) == 1
+    assert int(metadata["native_halo_conv2d_plan"]["output_ct_count"]) == int(native_target_count)
     assert metadata["runtime_output_storage_layout"] == "native_halo_stripe"
+
+
+def test_native_source_input_generates_native_output_signature_without_consumer() -> None:
+    from orion.experimental.cir.native_halo_conv2d import (
+        NativeHaloConv2DSpec,
+        NativeHaloStripeNoRIConvExecutor,
+    )
+
+    module = SimpleNamespace(
+        on_weight=torch.zeros((8, 8, 2, 2), dtype=torch.float32),
+        on_bias=None,
+        input_shape=torch.Size([1, 8, 16, 16]),
+        output_shape=torch.Size([1, 8, 8, 8]),
+        fhe_input_shape=torch.Size([1, 8, 16, 16]),
+        fhe_output_shape=torch.Size([1, 8, 8, 8]),
+        stride=(2, 2),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        input_gap=1,
+        output_gap=1,
+        layout_policy_input_physical_layout="native_source_stripe",
+        layout_policy_input_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+        layout_policy_output_layout={"top_beta": 0, "bottom_beta": 0, "gap": 1},
+        layout_policy_native_halo_channel_fold_mode="per_stripe",
+    )
+    spec = NativeHaloConv2DSpec(
+        family_label="native_source_terminal_keeps_native_output",
+        c_in=8,
+        h_in=16,
+        w_in=16,
+        c_out=8,
+        h_out=8,
+        w_out=8,
+        gap_in=1,
+        gap_out=1,
+        kernel=2,
+        stride=2,
+        pad=0,
+        dilation=1,
+        groups=1,
+        slot_count=128,
+        input_top_beta=0,
+        input_bottom_beta=0,
+        output_top_beta=0,
+        output_bottom_beta=0,
+        input_physical_top_beta=0,
+        input_physical_bottom_beta=0,
+        output_physical_top_beta=0,
+        output_physical_bottom_beta=0,
+    )
+    executor = NativeHaloStripeNoRIConvExecutor(module=module, spec=spec, output_node_id="pool")
+    plan = executor.native_plan
+    target_signature = tuple(getattr(module, "layout_policy_native_output_target_signature", ()) or ())
+
+    assert getattr(module, "layout_policy_output_materialization") == "native_halo_stripe"
+    assert getattr(module, "native_halo_output_storage_layout") == "native_source_stripe"
+    assert target_signature
+    assert any(int(target_signature[i][0]) < int(target_signature[i - 1][1]) for i in range(1, len(target_signature)))
+    assert plan.to_dict()["output_storage_layout"] == "native_halo_stripe"
+    assert int(plan.output_ct_count) == int(sum(plan.target_channel_group_counts))
+    assert int(executor.rows) == int(plan.output_ct_count)
 
 
 def test_provider_diag_builder_records_fail_closed_native_source_fallback(monkeypatch) -> None:

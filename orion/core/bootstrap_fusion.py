@@ -85,6 +85,109 @@ def module_uses_full_bootstrap_slots(module: Any) -> bool:
     return int(module_bootstrap_slots(module)) == int(get_slots())
 
 
+def _idx_chw_gap(channel: int, h: int, w: int, height: int, width: int, gap: int) -> int:
+    g = max(1, int(gap))
+    phases = int(g * g)
+    packed_w = int(width) * int(g)
+    group_block = int(height) * int(g) * int(packed_w)
+    group = int(channel) // int(phases)
+    phase = int(channel) % int(phases)
+    phase_h = int(phase) // int(g)
+    phase_w = int(phase) % int(g)
+    return int(
+        int(group) * int(group_block)
+        + (int(h) * int(g) + int(phase_h)) * int(packed_w)
+        + int(w) * int(g)
+        + int(phase_w)
+    )
+
+
+def native_bootstrap_active_mask(module: Any) -> torch.Tensor | None:
+    """Return per-CT active physical slots for native-stripe module outputs.
+
+    Native stripe outputs can use the full CKKS slot count while still leaving
+    physical row/channel slack inactive inside each ciphertext.  Bootstrap
+    preprocess masks must therefore be slot-accurate instead of treating every
+    slot in a full-slot ciphertext as semantically active.
+    """
+
+    raw_signature = tuple(getattr(module, "layout_policy_native_output_target_signature", ()) or ())
+    if not raw_signature:
+        return None
+
+    scheme = getattr(module, "scheme", None)
+    params = getattr(scheme, "params", None)
+    get_slots = getattr(params, "get_slots", None)
+    if not callable(get_slots):
+        return None
+    slots = int(get_slots())
+    if int(slots) <= 0:
+        return None
+
+    output_shape = tuple(int(value) for value in tuple(getattr(module, "output_shape", ()) or ()))
+    if len(output_shape) < 4:
+        return None
+    width = int(output_shape[3])
+    if int(width) <= 0:
+        return None
+    gap = max(1, int(getattr(module, "output_gap", getattr(module, "input_gap", 1)) or 1))
+    signature = tuple(tuple(int(value) for value in tuple(raw)) for raw in raw_signature)
+    cache_key = (signature, tuple(int(value) for value in output_shape), int(gap), int(slots))
+    cached_key = getattr(module, "_bootstrap_prescale_active_mask_cache_key", None)
+    cached_mask = getattr(module, "_bootstrap_prescale_active_mask_cache", None)
+    if cached_key == cache_key and cached_mask is not None:
+        return cached_mask
+
+    masks: list[torch.Tensor] = []
+    for raw in signature:
+        if len(tuple(raw)) != 4:
+            return None
+        h_start, h_end, _channel_start, channel_count = (int(value) for value in tuple(raw))
+        height = max(0, int(h_end) - int(h_start))
+        channels = max(0, int(channel_count))
+        mask = torch.zeros((int(slots),), dtype=torch.bool)
+        for local_channel in range(int(channels)):
+            for local_h in range(int(height)):
+                for w_index in range(int(width)):
+                    slot = _idx_chw_gap(
+                        int(local_channel),
+                        int(local_h),
+                        int(w_index),
+                        int(height),
+                        int(width),
+                        int(gap),
+                    )
+                    if int(slot) >= int(slots):
+                        return None
+                    mask[int(slot)] = True
+        masks.append(mask)
+    if not masks:
+        return None
+    result = torch.stack(masks)
+    setattr(module, "_bootstrap_prescale_active_mask_cache_key", cache_key)
+    setattr(module, "_bootstrap_prescale_active_mask_cache", result)
+    return result
+
+
+def native_bootstrap_has_inactive_slots(module: Any) -> bool:
+    mask = native_bootstrap_active_mask(module)
+    if mask is None or int(mask.numel()) <= 0:
+        return False
+    cache_key = getattr(module, "_bootstrap_prescale_active_mask_cache_key", None)
+    cached_key = getattr(module, "_bootstrap_prescale_has_inactive_slots_cache_key", None)
+    cached_value = getattr(module, "_bootstrap_prescale_has_inactive_slots_cache", None)
+    if cached_key == cache_key and cached_value is not None:
+        return bool(cached_value)
+    value = bool(not bool(mask.all().item()))
+    setattr(module, "_bootstrap_prescale_has_inactive_slots_cache_key", cache_key)
+    setattr(module, "_bootstrap_prescale_has_inactive_slots_cache", bool(value))
+    return bool(value)
+
+
+def _scalar_polynomial_fusion_target(module: Any) -> bool:
+    return bool(hasattr(module, "coeffs") and not hasattr(module, "on_weight"))
+
+
 def _activation_fusion_capable(module: Any) -> bool:
     class_name = type(module).__name__
     return bool(
@@ -138,6 +241,10 @@ def bootstrap_prescale_fusion_supported(module: Any) -> bool:
     if bootstrap_prescale_fusion_disabled():
         return False
     if module is None or not module_uses_full_bootstrap_slots(module):
+        return False
+    if native_bootstrap_has_inactive_slots(module) and (
+        _scalar_polynomial_fusion_target(module) or _relu_output_fusion_capable(module)
+    ):
         return False
     return bool(_runtime_fusion_capable(module) or _add_fusion_capable(module))
 

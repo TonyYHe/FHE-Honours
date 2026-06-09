@@ -775,11 +775,24 @@ class Bootstrap(Module):
         # prescale contract aligned even if the planner's guessed input level
         # differs from the level that reaches the hook at execution time.
         elements = self.fhe_input_shape.numel()
+        max_slots = int(self.scheme.params.get_slots())
         curr_slots = 2 ** math.ceil(math.log2(elements))
-        self.bootstrap_slots = curr_slots
+        self.bootstrap_slots = int(min(int(max_slots), int(curr_slots)))
+        vector_slots = int(math.ceil(int(elements) / float(int(max_slots))) * int(max_slots))
 
-        prescale_vec = torch.zeros(curr_slots)
-        prescale_vec[:elements] = self.prescale
+        active_mask = getattr(self, "_bootstrap_prescale_active_mask", None)
+        if active_mask is not None:
+            active = active_mask.detach().cpu().to(dtype=torch.bool).reshape(-1)
+            if int(active.numel()) > int(vector_slots):
+                raise ValueError(
+                    f"bootstrap active mask has {int(active.numel())} slots, "
+                    f"but prescale vector has {int(vector_slots)}"
+                )
+            prescale_vec = torch.zeros(int(vector_slots))
+            prescale_vec[: int(active.numel())] = active.to(dtype=torch.float32) * float(self.prescale)
+        else:
+            prescale_vec = torch.zeros(int(vector_slots))
+            prescale_vec[:elements] = self.prescale
         self._prescale_vec = prescale_vec
         self._prescale_ptxt_cache = {}
         self.prescale_ptxt = self._get_prescale_ptxt(self.input_level)

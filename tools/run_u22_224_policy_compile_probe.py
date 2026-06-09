@@ -427,7 +427,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    os.environ.setdefault("ORION_LAYOUT_POLICY_RELAYOUT_KERNEL", "1")
+    os.environ.setdefault("ORION_LAYOUT_POLICY_RELAYOUT_KERNEL", "0")
     os.environ.setdefault("ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO", "1")
     os.environ.setdefault("ORION_UNIFIED_LT_INDIVIDUAL_EVAL", "1")
     os.environ.setdefault("ORION_UNIFIED_LT_SHARED_ROTATION_KEYS", "0")

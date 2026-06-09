@@ -3257,6 +3257,8 @@ def _target_h_end_for_source_range(
 def _source_stripes_from_storage_signature(
     spec: NativeHaloConv2DSpec,
     signature: Any,
+    *,
+    target_internal_halo_overlap: int = 0,
 ) -> tuple[NativeHaloStripe, ...]:
     blocks = _normalise_source_storage_signature(signature, c_in=int(spec.c_in))
     if not blocks:
@@ -3269,6 +3271,7 @@ def _source_stripes_from_storage_signature(
     target_tiles = _channel_tile_candidates(int(spec.c_out), int(spec.gap_out))
     stripes: list[NativeHaloStripe] = []
     target_h = int(_output_physical_h_min(spec))
+    overlap = max(0, int(target_internal_halo_overlap))
     physical_min = int(_input_physical_h_min(spec))
     physical_max = int(_input_physical_h_max(spec))
     covered_source_h = int(physical_min)
@@ -3315,7 +3318,10 @@ def _source_stripes_from_storage_signature(
                 target_channel_tile=int(best_target_tile),
             )
         )
-        target_h = int(target_h_end)
+        if int(target_h_end) >= int(_output_physical_h_max(spec)):
+            target_h = int(target_h_end)
+        else:
+            target_h = max(int(target_h) + 1, int(target_h_end) - int(overlap))
     if int(covered_source_h) != int(physical_max):
         raise ValueError("native halo source storage signature does not cover all input rows")
     if int(target_h) != int(_output_physical_h_max(spec)):
@@ -3868,7 +3874,11 @@ def native_halo_conv2d_plan(
         # Treating the source storage blocks and generated target stripes as
         # independent tables would form a source x target cross product and
         # count boundary MVMs that the resident halo window was meant to avoid.
-        stripes = _source_stripes_from_storage_signature(spec, source_signature)
+        stripes = _source_stripes_from_storage_signature(
+            spec,
+            source_signature,
+            target_internal_halo_overlap=int(internal_overlap),
+        )
     elif target_signature:
         stripes = _target_stripes_from_storage_signature(spec, target_signature)
     elif str(fold_mode) == "per_stripe":
@@ -4108,7 +4118,7 @@ def native_halo_source_plaintext_blocks_from_nchw(
     src = values[0]
     slots = int(spec.slot_count)
     blocks: list[torch.Tensor] = []
-    for stripe in plan.stripes:
+    for stripe in plan.effective_source_stripes:
         source_tile = int(plan.source_tile_for_stripe(stripe))
         for group in range(int(plan.source_group_count_for_stripe(stripe))):
             block = torch.zeros((int(slots),), dtype=torch.float32)
@@ -4149,6 +4159,11 @@ class NativeHaloRelayoutKernel:
         fhe_output_shape: torch.Size,
         source_layout: dict[str, Any] | None = None,
     ) -> None:
+        raise RuntimeError(
+            "NativeHaloRelayoutKernel has been removed from the U22 "
+            "native-stripe mainline; native-halo compilation must not insert "
+            "physical relayout transforms."
+        )
         if str(direction) not in {"compact_to_native", "native_to_compact"}:
             raise ValueError(f"unknown native halo relayout direction {direction!r}")
         self.plan = plan
@@ -5757,9 +5772,10 @@ class NativeHaloStripeNoRIConvExecutor:
             tuple(int(value) for value in raw)
             for raw in (getattr(self.module, "layout_policy_native_input_source_signature", ()) or ())
         )
-        target_storage_signature = tuple(
-            tuple(int(value) for value in raw)
-            for raw in (getattr(self.module, "layout_policy_native_output_target_signature", ()) or ())
+        target_storage_signature = self._normalised_native_target_storage_signature(
+            spec,
+            fold_mode=str(fold_mode),
+            raw_signature=getattr(self.module, "layout_policy_native_output_target_signature", ()) or (),
         )
         target_internal_halo_overlap = self._target_internal_halo_overlap_for_spec(
             spec,
@@ -5828,10 +5844,77 @@ class NativeHaloStripeNoRIConvExecutor:
         materialization = str(getattr(self.module, "layout_policy_output_materialization", "") or "")
         if materialization in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
             return False
-        return bool(str(materialization) == "fused_relayout" or not _spec_has_physical_output_halo(spec))
+        if str(materialization) == "fused_relayout":
+            return True
+        if self._native_source_stripe_input_requested():
+            return False
+        return bool(not _spec_has_physical_output_halo(spec))
 
     def _uses_tight_compact_output(self) -> bool:
         return self._uses_tight_compact_output_for_spec(self.native_plan.spec)
+
+    def _native_source_stripe_input_requested(self) -> bool:
+        if tuple(getattr(self.module, "layout_policy_native_input_source_signature", ()) or ()):
+            return True
+        return self._input_physical_layout() == "native_source_stripe"
+
+    def _default_native_target_internal_overlap(self, spec: NativeHaloConv2DSpec) -> int:
+        semantic = max(0, int(spec.output_top_beta)) + max(0, int(spec.output_bottom_beta))
+        physical = max(0, int(spec.output_physical_top_beta or 0)) + max(
+            0,
+            int(spec.output_physical_bottom_beta or 0),
+        )
+        return max(1, int(semantic), int(physical))
+
+    def _default_native_target_storage_signature(
+        self,
+        spec: NativeHaloConv2DSpec,
+        *,
+        fold_mode: str,
+        target_internal_halo_overlap: int,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        source_tile = _heuristic_channel_tile(int(spec.c_in), int(spec.gap_in))
+        target_tile = _heuristic_channel_tile(int(spec.c_out), int(spec.gap_out))
+        source_h = _source_h_capacity_for_tile(spec, int(source_tile))
+        stripes = _default_native_target_stripes(
+            spec,
+            fold_mode=str(fold_mode),
+            source_tile=int(source_tile),
+            target_tile=int(target_tile),
+            source_h=int(source_h),
+            target_internal_halo_overlap=int(target_internal_halo_overlap),
+        )
+        return tuple(
+            _target_storage_signature_from_stripes(
+                spec,
+                tuple(stripes),
+                default_target_tile=int(target_tile),
+            )
+        )
+
+    def _normalised_native_target_storage_signature(
+        self,
+        spec: NativeHaloConv2DSpec,
+        *,
+        fold_mode: str,
+        raw_signature: Any,
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        signature = tuple(tuple(int(value) for value in raw) for raw in (raw_signature or ()))
+        if signature or self._uses_tight_compact_output_for_spec(spec):
+            return tuple(signature)
+        generated = self._default_native_target_storage_signature(
+            spec,
+            fold_mode=str(fold_mode),
+            target_internal_halo_overlap=int(self._default_native_target_internal_overlap(spec)),
+        )
+        setattr(self.module, "layout_policy_output_materialization", "native_halo_stripe")
+        setattr(
+            self.module,
+            "layout_policy_native_output_target_signature",
+            [[int(value) for value in item] for item in tuple(generated)],
+        )
+        setattr(self.module, "native_halo_output_storage_layout", "native_source_stripe")
+        return tuple(generated)
 
     def _target_internal_halo_overlap_for_spec(
         self,
@@ -5926,9 +6009,10 @@ class NativeHaloStripeNoRIConvExecutor:
             tuple(int(value) for value in raw)
             for raw in (getattr(self.module, "layout_policy_native_input_source_signature", ()) or ())
         )
-        target_storage_signature = tuple(
-            tuple(int(value) for value in raw)
-            for raw in (getattr(self.module, "layout_policy_native_output_target_signature", ()) or ())
+        target_storage_signature = self._normalised_native_target_storage_signature(
+            runtime_spec,
+            fold_mode=str(fold_mode),
+            raw_signature=getattr(self.module, "layout_policy_native_output_target_signature", ()) or (),
         )
         target_internal_halo_overlap = self._target_internal_halo_overlap_for_spec(
             runtime_spec,

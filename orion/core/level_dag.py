@@ -1,4 +1,6 @@
-import math 
+import math
+import os
+import time
  
 import networkx as nx 
 import torch.nn as nn
@@ -6,6 +8,46 @@ import matplotlib.pyplot as plt
 
 from orion.nn.linear import LinearTransform
 from .bootstrap_fusion import bootstrap_prescale_fusion_supported, module_bootstrap_ct_count
+
+
+_FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default) or default).strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _trace_enabled() -> bool:
+    return _env_truthy("ORION_BOOTSTRAP_SOLVER_TRACE", "0")
+
+
+def _trace(message: str) -> None:
+    if _trace_enabled():
+        print(f"[level-dag] {message}", flush=True)
+
+
+def _linear_transform_diag_count(module) -> int:
+    cached = getattr(module, "_bootstrap_solver_diag_count_cache", None)
+    if cached is not None:
+        return int(cached)
+    started = time.perf_counter()
+    diag_indices_by_block = getattr(module, "_single_slot_diag_indices_by_block", None)
+    if diag_indices_by_block is None:
+        diag_indices_by_block = getattr(module, "_dense_layer_cache_diag_indices_by_block", None)
+    if diag_indices_by_block is not None:
+        count = int(sum(len(values) for values in dict(diag_indices_by_block).values()))
+    else:
+        count = int(sum(len(diags) for diags in getattr(module, "diagonals", {}).values()))
+    setattr(module, "_bootstrap_solver_diag_count_cache", int(count))
+    elapsed = time.perf_counter() - started
+    if elapsed >= 0.05:
+        _trace(
+            "diag_count "
+            f"module={getattr(module, 'name', type(module).__name__)} "
+            f"blocks={len(getattr(module, 'diagonals', {}) or {})} "
+            f"count={int(count)} took {elapsed:.3f}s"
+        )
+    return int(count)
 
 class LevelDAG(nx.DiGraph):
     """
@@ -30,6 +72,7 @@ class LevelDAG(nx.DiGraph):
         by "adding" the two together. This addition is a bit abstract;
         see the paper for additional details.
         """
+        started = time.perf_counter()
 
         if self.number_of_nodes() == 0:
             return other 
@@ -86,14 +129,32 @@ class LevelDAG(nx.DiGraph):
                 aggregate_level_dag.add_edge(
                     source, target, weight=total, path=nodes_traversed)
 
+        elapsed = time.perf_counter() - started
+        if elapsed >= 0.05:
+            _trace(
+                "__add__ "
+                f"{fork}->{join} self_nodes={self.number_of_nodes()} "
+                f"other_nodes={other.number_of_nodes()} "
+                f"out_edges={aggregate_level_dag.number_of_edges()} "
+                f"took {elapsed:.3f}s"
+            )
         return aggregate_level_dag
     
     def append(self, other):
         """Append the LevelDAG "other" to the end of the LevelDAG "self"."""
+        started = time.perf_counter()
 
         if self.number_of_nodes() == 0:
             self.add_nodes_from(other.nodes(data=True))
             self.add_edges_from(other.edges(data=True))
+            elapsed = time.perf_counter() - started
+            if elapsed >= 0.05:
+                _trace(
+                    "append_empty "
+                    f"other_nodes={other.number_of_nodes()} "
+                    f"other_edges={other.number_of_edges()} "
+                    f"took {elapsed:.3f}s"
+                )
             return 
         elif other.number_of_nodes() == 0:
             return
@@ -111,6 +172,14 @@ class LevelDAG(nx.DiGraph):
             for head in other_head_nodes:
                 weight, _ = self.estimate_bootstrap_latency(tail, head)
                 self.add_edge(tail, head, weight=weight, path=[tail, head])
+        elapsed = time.perf_counter() - started
+        if elapsed >= 0.05:
+            _trace(
+                "append "
+                f"self_tail={len(self_tail_nodes)} other_head={len(other_head_nodes)} "
+                f"total_nodes={self.number_of_nodes()} total_edges={self.number_of_edges()} "
+                f"took {elapsed:.3f}s"
+            )
         
     def build_level_dag_from_path(self):
         """If a path parameter is provided, this method automatically 
@@ -153,6 +222,7 @@ class LevelDAG(nx.DiGraph):
     def build_layer(self, node: str):
         """Builds the next layer of nodes in the level DAG and estimates
            their latency, eventually used in shortest path."""
+        started = time.perf_counter()
 
         level_dag_nodes = [f"{node}@l={i}" for i in range(self.l_eff+1)]
         self.add_nodes_from(level_dag_nodes)
@@ -162,6 +232,13 @@ class LevelDAG(nx.DiGraph):
             weight = self.estimate_layer_latency(node_module, level)
             self.nodes[name]["weight"] = weight
 
+        elapsed = time.perf_counter() - started
+        if elapsed >= 0.05:
+            _trace(
+                "build_layer "
+                f"node={node} module={type(node_module).__name__ if node_module is not None else 'None'} "
+                f"levels={len(level_dag_nodes)} took {elapsed:.3f}s"
+            )
         return level_dag_nodes
 
     def estimate_layer_latency(self, module, level):
@@ -188,13 +265,12 @@ class LevelDAG(nx.DiGraph):
         elif level < module.depth:
             return float("inf")
         elif isinstance(module, LinearTransform):
+            if _env_truthy("ORION_BOOTSTRAP_SOLVER_ZERO_LAYER_LATENCY", "0"):
+                return 0
             # Iterate over blocks, extract number of diagonals and estimate
             # linear transform latency analytically based on params.
             alpha = 0.001
-            runtime = 0
-            for diags in module.diagonals.values(): # iterate over blocks
-                runtime += (alpha * len(diags) * level)
-            return runtime
+            return alpha * _linear_transform_diag_count(module) * level
         else:
             return 0
 
