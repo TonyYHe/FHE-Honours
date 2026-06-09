@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,52 @@ LABELS = {
 }
 
 
+def _layout_beta(layout: dict[str, Any]) -> int:
+    return max(clean_int(layout.get("top_beta")), clean_int(layout.get("bottom_beta")))
+
+
+def _raw_input_node(name: Any) -> bool:
+    return str(name) in {"x", "input"}
+
+
+def _fused_relayout_decisions(row: dict[str, Any]) -> list[dict[str, Any]]:
+    compile_plan = row.get("compile_plan", {}) if isinstance(row, dict) else {}
+    edges = compile_plan.get("edge_layouts", []) if isinstance(compile_plan, dict) else []
+    decisions: list[dict[str, Any]] = []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if bool(edge.get("relayout", False)):
+            continue
+        if _raw_input_node(edge.get("source", "")):
+            continue
+        if str(edge.get("layout_mode", "")) != "native_halo_stripe":
+            continue
+        source_beta = _layout_beta(dict(edge.get("source_layout", {}) or {}))
+        selected_beta = _layout_beta(dict(edge.get("selected_layout", {}) or {}))
+        if selected_beta <= source_beta:
+            continue
+        decisions.append(
+            {
+                "edge": str(edge.get("edge") or f"{edge.get('source', '')}->{edge.get('target', '')}"),
+                "source": str(edge.get("source", "")),
+                "target": str(edge.get("target", "")),
+                "source_beta": int(source_beta),
+                "selected_beta": int(selected_beta),
+                "reason": "native-source fused halo expansion",
+            }
+        )
+    return decisions
+
+
+def _read_json_rows(raw_json: Path) -> dict[str, dict[str, Any]]:
+    if not raw_json.exists():
+        raise FileNotFoundError(f"raw JSON compile plan is required to count fused re-layout decisions: {raw_json}")
+    payload = json.loads(raw_json.read_text(encoding="utf-8"))
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    return {str(row.get("policy", "")): row for row in rows if isinstance(row, dict)}
+
+
 def _build_command(raw_json: Path, raw_csv: Path) -> list[str | Path]:
     return [
         sys.executable,
@@ -61,7 +108,8 @@ def _build_command(raw_json: Path, raw_csv: Path) -> list[str | Path]:
     ]
 
 
-def _paper_rows(raw_csv: Path) -> list[dict[str, Any]]:
+def _paper_rows(raw_csv: Path, raw_json: Path) -> list[dict[str, Any]]:
+    json_rows = _read_json_rows(raw_json)
     rows: list[dict[str, Any]] = []
     for row in read_csv(raw_csv):
         policy = str(row.get("policy", ""))
@@ -73,12 +121,18 @@ def _paper_rows(raw_csv: Path) -> list[dict[str, Any]]:
                 f"Table 3 policy {policy!r} did not compile successfully: "
                 f"status={status!r}, error={row.get('error', '')!r}"
             )
+        json_row = json_rows.get(policy, {})
+        fused_relayouts = _fused_relayout_decisions(json_row)
+        explicit_relayouts = clean_int(row.get("summary_relayouts"))
         rows.append(
             {
                 "policy": policy,
                 "label": LABELS[policy],
                 "rotations": clean_int(row.get("summary_reported_rotation_estimate")),
-                "relayouts": clean_int(row.get("summary_relayouts")),
+                "relayouts": int(explicit_relayouts + len(fused_relayouts)),
+                "explicit_relayouts": int(explicit_relayouts),
+                "fused_relayouts": int(len(fused_relayouts)),
+                "fused_relayout_edges": "; ".join(str(item["edge"]) for item in fused_relayouts),
                 "status": status,
                 "provider_mode": row.get("provider_mode", ""),
             }
@@ -97,7 +151,7 @@ def _render_tex(rows: list[dict[str, Any]]) -> str:
         "\\label{tab:relayout_ablation}",
         "\\begin{tabular}{lrr}",
         "\\hline",
-        "\\textbf{Strategy} & \\textbf{\\# Rotations} & \\textbf{\\# Re-layouts}\\\\",
+        "\\textbf{Strategy} & \\textbf{\\# Rotations} & \\textbf{\\# Re-layout decisions}\\\\",
         "\\hline",
     ]
     for row in rows:
@@ -126,8 +180,11 @@ def main() -> int:
         if not matches:
             raise FileNotFoundError(f"no policy compile CSV under {run_root}")
         raw_csv = matches[-1]
+        candidate_json = raw_csv.with_suffix(".json")
+        if candidate_json.exists():
+            raw_json = candidate_json
 
-    rows = _paper_rows(raw_csv)
+    rows = _paper_rows(raw_csv, raw_json)
     if len(rows) != 3:
         raise SystemExit(f"expected 3 Table 3 policy rows, found {len(rows)} in {raw_csv}")
     paper_csv = dirs["paper"] / "table3_relayout_ablation.csv"
@@ -141,7 +198,11 @@ def main() -> int:
         source_script=SOURCE_SCRIPT,
         command=command,
         outputs=outputs,
-        measurement="compile-level 224x224 U22 policy probe; eager row uses producer-fused no-share policy, not legacy consumer-fused eager",
+        measurement=(
+            "compile-level 224x224 U22 policy probe; eager row uses producer-fused no-share policy, "
+            "not legacy consumer-fused eager; re-layout decisions count explicit materializations plus "
+            "native-source fused halo-expansion decisions"
+        ),
     )
     print_outputs(outputs)
     return 0
