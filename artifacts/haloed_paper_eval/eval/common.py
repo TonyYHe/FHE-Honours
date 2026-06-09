@@ -19,6 +19,12 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "haloed_paper_eval"
 DEFAULT_RESULT_ROOT = REPO_ROOT / ".tmp" / "results" / "haloed_paper_eval"
 
+CPP_LIBRARY_BUILDERS: tuple[dict[str, str], ...] = (
+    {"name": "diag_builder", "script": "tools/build_diag_builder.py"},
+    {"name": "clear_lattigo", "script": "tools/build_clear_lattigo.py"},
+    {"name": "cheddar", "script": "tools/build_cheddar_backend.py", "required_env": "CHEDDAR_ROOT"},
+)
+
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -69,6 +75,37 @@ def run_command(command: list[str | Path], *, log_path: Path, dry_run: bool = Fa
             text=True,
         )
         return int(proc.wait())
+
+
+def rebuild_local_cpp_libraries(*, log_dir: Path, dry_run: bool = False) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for builder in CPP_LIBRARY_BUILDERS:
+        name = str(builder["name"])
+        required_env = str(builder.get("required_env", ""))
+        if required_env and not os.environ.get(required_env, "").strip():
+            records.append(
+                {
+                    "name": name,
+                    "status": "skipped",
+                    "reason": f"{required_env} is not set",
+                    "log": "",
+                }
+            )
+            continue
+        command: list[str | Path] = [sys.executable, REPO_ROOT / str(builder["script"])]
+        log_path = Path(log_dir) / f"build_cpp_{name}.log"
+        rc = run_command(command, log_path=log_path, dry_run=bool(dry_run))
+        status = "dry_run" if bool(dry_run) else "ok" if int(rc) == 0 else "failed"
+        record = {
+            "name": name,
+            "status": status,
+            "command": command_text(command),
+            "log": str(log_path),
+        }
+        records.append(record)
+        if int(rc) != 0:
+            raise RuntimeError(f"C++ library rebuild failed for {name}; see {log_path}")
+    return records
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -171,6 +208,17 @@ def write_manifest(
                 "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS",
                 "ORION_LATTIGO_UNIFIED_NO_BSGS",
                 "ORION_CONCAT_FUSION",
+                "ORION_BOOTSTRAP_LAYOUT_REFINEMENT",
+                "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION",
+                "ORION_LATTIGO_CLEAR_BACKEND",
+                "ORION_SINGLE_SLOT_ENCODE_WORKERS",
+                "ORION_PACK_CONV_WORKERS",
+                "ORION_DIRECT_PACK_WORKERS",
+                "ORION_LT_COMPILE_WORKERS",
+                "ORION_UNIFIED_COMPILE_WORKERS",
+                "ORION_LATTIGO_COMPILE_WORKERS",
+                "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS",
+                "ORION_LATTIGO_BOOTSTRAP_WORKERS",
             )
         },
     }

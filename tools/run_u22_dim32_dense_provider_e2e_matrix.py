@@ -174,14 +174,14 @@ ENV_DEFAULTS: dict[str, str] = {
     "ORION_LATTIGO_COMPILE_WORKERS": str(CPU_COUNT),
     "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": str(CPU_COUNT),
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
-    "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "1",
+    "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "0",
     "ORION_LAYOUT_POLICY_PROVIDER_NATIVE_HALO": "1",
     "ORION_UNIFIED_LT_INDIVIDUAL_EVAL": "1",
     "ORION_UNIFIED_LT_SHARED_ROTATION_KEYS": "0",
     "ORION_LATTIGO_UNIFIED_NO_BSGS": "0",
     "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
     "ORION_REGION_FIRST_CLEANUP_AFTER_OUTPUTS": "1",
-    "ORION_CONCAT_FUSION": "0",
+    "ORION_CONCAT_FUSION": "1",
     "ORION_BOOTSTRAP_LAYOUT_REFINEMENT": "0",
     "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
@@ -205,7 +205,7 @@ REQUIRED_MAINLINE_ENV: dict[str, str] = {
 DENSE_MODE_ENV: dict[str, str] = {
     "ORION_DENSE_LAYER_CACHE_GRANULARITY": "group",
     "ORION_DENSE_LAYER_CACHE_GROUP_TRANSFORMS": "auto",
-    "ORION_CONCAT_FUSION": "0",
+    "ORION_CONCAT_FUSION": "1",
     "ORION_UNIFIED_LT_OUTPUT_FUSION": "1",
     "ORION_DISABLE_BOOTSTRAP_PRESCALE_FUSION": "0",
 }
@@ -306,6 +306,38 @@ def _mode_layer_mae_enabled(args: argparse.Namespace, mode: str) -> bool:
     if str(mode) == "provider":
         return bool(getattr(args, "provider_layer_mae", False))
     return bool(getattr(args, "dense_layer_mae", False))
+
+
+def _env_enabled_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text == "":
+        return bool(default)
+    return text not in {"0", "false", "no", "off"}
+
+
+def _cpp_diag_builder_required(env: dict[str, str], *, mode: str) -> bool:
+    if not _env_enabled_value(env.get("ORION_CPP_DIAG_BUILDER")):
+        return False
+    if str(mode) == "provider":
+        return _env_enabled_value(env.get("ORION_CPP_DIAG_BUILDER_PROVIDER"), default=True)
+    return _env_enabled_value(env.get("ORION_CPP_DIAG_BUILDER_DENSE"), default=True)
+
+
+def _require_cpp_diag_builder_available(env: dict[str, str], *, mode: str) -> None:
+    if not _cpp_diag_builder_required(env, mode=str(mode)):
+        return
+    from orion.backend.diag_builder import bindings as diag_builder
+
+    if diag_builder.load_library() is not None:
+        return
+    detail = diag_builder.load_error() or "diag_builder shared library unavailable"
+    raise RuntimeError(
+        "C++ diag_builder is required for this E2E run but failed to load: "
+        f"{detail}. Rebuild it on this host with "
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(REPO_ROOT / 'tools' / 'build_diag_builder.py'))}."
+    )
 
 
 def _provider_mode(policy: str) -> str:
@@ -431,18 +463,19 @@ def run_one(args: argparse.Namespace) -> int:
     )
     os.environ.update(env)
     env_snapshot = dict(os.environ)
-    base = _register_networks()
     out_path = Path(args.out)
     started_at = time.perf_counter()
     provider_mode = _provider_mode(str(args.policy)) if mode == "provider" else ""
     try:
+        _require_cpp_diag_builder_available(env_snapshot, mode=mode)
+        base = _register_networks()
         base._run_one(
             network=_network_name(str(args.case)),
             backend="lattigo",
             mode=mode,
             out_path=out_path,
             seed=int(args.seed),
-            compile_only=False,
+            compile_only=bool(getattr(args, "compile_only", False)),
             forward_runs=int(args.forward_runs),
             warmup_runs=int(args.warmup_runs),
             profile_modules=False,
@@ -461,6 +494,15 @@ def run_one(args: argparse.Namespace) -> int:
             ckks_preset="resnet",
         )
         return 0
+    except Exception as exc:
+        payload = _read_json(out_path) or {}
+        if str(payload.get("status", "")) in {"", "running", "started"}:
+            payload["status"] = "failed"
+            payload["phase"] = "preflight" if "diag_builder" in str(exc) else payload.get("phase", "run")
+            payload["error_type"] = type(exc).__name__
+            payload["error"] = str(exc)
+            _write_json(out_path, payload)
+        raise
     finally:
         _annotate_result(
             out_path,
@@ -1675,8 +1717,8 @@ def run_all(args: argparse.Namespace) -> int:
             "per_layer_source": "operator_breakdown_after_forward.mvm.group_rows",
             "stream_encode_s": "stream_build_map_s + stream_encode_hoist_s + stream_load_payload_s",
             "lt_accumulate_s": "stream_eval_s + stream_accumulate_s + cpp_baby_step_s + cpp_giant_step_s, with mvm_kernel_s fallback",
-            "dense_lt": "independent Orion LT; dense mode keeps concat fusion disabled and unified output/bootstrap prescale fusion enabled",
-            "provider_lt": "HaloED/provider mode keeps concat fusion disabled and unified output/bootstrap prescale fusion enabled",
+            "dense_lt": "independent Orion LT using the default dense lowering; effective per-mode env is recorded in mode_env",
+            "provider_lt": "HaloED/provider mode using native provider lowering; effective per-mode env is recorded in mode_env",
             "bootstrap_many": "disabled via ORION_LATTIGO_BOOTSTRAP_MANY=0",
         },
     }
@@ -1830,6 +1872,7 @@ def main() -> int:
         help="disable single-slot layer-cache materialization; useful for clear-backend correctness smoke runs",
     )
     parser.add_argument("--update-doc-only", action="store_true")
+    parser.add_argument("--compile-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--case", choices=tuple(CASES), default="192x192", help=argparse.SUPPRESS)
     parser.add_argument("--mode", choices=("dense", "provider"), default="dense", help=argparse.SUPPRESS)

@@ -483,13 +483,21 @@ def _layout_policy_node_plan(compile_plan: dict[str, Any], *, node: str) -> dict
 
 
 def _layout_policy_relayout_enabled() -> bool:
-    return str(os.environ.get("ORION_LAYOUT_POLICY_RELAYOUT_KERNEL", "1")).strip().lower() not in {
+    raw = str(os.environ.get("ORION_LAYOUT_POLICY_RELAYOUT_KERNEL", "0")).strip().lower()
+    enabled = raw not in {
         "",
         "0",
         "false",
         "no",
         "off",
     }
+    if bool(enabled):
+        raise RuntimeError(
+            "layout-policy relayout kernels have been removed from the U22 "
+            "native-stripe mainline; native-stripe layouts must remain explicit "
+            "without iterative relayout insertion."
+        )
+    return False
 
 
 def _layout_top_beta(layout: dict[str, Any]) -> int:
@@ -789,9 +797,25 @@ def _layout_policy_native_output_row(compile_plan: dict[str, Any], *, node: str)
     return None
 
 
+def _layout_policy_explicit_native_concat_output_row(
+    compile_plan: dict[str, Any],
+    *,
+    node: str,
+) -> dict[str, Any] | None:
+    row = _layout_policy_native_output_row(compile_plan, node=str(node))
+    if row is None:
+        return None
+    if not bool(row.get("output_relayout", False)):
+        return None
+    if not bool(row.get("concat_explicit_native_materialization", False)):
+        return None
+    if str(row.get("physical_layout", "")) != "native_source_stripe":
+        return None
+    return dict(row)
+
+
 def _layout_policy_output_relayout_rows(compile_plan: dict[str, Any], *, node: str) -> tuple[dict[str, Any], ...]:
-    if not _layout_policy_relayout_enabled():
-        return ()
+    relayout_enabled = bool(_layout_policy_relayout_enabled())
     rows = []
     for row in compile_plan.get("node_layouts", []):
         if str(row.get("node")) != str(node) or not bool(row.get("output_relayout", False)):
@@ -801,6 +825,8 @@ def _layout_policy_output_relayout_rows(compile_plan: dict[str, Any], *, node: s
             row.get("concat_explicit_native_materialization", False)
             and str(row.get("physical_layout", "")) == "native_source_stripe"
         )
+        if not bool(relayout_enabled) and not bool(explicit_native_concat):
+            continue
         if not _layout_policy_has_halo(layout) and not bool(explicit_native_concat):
             continue
         shape = [int(value) for value in row.get("shape", [])]
@@ -910,18 +936,32 @@ def _layout_policy_attach_backend_producer_outputs(
         module.layout_policy_output_layout = dict(layout)
         module.layout_policy_output_row_offset = int(top_beta * gap)
         target_signature = row.get("native_halo_target_storage_signature")
-        if target_signature:
+        forced_target_signature = (
+            _existing_native_signature_attr(module, "layout_policy_native_output_target_signature")
+            if bool(_layout_policy_respect_forced_native_signature_attrs())
+            else []
+        )
+        if forced_target_signature:
+            module.layout_policy_native_output_target_signature = forced_target_signature
+            module.layout_policy_output_materialization = str(
+                getattr(module, "layout_policy_output_materialization", "") or "native_halo_stripe"
+            )
+            module.native_halo_output_storage_layout = str(
+                getattr(module, "native_halo_output_storage_layout", "") or "native_source_stripe"
+            )
+        elif target_signature:
             module.layout_policy_native_output_target_signature = [
                 [int(value) for value in item] for item in target_signature
             ]
         elif hasattr(module, "layout_policy_native_output_target_signature"):
             delattr(module, "layout_policy_native_output_target_signature")
-        if str(row.get("physical_layout", "")) == "native_source_stripe":
-            module.layout_policy_output_materialization = "native_halo_stripe"
-        elif bool(row.get("producer_materialized_halo", False)) or (
-            _layout_physical_top_beta(layout) > 0 or _layout_physical_bottom_beta(layout) > 0
-        ):
-            module.layout_policy_output_materialization = "fused_relayout"
+        if not forced_target_signature:
+            if str(row.get("physical_layout", "")) == "native_source_stripe":
+                module.layout_policy_output_materialization = "native_halo_stripe"
+            elif bool(row.get("producer_materialized_halo", False)) or (
+                _layout_physical_top_beta(layout) > 0 or _layout_physical_bottom_beta(layout) > 0
+            ):
+                module.layout_policy_output_materialization = "fused_relayout"
         attached.append(
             {
                 "node": str(node),
@@ -968,7 +1008,17 @@ def _layout_policy_attach_backend_consumer_inputs(
         module.layout_policy_input_physical_layout = str(row.get("physical_layout", "") or "")
         module.layout_policy_input_row_offset = int(top_beta * gap)
         source_signature = row.get("native_halo_source_storage_signature")
-        if source_signature:
+        forced_source_signature = (
+            _existing_native_signature_attr(module, "layout_policy_native_input_source_signature")
+            if bool(_layout_policy_respect_forced_native_signature_attrs())
+            else []
+        )
+        if forced_source_signature:
+            module.layout_policy_native_input_source_signature = forced_source_signature
+            module.layout_policy_input_physical_layout = str(
+                getattr(module, "layout_policy_input_physical_layout", "") or "native_source_stripe"
+            )
+        elif source_signature:
             module.layout_policy_native_input_source_signature = [
                 [int(value) for value in item] for item in source_signature
             ]
@@ -1123,6 +1173,24 @@ def _layout_policy_native_halo_input_supported(base_executor: Any, relayout_rows
     return int(layout.get("gap", getattr(module, "input_gap", 1))) == int(getattr(module, "input_gap", 1))
 
 
+def _layout_policy_respect_forced_native_signature_attrs() -> bool:
+    return str(os.environ.get("ORION_RESPECT_FORCED_NATIVE_SIGNATURE_ATTRS", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _existing_native_signature_attr(module: Any, attr: str) -> list[list[int]]:
+    if module is None or not hasattr(module, str(attr)):
+        return []
+    return [
+        [int(value) for value in item]
+        for item in tuple(getattr(module, str(attr), ()) or ())
+    ]
+
+
 def _layout_policy_native_module_attrs(
     compile_plan: dict[str, Any],
     *,
@@ -1132,6 +1200,8 @@ def _layout_policy_native_module_attrs(
     compact_input_rows: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     attrs: dict[str, Any] = {}
+    module = getattr(base_executor, "module", None)
+    respect_forced_signatures = bool(_layout_policy_respect_forced_native_signature_attrs())
     plan_slots = int(compile_plan.get("slots", 0) or 0)
     if int(plan_slots) > 0:
         attrs["layout_policy_slot_count"] = int(plan_slots)
@@ -1187,7 +1257,19 @@ def _layout_policy_native_module_attrs(
             }
         )
         source_signature = row.get("native_halo_source_storage_signature")
-        if source_signature:
+        forced_source_signature = (
+            _existing_native_signature_attr(module, "layout_policy_native_input_source_signature")
+            if bool(respect_forced_signatures)
+            else []
+        )
+        if forced_source_signature:
+            attrs["layout_policy_native_input_source_signature"] = forced_source_signature
+            attrs["layout_policy_input_physical_layout"] = str(
+                getattr(module, "layout_policy_input_physical_layout", "")
+                or attrs.get("layout_policy_input_physical_layout", "")
+                or "native_source_stripe"
+            )
+        elif source_signature:
             attrs["layout_policy_native_input_source_signature"] = [
                 [int(value) for value in item] for item in source_signature
             ]
@@ -1212,7 +1294,24 @@ def _layout_policy_native_module_attrs(
                 }
             )
             target_signature = output_row.get("native_halo_target_storage_signature")
-            if target_signature:
+            forced_target_signature = (
+                _existing_native_signature_attr(module, "layout_policy_native_output_target_signature")
+                if bool(respect_forced_signatures)
+                else []
+            )
+            if forced_target_signature:
+                attrs["layout_policy_native_output_target_signature"] = forced_target_signature
+                attrs["layout_policy_output_materialization"] = str(
+                    getattr(module, "layout_policy_output_materialization", "")
+                    or attrs.get("layout_policy_output_materialization", "")
+                    or "native_halo_stripe"
+                )
+                attrs["native_halo_output_storage_layout"] = str(
+                    getattr(module, "native_halo_output_storage_layout", "")
+                    or attrs.get("native_halo_output_storage_layout", "")
+                    or "native_source_stripe"
+                )
+            elif target_signature:
                 attrs["layout_policy_native_output_target_signature"] = [
                     [int(value) for value in item] for item in target_signature
                 ]
@@ -1235,7 +1334,16 @@ def _layout_policy_native_module_attrs(
                 output_gap = max(1, int(output_layout.get("gap", 1)))
                 output_top_beta = _layout_physical_top_beta(output_layout)
                 slots = int(compile_plan.get("slots", 0) or getattr(base_executor, "slots", 0) or 0)
-                native_count = int(getattr(base_executor, "rows", 0) or 0)
+                forced_target_signature = (
+                    _existing_native_signature_attr(module, "layout_policy_native_output_target_signature")
+                    if bool(respect_forced_signatures)
+                    else []
+                )
+                native_count = (
+                    int(len(forced_target_signature))
+                    if forced_target_signature
+                    else int(getattr(base_executor, "rows", 0) or 0)
+                )
                 attrs.update(
                     {
                         **(
@@ -1246,7 +1354,12 @@ def _layout_policy_native_module_attrs(
                         "layout_policy_output_row_offset": int(output_top_beta * output_gap),
                         "layout_policy_output_layout": dict(output_layout),
                         "layout_policy_output_materialization": "native_halo_stripe",
-                        "layout_policy_native_output_target_signature": [],
+                        "layout_policy_native_output_target_signature": forced_target_signature or [],
+                        **(
+                            {"native_halo_output_storage_layout": "native_source_stripe"}
+                            if forced_target_signature
+                            else {}
+                        ),
                     }
                 )
     if str(compile_plan.get("policy", "")) in {
@@ -1533,6 +1646,11 @@ def _flat_nchw_index(n: int, c: int, h: int, w: int, shape: torch.Size) -> int:
 
 class LayoutPolicyRelayoutKernel:
     def __init__(self, *, edge_row: dict[str, Any], node: str, direction: str, index: int) -> None:
+        raise RuntimeError(
+            "LayoutPolicyRelayoutKernel has been removed from the U22 "
+            "native-stripe mainline; remove the caller instead of inserting "
+            "layout-policy relayout transforms."
+        )
         direction = str(direction)
         if direction not in {"compact_to_halo", "halo_to_compact", "layout_to_layout"}:
             raise ValueError(f"unknown layout relayout direction {direction!r}")
@@ -2610,7 +2728,11 @@ class LayoutPolicyProviderRuntimeExecutor:
 
 
 def _layout_policy_add_rows(compile_plan: dict[str, Any], *, node: str) -> tuple[dict[str, Any], ...]:
-    if not _layout_policy_relayout_enabled():
+    relayout_enabled = bool(_layout_policy_relayout_enabled())
+    explicit_native_concat = (
+        _layout_policy_explicit_native_concat_output_row(compile_plan, node=str(node)) is not None
+    )
+    if not bool(relayout_enabled) and not bool(explicit_native_concat):
         return ()
     rows = []
     for row in compile_plan.get("edge_layouts", []):
