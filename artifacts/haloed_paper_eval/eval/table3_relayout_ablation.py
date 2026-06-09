@@ -67,13 +67,19 @@ def _paper_rows(raw_csv: Path) -> list[dict[str, Any]]:
         policy = str(row.get("policy", ""))
         if policy not in LABELS:
             continue
+        status = str(row.get("status", ""))
+        if status != "ok":
+            raise RuntimeError(
+                f"Table 3 policy {policy!r} did not compile successfully: "
+                f"status={status!r}, error={row.get('error', '')!r}"
+            )
         rows.append(
             {
                 "policy": policy,
                 "label": LABELS[policy],
                 "rotations": clean_int(row.get("summary_reported_rotation_estimate")),
                 "relayouts": clean_int(row.get("summary_relayouts")),
-                "status": row.get("status", ""),
+                "status": status,
                 "provider_mode": row.get("provider_mode", ""),
             }
         )

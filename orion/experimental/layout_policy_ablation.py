@@ -872,7 +872,7 @@ def build_edge_infos(dag: NetworkDAG, *, slots: int = DEFAULT_SLOTS) -> tuple[Ed
         for edge in outgoing:
             optional_layouts.append(edge.requirement)
             optional_layouts.extend(tuple(edge.future_layouts))
-            hard_layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
+            optional_layouts.extend(_future_tconv_input_relayout_candidates(edge, slots=int(slots)))
         if not hard_layouts and not optional_layouts:
             continue
         hard_top_beta = max([int(layout.top_beta) for layout in hard_layouts] or [0])
@@ -6619,7 +6619,18 @@ def _non_dp_no_share_native_row(
         return None
     if str(edge.source) == "x":
         return None
-    native_relayout = bool(relayout) or str(source_physical) != PHYSICAL_NATIVE_SOURCE_STRIPE
+    producer_materialized_logical_halo_source = bool(
+        str(policy) == "always_no_share_producer_fused"
+        and str(source_physical) == PHYSICAL_LOGICAL_HALO
+        and _layout_has_physical_halo(source_layout)
+        and not _layout_has_physical_halo(target_layout)
+        and source_layout.covers(target_layout)
+    )
+    native_relayout = (
+        False
+        if bool(producer_materialized_logical_halo_source)
+        else bool(relayout) or str(source_physical) != PHYSICAL_NATIVE_SOURCE_STRIPE
+    )
     return _edge_row(
         edge,
         target_layout,
