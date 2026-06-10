@@ -810,9 +810,11 @@ class NewEvaluator:
         diag_sets: list[tuple[int, ...]] = []
         block_keys_by_block: dict[tuple[int, int], tuple[int, ...]] = {}
         block_memory_estimates: dict[tuple[int, int], dict[str, int | float]] = {}
+        diag_index_total = 0
         for _block, diag_idxs in sorted(diag_indices_by_block.items()):
             row, col = (int(value) for value in _block)
             raw_diag_count = int(len(tuple(diag_idxs)))
+            diag_index_total += int(raw_diag_count)
             payload_bytes = self._dense_layer_cache_payload_estimate_bytes(raw_diag_count=int(raw_diag_count))
             encoded_bytes = self._dense_layer_cache_encoded_plaintext_estimate_bytes(
                 raw_diag_count=int(raw_diag_count),
@@ -864,6 +866,7 @@ class NewEvaluator:
                 {
                     "row": int(row),
                     "col": int(col),
+                    "diag_index_count": int(len(tuple(_diag_idxs))),
                     "rotation_eval_count": int(stats.get("rotation_eval_count", 0) or 0),
                     "baby_rotation_eval_count": int(stats.get("baby_rotation_eval_count", 0) or 0),
                     "giant_rotation_eval_count": int(stats.get("giant_rotation_eval_count", 0) or 0),
@@ -876,6 +879,7 @@ class NewEvaluator:
         linear_layer._dense_layer_cache_rotation_stats = {
             "source": "planned_single_slot_dense_bsgs_eval_rotations",
             "transform_count": int(len(diag_indices_by_block)),
+            "diag_index_count": int(diag_index_total),
             "rows": int(rows),
             "cols": int(cols),
             "transform_rotation_eval_count_total": int(transform_rotation_total),

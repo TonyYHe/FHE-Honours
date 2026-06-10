@@ -291,6 +291,26 @@ def _segmentation_metrics(logits: torch.Tensor, target: torch.Tensor, *, thresho
     }
 
 
+def _segmentation_acceptance_metrics(payload: dict[str, Any], *, dice_atol: float | None) -> dict[str, Any]:
+    outputs = dict(payload.get("outputs") or {})
+    adapter = dict((outputs.get("adapter") or {}).get("segmentation") or {})
+    backend = dict((outputs.get("backend") or {}).get("segmentation") or {})
+    adapter_dice = adapter.get("dice")
+    backend_dice = backend.get("dice")
+    metrics: dict[str, Any] = {
+        "adapter_dice": adapter_dice,
+        "backend_dice": backend_dice,
+        "dice_atol": dice_atol,
+        "dice_close": False,
+    }
+    if adapter_dice is None or backend_dice is None or dice_atol is None:
+        return metrics
+    delta = abs(float(adapter_dice) - float(backend_dice))
+    metrics["dice_abs_delta"] = float(delta)
+    metrics["dice_close"] = bool(delta <= float(dice_atol))
+    return metrics
+
+
 def _tensor_stats(tensor: torch.Tensor) -> dict[str, float]:
     values = tensor.detach().cpu().to(dtype=torch.float32)
     return {
@@ -330,16 +350,26 @@ def _provider_mode(policy: str) -> str:
     return resolve(str(policy))
 
 
-def _apply_backend_env(*, backend_kind: str, mode: str, single_slot_layer_cache: bool) -> dict[str, str]:
+def _apply_backend_env(
+    *,
+    backend_kind: str,
+    mode: str,
+    single_slot_layer_cache: bool,
+    bootstrap_many: str | None = None,
+) -> dict[str, str]:
     from tools.run_u22_dim32_dense_provider_e2e_matrix import (
         _apply_env_defaults,
         _apply_layer_cache_override,
         _apply_mode_env,
     )
 
+    inherited_bootstrap_many = os.environ.get("ORION_LATTIGO_BOOTSTRAP_MANY")
     env = _apply_env_defaults(os.environ, backend="clear" if str(backend_kind) == "clear" else "ckks")
     env = _apply_mode_env(env, str(mode))
     env = _apply_layer_cache_override(env, single_slot_layer_cache=bool(single_slot_layer_cache))
+    requested_bootstrap_many = bootstrap_many if bootstrap_many is not None else inherited_bootstrap_many
+    if requested_bootstrap_many is not None:
+        env["ORION_LATTIGO_BOOTSTRAP_MANY"] = str(requested_bootstrap_many)
     os.environ.update(env)
     return {key: str(os.environ.get(key, "")) for key in sorted(env)}
 
@@ -348,6 +378,12 @@ def _backend_config(*, provider_mode: str, mode: str) -> dict[str, Any]:
     from tools.run_lattigo_e2e_compare import _r18_config
 
     return _r18_config(str(provider_mode) if str(mode) == "provider" else "", backend="lattigo")
+
+
+def _parse_layer_mae_targets(raw: str | None) -> set[str]:
+    if raw is None:
+        return set()
+    return {part.strip() for part in str(raw).split(",") if part.strip()}
 
 
 def _run_clear_or_ckks_backend(
@@ -360,7 +396,18 @@ def _run_clear_or_ckks_backend(
     payload_path: Path,
     payload: dict[str, Any],
 ) -> tuple[torch.Tensor | None, dict[str, Any]]:
-    from tools.run_lattigo_e2e_compare import _encrypt_model_input, _layer_mae_decode_model_output
+    from tools.run_lattigo_e2e_compare import (
+        _collect_bootstrap_report,
+        _collect_layer_mae_polynomial_clear_outputs,
+        _encrypt_model_input,
+        _install_layer_mae_clear_capture,
+        _install_layer_mae_he_capture,
+        _layer_mae_adjust_clear_outputs_after_compile,
+        _layer_mae_decode_model_output,
+        _layer_mae_summary,
+        _layer_mae_target_names,
+        _name_bootstraps,
+    )
 
     backend_started = time.perf_counter()
     backend_model, backend_meta = build_orion_cheb7_model_from_checkpoint(
@@ -373,6 +420,7 @@ def _run_clear_or_ckks_backend(
         backend_kind=str(args.backend_kind),
         mode=str(args.mode),
         single_slot_layer_cache=bool(args.single_slot_layer_cache),
+        bootstrap_many=args.backend_bootstrap_many,
     )
     config = _backend_config(provider_mode=provider_mode, mode=str(args.mode))
     payload["backend"] = {
@@ -387,7 +435,35 @@ def _run_clear_or_ckks_backend(
         "model_meta": backend_meta,
     }
     _write_json(payload_path, payload)
+    layer_mae_enabled = bool(args.backend_layer_mae)
+    layer_mae_names: set[str] = set()
+    layer_mae_clear_outputs: dict[str, torch.Tensor] | None = None
+    layer_mae_reference_transforms: dict[str, dict[str, Any]] = {}
+    remove_layer_mae_clear = None
     try:
+        if layer_mae_enabled:
+            layer_mae_names = set(_layer_mae_target_names(backend_model))
+            requested_layer_mae_targets = _parse_layer_mae_targets(args.backend_layer_mae_targets)
+            if requested_layer_mae_targets:
+                layer_mae_names &= requested_layer_mae_targets
+            layer_mae_clear_outputs, remove_layer_mae_clear = _install_layer_mae_clear_capture(
+                backend_model,
+                layer_mae_names,
+            )
+            payload["backend"]["layer_mae"] = {
+                "enabled": True,
+                "requested_targets": sorted(requested_layer_mae_targets),
+                "requested_targets_missing_initial": sorted(requested_layer_mae_targets - layer_mae_names),
+                "target_modules_initial": sorted(layer_mae_names),
+            }
+            _write_json(payload_path, payload)
+            with torch.no_grad():
+                _ = backend_model(image)
+            payload["backend"]["layer_mae"]["clear_output_count"] = int(len(layer_mae_clear_outputs or {}))
+            _write_json(payload_path, payload)
+        if remove_layer_mae_clear is not None:
+            remove_layer_mae_clear()
+            remove_layer_mae_clear = None
         scheme.init_scheme(config)
         payload["backend"]["status"] = "fitting"
         payload["backend"]["timing_s"] = {"total_so_far": float(time.perf_counter() - backend_started)}
@@ -397,9 +473,51 @@ def _run_clear_or_ckks_backend(
         payload["backend"]["timing_s"] = {"total_so_far": float(time.perf_counter() - backend_started)}
         _write_json(payload_path, payload)
         input_level = scheme.compile(backend_model)
+        _name_bootstraps(backend_model)
         payload["backend"]["status"] = "compiled"
         payload["backend"]["input_level"] = int(input_level)
+        payload["backend"]["bootstrap_report_after_compile"] = _collect_bootstrap_report(backend_model)
         payload["backend"]["timing_s"] = {"total_so_far": float(time.perf_counter() - backend_started)}
+        if layer_mae_enabled:
+            adjusted_outputs, reference_transforms, reference_transform_diagnostics = (
+                _layer_mae_adjust_clear_outputs_after_compile(
+                    backend_model,
+                    layer_mae_clear_outputs,
+                )
+            )
+            post_compile_layer_mae_names = set(_layer_mae_target_names(backend_model))
+            requested_layer_mae_targets = _parse_layer_mae_targets(args.backend_layer_mae_targets)
+            if requested_layer_mae_targets:
+                post_compile_layer_mae_names &= requested_layer_mae_targets
+            polynomial_outputs, polynomial_reference_diagnostics = _collect_layer_mae_polynomial_clear_outputs(
+                backend_model,
+                image,
+                post_compile_layer_mae_names,
+            )
+            if str(polynomial_reference_diagnostics.get("status", "")) == "ok":
+                adjusted_outputs.update(polynomial_outputs)
+            layer_mae_clear_outputs = {
+                str(name): value
+                for name, value in dict(adjusted_outputs or {}).items()
+                if str(name) in post_compile_layer_mae_names
+            }
+            layer_mae_reference_transforms = dict(reference_transforms)
+            payload["backend"]["layer_mae"].update(
+                {
+                    "target_modules_after_compile": sorted(post_compile_layer_mae_names),
+                    "requested_targets_missing_after_compile": sorted(
+                        requested_layer_mae_targets - post_compile_layer_mae_names
+                    ),
+                    "target_modules_removed_after_compile": sorted(
+                        str(name) for name in layer_mae_names - post_compile_layer_mae_names
+                    ),
+                    "reference_transform_count": int(len(layer_mae_reference_transforms)),
+                    "reference_transforms": dict(layer_mae_reference_transforms),
+                    "reference_transform_diagnostics": dict(reference_transform_diagnostics),
+                    "polynomial_reference_diagnostics": dict(polynomial_reference_diagnostics),
+                    "clear_output_count_after_reference_alignment": int(len(layer_mae_clear_outputs or {})),
+                }
+            )
         _write_json(payload_path, payload)
         if bool(args.compile_only):
             payload["backend"]["status"] = "ok_compile_only"
@@ -412,9 +530,40 @@ def _run_clear_or_ckks_backend(
         payload["backend"]["input_ciphertext_count"] = int(len(getattr(x_ct, "ids", ()) or ()))
         payload["backend"]["status"] = "forwarding"
         _write_json(payload_path, payload)
+        layer_mae_rows = None
+        remove_layer_mae = None
+        if layer_mae_enabled:
+            layer_mae_path = payload_path.with_name(f"{payload_path.stem}.forward0.layer_mae.jsonl")
+            layer_mae_rows, remove_layer_mae = _install_layer_mae_he_capture(
+                backend_model,
+                clear_outputs=dict(layer_mae_clear_outputs or {}),
+                reference_transforms=dict(layer_mae_reference_transforms or {}),
+                names=set((layer_mae_clear_outputs or {}).keys()),
+                jsonl_path=layer_mae_path,
+            )
+            payload["backend"]["layer_mae"]["jsonl_path"] = str(layer_mae_path)
+            payload["backend"]["layer_mae"]["timing_note"] = (
+                "layer MAE decrypts module outputs inside HE forward; this run is for diagnostics, not speed."
+            )
+            _write_json(payload_path, payload)
         forward_started = time.perf_counter()
-        out_ct = backend_model(x_ct)
+        try:
+            out_ct = backend_model(x_ct)
+        finally:
+            if remove_layer_mae is not None:
+                remove_layer_mae()
+                remove_layer_mae = None
         forward_s = float(time.perf_counter() - forward_started)
+        payload["backend"]["bootstrap_report_after_forward"] = _collect_bootstrap_report(backend_model)
+        if layer_mae_rows is not None:
+            layer_mae_summary = _layer_mae_summary(layer_mae_rows, expected_names=set((layer_mae_clear_outputs or {}).keys()))
+            payload["backend"]["layer_mae"].update(
+                {
+                    "summary": layer_mae_summary,
+                    "rows": list(layer_mae_rows),
+                    "overall_ok": bool(layer_mae_summary.get("overall_ok", False)),
+                }
+            )
         payload["backend"]["status"] = "decoding"
         payload["backend"]["timing_s"] = {
             "total_so_far": float(time.perf_counter() - backend_started),
@@ -445,6 +594,8 @@ def _run_clear_or_ckks_backend(
         }
         return decoded, payload["backend"]
     finally:
+        if remove_layer_mae_clear is not None:
+            remove_layer_mae_clear()
         scheme.delete_scheme()
 
 
@@ -569,10 +720,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if bool(args.compile_only):
             payload["status"] = "ok_compile_only" if alignment_ok else "mismatch"
         else:
-            backend_ok = bool(payload["comparisons"]["adapter_vs_backend"]["logits"]["allclose"]) and bool(
+            backend_allclose = bool(payload["comparisons"]["adapter_vs_backend"]["logits"]["allclose"]) and bool(
                 payload["comparisons"]["adapter_vs_backend"]["prob"]["allclose"]
             )
-            payload["status"] = "ok" if alignment_ok and backend_ok else "mismatch"
+            segmentation_acceptance = _segmentation_acceptance_metrics(
+                payload,
+                dice_atol=args.backend_dice_atol,
+            )
+            payload["comparisons"]["adapter_vs_backend"]["segmentation"] = segmentation_acceptance
+            backend_dice_close = bool(segmentation_acceptance.get("dice_close", False))
+            if alignment_ok and backend_allclose:
+                payload["status"] = "ok"
+            elif alignment_ok and backend_dice_close:
+                payload["status"] = "ok_backend_dice_close"
+            else:
+                payload["status"] = "mismatch"
     else:
         payload["status"] = "ok_skip_backend" if alignment_ok else "mismatch"
     _write_json(payload_path, payload)
@@ -599,6 +761,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend-kind", choices=("clear", "ckks"), default="clear")
     parser.add_argument("--backend-atol", type=float, default=1.0e-5)
     parser.add_argument("--backend-rtol", type=float, default=1.0e-4)
+    parser.add_argument("--backend-dice-atol", type=float, default=None)
+    parser.add_argument("--backend-bootstrap-many", choices=("0", "1"), default=None)
+    parser.add_argument("--backend-layer-mae", action="store_true")
+    parser.add_argument(
+        "--backend-layer-mae-targets",
+        default="",
+        help="Comma-separated module names to capture for backend layer MAE; default captures every supported module.",
+    )
     parser.add_argument("--mode", choices=("provider", "dense"), default="provider")
     parser.add_argument("--policy", default="dp_no_share_fold")
     parser.add_argument("--provider-mode", default=None)

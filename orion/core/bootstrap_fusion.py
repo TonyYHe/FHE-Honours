@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import inspect
 from typing import Any
 
 import torch
@@ -102,6 +103,70 @@ def _idx_chw_gap(channel: int, h: int, w: int, height: int, width: int, gap: int
     )
 
 
+def _runtime_candidates(module: Any) -> tuple[Any, ...]:
+    runtime = getattr(module, "region_runtime", None)
+    return tuple(
+        candidate
+        for candidate in (
+            getattr(runtime, "executor", None) if runtime is not None else None,
+            getattr(module, "layout_policy_add_runtime", None),
+            getattr(module, "layout_policy_concat_runtime", None),
+        )
+        if candidate is not None
+    )
+
+
+def _layout_policy_native_output_target_signature(module: Any) -> tuple[tuple[int, int, int, int], ...]:
+    raw_signature = tuple(getattr(module, "layout_policy_native_output_target_signature", ()) or ())
+    if raw_signature:
+        return tuple(tuple(int(value) for value in tuple(raw)) for raw in raw_signature)
+
+    for candidate in _runtime_candidates(module):
+        compile_plan = getattr(candidate, "compile_plan", None)
+        node = getattr(candidate, "output_node_id", getattr(candidate, "node", None))
+        if not isinstance(compile_plan, dict) or node is None:
+            continue
+        for row in tuple(compile_plan.get("node_layouts", ()) or ()):
+            if str(row.get("node", "")) != str(node):
+                continue
+            signature = tuple(row.get("native_halo_target_storage_signature", ()) or ())
+            if signature:
+                return tuple(tuple(int(value) for value in tuple(raw)) for raw in signature)
+        for row in tuple(compile_plan.get("edge_layouts", ()) or ()):
+            if str(row.get("node", "")) != str(node):
+                continue
+            signature = tuple(row.get("native_halo_target_storage_signature", ()) or ())
+            if signature:
+                return tuple(tuple(int(value) for value in tuple(raw)) for raw in signature)
+    return ()
+
+
+def _layout_policy_native_output_materialized(module: Any) -> bool:
+    materialization = str(getattr(module, "layout_policy_output_materialization", "") or "")
+    if materialization in {"native_halo_stripe", "native_stripe", "channel_aligned_native_stripe"}:
+        return True
+    for candidate in _runtime_candidates(module):
+        compile_plan = getattr(candidate, "compile_plan", None)
+        node = getattr(candidate, "output_node_id", getattr(candidate, "node", None))
+        if not isinstance(compile_plan, dict) or node is None:
+            continue
+        for row in tuple(compile_plan.get("node_layouts", ()) or ()):
+            if str(row.get("node", "")) != str(node):
+                continue
+            if str(row.get("physical_layout", "")) == "native_source_stripe":
+                return True
+            if row.get("native_halo_target_storage_signature"):
+                return True
+        for row in tuple(compile_plan.get("edge_layouts", ()) or ()):
+            if str(row.get("node", "")) != str(node):
+                continue
+            if str(row.get("physical_layout", "")) == "native_source_stripe":
+                return True
+            if row.get("native_halo_target_storage_signature"):
+                return True
+    return False
+
+
 def native_bootstrap_active_mask(module: Any) -> torch.Tensor | None:
     """Return per-CT active physical slots for native-stripe module outputs.
 
@@ -111,7 +176,7 @@ def native_bootstrap_active_mask(module: Any) -> torch.Tensor | None:
     slot in a full-slot ciphertext as semantically active.
     """
 
-    raw_signature = tuple(getattr(module, "layout_policy_native_output_target_signature", ()) or ())
+    raw_signature = _layout_policy_native_output_target_signature(module)
     if not raw_signature:
         return None
 
@@ -213,21 +278,72 @@ def _relu_output_fusion_capable(module: Any) -> bool:
     return bool(type(parent).__name__ == "ReLU" and getattr(sign, "acts", None))
 
 
-def _runtime_fusion_capable(module: Any) -> bool:
+def _mask_summary(active_mask: torch.Tensor | None) -> dict[str, Any]:
+    if active_mask is None:
+        return {"masked": False}
+    mask = active_mask.detach().cpu().to(dtype=torch.bool)
+    total = int(mask.numel())
+    active = int(mask.sum().item()) if total > 0 else 0
+    return {
+        "masked": bool(total > 0 and active < total),
+        "active_slots": int(active),
+        "inactive_slots": int(total - active),
+        "total_slots": int(total),
+        "mask_shape": [int(value) for value in tuple(mask.shape)],
+    }
+
+
+def _call_fusion_capable(
+    capable: Any,
+    *,
+    masked: bool,
+    active_mask: torch.Tensor | None,
+) -> bool:
+    if not callable(capable):
+        return bool(capable) and not bool(masked)
+    if not bool(masked):
+        return bool(capable())
+    try:
+        signature = inspect.signature(capable)
+    except (TypeError, ValueError):
+        return False
+    params = signature.parameters
+    accepts_kwargs = any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    if accepts_kwargs or "masked" in params or "active_mask" in params:
+        kwargs: dict[str, Any] = {}
+        if accepts_kwargs or "masked" in params:
+            kwargs["masked"] = True
+        if accepts_kwargs or "active_mask" in params:
+            kwargs["active_mask"] = active_mask
+        return bool(capable(**kwargs))
+    return False
+
+
+def _runtime_fusion_capable(
+    module: Any,
+    *,
+    masked: bool = False,
+    active_mask: torch.Tensor | None = None,
+) -> bool:
     runtime = getattr(module, "region_runtime", None)
     executor = getattr(runtime, "executor", None) if runtime is not None else None
     capable = getattr(executor, "bootstrap_prescale_fusion_capable", None)
-    if callable(capable):
-        return bool(capable())
-    return bool(getattr(executor, "bootstrap_prescale_fusion_capable", False))
+    if capable is not None:
+        return _call_fusion_capable(capable, masked=bool(masked), active_mask=active_mask)
+    return bool(getattr(executor, "bootstrap_prescale_fusion_capable", False)) and not bool(masked)
 
 
-def _add_fusion_capable(module: Any) -> bool:
+def _add_fusion_capable(
+    module: Any,
+    *,
+    masked: bool = False,
+    active_mask: torch.Tensor | None = None,
+) -> bool:
     runtime = getattr(module, "layout_policy_add_runtime", None)
     capable = getattr(runtime, "bootstrap_prescale_fusion_capable", None)
-    if callable(capable):
-        return bool(capable())
-    return bool(getattr(runtime, "bootstrap_prescale_fusion_capable", False))
+    if capable is not None:
+        return _call_fusion_capable(capable, masked=bool(masked), active_mask=active_mask)
+    return bool(getattr(runtime, "bootstrap_prescale_fusion_capable", False)) and not bool(masked)
 
 
 def bootstrap_prescale_fusion_supported(module: Any) -> bool:
@@ -242,20 +358,35 @@ def bootstrap_prescale_fusion_supported(module: Any) -> bool:
         return False
     if module is None or not module_uses_full_bootstrap_slots(module):
         return False
-    if native_bootstrap_has_inactive_slots(module) and (
+    active_mask = native_bootstrap_active_mask(module)
+    if active_mask is None and _layout_policy_native_output_materialized(module):
+        return False
+    mask_info = _mask_summary(active_mask)
+    masked = bool(mask_info.get("masked", False))
+    if bool(masked) and (
         _scalar_polynomial_fusion_target(module) or _relu_output_fusion_capable(module)
     ):
         return False
-    return bool(_runtime_fusion_capable(module) or _add_fusion_capable(module))
+    return bool(
+        _runtime_fusion_capable(module, masked=bool(masked), active_mask=active_mask)
+        or _add_fusion_capable(module, masked=bool(masked), active_mask=active_mask)
+    )
 
 
-def bootstrap_prescale_affine(bootstrapper: Any) -> dict[str, float]:
+def bootstrap_prescale_affine(bootstrapper: Any) -> dict[str, Any]:
     scale = float(getattr(bootstrapper, "prescale", 1.0))
     constant = float(getattr(bootstrapper, "constant", 0.0))
-    return {
+    active_mask = getattr(bootstrapper, "_bootstrap_prescale_active_mask", None)
+    summary = _mask_summary(active_mask)
+    payload: dict[str, Any] = {
         "scale": float(scale),
         "bias": float(scale * constant),
+        **summary,
     }
+    if active_mask is not None:
+        payload["active_mask"] = active_mask.detach().cpu().to(dtype=torch.bool)
+        payload["mask_source"] = "native_bootstrap_active_mask"
+    return payload
 
 
 def install_bootstrap_prescale_fusion(module: Any, bootstrapper: Any) -> bool:
@@ -277,5 +408,9 @@ def install_bootstrap_prescale_fusion(module: Any, bootstrapper: Any) -> bool:
             if candidate is not None:
                 setattr(candidate, "_bootstrap_prescale_fusion", dict(affine))
     setattr(bootstrapper, "preprocess_fused", True)
-    setattr(bootstrapper, "preprocess_fusion_kind", "producer_affine")
+    setattr(
+        bootstrapper,
+        "preprocess_fusion_kind",
+        "producer_affine_masked" if bool(affine.get("masked", False)) else "producer_affine",
+    )
     return True

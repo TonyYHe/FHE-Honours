@@ -1394,6 +1394,36 @@ def _layer_mae_tensor_summary(value: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def _layer_mae_masked_value_summary(value: torch.Tensor, mask: torch.Tensor) -> dict[str, Any]:
+    result = _layer_mae_tensor(value)
+    active = mask.detach().cpu().to(dtype=torch.bool)
+    if tuple(active.shape) != tuple(result.shape):
+        active = active.reshape(-1)
+        result = result.reshape(-1)
+        compare_count = min(int(active.numel()), int(result.numel()))
+        active = active[: int(compare_count)]
+        result = result[: int(compare_count)]
+    selected = result[active]
+    if int(selected.numel()) <= 0:
+        return {"count": 0}
+    flat = selected.reshape(-1)
+    abs_flat = flat.abs()
+    quantiles = torch.quantile(abs_flat, torch.tensor([0.5, 0.9, 0.95, 0.99], dtype=torch.float32))
+    return {
+        "count": int(flat.numel()),
+        "min": float(flat.min().item()),
+        "max": float(flat.max().item()),
+        "mean": float(flat.mean().item()),
+        "rms": float(torch.sqrt(torch.mean(flat * flat)).item()),
+        "abs_mean": float(abs_flat.mean().item()),
+        "abs_max": float(abs_flat.max().item()),
+        "abs_p50": float(quantiles[0].item()),
+        "abs_p90": float(quantiles[1].item()),
+        "abs_p95": float(quantiles[2].item()),
+        "abs_p99": float(quantiles[3].item()),
+    }
+
+
 def _layer_mae_metric(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, Any]:
     left = _layer_mae_tensor(reference)
     right = _layer_mae_tensor(actual)
@@ -1542,6 +1572,73 @@ def _layer_mae_native_output_signature(
     return ()
 
 
+def _layer_mae_serialise_native_signature(signature: Any) -> list[list[int]]:
+    rows: list[list[int]] = []
+    for item in tuple(signature or ()):
+        try:
+            rows.append([int(value) for value in tuple(item)])
+        except Exception:
+            return []
+    return rows
+
+
+def _layer_mae_serialise_native_stripes(stripes: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for stripe in tuple(stripes or ()):
+        to_dict = getattr(stripe, "to_dict", None)
+        if callable(to_dict):
+            try:
+                rows.append({str(key): value for key, value in dict(to_dict()).items()})
+                continue
+            except Exception:
+                pass
+        row: dict[str, Any] = {}
+        for key in (
+            "index",
+            "target_h_start",
+            "target_h_end",
+            "source_h_start",
+            "source_h_end",
+            "source_channel_tile",
+            "target_channel_tile",
+            "source_owner_h_start",
+            "source_owner_h_end",
+        ):
+            if hasattr(stripe, key):
+                try:
+                    row[str(key)] = int(getattr(stripe, key))
+                except Exception:
+                    row[str(key)] = str(getattr(stripe, key))
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _layer_mae_native_plan_debug(native_executor: Any | None) -> dict[str, Any]:
+    plan = getattr(native_executor, "native_plan", None) if native_executor is not None else None
+    if plan is None:
+        return {}
+    debug: dict[str, Any] = {
+        "source_storage_signature": _layer_mae_serialise_native_signature(
+            getattr(plan, "source_storage_signature", ()) or ()
+        ),
+        "target_storage_signature": _layer_mae_serialise_native_signature(
+            getattr(plan, "target_storage_signature", ()) or ()
+        ),
+        "target_internal_halo_overlap": int(getattr(plan, "target_internal_halo_overlap", 0) or 0),
+        "independent_source_target_stripes": bool(getattr(plan, "independent_source_target_stripes", False)),
+    }
+    for attr in ("stripes", "source_stripes", "target_stripes", "effective_source_stripes", "effective_target_stripes"):
+        value = getattr(plan, attr, ()) or ()
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                value = ()
+        debug[str(attr)] = _layer_mae_serialise_native_stripes(value)
+    return debug
+
+
 def _layer_mae_should_decode_native_signature_output(
     module: torch.nn.Module,
     value: CipherTensor,
@@ -1587,6 +1684,138 @@ def _layer_mae_native_halo_native_target_ct_count(executor: Any) -> int:
                 int(plan.target_block_index(stripe, int(target_group))),
             )
     return int(max_block_index + 1)
+
+
+def _layer_mae_native_halo_active_slot_mask(executor: Any) -> torch.Tensor:
+    plan = _layer_mae_native_halo_plan(executor)
+    spec = plan.spec
+    target_count = int(_layer_mae_native_halo_native_target_ct_count(executor))
+    slots = int(spec.slot_count)
+    mask = torch.zeros((int(target_count), int(slots)), dtype=torch.bool)
+    gap = max(1, int(spec.gap_out))
+    phases = int(gap * gap)
+    packed_w = int(spec.w_out) * int(gap)
+    for stripe in plan.stripes:
+        target_tile = int(plan.target_tile_for_stripe(stripe))
+        group_block = int(stripe.target_h) * int(gap) * int(packed_w)
+        for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+            block_index = int(plan.target_block_index(stripe, int(target_group)))
+            if int(block_index) < 0 or int(block_index) >= int(target_count):
+                raise RuntimeError(f"native halo target block out of range: {int(block_index)} / {int(target_count)}")
+            channel_start = int(target_group) * int(target_tile)
+            channel_end = min(int(spec.c_out), int(channel_start) + int(target_tile))
+            for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
+                if int(channel) < 0 or int(channel) >= int(spec.c_out):
+                    continue
+                group = int(local_channel) // int(phases)
+                phase = int(local_channel) % int(phases)
+                phase_h = int(phase) // int(gap)
+                phase_w = int(phase) % int(gap)
+                for global_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
+                    if int(global_h) < 0 or int(global_h) >= int(spec.h_out):
+                        continue
+                    local_h = int(global_h) - int(stripe.target_h_start)
+                    for w_index in range(int(spec.w_out)):
+                        slot = (
+                            int(group) * int(group_block)
+                            + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                            + int(w_index) * int(gap)
+                            + int(phase_w)
+                        )
+                        if int(slot) < 0 or int(slot) >= int(slots):
+                            raise RuntimeError(f"native halo target slot out of range: {int(slot)} / {int(slots)}")
+                        mask[int(block_index), int(slot)] = True
+    return mask
+
+
+def _layer_mae_native_signature_active_slot_mask(
+    signature: Any,
+    *,
+    module: torch.nn.Module,
+    slot_count: int,
+) -> torch.Tensor:
+    logical_shape = tuple(int(value) for value in tuple(getattr(module, "output_shape", ()) or ()))
+    if len(logical_shape) != 4:
+        raise RuntimeError(f"native signature active-mask audit requires 4D output shape, got {logical_shape}")
+    n, channels, height, width = logical_shape
+    if int(n) != 1:
+        raise RuntimeError(f"native signature active-mask audit currently supports batch=1, got {int(n)}")
+    gap = max(1, int(getattr(module, "output_gap", 1) or 1))
+    blocks = tuple(signature or ())
+    mask = torch.zeros((int(len(blocks)), int(slot_count)), dtype=torch.bool)
+    phases = int(gap * gap)
+    packed_w = int(width) * int(gap)
+    for block_index, (h_start, h_end, channel_start, channel_count) in enumerate(blocks):
+        block_h = int(h_end) - int(h_start)
+        if int(block_h) <= 0 or int(channel_count) <= 0:
+            continue
+        group_block = int(block_h) * int(gap) * int(packed_w)
+        for local_channel in range(int(channel_count)):
+            channel = int(channel_start) + int(local_channel)
+            if int(channel) < 0 or int(channel) >= int(channels):
+                continue
+            group = int(local_channel) // int(phases)
+            phase = int(local_channel) % int(phases)
+            phase_h = int(phase) // int(gap)
+            phase_w = int(phase) % int(gap)
+            for global_h in range(int(h_start), int(h_end)):
+                if int(global_h) < 0 or int(global_h) >= int(height):
+                    continue
+                local_h = int(global_h) - int(h_start)
+                for w_index in range(int(width)):
+                    slot = (
+                        int(group) * int(group_block)
+                        + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                        + int(w_index) * int(gap)
+                        + int(phase_w)
+                    )
+                    if int(slot) < 0 or int(slot) >= int(slot_count):
+                        raise RuntimeError(f"native signature target slot out of range: {int(slot)} / {int(slot_count)}")
+                    mask[int(block_index), int(slot)] = True
+    return mask
+
+
+def _layer_mae_physical_slot_audit(raw_decoded: torch.Tensor, active_mask: torch.Tensor) -> dict[str, Any]:
+    mask = active_mask.detach().cpu().to(dtype=torch.bool)
+    raw = _layer_mae_tensor(raw_decoded).reshape(-1)
+    expected_values = int(mask.numel())
+    if int(raw.numel()) < int(expected_values):
+        raise RuntimeError(
+            f"physical slot audit expected at least {int(expected_values)} raw slots, got {int(raw.numel())}"
+        )
+    values = raw[: int(expected_values)].reshape(tuple(mask.shape))
+    inactive = ~mask
+    rows: list[dict[str, Any]] = []
+    for index in range(int(values.shape[0])):
+        rows.append(
+            {
+                "group": int(index),
+                "active": _layer_mae_masked_value_summary(values[int(index)], mask[int(index)]),
+                "inactive": _layer_mae_masked_value_summary(values[int(index)], inactive[int(index)]),
+            }
+        )
+    active_abs_max = (
+        float(values[mask].abs().max().item())
+        if bool(mask.any().item())
+        else 0.0
+    )
+    inactive_abs_max = (
+        float(values[inactive].abs().max().item())
+        if bool(inactive.any().item())
+        else 0.0
+    )
+    return {
+        "shape": [int(value) for value in tuple(mask.shape)],
+        "total_slots": int(mask.numel()),
+        "active_slots": int(mask.sum().item()) if int(mask.numel()) > 0 else 0,
+        "inactive_slots": int((~mask).sum().item()) if int(mask.numel()) > 0 else 0,
+        "active": _layer_mae_masked_value_summary(values, mask),
+        "inactive": _layer_mae_masked_value_summary(values, inactive),
+        "inactive_to_active_abs_max_ratio": (
+            float(inactive_abs_max / active_abs_max) if float(active_abs_max) > 0.0 else None
+        ),
+        "groups": rows,
+    }
 
 
 def _layer_mae_native_halo_uses_compact_physical_targets(executor: Any) -> bool:
@@ -1976,8 +2205,17 @@ def _layer_mae_decode_cipher_output(
                 )
                 decode_info["raw_decoded_slot_count"] = int(raw_decoded.numel())
                 decode_info["native_halo_expected_ct_count"] = int(_layer_mae_native_halo_expected_ct_count(native_executor))
+                decode_info["native_halo_plan"] = _layer_mae_native_plan_debug(native_executor)
             if bool(_layer_mae_native_halo_uses_compact_physical_targets(native_executor)):
                 return _layer_mae_decode_native_halo_compact_physical_output(raw_decoded, native_executor)
+            if decode_info is not None:
+                try:
+                    decode_info["physical_slot_audit"] = _layer_mae_physical_slot_audit(
+                        raw_decoded,
+                        _layer_mae_native_halo_active_slot_mask(native_executor),
+                    )
+                except Exception as exc:
+                    decode_info["physical_slot_audit_error"] = repr(exc)
             return _layer_mae_decode_native_halo_output(raw_decoded, native_executor)
         if _layer_mae_should_decode_native_signature_output(
             module,
@@ -1994,8 +2232,21 @@ def _layer_mae_decode_cipher_output(
                 decode_info["decode_kind"] = "native_signature_stripe"
                 decode_info["raw_decoded_slot_count"] = int(raw_decoded.numel())
                 decode_info["native_signature_expected_ct_count"] = int(len(signature))
+                decode_info["native_signature"] = _layer_mae_serialise_native_signature(signature)
                 if signature_owner is not module or signature_owner_name != module_name:
                     decode_info["native_signature_owner"] = str(signature_owner_name or "")
+                try:
+                    slot_count = int(raw_decoded.numel()) // max(1, int(len(signature)))
+                    decode_info["physical_slot_audit"] = _layer_mae_physical_slot_audit(
+                        raw_decoded,
+                        _layer_mae_native_signature_active_slot_mask(
+                            signature,
+                            module=module,
+                            slot_count=int(slot_count),
+                        ),
+                    )
+                except Exception as exc:
+                    decode_info["physical_slot_audit_error"] = repr(exc)
             return _layer_mae_decode_native_signature_output(
                 raw_decoded,
                 module=module,
@@ -2548,6 +2799,7 @@ def _install_layer_mae_he_capture(
                     row["ciphertext_count"] = int(len(getattr(output, "ids", ()) or ()))
                     row["cipher_shape"] = _json_shape(getattr(output, "shape", ()))
                     row["cipher_on_shape"] = _json_shape(getattr(output, "on_shape", ()))
+                    row["cipher_state"] = _cipher_ids_state(output)
                     if native_executor_owner:
                         decode_info.setdefault("native_halo_executor_owner", str(native_executor_owner))
                     decode_info.setdefault("decode_kind", "native_halo_stripe" if bool(native_decode) else "cipher_tensor")
@@ -4258,6 +4510,7 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
     transform_rotation_total = 0
     shared_rotation_total = 0
     transform_count = 0
+    diag_index_total = 0
     estimate_values: list[int] = []
     streaming_transform_count = 0
     for group_index, group in enumerate(groups):
@@ -4283,10 +4536,17 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
             shared_rotation_total += int(group_shared_total)
             group_transform_count = int(cached.get("transform_count", 0) or 0)
             transform_count += int(group_transform_count)
+            group_diag_total = int(cached.get("diag_index_count", 0) or 0)
+            if not group_diag_total:
+                group_diag_total = int(
+                    sum(int(item.get("diag_index_count", 0) or 0) for item in cached.get("per_transform", []) or [])
+                )
+            diag_index_total += int(group_diag_total)
             per_group.append(
                 {
                     "group_index": int(group_index),
                     "transform_count": int(group_transform_count),
+                    "diag_index_count": int(group_diag_total),
                     "rotation_key_count_total": int(group_transform_total),
                     "shared_rotation_eval_count": int(group_shared_total),
                     "unique_rotation_key_count": int(len(cached_keys)),
@@ -4310,11 +4570,13 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
                 slots=int(slots),
                 individual_eval=bool(individual_eval),
             )
+            group_diag_total = int(sum(len(values) for values in diag_sets))
             group_transform_total = int(group_stats["transform_rotation_eval_count_total"])
             group_shared_total = int(group_stats["shared_rotation_eval_count_total"])
             transform_rotation_total += int(group_transform_total)
             shared_rotation_total += int(group_shared_total)
             transform_count += int(len(ids))
+            diag_index_total += int(group_diag_total)
             unique_keys.update(int(key) for key in group_stats["unique_rotation_keys"])
             for transform_index, transform_id in enumerate(ids):
                 estimate = _linear_transform_device_estimate(int(transform_id))
@@ -4327,6 +4589,7 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
                     {
                         "transform_index": int(transform_index),
                         "transform_id": int(transform_id),
+                        "diag_index_count": int(len(diag_sets[transform_index])),
                         "rotation_eval_count": int(stat.get("rotation_eval_count", 0) or 0),
                         "rotation_key_count": int(stat.get("rotation_key_count", 0) or 0),
                         "rotation_key_request_count": int(stat.get("rotation_key_request_count", 0) or 0),
@@ -4338,6 +4601,7 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
                 {
                     "group_index": int(group_index),
                     "transform_count": int(len(ids)),
+                    "diag_index_count": int(group_diag_total),
                     "rotation_key_count_total": int(group_transform_total),
                     "transform_rotation_eval_count_total": int(group_transform_total),
                     "shared_rotation_eval_count": int(group_shared_total),
@@ -4388,6 +4652,7 @@ def _unified_group_rotation_stats(groups: list[Any]) -> dict[str, Any]:
         "group_count": int(len(groups)),
         "group_object_ids": [int(id(group)) for group in groups],
         "transform_count": int(transform_count),
+        "diag_index_count": int(diag_index_total),
         "transform_rotation_eval_count_total": int(transform_rotation_total),
         "transform_rotation_key_count_total": int(transform_rotation_total),
         "shared_rotation_eval_count_total": int(shared_rotation_total),
@@ -4813,6 +5078,9 @@ def _collect_rotation_report(net: torch.nn.Module, *, mode: str) -> dict[str, An
     total_output_rotation_evals = int(
         sum(int(row.get("stats", {}).get("output_rotation_eval_count", 0)) for row in total_rows)
     )
+    total_diag_index_count = int(
+        sum(int(row.get("stats", {}).get("diag_index_count", 0)) for row in total_rows)
+    )
     return {
         "mode": str(mode),
         "source": "compiled_backend_rotation_keys_plus_output_rotation_estimate",
@@ -4823,6 +5091,7 @@ def _collect_rotation_report(net: torch.nn.Module, *, mode: str) -> dict[str, An
         "total_transform_rotation_key_count": int(total_transform_rotation_keys),
         "total_shared_rotation_eval_count": int(total_shared_rotation_evals),
         "total_output_rotation_eval_count": int(total_output_rotation_evals),
+        "total_diag_index_count": int(total_diag_index_count),
         "rows": rows,
     }
 

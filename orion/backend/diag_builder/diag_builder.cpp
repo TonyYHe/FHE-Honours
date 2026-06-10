@@ -71,6 +71,10 @@ struct OrionProviderNativeSourceSpec {
   int target_index;
   int compact_output;
   int compact_target_block;
+  const unsigned char *source_active_mask;
+  int source_active_mask_len;
+  const unsigned char *target_active_mask;
+  int target_active_mask_len;
 };
 
 struct OrionProviderCompactSourceSpec {
@@ -103,6 +107,10 @@ struct OrionProviderCompactSourceSpec {
   int target_index;
   int compact_output;
   int compact_target_block;
+  const unsigned char *source_active_mask;
+  int source_active_mask_len;
+  const unsigned char *target_active_mask;
+  int target_active_mask_len;
 };
 
 struct OrionProviderStripeSpec {
@@ -137,6 +145,10 @@ struct OrionProviderCompactSourceConcatIndexSpec {
   int source_ct_count;
   int target_ct_count;
   int fuse_output_relayout;
+  const unsigned char *source_active_masks;
+  int source_active_masks_len;
+  const unsigned char *target_active_masks;
+  int target_active_masks_len;
 };
 
 }
@@ -373,6 +385,30 @@ bool PhysicalOutputHValid(const OrionProviderNativeSourceSpec &spec, int64_t out
 
 int64_t PhysicalOutputHPosition(const OrionProviderNativeSourceSpec &spec, int64_t output_h) {
   return output_h + std::max(0, spec.output_physical_top_beta);
+}
+
+bool ActiveMaskSlot(const unsigned char *mask, int mask_len, int64_t slot) {
+  if (mask == nullptr || mask_len <= 0) {
+    return true;
+  }
+  if (slot < 0 || slot >= static_cast<int64_t>(mask_len)) {
+    return false;
+  }
+  return mask[static_cast<std::size_t>(slot)] != 0;
+}
+
+bool ActiveBlockMaskSlot(const unsigned char *mask, int mask_len, int slots, int block, int64_t slot) {
+  if (mask == nullptr || mask_len <= 0) {
+    return true;
+  }
+  if (slots <= 0 || block < 0 || slot < 0 || slot >= static_cast<int64_t>(slots)) {
+    return false;
+  }
+  const int64_t index = static_cast<int64_t>(block) * static_cast<int64_t>(slots) + slot;
+  if (index < 0 || index >= static_cast<int64_t>(mask_len)) {
+    return false;
+  }
+  return mask[static_cast<std::size_t>(index)] != 0;
 }
 
 struct DenseSpec {
@@ -1326,6 +1362,9 @@ OrionDiagPayloadBatch BuildProviderNativeSourcePayload(
                 spec.stripe_source_h,
                 spec.w_in,
                 spec.gap_in);
+            if (!ActiveMaskSlot(spec.source_active_mask, spec.source_active_mask_len, source_slot)) {
+              continue;
+            }
             for (int local_target = 0; local_target < target_count; ++local_target) {
               const int target_channel = spec.compact_output ? target_start + local_target : local_target;
               int64_t target_index = 0;
@@ -1350,7 +1389,8 @@ OrionDiagPayloadBatch BuildProviderNativeSourcePayload(
                     spec.w_out,
                     spec.gap_out);
               }
-              if (!target_ok) {
+              if (!target_ok ||
+                  !ActiveMaskSlot(spec.target_active_mask, spec.target_active_mask_len, target_index)) {
                 continue;
               }
               const int64_t weight_index =
@@ -1459,6 +1499,9 @@ OrionDiagPayloadBatch BuildProviderCompactSourcePayload(
               continue;
             }
             const int64_t source_slot = source_index % spec.slots;
+            if (!ActiveMaskSlot(spec.source_active_mask, spec.source_active_mask_len, source_slot)) {
+              continue;
+            }
             for (int local_target = 0; local_target < target_count; ++local_target) {
               int64_t target_slot = 0;
               bool target_ok = true;
@@ -1487,7 +1530,8 @@ OrionDiagPayloadBatch BuildProviderCompactSourcePayload(
                     spec.w_out,
                     spec.gap_out);
               }
-              if (!target_ok) {
+              if (!target_ok ||
+                  !ActiveMaskSlot(spec.target_active_mask, spec.target_active_mask_len, target_slot)) {
                 continue;
               }
               const int64_t weight_index =
@@ -1676,12 +1720,28 @@ OrionDiagPayloadBatch BuildProviderCompactSourceConcatIndexOnly(
                   continue;
                 }
                 const int source_slot = static_cast<int>(source_index % spec.slots);
+                if (!ActiveBlockMaskSlot(
+                        spec.source_active_masks,
+                        spec.source_active_masks_len,
+                        spec.slots,
+                        source_block,
+                        source_slot)) {
+                  continue;
+                }
                 const int64_t target_index = target_channel_base + event.target_spatial;
                 const int target_block = static_cast<int>(target_index / spec.slots);
                 if (target_block < 0 || target_block >= spec.target_ct_count) {
                   continue;
                 }
                 const int target_slot = static_cast<int>(target_index % spec.slots);
+                if (!ActiveBlockMaskSlot(
+                        spec.target_active_masks,
+                        spec.target_active_masks_len,
+                        spec.slots,
+                        target_block,
+                        target_slot)) {
+                  continue;
+                }
                 int diag = (source_slot - target_slot) % spec.slots;
                 if (diag < 0) {
                   diag += spec.slots;
@@ -1759,7 +1819,7 @@ OrionDiagPayloadBatch BuildProviderCompactSourceConcatIndexOnly(
 
 extern "C" {
 
-const char *OrionDiagBuilderVersion() { return "dense_conv2d_conv_transpose2d_v1"; }
+const char *OrionDiagBuilderVersion() { return "dense_conv2d_conv_transpose2d_provider_active_mask_v3"; }
 
 const char *OrionDiagBuilderLastError() { return g_last_error.c_str(); }
 

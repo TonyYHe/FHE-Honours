@@ -11,6 +11,7 @@ from common import DEFAULT_RESULT_ROOT, timestamp
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TARGETS = {
+    "accuracy": "accuracy_medseg_cheb7.py",
     "fig7": "fig7_operator_conv_perf.py",
     "table1": "table1_e2e_unet.py",
     "fig8": "fig8_cheb7_qualitative.py",

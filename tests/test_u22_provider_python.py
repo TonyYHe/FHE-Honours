@@ -2382,6 +2382,7 @@ def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() ->
                         "fhe_shape": [1, 1, 4, 4],
                         "output_relayout": False,
                         "physical_layout": "native_source_stripe",
+                        "native_halo_target_storage_signature": [[-1, 5, 0, 1]],
                         "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
                     }
                 ],
@@ -2441,6 +2442,158 @@ def test_native_halo_stripe_provider_honors_dp_input_and_output_halo_layout() ->
         assert counts["target_count"] >= 1
         assert tuple(int(value) for value in out.on_shape) == (1, int(scheme.params.get_slots()))
         assert float((decoded - reference).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_native_provider_masked_prescale_affine_matches_unfused_prebootstrap_slots() -> None:
+    from orion.core.bootstrap_fusion import native_bootstrap_active_mask
+    from orion.experimental.cir.halo_local_conv_provider import HaloLocalConvRuntimeExecutor
+    from orion.experimental.cir.native_halo_conv2d import native_halo_source_plaintext_blocks_from_nchw
+    from orion.experimental.u22_phase1 import LayoutPolicyProviderRuntimeExecutor
+
+    def make_executor() -> tuple[Conv2d, LayoutPolicyProviderRuntimeExecutor]:
+        conv = Conv2d(1, 1, kernel_size=3, padding=1, bias=True)
+        conv.weight.data = torch.tensor(
+            [[[[0.0, 0.25, 0.0], [0.5, 1.0, -0.25], [0.0, -0.5, 0.125]]]],
+            dtype=torch.float32,
+        )
+        conv.bias.data.fill_(0.125)
+        conv.init_orion_params()
+        conv.input_shape = torch.Size((1, 1, 4, 4))
+        conv.output_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        conv.fhe_output_shape = torch.Size((1, 1, 4, 4))
+        conv.input_gap = 1
+        conv.output_gap = 1
+        conv.name = "native_halo_masked_affine_toy_conv"
+        level = len(scheme.params.get_logq()) - 1
+        conv.set_level(level)
+        conv.set_depth(2)
+        executor = LayoutPolicyProviderRuntimeExecutor(
+            base_executor=HaloLocalConvRuntimeExecutor(module=conv, output_node_id="conv"),
+            output_node_id="conv",
+            compile_plan={
+                "policy": "dp",
+                "edge_layouts": [
+                    {
+                        "edge": "x->conv",
+                        "source": "x",
+                        "target": "conv",
+                        "op_kind": "conv2d",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "relayout": False,
+                        "layout_mode": "native_halo_stripe",
+                        "physical_layout": "native_source_stripe",
+                        "source_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+                "node_layouts": [
+                    {
+                        "node": "conv",
+                        "shape": [1, 1, 4, 4],
+                        "fhe_shape": [1, 1, 4, 4],
+                        "output_relayout": False,
+                        "physical_layout": "native_source_stripe",
+                        "native_halo_target_storage_signature": [[-1, 5, 0, 1]],
+                        "selected_layout": {"top_beta": 1, "bottom_beta": 1, "stride": 1, "gap": 1, "tile_count": 1},
+                    }
+                ],
+            },
+        )
+        executor.assigned_level = level
+        executor.assigned_depth = 3
+        return conv, executor
+
+    def encode_input(x: torch.Tensor, executor: LayoutPolicyProviderRuntimeExecutor) -> CipherTensor:
+        ids = []
+        level = len(scheme.params.get_logq()) - 1
+        native_plan = executor._native_halo_plan()
+        for block in native_halo_source_plaintext_blocks_from_nchw(x, native_plan):
+            block_ct = scheme.encrypt(scheme.encode(block, level))
+            ids.append(int(block_ct.ids[0]))
+            block_ct.ids = []
+        return CipherTensor(
+            scheme,
+            ids,
+            torch.Size(tuple(int(value) for value in x.shape)),
+            torch.Size([int(len(ids)), int(scheme.params.get_slots())]),
+        )
+
+    def decode_blocks(value: CipherTensor) -> torch.Tensor:
+        decoded = value.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+        return decoded.to(dtype=torch.float32).flatten().reshape(int(len(value.ids)), int(scheme.params.get_slots()))
+
+    def plan_invariant_subset(metadata: dict) -> dict[str, int | str | bool]:
+        return {
+            key: metadata[key]
+            for key in (
+                "rows",
+                "cols",
+                "runtime_input_ct_count",
+                "runtime_output_ct_count",
+                "conv_lt_raw_submatrix_tasks",
+                "conv_lt_effective_submatrix_tasks",
+                "runtime_transform_count",
+                "runtime_group_count",
+                "relayout_sparse_lt_tasks",
+                "native_c_only_rotations",
+                "native_cb_shared_rotations",
+                "native_shared_baby_rotations",
+                "native_shared_giant_rotations",
+                "runtime_output_storage_layout",
+            )
+        }
+
+    _init_python_scheme(logn=15)
+    try:
+        torch.manual_seed(123)
+        x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4) / 10.0
+        scale = 0.25
+        constant = -1.5
+        bias = float(scale * constant)
+
+        unfused_conv, unfused_executor = make_executor()
+        active_mask = unfused_executor._with_base_module_attrs(lambda: native_bootstrap_active_mask(unfused_conv))
+        assert active_mask is not None
+        assert bool((~active_mask).any().item())
+        unfused_out = unfused_executor(encode_input(x, unfused_executor))["conv"]
+        unfused_blocks = decode_blocks(unfused_out)
+        unfused_metadata = unfused_executor.compile_cache_metadata()
+
+        fused_conv, fused_executor = make_executor()
+        fusion = {
+            "scale": float(scale),
+            "bias": float(bias),
+            "masked": True,
+            "active_mask": active_mask,
+            "active_slots": int(active_mask.sum().item()),
+            "inactive_slots": int((~active_mask).sum().item()),
+            "total_slots": int(active_mask.numel()),
+            "mask_shape": [int(value) for value in tuple(active_mask.shape)],
+            "mask_source": "unit_test",
+        }
+        assert fused_executor.bootstrap_prescale_fusion_capable(masked=True, active_mask=active_mask)
+        fused_executor._bootstrap_prescale_fusion = dict(fusion)
+        fused_out = fused_executor(encode_input(x, fused_executor))["conv"]
+        fused_blocks = decode_blocks(fused_out)
+        fused_metadata = fused_executor.compile_cache_metadata()
+
+        expected = torch.zeros_like(unfused_blocks)
+        expected[active_mask] = unfused_blocks[active_mask] * float(scale) + float(bias)
+
+        assert torch.allclose(fused_blocks[active_mask], expected[active_mask], atol=1.0e-5, rtol=1.0e-5)
+        assert float(fused_blocks[~active_mask].abs().max().item()) <= 1.0e-6
+        assert plan_invariant_subset(fused_metadata) == plan_invariant_subset(unfused_metadata)
+        assert fused_metadata["bootstrap_prescale_masked_affine"] is True
+        assert fused_metadata["bootstrap_prescale_masked_affine_mask"]["active_slots"] == int(active_mask.sum().item())
+        assert fused_executor.last_runtime_io["bootstrap_prescale_masked"] is True
+        assert fused_executor.last_runtime_io["bootstrap_prescale_mask"]["inactive_slots"] == int((~active_mask).sum().item())
+        assert fused_executor.last_runtime_io["runtime_lowering"] == "provider_executable+native_halo_layout"
     finally:
         scheme.delete_scheme()
 
@@ -5331,6 +5484,145 @@ def test_u22_tconv_provider_fuses_output_bottom_beta_relayout_on_python_backend(
 
         assert tuple(int(value) for value in out.on_shape) == (1, 1, 5, 4)
         assert float((packed - expected).abs().max().item()) <= 1.0e-5
+    finally:
+        scheme.delete_scheme()
+
+
+def test_u22_tconv_masked_prescale_affine_matches_unfused_prebootstrap_slots() -> None:
+    from orion.core.bootstrap_fusion import native_bootstrap_active_mask
+
+    def make_module(name: str) -> ConvTranspose2d:
+        module = ConvTranspose2d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=2,
+            stride=2,
+            padding=0,
+            output_padding=0,
+            groups=1,
+            bias=True,
+        )
+        module.eval()
+        module.init_orion_params()
+        module.on_weight = torch.tensor(
+            [[[[1.0, -0.25], [0.5, 0.125]]]],
+            dtype=torch.float32,
+        )
+        module.on_bias = torch.tensor([0.125], dtype=torch.float32)
+        module.input_shape = torch.Size((1, 1, 2, 2))
+        module.output_shape = torch.Size((1, 1, 4, 4))
+        module.input_gap = 2
+        module.output_gap = 1
+        module.fhe_input_shape = torch.Size((1, 1, 4, 4))
+        module.fhe_output_shape = torch.Size((1, 1, 6, 4))
+        module.layout_policy_output_layout = {
+            "top_beta": 1,
+            "bottom_beta": 1,
+            "physical_top_beta": 1,
+            "physical_bottom_beta": 1,
+            "gap": 1,
+        }
+        module.layout_policy_output_materialization = "native_halo_stripe"
+        module.layout_policy_native_output_target_signature = [[-1, 5, 0, 1]]
+        module.name = str(name)
+        level = len(scheme.params.get_logq()) - 1
+        module.set_level(level)
+        module.set_depth(2)
+        module.scheme = scheme
+        return module
+
+    def decode_blocks(value: CipherTensor) -> torch.Tensor:
+        slots = int(scheme.params.get_slots())
+        raw = CipherTensor(
+            scheme,
+            [int(value) for value in value.ids],
+            torch.Size([int(len(value.ids)), int(slots)]),
+            torch.Size([int(len(value.ids)), int(slots)]),
+        )
+        decoded = raw.decrypt().decode().detach().cpu()
+        if torch.is_complex(decoded):
+            decoded = decoded.real
+        return decoded.to(dtype=torch.float32).flatten().reshape(
+            int(len(value.ids)),
+            int(slots),
+        )
+
+    def plan_invariant_subset(metadata: dict) -> dict:
+        keys = (
+            "input_block_count",
+            "output_block_count",
+            "input_total_slots",
+            "output_total_slots",
+            "output_fold_block_height",
+            "output_fold_rotations",
+            "hybrid_pair_count",
+            "hybrid_pair_rejected_count",
+            "hybrid_pair_layout_strategy",
+            "compiled_transform_count",
+            "skipped_empty_transform_count",
+            "layout_policy_native_output_target_signature",
+        )
+        return {key: metadata[key] for key in keys}
+
+    _init_python_scheme(logn=8)
+    try:
+        x = torch.arange(1, 5, dtype=torch.float32).reshape(1, 2, 2) / 4.0
+        scale = 0.25
+        constant = -1.5
+        bias = float(scale * constant)
+
+        unfused_module = make_module("synthetic_tconv_masked_affine_unfused")
+        unfused_runtime = TconvK2S2PythonRuntimeExecutor(
+            module=unfused_module,
+            output_node_id="synthetic_tconv_masked_affine_unfused",
+        )
+        active_mask = native_bootstrap_active_mask(unfused_module)
+        assert active_mask is not None
+        assert bool((~active_mask).any().item())
+
+        unfused_out = unfused_runtime(_encode_input(unfused_module, x))[
+            "synthetic_tconv_masked_affine_unfused"
+        ]
+        unfused_blocks = decode_blocks(unfused_out)
+        unfused_metadata = unfused_runtime.compile_cache_metadata()
+
+        fused_module = make_module("synthetic_tconv_masked_affine_fused")
+        fused_module.on_weight = fused_module.on_weight * float(scale)
+        fused_module.on_bias = fused_module.on_bias * float(scale) + float(bias)
+        fused_module._bootstrap_prescale_fusion_masked = True
+        fused_module._bootstrap_prescale_active_mask = active_mask
+        fused_module._bootstrap_prescale_affine_mask_summary = {
+            "masked": True,
+            "active_slots": int(active_mask.sum().item()),
+            "inactive_slots": int((~active_mask).sum().item()),
+            "total_slots": int(active_mask.numel()),
+            "mask_shape": [int(value) for value in tuple(active_mask.shape)],
+            "mask_source": "unit_test",
+        }
+        fused_runtime = TconvK2S2PythonRuntimeExecutor(
+            module=fused_module,
+            output_node_id="synthetic_tconv_masked_affine_fused",
+        )
+        fused_out = fused_runtime(_encode_input(fused_module, x))["synthetic_tconv_masked_affine_fused"]
+        fused_blocks = decode_blocks(fused_out)
+        fused_metadata = fused_runtime.compile_cache_metadata()
+
+        expected = torch.zeros_like(unfused_blocks)
+        expected[active_mask] = unfused_blocks[active_mask] * float(scale) + float(bias)
+
+        assert torch.allclose(fused_blocks[active_mask], expected[active_mask], atol=1.0e-5, rtol=1.0e-5)
+        assert float(fused_blocks[~active_mask].abs().max().item()) <= 1.0e-6
+        assert plan_invariant_subset(fused_metadata) == plan_invariant_subset(unfused_metadata)
+        assert fused_metadata["bootstrap_prescale_masked_affine"] is True
+        assert fused_metadata["bootstrap_prescale_masked_affine_strategy"] == "tconv_mvm_bias_active_slots"
+        assert fused_metadata["bootstrap_prescale_masked_affine_mask"]["active_slots"] == int(
+            active_mask.sum().item()
+        )
+        assert fused_runtime.last_runtime_io["bootstrap_prescale_masked_affine"] is True
+        assert (
+            fused_runtime.last_runtime_io["bootstrap_prescale_masked_affine_mask"]["inactive_slots"]
+            == int((~active_mask).sum().item())
+        )
     finally:
         scheme.delete_scheme()
 

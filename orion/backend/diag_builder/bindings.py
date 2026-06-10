@@ -77,6 +77,10 @@ class _CProviderNativeSourceSpec(ctypes.Structure):
         ("target_index", ctypes.c_int),
         ("compact_output", ctypes.c_int),
         ("compact_target_block", ctypes.c_int),
+        ("source_active_mask", ctypes.POINTER(ctypes.c_ubyte)),
+        ("source_active_mask_len", ctypes.c_int),
+        ("target_active_mask", ctypes.POINTER(ctypes.c_ubyte)),
+        ("target_active_mask_len", ctypes.c_int),
     ]
 
 
@@ -111,6 +115,10 @@ class _CProviderCompactSourceSpec(ctypes.Structure):
         ("target_index", ctypes.c_int),
         ("compact_output", ctypes.c_int),
         ("compact_target_block", ctypes.c_int),
+        ("source_active_mask", ctypes.POINTER(ctypes.c_ubyte)),
+        ("source_active_mask_len", ctypes.c_int),
+        ("target_active_mask", ctypes.POINTER(ctypes.c_ubyte)),
+        ("target_active_mask_len", ctypes.c_int),
     ]
 
 
@@ -149,6 +157,10 @@ class _CProviderCompactSourceConcatIndexSpec(ctypes.Structure):
         ("source_ct_count", ctypes.c_int),
         ("target_ct_count", ctypes.c_int),
         ("fuse_output_relayout", ctypes.c_int),
+        ("source_active_masks", ctypes.POINTER(ctypes.c_ubyte)),
+        ("source_active_masks_len", ctypes.c_int),
+        ("target_active_masks", ctypes.POINTER(ctypes.c_ubyte)),
+        ("target_active_masks_len", ctypes.c_int),
     ]
 
 
@@ -211,6 +223,13 @@ def load_library() -> ctypes.CDLL | None:
             lib = ctypes.CDLL(str(path))
             lib.OrionDiagBuilderVersion.argtypes = []
             lib.OrionDiagBuilderVersion.restype = ctypes.c_char_p
+            raw_version = lib.OrionDiagBuilderVersion()
+            version = raw_version.decode("utf-8", errors="replace") if raw_version else ""
+            if "provider_active_mask_v3" not in str(version):
+                raise OSError(
+                    "diag_builder shared library is too old for provider active-mask ABI: "
+                    f"{version!r}"
+                )
             lib.OrionDiagBuilderLastError.argtypes = []
             lib.OrionDiagBuilderLastError.restype = ctypes.c_char_p
             lib.OrionBuildDenseConv2D.argtypes = [
@@ -329,6 +348,21 @@ def _shape4(values: Any) -> tuple[int, int, int, int]:
     if len(shape) != 4:
         raise ValueError(f"expected 4D shape, got {shape!r}")
     return shape
+
+
+def _active_mask_array(mask: Any | None, *, slots: int, name: str) -> np.ndarray | None:
+    if mask is None:
+        return None
+    arr = np.asarray(mask, dtype=np.bool_).reshape(-1)
+    if int(arr.size) != int(slots):
+        raise ValueError(f"{name} length {int(arr.size)} does not match slot count {int(slots)}")
+    return np.ascontiguousarray(arr.astype(np.uint8, copy=False), dtype=np.uint8)
+
+
+def _active_mask_ptr(mask: np.ndarray | None) -> ctypes.POINTER(ctypes.c_ubyte):
+    if mask is None:
+        return ctypes.POINTER(ctypes.c_ubyte)()
+    return mask.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
 
 
 def _int_array(values: Iterable[int]):
@@ -820,6 +854,8 @@ def build_provider_native_source_conv2d_payload(
     compact_target_block: int | None = None,
     source_index_override: int | None = None,
     target_index_override: int | None = None,
+    source_active_mask: Any | None = None,
+    target_active_mask: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]] | None:
     lib = load_library()
     build = None if lib is None else getattr(lib, "OrionBuildProviderNativeSourceConv2D", None)
@@ -839,6 +875,8 @@ def build_provider_native_source_conv2d_payload(
         if source_index_override is not None
         else int(plan.source_block_index(stripe, int(source_group)))
     )
+    source_mask_np = _active_mask_array(source_active_mask, slots=int(spec.slot_count), name="source_active_mask")
+    target_mask_np = _active_mask_array(target_active_mask, slots=int(spec.slot_count), name="target_active_mask")
     source_owner_h_start = getattr(stripe, "source_owner_h_start", None)
     if source_owner_h_start is None:
         source_owner_h_start = int(stripe.source_h_start)
@@ -881,6 +919,10 @@ def build_provider_native_source_conv2d_payload(
         int(target_index),
         int(compact_target_block is not None),
         int(-1 if compact_target_block is None else compact_target_block),
+        _active_mask_ptr(source_mask_np),
+        0 if source_mask_np is None else int(source_mask_np.size),
+        _active_mask_ptr(target_mask_np),
+        0 if target_mask_np is None else int(target_mask_np.size),
     )
     if weight_np is None:
         weight_np = np.ascontiguousarray(weight.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1), dtype=np.float32)
@@ -913,6 +955,11 @@ def build_provider_native_source_conv2d_payload(
             "diag_builder_source_owner_h_end": int(source_owner_h_end),
             "diag_builder_source_index_override": bool(source_index_override is not None),
             "diag_builder_target_index_override": bool(target_index_override is not None),
+            "provider_mvm_active_mask_abi_version": 1,
+            "provider_mvm_source_active_filter": bool(source_mask_np is not None),
+            "provider_mvm_target_active_filter": bool(target_mask_np is not None),
+            "provider_mvm_source_active_slots": int(source_mask_np.sum()) if source_mask_np is not None else -1,
+            "provider_mvm_target_active_slots": int(target_mask_np.sum()) if target_mask_np is not None else -1,
         }
         return payload.diag_indices, payload.diag_data, metadata
     finally:
@@ -929,6 +976,8 @@ def build_provider_compact_source_conv2d_payload(
     target_group: int,
     source_layout: dict[str, Any],
     compact_target_block: int | None = None,
+    source_active_mask: Any | None = None,
+    target_active_mask: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]] | None:
     lib = load_library()
     build = None if lib is None else getattr(lib, "OrionBuildProviderCompactSourceConv2D", None)
@@ -961,6 +1010,8 @@ def build_provider_compact_source_conv2d_payload(
         ),
     )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
+    source_mask_np = _active_mask_array(source_active_mask, slots=int(spec.slot_count), name="source_active_mask")
+    target_mask_np = _active_mask_array(target_active_mask, slots=int(spec.slot_count), name="target_active_mask")
     c_spec = _CProviderCompactSourceSpec(
         int(spec.slot_count),
         int(spec.c_in),
@@ -991,6 +1042,10 @@ def build_provider_compact_source_conv2d_payload(
         int(target_index),
         int(compact_target_block is not None),
         int(-1 if compact_target_block is None else compact_target_block),
+        _active_mask_ptr(source_mask_np),
+        0 if source_mask_np is None else int(source_mask_np.size),
+        _active_mask_ptr(target_mask_np),
+        0 if target_mask_np is None else int(target_mask_np.size),
     )
     weight_np = np.ascontiguousarray(weight.detach().cpu().to(dtype=torch.float32).numpy().reshape(-1), dtype=np.float32)
     started = time.perf_counter()
@@ -1014,6 +1069,11 @@ def build_provider_compact_source_conv2d_payload(
             "diag_builder_build_s": float(build_s),
             "diag_builder_payload_count": 1.0,
             "diag_builder_fallback_reason": "",
+            "provider_mvm_active_mask_abi_version": 1,
+            "provider_mvm_source_active_filter": bool(source_mask_np is not None),
+            "provider_mvm_target_active_filter": bool(target_mask_np is not None),
+            "provider_mvm_source_active_slots": int(source_mask_np.sum()) if source_mask_np is not None else -1,
+            "provider_mvm_target_active_slots": int(target_mask_np.sum()) if target_mask_np is not None else -1,
         }
         return payload.diag_indices, payload.diag_data, metadata
     finally:
@@ -1030,6 +1090,8 @@ def build_provider_compact_source_concat_conv2d_indices(
     target_ct_count: int,
     output_materialization: str = "",
     weight_np: np.ndarray | None = None,
+    source_active_masks: Any | None = None,
+    target_active_masks: Any | None = None,
 ) -> tuple[dict[int, list[tuple[int, tuple[int, ...]]]], dict[str, Any]] | None:
     lib = load_library()
     build = None if lib is None else getattr(lib, "OrionBuildProviderCompactSourceConcatConv2DIndexOnly", None)
@@ -1056,6 +1118,16 @@ def build_provider_compact_source_concat_conv2d_indices(
         ),
     )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
+    source_masks_np = _active_mask_array(
+        source_active_masks,
+        slots=int(source_ct_count) * int(spec.slot_count),
+        name="source_active_masks",
+    )
+    target_masks_np = _active_mask_array(
+        target_active_masks,
+        slots=int(target_ct_count) * int(spec.slot_count),
+        name="target_active_masks",
+    )
     c_spec = _CProviderCompactSourceConcatIndexSpec(
         int(spec.slot_count),
         int(spec.c_in),
@@ -1079,6 +1151,10 @@ def build_provider_compact_source_concat_conv2d_indices(
         int(source_ct_count),
         int(target_ct_count),
         int(str(output_materialization or "") == "fused_relayout"),
+        _active_mask_ptr(source_masks_np),
+        0 if source_masks_np is None else int(source_masks_np.size),
+        _active_mask_ptr(target_masks_np),
+        0 if target_masks_np is None else int(target_masks_np.size),
     )
     stripe_specs = [
         _CProviderStripeSpec(
@@ -1117,6 +1193,9 @@ def build_provider_compact_source_concat_conv2d_indices(
                 "diag_builder_build_s": float(build_s),
                 "diag_builder_payload_count": 0.0,
                 "diag_builder_fallback_reason": "",
+                "provider_mvm_active_mask_abi_version": 1,
+                "provider_mvm_source_active_filter": bool(source_masks_np is not None),
+                "provider_mvm_target_active_filter": bool(target_masks_np is not None),
             }
             return {}, metadata
         by_source: dict[int, list[tuple[int, tuple[int, ...]]]] = {}
@@ -1138,6 +1217,11 @@ def build_provider_compact_source_concat_conv2d_indices(
             "diag_builder_build_s": float(build_s),
             "diag_builder_payload_count": float(len(payloads)),
             "diag_builder_fallback_reason": "",
+            "provider_mvm_active_mask_abi_version": 1,
+            "provider_mvm_source_active_filter": bool(source_masks_np is not None),
+            "provider_mvm_target_active_filter": bool(target_masks_np is not None),
+            "provider_mvm_source_active_slots": int(source_masks_np.sum()) if source_masks_np is not None else -1,
+            "provider_mvm_target_active_slots": int(target_masks_np.sum()) if target_masks_np is not None else -1,
         }
         return ordered, metadata
     finally:

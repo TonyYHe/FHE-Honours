@@ -2373,22 +2373,63 @@ class LayoutPolicyProviderRuntimeExecutor:
             return "provider_executable+compact_layout"
         return "provider_executable+relayout_lt"
 
-    def _bootstrap_prescale_fusion_spec(self) -> dict[str, float] | None:
+    @staticmethod
+    def _bootstrap_prescale_mask_summary(fusion: dict[str, Any] | None) -> dict[str, Any]:
+        if not fusion or "active_mask" not in fusion:
+            return {"masked": bool(dict(fusion or {}).get("masked", False))}
+        mask = fusion["active_mask"]
+        if not isinstance(mask, torch.Tensor):
+            return {"masked": bool(dict(fusion).get("masked", False))}
+        active_mask = mask.detach().cpu().to(dtype=torch.bool)
+        total = int(active_mask.numel())
+        active = int(active_mask.sum().item()) if total > 0 else 0
+        return {
+            "masked": bool(total > 0 and active < total),
+            "active_slots": int(active),
+            "inactive_slots": int(total - active),
+            "total_slots": int(total),
+            "mask_shape": [int(value) for value in tuple(active_mask.shape)],
+            "mask_source": str(dict(fusion).get("mask_source", "")),
+        }
+
+    def _bootstrap_prescale_fusion_spec(self) -> dict[str, Any] | None:
         fusion = self.__dict__.get("_bootstrap_prescale_fusion", None)
         if not fusion:
             return None
-        return {
+        raw = dict(fusion)
+        spec: dict[str, Any] = {
             "scale": float(dict(fusion).get("scale", 1.0)),
             "bias": float(dict(fusion).get("bias", 0.0)),
+            **self._bootstrap_prescale_mask_summary(raw),
         }
+        if isinstance(raw.get("active_mask"), torch.Tensor):
+            spec["active_mask"] = raw["active_mask"].detach().cpu().to(dtype=torch.bool)
+        return spec
 
-    def bootstrap_prescale_fusion_capable(self) -> bool:
+    def bootstrap_prescale_fusion_capable(
+        self,
+        *,
+        masked: bool = False,
+        active_mask: torch.Tensor | None = None,
+    ) -> bool:
         if str(getattr(self, "unsupported_layout_policy_reason", "") or ""):
             return False
+        requires_mask = bool(masked)
+        if active_mask is not None:
+            mask = active_mask.detach().cpu().to(dtype=torch.bool)
+            requires_mask = bool(int(mask.numel()) > 0 and int(mask.sum().item()) < int(mask.numel()))
         if self.output_relayout_rows:
-            return True
+            return not bool(requires_mask)
         module = getattr(self.base_executor, "module", None)
-        return bool(module is not None and hasattr(module, "on_weight") and hasattr(module, "on_bias"))
+        has_mvm_bias = bool(module is not None and hasattr(module, "on_weight") and hasattr(module, "on_bias"))
+        if not bool(has_mvm_bias):
+            return False
+        if not bool(requires_mask):
+            return True
+        return bool(
+            getattr(self.base_executor, "native_halo_output_capable", False)
+            or getattr(self.base_executor, "same_shape_runtime_layout", "") == "native_halo_stripe_no_ri_io"
+        )
 
     def _native_halo_module_attrs(self) -> dict[str, Any]:
         return _layout_policy_native_module_attrs(
@@ -2408,10 +2449,29 @@ class LayoutPolicyProviderRuntimeExecutor:
             return {}
         scale = float(fusion["scale"])
         bias = float(fusion["bias"])
-        return {
+        attrs: dict[str, Any] = {
             "on_weight": getattr(module, "on_weight") * float(scale),
             "on_bias": getattr(module, "on_bias") * float(scale) + float(bias),
         }
+        if bool(fusion.get("masked", False)):
+            attrs["_bootstrap_prescale_fusion_masked"] = True
+            attrs["_bootstrap_prescale_active_mask"] = fusion.get("active_mask")
+            attrs["_bootstrap_prescale_fusion_scale"] = float(scale)
+            attrs["_bootstrap_prescale_fusion_bias"] = float(bias)
+            attrs["_bootstrap_prescale_affine_mask_summary"] = {
+                key: value
+                for key, value in fusion.items()
+                if key
+                in {
+                    "masked",
+                    "active_slots",
+                    "inactive_slots",
+                    "total_slots",
+                    "mask_shape",
+                    "mask_source",
+                }
+            }
+        return attrs
 
     def _with_base_module_attrs(self, callback: Any) -> Any:
         attrs = {
@@ -2619,6 +2679,20 @@ class LayoutPolicyProviderRuntimeExecutor:
                 **base_timing,
                 "relayout_s": float(relayout_s + output_relayout_s),
             }
+            fusion = self._bootstrap_prescale_fusion_spec()
+            fusion_summary = {
+                key: value
+                for key, value in dict(fusion or {}).items()
+                if key
+                in {
+                    "masked",
+                    "active_slots",
+                    "inactive_slots",
+                    "total_slots",
+                    "mask_shape",
+                    "mask_source",
+                }
+            }
             self.last_runtime_io = {
                 **base_io,
                 "policy": str(self.compile_plan.get("policy", "")),
@@ -2644,7 +2718,9 @@ class LayoutPolicyProviderRuntimeExecutor:
                 "relayout_rotation_count": int(relayout_ops["rotation_count"]),
                 "relayout_mask_mult_count": int(relayout_ops["mask_mult_count"]),
                 "relayout_sparse_lt_count": int(relayout_ops["sparse_lt_count"]),
-                "bootstrap_prescale_fused": bool(self._bootstrap_prescale_fusion_spec() is not None),
+                "bootstrap_prescale_fused": bool(fusion is not None),
+                "bootstrap_prescale_masked": bool(fusion_summary.get("masked", False)),
+                "bootstrap_prescale_mask": fusion_summary,
             }
             return outputs
         finally:
@@ -2678,6 +2754,20 @@ class LayoutPolicyProviderRuntimeExecutor:
         get_metadata = getattr(self.base_executor, "compile_cache_metadata", None)
         if callable(get_metadata):
             metadata = dict(self._with_base_module_attrs(lambda: get_metadata()))
+        fusion = self._bootstrap_prescale_fusion_spec()
+        fusion_summary = {
+            key: value
+            for key, value in dict(fusion or {}).items()
+            if key
+            in {
+                "masked",
+                "active_slots",
+                "inactive_slots",
+                "total_slots",
+                "mask_shape",
+                "mask_source",
+            }
+        }
         metadata["layout_policy_wrapper"] = {
             "policy": str(self.compile_plan.get("policy", "")),
             "relayout_edge_count": int(len(self.relayout_rows)),
@@ -2718,7 +2808,9 @@ class LayoutPolicyProviderRuntimeExecutor:
             "base_executor": type(self.base_executor).__name__,
             "runtime_lowering": self._runtime_lowering_label(),
             "native_halo_provider": bool(self.native_halo_input),
-            "bootstrap_prescale_fused": bool(self._bootstrap_prescale_fusion_spec() is not None),
+            "bootstrap_prescale_fused": bool(fusion is not None),
+            "bootstrap_prescale_masked": bool(fusion_summary.get("masked", False)),
+            "bootstrap_prescale_mask": fusion_summary,
         }
         if self.native_physical_relayout_kernel is not None:
             metadata["layout_policy_wrapper"]["native_physical_input_relayout"] = (
@@ -3852,7 +3944,43 @@ class TconvK2S2PythonRuntimeExecutor:
     def load_compile_cache_metadata(self, metadata: dict[str, Any]) -> None:
         self._compile_cache_metadata = dict(metadata or {})
 
+    def _bootstrap_prescale_fusion_mask_summary(self) -> dict[str, Any]:
+        masked = bool(getattr(self.module, "_bootstrap_prescale_fusion_masked", False))
+        summary = dict(getattr(self.module, "_bootstrap_prescale_affine_mask_summary", {}) or {})
+        active_mask = getattr(self.module, "_bootstrap_prescale_active_mask", None)
+        if isinstance(active_mask, torch.Tensor):
+            mask = active_mask.detach().cpu().to(dtype=torch.bool)
+            total = int(mask.numel())
+            active = int(mask.sum().item()) if total > 0 else 0
+            summary.update(
+                {
+                    "masked": bool(total > 0 and active < total),
+                    "active_slots": int(active),
+                    "inactive_slots": int(total - active),
+                    "total_slots": int(total),
+                    "mask_shape": [int(value) for value in tuple(mask.shape)],
+                }
+            )
+        elif masked:
+            summary["masked"] = True
+        return {
+            "masked": bool(summary.get("masked", False)),
+            **{
+                key: value
+                for key, value in summary.items()
+                if key
+                in {
+                    "active_slots",
+                    "inactive_slots",
+                    "total_slots",
+                    "mask_shape",
+                    "mask_source",
+                }
+            },
+        }
+
     def compile_cache_metadata(self) -> dict[str, Any]:
+        fusion_mask = self._bootstrap_prescale_fusion_mask_summary()
         return {
             "kind": type(self).__name__,
             "fhe_input_shape": [int(value) for value in self.compiled_fhe_input_shape],
@@ -3871,6 +3999,8 @@ class TconvK2S2PythonRuntimeExecutor:
             "output_total_slots": int(self.output_total_slots),
             "output_fold_block_height": int(self.output_fold_block_height),
             "output_fold_rotations": int(self.output_fold_rotations),
+            "compiled_transform_count": int(self.compiled_transform_count),
+            "skipped_empty_transform_count": int(self.skipped_empty_transform_count),
             "native_source_tconv_output_assignments": {
                 str(int(source_block)): [int(value) for value in output_blocks]
                 for source_block, output_blocks in dict(self.native_source_tconv_output_assignments).items()
@@ -3886,6 +4016,11 @@ class TconvK2S2PythonRuntimeExecutor:
             "hybrid_pair_layout_reject_reasons": [
                 str(value) for value in self.hybrid_pair_layout_reject_reasons
             ],
+            "bootstrap_prescale_masked_affine": bool(fusion_mask.get("masked", False)),
+            "bootstrap_prescale_masked_affine_strategy": (
+                "tconv_mvm_bias_active_slots" if bool(fusion_mask.get("masked", False)) else ""
+            ),
+            "bootstrap_prescale_masked_affine_mask": fusion_mask,
             "groups_by_input_unit": [
                 {
                     "storage_key": str(getattr(group, "_storage_key", "")),
@@ -4224,6 +4359,142 @@ class TconvK2S2PythonRuntimeExecutor:
             channels=int(getattr(self.module, "output_shape")[1]),
             label="target",
         )
+
+    def _strict_inactive_slot_zero_enabled(self) -> bool:
+        return bool(_env_truthy("ORION_STRICT_INACTIVE_SLOT_ZERO") or _env_truthy("ORION_NATIVE_MVM_ZERO_INACTIVE_SLOTS"))
+
+    def _provider_mvm_masked_materialization_enabled(self) -> bool:
+        value = os.environ.get("ORION_PROVIDER_MVM_MASKED_MATERIALIZATION")
+        if value is None:
+            return True
+        return bool(_env_truthy("ORION_PROVIDER_MVM_MASKED_MATERIALIZATION"))
+
+    @staticmethod
+    def _cipher_mask_meta(value: Any) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "id_count": int(len(getattr(value, "ids", ()) or ())),
+            "shape": [int(v) for v in tuple(getattr(value, "shape", ()) or ())],
+            "on_shape": [int(v) for v in tuple(getattr(value, "on_shape", ()) or ())],
+        }
+        if int(meta["id_count"]) > 0:
+            for name, getter in (
+                ("level", getattr(value, "level", None)),
+                ("scale", getattr(value, "scale", None)),
+                ("log_scale", getattr(value, "log_scale", None)),
+            ):
+                if not callable(getter):
+                    continue
+                try:
+                    raw = getter()
+                    meta[str(name)] = float(raw) if str(name) == "log_scale" else int(raw)
+                except Exception:
+                    pass
+        return meta
+
+    def _native_output_active_slot_mask(self, *, slots: int) -> torch.Tensor | None:
+        signature = tuple(self._native_output_storage_blocks())
+        if not signature:
+            return None
+        logical_shape = tuple(int(value) for value in tuple(getattr(self.module, "output_shape", ()) or ()))
+        if len(logical_shape) != 4:
+            raise RuntimeError(f"{self.output_node_id} native output mask requires 4D output shape, got {logical_shape}")
+        n, channels, height, width = logical_shape
+        if int(n) != 1:
+            raise RuntimeError(f"{self.output_node_id} native output mask currently supports batch=1, got {int(n)}")
+        gap = max(1, int(getattr(self.module, "output_gap", 1) or 1))
+        phases = int(gap * gap)
+        packed_w = int(width) * int(gap)
+        mask = torch.zeros((int(len(signature)), int(slots)), dtype=torch.bool)
+        for block_index, (h_start, h_end, channel_start, channel_count) in enumerate(signature):
+            block_h = int(h_end) - int(h_start)
+            if int(block_h) <= 0 or int(channel_count) <= 0:
+                continue
+            group_block = int(block_h) * int(gap) * int(packed_w)
+            for local_channel in range(int(channel_count)):
+                channel = int(channel_start) + int(local_channel)
+                if int(channel) < 0 or int(channel) >= int(channels):
+                    continue
+                group = int(local_channel) // int(phases)
+                phase = int(local_channel) % int(phases)
+                phase_h = int(phase) // int(gap)
+                phase_w = int(phase) % int(gap)
+                for global_h in range(int(h_start), int(h_end)):
+                    if int(global_h) < 0 or int(global_h) >= int(height):
+                        continue
+                    local_h = int(global_h) - int(h_start)
+                    for w_index in range(int(width)):
+                        slot = (
+                            int(group) * int(group_block)
+                            + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                            + int(w_index) * int(gap)
+                            + int(phase_w)
+                        )
+                        if int(slot) < 0 or int(slot) >= int(slots):
+                            raise RuntimeError(
+                                f"{self.output_node_id} native output active slot out of range: "
+                                f"{int(slot)} / {int(slots)}"
+                            )
+                        mask[int(block_index), int(slot)] = True
+        return mask
+
+    def _zero_native_output_inactive_slots_no_rescale(self, value: Any) -> tuple[Any, dict[str, Any]]:
+        ids = [int(v) for v in tuple(getattr(value, "ids", ()) or ())]
+        slots = int(value.scheme.params.get_slots())
+        active_mask = self._native_output_active_slot_mask(slots=int(slots))
+        if active_mask is None:
+            return value, {
+                "enabled": True,
+                "applied": False,
+                "reason": "no_native_output_signature",
+            }
+        if len(ids) != int(active_mask.shape[0]):
+            raise RuntimeError(
+                f"{self.output_node_id} inactive-slot mask block count mismatch: "
+                f"cipher has {len(ids)} ids, mask has {int(active_mask.shape[0])}"
+            )
+        backend = value.backend
+        mul_plain_new = getattr(backend, "MulPlaintextNew", None)
+        if not callable(mul_plain_new):
+            raise RuntimeError("backend does not expose MulPlaintextNew for no-rescale inactive-slot masking")
+        level = int(value.level())
+        before = self._cipher_mask_meta(value)
+        out_ids: list[int] = []
+        plaintext_count = 0
+        for block_index, ct_id in enumerate(ids):
+            mask = active_mask[int(block_index)].detach().cpu().to(dtype=torch.float32)
+            ptxt = value.scheme.encode(mask, int(level), scale=1)
+            try:
+                out_ids.append(int(mul_plain_new(int(ct_id), int(ptxt.ids[0]))))
+                plaintext_count += 1
+            finally:
+                ptxt.release()
+        from orion.backend.python.tensors import CipherTensor
+
+        masked = CipherTensor(value.scheme, out_ids, value.shape, value.on_shape)
+        after = self._cipher_mask_meta(masked)
+        return masked, {
+            "enabled": True,
+            "applied": True,
+            "kind": "native_output_inactive_slot_plaintext_mask_no_rescale",
+            "mask_scale": 1,
+            "plaintext_count": int(plaintext_count),
+            "total_slots": int(active_mask.numel()),
+            "active_slots": int(active_mask.sum().item()) if int(active_mask.numel()) > 0 else 0,
+            "inactive_slots": int((~active_mask).sum().item()) if int(active_mask.numel()) > 0 else 0,
+            "mask_shape": [int(value) for value in tuple(active_mask.shape)],
+            "before": before,
+            "after": after,
+            "level_delta": (
+                int(after["level"]) - int(before["level"])
+                if "level" in before and "level" in after
+                else None
+            ),
+            "log_scale_delta": (
+                float(after["log_scale"]) - float(before["log_scale"])
+                if "log_scale" in before and "log_scale" in after
+                else None
+            ),
+        }
 
     def _cache_layout_signature(self) -> dict[str, Any]:
         return {
@@ -5975,6 +6246,11 @@ class TconvK2S2PythonRuntimeExecutor:
         empty_transform_count = 0
         recipe_diagonal_cache: dict[str, Any] = {}
         recipe_cache_lock = threading.Lock()
+        materialization_active_mask = (
+            self._native_output_active_slot_mask(slots=int(slots))
+            if bool(native_output_blocks) and self._provider_mvm_masked_materialization_enabled()
+            else None
+        )
 
         def release_recipe_diagonal_cache() -> None:
             with recipe_cache_lock:
@@ -5994,10 +6270,17 @@ class TconvK2S2PythonRuntimeExecutor:
                 block_diag_idx = torch.empty((0,), dtype=torch.int64)
                 block_output_local = torch.empty((0,), dtype=torch.int64)
                 block_values = torch.empty((0,), dtype=torch.float32)
+            block_materialization_mask = (
+                materialization_active_mask[int(output_block)]
+                if materialization_active_mask is not None
+                else None
+            )
             for diag_idx in torch.unique(block_diag_idx).tolist():
                 mask = block_diag_idx == int(diag_idx)
                 diag = torch.zeros((int(slots),), dtype=torch.float32)
                 diag.index_add_(0, block_output_local[mask], block_values[mask])
+                if block_materialization_mask is not None:
+                    diag.masked_fill_(~block_materialization_mask, 0.0)
                 diagonals[int(diag_idx)] = diag
             if not diagonals:
                 empty_transform_count += 1
@@ -6104,6 +6387,11 @@ class TconvK2S2PythonRuntimeExecutor:
         self._bias_ptxt_cache[cache_key] = ptxt
         return ptxt
 
+    def _masked_materialization_inactive_fill(self) -> float:
+        if bool(getattr(self.module, "_bootstrap_prescale_fusion_masked", False)):
+            return float(getattr(self.module, "_bootstrap_prescale_fusion_bias", 0.0))
+        return 0.0
+
     def _construct_bias_vector(self) -> torch.Tensor:
         n, channels, height, width = (int(value) for value in getattr(self.module, "output_shape"))
         native_output_blocks = self._native_output_storage_blocks()
@@ -6138,6 +6426,11 @@ class TconvK2S2PythonRuntimeExecutor:
                 channels_for_bias = local_c_grid.reshape(-1)[valid] + int(channel_start)
                 start = int(block_index * block_slots)
                 bias_vector[start + slot_index[valid]] = bias[channels_for_bias.to(dtype=torch.int64)]
+            if self._provider_mvm_masked_materialization_enabled():
+                active_mask = self._native_output_active_slot_mask(slots=int(block_slots))
+                if active_mask is not None:
+                    blocks = bias_vector.reshape(int(len(native_output_blocks)), int(block_slots))
+                    blocks.masked_fill_(~active_mask, float(self._masked_materialization_inactive_fill()))
             return bias_vector.repeat(int(n))
 
         on_channels, on_height, on_width = (int(value) for value in getattr(self.module, "fhe_output_shape")[1:])
@@ -6209,6 +6502,9 @@ class TconvK2S2PythonRuntimeExecutor:
         self.last_runtime_io["use_ct_pt_hybrid_packing"] = bool(self.use_ct_pt_hybrid_packing)
         self.last_runtime_io["project_complex_inputs_to_real"] = bool(self.project_complex_inputs_to_real)
         self.last_runtime_io["disable_tile_family_sharing"] = bool(self.disable_tile_family_sharing)
+        self.last_runtime_io["provider_mvm_masked_materialization"] = bool(
+            self._provider_mvm_masked_materialization_enabled()
+        )
         self.last_runtime_io["compiled_transform_count"] = int(self.compiled_transform_count)
         self.last_runtime_io["skipped_empty_transform_count"] = int(self.skipped_empty_transform_count)
         self.last_runtime_io["hybrid_pair_count"] = int(self.hybrid_pair_count)
@@ -6235,6 +6531,12 @@ class TconvK2S2PythonRuntimeExecutor:
             str(int(source_block)): [int(value) for value in output_blocks]
             for source_block, output_blocks in dict(self.native_source_tconv_output_assignments).items()
         }
+        fusion_mask = self._bootstrap_prescale_fusion_mask_summary()
+        self.last_runtime_io["bootstrap_prescale_masked_affine"] = bool(fusion_mask.get("masked", False))
+        self.last_runtime_io["bootstrap_prescale_masked_affine_strategy"] = (
+            "tconv_mvm_bias_active_slots" if bool(fusion_mask.get("masked", False)) else ""
+        )
+        self.last_runtime_io["bootstrap_prescale_masked_affine_mask"] = fusion_mask
         self.last_runtime_io.update(
             self._rotation_report_snapshot_for_scheme(
                 scheme=scheme,
@@ -6371,6 +6673,10 @@ class TconvK2S2PythonRuntimeExecutor:
         out = self._assemble_output(final_ids, scheme=scheme)
         self.last_runtime_timing["bias_s"] = float(time.time() - bias_started)
         self.last_runtime_counts["bias_add_count"] = int(len(final_ids))
+        strict_inactive_slot_zero: dict[str, Any] = {"enabled": False, "applied": False}
+        if self._strict_inactive_slot_zero_enabled():
+            out, strict_inactive_slot_zero = self._zero_native_output_inactive_slots_no_rescale(out)
+        self.last_runtime_io["strict_inactive_slot_zero"] = strict_inactive_slot_zero
         self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
         self.last_runtime_timing["total_call_s"] = float(time.time() - call_started)
         self.last_runtime_io["output"] = self._cipher_ids_state([int(value) for value in getattr(out, "ids", ())], scheme=scheme)

@@ -56,6 +56,39 @@ def test_layer_mae_targets_exclude_modules_fused_after_compile() -> None:
     assert _layer_mae_target_names(net) == ["conv"]
 
 
+def test_masked_producer_affine_matches_unfused_bootstrap_preprocess_algebra() -> None:
+    values = torch.tensor(
+        [
+            [0.25, -0.5, 12_345_678.0, -12_345_678.0],
+            [0.75, 1.25, 0.0, -50.0],
+        ],
+        dtype=torch.float32,
+    )
+    active_mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, False, True, False],
+        ],
+        dtype=torch.bool,
+    )
+    scale = 0.25
+    constant = -1.5
+    scalar_bias = float(scale * constant)
+
+    unfused_preboot = (values + float(constant)) * float(scale)
+    unfused_preboot = torch.where(active_mask, unfused_preboot, torch.zeros_like(unfused_preboot))
+
+    masked_fused = torch.where(
+        active_mask,
+        values * float(scale) + float(scalar_bias),
+        torch.zeros_like(values),
+    )
+    scalar_fused = values * float(scale) + float(scalar_bias)
+
+    assert torch.equal(masked_fused, unfused_preboot)
+    assert float((scalar_fused[~active_mask] - unfused_preboot[~active_mask]).abs().max().item()) > 1.0
+
+
 def test_bootstrap_placer_uses_runtime_materialized_output_shape() -> None:
     class _RuntimeExecutor:
         def runtime_fhe_output_shape(self):

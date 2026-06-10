@@ -51,6 +51,10 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() not in _FALSE_ENV_VALUES
 
 
+def _provider_mvm_masked_materialization_enabled() -> bool:
+    return bool(_env_enabled("ORION_PROVIDER_MVM_MASKED_MATERIALIZATION", default=True))
+
+
 def _provider_diag_builder_enabled() -> bool:
     return bool(_env_enabled("ORION_CPP_DIAG_BUILDER") and _env_enabled("ORION_CPP_DIAG_BUILDER_PROVIDER", True))
 
@@ -407,6 +411,184 @@ def _idx_chw_gap_channel_positions(
         + w_values * int(g)
         + phase_w
     ).to(dtype=torch.int64)
+
+
+def _native_halo_target_active_slot_mask_for_block(
+    *,
+    spec: Any,
+    plan: Any,
+    stripe: Any,
+    target_group: int,
+    slots: int,
+    compact_target_block: int | None = None,
+) -> torch.Tensor:
+    mask = torch.zeros((int(slots),), dtype=torch.bool)
+    gap = max(1, int(spec.gap_out))
+    phases = int(gap * gap)
+    packed_w = int(spec.w_out) * int(gap)
+    target_tile = int(plan.target_tile_for_stripe(stripe))
+    channel_start = int(target_group) * int(target_tile)
+    channel_end = min(int(spec.c_out), int(channel_start) + int(target_tile))
+    compact_output = compact_target_block is not None
+    target_height = _spec_physical_output_h(spec) if bool(compact_output) else int(stripe.target_h)
+    group_block = int(target_height) * int(gap) * int(packed_w)
+    for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
+        if int(channel) < 0 or int(channel) >= int(spec.c_out):
+            continue
+        target_channel = int(channel) if bool(compact_output) else int(local_channel)
+        group = int(target_channel) // int(phases)
+        phase = int(target_channel) % int(phases)
+        phase_h = int(phase) // int(gap)
+        phase_w = int(phase) % int(gap)
+        for global_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
+            if bool(compact_output):
+                if int(global_h) < 0 or int(global_h) >= int(spec.h_out):
+                    continue
+                local_h = int(_spec_physical_output_h_positions(spec, int(global_h)))
+            else:
+                if int(global_h) < 0 or int(global_h) >= int(spec.h_out):
+                    continue
+                local_h = int(global_h) - int(stripe.target_h_start)
+            for w_index in range(int(spec.w_out)):
+                slot = (
+                    int(group) * int(group_block)
+                    + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                    + int(w_index) * int(gap)
+                    + int(phase_w)
+                )
+                if bool(compact_output):
+                    if int(slot) // int(slots) != int(compact_target_block):
+                        continue
+                    slot = int(slot) % int(slots)
+                if int(slot) < 0 or int(slot) >= int(slots):
+                    raise RuntimeError(f"native halo target active slot out of range: {int(slot)} / {int(slots)}")
+                mask[int(slot)] = True
+    return mask
+
+
+def _native_halo_source_active_slot_mask_for_block(
+    *,
+    spec: Any,
+    plan: Any,
+    stripe: Any,
+    source_group: int,
+    slots: int,
+) -> torch.Tensor:
+    mask = torch.zeros((int(slots),), dtype=torch.bool)
+    gap = max(1, int(spec.gap_in))
+    phases = int(gap * gap)
+    packed_w = int(spec.w_in) * int(gap)
+    source_tile = int(plan.source_tile_for_stripe(stripe))
+    channel_start = int(source_group) * int(source_tile)
+    channel_end = min(int(spec.c_in), int(channel_start) + int(source_tile))
+    group_block = int(stripe.source_h) * int(gap) * int(packed_w)
+    h_start = max(
+        int(stripe.source_h_start),
+        0,
+        int(_input_physical_h_min(spec)),
+        int(_stripe_source_owner_h_start(stripe)),
+    )
+    h_end = min(
+        int(stripe.source_h_end),
+        int(spec.h_in),
+        int(_input_physical_h_max(spec)),
+        int(_stripe_source_owner_h_end(stripe)),
+    )
+    if int(h_end) <= int(h_start):
+        return mask
+    for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
+        if int(channel) < 0 or int(channel) >= int(spec.c_in):
+            continue
+        group = int(local_channel) // int(phases)
+        phase = int(local_channel) % int(phases)
+        phase_h = int(phase) // int(gap)
+        phase_w = int(phase) % int(gap)
+        for global_h in range(int(h_start), int(h_end)):
+            local_h = int(global_h) - int(stripe.source_h_start)
+            if int(local_h) < 0 or int(local_h) >= int(stripe.source_h):
+                continue
+            for w_index in range(int(spec.w_in)):
+                slot = (
+                    int(group) * int(group_block)
+                    + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                    + int(w_index) * int(gap)
+                    + int(phase_w)
+                )
+                if int(slot) < 0 or int(slot) >= int(slots):
+                    raise RuntimeError(f"native halo source active slot out of range: {int(slot)} / {int(slots)}")
+                mask[int(slot)] = True
+    return mask
+
+
+def _compact_source_active_slot_mask_for_block(
+    *,
+    spec: Any,
+    source_layout: dict[str, Any],
+    source_block: int,
+    slots: int,
+) -> torch.Tensor:
+    mask = torch.zeros((int(slots),), dtype=torch.bool)
+    source_physical_top_beta = max(
+        0,
+        int(_layout_physical_top_beta(source_layout, default=spec.input_physical_top_beta or 0) or 0),
+    )
+    source_physical_bottom_beta = max(
+        0,
+        int(_layout_physical_bottom_beta(source_layout, default=spec.input_physical_bottom_beta or 0) or 0),
+    )
+    source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
+    source_height = int(spec.h_in) + int(source_physical_top_beta) + int(source_physical_bottom_beta)
+    h_start = 0
+    h_end = int(spec.h_in)
+    if int(h_end) <= int(h_start):
+        return mask
+    channels = torch.arange(int(spec.c_in), dtype=torch.int64)
+    for global_h in range(int(h_start), int(h_end)):
+        physical_h = int(global_h) + int(source_physical_top_beta)
+        if int(physical_h) < 0 or int(physical_h) >= int(source_height):
+            continue
+        w_values = torch.arange(int(spec.w_in), dtype=torch.int64)
+        flat_index = _idx_chw_gap_channel_positions(
+            channels,
+            h=torch.full((int(spec.w_in),), int(physical_h), dtype=torch.int64),
+            w=w_values,
+            height=int(source_height),
+            width=int(spec.w_in),
+            gap=int(source_gap),
+        )
+        block_mask = torch.div(flat_index, int(slots), rounding_mode="floor") == int(source_block)
+        if bool(block_mask.any().item()):
+            mask[torch.remainder(flat_index[block_mask], int(slots)).to(dtype=torch.int64)] = True
+    return mask
+
+
+def _mask_transform_diagonals_for_active_slots(transform: Any, active_mask: torch.Tensor) -> Any:
+    mask = active_mask.detach().cpu().to(dtype=torch.bool).reshape(-1)
+    slots = int(mask.numel())
+    masked: dict[Any, dict[int, torch.Tensor]] = {}
+    for block_key, block in dict(getattr(transform, "diagonals", {}) or {}).items():
+        block_diags: dict[int, torch.Tensor] = {}
+        for diag_index, values in dict(block or {}).items():
+            diag = (
+                values.detach().clone().cpu().to(dtype=torch.float32)
+                if isinstance(values, torch.Tensor)
+                else torch.as_tensor(values, dtype=torch.float32).detach().clone().cpu()
+            )
+            diag = diag.reshape(-1)
+            if int(diag.numel()) == 0:
+                block_diags[int(diag_index)] = diag
+                continue
+            if int(diag.numel()) != int(slots):
+                raise RuntimeError(
+                    "provider MVM masked materialization diagonal length mismatch: "
+                    f"got {int(diag.numel())}, expected {int(slots)}"
+                )
+            diag.masked_fill_(~mask, 0.0)
+            block_diags[int(diag_index)] = diag
+        masked[block_key] = block_diags
+    transform.diagonals = masked
+    setattr(transform, "provider_mvm_masked_materialization", True)
+    return transform
 
 
 def _channel_base_offsets_chw_gap(
@@ -1674,6 +1856,24 @@ def _cpp_provider_native_source_transform(
     try:
         from orion.backend.diag_builder import bindings as diag_builder
 
+        source_active_mask = None
+        target_active_mask = None
+        if _provider_mvm_masked_materialization_enabled():
+            source_active_mask = _native_halo_source_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                source_group=int(source_group),
+                slots=int(spec.slot_count),
+            )
+            target_active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                compact_target_block=compact_target_block,
+                slots=int(spec.slot_count),
+            )
         built = diag_builder.build_provider_native_source_conv2d_payload(
             spec=spec,
             plan=plan,
@@ -1685,6 +1885,8 @@ def _cpp_provider_native_source_transform(
             compact_target_block=compact_target_block,
             source_index_override=source_index_override,
             target_index_override=target_index_override,
+            source_active_mask=source_active_mask,
+            target_active_mask=target_active_mask,
         )
     except Exception:
         if _provider_diag_builder_strict():
@@ -1804,6 +2006,23 @@ def _build_conv_transform_batch(
         ]
 
     def build_one(target_group: int) -> tuple[int, tuple[np.ndarray, np.ndarray, dict[str, Any]] | None]:
+        source_active_mask = None
+        target_active_mask = None
+        if _provider_mvm_masked_materialization_enabled():
+            source_active_mask = _native_halo_source_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                source_group=int(source_group),
+                slots=int(spec.slot_count),
+            )
+            target_active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                slots=int(spec.slot_count),
+            )
         built = diag_builder.build_provider_native_source_conv2d_payload(
             spec=spec,
             plan=plan,
@@ -1813,6 +2032,8 @@ def _build_conv_transform_batch(
             source_group=int(source_group),
             target_group=int(target_group),
             compact_target_block=None,
+            source_active_mask=source_active_mask,
+            target_active_mask=target_active_mask,
         )
         return int(target_group), built
 
@@ -1988,6 +2209,23 @@ def _cpp_provider_compact_source_transform(
     try:
         from orion.backend.diag_builder import bindings as diag_builder
 
+        source_active_mask = None
+        target_active_mask = None
+        if _provider_mvm_masked_materialization_enabled():
+            source_active_mask = _compact_source_active_slot_mask_for_block(
+                spec=spec,
+                source_layout=dict(source_layout),
+                source_block=int(source_block),
+                slots=int(spec.slot_count),
+            )
+            target_active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                compact_target_block=compact_target_block,
+                slots=int(spec.slot_count),
+            )
         built = diag_builder.build_provider_compact_source_conv2d_payload(
             spec=spec,
             plan=plan,
@@ -1997,6 +2235,8 @@ def _cpp_provider_compact_source_transform(
             target_group=int(target_group),
             source_layout=dict(source_layout),
             compact_target_block=compact_target_block,
+            source_active_mask=source_active_mask,
+            target_active_mask=target_active_mask,
         )
     except Exception:
         if _provider_diag_builder_strict():
@@ -2069,6 +2309,23 @@ def _build_compact_source_conv_payload_shadow(
             return None
         from orion.backend.diag_builder import bindings as diag_builder
 
+        source_active_mask = None
+        target_active_mask = None
+        if _provider_mvm_masked_materialization_enabled():
+            source_active_mask = _compact_source_active_slot_mask_for_block(
+                spec=spec,
+                source_layout=dict(source_layout),
+                source_block=int(source_block),
+                slots=int(spec.slot_count),
+            )
+            target_active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                compact_target_block=compact_target_block,
+                slots=int(spec.slot_count),
+            )
         built = diag_builder.build_provider_compact_source_conv2d_payload(
             spec=spec,
             plan=plan,
@@ -2078,6 +2335,8 @@ def _build_compact_source_conv_payload_shadow(
             target_group=int(target_group),
             source_layout=dict(source_layout),
             compact_target_block=compact_target_block,
+            source_active_mask=source_active_mask,
+            target_active_mask=target_active_mask,
         )
         if built is None:
             return None
@@ -2136,6 +2395,34 @@ def _build_compact_source_concat_indices_cpp(
     try:
         from orion.backend.diag_builder import bindings as diag_builder
 
+        source_active_masks = None
+        target_active_masks = None
+        if _provider_mvm_masked_materialization_enabled():
+            slots = int(spec.slot_count)
+            source_active_masks = torch.stack(
+                [
+                    _compact_source_active_slot_mask_for_block(
+                        spec=spec,
+                        source_layout=dict(source_layout),
+                        source_block=int(source_block),
+                        slots=int(slots),
+                    )
+                    for source_block in range(int(source_ct_count))
+                ],
+                dim=0,
+            ) if int(source_ct_count) > 0 else torch.zeros((0, int(slots)), dtype=torch.bool)
+            target_active_masks = torch.zeros((int(target_ct_count), int(slots)), dtype=torch.bool)
+            for stripe in tuple(plan.stripes):
+                for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                    for target_block in range(int(target_ct_count)):
+                        target_active_masks[int(target_block)] |= _native_halo_target_active_slot_mask_for_block(
+                            spec=spec,
+                            plan=plan,
+                            stripe=stripe,
+                            target_group=int(target_group),
+                            compact_target_block=int(target_block),
+                            slots=int(slots),
+                        )
         built = diag_builder.build_provider_compact_source_concat_conv2d_indices(
             spec=spec,
             plan=plan,
@@ -2144,6 +2431,8 @@ def _build_compact_source_concat_indices_cpp(
             source_ct_count=int(source_ct_count),
             target_ct_count=int(target_ct_count),
             output_materialization=str(output_materialization or ""),
+            source_active_masks=source_active_masks,
+            target_active_masks=target_active_masks,
         )
     except Exception:
         if _provider_diag_builder_strict():
@@ -2204,6 +2493,15 @@ def _collect_compact_source_conv_diag_sets(
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
     compact_output_h = _spec_physical_output_h(spec)
+    source_active_mask = None
+    target_active_masks: dict[int, torch.Tensor] = {}
+    if _provider_mvm_masked_materialization_enabled():
+        source_active_mask = _compact_source_active_slot_mask_for_block(
+            spec=spec,
+            source_layout=dict(source_layout),
+            source_block=int(source_block),
+            slots=int(slots),
+        )
     out_h_values = torch.arange(
         int(stripe.target_h_start),
         int(stripe.target_h_end),
@@ -2319,12 +2617,26 @@ def _collect_compact_source_conv_diag_sets(
                     block_mask = target_blocks == int(block)
                     if not bool(block_mask.any().item()):
                         continue
+                    if _provider_mvm_masked_materialization_enabled() and int(block) not in target_active_masks:
+                        target_active_masks[int(block)] = _native_halo_target_active_slot_mask_for_block(
+                            spec=spec,
+                            plan=plan,
+                            stripe=stripe,
+                            target_group=int(target_group),
+                            compact_target_block=int(block) if bool(compact_output) else None,
+                            slots=int(slots),
+                        )
                     pair_mask = (
                         source_block_mask[:, None, :]
                         & block_mask[None, :, :]
                         & target_h_valid[None, None, :]
                         & coeff_nonzero[:, :, None]
                     )
+                    if source_active_mask is not None:
+                        pair_mask = pair_mask & source_active_mask[source_vec.to(dtype=torch.int64)][:, None, :]
+                    target_active_mask = target_active_masks.get(int(block))
+                    if target_active_mask is not None:
+                        pair_mask = pair_mask & target_active_mask[target_vec.to(dtype=torch.int64)][None, :, :]
                     if not bool(pair_mask.any().item()):
                         continue
                     diag_sets.setdefault(int(block), set()).update(
@@ -2497,6 +2809,33 @@ def _build_compact_source_concat_transforms_single_slot(
     out_w_values = torch.arange(int(spec.w_out), dtype=torch.int64)
     max_pair_count = int(_native_halo_build_pair_chunk_limit())
     precomputed_index_diag_sets: dict[tuple[int, int], set[int]] | None = None
+    source_active_masks = None
+    target_active_masks = None
+    if _provider_mvm_masked_materialization_enabled():
+        source_active_masks = torch.stack(
+            [
+                _compact_source_active_slot_mask_for_block(
+                    spec=spec,
+                    source_layout=dict(source_layout),
+                    source_block=int(source_block),
+                    slots=int(slots),
+                )
+                for source_block in range(int(source_ct_count))
+            ],
+            dim=0,
+        ) if int(source_ct_count) > 0 else torch.zeros((0, int(slots)), dtype=torch.bool)
+        target_active_masks = torch.zeros((int(target_ct_count), int(slots)), dtype=torch.bool)
+        for stripe in tuple(plan.stripes):
+            for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                for target_block in range(int(target_ct_count)):
+                    target_active_masks[int(target_block)] |= _native_halo_target_active_slot_mask_for_block(
+                        spec=spec,
+                        plan=plan,
+                        stripe=stripe,
+                        target_group=int(target_group),
+                        compact_target_block=int(target_block),
+                        slots=int(slots),
+                    )
     if cpp_built is not _CPP_DIAG_BUILDER_FALLBACK and not _provider_diag_builder_shadow():
         cpp_result, _metadata = cpp_built
         precomputed_index_diag_sets = _compact_source_concat_diag_sets_from_index_result(cpp_result)
@@ -2608,9 +2947,23 @@ def _build_compact_source_concat_transforms_single_slot(
                                 continue
                             target_vec = torch.remainder(target_index, int(slots))
                             diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
+                            source_pair_active = source_valid
+                            target_pair_active = target_valid
+                            if source_active_masks is not None and int(source_active_masks.numel()) > 0:
+                                source_flat_mask = source_active_masks.reshape(-1)
+                                source_flat_index = source_blocks * int(slots) + source_vec
+                                source_pair_active = source_pair_active & source_flat_mask[
+                                    source_flat_index.clamp(0, int(source_flat_mask.numel()) - 1).to(dtype=torch.int64)
+                                ]
+                            if target_active_masks is not None and int(target_active_masks.numel()) > 0:
+                                target_flat_mask = target_active_masks.reshape(-1)
+                                target_flat_index = target_blocks * int(slots) + target_vec
+                                target_pair_active = target_pair_active & target_flat_mask[
+                                    target_flat_index.clamp(0, int(target_flat_mask.numel()) - 1).to(dtype=torch.int64)
+                                ]
                             pair_mask = (
-                                source_valid[:, None, :]
-                                & target_valid[None, :, :]
+                                source_pair_active[:, None, :]
+                                & target_pair_active[None, :, :]
                                 & coeff_nonzero[:, :, None]
                             )
                             if not bool(pair_mask.any().item()):
@@ -4627,6 +4980,24 @@ def _build_conv_transform(
     target_end = min(int(spec.c_out), int(target_start) + int(target_tile))
     source_count = int(source_end - source_start)
     target_count = int(target_end - target_start)
+    source_active_mask = None
+    target_active_mask = None
+    if _provider_mvm_masked_materialization_enabled():
+        source_active_mask = _native_halo_source_active_slot_mask_for_block(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            source_group=int(source_group),
+            slots=int(slots),
+        )
+        target_active_mask = _native_halo_target_active_slot_mask_for_block(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            target_group=int(target_group),
+            compact_target_block=compact_target_block,
+            slots=int(slots),
+        )
     key_parts: list[torch.Tensor] = []
     value_parts: list[torch.Tensor] = []
     source_channels = torch.arange(int(source_count), dtype=torch.int64)
@@ -4757,6 +5128,10 @@ def _build_conv_transform(
                     target_block_mask = torch.ones_like(target_vec, dtype=torch.bool)
 
                 pair_mask = coeff_nonzero[:, :, None] & target_block_mask[None, :, :]
+                if source_active_mask is not None:
+                    pair_mask = pair_mask & source_active_mask[source_vec.to(dtype=torch.int64)][:, None, :]
+                if target_active_mask is not None:
+                    pair_mask = pair_mask & target_active_mask[target_vec.to(dtype=torch.int64)][None, :, :]
                 if not bool(pair_mask.any().item()):
                     continue
                 diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
@@ -4821,6 +5196,17 @@ def _build_conv_transform(
             _single_slot_release_diagonal_cache=cache.release,
         )
 
+    materialization_mask = (
+        None
+        if bool(compact_output) or not _provider_mvm_masked_materialization_enabled()
+        else _native_halo_target_active_slot_mask_for_block(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            target_group=int(target_group),
+            slots=int(slots),
+        )
+    )
     diag_tensors: dict[int, torch.Tensor] = {}
     unique, counts = torch.unique_consecutive(diag_indices, return_counts=True)
     start = 0
@@ -4828,6 +5214,8 @@ def _build_conv_transform(
         end = int(start + int(count_value))
         diag = torch.zeros((int(slots),), dtype=torch.float32)
         diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
+        if materialization_mask is not None:
+            diag.masked_fill_(~materialization_mask, 0.0)
         diag_tensors[int(diag_value)] = diag
         start = int(end)
     transform = SimpleNamespace(
@@ -4848,6 +5236,7 @@ def _build_conv_transform(
         giant_shifts=tuple(sorted(int(value) for value in giant)),
         rotation_group_id=f"native_halo:{spec.family_label}:s{int(stripe.index)}:src{int(source_group)}",
         rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+        provider_mvm_masked_materialization=bool(materialization_mask is not None),
     )
     return _build_conv_transform_payload_shadow(
         transform,
@@ -4885,6 +5274,24 @@ def _build_conv_transform_payload_shadow(
             return None
         from orion.backend.diag_builder import bindings as diag_builder
 
+        source_active_mask = None
+        target_active_mask = None
+        if _provider_mvm_masked_materialization_enabled():
+            source_active_mask = _native_halo_source_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                source_group=int(source_group),
+                slots=int(spec.slot_count),
+            )
+            target_active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                compact_target_block=compact_target_block,
+                slots=int(spec.slot_count),
+            )
         built = diag_builder.build_provider_native_source_conv2d_payload(
             spec=spec,
             plan=plan,
@@ -4895,6 +5302,8 @@ def _build_conv_transform_payload_shadow(
             compact_target_block=compact_target_block,
             source_index_override=source_index_override,
             target_index_override=target_index_override,
+            source_active_mask=source_active_mask,
+            target_active_mask=target_active_mask,
         )
         if built is None:
             return None
@@ -5095,6 +5504,16 @@ def _build_conv_transforms_for_compact_output(
     key_parts_by_block: dict[int, list[torch.Tensor]] = {}
     value_parts_by_block: dict[int, list[torch.Tensor]] = {}
     source_channels = torch.arange(int(source_count), dtype=torch.int64)
+    source_active_mask = None
+    target_active_masks: dict[int, torch.Tensor] = {}
+    if _provider_mvm_masked_materialization_enabled():
+        source_active_mask = _native_halo_source_active_slot_mask_for_block(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            source_group=int(source_group),
+            slots=int(slots),
+        )
     out_h_values = torch.arange(
         int(stripe.target_h_start),
         int(stripe.target_h_end),
@@ -5195,7 +5614,21 @@ def _build_conv_transforms_for_compact_output(
                 for target_block in torch.unique(target_blocks).tolist():
                     block = int(target_block)
                     block_mask = target_blocks == int(block)
+                    if _provider_mvm_masked_materialization_enabled() and int(block) not in target_active_masks:
+                        target_active_masks[int(block)] = _native_halo_target_active_slot_mask_for_block(
+                            spec=spec,
+                            plan=plan,
+                            stripe=stripe,
+                            target_group=int(target_group),
+                            compact_target_block=int(block),
+                            slots=int(slots),
+                        )
                     pair_mask = coeff_nonzero[:, :, None] & block_mask[None, :, :] & target_h_valid[None, None, :]
+                    if source_active_mask is not None:
+                        pair_mask = pair_mask & source_active_mask[source_vec.to(dtype=torch.int64)][:, None, :]
+                    target_active_mask = target_active_masks.get(int(block))
+                    if target_active_mask is not None:
+                        pair_mask = pair_mask & target_active_mask[target_slots.to(dtype=torch.int64)][None, :, :]
                     if not bool(pair_mask.any().item()):
                         continue
                     key_parts_by_block.setdefault(int(block), []).append(flat_keys[pair_mask])
@@ -5331,6 +5764,24 @@ def _build_conv_compact_output_payload_shadow(
             return None
         from orion.backend.diag_builder import bindings as diag_builder
 
+        source_active_mask = None
+        target_active_mask = None
+        if _provider_mvm_masked_materialization_enabled():
+            source_active_mask = _native_halo_source_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                source_group=int(source_group),
+                slots=int(spec.slot_count),
+            )
+            target_active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=spec,
+                plan=plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                compact_target_block=int(transform.target_index),
+                slots=int(spec.slot_count),
+            )
         built = diag_builder.build_provider_native_source_conv2d_payload(
             spec=spec,
             plan=plan,
@@ -5340,6 +5791,8 @@ def _build_conv_compact_output_payload_shadow(
             target_group=int(target_group),
             compact_target_block=int(transform.target_index),
             source_index_override=source_index_override,
+            source_active_mask=source_active_mask,
+            target_active_mask=target_active_mask,
         )
         if built is None:
             return None
@@ -5538,6 +5991,23 @@ def _build_compact_source_conv_transform(
     )
     source_gap = max(1, int(source_layout.get("gap", spec.gap_in) or 1))
     source_height = int(spec.h_in) + int(source_top_beta) + int(source_bottom_beta)
+    source_active_mask = None
+    target_active_mask = None
+    if _provider_mvm_masked_materialization_enabled():
+        source_active_mask = _compact_source_active_slot_mask_for_block(
+            spec=spec,
+            source_layout=dict(source_layout),
+            source_block=int(source_block),
+            slots=int(slots),
+        )
+        target_active_mask = _native_halo_target_active_slot_mask_for_block(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            target_group=int(target_group),
+            compact_target_block=compact_target_block,
+            slots=int(slots),
+        )
     key_parts: list[torch.Tensor] = []
     value_parts: list[torch.Tensor] = []
     out_h_values = torch.arange(
@@ -5655,6 +6125,10 @@ def _build_compact_source_conv_transform(
                     & target_block_mask[None, :, :]
                     & coeff_nonzero[:, :, None]
                 )
+                if source_active_mask is not None:
+                    pair_mask = pair_mask & source_active_mask[source_vec.to(dtype=torch.int64)][:, None, :]
+                if target_active_mask is not None:
+                    pair_mask = pair_mask & target_active_mask[target_vec.to(dtype=torch.int64)][None, :, :]
                 if not bool(pair_mask.any().item()):
                     continue
                 diag_index = (source_vec[:, None, :] - target_vec[None, :, :]).remainder(int(slots))
@@ -5679,6 +6153,17 @@ def _build_compact_source_conv_transform(
     if not diag_set:
         return None
     baby, giant = _bsgs_rotation_sets(set(int(value) for value in diag_set), slots=int(slots), n1=int(group_n1))
+    materialization_mask = (
+        None
+        if bool(compact_output) or not _provider_mvm_masked_materialization_enabled()
+        else _native_halo_target_active_slot_mask_for_block(
+            spec=spec,
+            plan=plan,
+            stripe=stripe,
+            target_group=int(target_group),
+            slots=int(slots),
+        )
+    )
     diag_tensors: dict[int, torch.Tensor] = {}
     unique, counts = torch.unique_consecutive(diag_indices, return_counts=True)
     start = 0
@@ -5686,6 +6171,8 @@ def _build_compact_source_conv_transform(
         end = int(start + int(count_value))
         diag = torch.zeros((int(slots),), dtype=torch.float32)
         diag.index_add_(0, output_slots[int(start): int(end)], values[int(start): int(end)].to(dtype=torch.float32))
+        if materialization_mask is not None:
+            diag.masked_fill_(~materialization_mask, 0.0)
         diag_tensors[int(diag_value)] = diag
         start = int(end)
     transform = SimpleNamespace(
@@ -5706,6 +6193,7 @@ def _build_compact_source_conv_transform(
         giant_shifts=tuple(sorted(int(value) for value in giant)),
         rotation_group_id=f"native_halo:{spec.family_label}:compact_src{int(source_block)}",
         rotation_cost_owner=bool(int(target_group) == 0 and (not bool(compact_output) or int(compact_target_block) == 0)),
+        provider_mvm_masked_materialization=bool(materialization_mask is not None),
     )
     return _build_compact_source_conv_payload_shadow(
         transform,
@@ -6279,6 +6767,11 @@ class NativeHaloStripeNoRIConvExecutor:
             "output_relayout_s": 0.0,
         }
 
+    def _masked_materialization_inactive_fill(self) -> float:
+        if bool(getattr(self.module, "_bootstrap_prescale_fusion_masked", False)):
+            return float(getattr(self.module, "_bootstrap_prescale_fusion_bias", 0.0))
+        return 0.0
+
     def _bias_chunk(self, *, block_index: int) -> torch.Tensor | None:
         if self.bias_vector is None:
             return None
@@ -6314,6 +6807,15 @@ class NativeHaloStripeNoRIConvExecutor:
             .reshape(-1)
         )
         out.index_copy_(0, flat_index.reshape(-1).to(dtype=torch.int64), values)
+        if _provider_mvm_masked_materialization_enabled():
+            active_mask = _native_halo_target_active_slot_mask_for_block(
+                spec=self.spec,
+                plan=self.native_plan,
+                stripe=stripe,
+                target_group=int(target_group),
+                slots=int(self.slots),
+            )
+            out.masked_fill_(~active_mask, float(self._masked_materialization_inactive_fill()))
         return out
 
     def _compact_bias_chunk(self, *, block_index: int) -> torch.Tensor | None:
@@ -6340,7 +6842,154 @@ class NativeHaloStripeNoRIConvExecutor:
             positions = (flat_index[mask] - int(start)).to(dtype=torch.int64)
             values = self.bias_vector.detach().to(dtype=torch.float32)[:, None].expand_as(flat_index)[mask]
             out.index_copy_(0, positions, values)
+        if _provider_mvm_masked_materialization_enabled():
+            active = torch.zeros((int(self.slots),), dtype=torch.bool)
+            logical_out_h = torch.arange(int(spec.h_out), dtype=torch.int64).repeat_interleave(int(spec.w_out))
+            logical_out_w = torch.arange(int(spec.w_out), dtype=torch.int64).repeat(int(spec.h_out))
+            active_index = _idx_chw_gap_channel_positions(
+                channels,
+                h=logical_out_h + max(0, int(spec.output_physical_top_beta or 0)),
+                w=logical_out_w,
+                height=int(compact_output_h),
+                width=int(spec.w_out),
+                gap=int(spec.gap_out),
+            )
+            active_block = (active_index >= int(start)) & (active_index < int(stop))
+            if bool(active_block.any().item()):
+                active[(active_index[active_block] - int(start)).to(dtype=torch.int64)] = True
+            out.masked_fill_(~active, float(self._masked_materialization_inactive_fill()))
         return out
+
+    def _strict_inactive_slot_zero_enabled(self) -> bool:
+        return bool(
+            _env_enabled("ORION_STRICT_INACTIVE_SLOT_ZERO")
+            or _env_enabled("ORION_NATIVE_MVM_ZERO_INACTIVE_SLOTS")
+        )
+
+    @staticmethod
+    def _cipher_mask_meta(value: CipherTensor) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "id_count": int(len(getattr(value, "ids", ()) or ())),
+            "shape": [int(v) for v in tuple(getattr(value, "shape", ()) or ())],
+            "on_shape": [int(v) for v in tuple(getattr(value, "on_shape", ()) or ())],
+        }
+        if int(meta["id_count"]) > 0:
+            for name, getter in (
+                ("level", getattr(value, "level", None)),
+                ("scale", getattr(value, "scale", None)),
+                ("log_scale", getattr(value, "log_scale", None)),
+            ):
+                if not callable(getter):
+                    continue
+                try:
+                    raw = getter()
+                    meta[str(name)] = float(raw) if str(name) == "log_scale" else int(raw)
+                except Exception:
+                    pass
+        return meta
+
+    def _native_output_active_slot_mask(self) -> torch.Tensor | None:
+        if self._uses_tight_compact_output():
+            return None
+        plan = self.native_plan
+        spec = plan.spec
+        mask = torch.zeros((int(self.rows), int(self.slots)), dtype=torch.bool)
+        gap = max(1, int(spec.gap_out))
+        phases = int(gap * gap)
+        packed_w = int(spec.w_out) * int(gap)
+        for stripe in plan.stripes:
+            target_tile = int(plan.target_tile_for_stripe(stripe))
+            group_block = int(stripe.target_h) * int(gap) * int(packed_w)
+            for target_group in range(int(plan.target_group_count_for_stripe(stripe))):
+                block_index = int(plan.target_block_index(stripe, int(target_group)))
+                if int(block_index) < 0 or int(block_index) >= int(self.rows):
+                    raise RuntimeError(
+                        f"{self.output_node_id} native output block out of range: "
+                        f"{int(block_index)} / {int(self.rows)}"
+                    )
+                channel_start = int(target_group) * int(target_tile)
+                channel_end = min(int(spec.c_out), int(channel_start) + int(target_tile))
+                for local_channel, channel in enumerate(range(int(channel_start), int(channel_end))):
+                    if int(channel) < 0 or int(channel) >= int(spec.c_out):
+                        continue
+                    group = int(local_channel) // int(phases)
+                    phase = int(local_channel) % int(phases)
+                    phase_h = int(phase) // int(gap)
+                    phase_w = int(phase) % int(gap)
+                    for global_h in range(int(stripe.target_h_start), int(stripe.target_h_end)):
+                        if int(global_h) < 0 or int(global_h) >= int(spec.h_out):
+                            continue
+                        local_h = int(global_h) - int(stripe.target_h_start)
+                        for w_index in range(int(spec.w_out)):
+                            slot = (
+                                int(group) * int(group_block)
+                                + (int(local_h) * int(gap) + int(phase_h)) * int(packed_w)
+                                + int(w_index) * int(gap)
+                                + int(phase_w)
+                            )
+                            if int(slot) < 0 or int(slot) >= int(self.slots):
+                                raise RuntimeError(
+                                    f"{self.output_node_id} native output active slot out of range: "
+                                    f"{int(slot)} / {int(self.slots)}"
+                                )
+                            mask[int(block_index), int(slot)] = True
+        return mask
+
+    def _zero_native_output_inactive_slots_no_rescale(self, value: CipherTensor) -> tuple[CipherTensor, dict[str, Any]]:
+        active_mask = self._native_output_active_slot_mask()
+        if active_mask is None:
+            return value, {
+                "enabled": True,
+                "applied": False,
+                "reason": "compact_output_storage",
+            }
+        ids = [int(v) for v in tuple(getattr(value, "ids", ()) or ())]
+        if len(ids) != int(active_mask.shape[0]):
+            raise RuntimeError(
+                f"{self.output_node_id} inactive-slot mask block count mismatch: "
+                f"cipher has {len(ids)} ids, mask has {int(active_mask.shape[0])}"
+            )
+        backend = value.backend
+        mul_plain_new = getattr(backend, "MulPlaintextNew", None)
+        if not callable(mul_plain_new):
+            raise RuntimeError("backend does not expose MulPlaintextNew for no-rescale inactive-slot masking")
+        level = int(value.level())
+        before = self._cipher_mask_meta(value)
+        out_ids: list[int] = []
+        plaintext_count = 0
+        for block_index, ct_id in enumerate(ids):
+            mask = active_mask[int(block_index)].detach().cpu().to(dtype=torch.float32)
+            ptxt = value.scheme.encode(mask, int(level), scale=1)
+            try:
+                out_ids.append(int(mul_plain_new(int(ct_id), int(ptxt.ids[0]))))
+                plaintext_count += 1
+            finally:
+                ptxt.release()
+        masked = CipherTensor(value.scheme, out_ids, value.shape, value.on_shape)
+        after = self._cipher_mask_meta(masked)
+        return masked, {
+            "enabled": True,
+            "applied": True,
+            "kind": "native_output_inactive_slot_plaintext_mask_no_rescale",
+            "mask_scale": 1,
+            "plaintext_count": int(plaintext_count),
+            "total_slots": int(active_mask.numel()),
+            "active_slots": int(active_mask.sum().item()) if int(active_mask.numel()) > 0 else 0,
+            "inactive_slots": int((~active_mask).sum().item()) if int(active_mask.numel()) > 0 else 0,
+            "mask_shape": [int(value) for value in tuple(active_mask.shape)],
+            "before": before,
+            "after": after,
+            "level_delta": (
+                int(after["level"]) - int(before["level"])
+                if "level" in before and "level" in after
+                else None
+            ),
+            "log_scale_delta": (
+                float(after["log_scale"]) - float(before["log_scale"])
+                if "log_scale" in before and "log_scale" in after
+                else None
+            ),
+        }
 
     def _compile_bias_plaintexts_at_level(self, scheme: Any, *, level: int) -> tuple[Any | None, ...]:
         if self.bias_vector is None:
@@ -6700,6 +7349,41 @@ class NativeHaloStripeNoRIConvExecutor:
             self._bias_plaintext_cache[(int(block_index), int(level))] = ptxt
         return _add_plaintext_for_add(ct, ptxt)
 
+    def _bootstrap_prescale_fusion_mask_summary(self) -> dict[str, Any]:
+        masked = bool(getattr(self.module, "_bootstrap_prescale_fusion_masked", False))
+        summary = dict(getattr(self.module, "_bootstrap_prescale_affine_mask_summary", {}) or {})
+        active_mask = getattr(self.module, "_bootstrap_prescale_active_mask", None)
+        if isinstance(active_mask, torch.Tensor):
+            mask = active_mask.detach().cpu().to(dtype=torch.bool)
+            total = int(mask.numel())
+            active = int(mask.sum().item()) if total > 0 else 0
+            summary.update(
+                {
+                    "masked": bool(total > 0 and active < total),
+                    "active_slots": int(active),
+                    "inactive_slots": int(total - active),
+                    "total_slots": int(total),
+                    "mask_shape": [int(value) for value in tuple(mask.shape)],
+                }
+            )
+        elif masked:
+            summary["masked"] = True
+        return {
+            "masked": bool(summary.get("masked", False)),
+            **{
+                key: value
+                for key, value in summary.items()
+                if key
+                in {
+                    "active_slots",
+                    "inactive_slots",
+                    "total_slots",
+                    "mask_shape",
+                    "mask_source",
+                }
+            },
+        }
+
     def compile_cache_metadata(self) -> dict[str, Any]:
         self._refresh_runtime_plan()
         lt_grouping_mode = (
@@ -6708,6 +7392,7 @@ class NativeHaloStripeNoRIConvExecutor:
             else str(self._lt_grouping_mode())
         )
         runtime_group_rows = self._runtime_group_metadata_rows()
+        fusion_mask = self._bootstrap_prescale_fusion_mask_summary()
         return {
             "kind": type(self).__name__,
             "kernel_kind": self.kernel_kind,
@@ -6743,6 +7428,11 @@ class NativeHaloStripeNoRIConvExecutor:
             "runtime_transform_count": int(sum(len(item.target_indices) for item in self.runtime_groups)),
             "runtime_groups": runtime_group_rows,
             "groups_by_input_index": runtime_group_rows if str(lt_grouping_mode) == "shared" else [],
+            "bootstrap_prescale_masked_affine": bool(fusion_mask.get("masked", False)),
+            "bootstrap_prescale_masked_affine_strategy": (
+                "native_mvm_bias_active_slots" if bool(fusion_mask.get("masked", False)) else ""
+            ),
+            "bootstrap_prescale_masked_affine_mask": fusion_mask,
         }
 
     def compile(self, scheme: Any) -> None:
@@ -7377,12 +8067,16 @@ class NativeHaloStripeNoRIConvExecutor:
             self.output_shape,
             self.runtime_native_fhe_output_shape(),
         )
+        strict_inactive_slot_zero: dict[str, Any] = {"enabled": False, "applied": False}
+        if self._strict_inactive_slot_zero_enabled():
+            native_output, strict_inactive_slot_zero = self._zero_native_output_inactive_slots_no_rescale(native_output)
         self.last_runtime_timing["postprocess_s"] = float(time.time() - postprocess_started)
         compact_output_rotation_stats = (
             native_halo_conv2d_compact_output_rotation_stats(self.native_plan)
             if self._uses_tight_compact_output()
             else None
         )
+        fusion_mask = self._bootstrap_prescale_fusion_mask_summary()
         self.last_runtime_io = {
             "runtime_lowering": (
                 f"native_halo_stripe_no_ri+{self._compact_output_storage_layout()}_output"
@@ -7402,6 +8096,7 @@ class NativeHaloStripeNoRIConvExecutor:
             else "native_halo_stripe",
             "provider_lt_grouping_mode": str(self._compiled_lt_grouping_mode),
             "provider_disable_shared_rotation": bool(str(self._compiled_lt_grouping_mode) == "individual"),
+            "provider_mvm_masked_materialization": bool(_provider_mvm_masked_materialization_enabled()),
             "runtime_group_count": int(len(self.runtime_groups)),
             "internal_input_relayout": False,
             "internal_output_relayout": False,
@@ -7428,6 +8123,12 @@ class NativeHaloStripeNoRIConvExecutor:
             "native_halo_channel_fold_mode": str(self.native_plan.channel_fold_mode),
             "native_plan_c_only_rotations": int(self.native_plan.c_only_rotations),
             "native_plan_cb_shared_rotations": int(self.native_plan.cb_shared_rotations),
+            "bootstrap_prescale_masked_affine": bool(fusion_mask.get("masked", False)),
+            "bootstrap_prescale_masked_affine_strategy": (
+                "native_mvm_bias_active_slots" if bool(fusion_mask.get("masked", False)) else ""
+            ),
+            "bootstrap_prescale_masked_affine_mask": fusion_mask,
+            "strict_inactive_slot_zero": strict_inactive_slot_zero,
         }
         return {self.output_node_id: native_output}
 
