@@ -48,6 +48,18 @@ backend:
 .venv/bin/python artifacts/haloed_paper_eval/eval/accuracy_medseg_cheb7.py --run-kind ckks
 ```
 
+Reproduce the COVID-256 single-image CKKS sanity case used for the
+Concat-depth/low-postscale check:
+
+```bash
+.venv/bin/python artifacts/haloed_paper_eval/eval/accuracy_medseg_cheb7.py \
+  --run-kind ckks \
+  --tasks covid19 \
+  --counts 1 \
+  --val-indices 1951 \
+  --data-root artifacts/haloed_paper_eval/fixtures/fhelipe_medseg_accuracy10
+```
+
 Re-render from an existing root without rerunning long experiments:
 
 ```bash

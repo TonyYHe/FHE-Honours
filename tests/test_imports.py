@@ -67,6 +67,7 @@ def test_operations():
 
     concat = on.Concat(dim=1)
     assert isinstance(concat, on.Concat)
+    assert concat.depth == 1
     
     mult = on.Mult()
     assert isinstance(mult, on.Mult)

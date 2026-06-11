@@ -120,7 +120,11 @@ class Concat(Module):
         super().__init__()
         self.dim = int(dim)
         self.bsgs_ratio = float(bsgs_ratio)
-        self.set_depth(0)
+        # HE concat materialization is a real linear transform when a following
+        # consumer cannot use the lazy ConcatCipherTensor directly. Count that
+        # level in bootstrap placement; fused/view consumers must opt out
+        # explicitly rather than silently borrowing this budget.
+        self.set_depth(1)
         self.concat_input_shapes = ()
         self.concat_input_fhe_shapes = ()
         self.concat_input_gaps = ()

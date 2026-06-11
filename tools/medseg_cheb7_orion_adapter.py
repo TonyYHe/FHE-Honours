@@ -36,17 +36,18 @@ ACTIVATION_NAMES = (
     "dec1b_act",
 )
 
-
 class CheckpointScaledChebyshevSiLU(on.Chebyshev):
     """Orion-compatible scaled-domain Chebyshev SiLU loaded from medseg checkpoints."""
 
-    def __init__(self, *, degree: int = 7, postscale: float = 1.0) -> None:
+    def __init__(self, *, degree: int = 7, postscale: float = 1.0, prescale: float | None = None) -> None:
         on.Module.__init__(self)
         self.degree = int(degree)
         self.fn = F.silu
         self.within_composite = False
         self.register_buffer("coeffs", torch.zeros(int(self.degree) + 1, dtype=torch.float32))
         self.register_buffer("postscale_tensor", torch.tensor(float(postscale), dtype=torch.float32))
+        prescale_value = float(1.0 / postscale if postscale != 0.0 else 1.0) if prescale is None else float(prescale)
+        self.register_buffer("prescale_tensor", torch.tensor(float(prescale_value), dtype=torch.float32))
         self.output_scale = None
         self.constant = 0.0
         self.set_depth()
@@ -57,8 +58,7 @@ class CheckpointScaledChebyshevSiLU(on.Chebyshev):
 
     @property
     def prescale(self) -> float:
-        postscale = self.postscale
-        return 1.0 / postscale if postscale != 0.0 else 1.0
+        return float(self.prescale_tensor.detach().cpu().item())
 
     def set_depth(self) -> None:
         self.depth = int(math.ceil(math.log2(int(self.degree) + 1)))
@@ -121,7 +121,8 @@ class CheckpointScaledChebyshevSiLU(on.Chebyshev):
             return self.scheme.poly_evaluator.evaluate_polynomial(x, self.poly, self.output_scale)
 
         postscale = self.postscale_tensor.to(device=x.device, dtype=x.dtype)
-        z = x / postscale
+        prescale = self.prescale_tensor.to(device=x.device, dtype=x.dtype)
+        z = x * prescale
         coeffs = self.coeffs.to(device=x.device, dtype=x.dtype)
         return postscale * self._chebyshev_eval(z, coeffs)
 
@@ -158,11 +159,20 @@ def replace_orion_silu_with_checkpoint_cheb(
             postscale = float(checkpoint_state[tensor_key].detach().cpu().to(dtype=torch.float32).item())
         else:
             postscale = float(row.get("postscale", row.get("domain_postscale", 1.0)))
-        setattr(model, name, CheckpointScaledChebyshevSiLU(degree=degree, postscale=postscale))
+        prescale_log_key = f"{name}.log_prescale"
+        prescale_tensor_key = f"{name}.prescale_tensor"
+        if prescale_log_key in checkpoint_state:
+            prescale = float(torch.exp(checkpoint_state[prescale_log_key].detach().cpu().to(dtype=torch.float32)).item())
+        elif prescale_tensor_key in checkpoint_state:
+            prescale = float(checkpoint_state[prescale_tensor_key].detach().cpu().to(dtype=torch.float32).item())
+        else:
+            prescale = float(row.get("prescale", 1.0 / postscale if postscale != 0.0 else 1.0))
+        setattr(model, name, CheckpointScaledChebyshevSiLU(degree=degree, postscale=postscale, prescale=prescale))
         installed[name] = {
             "degree": float(degree),
             "postscale": float(postscale),
-            "prescale": float(1.0 / postscale if postscale != 0.0 else 1.0),
+            "prescale": float(prescale),
+            "domain_postscale": float(1.0 / prescale if prescale != 0.0 else math.inf),
         }
     return installed
 
@@ -191,16 +201,17 @@ def build_orion_cheb7_model_from_checkpoint(
     )
     adapter_state = dict(state)
     for name in installed:
-        log_key = f"{name}.log_postscale"
         tensor_key = f"{name}.postscale_tensor"
-        if log_key in adapter_state and tensor_key not in adapter_state:
-            adapter_state[tensor_key] = torch.exp(adapter_state[log_key].detach().cpu().to(dtype=torch.float32))
+        prescale_tensor_key = f"{name}.prescale_tensor"
+        adapter_state[tensor_key] = torch.tensor(float(installed[name]["postscale"]), dtype=torch.float32)
+        adapter_state[prescale_tensor_key] = torch.tensor(float(installed[name]["prescale"]), dtype=torch.float32)
     missing, unexpected = model.load_state_dict(adapter_state, strict=False)
     ignored_missing = {f"{name}.postscale_tensor" for name in installed}
+    ignored_missing.update({f"{name}.prescale_tensor" for name in installed})
     ignored_unexpected = {
         f"{name}.{suffix}"
         for name in installed
-        for suffix in ("log_postscale", "blend_alpha", "reference_postscale_tensor")
+        for suffix in ("log_postscale", "log_prescale", "blend_alpha", "reference_postscale_tensor")
     }
     remaining_missing = [key for key in missing if key not in ignored_missing]
     remaining_unexpected = [key for key in unexpected if key not in ignored_unexpected]

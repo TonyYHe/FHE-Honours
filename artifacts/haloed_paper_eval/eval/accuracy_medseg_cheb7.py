@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,12 @@ ARTIFACT = "accuracy"
 SOURCE_SCRIPT = "tools/verify_medseg_cheb7_orion_clear_adapter.py"
 SUBSET_VAL_LIMIT = 512
 SUBSET_VAL_SEED = 1
+BACKEND_ENV_DEFAULTS = {
+    "ORION_PROVIDER_MVM_MASKED_MATERIALIZATION": "1",
+    "ORION_BOOTSTRAP_LAYOUT_REFINEMENT": "0",
+    "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "0",
+    "ORION_CONCAT_FUSION": "0",
+}
 
 
 @dataclass(frozen=True)
@@ -151,6 +158,51 @@ def _subset_start_for(task: AccuracyTask, dataset: FhelipeSegmentationDataset) -
     return int(task.subset_start) if int(task.subset_start) < len(dataset) else 0
 
 
+def _sample_specs(
+    task: AccuracyTask,
+    *,
+    count: int,
+    data_root: Path,
+    val_indices: list[int] | None = None,
+) -> tuple[FhelipeSegmentationDataset, list[dict[str, Any]]]:
+    dataset, original_indices = _subset_dataset(task, data_root=data_root)
+    if val_indices:
+        rows: list[dict[str, Any]] = []
+        for requested_val_index in val_indices:
+            resolved_subset_index = int(requested_val_index) % len(dataset)
+            fixture_original_val_index = int(original_indices[resolved_subset_index])
+            rows.append(
+                {
+                    "task": task.label,
+                    "dataset": task.dataset,
+                    "image_size": int(task.image_size),
+                    "subset_index": int(resolved_subset_index),
+                    "original_val_index": int(requested_val_index),
+                    "backend_val_index": int(requested_val_index),
+                    "fixture_original_val_index": int(fixture_original_val_index),
+                }
+            )
+        return dataset, rows
+
+    start = _subset_start_for(task, dataset)
+    end = int(start) + int(count)
+    if end > len(dataset):
+        raise IndexError(f"{task.label} requested subset [{start}, {end}) but dataset has {len(dataset)} examples")
+    rows: list[dict[str, Any]] = []
+    for subset_index in range(int(start), end):
+        original_val_index = int(original_indices[subset_index])
+        row = {
+            "task": task.label,
+            "dataset": task.dataset,
+            "image_size": int(task.image_size),
+            "subset_index": int(subset_index),
+            "original_val_index": int(original_val_index),
+        }
+        row["backend_val_index"] = int(subset_index if int(start) == 0 and original_val_index != subset_index else original_val_index)
+        rows.append(row)
+    return dataset, rows
+
+
 def _load_stage_checkpoint(path: Path, *, device: torch.device | str) -> torch.nn.Module:
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
     model_cfg = dict(checkpoint.get("model", {}) or {})
@@ -171,24 +223,14 @@ def _load_stage_checkpoint(path: Path, *, device: torch.device | str) -> torch.n
     return model
 
 
-def _sample_rows(task: AccuracyTask, *, count: int, data_root: Path) -> list[dict[str, Any]]:
-    dataset, original_indices = _subset_dataset(task, data_root=data_root)
-    start = _subset_start_for(task, dataset)
-    end = int(start) + int(count)
-    if end > len(dataset):
-        raise IndexError(f"{task.label} requested subset [{start}, {end}) but dataset has {len(dataset)} examples")
-    rows = []
-    for subset_index in range(int(start), end):
-        original_val_index = int(original_indices[subset_index])
-        row = {
-            "task": task.label,
-            "dataset": task.dataset,
-            "image_size": int(task.image_size),
-            "subset_index": int(subset_index),
-            "original_val_index": int(original_val_index),
-        }
-        row["backend_val_index"] = int(subset_index if int(start) == 0 and original_val_index != subset_index else original_val_index)
-        rows.append(row)
+def _sample_rows(
+    task: AccuracyTask,
+    *,
+    count: int,
+    data_root: Path,
+    val_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    _dataset, rows = _sample_specs(task, count=count, data_root=data_root, val_indices=val_indices)
     return rows
 
 
@@ -226,12 +268,9 @@ def _evaluate_pytorch_rows(
     device: torch.device | str,
     baselines: set[str],
     include_cheb: bool,
+    val_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    dataset, original_indices = _subset_dataset(task, data_root=data_root)
-    start = _subset_start_for(task, dataset)
-    end = int(start) + int(count)
-    if end > len(dataset):
-        raise IndexError(f"{task.label} requested subset [{start}, {end}) but dataset has {len(dataset)} examples")
+    dataset, sample_rows = _sample_specs(task, count=count, data_root=data_root, val_indices=val_indices)
 
     models: dict[str, torch.nn.Module] = {}
     if "plain" in baselines:
@@ -243,17 +282,9 @@ def _evaluate_pytorch_rows(
         models["cheb"] = cheb_model
 
     rows: list[dict[str, Any]] = []
-    for subset_index in range(int(start), end):
-        image, target = dataset[subset_index]
-        original_val_index = int(original_indices[subset_index])
-        row: dict[str, Any] = {
-            "task": task.label,
-            "dataset": task.dataset,
-            "image_size": int(task.image_size),
-            "subset_index": int(subset_index),
-            "original_val_index": int(original_val_index),
-            "backend_val_index": int(subset_index if int(start) == 0 and original_val_index != subset_index else original_val_index),
-        }
+    for sample_row in sample_rows:
+        image, target = dataset[int(sample_row["subset_index"])]
+        row: dict[str, Any] = dict(sample_row)
         for name, model in models.items():
             metrics = _model_metrics(model, image, target, device=device)
             prefix = "cheb" if name == "cheb" else name
@@ -286,6 +317,7 @@ def _backend_command(
     backend_atol: float | None,
     backend_rtol: float | None,
     backend_dice_atol: float | None,
+    backend_bootstrap_many: str | None,
 ) -> list[str | Path]:
     atol = float(backend_atol if backend_atol is not None else (5.0e-3 if run_kind == "ckks" else 1.0e-5))
     rtol = float(backend_rtol if backend_rtol is not None else (1.0e-3 if run_kind == "ckks" else 1.0e-4))
@@ -326,6 +358,8 @@ def _backend_command(
         command.append("--single-slot-layer-cache")
     if backend_dice_atol is not None:
         command.extend(["--backend-dice-atol", str(float(backend_dice_atol))])
+    if backend_bootstrap_many is not None:
+        command.extend(["--backend-bootstrap-many", str(backend_bootstrap_many)])
     return command
 
 
@@ -466,13 +500,15 @@ def _run_backend_rows(
     backend_atol: float | None,
     backend_rtol: float | None,
     backend_dice_atol: float | None,
+    backend_bootstrap_many: str | None,
     baselines: set[str],
     dry_run: bool,
     check_existing: bool,
     force: bool,
+    val_indices: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[list[str | Path]]]:
     if dry_run:
-        baseline_rows = _sample_rows(task, count=count, data_root=data_root)
+        baseline_rows = _sample_rows(task, count=count, data_root=data_root, val_indices=val_indices)
     else:
         baseline_rows = _evaluate_pytorch_rows(
             task,
@@ -481,6 +517,7 @@ def _run_backend_rows(
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
             baselines=baselines,
             include_cheb=False,
+            val_indices=val_indices,
         )
     commands: list[list[str | Path]] = []
     rows: list[dict[str, Any]] = []
@@ -504,6 +541,7 @@ def _run_backend_rows(
             backend_atol=backend_atol,
             backend_rtol=backend_rtol,
             backend_dice_atol=backend_dice_atol,
+            backend_bootstrap_many=backend_bootstrap_many,
         )
         commands.append(command)
         use_existing = False
@@ -605,6 +643,7 @@ def _run_pytorch(
     data_root: Path,
     device: torch.device | str,
     baselines: set[str],
+    val_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task in tasks:
@@ -615,6 +654,7 @@ def _run_pytorch(
             device=device,
             baselines=baselines,
             include_cheb=True,
+            val_indices=val_indices,
         )
         for row in task_rows:
             row["run_kind"] = "pytorch"
@@ -640,15 +680,34 @@ def main() -> int:
     parser.add_argument("--backend-atol", type=float, default=None)
     parser.add_argument("--backend-rtol", type=float, default=None)
     parser.add_argument("--backend-dice-atol", type=float, default=1.0e-3)
+    parser.add_argument(
+        "--backend-bootstrap-many",
+        choices=("0", "1"),
+        default="1",
+        help="CKKS bootstrap execution scheduling flag passed through to the verifier; it is not a correctness knob.",
+    )
+    parser.add_argument(
+        "--val-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional explicit verifier val-index values for reproducing individual accuracy cases.",
+    )
     parser.add_argument("--no-single-slot-layer-cache", dest="single_slot_layer_cache", action="store_false")
     parser.set_defaults(single_slot_layer_cache=True)
     args = parser.parse_args()
 
     selected_tasks = _select_tasks(list(args.tasks))
+    explicit_val_indices = None if args.val_indices is None else [int(value) for value in args.val_indices]
+    if explicit_val_indices and len(selected_tasks) != 1:
+        raise ValueError("--val-indices can only be used with a single --tasks value")
     counts = _normalize_counts(list(args.counts))
     max_count = max(counts)
     baselines = {"plain", "scaled"} if args.baseline == "both" else {str(args.baseline)}
     run_kinds = ["pytorch", "clear", "ckks"] if args.run_kind == "all" else [str(args.run_kind)]
+    if any(kind in {"clear", "ckks"} for kind in run_kinds):
+        for key, value in BACKEND_ENV_DEFAULTS.items():
+            os.environ.setdefault(key, value)
 
     run_root = (
         maybe_existing_artifact_root(resolve_run_root(args, ARTIFACT), ARTIFACT)
@@ -670,6 +729,7 @@ def main() -> int:
                 data_root=Path(args.data_root),
                 device=torch.device(str(args.device)),
                 baselines=baselines,
+                val_indices=explicit_val_indices,
             )
         else:
             rows = []
@@ -689,10 +749,12 @@ def main() -> int:
                     backend_atol=args.backend_atol,
                     backend_rtol=args.backend_rtol,
                     backend_dice_atol=args.backend_dice_atol,
+                    backend_bootstrap_many=str(args.backend_bootstrap_many) if run_kind == "ckks" else None,
                     baselines=baselines,
                     dry_run=bool(args.dry_run),
                     check_existing=bool(args.check_existing),
                     force=bool(args.force),
+                    val_indices=explicit_val_indices,
                 )
                 rows.extend(task_rows)
                 backend_commands.extend(task_commands)
@@ -744,7 +806,10 @@ def main() -> int:
         extra={
             "counts": counts,
             "tasks": [task.key for task in selected_tasks],
+            "val_indices": explicit_val_indices or [],
             "run_kinds": run_kinds,
+            "backend_bootstrap_many": str(args.backend_bootstrap_many),
+            "backend_env_defaults": BACKEND_ENV_DEFAULTS,
             "backend_commands": [" ".join(str(part) for part in command) for command in commands],
         },
     )

@@ -12,8 +12,12 @@ from orion.models.unet import (
 )
 from tools.train_fhelipe_medseg_staged_unet import (
     ScaledChebyshevSiLU,
+    clamp_cheb_prescales,
+    clamp_cheb_postscales,
     fit_scaled_domain_chebyshev_silu,
     parse_poly_degree_overrides,
+    parse_poly_prescale_caps,
+    parse_poly_postscale_caps,
     replace_plain_silu_with_range_poly,
     set_poly_blend_alpha,
 )
@@ -144,6 +148,50 @@ def test_range_poly_replacement_accepts_per_layer_degree_overrides() -> None:
     assert metadata["enc3b_act"]["degree"] == 15
     assert metadata["dec1a_act"]["degree"] == 15
     assert metadata["enc1a_act"]["degree"] == 7
+
+
+def test_parse_poly_postscale_caps_and_clamp_trainable_scale() -> None:
+    caps = parse_poly_postscale_caps("dec4a_act=3072, dec4b_act=6144")
+    module = torch.nn.Module()
+    module.dec4a_act = ScaledChebyshevSiLU([0.0, 0.5], postscale=8192.0, trainable_scale=True)
+
+    changed = clamp_cheb_postscales(module, {"dec4a_act": caps["dec4a_act"]})
+
+    assert changed["dec4a_act"]["clamped"] is True
+    assert torch.exp(module.dec4a_act.log_postscale).item() == pytest.approx(3072.0)
+
+
+def test_independent_prescale_survives_postscale_cap() -> None:
+    module = torch.nn.Module()
+    module.dec4a_act = ScaledChebyshevSiLU(
+        [0.0, 0.5],
+        postscale=8192.0,
+        prescale=1.0 / 8192.0,
+        trainable_scale=True,
+        trainable_prescale=True,
+    )
+    before_prescale = torch.exp(module.dec4a_act.log_prescale).item()
+
+    clamp_cheb_postscales(module, {"dec4a_act": 2048.0})
+
+    assert torch.exp(module.dec4a_act.log_postscale).item() == pytest.approx(2048.0)
+    assert torch.exp(module.dec4a_act.log_prescale).item() == pytest.approx(before_prescale)
+
+
+def test_parse_poly_prescale_caps_and_clamp_trainable_prescale() -> None:
+    caps = parse_poly_prescale_caps("dec4a_act=0.001")
+    module = torch.nn.Module()
+    module.dec4a_act = ScaledChebyshevSiLU(
+        [0.0, 0.5],
+        postscale=2048.0,
+        prescale=0.01,
+        trainable_prescale=True,
+    )
+
+    changed = clamp_cheb_prescales(module, {"dec4a_act": caps["dec4a_act"]})
+
+    assert changed["dec4a_act"]["clamped"] is True
+    assert torch.exp(module.dec4a_act.log_prescale).item() == pytest.approx(0.001)
 
 
 def test_scaled_chebyshev_silu_coefficients_match_runtime_basis() -> None:

@@ -75,8 +75,10 @@ class ScaledChebyshevSiLU(nn.Module):
         coeffs: Iterable[float],
         *,
         postscale: float,
+        prescale: float | None = None,
         trainable_coeffs: bool = False,
         trainable_scale: bool = False,
+        trainable_prescale: bool = False,
         blend_alpha: float = 1.0,
         reference_activation: str = "plain-silu",
         reference_postscale: float | None = None,
@@ -88,11 +90,22 @@ class ScaledChebyshevSiLU(nn.Module):
         else:
             self.register_buffer("coeffs", coeff_tensor)
         self.postscale = float(postscale)
-        self.prescale = 1.0 / self.postscale if self.postscale != 0.0 else 1.0
+        self.independent_prescale = bool(trainable_prescale or prescale is not None)
+        self.prescale = (
+            float(prescale)
+            if prescale is not None
+            else (1.0 / self.postscale if self.postscale != 0.0 else 1.0)
+        )
         if bool(trainable_scale):
             self.log_postscale = nn.Parameter(torch.log(torch.tensor(float(max(self.postscale, 1.0)), dtype=torch.float32)))
         else:
             self.register_buffer("postscale_tensor", torch.tensor(float(self.postscale), dtype=torch.float32))
+        if bool(trainable_prescale):
+            self.log_prescale = nn.Parameter(
+                torch.log(torch.tensor(float(max(self.prescale, 1.0e-12)), dtype=torch.float32))
+            )
+        elif self.independent_prescale:
+            self.register_buffer("prescale_tensor", torch.tensor(float(self.prescale), dtype=torch.float32))
         self.register_buffer("blend_alpha", torch.tensor(float(blend_alpha), dtype=torch.float32))
         self.reference_activation = str(reference_activation)
         reference_postscale_value = float(self.postscale if reference_postscale is None else reference_postscale)
@@ -109,7 +122,13 @@ class ScaledChebyshevSiLU(nn.Module):
             postscale = torch.exp(self.log_postscale).to(device=x.device, dtype=x.dtype).clamp_min(1.0e-6)
         else:
             postscale = self.postscale_tensor.to(device=x.device, dtype=x.dtype)
-        z = x / postscale
+        if hasattr(self, "log_prescale"):
+            prescale = torch.exp(self.log_prescale).to(device=x.device, dtype=x.dtype).clamp_min(1.0e-12)
+        elif hasattr(self, "prescale_tensor"):
+            prescale = self.prescale_tensor.to(device=x.device, dtype=x.dtype)
+        else:
+            prescale = 1.0 / postscale
+        z = x * prescale
         coeffs = self.coeffs.to(device=z.device, dtype=z.dtype)
         if coeffs.numel() == 0:
             cheb = torch.zeros_like(z)
@@ -177,6 +196,50 @@ def parse_poly_degree_overrides(value: str) -> dict[str, int]:
             raise ValueError(f"invalid polynomial degree for {name!r}: {degree}")
         overrides[name] = degree
     return overrides
+
+
+def parse_poly_postscale_caps(value: str) -> dict[str, float]:
+    caps: dict[str, float] = {}
+    text = str(value or "").strip()
+    if not text:
+        return caps
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"invalid --poly-postscale-caps entry {item!r}; expected module=cap")
+        name, cap_text = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"invalid --poly-postscale-caps entry {item!r}; empty module name")
+        cap = float(cap_text.strip())
+        if not math.isfinite(cap) or cap <= 0.0:
+            raise ValueError(f"invalid postscale cap for {name!r}: {cap}")
+        caps[name] = cap
+    return caps
+
+
+def parse_poly_prescale_caps(value: str) -> dict[str, float]:
+    caps: dict[str, float] = {}
+    text = str(value or "").strip()
+    if not text:
+        return caps
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"invalid --poly-prescale-caps entry {item!r}; expected module=cap")
+        name, cap_text = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"invalid --poly-prescale-caps entry {item!r}; empty module name")
+        cap = float(cap_text.strip())
+        if not math.isfinite(cap) or cap <= 0.0:
+            raise ValueError(f"invalid prescale cap for {name!r}: {cap}")
+        caps[name] = cap
+    return caps
 
 
 def make_activation(kind: str, *, scale_margin: float) -> nn.Module:
@@ -361,6 +424,8 @@ def set_scaled_silu_updates(model: nn.Module, *, enabled: bool) -> None:
             module.track_scale_updates = bool(enabled)
         if isinstance(module, ScaledChebyshevSiLU) and hasattr(module, "log_postscale"):
             module.log_postscale.requires_grad_(bool(enabled))
+        if isinstance(module, ScaledChebyshevSiLU) and hasattr(module, "log_prescale"):
+            module.log_prescale.requires_grad_(bool(enabled))
 
 
 def cheb_scale_parameters(model: nn.Module) -> list[nn.Parameter]:
@@ -368,6 +433,8 @@ def cheb_scale_parameters(model: nn.Module) -> list[nn.Parameter]:
     for module in model.modules():
         if isinstance(module, ScaledChebyshevSiLU) and hasattr(module, "log_postscale"):
             params.append(module.log_postscale)
+        if isinstance(module, ScaledChebyshevSiLU) and hasattr(module, "log_prescale"):
+            params.append(module.log_prescale)
     return params
 
 
@@ -406,6 +473,7 @@ def replace_scaled_silu_with_poly(
     degree_overrides: dict[str, int] | None = None,
     trainable_coeffs: bool = False,
     trainable_scale: bool = False,
+    trainable_prescale: bool = False,
 ) -> dict[str, dict[str, float]]:
     metadata: dict[str, dict[str, float]] = {}
     overrides = dict(degree_overrides or {})
@@ -433,6 +501,7 @@ def replace_scaled_silu_with_poly(
                         postscale=postscale,
                         trainable_coeffs=bool(trainable_coeffs),
                         trainable_scale=bool(trainable_scale),
+                        trainable_prescale=bool(trainable_prescale),
                         reference_activation="scaled-silu",
                     ),
                 )
@@ -444,6 +513,7 @@ def replace_scaled_silu_with_poly(
                     "degree": int(module_degree),
                     "trainable_coeffs": bool(trainable_coeffs),
                     "trainable_scale": bool(trainable_scale),
+                    "trainable_prescale": bool(trainable_prescale),
                     "reference_activation": "scaled-silu",
                 }
             else:
@@ -465,6 +535,7 @@ def replace_scaled_silu_with_range_poly(
     scale_margin: float,
     trainable_coeffs: bool = False,
     trainable_scale: bool = False,
+    trainable_prescale: bool = False,
 ) -> dict[str, dict[str, float]]:
     metadata: dict[str, dict[str, float]] = {}
     overrides = dict(degree_overrides or {})
@@ -502,6 +573,7 @@ def replace_scaled_silu_with_range_poly(
                         postscale=domain_postscale,
                         trainable_coeffs=bool(trainable_coeffs),
                         trainable_scale=bool(trainable_scale),
+                        trainable_prescale=bool(trainable_prescale),
                         reference_activation="scaled-silu",
                         reference_postscale=target_postscale,
                     ),
@@ -516,6 +588,7 @@ def replace_scaled_silu_with_range_poly(
                     "fit": "scaled_silu_target_on_range_domain",
                     "trainable_coeffs": bool(trainable_coeffs),
                     "trainable_scale": bool(trainable_scale),
+                    "trainable_prescale": bool(trainable_prescale),
                     "reference_activation": "scaled-silu",
                 }
             else:
@@ -611,6 +684,7 @@ def replace_plain_silu_with_range_poly(
     scale_margin: float,
     trainable_coeffs: bool = False,
     trainable_scale: bool = False,
+    trainable_prescale: bool = False,
 ) -> dict[str, dict[str, float]]:
     metadata: dict[str, dict[str, float]] = {}
     overrides = dict(degree_overrides or {})
@@ -643,6 +717,7 @@ def replace_plain_silu_with_range_poly(
                         postscale=postscale,
                         trainable_coeffs=bool(trainable_coeffs),
                         trainable_scale=bool(trainable_scale),
+                        trainable_prescale=bool(trainable_prescale),
                         reference_activation="plain-silu",
                     ),
                 )
@@ -655,6 +730,7 @@ def replace_plain_silu_with_range_poly(
                     "fit": "silu_x_on_scaled_domain",
                     "trainable_coeffs": bool(trainable_coeffs),
                     "trainable_scale": bool(trainable_scale),
+                    "trainable_prescale": bool(trainable_prescale),
                     "reference_activation": "plain-silu",
                 }
             else:
@@ -673,6 +749,127 @@ def set_poly_blend_alpha(model: nn.Module, *, alpha: float) -> None:
             module.blend_alpha.copy_(torch.tensor(float(alpha), device=module.blend_alpha.device, dtype=module.blend_alpha.dtype))
 
 
+def _cheb_postscale_value(module: ScaledChebyshevSiLU) -> float:
+    if hasattr(module, "log_postscale"):
+        return float(torch.exp(module.log_postscale.detach().cpu().to(dtype=torch.float32)).item())
+    if hasattr(module, "postscale_tensor"):
+        return float(module.postscale_tensor.detach().cpu().to(dtype=torch.float32).item())
+    return float(module.postscale)
+
+
+def _cheb_prescale_value(module: ScaledChebyshevSiLU) -> float:
+    if hasattr(module, "log_prescale"):
+        return float(torch.exp(module.log_prescale.detach().cpu().to(dtype=torch.float32)).item())
+    if hasattr(module, "prescale_tensor"):
+        return float(module.prescale_tensor.detach().cpu().to(dtype=torch.float32).item())
+    postscale = _cheb_postscale_value(module)
+    return float(1.0 / postscale if postscale != 0.0 else 1.0)
+
+
+def _set_cheb_postscale(module: ScaledChebyshevSiLU, value: float) -> None:
+    value = float(value)
+    if hasattr(module, "log_postscale"):
+        module.log_postscale.data.fill_(math.log(max(value, 1.0e-12)))
+    elif hasattr(module, "postscale_tensor"):
+        module.postscale_tensor.copy_(torch.tensor(value, device=module.postscale_tensor.device, dtype=module.postscale_tensor.dtype))
+    module.postscale = value
+    if not bool(getattr(module, "independent_prescale", False)):
+        module.prescale = 1.0 / value if value != 0.0 else 1.0
+
+
+def _set_cheb_prescale(module: ScaledChebyshevSiLU, value: float) -> None:
+    value = float(value)
+    if hasattr(module, "log_prescale"):
+        module.log_prescale.data.fill_(math.log(max(value, 1.0e-12)))
+    elif hasattr(module, "prescale_tensor"):
+        module.prescale_tensor.copy_(torch.tensor(value, device=module.prescale_tensor.device, dtype=module.prescale_tensor.dtype))
+    elif not bool(getattr(module, "independent_prescale", False)):
+        postscale = 1.0 / value if value != 0.0 else 1.0
+        _set_cheb_postscale(module, postscale)
+    module.prescale = value
+
+
+def clamp_cheb_postscales(model: nn.Module, caps: dict[str, float]) -> dict[str, dict[str, float | bool]]:
+    if not caps:
+        return {}
+    modules = {name: module for name, module in model.named_modules() if isinstance(module, ScaledChebyshevSiLU)}
+    unused = sorted(set(caps) - set(modules))
+    if unused:
+        raise ValueError(f"--poly-postscale-caps did not match activation modules: {', '.join(unused)}")
+    changed: dict[str, dict[str, float | bool]] = {}
+    with torch.no_grad():
+        for name, cap in caps.items():
+            module = modules[name]
+            before = _cheb_postscale_value(module)
+            after = min(before, float(cap))
+            if after < before:
+                _set_cheb_postscale(module, after)
+            changed[name] = {
+                "before": float(before),
+                "after": float(after),
+                "cap": float(cap),
+                "clamped": bool(after < before),
+            }
+    return changed
+
+
+def clamp_cheb_prescales(model: nn.Module, caps: dict[str, float]) -> dict[str, dict[str, float | bool]]:
+    if not caps:
+        return {}
+    modules = {name: module for name, module in model.named_modules() if isinstance(module, ScaledChebyshevSiLU)}
+    unused = sorted(set(caps) - set(modules))
+    if unused:
+        raise ValueError(f"--poly-prescale-caps did not match activation modules: {', '.join(unused)}")
+    changed: dict[str, dict[str, float | bool]] = {}
+    with torch.no_grad():
+        for name, cap in caps.items():
+            module = modules[name]
+            before = _cheb_prescale_value(module)
+            after = min(before, float(cap))
+            if after < before:
+                _set_cheb_prescale(module, after)
+            changed[name] = {
+                "before": float(before),
+                "after": float(after),
+                "cap": float(cap),
+                "clamped": bool(after < before),
+            }
+    return changed
+
+
+def collect_cheb_postscale_stats(model: nn.Module, caps: dict[str, float] | None = None) -> dict[str, object]:
+    caps = dict(caps or {})
+    rows: dict[str, dict[str, float | bool]] = {}
+    values: list[float] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, ScaledChebyshevSiLU):
+            continue
+        value = _cheb_postscale_value(module)
+        prescale = _cheb_prescale_value(module)
+        values.append(value)
+        row: dict[str, float | bool] = {
+            "postscale": float(value),
+            "prescale": float(prescale),
+            "domain_postscale": float(1.0 / prescale if prescale != 0.0 else math.inf),
+            "independent_prescale": bool(getattr(module, "independent_prescale", False)),
+        }
+        if name in caps:
+            cap = float(caps[name])
+            row["cap"] = cap
+            row["at_cap"] = bool(value >= cap * (1.0 - 1.0e-6))
+        rows[name] = row
+    if not values:
+        return {"count": 0, "modules": rows}
+    selected = {name: rows[name] for name in caps if name in rows}
+    return {
+        "count": int(len(values)),
+        "min": float(min(values)),
+        "mean": float(sum(values) / len(values)),
+        "max": float(max(values)),
+        "selected": selected,
+    }
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -682,6 +879,8 @@ def run_epoch(
     grad_clip_norm: float = 0.0,
     teacher: nn.Module | None = None,
     distill_weight: float = 0.0,
+    cheb_postscale_caps: dict[str, float] | None = None,
+    cheb_prescale_caps: dict[str, float] | None = None,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -709,6 +908,10 @@ def run_epoch(
             if float(grad_clip_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
             optimizer.step()
+            if cheb_postscale_caps:
+                clamp_cheb_postscales(model, dict(cheb_postscale_caps))
+            if cheb_prescale_caps:
+                clamp_cheb_prescales(model, dict(cheb_prescale_caps))
         metrics = batch_metrics(logits.detach(), masks)
         batch = int(images.shape[0])
         total_loss += float(loss.detach().item()) * batch
@@ -792,11 +995,19 @@ def train_stage(
     teacher_model: nn.Module | None = None,
     distill_weight: float = 0.0,
     homotopy_epochs: int = 0,
+    cheb_postscale_caps: dict[str, float] | None = None,
+    cheb_prescale_caps: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
     best_metrics: dict[str, float] | None = None
     best_dice = -math.inf
     history: list[dict[str, object]] = []
+    cheb_postscale_caps = dict(cheb_postscale_caps or {})
+    cheb_prescale_caps = dict(cheb_prescale_caps or {})
+    if cheb_postscale_caps:
+        clamp_cheb_postscales(model, cheb_postscale_caps)
+    if cheb_prescale_caps:
+        clamp_cheb_prescales(model, cheb_prescale_caps)
     if initial_metrics is not None and int(homotopy_epochs) <= 0:
         initial_values = [initial_metrics["dice"], initial_metrics["iou"], initial_metrics["loss"]]
         if all(math.isfinite(float(value)) for value in initial_values):
@@ -828,6 +1039,8 @@ def train_stage(
             grad_clip_norm=float(grad_clip_norm),
             teacher=teacher_model,
             distill_weight=float(distill_weight),
+            cheb_postscale_caps=cheb_postscale_caps,
+            cheb_prescale_caps=cheb_prescale_caps,
         )
         val_metrics = run_epoch(model, val_loader, device=device, optimizer=None)
         row = {
@@ -837,6 +1050,9 @@ def train_stage(
             "train": train_metrics,
             "valid": val_metrics,
         }
+        if cheb_postscale_caps or cheb_prescale_caps:
+            row["cheb_postscales"] = collect_cheb_postscale_stats(model, cheb_postscale_caps)
+            row["cheb_prescale_caps"] = cheb_prescale_caps
         history.append(row)
         print("epoch", json.dumps(row, sort_keys=True), flush=True)
         metric_values = [
@@ -850,6 +1066,10 @@ def train_stage(
         metrics_are_finite = all(math.isfinite(float(value)) for value in metric_values)
         save_allowed = int(homotopy_epochs) <= 0 or float(blend_alpha) >= 1.0
         if metrics_are_finite and save_allowed and float(val_metrics["dice"]) >= best_dice:
+            if cheb_postscale_caps:
+                clamp_cheb_postscales(model, cheb_postscale_caps)
+            if cheb_prescale_caps:
+                clamp_cheb_prescales(model, cheb_prescale_caps)
             best_dice = float(val_metrics["dice"])
             best_metrics = val_metrics
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -965,6 +1185,11 @@ def parse_args() -> argparse.Namespace:
         help="Make per-activation Chebyshev postscale trainable during optional polynomial fine-tuning.",
     )
     parser.add_argument(
+        "--train-poly-prescale",
+        action="store_true",
+        help="Make per-activation Chebyshev prescale trainable independently from postscale.",
+    )
+    parser.add_argument(
         "--range-fit-scaled-poly",
         action="store_true",
         help="For scaled-SiLU replacement, fit Chebyshev on observed activation ranges while preserving trained target scales.",
@@ -980,6 +1205,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Ramp polynomial modules from exact SiLU to pure Chebyshev over this many fine-tuning epochs.",
+    )
+    parser.add_argument(
+        "--poly-init-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional Chebyshev checkpoint used to initialize the polynomial stage before fine-tuning.",
+    )
+    parser.add_argument(
+        "--poly-postscale-caps",
+        default="",
+        help="Comma-separated module=cap entries applied during polynomial fine-tuning and saved into the checkpoint.",
+    )
+    parser.add_argument(
+        "--poly-prescale-caps",
+        default="",
+        help="Comma-separated module=max_prescale entries applied during polynomial fine-tuning.",
     )
     parser.add_argument(
         "--eval-poly-only",
@@ -1050,9 +1291,15 @@ def main() -> int:
     stage2_suffix = "finetune" if stage2_init == "stage1" else "retrain"
     stage2_name = f"{stage2_prefix}_avgpool_{stage2_suffix}"
     poly_degree_overrides = parse_poly_degree_overrides(str(args.poly_degree_overrides))
+    poly_postscale_caps = parse_poly_postscale_caps(str(args.poly_postscale_caps))
     poly_stage_label = f"degree_{int(args.poly_degree)}"
     if poly_degree_overrides:
         poly_stage_label += "_mixed"
+    poly_prescale_caps = parse_poly_prescale_caps(str(args.poly_prescale_caps))
+    if poly_postscale_caps:
+        poly_stage_label += "_postscale_capped"
+    if bool(args.train_poly_prescale):
+        poly_stage_label += "_prepost"
     poly_stage_name = f"{stage2_prefix}_avgpool_{poly_stage_label}"
     stage1_path = Path(args.out_dir) / f"{tag}_{stage1_name}_best.pt"
     stage2_path = Path(args.out_dir) / f"{tag}_{stage2_name}_best.pt"
@@ -1162,6 +1409,7 @@ def main() -> int:
                 scale_margin=float(args.scale_margin),
                 trainable_coeffs=bool(args.train_poly_coeffs),
                 trainable_scale=bool(args.train_poly_scale),
+                trainable_prescale=bool(args.train_poly_prescale),
             )
         else:
             if bool(args.range_fit_scaled_poly):
@@ -1174,6 +1422,7 @@ def main() -> int:
                     scale_margin=float(args.scale_margin),
                     trainable_coeffs=bool(args.train_poly_coeffs),
                     trainable_scale=bool(args.train_poly_scale),
+                    trainable_prescale=bool(args.train_poly_prescale),
                 )
             else:
                 poly_meta = replace_scaled_silu_with_poly(
@@ -1182,7 +1431,36 @@ def main() -> int:
                     degree_overrides=poly_degree_overrides,
                     trainable_coeffs=bool(args.train_poly_coeffs),
                     trainable_scale=bool(args.train_poly_scale),
+                    trainable_prescale=bool(args.train_poly_prescale),
                 )
+        if args.poly_init_checkpoint is not None:
+            poly_checkpoint = torch.load(Path(args.poly_init_checkpoint), map_location="cpu", weights_only=False)
+            checkpoint_state = poly_checkpoint["state_dict"]
+            if bool(args.train_poly_prescale):
+                missing, unexpected = poly_model.load_state_dict(checkpoint_state, strict=False)
+                allowed_missing: set[str] = set()
+                for name, module in poly_model.named_modules():
+                    if not isinstance(module, ScaledChebyshevSiLU):
+                        continue
+                    log_key = f"{name}.log_prescale"
+                    tensor_key = f"{name}.prescale_tensor"
+                    if log_key not in checkpoint_state and tensor_key not in checkpoint_state:
+                        allowed_missing.add(log_key)
+                        _set_cheb_prescale(module, 1.0 / _cheb_postscale_value(module))
+                remaining_missing = [key for key in missing if key not in allowed_missing]
+                if unexpected or remaining_missing:
+                    raise RuntimeError(
+                        "poly init checkpoint did not match pre/post-scale Cheb model: "
+                        f"missing={remaining_missing[:8]} unexpected={list(unexpected)[:8]}"
+                    )
+            else:
+                poly_model.load_state_dict(checkpoint_state, strict=True)
+            poly_model.to(device)
+            set_poly_blend_alpha(poly_model, alpha=1.0)
+        if poly_postscale_caps:
+            clamp_cheb_postscales(poly_model, poly_postscale_caps)
+        if poly_prescale_caps:
+            clamp_cheb_prescales(poly_model, poly_prescale_caps)
         poly_metrics = evaluate_with_reference(poly_model, val_loader, device=device, reference=stage2_model)
         if int(args.poly_finetune_epochs) > 0:
             if int(args.poly_homotopy_epochs) > 0:
@@ -1203,6 +1481,8 @@ def main() -> int:
                 distill_weight=float(args.poly_distill_weight),
                 homotopy_epochs=int(args.poly_homotopy_epochs),
                 freeze_scale_after_epoch=int(args.freeze_scale_after_epoch),
+                cheb_postscale_caps=poly_postscale_caps,
+                cheb_prescale_caps=poly_prescale_caps,
             )
             poly_checkpoint = torch.load(poly_finetune_path, map_location="cpu", weights_only=False)
             poly_model.load_state_dict(poly_checkpoint["state_dict"])
@@ -1284,9 +1564,13 @@ def main() -> int:
             "poly_lr": float(args.poly_lr),
             "train_poly_coeffs": bool(args.train_poly_coeffs),
             "train_poly_scale": bool(args.train_poly_scale),
+            "train_poly_prescale": bool(args.train_poly_prescale),
             "range_fit_scaled_poly": bool(args.range_fit_scaled_poly),
             "poly_distill_weight": float(args.poly_distill_weight),
             "poly_homotopy_epochs": int(args.poly_homotopy_epochs),
+            "poly_init_checkpoint": "" if args.poly_init_checkpoint is None else str(args.poly_init_checkpoint),
+            "poly_postscale_caps": poly_postscale_caps,
+            "poly_prescale_caps": poly_prescale_caps,
             "eval_poly_only": bool(args.eval_poly_only),
             "skip_poly": skip_poly,
             "freeze_scale_after_epoch": int(args.freeze_scale_after_epoch),
@@ -1306,6 +1590,7 @@ def main() -> int:
         "plain_silu_fit_ranges": plain_silu_ranges,
         "scaled_silu_fit_ranges": scaled_silu_ranges,
         "degree_replacements": poly_meta,
+        "poly_postscale_stats": collect_cheb_postscale_stats(poly_model, poly_postscale_caps) if not skip_poly else {},
         "load_notes": incompatible,
         "wall_s": float(time.time() - started),
     }
