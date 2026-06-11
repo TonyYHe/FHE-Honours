@@ -72,7 +72,7 @@ TASKS = {
         cheb_checkpoint=REPO_ROOT
         / "checkpoints"
         / "fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603"
-        / "covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_finetune_best.pt",
+        / "covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
         replacements=REPO_ROOT
         / "artifacts"
         / "haloed_paper_eval"
@@ -96,7 +96,7 @@ TASKS = {
         cheb_checkpoint=REPO_ROOT
         / "checkpoints"
         / "fhelipe_medseg_staged_nusetmsb_384_scaled_silu_freeze15_cheb7_20260603"
-        / "nusetmsb_unet22_plus_output_base32_384_scaled_silu_avgpool_degree_7_finetune_best.pt",
+        / "nusetmsb_unet22_plus_output_base32_384_scaled_silu_avgpool_degree_7_dec4a1536_rawgain_g045_finetune_best.pt",
         replacements=REPO_ROOT
         / "artifacts"
         / "haloed_paper_eval"

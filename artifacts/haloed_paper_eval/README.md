@@ -35,6 +35,10 @@ Regenerate the MedSeg Cheb7 accuracy table in PyTorch:
 ```
 
 The default accuracy sample count is 10 fixed validation examples per task.
+MedSeg Cheb7 artifact defaults use the reduced-scale raw-gain fine-tuned
+checkpoints.  COVID-256 uses the decoder-wide `rawgain_tight_g045` checkpoint;
+NuSeg-384 uses the `dec4a1536_rawgain_g045` checkpoint.  The scale schedule is
+saved in the checkpoint; artifact evaluation does not apply a runtime clamp.
 
 Run the same fixed-index accuracy cases through the Orion cleartext or CKKS
 backend:

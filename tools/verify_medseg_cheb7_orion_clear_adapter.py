@@ -31,21 +31,23 @@ DEFAULT_CHECKPOINTS = {
     "covid19": REPO_ROOT
     / "checkpoints"
     / "fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603"
-    / "covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_finetune_best.pt",
+    / "covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
     "nusetmsb": REPO_ROOT
     / "checkpoints"
     / "fhelipe_medseg_staged_nusetmsb_384_scaled_silu_freeze15_cheb7_20260603"
-    / "nusetmsb_unet22_plus_output_base32_384_scaled_silu_avgpool_degree_7_finetune_best.pt",
+    / "nusetmsb_unet22_plus_output_base32_384_scaled_silu_avgpool_degree_7_dec4a1536_rawgain_g045_finetune_best.pt",
 }
 
 DEFAULT_REPLACEMENTS = {
     "covid19": REPO_ROOT
-    / ".tmp"
-    / "results"
+    / "artifacts"
+    / "haloed_paper_eval"
+    / "fixtures"
     / "fhelipe_medseg_covid19_unet22_plus_output_256_base32_scaled_silu_freeze15_cheb7_finetune20_20260603.json",
     "nusetmsb": REPO_ROOT
-    / ".tmp"
-    / "results"
+    / "artifacts"
+    / "haloed_paper_eval"
+    / "fixtures"
     / "fhelipe_medseg_nusetmsb_unet22_plus_output_384_base32_scaled_silu_freeze15_cheb7_finetune20_20260603.json",
 }
 
@@ -131,6 +133,22 @@ def _activation_postscale(name: str, state: dict[str, torch.Tensor], replacement
     return float(row.get("postscale", row.get("domain_postscale", 1.0)))
 
 
+def _activation_prescale(
+    name: str,
+    state: dict[str, torch.Tensor],
+    replacements: dict[str, dict[str, Any]],
+    postscale: float,
+) -> float:
+    log_key = f"{name}.log_prescale"
+    tensor_key = f"{name}.prescale_tensor"
+    if log_key in state:
+        return float(torch.exp(state[log_key].detach().cpu().to(dtype=torch.float32)).item())
+    if tensor_key in state:
+        return float(state[tensor_key].detach().cpu().to(dtype=torch.float32).item())
+    row = dict(replacements.get(name, {}) or {})
+    return float(row.get("prescale", 1.0 / postscale if postscale != 0.0 else 1.0))
+
+
 def _replace_reference_activations(
     model: torch.nn.Module,
     *,
@@ -148,6 +166,9 @@ def _replace_reference_activations(
         degree = int(len(coeffs) - 1)
         postscale = _activation_postscale(name, state, replacements)
         log_key = f"{name}.log_postscale"
+        prescale = _activation_prescale(name, state, replacements, postscale)
+        prescale_log_key = f"{name}.log_prescale"
+        prescale_tensor_key = f"{name}.prescale_tensor"
         reference_key = f"{name}.reference_postscale_tensor"
         reference_activation = str(row.get("reference_activation", default_reference_activation))
         reference_postscale = (
@@ -161,8 +182,12 @@ def _replace_reference_activations(
             ScaledChebyshevSiLU(
                 coeffs,
                 postscale=float(postscale),
+                prescale=float(prescale)
+                if (prescale_log_key in state or prescale_tensor_key in state or "prescale" in row)
+                else None,
                 trainable_coeffs=False,
                 trainable_scale=log_key in state,
+                trainable_prescale=prescale_log_key in state,
                 blend_alpha=1.0,
                 reference_activation=reference_activation,
                 reference_postscale=reference_postscale,
@@ -171,7 +196,8 @@ def _replace_reference_activations(
         installed[name] = {
             "degree": float(degree),
             "postscale": float(postscale),
-            "prescale": float(1.0 / postscale if postscale != 0.0 else 1.0),
+            "prescale": float(prescale),
+            "domain_postscale": float(1.0 / prescale if prescale != 0.0 else float("inf")),
             "reference_postscale": float(reference_postscale),
         }
     return installed
@@ -209,6 +235,7 @@ def _build_training_reference_model(
         ignored_missing.update(
             {
                 f"{name}.postscale_tensor",
+                f"{name}.prescale_tensor",
                 f"{name}.blend_alpha",
                 f"{name}.reference_postscale_tensor",
             }
