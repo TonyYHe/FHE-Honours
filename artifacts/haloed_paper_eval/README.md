@@ -60,6 +60,10 @@ Concat-depth/low-postscale check:
   --data-root artifacts/haloed_paper_eval/fixtures/fhelipe_medseg_accuracy10
 ```
 
+For fixture-backed datasets, use `--original-val-indices` when you want to
+select by the original validation ID recorded in `accuracy_original_val_indices`
+instead of reproducing an exact verifier `--val-index` argument.
+
 Re-render from an existing root without rerunning long experiments:
 
 ```bash

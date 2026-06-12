@@ -164,8 +164,31 @@ def _sample_specs(
     count: int,
     data_root: Path,
     val_indices: list[int] | None = None,
+    original_val_indices: list[int] | None = None,
 ) -> tuple[FhelipeSegmentationDataset, list[dict[str, Any]]]:
     dataset, original_indices = _subset_dataset(task, data_root=data_root)
+    if val_indices and original_val_indices:
+        raise ValueError("use only one of --val-indices or --original-val-indices")
+    if original_val_indices:
+        original_to_subset = {int(value): int(index) for index, value in enumerate(original_indices)}
+        missing = [int(value) for value in original_val_indices if int(value) not in original_to_subset]
+        if missing:
+            raise ValueError(f"requested original validation IDs are not in the fixture subset: {missing}")
+        rows: list[dict[str, Any]] = []
+        for original_val_index in original_val_indices:
+            subset_index = int(original_to_subset[int(original_val_index)])
+            rows.append(
+                {
+                    "task": task.label,
+                    "dataset": task.dataset,
+                    "image_size": int(task.image_size),
+                    "subset_index": int(subset_index),
+                    "original_val_index": int(original_val_index),
+                    "backend_val_index": int(subset_index),
+                    "fixture_original_val_index": int(original_val_index),
+                }
+            )
+        return dataset, rows
     if val_indices:
         rows: list[dict[str, Any]] = []
         for requested_val_index in val_indices:
@@ -229,8 +252,15 @@ def _sample_rows(
     count: int,
     data_root: Path,
     val_indices: list[int] | None = None,
+    original_val_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    _dataset, rows = _sample_specs(task, count=count, data_root=data_root, val_indices=val_indices)
+    _dataset, rows = _sample_specs(
+        task,
+        count=count,
+        data_root=data_root,
+        val_indices=val_indices,
+        original_val_indices=original_val_indices,
+    )
     return rows
 
 
@@ -269,8 +299,15 @@ def _evaluate_pytorch_rows(
     baselines: set[str],
     include_cheb: bool,
     val_indices: list[int] | None = None,
+    original_val_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    dataset, sample_rows = _sample_specs(task, count=count, data_root=data_root, val_indices=val_indices)
+    dataset, sample_rows = _sample_specs(
+        task,
+        count=count,
+        data_root=data_root,
+        val_indices=val_indices,
+        original_val_indices=original_val_indices,
+    )
 
     models: dict[str, torch.nn.Module] = {}
     if "plain" in baselines:
@@ -506,9 +543,16 @@ def _run_backend_rows(
     check_existing: bool,
     force: bool,
     val_indices: list[int] | None = None,
+    original_val_indices: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[list[str | Path]]]:
     if dry_run:
-        baseline_rows = _sample_rows(task, count=count, data_root=data_root, val_indices=val_indices)
+        baseline_rows = _sample_rows(
+            task,
+            count=count,
+            data_root=data_root,
+            val_indices=val_indices,
+            original_val_indices=original_val_indices,
+        )
     else:
         baseline_rows = _evaluate_pytorch_rows(
             task,
@@ -518,6 +562,7 @@ def _run_backend_rows(
             baselines=baselines,
             include_cheb=False,
             val_indices=val_indices,
+            original_val_indices=original_val_indices,
         )
     commands: list[list[str | Path]] = []
     rows: list[dict[str, Any]] = []
@@ -644,6 +689,7 @@ def _run_pytorch(
     device: torch.device | str,
     baselines: set[str],
     val_indices: list[int] | None = None,
+    original_val_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task in tasks:
@@ -655,6 +701,7 @@ def _run_pytorch(
             baselines=baselines,
             include_cheb=True,
             val_indices=val_indices,
+            original_val_indices=original_val_indices,
         )
         for row in task_rows:
             row["run_kind"] = "pytorch"
@@ -693,14 +740,26 @@ def main() -> int:
         default=None,
         help="Optional explicit verifier val-index values for reproducing individual accuracy cases.",
     )
+    parser.add_argument(
+        "--original-val-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional original validation IDs; resolved through the fixture accuracy_original_val_indices array.",
+    )
     parser.add_argument("--no-single-slot-layer-cache", dest="single_slot_layer_cache", action="store_false")
     parser.set_defaults(single_slot_layer_cache=True)
     args = parser.parse_args()
 
     selected_tasks = _select_tasks(list(args.tasks))
     explicit_val_indices = None if args.val_indices is None else [int(value) for value in args.val_indices]
-    if explicit_val_indices and len(selected_tasks) != 1:
-        raise ValueError("--val-indices can only be used with a single --tasks value")
+    explicit_original_val_indices = (
+        None if args.original_val_indices is None else [int(value) for value in args.original_val_indices]
+    )
+    if explicit_val_indices and explicit_original_val_indices:
+        raise ValueError("use only one of --val-indices or --original-val-indices")
+    if (explicit_val_indices or explicit_original_val_indices) and len(selected_tasks) != 1:
+        raise ValueError("--val-indices/--original-val-indices can only be used with a single --tasks value")
     counts = _normalize_counts(list(args.counts))
     max_count = max(counts)
     baselines = {"plain", "scaled"} if args.baseline == "both" else {str(args.baseline)}
@@ -730,6 +789,7 @@ def main() -> int:
                 device=torch.device(str(args.device)),
                 baselines=baselines,
                 val_indices=explicit_val_indices,
+                original_val_indices=explicit_original_val_indices,
             )
         else:
             rows = []
@@ -755,6 +815,7 @@ def main() -> int:
                     check_existing=bool(args.check_existing),
                     force=bool(args.force),
                     val_indices=explicit_val_indices,
+                    original_val_indices=explicit_original_val_indices,
                 )
                 rows.extend(task_rows)
                 backend_commands.extend(task_commands)
@@ -807,6 +868,7 @@ def main() -> int:
             "counts": counts,
             "tasks": [task.key for task in selected_tasks],
             "val_indices": explicit_val_indices or [],
+            "original_val_indices": explicit_original_val_indices or [],
             "run_kinds": run_kinds,
             "backend_bootstrap_many": str(args.backend_bootstrap_many),
             "backend_env_defaults": BACKEND_ENV_DEFAULTS,
