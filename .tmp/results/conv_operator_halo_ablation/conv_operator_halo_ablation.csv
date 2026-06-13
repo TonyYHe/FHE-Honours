@@ -1,5 +1,0 @@
-case,input,output,kernel,gap,original_orion,flat_halo,flat_halo_b,aligned_halo_b,halo_saving,b_saving_after_halo,align_saving_after_halo_b,total_saving,total_gain,total_reduction,channel_tile,source_h,target_h,height_stripes,flat_programs,flat_b_groups,aligned_programs,aligned_b_groups
-r34_stage1,64x56x56,64x56x56,3x3,4,2315,1555,1094,904,760,461,190,1411,2.56x,60.95%,16,36,34,2,32,8,32,8
-r34_stage2,128x28x28,128x28x28,3x3,8,1323,741,650,548,582,91,102,775,2.41x,58.58%,64,18,16,2,8,4,8,4
-r34_stage3,256x14x14,256x14x14,3x3,16,499,312,312,312,187,0,0,187,1.60x,37.47%,256,9,7,2,2,2,2,2
-u22_256_enc1a,3x256x256,32x256x256,3x3,1,1536,1280,240,240,256,1040,0,1296,6.40x,84.38%,2,64,62,5,160,10,160,10
