@@ -35,17 +35,21 @@ Regenerate quick compile/plot artifacts:
 .venv/bin/python artifacts/haloed_paper_eval/eval/build_all.py --only fig7 table2 table3
 ```
 
-Regenerate the MedSeg Cheb7 accuracy table in PyTorch:
+Regenerate the MedSeg scaled-SiLU reference vs Cheb7 accuracy table in PyTorch:
 
 ```bash
 .venv/bin/python artifacts/haloed_paper_eval/eval/accuracy_medseg_cheb7.py --run-kind pytorch
 ```
 
-The default accuracy sample count is 10 fixed validation examples per task.
+The default accuracy sample count is 10 fixed validation examples per task,
+using the fixture data under `artifacts/haloed_paper_eval/fixtures/`.
 MedSeg Cheb7 artifact defaults use the reduced-scale raw-gain fine-tuned
 checkpoints.  COVID-256 uses the decoder-wide `rawgain_tight_g045` checkpoint;
 NuSeg-384 uses the `dec4a1536_rawgain_g045` checkpoint.  The scale schedule is
 saved in the checkpoint; artifact evaluation does not apply a runtime clamp.
+The accuracy summary reports the scaled-SiLU PyTorch reference, the Cheb7
+PyTorch/clear/CKKS result, and the Cheb7 drop relative to the scaled-SiLU
+reference.  It does not require or report the older plain-SiLU baseline.
 The CKKS backend defaults set `ORION_PROVIDER_MVM_MASKED_MATERIALIZATION=1`,
 `ORION_BOOTSTRAP_LAYOUT_REFINEMENT=0`,
 `ORION_LAYOUT_POLICY_RELAYOUT_KERNEL=0`, and `ORION_CONCAT_FUSION=0`.  The
@@ -86,8 +90,8 @@ rerunning long experiments:
 
 ## Target Mapping
 
-- `accuracy_medseg_cheb7.py` reproduces fixed-index MedSeg Cheb7 accuracy in
-  PyTorch, cleartext backend, or CKKS backend.
+- `accuracy_medseg_cheb7.py` reproduces fixed-index MedSeg scaled-SiLU vs Cheb7
+  accuracy in PyTorch, cleartext backend, or CKKS backend.
 - `fig7_operator_conv_perf.py` wraps `tools/run_conv_kernel_table.py`.
 - `table1_e2e_unet.py` wraps `tools/run_u22_dim32_dense_provider_e2e_matrix.py`.
 - `appendix_compile_mvm.py` extracts the appendix BSGS-MVM count and compile

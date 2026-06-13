@@ -46,6 +46,7 @@ BACKEND_ENV_DEFAULTS = {
     "ORION_LAYOUT_POLICY_RELAYOUT_KERNEL": "0",
     "ORION_CONCAT_FUSION": "0",
 }
+FIXTURE_DATA_ROOT = REPO_ROOT / "artifacts" / "haloed_paper_eval" / "fixtures" / "fhelipe_medseg_accuracy10"
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,6 @@ class AccuracyTask:
     dataset: str
     image_size: int
     subset_start: int
-    plain_checkpoint: Path
     scaled_checkpoint: Path
     cheb_checkpoint: Path
     replacements: Path
@@ -68,10 +68,6 @@ TASKS = {
         dataset="covid19",
         image_size=256,
         subset_start=465,
-        plain_checkpoint=REPO_ROOT
-        / "checkpoints"
-        / "fhelipe_medseg_unet22_plus_output_relu_silu_20260603"
-        / "covid19_unet22_plus_output_base32_256_silu_avgpool_retrain_best.pt",
         scaled_checkpoint=REPO_ROOT
         / "checkpoints"
         / "fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603"
@@ -92,10 +88,6 @@ TASKS = {
         dataset="nusetmsb",
         image_size=384,
         subset_start=117,
-        plain_checkpoint=REPO_ROOT
-        / "checkpoints"
-        / "fhelipe_medseg_unet22_plus_output_relu_silu_20260603"
-        / "nusetmsb_unet22_plus_output_base32_384_silu_avgpool_retrain_best.pt",
         scaled_checkpoint=REPO_ROOT
         / "checkpoints"
         / "fhelipe_medseg_staged_nusetmsb_384_scaled_silu_freeze15_cheb7_20260603"
@@ -278,16 +270,12 @@ def _model_metrics(model: torch.nn.Module, image: torch.Tensor, target: torch.Te
 
 
 def _add_drop_metrics(row: dict[str, Any]) -> None:
-    for baseline in ("plain_silu", "scaled_silu"):
-        dice_key = f"{baseline}_dice"
-        iou_key = f"{baseline}_iou"
-        loss_key = f"{baseline}_loss"
-        if dice_key in row and row.get("cheb_dice", "") != "":
-            row[f"{baseline}_dice_drop"] = float(row[dice_key]) - float(row["cheb_dice"])
-        if iou_key in row and row.get("cheb_iou", "") != "":
-            row[f"{baseline}_iou_drop"] = float(row[iou_key]) - float(row["cheb_iou"])
-        if loss_key in row and row.get("cheb_loss", "") != "":
-            row[f"{baseline}_loss_delta"] = float(row["cheb_loss"]) - float(row[loss_key])
+    if "scaled_silu_dice" in row and row.get("cheb_dice", "") != "":
+        row["scaled_silu_dice_drop"] = float(row["scaled_silu_dice"]) - float(row["cheb_dice"])
+    if "scaled_silu_iou" in row and row.get("cheb_iou", "") != "":
+        row["scaled_silu_iou_drop"] = float(row["scaled_silu_iou"]) - float(row["cheb_iou"])
+    if "scaled_silu_loss" in row and row.get("cheb_loss", "") != "":
+        row["scaled_silu_loss_delta"] = float(row["cheb_loss"]) - float(row["scaled_silu_loss"])
 
 
 def _evaluate_pytorch_rows(
@@ -296,7 +284,6 @@ def _evaluate_pytorch_rows(
     count: int,
     data_root: Path,
     device: torch.device | str,
-    baselines: set[str],
     include_cheb: bool,
     val_indices: list[int] | None = None,
     original_val_indices: list[int] | None = None,
@@ -310,10 +297,7 @@ def _evaluate_pytorch_rows(
     )
 
     models: dict[str, torch.nn.Module] = {}
-    if "plain" in baselines:
-        models["plain_silu"] = _load_stage_checkpoint(task.plain_checkpoint, device=device)
-    if "scaled" in baselines:
-        models["scaled_silu"] = _load_stage_checkpoint(task.scaled_checkpoint, device=device)
+    models["scaled_silu"] = _load_stage_checkpoint(task.scaled_checkpoint, device=device)
     if include_cheb:
         cheb_model, _meta = _build_training_reference_model(task.cheb_checkpoint, replacements_path=task.replacements, device=device)
         models["cheb"] = cheb_model
@@ -538,7 +522,6 @@ def _run_backend_rows(
     backend_rtol: float | None,
     backend_dice_atol: float | None,
     backend_bootstrap_many: str | None,
-    baselines: set[str],
     dry_run: bool,
     check_existing: bool,
     force: bool,
@@ -559,7 +542,6 @@ def _run_backend_rows(
             count=count,
             data_root=data_root,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            baselines=baselines,
             include_cheb=False,
             val_indices=val_indices,
             original_val_indices=original_val_indices,
@@ -609,18 +591,12 @@ def _run_backend_rows(
 def _summary_rows(rows: list[dict[str, Any]], *, counts: list[int], tasks: list[AccuracyTask], run_kind: str) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     numeric_fields = [
-        "plain_silu_dice",
-        "plain_silu_iou",
-        "plain_silu_loss",
         "scaled_silu_dice",
         "scaled_silu_iou",
         "scaled_silu_loss",
         "cheb_dice",
         "cheb_iou",
         "cheb_loss",
-        "plain_silu_dice_drop",
-        "plain_silu_iou_drop",
-        "plain_silu_loss_delta",
         "scaled_silu_dice_drop",
         "scaled_silu_iou_drop",
         "scaled_silu_loss_delta",
@@ -659,21 +635,19 @@ def _write_markdown(path: Path, summaries: list[dict[str, Any]]) -> None:
     lines = [
         "# MedSeg Cheb7 Accuracy Summary",
         "",
-        "Drop columns are baseline minus Cheb7; positive means Cheb7 is lower.",
+        "Drop columns are scaled-SiLU reference minus Cheb7; positive means Cheb7 is lower.",
         "",
-        "| Run | Task | N | Plain Dice | Cheb Dice | Drop vs plain | Scaled Dice | Drop vs scaled |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Run | Task | N | Scaled-SiLU Dice | Cheb7 Dice | Drop vs scaled |",
+        "|---|---|---:|---:|---:|---:|",
     ]
     for row in summaries:
         lines.append(
-            "| {run_kind} | {task} | {sample_count} | {plain:.6f} | {cheb:.6f} | {plain_drop:.6f} | {scaled:.6f} | {scaled_drop:.6f} |".format(
+            "| {run_kind} | {task} | {sample_count} | {scaled:.6f} | {cheb:.6f} | {scaled_drop:.6f} |".format(
                 run_kind=row.get("run_kind", ""),
                 task=row.get("task", ""),
                 sample_count=int(row.get("sample_count", 0)),
-                plain=clean_number(row.get("plain_silu_dice", "")),
-                cheb=clean_number(row.get("cheb_dice", "")),
-                plain_drop=clean_number(row.get("plain_silu_dice_drop", "")),
                 scaled=clean_number(row.get("scaled_silu_dice", "")),
+                cheb=clean_number(row.get("cheb_dice", "")),
                 scaled_drop=clean_number(row.get("scaled_silu_dice_drop", "")),
             )
         )
@@ -687,7 +661,6 @@ def _run_pytorch(
     max_count: int,
     data_root: Path,
     device: torch.device | str,
-    baselines: set[str],
     val_indices: list[int] | None = None,
     original_val_indices: list[int] | None = None,
 ) -> list[dict[str, Any]]:
@@ -698,7 +671,6 @@ def _run_pytorch(
             count=max_count,
             data_root=data_root,
             device=device,
-            baselines=baselines,
             include_cheb=True,
             val_indices=val_indices,
             original_val_indices=original_val_indices,
@@ -717,8 +689,7 @@ def main() -> int:
     parser.add_argument("--run-kind", choices=("pytorch", "clear", "ckks", "all"), default="pytorch")
     parser.add_argument("--tasks", nargs="+", choices=("all", "covid19", "nusetmsb"), default=["all"])
     parser.add_argument("--counts", nargs="+", type=int, default=[10])
-    parser.add_argument("--baseline", choices=("plain", "scaled", "both"), default="both")
-    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "data" / "fhelipe_medseg")
+    parser.add_argument("--data-root", type=Path, default=FIXTURE_DATA_ROOT)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--backend-mode", choices=("provider", "dense"), default="provider")
@@ -762,7 +733,6 @@ def main() -> int:
         raise ValueError("--val-indices/--original-val-indices can only be used with a single --tasks value")
     counts = _normalize_counts(list(args.counts))
     max_count = max(counts)
-    baselines = {"plain", "scaled"} if args.baseline == "both" else {str(args.baseline)}
     run_kinds = ["pytorch", "clear", "ckks"] if args.run_kind == "all" else [str(args.run_kind)]
     if any(kind in {"clear", "ckks"} for kind in run_kinds):
         for key, value in BACKEND_ENV_DEFAULTS.items():
@@ -787,7 +757,6 @@ def main() -> int:
                 max_count=max_count,
                 data_root=Path(args.data_root),
                 device=torch.device(str(args.device)),
-                baselines=baselines,
                 val_indices=explicit_val_indices,
                 original_val_indices=explicit_original_val_indices,
             )
@@ -810,7 +779,6 @@ def main() -> int:
                     backend_rtol=args.backend_rtol,
                     backend_dice_atol=args.backend_dice_atol,
                     backend_bootstrap_many=str(args.backend_bootstrap_many) if run_kind == "ckks" else None,
-                    baselines=baselines,
                     dry_run=bool(args.dry_run),
                     check_existing=bool(args.check_existing),
                     force=bool(args.force),
@@ -861,8 +829,8 @@ def main() -> int:
         command=[sys.executable, Path(__file__).resolve(), "--run-kind", str(args.run_kind)],
         outputs=outputs,
         measurement=(
-            "fixed validation subset medseg Cheb7 accuracy; subset uses val_limit=512 and val_seed=1; "
-            "drop is baseline Dice/IoU minus Cheb7"
+            "fixed validation subset medseg scaled-SiLU reference vs Cheb7 accuracy; "
+            "drop is scaled-SiLU Dice/IoU minus Cheb7"
         ),
         extra={
             "counts": counts,
