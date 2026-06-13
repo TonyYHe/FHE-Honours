@@ -1,0 +1,4 @@
+[submodule "lattigo"]
+	path = lattigo
+	url = https://github.com/realqhc/lattigo.git
+	branch = ae/haloed-paper-eval
