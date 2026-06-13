@@ -1,8 +1,15 @@
 # HaloED Paper Evaluation Artifacts
 
 This folder contains Orion-side artifact scripts for regenerating the paper
-evaluation figures and tables.  The scripts run local Orion workflows and then
-render paper-facing outputs under `.tmp/results/haloed_paper_eval/`.
+evaluation figures and tables.  The scripts run the current Orion workflows
+with the current artifact configuration and then render paper-facing outputs
+under `.tmp/results/haloed_paper_eval/`.
+
+Artifact evaluation should generate fresh results.  Historical JSON files under
+`.tmp/results` are useful for development sanity checks, but they are not AE
+inputs and are not embedded as defaults.  Derived paper artifacts, such as the
+appendix compile/MVM table and the bootstrap summary, must be extracted from the
+same fresh Table 1/E2E run root produced by the reviewer.
 
 The paper repository is not modified by these scripts.  Original `tools/`
 scripts are also left unchanged; the `eval/` scripts provide paper defaults,
@@ -39,6 +46,11 @@ MedSeg Cheb7 artifact defaults use the reduced-scale raw-gain fine-tuned
 checkpoints.  COVID-256 uses the decoder-wide `rawgain_tight_g045` checkpoint;
 NuSeg-384 uses the `dec4a1536_rawgain_g045` checkpoint.  The scale schedule is
 saved in the checkpoint; artifact evaluation does not apply a runtime clamp.
+The CKKS backend defaults set `ORION_PROVIDER_MVM_MASKED_MATERIALIZATION=1`,
+`ORION_BOOTSTRAP_LAYOUT_REFINEMENT=0`,
+`ORION_LAYOUT_POLICY_RELAYOUT_KERNEL=0`, and `ORION_CONCAT_FUSION=0`.  The
+`ORION_LATTIGO_BOOTSTRAP_MANY` flag is treated only as a Lattigo execution
+scheduling setting.
 
 Run the same fixed-index accuracy cases through the Orion cleartext or CKKS
 backend:
@@ -64,7 +76,8 @@ For fixture-backed datasets, use `--original-val-indices` when you want to
 select by the original validation ID recorded in `accuracy_original_val_indices`
 instead of reproducing an exact verifier `--val-index` argument.
 
-Re-render from an existing root without rerunning long experiments:
+Re-render from an existing root produced by this artifact runner without
+rerunning long experiments:
 
 ```bash
 .venv/bin/python artifacts/haloed_paper_eval/eval/build_all.py \
@@ -77,11 +90,27 @@ Re-render from an existing root without rerunning long experiments:
   PyTorch, cleartext backend, or CKKS backend.
 - `fig7_operator_conv_perf.py` wraps `tools/run_conv_kernel_table.py`.
 - `table1_e2e_unet.py` wraps `tools/run_u22_dim32_dense_provider_e2e_matrix.py`.
+- `appendix_compile_mvm.py` extracts the appendix BSGS-MVM count and compile
+  table from the same fresh Table 1 E2E JSONs.
 - `fig8_cheb7_qualitative.py` wraps `tools/verify_medseg_cheb7_orion_clear_adapter.py`.
 - `table2_dp_layout_breakdown.py` wraps `tools/generate_unet22_compile_plan_csv.py`.
 - `table3_relayout_ablation.py` wraps `tools/run_u22_224_policy_compile_probe.py`.
 - `bootstrap_analysis_numbers.py` extracts the paper bootstrap numbers from
-  E2E output breakdowns.
+  the same fresh Table 1 E2E output breakdowns.
+
+## Paper Evidence Ledger
+
+- Fig. 7 convolution microbenchmarks: `fig7_operator_conv_perf.py`.
+- Table 1 end-to-end speedup: `table1_e2e_unet.py`.
+- End-to-end compile-time appendix table: `appendix_compile_mvm.py`, derived
+  from the Table 1 run root.
+- Fig. 8 qualitative examples: `fig8_cheb7_qualitative.py`, using the
+  low-postscale Cheb7 checkpoints and fixture original validation IDs.
+- Accuracy table/RQ3: `accuracy_medseg_cheb7.py`.
+- Table 2 DP layout breakdown: `table2_dp_layout_breakdown.py`.
+- Table 3 re-layout ablation: `table3_relayout_ablation.py`.
+- RQ4 bootstrap and rotation analysis: `bootstrap_analysis_numbers.py`, derived
+  from the Table 1 run root.
 
 Each target writes:
 

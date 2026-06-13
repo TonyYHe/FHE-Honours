@@ -123,7 +123,7 @@ def main() -> int:
         source_script=SOURCE_SCRIPT,
         command=[],
         outputs=outputs,
-        measurement="derived from 256x256 dense/provider E2E operator_breakdown_after_forward totals",
+        measurement="derived from fresh Table 1 256x256 dense/provider E2E operator_breakdown_after_forward totals",
         extra={"source_root": str(source_root)},
     )
     print_outputs(outputs)

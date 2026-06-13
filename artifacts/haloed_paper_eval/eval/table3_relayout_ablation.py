@@ -30,7 +30,7 @@ LABELS = {
     "fixed_max_no_share": "\\fixedmax",
     "always_no_share_producer_fused": "\\eagerrelayout",
     "always_no_share_producer": "\\eagerrelayout",
-    "dp_no_share_fold": "\\halodp",
+    "dp_no_share_fold": "\\system",
 }
 
 
@@ -151,7 +151,7 @@ def _render_tex(rows: list[dict[str, Any]]) -> str:
         "\\label{tab:relayout_ablation}",
         "\\begin{tabular}{lrr}",
         "\\hline",
-        "\\textbf{Strategy} & \\textbf{\\# Rotations} & \\textbf{\\# Re-layout decisions}\\\\",
+        "\\textbf{Strategy} & \\textbf{\\# Rotations} & \\textbf{\\# Re-layouts}\\\\",
         "\\hline",
     ]
     for row in rows:
