@@ -37,7 +37,11 @@ class Activation(Module):
         self.output_scale = output_scale
 
     def compile(self):
-        coeffs = [float(value) for value in (self.coeffs or [])]
+        coeffs = (
+            []
+            if self.coeffs is None
+            else [float(value) for value in self.coeffs]
+        )
         fusion = _bootstrap_prescale_fusion(self)
         if fusion is not None and coeffs:
             coeffs = [float(value) * float(fusion["scale"]) for value in coeffs]
@@ -117,7 +121,11 @@ class Chebyshev(Module):
         self.output_scale = output_scale
 
     def compile(self):
-        coeffs = [float(value) for value in (self.coeffs or [])]
+        coeffs = (
+            []
+            if self.coeffs is None
+            else [float(value) for value in self.coeffs]
+        )
         output_scale_fusion = getattr(self, "_bootstrap_output_scale_fusion", None)
         if output_scale_fusion is not None and coeffs:
             coeffs = [float(value) * float(output_scale_fusion) for value in coeffs]

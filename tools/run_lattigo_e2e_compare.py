@@ -439,6 +439,42 @@ _LT_PROFILE_COUNTER_NAMES = (
 )
 
 
+_LT_PROFILE_SECONDS_NAMES = (
+    "shared_buffer_s",
+    "decompose_s",
+    "collect_rotations_s",
+    "pre_rotate_s",
+    "pre_rotate_alloc_s",
+    "pre_rotate_automorphism_s",
+    "transform_total_s",
+    "transform_setup_s",
+    "transform_index_s",
+    "transform_copy_scale_s",
+    "transform_mul_accum_s",
+    "transform_inner_reduce_s",
+    "transform_giant_moddown_s",
+    "transform_giant_keyswitch_s",
+    "transform_giant_auto_s",
+    "transform_outer_reduce_s",
+    "transform_final_moddown_s",
+    "transform_zero_diag_s",
+    "evaluate_many_total_s",
+    "evaluate_many_setup_s",
+    "evaluate_many_decompose_s",
+    "evaluate_many_pre_rotate_s",
+    "evaluate_many_multiply_s",
+    "wrapper_total_s",
+    "wrapper_retrieve_transform_s",
+    "wrapper_retrieve_cipher_s",
+    "wrapper_ensure_keys_s",
+    "wrapper_new_evaluator_s",
+    "wrapper_validate_s",
+    "wrapper_evaluate_new_s",
+    "wrapper_streaming_evaluate_s",
+    "wrapper_push_s",
+)
+
+
 def _set_lattigo_lt_profile_enabled(enabled: bool) -> bool:
     backend = getattr(scheme, "backend", None)
     enable = getattr(backend, "EnableLinearTransformEvaluationProfile", None)
@@ -462,6 +498,18 @@ def _collect_lattigo_lt_profile() -> dict[str, int]:
     return {
         str(name): int(values[index]) if index < len(values) else 0
         for index, name in enumerate(_LT_PROFILE_COUNTER_NAMES)
+    }
+
+
+def _collect_lattigo_lt_profile_seconds() -> dict[str, float]:
+    backend = getattr(scheme, "backend", None)
+    getter = getattr(backend, "GetLinearTransformEvaluationProfileSeconds", None)
+    if not callable(getter):
+        return {}
+    values = [float(value) for value in getter()]
+    return {
+        str(name): float(values[index]) if index < len(values) else 0.0
+        for index, name in enumerate(_LT_PROFILE_SECONDS_NAMES)
     }
 
 
@@ -1292,6 +1340,14 @@ def _configure_lattigo_runtime_defaults() -> dict[str, str]:
     applied: dict[str, str] = {}
     for name, value in defaults.items():
         os.environ.setdefault(name, value)
+        applied[name] = str(os.environ.get(name, ""))
+    for name in (
+        "ORION_LATTIGO_CLEAR_BACKEND",
+        "ORION_LATTIGO_STREAMING_LT",
+        "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT",
+        "ORION_SINGLE_SLOT_LAYER_CACHE",
+        "ORION_CLEAR_LATTIGO_EVAL_THREADS",
+    ):
         applied[name] = str(os.environ.get(name, ""))
     applied["ORION_COMPILE_PARALLEL_POLICY"] = os.environ.get("ORION_COMPILE_PARALLEL_POLICY", "auto")
     applied["compile_parallel_policy_audit"] = json.dumps(policy_audit(), sort_keys=True)
@@ -2540,7 +2596,11 @@ def _install_layer_mae_polynomial_clear_capture(
 
 
 def _chebyshev_eval_tensor(value: torch.Tensor, coeffs: Any) -> torch.Tensor:
-    coeff_list = [float(coeff) for coeff in (coeffs or [])]
+    coeff_list = (
+        []
+        if coeffs is None
+        else [float(coeff) for coeff in coeffs]
+    )
     x = _layer_mae_tensor(value)
     if not coeff_list:
         return torch.zeros_like(x)
@@ -2843,6 +2903,19 @@ def _install_layer_mae_he_capture(
                         row["status"] = "missing_clear_reference"
                         row["skip_reason"] = "missing_clear_reference"
                 else:
+                    # Flatten may retain the FHE tensor's four-dimensional logical
+                    # representation even though PyTorch returns a two-dimensional tensor.
+                    # If both contain the same number of elements, align their shapes for
+                    # this diagnostic comparison only.
+                    if (
+                        type(module).__name__ == "Flatten"
+                        and tuple(decoded.shape) != tuple(reference.shape)
+                        and int(decoded.numel()) == int(reference.numel())
+                    ):
+                        decoded = decoded.reshape(tuple(reference.shape))
+                        row["actual"] = _layer_mae_tensor_summary(decoded)
+                        row["diagnostic_reshape"] = "flatten_to_clear_reference_shape"
+
                     row["reference"] = _layer_mae_tensor_summary(reference)
                     row["metrics_vs_clear"] = _layer_mae_metric(reference, decoded)
                     metrics = dict(row["metrics_vs_clear"])
@@ -4341,6 +4414,275 @@ def _collect_forward_operator_breakdown(
     }
 
 
+def _step1_percent(seconds: float | None, he_forward_s: float | None) -> float | None:
+    if seconds is None or he_forward_s is None or float(he_forward_s) <= 0.0:
+        return None
+    return float(100.0 * float(seconds) / float(he_forward_s))
+
+
+def _step1_timed_entry(seconds: float | None, he_forward_s: float | None) -> dict[str, Any]:
+    return {
+        "seconds": None if seconds is None else float(seconds),
+        "percent_of_he_forward": _step1_percent(seconds, he_forward_s),
+    }
+
+
+def _build_step1_online_encode_profile(
+    *,
+    operator_breakdown: dict[str, Any] | None,
+    lt_profile_counters: dict[str, Any] | None,
+    lt_profile_seconds: dict[str, Any] | None,
+    runtime_fairness_mode: str,
+    backend: str,
+    clear_backend_enabled: bool,
+) -> dict[str, Any]:
+    breakdown = dict(operator_breakdown or {})
+    totals = dict(breakdown.get("totals", {}) or {})
+    seconds_profile = dict(lt_profile_seconds or {})
+    counters = dict(lt_profile_counters or {})
+    he_forward_raw = totals.get("he_forward_s")
+    he_forward_s = None if he_forward_raw is None else float(he_forward_raw)
+
+    encode_s = _timing_float(totals, "lt_layer_cache_encode_s")
+    key_prepare_s = _timing_float(totals, "lt_layer_cache_key_prepare_s")
+    evict_s = _timing_float(totals, "lt_layer_cache_evict_s")
+    turnover_s = _timing_float(totals, "lt_layer_cache_turnover_s")
+    layer_cache_other_s = max(0.0, turnover_s - encode_s - key_prepare_s - evict_s)
+    runtime_load_trim_s = _timing_float(totals, "wall_runtime_load_trim_s")
+    wrapper_s = _timing_float(totals, "wall_linear_wrapper_postprocess_s")
+    executor_s = _timing_float(totals, "wall_executor_overhead_s")
+    unattributed_raw = totals.get("wall_unattributed_he_forward_s")
+    unattributed_s = None if unattributed_raw is None else float(unattributed_raw)
+
+    major_seconds = {
+        "mvm_kernel": _timing_float(totals, "mvm_kernel_s"),
+        "activation_excluding_bootstrap": _timing_float(totals, "activation_s"),
+        "bootstrap": _timing_float(totals, "bootstrap_s"),
+        "online_encode": float(encode_s),
+        "layer_cache_key_prepare": float(key_prepare_s),
+        "layer_cache_evict": float(evict_s),
+        "layer_cache_other": float(layer_cache_other_s),
+        "runtime_load_trim": float(runtime_load_trim_s),
+        "linear_wrapper_postprocess": float(wrapper_s),
+        "provider_executor_overhead": float(executor_s),
+        "unattributed": unattributed_s,
+    }
+    major_wall_categories = {
+        str(name): _step1_timed_entry(value, he_forward_s)
+        for name, value in major_seconds.items()
+    }
+
+    rotation_s = float(
+        _timing_float(seconds_profile, "pre_rotate_automorphism_s")
+        + _timing_float(seconds_profile, "transform_giant_moddown_s")
+        + _timing_float(seconds_profile, "transform_giant_keyswitch_s")
+        + _timing_float(seconds_profile, "transform_giant_auto_s")
+    )
+    module_categories = dict(
+        dict(breakdown.get("module_wall", {}) or {}).get("totals_by_category", {}) or {}
+    )
+    elementwise_add_s = _timing_float(dict(module_categories.get("add", {}) or {}), "module_wall_s")
+    elementwise_multiply_s = _timing_float(
+        dict(module_categories.get("multiply", {}) or {}),
+        "module_wall_s",
+    )
+    explicit_accumulate_s = float(
+        _timing_float(totals, "lt_runtime_stream_accumulate_s")
+        + _timing_float(totals, "linear_wrapper_accumulate_s")
+        + _timing_float(totals, "executor_accumulate_s")
+    )
+    micro_seconds = {
+        "lt_fused_multiply_accumulate": _timing_float(seconds_profile, "transform_mul_accum_s"),
+        "lt_rotation": float(rotation_s),
+        "explicit_accumulate": float(explicit_accumulate_s),
+        "elementwise_add_module_wall": float(elementwise_add_s),
+        "elementwise_multiply_module_wall": float(elementwise_multiply_s),
+        "bootstrap": _timing_float(totals, "bootstrap_s"),
+    }
+    operator_microprofile = {
+        str(name): _step1_timed_entry(value, he_forward_s)
+        for name, value in micro_seconds.items()
+    }
+
+    validation_errors: list[str] = []
+    if str(backend) != "lattigo":
+        validation_errors.append("backend must be lattigo")
+    if bool(clear_backend_enabled):
+        validation_errors.append("ORION_LATTIGO_CLEAR_BACKEND must be disabled")
+    if str(runtime_fairness_mode) != "single_slot_layer_cache":
+        validation_errors.append(
+            "runtime_fairness_mode must be single_slot_layer_cache; legacy chunk streaming is not Step 1"
+        )
+    if he_forward_s is None or float(he_forward_s) <= 0.0:
+        validation_errors.append("he_forward_s is missing or non-positive")
+    if not totals:
+        validation_errors.append("operator breakdown is missing")
+    if not seconds_profile:
+        validation_errors.append("linear-transform seconds profile is missing; run with --profile-lt")
+    if float(encode_s) <= 0.0:
+        validation_errors.append("online Encode time is zero; verify single-slot layer caching was exercised")
+
+    return {
+        "schema_version": 1,
+        "valid": not validation_errors,
+        "validation_errors": validation_errors,
+        "measurement_scope": "one real-FHE HE forward pass",
+        "denominator": "he_forward_s",
+        "he_forward_s": he_forward_s,
+        "runtime_fairness_mode": str(runtime_fairness_mode),
+        "online_encode_s": float(encode_s),
+        "online_encode_pct_of_he_forward": _step1_percent(encode_s, he_forward_s),
+        "online_encode_source": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+        "major_wall_categories": major_wall_categories,
+        "operator_microprofile": operator_microprofile,
+        "operation_counts": {
+            str(key): int(value)
+            for key, value in counters.items()
+        },
+        "lt_profile_seconds": {
+            str(key): float(value)
+            for key, value in seconds_profile.items()
+        },
+        "notes": [
+            "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
+            "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+            "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
+            "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
+            "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
+            "elementwise add/multiply entries are Orion module wall timers; they do not include fused additions inside linear-transform kernels.",
+        ],
+    }
+
+
+def _mean_step1_online_encode_profiles(
+    attempts: list[dict[str, Any]],
+    *,
+    expected_attempt_count: int | None = None,
+) -> dict[str, Any]:
+    profiles = [
+        dict(attempt.get("step1_online_encode_profile", {}) or {})
+        for attempt in attempts
+        if isinstance(attempt.get("step1_online_encode_profile"), dict)
+    ]
+    if not profiles:
+        return {
+            "schema_version": 1,
+            "valid": False,
+            "validation_errors": ["no measured Step 1 profiles are available"],
+            "measured_attempt_count": int(len(attempts)),
+            "profile_count": 0,
+        }
+
+    def mean_values(values: list[Any]) -> float | None:
+        numeric = [float(value) for value in values if value is not None]
+        return float(sum(numeric) / len(numeric)) if numeric else None
+
+    he_forward_s = mean_values([profile.get("he_forward_s") for profile in profiles])
+    category_names = sorted(
+        {
+            str(name)
+            for profile in profiles
+            for name in dict(profile.get("major_wall_categories", {}) or {})
+        }
+    )
+    micro_names = sorted(
+        {
+            str(name)
+            for profile in profiles
+            for name in dict(profile.get("operator_microprofile", {}) or {})
+        }
+    )
+
+    def mean_entries(container_name: str, names: list[str]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name in names:
+            seconds = mean_values(
+                [
+                    dict(profile.get(container_name, {}) or {}).get(name, {}).get("seconds")
+                    for profile in profiles
+                ]
+            )
+            result[str(name)] = _step1_timed_entry(seconds, he_forward_s)
+        return result
+
+    counter_names = sorted(
+        {
+            str(name)
+            for profile in profiles
+            for name in dict(profile.get("operation_counts", {}) or {})
+        }
+    )
+    mean_counts = {
+        name: mean_values(
+            [dict(profile.get("operation_counts", {}) or {}).get(name) for profile in profiles]
+        )
+        for name in counter_names
+    }
+    total_counts = {
+        name: int(
+            sum(int(dict(profile.get("operation_counts", {}) or {}).get(name, 0) or 0) for profile in profiles)
+        )
+        for name in counter_names
+    }
+    seconds_names = sorted(
+        {
+            str(name)
+            for profile in profiles
+            for name in dict(profile.get("lt_profile_seconds", {}) or {})
+        }
+    )
+    lt_seconds_mean = {
+        name: mean_values(
+            [dict(profile.get("lt_profile_seconds", {}) or {}).get(name) for profile in profiles]
+        )
+        for name in seconds_names
+    }
+    modes = sorted({str(profile.get("runtime_fairness_mode", "unknown")) for profile in profiles})
+    errors = sorted(
+        {
+            str(error)
+            for profile in profiles
+            for error in list(profile.get("validation_errors", []) or [])
+        }
+    )
+    if len(profiles) != len(attempts):
+        errors.append("one or more measured attempts are missing a Step 1 profile")
+    if expected_attempt_count is not None and len(attempts) != int(expected_attempt_count):
+        errors.append(
+            f"only {len(attempts)} of {int(expected_attempt_count)} requested measured attempts succeeded"
+        )
+    if len(modes) != 1:
+        errors.append(f"measured attempts used inconsistent runtime modes: {modes}")
+    if any(not bool(profile.get("valid", False)) for profile in profiles):
+        errors.append("one or more measured attempts failed Step 1 validation")
+    errors = sorted(set(errors))
+    online_encode_s = mean_values([profile.get("online_encode_s") for profile in profiles])
+    return {
+        "schema_version": 1,
+        "valid": not errors,
+        "validation_errors": errors,
+        "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
+        "denominator": "mean he_forward_s",
+        "he_forward_s": he_forward_s,
+        "runtime_fairness_mode": modes[0] if len(modes) == 1 else "inconsistent",
+        "online_encode_s": online_encode_s,
+        "online_encode_pct_of_he_forward": _step1_percent(online_encode_s, he_forward_s),
+        "measured_attempt_count": int(len(attempts)),
+        "requested_measured_attempt_count": (
+            int(len(attempts))
+            if expected_attempt_count is None
+            else int(expected_attempt_count)
+        ),
+        "profile_count": int(len(profiles)),
+        "major_wall_categories": mean_entries("major_wall_categories", category_names),
+        "operator_microprofile": mean_entries("operator_microprofile", micro_names),
+        "operation_counts_mean_per_forward": mean_counts,
+        "operation_counts_total": total_counts,
+        "lt_profile_seconds_mean": lt_seconds_mean,
+        "notes": list(profiles[0].get("notes", []) or []),
+    }
+
+
 def _backend_u64_array(callable_obj: Callable[..., Any], *args: Any) -> list[int]:
     values = callable_obj(*args)
     if isinstance(values, int):
@@ -5273,9 +5615,15 @@ def _run_forward_attempt(
             if bool(lt_profile_enabled):
                 _set_lattigo_lt_profile_enabled(False)
                 attempt["lattigo_lt_profile_after_he_forward"] = _collect_lattigo_lt_profile()
+                attempt["lattigo_lt_profile_seconds_after_he_forward"] = (
+                    _collect_lattigo_lt_profile_seconds()
+                )
                 if bool(record_primary):
                     payload["lattigo_lt_profile_after_forward"] = dict(
                         attempt["lattigo_lt_profile_after_he_forward"]
+                    )
+                    payload["lattigo_lt_profile_seconds_after_forward"] = dict(
+                        attempt["lattigo_lt_profile_seconds_after_he_forward"]
                     )
                 _write(payload, out_path)
             if bool(bootstrap_profile_enabled):
@@ -5360,6 +5708,18 @@ def _run_forward_attempt(
         attempt["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
         attempt["trim_s"] = runtime_fairness.get("trim_s")
         attempt["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
+        if bool(operator_breakdown):
+            clear_backend_enabled = str(
+                os.environ.get("ORION_LATTIGO_CLEAR_BACKEND", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            attempt["step1_online_encode_profile"] = _build_step1_online_encode_profile(
+                operator_breakdown=attempt.get("operator_breakdown_after_forward"),
+                lt_profile_counters=attempt.get("lattigo_lt_profile_after_he_forward"),
+                lt_profile_seconds=attempt.get("lattigo_lt_profile_seconds_after_he_forward"),
+                runtime_fairness_mode=str(attempt["runtime_fairness_mode"]),
+                backend=str(payload.get("backend", "")),
+                clear_backend_enabled=bool(clear_backend_enabled),
+            )
         if bool(record_primary):
             payload["runtime_fairness_timing_after_forward"] = dict(runtime_fairness)
             payload["provider_group_counts_after_forward"] = dict(provider_group_counts)
@@ -5374,6 +5734,10 @@ def _run_forward_attempt(
             payload["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
             payload["trim_s"] = runtime_fairness.get("trim_s")
             payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
+            if bool(operator_breakdown):
+                payload["step1_online_encode_profile_after_forward"] = dict(
+                    attempt["step1_online_encode_profile"]
+                )
         _write(payload, out_path)
         decoded, decode_info = _attempt_timed(
             payload,
@@ -5739,6 +6103,11 @@ def _run_one(
             payload["layer_cache_evict_s"] = runtime_fairness.get("layer_cache_evict_s")
             payload["trim_s"] = runtime_fairness.get("trim_s")
             payload["runtime_fairness_mode"] = str(runtime_fairness.get("runtime_fairness_mode", "unknown"))
+            if bool(operator_breakdown):
+                payload["step1_online_encode_profile"] = _mean_step1_online_encode_profiles(
+                    measured_attempts,
+                    expected_attempt_count=int(runs),
+                )
         payload["status"] = "ok" if payload.get("measured_forward_ok_count", 0) > 0 else "failed_forward"
         payload["step"] = "done"
         payload["phase"] = "done"

@@ -9,13 +9,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import platform
 
 from orion.core.orion import Scheme
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LIB_PATH = ROOT / "orion" / "backend" / "clear_lattigo" / "clear_lattigo-linux.so"
 
+def _library_name() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        if platform.machine().lower() in {"arm64", "aarch64"}:
+            return "clear_lattigo-mac-arm64.dylib"
+        return "clear_lattigo-mac.dylib"
+    if system == "Windows":
+        return "clear_lattigo-windows.dll"
+    return "clear_lattigo-linux.so"
+
+LIB_PATH = ROOT / "orion" / "backend" / "clear_lattigo" / _library_name()
 
 def _build_clear_lattigo() -> None:
     if LIB_PATH.exists():

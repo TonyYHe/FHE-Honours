@@ -1,0 +1,18 @@
+|    Processing blocks:   0%|          | 0/1 [00:00<?, ?it/s]|    Processing blocks:   0%|          | 0/1 [00:00<?, ?it/s, Current Block=(0,0), Total Diagonals=73]                                                                                                             11.26 real         5.41 user         9.56 sys
+         10501963776  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             3073657  page reclaims
+                5207  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                4178  voluntary context switches
+              246787  involuntary context switches
+        123623913584  instructions retired
+         61125808998  cycles elapsed
+         28567425664  peak memory footprint

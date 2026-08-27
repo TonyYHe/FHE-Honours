@@ -6334,8 +6334,6 @@ class NativeHaloStripeNoRIConvExecutor:
             return False
         if str(materialization) == "fused_relayout":
             return True
-        if self._native_source_stripe_input_requested():
-            return False
         return bool(not _spec_has_physical_output_halo(spec))
 
     def _uses_tight_compact_output(self) -> bool:

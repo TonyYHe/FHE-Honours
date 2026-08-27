@@ -783,18 +783,25 @@ def _layout_policy_provider_unsupported_reason(
     return ""
 
 
-def _layout_policy_native_output_row(compile_plan: dict[str, Any], *, node: str) -> dict[str, Any] | None:
+def _layout_policy_output_row(compile_plan: dict[str, Any], *, node: str) -> dict[str, Any] | None:
     for row in compile_plan.get("node_layouts", []):
         if str(row.get("node")) != str(node):
-            continue
-        layout = dict(row.get("selected_layout", {}))
-        if str(row.get("physical_layout", "")) != "native_source_stripe" and not _layout_policy_has_physical_halo(layout):
             continue
         shape = [int(value) for value in row.get("shape", [])]
         if len(shape) != 4:
             continue
         return dict(row)
     return None
+
+
+def _layout_policy_native_output_row(compile_plan: dict[str, Any], *, node: str) -> dict[str, Any] | None:
+    row = _layout_policy_output_row(compile_plan, node=str(node))
+    if row is None:
+        return None
+    layout = dict(row.get("selected_layout", {}))
+    if str(row.get("physical_layout", "")) != "native_source_stripe" and not _layout_policy_has_physical_halo(layout):
+        return None
+    return row
 
 
 def _layout_policy_explicit_native_concat_output_row(
@@ -1276,7 +1283,7 @@ def _layout_policy_native_module_attrs(
         elif native_input_rows:
             attrs["layout_policy_native_input_source_signature"] = []
     if bool(getattr(base_executor, "native_halo_output_capable", False)):
-        output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
+        output_row = _layout_policy_output_row(compile_plan, node=str(node))
         if output_row is not None:
             output_layout = dict(output_row.get("selected_layout", {}))
             output_gap = max(1, int(output_layout.get("gap", 1)))
@@ -2530,6 +2537,22 @@ class LayoutPolicyProviderRuntimeExecutor:
             row = dict(self.output_relayout_rows[-1])
             layout = dict(row.get("target_layout", row.get("selected_layout", {})) or {})
             return _layout_policy_on_shape(row, layout)
+        for raw_row in self.compile_plan.get("node_layouts", []):
+            row = dict(raw_row)
+            if str(row.get("node", "")) != str(self.output_node_id):
+                continue
+            if str(row.get("physical_layout", "")) == "native_source_stripe":
+                break
+            shape = [int(value) for value in row.get("shape", [])]
+            if len(shape) != 4:
+                break
+            layout = dict(row.get("selected_layout", {}) or {})
+            return _layout_policy_output_fhe_shape(
+                self.compile_plan,
+                node=self.output_node_id,
+                row=row,
+                layout=layout,
+            )
         attrs = self._native_halo_module_attrs()
         if "fhe_output_shape" in attrs:
             return attrs["fhe_output_shape"]

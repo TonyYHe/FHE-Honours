@@ -1,0 +1,3540 @@
+{
+  "status": "ok_compile_only",
+  "step": "done_compile_only",
+  "network": "resnet20_cifar10",
+  "backend": "lattigo",
+  "label": "ResNet20 CIFAR10",
+  "model": "ResNet20",
+  "dataset": "cifar10",
+  "network_scope": "full",
+  "mode": "dense",
+  "provider_mode": "",
+  "io_mode": "none",
+  "io_dir": null,
+  "diags_path": "",
+  "keys_path": "",
+  "logn_override": null,
+  "ckks_preset": "network-default",
+  "activation": {
+    "kind": null,
+    "silu_degree": null
+  },
+  "seed": 0,
+  "input_shape": [
+    1,
+    3,
+    32,
+    32
+  ],
+  "compile_only": true,
+  "forward_runs": 1,
+  "warmup_runs": 0,
+  "profile_modules": false,
+  "profile_lt": false,
+  "trace_forward_memory": false,
+  "operator_breakdown": false,
+  "layer_mae": false,
+  "bootstrap_many_enabled": false,
+  "saved_io_prewarm_mode": "",
+  "saved_io_prewarm_max_units": null,
+  "cheddar_runtime_env": {},
+  "lattigo_runtime_env": {
+    "ORION_LATTIGO_BOOTSTRAP_MANY": "0",
+    "ORION_PACK_CONV_WORKERS": "1",
+    "ORION_LT_COMPILE_WORKERS": "1",
+    "ORION_UNIFIED_COMPILE_WORKERS": "1",
+    "ORION_UNIFIED_STREAM_COMPILE_BATCH_TRANSFORMS": "1",
+    "ORION_UNIFIED_COMPILE_BATCH_TRANSFORMS": "1",
+    "ORION_UNIFIED_LOAD_BATCH_TRANSFORMS": "1",
+    "ORION_UNIFIED_CACHED_LOAD_BATCH_TRANSFORMS": "1",
+    "ORION_CPP_DIAG_BUILDER_PROVIDER_NATIVE_SOURCE_SINGLE_SLOT_METADATA": "1",
+    "ORION_CPP_DIAG_BUILDER_PROVIDER_COMPACT_OUTPUT_SINGLE_SLOT_METADATA": "1",
+    "ORION_LATTIGO_COMPILE_WORKERS": "1",
+    "ORION_LATTIGO_DIAGONAL_ENCODE_WORKERS": "1",
+    "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1",
+    "ORION_LATTIGO_BOOTSTRAP_WORKERS": "1",
+    "ORION_UNIFIED_STREAM_COMPILE_BATCH_GB": "2",
+    "ORION_UNIFIED_LT_CLEAR_SOURCE_DIAGONALS_AFTER_COMPILE": "1",
+    "ORION_COMPILE_PARALLEL_POLICY": "auto",
+    "compile_parallel_policy_audit": "{\"available_bytes\": 0, \"budget_bytes\": 0, \"policy\": \"auto\", \"reserve_bytes\": 0, \"total_bytes\": 0}"
+  },
+  "config": {
+    "ckks_params": {
+      "LogN": 16,
+      "LogQ": [
+        55,
+        40,
+        40,
+        40,
+        40,
+        40,
+        40,
+        40,
+        40,
+        40,
+        40
+      ],
+      "LogP": [
+        61,
+        61,
+        61
+      ],
+      "LogScale": 40,
+      "H": 192,
+      "RingType": "Standard"
+    },
+    "boot_params": {
+      "LogP": [
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61
+      ]
+    },
+    "orion": {
+      "margin": 2,
+      "embedding_method": "hybrid",
+      "backend": "lattigo",
+      "fuse_modules": true,
+      "debug": false,
+      "io_mode": "none",
+      "experimental_region_first": ""
+    }
+  },
+  "phase": "compile_load_done",
+  "timing_s": {
+    "clear_forward": 0.0023613749981450383,
+    "init_scheme": 0.0021231249993434176,
+    "fit": 0.025641666001320118,
+    "compile": 7.886747041997296
+  },
+  "clear": {
+    "shape": [
+      1,
+      10
+    ],
+    "checksum": 0.14203885197639465,
+    "l2": 0.19466271996498108,
+    "values": [
+      -0.02471054159104824,
+      -0.027802295982837677,
+      0.06339696049690247,
+      -0.055850349366664886,
+      0.12316488474607468,
+      -0.0225195474922657,
+      0.0885002389550209,
+      0.028610631823539734,
+      0.03243220970034599,
+      -0.06318332254886627
+    ]
+  },
+  "device_memory_after_init_scheme": {
+    "available": false
+  },
+  "device_memory_after_fit": {
+    "available": false
+  },
+  "input_level": 6,
+  "attach_audit": {},
+  "region_audit_after_compile": {
+    "selected_region_count": 0,
+    "executable_region_count": 0,
+    "rows": []
+  },
+  "bootstrap_report_after_compile": {
+    "count": 47,
+    "by_slots": {
+      "16384": 18,
+      "8192": 15,
+      "4096": 14
+    },
+    "rows": [
+      {
+        "name": "act.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "act.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.2,
+        "postscale": 5.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.0.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.0.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.0.act1.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.0.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.0.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.1.conv1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.1.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.1.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.1.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.1.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.1.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.2.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.2.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.2.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.2.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.0.2.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 16384,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.0.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.0.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.0.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.0.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.3333333333333333,
+        "postscale": 3.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.0.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.1.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.1.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.1.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.1.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.1.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.2.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.2.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.2.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.2.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.1.2.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 8192,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.0.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.0.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.0.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.0.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.0.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.1.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.1.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.1.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.1.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.1.act2.mult2.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.2.act1.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.2.act1.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.2.act2.sign.acts.1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 0.5,
+        "postscale": 2.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      },
+      {
+        "name": "layers.2.2.act2.mult1.bootstrapper",
+        "input_level": 2,
+        "bootstrap_slots": 4096,
+        "prescale": 1.0,
+        "postscale": 1.0,
+        "runtime_profile": [],
+        "runtime_call_count": 0
+      }
+    ]
+  },
+  "rotation_report_after_compile": {
+    "mode": "dense",
+    "source": "compiled_backend_rotation_keys_plus_output_rotation_estimate",
+    "row_count": 45,
+    "unique_rotation_stats_row_count": 25,
+    "duplicate_rotation_stats_row_count": 20,
+    "total_rotation_eval_count_estimate": 870,
+    "total_transform_rotation_key_count": 823,
+    "total_shared_rotation_eval_count": 0,
+    "total_output_rotation_eval_count": 47,
+    "total_diag_index_count": 0,
+    "rows": [
+      {
+        "node": "conv1",
+        "module_path": "conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "conv1",
+        "module_path": "conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 49,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            49
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.0.0.conv1",
+        "module_path": "layers.0.0.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.0.0.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.0.0.conv1",
+        "module_path": "layers.0.0.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.0.0.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 54,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            54
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.0.0.conv2",
+        "module_path": "layers.0.0.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.0.0.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.0.0.conv2",
+        "module_path": "layers.0.0.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.0.0.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 59,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            59
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.0.1.conv1",
+        "module_path": "layers.0.1.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.0.1.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.0.1.conv1",
+        "module_path": "layers.0.1.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.0.1.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 64,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            64
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.0.1.conv2",
+        "module_path": "layers.0.1.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.0.1.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.0.1.conv2",
+        "module_path": "layers.0.1.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.0.1.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 69,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            69
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.0.2.conv1",
+        "module_path": "layers.0.2.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.0.2.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.0.2.conv1",
+        "module_path": "layers.0.2.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.0.2.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 74,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            74
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.0.2.conv2",
+        "module_path": "layers.0.2.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.0.2.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.0.2.conv2",
+        "module_path": "layers.0.2.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.0.2.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 23,
+          "transform_rotation_key_count_total": 23,
+          "unique_rotation_key_count": 23,
+          "output_rotations_per_output_ct": 1,
+          "output_rotation_eval_count": 1,
+          "rotation_eval_count_estimate": 24,
+          "unique_rotation_keys": [
+            5,
+            17029,
+            38477,
+            44421,
+            61313,
+            69633,
+            73729,
+            77825,
+            81921,
+            82049,
+            86017,
+            90113,
+            94209,
+            95053,
+            98305,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 79,
+              "rotation_eval_count": 23,
+              "rotation_key_count": 23,
+              "rotation_key_request_count": 24,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            79
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.0.conv1",
+        "module_path": "layers.1.0.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.0.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.0.conv1",
+        "module_path": "layers.1.0.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.0.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 30,
+          "transform_rotation_key_count_total": 30,
+          "unique_rotation_key_count": 30,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 32,
+          "unique_rotation_keys": [
+            5,
+            7937,
+            16897,
+            18985,
+            20993,
+            21289,
+            25089,
+            29185,
+            33281,
+            37377,
+            38477,
+            39685,
+            41473,
+            44421,
+            45569,
+            61313,
+            77481,
+            94925,
+            102017,
+            102401,
+            106445,
+            106497,
+            110593,
+            112553,
+            114689,
+            116869,
+            118785,
+            122881,
+            125261,
+            126977
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 84,
+              "rotation_eval_count": 30,
+              "rotation_key_count": 30,
+              "rotation_key_request_count": 31,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            84
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.0.conv2",
+        "module_path": "layers.1.0.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.0.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.0.conv2",
+        "module_path": "layers.1.0.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.0.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 44,
+          "transform_rotation_key_count_total": 44,
+          "unique_rotation_key_count": 44,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 46,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            3841,
+            7937,
+            16897,
+            20993,
+            21289,
+            24833,
+            25089,
+            28929,
+            29185,
+            33025,
+            33281,
+            37121,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            61949,
+            82901,
+            91033,
+            102401,
+            106445,
+            106497,
+            110337,
+            110593,
+            112553,
+            114433,
+            114689,
+            118529,
+            118785,
+            122625,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 91,
+              "rotation_eval_count": 44,
+              "rotation_key_count": 44,
+              "rotation_key_request_count": 45,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            91
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.0.shortcut.0",
+        "module_path": "layers.1.0.shortcut.0",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.0.shortcut.0"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.0.shortcut.0",
+        "module_path": "layers.1.0.shortcut.0",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.0.shortcut.0"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 10,
+          "transform_rotation_key_count_total": 10,
+          "unique_rotation_key_count": 10,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 12,
+          "unique_rotation_keys": [
+            82049,
+            95053,
+            102401,
+            106497,
+            110593,
+            114689,
+            118785,
+            122881,
+            126977,
+            130253
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 86,
+              "rotation_eval_count": 10,
+              "rotation_key_count": 10,
+              "rotation_key_request_count": 11,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            86
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.1.conv1",
+        "module_path": "layers.1.1.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.1.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.1.conv1",
+        "module_path": "layers.1.1.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.1.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 44,
+          "transform_rotation_key_count_total": 44,
+          "unique_rotation_key_count": 44,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 46,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            3841,
+            7937,
+            16897,
+            20993,
+            21289,
+            24833,
+            25089,
+            28929,
+            29185,
+            33025,
+            33281,
+            37121,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            61949,
+            82901,
+            91033,
+            102401,
+            106445,
+            106497,
+            110337,
+            110593,
+            112553,
+            114433,
+            114689,
+            118529,
+            118785,
+            122625,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 96,
+              "rotation_eval_count": 44,
+              "rotation_key_count": 44,
+              "rotation_key_request_count": 45,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            96
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.1.conv2",
+        "module_path": "layers.1.1.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.1.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.1.conv2",
+        "module_path": "layers.1.1.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.1.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 44,
+          "transform_rotation_key_count_total": 44,
+          "unique_rotation_key_count": 44,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 46,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            3841,
+            7937,
+            16897,
+            20993,
+            21289,
+            24833,
+            25089,
+            28929,
+            29185,
+            33025,
+            33281,
+            37121,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            61949,
+            82901,
+            91033,
+            102401,
+            106445,
+            106497,
+            110337,
+            110593,
+            112553,
+            114433,
+            114689,
+            118529,
+            118785,
+            122625,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 101,
+              "rotation_eval_count": 44,
+              "rotation_key_count": 44,
+              "rotation_key_request_count": 45,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            101
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.2.conv1",
+        "module_path": "layers.1.2.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.2.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.2.conv1",
+        "module_path": "layers.1.2.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.2.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 44,
+          "transform_rotation_key_count_total": 44,
+          "unique_rotation_key_count": 44,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 46,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            3841,
+            7937,
+            16897,
+            20993,
+            21289,
+            24833,
+            25089,
+            28929,
+            29185,
+            33025,
+            33281,
+            37121,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            61949,
+            82901,
+            91033,
+            102401,
+            106445,
+            106497,
+            110337,
+            110593,
+            112553,
+            114433,
+            114689,
+            118529,
+            118785,
+            122625,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 106,
+              "rotation_eval_count": 44,
+              "rotation_key_count": 44,
+              "rotation_key_request_count": 45,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            106
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.1.2.conv2",
+        "module_path": "layers.1.2.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.1.2.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.1.2.conv2",
+        "module_path": "layers.1.2.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.1.2.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 44,
+          "transform_rotation_key_count_total": 44,
+          "unique_rotation_key_count": 44,
+          "output_rotations_per_output_ct": 2,
+          "output_rotation_eval_count": 2,
+          "rotation_eval_count_estimate": 46,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            3841,
+            7937,
+            16897,
+            20993,
+            21289,
+            24833,
+            25089,
+            28929,
+            29185,
+            33025,
+            33281,
+            37121,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            61949,
+            82901,
+            91033,
+            102401,
+            106445,
+            106497,
+            110337,
+            110593,
+            112553,
+            114433,
+            114689,
+            118529,
+            118785,
+            122625,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 111,
+              "rotation_eval_count": 44,
+              "rotation_key_count": 44,
+              "rotation_key_request_count": 45,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            111
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.0.conv1",
+        "module_path": "layers.2.0.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.0.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.0.conv1",
+        "module_path": "layers.2.0.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.0.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 36,
+          "transform_rotation_key_count_total": 36,
+          "unique_rotation_key_count": 36,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 39,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            1949,
+            3841,
+            7937,
+            9745,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            61949,
+            69009,
+            82901,
+            90881,
+            91033,
+            92445,
+            94977,
+            99073,
+            103169,
+            106445,
+            112553,
+            118785,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 116,
+              "rotation_eval_count": 36,
+              "rotation_key_count": 36,
+              "rotation_key_request_count": 37,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            116
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.0.conv2",
+        "module_path": "layers.2.0.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.0.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.0.conv2",
+        "module_path": "layers.2.0.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.0.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 60,
+          "transform_rotation_key_count_total": 60,
+          "unique_rotation_key_count": 60,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 63,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            625,
+            1949,
+            3125,
+            3841,
+            7937,
+            9745,
+            10377,
+            15625,
+            18489,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            42021,
+            44421,
+            45313,
+            45569,
+            47601,
+            48725,
+            49409,
+            51885,
+            53505,
+            61313,
+            61949,
+            69009,
+            69121,
+            73217,
+            77057,
+            77313,
+            78125,
+            79033,
+            81153,
+            81409,
+            82341,
+            82901,
+            82945,
+            85249,
+            87041,
+            89345,
+            90881,
+            91033,
+            91137,
+            92445,
+            94977,
+            95233,
+            99073,
+            103169,
+            106445,
+            106933,
+            112553,
+            118785,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 123,
+              "rotation_eval_count": 60,
+              "rotation_key_count": 60,
+              "rotation_key_request_count": 61,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            123
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.0.shortcut.0",
+        "module_path": "layers.2.0.shortcut.0",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.0.shortcut.0"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.0.shortcut.0",
+        "module_path": "layers.2.0.shortcut.0",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.0.shortcut.0"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 20,
+          "transform_rotation_key_count_total": 20,
+          "unique_rotation_key_count": 20,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 23,
+          "unique_rotation_keys": [
+            5,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            44421,
+            45313,
+            45569,
+            48725,
+            49409,
+            53505,
+            61313,
+            82901,
+            106445,
+            112553,
+            118785,
+            122881,
+            126977
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 118,
+              "rotation_eval_count": 20,
+              "rotation_key_count": 20,
+              "rotation_key_request_count": 21,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            118
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.1.conv1",
+        "module_path": "layers.2.1.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.1.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.1.conv1",
+        "module_path": "layers.2.1.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.1.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 60,
+          "transform_rotation_key_count_total": 60,
+          "unique_rotation_key_count": 60,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 63,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            625,
+            1949,
+            3125,
+            3841,
+            7937,
+            9745,
+            10377,
+            15625,
+            18489,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            42021,
+            44421,
+            45313,
+            45569,
+            47601,
+            48725,
+            49409,
+            51885,
+            53505,
+            61313,
+            61949,
+            69009,
+            69121,
+            73217,
+            77057,
+            77313,
+            78125,
+            79033,
+            81153,
+            81409,
+            82341,
+            82901,
+            82945,
+            85249,
+            87041,
+            89345,
+            90881,
+            91033,
+            91137,
+            92445,
+            94977,
+            95233,
+            99073,
+            103169,
+            106445,
+            106933,
+            112553,
+            118785,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 128,
+              "rotation_eval_count": 60,
+              "rotation_key_count": 60,
+              "rotation_key_request_count": 61,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            128
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.1.conv2",
+        "module_path": "layers.2.1.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.1.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.1.conv2",
+        "module_path": "layers.2.1.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.1.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 60,
+          "transform_rotation_key_count_total": 60,
+          "unique_rotation_key_count": 60,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 63,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            625,
+            1949,
+            3125,
+            3841,
+            7937,
+            9745,
+            10377,
+            15625,
+            18489,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            42021,
+            44421,
+            45313,
+            45569,
+            47601,
+            48725,
+            49409,
+            51885,
+            53505,
+            61313,
+            61949,
+            69009,
+            69121,
+            73217,
+            77057,
+            77313,
+            78125,
+            79033,
+            81153,
+            81409,
+            82341,
+            82901,
+            82945,
+            85249,
+            87041,
+            89345,
+            90881,
+            91033,
+            91137,
+            92445,
+            94977,
+            95233,
+            99073,
+            103169,
+            106445,
+            106933,
+            112553,
+            118785,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 133,
+              "rotation_eval_count": 60,
+              "rotation_key_count": 60,
+              "rotation_key_request_count": 61,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            133
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.2.conv1",
+        "module_path": "layers.2.2.conv1",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.2.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.2.conv1",
+        "module_path": "layers.2.2.conv1",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.2.conv1"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 60,
+          "transform_rotation_key_count_total": 60,
+          "unique_rotation_key_count": 60,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 63,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            625,
+            1949,
+            3125,
+            3841,
+            7937,
+            9745,
+            10377,
+            15625,
+            18489,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            42021,
+            44421,
+            45313,
+            45569,
+            47601,
+            48725,
+            49409,
+            51885,
+            53505,
+            61313,
+            61949,
+            69009,
+            69121,
+            73217,
+            77057,
+            77313,
+            78125,
+            79033,
+            81153,
+            81409,
+            82341,
+            82901,
+            82945,
+            85249,
+            87041,
+            89345,
+            90881,
+            91033,
+            91137,
+            92445,
+            94977,
+            95233,
+            99073,
+            103169,
+            106445,
+            106933,
+            112553,
+            118785,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 138,
+              "rotation_eval_count": 60,
+              "rotation_key_count": 60,
+              "rotation_key_request_count": 61,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            138
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "layers.2.2.conv2",
+        "module_path": "layers.2.2.conv2",
+        "kind": "Conv2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "layers.2.2.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346584784
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346584784
+          ]
+        },
+        "duplicate_rotation_stats": true
+      },
+      {
+        "node": "layers.2.2.conv2",
+        "module_path": "layers.2.2.conv2",
+        "kind": "Conv2d",
+        "stage": "",
+        "nodes": [
+          "layers.2.2.conv2"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 60,
+          "transform_rotation_key_count_total": 60,
+          "unique_rotation_key_count": 60,
+          "output_rotations_per_output_ct": 3,
+          "output_rotation_eval_count": 3,
+          "rotation_eval_count_estimate": 63,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            625,
+            1949,
+            3125,
+            3841,
+            7937,
+            9745,
+            10377,
+            15625,
+            18489,
+            21289,
+            33281,
+            37377,
+            38477,
+            41217,
+            41473,
+            42021,
+            44421,
+            45313,
+            45569,
+            47601,
+            48725,
+            49409,
+            51885,
+            53505,
+            61313,
+            61949,
+            69009,
+            69121,
+            73217,
+            77057,
+            77313,
+            78125,
+            79033,
+            81153,
+            81409,
+            82341,
+            82901,
+            82945,
+            85249,
+            87041,
+            89345,
+            90881,
+            91033,
+            91137,
+            92445,
+            94977,
+            95233,
+            99073,
+            103169,
+            106445,
+            106933,
+            112553,
+            118785,
+            122881,
+            126721,
+            126977,
+            130817
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 143,
+              "rotation_eval_count": 60,
+              "rotation_key_count": 60,
+              "rotation_key_request_count": 61,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            143
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "avgpool",
+        "module_path": "avgpool",
+        "kind": "AdaptiveAvgPool2d_module_unified",
+        "stage": "module_unified",
+        "nodes": [
+          "avgpool"
+        ],
+        "stats": {
+          "source": "compiled_backend_unified_transform_rotation_keys",
+          "group_count": 1,
+          "group_object_ids": [
+            4346586800
+          ],
+          "transform_count": 0,
+          "diag_index_count": 0,
+          "transform_rotation_eval_count_total": 0,
+          "transform_rotation_key_count_total": 0,
+          "shared_rotation_eval_count_total": 0,
+          "unique_rotation_key_count": 0,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 0,
+          "rotation_eval_count_mode": "shared_group_bsgs",
+          "unique_rotation_keys": [],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_group": [
+            {
+              "group_index": 0,
+              "transform_count": 0,
+              "rotation_key_count_total": 0,
+              "shared_rotation_eval_count": 0,
+              "unique_rotation_key_count": 0,
+              "per_transform": []
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "groups",
+          "ids": [
+            4346586800
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "avgpool",
+        "module_path": "avgpool",
+        "kind": "AdaptiveAvgPool2d",
+        "stage": "",
+        "nodes": [
+          "avgpool"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 30,
+          "transform_rotation_key_count_total": 30,
+          "unique_rotation_key_count": 30,
+          "output_rotations_per_output_ct": 5,
+          "output_rotation_eval_count": 5,
+          "rotation_eval_count_estimate": 35,
+          "unique_rotation_keys": [
+            625,
+            4561,
+            7937,
+            9745,
+            13825,
+            21761,
+            28609,
+            31745,
+            39681,
+            45569,
+            47601,
+            53505,
+            54833,
+            60833,
+            61313,
+            63489,
+            68897,
+            69009,
+            71425,
+            81409,
+            84561,
+            89345,
+            95233,
+            98113,
+            103169,
+            110001,
+            113153,
+            121089,
+            128353,
+            128481
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 148,
+              "rotation_eval_count": 30,
+              "rotation_key_count": 30,
+              "rotation_key_request_count": 31,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            148
+          ]
+        },
+        "duplicate_rotation_stats": false
+      },
+      {
+        "node": "linear",
+        "module_path": "linear",
+        "kind": "Linear",
+        "stage": "",
+        "nodes": [
+          "linear"
+        ],
+        "stats": {
+          "source": "compiled_backend_transform_rotation_keys",
+          "transform_count": 1,
+          "rows": 1,
+          "cols": 1,
+          "transform_rotation_eval_count_total": 16,
+          "transform_rotation_key_count_total": 16,
+          "unique_rotation_key_count": 16,
+          "output_rotations_per_output_ct": 0,
+          "output_rotation_eval_count": 0,
+          "rotation_eval_count_estimate": 16,
+          "unique_rotation_keys": [
+            5,
+            25,
+            125,
+            625,
+            3125,
+            15625,
+            28609,
+            60833,
+            61313,
+            68897,
+            69153,
+            78125,
+            98113,
+            106561,
+            128353,
+            128481
+          ],
+          "estimate_device_bytes_total": null,
+          "estimate_device_bytes_max": null,
+          "streaming_transform_count": 0,
+          "per_transform": [
+            {
+              "row": 0,
+              "col": 0,
+              "transform_id": 150,
+              "rotation_eval_count": 16,
+              "rotation_key_count": 16,
+              "rotation_key_request_count": 17,
+              "estimate_device_bytes": null,
+              "uses_streaming": false
+            }
+          ]
+        },
+        "stats_identity": {
+          "kind": "transforms",
+          "ids": [
+            150
+          ]
+        },
+        "duplicate_rotation_stats": false
+      }
+    ]
+  },
+  "compile_load_profile_after_compile": {
+    "read_s": 0.0,
+    "diag_generate_s": 0.02934149999782676,
+    "diag_builder_build_s": 0.3142661659985606,
+    "diag_builder_shadow_s": 0.0,
+    "encode_s": 0.1136423320058384,
+    "decode_s": 0.0,
+    "serialize_s": 0.0,
+    "device_commit_s": 0.0,
+    "key_prepare_s": 0.002743499993812293,
+    "wait_s": 0.0,
+    "peak_host_bytes": 0.0,
+    "peak_device_bytes": 0.0
+  },
+  "operator_breakdown_after_compile": {
+    "totals": {
+      "compile_s": 7.886747041997296,
+      "group_count": 0,
+      "transform_count": 0,
+      "payload_bytes": 0,
+      "group_total_s": 0.0,
+      "group_flatten_s": 0.0,
+      "group_backend_generate_s": 0.0,
+      "group_rotation_key_compile_s": 0.0,
+      "group_record_keys_s": 0.0,
+      "group_save_unload_s": 0.0,
+      "group_compile_gc_s": 0.0,
+      "executor_prepare_s": 0.0,
+      "executor_compile_unified_s": 0.0,
+      "executor_build_transform_s": 0.0,
+      "executor_group_compile_s": 0.0
+    },
+    "compile_load_profile": {
+      "read_s": 0.0,
+      "diag_generate_s": 0.02934149999782676,
+      "diag_builder_build_s": 0.3142661659985606,
+      "diag_builder_shadow_s": 0.0,
+      "encode_s": 0.1136423320058384,
+      "decode_s": 0.0,
+      "serialize_s": 0.0,
+      "device_commit_s": 0.0,
+      "key_prepare_s": 0.002743499993812293,
+      "wait_s": 0.0,
+      "peak_host_bytes": 0.0,
+      "peak_device_bytes": 0.0
+    },
+    "group_rows": [],
+    "executor_rows": []
+  },
+  "device_memory_after_compile": {
+    "available": false
+  },
+  "compile_load_done": true
+}
