@@ -1947,6 +1947,64 @@ def pack_linear(linear_layer: nn.Module, last: bool):
     diagonals, output_rotations = diagonalize(weight, slots, embed_method, last)
     return diagonals, output_rotations
 
+
+def pack_linear_blocks(linear_layer: nn.Module, last: bool, blocks):
+    slots = int(linear_layer.scheme.params.get_slots())
+    embed_method = str(linear_layer.scheme.params.get_embedding_method())
+    weight = construct_linear_matrix(linear_layer)
+    diagonals, _output_rotations = diagonalize(
+        weight,
+        int(slots),
+        str(embed_method),
+        bool(last),
+        allowed_blocks={
+            (int(row), int(col))
+            for row, col in blocks
+        },
+    )
+    return diagonals
+
+
+def build_linear_block_payloads(linear_layer: nn.Module, last: bool, blocks):
+    return _diagonals_to_block_payloads(
+        pack_linear_blocks(linear_layer, bool(last), blocks)
+    )
+
+
+def pack_linear_diagonal_indices(linear_layer: nn.Module, last: bool):
+    slots = int(linear_layer.scheme.params.get_slots())
+    embed_method = str(linear_layer.scheme.params.get_embedding_method())
+    weight = construct_linear_matrix(linear_layer)
+    matrix_height, matrix_width = (int(value) for value in weight.shape)
+    coo = weight.tocoo()
+    chunks: list[np.ndarray] = []
+    if int(coo.nnz) > 0:
+        _append_diagonal_key_chunk(
+            chunks,
+            np.asarray(coo.row, dtype=np.int64),
+            np.asarray(coo.col, dtype=np.int64),
+            matrix_height=int(matrix_height),
+            matrix_width=int(matrix_width),
+            num_slots=int(slots),
+            embed_method=str(embed_method),
+            is_last_layer=bool(last),
+        )
+    indices = _diagonal_key_chunks_to_indices(
+        chunks,
+        matrix_height=int(matrix_height),
+        matrix_width=int(matrix_width),
+        num_slots=int(slots),
+        embed_method=str(embed_method),
+        is_last_layer=bool(last),
+    )
+    output_rotations = _packed_output_rotations(
+        matrix_height=int(matrix_height),
+        num_slots=int(slots),
+        embed_method=str(embed_method),
+        is_last_layer=bool(last),
+    )
+    return indices, int(output_rotations)
+
 def construct_linear_matrix(linear_layer):
     if len(linear_layer.input_shape) == 2:
         N = linear_layer.input_shape[0]
@@ -2006,6 +2064,7 @@ def diagonalize(
     is_last_layer: bool,
     *,
     allow_hybrid: bool = True,
+    allowed_blocks: set[tuple[int, int]] | None = None,
 ):
     """
     For each (slots, slots) block of the input matrix, this function 
@@ -2080,14 +2139,29 @@ def diagonalize(
     total_diagonals = 0
 
     # Process each block 
+    requested_blocks = (
+        {
+            (int(row), int(col))
+            for row, col in allowed_blocks
+            if 0 <= int(row) < int(num_block_rows) and 0 <= int(col) < int(num_block_cols)
+        }
+        if allowed_blocks is not None
+        else {
+            (int(row), int(col))
+            for row in range(int(num_block_rows))
+            for col in range(int(num_block_cols))
+        }
+    )
     progress_bar = tqdm(
-        total=num_block_rows * num_block_cols,
+        total=len(requested_blocks),
         desc="|    Processing blocks",
         leave=False,
     )
     start_time = time.time()
     for block_row in range(num_block_rows):
         for block_col in range(num_block_cols):
+            if (int(block_row), int(block_col)) not in requested_blocks:
+                continue
             row_start = num_slots * block_row
             col_start = num_slots * block_col
             block_sparse = matrix[

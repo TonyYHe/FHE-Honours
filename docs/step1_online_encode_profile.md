@@ -130,9 +130,20 @@ Each `forward_attempts[*].step1_online_encode_profile` contains the correspondin
   - forces the real-FHE single-slot configuration only in the child environment;
   - runs warmup and measured forwards with all required profilers;
   - validates the output and prints the fields needed for discussion.
+- `orion/core/packing.py` and `orion/nn/linear.py`
+  - add index-only single-slot metadata for fully connected `Linear` layers;
+  - add block-level runtime diagonal/payload reconstruction, matching the existing Conv2d and ConvTranspose2d design;
+  - fix ResNet20 compilation failing at the final hybrid-packed classifier with “requires diagonal-index metadata and a runtime diagonal recipe”.
 - `tests/test_step1_online_encode_profile.py`
   - tests backend timer naming, percentage calculations, rotation aggregation, invalid-mode rejection, measured-run averaging, and launcher configuration.
+- `tests/test_dense_baseline_compile.py`
+  - verifies Linear index metadata against full packing for square/hybrid layouts;
+  - verifies block reconstruction and that compile-time single-slot setup retains no plaintext diagonal payloads.
 - `FHE_compression.md`
   - records the Step 1 status, measurement definition, server command, acceptance gate, and this detailed guide.
 
 No real-FHE timing was fabricated or inferred locally, and no global `ORION_LATTIGO_STREAMING_LT` default was changed.
+
+## Troubleshooting history
+
+The first real-FHE server attempt reached compilation but stopped at the final ResNet20 `linear` layer because it lacked a single-slot runtime recipe. That gap is fixed by the Linear packing changes listed above. A clear-Lattigo structural run with single-slot caching now compiles and completes the same ResNet20 path with `status="ok"`, one successful forward, and matching output shape. This structural run is not accepted as Step 1 timing because the Step 1 validator correctly rejects the clear backend.

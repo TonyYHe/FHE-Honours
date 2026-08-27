@@ -16,7 +16,7 @@ from orion.backend.python import compile_cache
 from orion.backend.python import lt_evaluator as lt_evaluator_module
 from orion.core import packing
 from orion.core import orion as orion_core
-from orion.nn.linear import Conv2d, ConvTranspose2d
+from orion.nn.linear import Conv2d, ConvTranspose2d, Linear
 from orion.nn.module import Module
 from orion.nn.pooling import AvgPool2d
 
@@ -88,6 +88,16 @@ def _configure_tconv2d(layer: ConvTranspose2d, x: torch.Tensor, *, input_gap: in
     )
 
 
+def _configure_linear(layer: Linear, x: torch.Tensor) -> None:
+    y = layer(x)
+    layer.input_shape = torch.Size(x.shape)
+    layer.output_shape = torch.Size(y.shape)
+    layer.input_gap = 1
+    layer.output_gap = 1
+    layer.fhe_input_shape = torch.Size(x.shape)
+    layer.fhe_output_shape = torch.Size(y.shape)
+
+
 def _assert_diagonals_close(left, right) -> None:
     assert set(left.keys()) == set(right.keys())
     for block_key in left:
@@ -103,6 +113,73 @@ def _diag_indices(diagonals) -> dict[tuple[int, int], tuple[int, ...]]:
         (int(row), int(col)): tuple(sorted(int(index) for index in dict(block).keys()))
         for (row, col), block in dict(diagonals).items()
     }
+
+
+@pytest.mark.parametrize(
+    ("embedding_method", "last"),
+    [("square", False), ("hybrid", False), ("hybrid", True)],
+)
+def test_linear_single_slot_diagonal_indices_match_full_pack(
+    embedding_method: str,
+    last: bool,
+) -> None:
+    torch.manual_seed(0)
+    layer = Linear(20, 10, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=16, embedding_method=embedding_method)
+    _configure_linear(layer, torch.randn(1, 20))
+
+    full, full_rotations = packing.pack_linear(layer, last=bool(last))
+    indices, index_rotations = packing.pack_linear_diagonal_indices(layer, last=bool(last))
+
+    assert int(index_rotations) == int(full_rotations)
+    assert indices == _diag_indices(full)
+
+
+def test_linear_single_slot_block_recipe_matches_full_block() -> None:
+    torch.manual_seed(0)
+    layer = Linear(20, 10, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=8, embedding_method="square")
+    _configure_linear(layer, torch.randn(1, 20))
+
+    full, _rotations = packing.pack_linear(layer, last=True)
+    block_key = sorted(full)[-1]
+    block = packing.pack_linear_blocks(layer, last=True, blocks=[block_key])
+
+    assert set(block) == {block_key}
+    _assert_diagonals_close(block, {block_key: full[block_key]})
+
+
+def test_linear_single_slot_generate_diagonals_installs_recipe_without_payload(
+    monkeypatch,
+) -> None:
+    torch.manual_seed(0)
+    layer = Linear(20, 10, bias=False)
+    layer.init_orion_params()
+    _attach_fake_scheme(layer, slots=16, embedding_method="hybrid")
+    layer.scheme.lt_evaluator = SimpleNamespace(single_slot_layer_cache_enabled=lambda: True)
+    _configure_linear(layer, torch.randn(1, 20))
+    original_pack = packing.pack_linear
+
+    def fail_pack_linear(*_args, **_kwargs):
+        raise AssertionError("single-slot generate_diagonals must not materialize payload diagonals")
+
+    monkeypatch.setattr(packing, "pack_linear", fail_pack_linear)
+    layer.generate_diagonals(last=True)
+
+    assert layer.diagonals == {}
+    assert layer._dense_layer_cache_diag_indices_by_block
+    assert callable(layer._dense_layer_cache_build_diagonals)
+    assert callable(layer._dense_layer_cache_build_block_diagonals)
+    assert callable(layer._dense_layer_cache_build_block_payloads)
+
+    monkeypatch.setattr(packing, "pack_linear", original_pack)
+    rebuilt = layer._dense_layer_cache_build_diagonals()
+    assert _diag_indices(rebuilt) == layer._dense_layer_cache_diag_indices_by_block
+    block_key = sorted(layer._dense_layer_cache_diag_indices_by_block)[0]
+    block = layer._dense_layer_cache_build_block_diagonals([block_key])
+    assert set(block) == {block_key}
 
 
 @pytest.mark.parametrize("embedding_method", ["square", "hybrid"])

@@ -268,6 +268,28 @@ class Linear(LinearTransform):
     def generate_diagonals(self, last):
         if self.load_cached_transform_metadata():
             return
+        if self.scheme.lt_evaluator.single_slot_layer_cache_enabled():
+            diag_indices, output_rotations = packing.pack_linear_diagonal_indices(self, bool(last))
+            self.output_rotations = int(output_rotations)
+            self._install_single_slot_payload_recipe(
+                diag_indices_by_block=diag_indices,
+                build_diagonals=lambda self=self, last=bool(last): packing.pack_linear(self, bool(last))[0],
+                build_block_diagonals=(
+                    lambda blocks, self=self, last=bool(last): packing.pack_linear_blocks(
+                        self,
+                        bool(last),
+                        blocks,
+                    )
+                ),
+                build_block_payloads=(
+                    lambda blocks, self=self, last=bool(last): packing.build_linear_block_payloads(
+                        self,
+                        bool(last),
+                        blocks,
+                    )
+                ),
+            )
+            return
         # Here, we'll apply our packing strategies to return the diagonals
         # of our linear layer. When using the "hybrid" method of packing, this
         # may also require several output rotations and summations.
