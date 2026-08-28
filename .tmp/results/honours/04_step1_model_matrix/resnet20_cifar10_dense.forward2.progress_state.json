@@ -1,0 +1,15 @@
+{
+  "attempt_index": 2,
+  "attempt_kind": "measured",
+  "event": "end",
+  "layer": "linear",
+  "layer_cache_evict_s": 5.511194467544556e-05,
+  "mode": "dense",
+  "network": "resnet20_cifar10",
+  "path": "dense",
+  "phase": "evict",
+  "pid": 3786875,
+  "result_path": "/home/tony/FHE-Honours/.tmp/results/honours/04_step1_model_matrix/resnet20_cifar10_dense.json",
+  "time": "2026-08-28T07:06:19Z",
+  "time_s": 1787900779.6841733
+}
