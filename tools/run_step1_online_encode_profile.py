@@ -89,6 +89,11 @@ def _result_errors(payload: dict[str, Any]) -> list[str]:
         errors.extend(str(value) for value in validation)
         if not validation:
             errors.append("Step 1 profile is marked invalid")
+    if int(profile.get("schema_version", 0) or 0) < 2:
+        errors.append("Step 1 profile uses the obsolete pre-accounting schema; expected version 2+")
+    accounting = dict(profile.get("major_wall_categories_accounting", {}) or {})
+    if not accounting or not bool(accounting.get("valid", False)):
+        errors.append("major wall categories failed additive wall-time accounting validation")
     if int(profile.get("profile_count", 0) or 0) != int(
         profile.get("measured_attempt_count", 0) or 0
     ):
@@ -117,6 +122,7 @@ def _print_result_summary(payload: dict[str, Any], out_path: Path) -> None:
         "mean_online_encode_s": profile.get("online_encode_s"),
         "online_encode_pct_of_he_forward": profile.get("online_encode_pct_of_he_forward"),
         "major_wall_categories": categories,
+        "major_wall_categories_accounting": profile.get("major_wall_categories_accounting"),
         "operator_microprofile": micro,
         "validation_errors": profile.get("validation_errors", []),
     }

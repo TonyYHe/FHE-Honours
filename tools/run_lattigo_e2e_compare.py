@@ -3262,21 +3262,38 @@ def _install_activation_breakdown_profiler(
 
         return post_hook
 
-    for name, module in net.named_modules():
-        if not isinstance(module, Module):
+    activation_modules = [
+        (str(name), module)
+        for name, module in net.named_modules()
+        if isinstance(module, Module) and _module_category(module) == "activation"
+    ]
+    activation_paths = {str(name) for name, _module in activation_modules}
+    for name, module in activation_modules:
+        # Activation implementations such as ReLU -> _Sign -> Chebyshev are
+        # nested. Hooking every node and summing their inclusive wall times
+        # double-counts the same interval. Profile only the outermost
+        # activation roots and record every Bootstrap descendant so its time
+        # can be removed from the root's inclusive interval.
+        has_activation_ancestor = any(
+            ancestor != str(name)
+            and (ancestor == "" or str(name).startswith(f"{ancestor}."))
+            for ancestor in activation_paths
+        )
+        if has_activation_ancestor:
             continue
-        if _module_category(module) != "activation":
-            continue
-        bootstrapper = getattr(module, "bootstrapper", None)
+        bootstrapper_paths = [
+            f"{name}.{child_name}" if str(name) else str(child_name)
+            for child_name, child in module.named_modules()
+            if str(child_name) and isinstance(child, Bootstrap)
+        ]
         row = {
             "module_path": str(name),
             "class": type(module).__name__,
             "category": "activation",
             "level": None if getattr(module, "level", None) is None else int(getattr(module, "level")),
             "depth": None if getattr(module, "depth", None) is None else int(getattr(module, "depth")),
-            "bootstrapper_path": (
-                f"{name}.bootstrapper" if isinstance(bootstrapper, Bootstrap) else ""
-            ),
+            "bootstrapper_path": bootstrapper_paths[0] if len(bootstrapper_paths) == 1 else "",
+            "bootstrapper_paths": list(bootstrapper_paths),
             "call_count": 0,
             "elapsed_s": 0.0,
             "max_call_s": 0.0,
@@ -3692,8 +3709,17 @@ def _collect_activation_runtime_breakdown(
     for row in profile.get("rows", []) or []:
         row = dict(row)
         elapsed = float(row.get("elapsed_s", 0.0) or 0.0)
-        child_path = str(row.get("bootstrapper_path", ""))
-        child_bootstrap = float(boot_by_name.get(child_path, 0.0) or 0.0)
+        child_paths = [
+            str(path)
+            for path in list(row.get("bootstrapper_paths", []) or [])
+            if str(path)
+        ]
+        if not child_paths and str(row.get("bootstrapper_path", "")):
+            child_paths = [str(row["bootstrapper_path"])]
+        child_bootstrap = float(
+            sum(float(boot_by_name.get(path, 0.0) or 0.0) for path in child_paths)
+        )
+        row["bootstrapper_paths"] = list(child_paths)
         core = max(0.0, float(elapsed - child_bootstrap))
         row["bootstrap_child_s"] = float(child_bootstrap)
         row["activation_excluding_bootstrap_s"] = float(core)
@@ -4392,6 +4418,12 @@ def _collect_forward_operator_breakdown(
         None if he_forward_value is None else float(he_forward_value - legacy_accounted)
     )
     return {
+        "schema_version": 2,
+        "additive_wall_accounting": False,
+        "accounting_note": (
+            "This object mixes exclusive totals with nested diagnostic breakdowns; "
+            "use step1_online_encode_profile.major_wall_categories for an additive wall partition."
+        ),
         "notes": [
             "MVM is collected from UnifiedTransformGroup runtime timing and is streaming-safe, including provider runtime groups.",
             "mvm_kernel_s uses stream_eval+stream_accumulate or baby+giant-step counters, with eval_s as fallback.",
@@ -4415,15 +4447,93 @@ def _collect_forward_operator_breakdown(
 
 
 def _step1_percent(seconds: float | None, he_forward_s: float | None) -> float | None:
-    if seconds is None or he_forward_s is None or float(he_forward_s) <= 0.0:
+    if seconds is None or he_forward_s is None:
         return None
-    return float(100.0 * float(seconds) / float(he_forward_s))
+    seconds_value = float(seconds)
+    he_forward_value = float(he_forward_s)
+    if (
+        not math.isfinite(seconds_value)
+        or not math.isfinite(he_forward_value)
+        or he_forward_value <= 0.0
+    ):
+        return None
+    return float(100.0 * seconds_value / he_forward_value)
 
 
 def _step1_timed_entry(seconds: float | None, he_forward_s: float | None) -> dict[str, Any]:
+    seconds_value = None if seconds is None else float(seconds)
+    if seconds_value is not None and not math.isfinite(seconds_value):
+        seconds_value = None
     return {
-        "seconds": None if seconds is None else float(seconds),
-        "percent_of_he_forward": _step1_percent(seconds, he_forward_s),
+        "seconds": seconds_value,
+        "percent_of_he_forward": _step1_percent(seconds_value, he_forward_s),
+    }
+
+
+_STEP1_PROFILE_SCHEMA_VERSION = 2
+
+
+def _step1_bootstrap_wall_seconds(
+    bootstrap_profile: dict[str, Any] | None,
+) -> float | None:
+    profile = dict(bootstrap_profile or {})
+    totals = dict(profile.get("totals", {}) or {})
+    if not bool(profile.get("available", False)) or "total_s" not in totals:
+        return None
+    try:
+        value = float(totals["total_s"])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0.0 else None
+
+
+def _step1_major_wall_accounting(
+    categories: dict[str, Any],
+    he_forward_s: float | None,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    values: dict[str, float] = {}
+    for name, entry in dict(categories or {}).items():
+        raw = dict(entry or {}).get("seconds")
+        if raw is None:
+            errors.append(f"major wall category {name!r} is missing seconds")
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            errors.append(f"major wall category {name!r} is not numeric")
+            continue
+        if not math.isfinite(value):
+            errors.append(f"major wall category {name!r} is not finite")
+            continue
+        if value < 0.0:
+            errors.append(f"major wall category {name!r} is negative")
+            continue
+        values[str(name)] = float(value)
+
+    he_value = None if he_forward_s is None else float(he_forward_s)
+    if he_value is None or not math.isfinite(he_value) or he_value <= 0.0:
+        errors.append("major wall accounting requires a positive finite he_forward_s")
+        he_value = None
+    category_sum_s = float(sum(values.values()))
+    closure_error_s = None if he_value is None else float(he_value - category_sum_s)
+    tolerance_s = None if he_value is None else max(1e-6, abs(he_value) * 1e-9)
+    if (
+        he_value is not None
+        and tolerance_s is not None
+        and abs(float(closure_error_s)) > float(tolerance_s)
+    ):
+        errors.append(
+            "major wall categories do not close to he_forward_s: "
+            f"error={float(closure_error_s):.9g}s tolerance={float(tolerance_s):.9g}s"
+        )
+    return {
+        "valid": not errors,
+        "validation_errors": errors,
+        "category_sum_s": float(category_sum_s),
+        "category_sum_pct_of_he_forward": _step1_percent(category_sum_s, he_value),
+        "closure_error_s": closure_error_s,
+        "tolerance_s": tolerance_s,
     }
 
 
@@ -4432,6 +4542,7 @@ def _build_step1_online_encode_profile(
     operator_breakdown: dict[str, Any] | None,
     lt_profile_counters: dict[str, Any] | None,
     lt_profile_seconds: dict[str, Any] | None,
+    bootstrap_profile: dict[str, Any] | None,
     runtime_fairness_mode: str,
     backend: str,
     clear_backend_enabled: bool,
@@ -4451,13 +4562,15 @@ def _build_step1_online_encode_profile(
     runtime_load_trim_s = _timing_float(totals, "wall_runtime_load_trim_s")
     wrapper_s = _timing_float(totals, "wall_linear_wrapper_postprocess_s")
     executor_s = _timing_float(totals, "wall_executor_overhead_s")
-    unattributed_raw = totals.get("wall_unattributed_he_forward_s")
-    unattributed_s = None if unattributed_raw is None else float(unattributed_raw)
+    bootstrap_s = _step1_bootstrap_wall_seconds(bootstrap_profile)
 
-    major_seconds = {
+    # These are non-overlapping wall intervals. Nested activation hooks and
+    # parallel backend microtimers intentionally do not participate in this
+    # accounting view; whatever they cannot identify exclusively remains in
+    # other_he_forward.
+    known_major_seconds = {
         "mvm_kernel": _timing_float(totals, "mvm_kernel_s"),
-        "activation_excluding_bootstrap": _timing_float(totals, "activation_s"),
-        "bootstrap": _timing_float(totals, "bootstrap_s"),
+        "bootstrap": bootstrap_s,
         "online_encode": float(encode_s),
         "layer_cache_key_prepare": float(key_prepare_s),
         "layer_cache_evict": float(evict_s),
@@ -4465,12 +4578,28 @@ def _build_step1_online_encode_profile(
         "runtime_load_trim": float(runtime_load_trim_s),
         "linear_wrapper_postprocess": float(wrapper_s),
         "provider_executor_overhead": float(executor_s),
-        "unattributed": unattributed_s,
     }
+    known_values = [
+        float(value)
+        for value in known_major_seconds.values()
+        if value is not None and math.isfinite(float(value))
+    ]
+    known_major_s = float(sum(known_values))
+    other_he_forward_s = (
+        None
+        if he_forward_s is None or not math.isfinite(float(he_forward_s))
+        else float(float(he_forward_s) - known_major_s)
+    )
+    major_seconds = dict(known_major_seconds)
+    major_seconds["other_he_forward"] = other_he_forward_s
     major_wall_categories = {
         str(name): _step1_timed_entry(value, he_forward_s)
         for name, value in major_seconds.items()
     }
+    major_wall_accounting = _step1_major_wall_accounting(
+        major_wall_categories,
+        he_forward_s,
+    )
 
     rotation_s = float(
         _timing_float(seconds_profile, "pre_rotate_automorphism_s")
@@ -4497,7 +4626,7 @@ def _build_step1_online_encode_profile(
         "explicit_accumulate": float(explicit_accumulate_s),
         "elementwise_add_module_wall": float(elementwise_add_s),
         "elementwise_multiply_module_wall": float(elementwise_multiply_s),
-        "bootstrap": _timing_float(totals, "bootstrap_s"),
+        "bootstrap": bootstrap_s,
     }
     operator_microprofile = {
         str(name): _step1_timed_entry(value, he_forward_s)
@@ -4519,11 +4648,19 @@ def _build_step1_online_encode_profile(
         validation_errors.append("operator breakdown is missing")
     if not seconds_profile:
         validation_errors.append("linear-transform seconds profile is missing; run with --profile-lt")
+    if bootstrap_s is None:
+        validation_errors.append(
+            "backend bootstrap wall profile is missing; run real Lattigo with --profile-modules"
+        )
     if float(encode_s) <= 0.0:
         validation_errors.append("online Encode time is zero; verify single-slot layer caching was exercised")
+    validation_errors.extend(
+        f"major wall accounting: {error}"
+        for error in list(major_wall_accounting.get("validation_errors", []) or [])
+    )
 
     return {
-        "schema_version": 1,
+        "schema_version": _STEP1_PROFILE_SCHEMA_VERSION,
         "valid": not validation_errors,
         "validation_errors": validation_errors,
         "measurement_scope": "one real-FHE HE forward pass",
@@ -4534,7 +4671,34 @@ def _build_step1_online_encode_profile(
         "online_encode_pct_of_he_forward": _step1_percent(encode_s, he_forward_s),
         "online_encode_source": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
         "major_wall_categories": major_wall_categories,
+        "major_wall_categories_accounting": major_wall_accounting,
+        "major_wall_categories_metadata": {
+            "additive": True,
+            "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+            "residual_category": "other_he_forward",
+            "entry_sources": {
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+            },
+        },
         "operator_microprofile": operator_microprofile,
+        "operator_microprofile_metadata": {
+            "additive": False,
+            "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+            "reason": (
+                "module timers can be nested and Lattigo microtimers can accumulate parallel work; "
+                "fused multiply-accumulate cannot be separated into primitive multiply and add"
+            ),
+            "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+        },
         "operation_counts": {
             str(key): int(value)
             for key, value in counters.items()
@@ -4545,7 +4709,8 @@ def _build_step1_online_encode_profile(
         },
         "notes": [
             "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-            "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+            "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+            "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
             "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
             "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
             "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
@@ -4566,7 +4731,7 @@ def _mean_step1_online_encode_profiles(
     ]
     if not profiles:
         return {
-            "schema_version": 1,
+            "schema_version": _STEP1_PROFILE_SCHEMA_VERSION,
             "valid": False,
             "validation_errors": ["no measured Step 1 profiles are available"],
             "measured_attempt_count": int(len(attempts)),
@@ -4638,6 +4803,11 @@ def _mean_step1_online_encode_profiles(
         for name in seconds_names
     }
     modes = sorted({str(profile.get("runtime_fairness_mode", "unknown")) for profile in profiles})
+    schema_versions = sorted({int(profile.get("schema_version", 0) or 0) for profile in profiles})
+    category_sets = {
+        tuple(sorted(dict(profile.get("major_wall_categories", {}) or {})))
+        for profile in profiles
+    }
     errors = sorted(
         {
             str(error)
@@ -4653,12 +4823,25 @@ def _mean_step1_online_encode_profiles(
         )
     if len(modes) != 1:
         errors.append(f"measured attempts used inconsistent runtime modes: {modes}")
+    if schema_versions != [_STEP1_PROFILE_SCHEMA_VERSION]:
+        errors.append(f"measured attempts used unsupported Step 1 schemas: {schema_versions}")
+    if len(category_sets) != 1:
+        errors.append("measured attempts used inconsistent major wall category sets")
     if any(not bool(profile.get("valid", False)) for profile in profiles):
         errors.append("one or more measured attempts failed Step 1 validation")
-    errors = sorted(set(errors))
     online_encode_s = mean_values([profile.get("online_encode_s") for profile in profiles])
+    major_wall_categories = mean_entries("major_wall_categories", category_names)
+    major_wall_accounting = _step1_major_wall_accounting(
+        major_wall_categories,
+        he_forward_s,
+    )
+    errors.extend(
+        f"major wall accounting: {error}"
+        for error in list(major_wall_accounting.get("validation_errors", []) or [])
+    )
+    errors = sorted(set(errors))
     return {
-        "schema_version": 1,
+        "schema_version": _STEP1_PROFILE_SCHEMA_VERSION,
         "valid": not errors,
         "validation_errors": errors,
         "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
@@ -4674,8 +4857,15 @@ def _mean_step1_online_encode_profiles(
             else int(expected_attempt_count)
         ),
         "profile_count": int(len(profiles)),
-        "major_wall_categories": mean_entries("major_wall_categories", category_names),
+        "major_wall_categories": major_wall_categories,
+        "major_wall_categories_accounting": major_wall_accounting,
+        "major_wall_categories_metadata": dict(
+            profiles[0].get("major_wall_categories_metadata", {}) or {}
+        ),
         "operator_microprofile": mean_entries("operator_microprofile", micro_names),
+        "operator_microprofile_metadata": dict(
+            profiles[0].get("operator_microprofile_metadata", {}) or {}
+        ),
         "operation_counts_mean_per_forward": mean_counts,
         "operation_counts_total": total_counts,
         "lt_profile_seconds_mean": lt_seconds_mean,
@@ -5461,6 +5651,18 @@ def _collect_bootstrap_report(net: torch.nn.Module) -> dict[str, Any]:
     return {"count": int(len(rows)), "by_slots": by_slots, "rows": rows}
 
 
+def _reset_bootstrap_runtime_profiles(net: torch.nn.Module) -> int:
+    """Start a fresh Python-side Bootstrap profile for one forward attempt."""
+    reset_count = 0
+    for module in net.modules():
+        if not isinstance(module, Bootstrap):
+            continue
+        module._bootstrap_runtime_profile = []
+        module._bootstrap_runtime_call_index = 0
+        reset_count += 1
+    return int(reset_count)
+
+
 def _name_bootstraps(net: torch.nn.Module) -> None:
     for name, module in net.named_modules():
         if isinstance(module, Bootstrap):
@@ -5534,6 +5736,11 @@ def _run_forward_attempt(
         attempt["memory_trace_path"] = str(memory_trace_path)
     payload.setdefault("forward_attempts", []).append(attempt)
     _write(payload, out_path)
+
+    # Bootstrap stores its detailed Python profile on the long-lived module.
+    # Without this reset, attempt N contains all calls from attempts 0..N and
+    # can produce impossible percentages above 100%.
+    attempt["bootstrap_runtime_profiles_reset"] = _reset_bootstrap_runtime_profiles(net)
 
     profile_snapshot = None
     remove_profile = None
@@ -5716,6 +5923,7 @@ def _run_forward_attempt(
                 operator_breakdown=attempt.get("operator_breakdown_after_forward"),
                 lt_profile_counters=attempt.get("lattigo_lt_profile_after_he_forward"),
                 lt_profile_seconds=attempt.get("lattigo_lt_profile_seconds_after_he_forward"),
+                bootstrap_profile=attempt.get("lattigo_bootstrap_profile_after_he_forward"),
                 runtime_fairness_mode=str(attempt["runtime_fairness_mode"]),
                 backend=str(payload.get("backend", "")),
                 clear_backend_enabled=bool(clear_backend_enabled),

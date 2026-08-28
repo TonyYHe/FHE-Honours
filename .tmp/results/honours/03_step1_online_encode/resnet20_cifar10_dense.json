@@ -23567,7 +23567,10 @@
               "residual_after_known_subtimers_s": 3.7343309484422207
             }
           ]
-        }
+        },
+        "schema_version": 1,
+        "additive_wall_accounting": false,
+        "accounting_note": "Historical schema-v1 raw capture: Python Bootstrap records accumulated across attempts and activation hooks were nested. Do not use this object for additive wall accounting; use the schema-v2 step1_online_encode_profile.major_wall_categories."
       },
       "device_memory_after_he_forward": {
         "available": false
@@ -23653,7 +23656,7 @@
       "trim_s": 0.0,
       "runtime_fairness_mode": "single_slot_layer_cache",
       "step1_online_encode_profile": {
-        "schema_version": 1,
+        "schema_version": 2,
         "valid": true,
         "validation_errors": [],
         "measurement_scope": "one real-FHE HE forward pass",
@@ -23668,13 +23671,9 @@
             "seconds": 62.69565474241972,
             "percent_of_he_forward": 4.116134640509732
           },
-          "activation_excluding_bootstrap": {
-            "seconds": 1550.7404253482819,
-            "percent_of_he_forward": 101.81018779434007
-          },
           "bootstrap": {
-            "seconds": 986.0077178366482,
-            "percent_of_he_forward": 64.73400014517075
+            "seconds": 985.091604277,
+            "percent_of_he_forward": 64.67385488035136
           },
           "online_encode": {
             "seconds": 299.63172679394484,
@@ -23704,9 +23703,34 @@
             "seconds": 0.0,
             "percent_of_he_forward": 0.0
           },
-          "unattributed": {
-            "seconds": -1378.9894902855158,
-            "percent_of_he_forward": -90.53428715567159
+          "other_he_forward": {
+            "seconds": 172.6670486224143,
+            "percent_of_he_forward": 11.336045903487882
+          }
+        },
+        "major_wall_categories_accounting": {
+          "valid": true,
+          "validation_errors": [],
+          "category_sum_s": 1523.16822014004,
+          "category_sum_pct_of_he_forward": 100.0,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1.52316822014004e-06
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+          "residual_category": "other_he_forward",
+          "entry_sources": {
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories"
           }
         },
         "operator_microprofile": {
@@ -23731,9 +23755,15 @@
             "percent_of_he_forward": 37.80383082099247
           },
           "bootstrap": {
-            "seconds": 986.0077178366482,
-            "percent_of_he_forward": 64.73400014517075
+            "seconds": 985.091604277,
+            "percent_of_he_forward": 64.67385488035136
           }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add",
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s"
         },
         "operation_counts": {
           "diag_terms": 17651,
@@ -23782,7 +23812,8 @@
         },
         "notes": [
           "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-          "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+          "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+          "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
           "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
           "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
           "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
@@ -62587,7 +62618,10 @@
               "residual_after_known_subtimers_s": 3.7297759242355824
             }
           ]
-        }
+        },
+        "schema_version": 1,
+        "additive_wall_accounting": false,
+        "accounting_note": "Historical schema-v1 raw capture: Python Bootstrap records accumulated across attempts and activation hooks were nested. Do not use this object for additive wall accounting; use the schema-v2 step1_online_encode_profile.major_wall_categories."
       },
       "device_memory_after_he_forward": {
         "available": false
@@ -62673,7 +62707,7 @@
       "trim_s": 0.0,
       "runtime_fairness_mode": "single_slot_layer_cache",
       "step1_online_encode_profile": {
-        "schema_version": 1,
+        "schema_version": 2,
         "valid": true,
         "validation_errors": [],
         "measurement_scope": "one real-FHE HE forward pass",
@@ -62688,13 +62722,9 @@
             "seconds": 61.49961520731449,
             "percent_of_he_forward": 4.035575496320562
           },
-          "activation_excluding_bootstrap": {
-            "seconds": 1533.7254837751389,
-            "percent_of_he_forward": 100.64233669659127
-          },
           "bootstrap": {
-            "seconds": 1967.4968354515731,
-            "percent_of_he_forward": 129.10620646114663
+            "seconds": 980.827005869,
+            "percent_of_he_forward": 64.36140157416187
           },
           "online_encode": {
             "seconds": 306.0286820232868,
@@ -62724,9 +62754,34 @@
             "seconds": 0.0,
             "percent_of_he_forward": 0.0
           },
-          "unattributed": {
-            "seconds": -2347.852234710008,
-            "percent_of_he_forward": -154.0649468364523
+          "other_he_forward": {
+            "seconds": 172.54307864770408,
+            "percent_of_he_forward": 11.32219474712372
+          }
+        },
+        "major_wall_categories_accounting": {
+          "valid": true,
+          "validation_errors": [],
+          "category_sum_s": 1523.936679251492,
+          "category_sum_pct_of_he_forward": 100.0,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1.523936679251492e-06
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+          "residual_category": "other_he_forward",
+          "entry_sources": {
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories"
           }
         },
         "operator_microprofile": {
@@ -62751,9 +62806,15 @@
             "percent_of_he_forward": 37.56850248207147
           },
           "bootstrap": {
-            "seconds": 1967.4968354515731,
-            "percent_of_he_forward": 129.10620646114663
+            "seconds": 980.827005869,
+            "percent_of_he_forward": 64.36140157416187
           }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add",
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s"
         },
         "operation_counts": {
           "diag_terms": 17651,
@@ -62802,7 +62863,8 @@
         },
         "notes": [
           "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-          "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+          "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+          "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
           "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
           "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
           "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
@@ -116929,7 +116991,10 @@
               "residual_after_known_subtimers_s": 3.734317574650049
             }
           ]
-        }
+        },
+        "schema_version": 1,
+        "additive_wall_accounting": false,
+        "accounting_note": "Historical schema-v1 raw capture: Python Bootstrap records accumulated across attempts and activation hooks were nested. Do not use this object for additive wall accounting; use the schema-v2 step1_online_encode_profile.major_wall_categories."
       },
       "device_memory_after_he_forward": {
         "available": false
@@ -117015,7 +117080,7 @@
       "trim_s": 0.0,
       "runtime_fairness_mode": "single_slot_layer_cache",
       "step1_online_encode_profile": {
-        "schema_version": 1,
+        "schema_version": 2,
         "valid": true,
         "validation_errors": [],
         "measurement_scope": "one real-FHE HE forward pass",
@@ -117030,13 +117095,9 @@
             "seconds": 62.21560209617019,
             "percent_of_he_forward": 4.007843718062654
           },
-          "activation_excluding_bootstrap": {
-            "seconds": 1565.3154062181711,
-            "percent_of_he_forward": 100.83547062521106
-          },
           "bootstrap": {
-            "seconds": 2969.5792645551264,
-            "percent_of_he_forward": 191.29622152236647
+            "seconds": 1001.40097096,
+            "percent_of_he_forward": 64.50887647956934
           },
           "online_encode": {
             "seconds": 312.64969750493765,
@@ -117066,9 +117127,34 @@
             "seconds": 0.0,
             "percent_of_he_forward": 0.0
           },
-          "unattributed": {
-            "seconds": -3360.540278855711,
-            "percent_of_he_forward": -216.48139360749616
+          "other_he_forward": {
+            "seconds": 172.95342095758633,
+            "percent_of_he_forward": 11.141422060512017
+          }
+        },
+        "major_wall_categories_accounting": {
+          "valid": true,
+          "validation_errors": [],
+          "category_sum_s": 1552.3460112921894,
+          "category_sum_pct_of_he_forward": 100.0,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1.5523460112921894e-06
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+          "residual_category": "other_he_forward",
+          "entry_sources": {
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories"
           }
         },
         "operator_microprofile": {
@@ -117093,9 +117179,15 @@
             "percent_of_he_forward": 37.75584455798014
           },
           "bootstrap": {
-            "seconds": 2969.5792645551264,
-            "percent_of_he_forward": 191.29622152236647
+            "seconds": 1001.40097096,
+            "percent_of_he_forward": 64.50887647956934
           }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add",
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s"
         },
         "operation_counts": {
           "diag_terms": 17651,
@@ -117144,7 +117236,8 @@
         },
         "notes": [
           "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-          "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+          "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+          "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
           "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
           "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
           "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
@@ -186593,7 +186686,10 @@
               "residual_after_known_subtimers_s": 3.5057058334350586
             }
           ]
-        }
+        },
+        "schema_version": 1,
+        "additive_wall_accounting": false,
+        "accounting_note": "Historical schema-v1 raw capture: Python Bootstrap records accumulated across attempts and activation hooks were nested. Do not use this object for additive wall accounting; use the schema-v2 step1_online_encode_profile.major_wall_categories."
       },
       "device_memory_after_he_forward": {
         "available": false
@@ -186679,7 +186775,7 @@
       "trim_s": 0.0,
       "runtime_fairness_mode": "single_slot_layer_cache",
       "step1_online_encode_profile": {
-        "schema_version": 1,
+        "schema_version": 2,
         "valid": true,
         "validation_errors": [],
         "measurement_scope": "one real-FHE HE forward pass",
@@ -186694,13 +186790,9 @@
             "seconds": 63.428380735218525,
             "percent_of_he_forward": 4.070041014453669
           },
-          "activation_excluding_bootstrap": {
-            "seconds": 1576.2502511106431,
-            "percent_of_he_forward": 101.14404777010283
-          },
           "bootstrap": {
-            "seconds": 3976.8123182468116,
-            "percent_of_he_forward": 255.1821291105728
+            "seconds": 1006.538075944,
+            "percent_of_he_forward": 64.58703823455329
           },
           "online_encode": {
             "seconds": 312.6010283753276,
@@ -186730,9 +186822,34 @@
             "seconds": 0.0,
             "percent_of_he_forward": 0.0
           },
-          "unattributed": {
-            "seconds": -4373.859761826694,
-            "percent_of_he_forward": -280.6596734104987
+          "other_he_forward": {
+            "seconds": 172.6647315867608,
+            "percent_of_he_forward": 11.079465235623587
+          }
+        },
+        "major_wall_categories_accounting": {
+          "valid": true,
+          "validation_errors": [],
+          "category_sum_s": 1558.4211684837937,
+          "category_sum_pct_of_he_forward": 100.0,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1.5584211684837938e-06
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+          "residual_category": "other_he_forward",
+          "entry_sources": {
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories"
           }
         },
         "operator_microprofile": {
@@ -186757,9 +186874,15 @@
             "percent_of_he_forward": 37.40236239437552
           },
           "bootstrap": {
-            "seconds": 3976.8123182468116,
-            "percent_of_he_forward": 255.1821291105728
+            "seconds": 1006.538075944,
+            "percent_of_he_forward": 64.58703823455329
           }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add",
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s"
         },
         "operation_counts": {
           "diag_terms": 17651,
@@ -186808,7 +186931,8 @@
         },
         "notes": [
           "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-          "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+          "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+          "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
           "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
           "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
           "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
@@ -271543,7 +271667,10 @@
           "residual_after_known_subtimers_s": 3.7297759242355824
         }
       ]
-    }
+    },
+    "schema_version": 1,
+    "additive_wall_accounting": false,
+    "accounting_note": "Historical schema-v1 raw capture: Python Bootstrap records accumulated across attempts and activation hooks were nested. Do not use this object for additive wall accounting; use the schema-v2 step1_online_encode_profile.major_wall_categories."
   },
   "runtime_fairness_timing_after_forward": {
     "resident_compute_s": 61.49961520731449,
@@ -271613,7 +271740,7 @@
   "trim_s": 0.0,
   "runtime_fairness_mode": "single_slot_layer_cache",
   "step1_online_encode_profile_after_forward": {
-    "schema_version": 1,
+    "schema_version": 2,
     "valid": true,
     "validation_errors": [],
     "measurement_scope": "one real-FHE HE forward pass",
@@ -271628,13 +271755,9 @@
         "seconds": 61.49961520731449,
         "percent_of_he_forward": 4.035575496320562
       },
-      "activation_excluding_bootstrap": {
-        "seconds": 1533.7254837751389,
-        "percent_of_he_forward": 100.64233669659127
-      },
       "bootstrap": {
-        "seconds": 1967.4968354515731,
-        "percent_of_he_forward": 129.10620646114663
+        "seconds": 980.827005869,
+        "percent_of_he_forward": 64.36140157416187
       },
       "online_encode": {
         "seconds": 306.0286820232868,
@@ -271664,9 +271787,34 @@
         "seconds": 0.0,
         "percent_of_he_forward": 0.0
       },
-      "unattributed": {
-        "seconds": -2347.852234710008,
-        "percent_of_he_forward": -154.0649468364523
+      "other_he_forward": {
+        "seconds": 172.54307864770408,
+        "percent_of_he_forward": 11.32219474712372
+      }
+    },
+    "major_wall_categories_accounting": {
+      "valid": true,
+      "validation_errors": [],
+      "category_sum_s": 1523.936679251492,
+      "category_sum_pct_of_he_forward": 100.0,
+      "closure_error_s": 0.0,
+      "tolerance_s": 1.523936679251492e-06
+    },
+    "major_wall_categories_metadata": {
+      "additive": true,
+      "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+      "residual_category": "other_he_forward",
+      "entry_sources": {
+        "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+        "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+        "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+        "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+        "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+        "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+        "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+        "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+        "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+        "other_he_forward": "he_forward_s minus all other major wall categories"
       }
     },
     "operator_microprofile": {
@@ -271691,9 +271839,15 @@
         "percent_of_he_forward": 37.56850248207147
       },
       "bootstrap": {
-        "seconds": 1967.4968354515731,
-        "percent_of_he_forward": 129.10620646114663
+        "seconds": 980.827005869,
+        "percent_of_he_forward": 64.36140157416187
       }
+    },
+    "operator_microprofile_metadata": {
+      "additive": false,
+      "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+      "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add",
+      "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s"
     },
     "operation_counts": {
       "diag_terms": 17651,
@@ -271742,7 +271896,8 @@
     },
     "notes": [
       "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-      "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+      "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+      "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
       "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
       "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
       "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
@@ -306001,7 +306156,7 @@
     "source_count": 69
   },
   "step1_online_encode_profile": {
-    "schema_version": 1,
+    "schema_version": 2,
     "valid": true,
     "validation_errors": [],
     "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
@@ -306014,13 +306169,9 @@
     "requested_measured_attempt_count": 3,
     "profile_count": 3,
     "major_wall_categories": {
-      "activation_excluding_bootstrap": {
-        "seconds": 1558.4303803679843,
-        "percent_of_he_forward": 100.87572546835807
-      },
       "bootstrap": {
-        "seconds": 2971.296139417837,
-        "percent_of_he_forward": 192.32919058875876
+        "seconds": 996.2553509243334,
+        "percent_of_he_forward": 64.48666718913404
       },
       "layer_cache_evict": {
         "seconds": 0.001909404993057251,
@@ -306046,6 +306197,10 @@
         "seconds": 310.426469301184,
         "percent_of_he_forward": 20.093611937893428
       },
+      "other_he_forward": {
+        "seconds": 172.7204103973504,
+        "percent_of_he_forward": 11.180028906977022
+      },
       "provider_executor_overhead": {
         "seconds": 0.0,
         "percent_of_he_forward": 0.0
@@ -306053,16 +306208,37 @@
       "runtime_load_trim": {
         "seconds": 0.0,
         "percent_of_he_forward": 0.0
-      },
-      "unattributed": {
-        "seconds": -3360.7507584641376,
-        "percent_of_he_forward": -217.53821996100578
+      }
+    },
+    "major_wall_categories_accounting": {
+      "valid": true,
+      "validation_errors": [],
+      "category_sum_s": 1544.9012863424916,
+      "category_sum_pct_of_he_forward": 99.99999999999999,
+      "closure_error_s": 0.0,
+      "tolerance_s": 1.5449012863424917e-06
+    },
+    "major_wall_categories_metadata": {
+      "additive": true,
+      "timing_semantics": "non-overlapping wall intervals inside he_forward_s",
+      "residual_category": "other_he_forward",
+      "entry_sources": {
+        "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+        "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+        "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+        "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+        "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+        "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+        "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s",
+        "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+        "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+        "other_he_forward": "he_forward_s minus all other major wall categories"
       }
     },
     "operator_microprofile": {
       "bootstrap": {
-        "seconds": 2971.296139417837,
-        "percent_of_he_forward": 192.32919058875876
+        "seconds": 996.2553509243334,
+        "percent_of_he_forward": 64.48666718913404
       },
       "elementwise_add_module_wall": {
         "seconds": 0.04078978920976321,
@@ -306084,6 +306260,12 @@
         "seconds": 456.81189433500026,
         "percent_of_he_forward": 29.569002134530482
       }
+    },
+    "operator_microprofile_metadata": {
+      "additive": false,
+      "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+      "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add",
+      "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s"
     },
     "operation_counts_mean_per_forward": {
       "baby_rotation_count": 1551.0,
@@ -306143,7 +306325,8 @@
     },
     "notes": [
       "Online Encode is the single-slot layer-cache materialize/diagonal-encode interval inside he_forward_s.",
-      "Major wall categories use the HE-forward wall clock as denominator and are intended to account for that boundary.",
+      "Major wall categories are non-overlapping, include an explicit residual, and are validated to close to he_forward_s.",
+      "Bootstrap wall time comes from the per-attempt backend profile, which is reset before every HE forward.",
       "Linear-transform multiplication uses fused multiply-accumulate kernels, so multiplication and the fused addition cannot be timed separately without changing the kernel.",
       "Operator microtimers may be nested or represent parallel work; their percentages are diagnostic and must not be summed.",
       "lt_rotation includes pre-rotation automorphism plus giant-step mod-down, key-switch, and automorphism timers.",
