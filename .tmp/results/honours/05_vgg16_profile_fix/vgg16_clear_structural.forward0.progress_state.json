@@ -1,0 +1,15 @@
+{
+  "attempt_index": 0,
+  "attempt_kind": "measured",
+  "event": "end",
+  "layer": "classifier",
+  "layer_cache_evict_s": 0.0004885839880444109,
+  "mode": "provider",
+  "network": "vgg16_imgnet",
+  "path": "dense",
+  "phase": "evict",
+  "pid": 67241,
+  "result_path": ".tmp/results/honours/05_vgg16_profile_fix/vgg16_clear_structural.json",
+  "time": "2026-08-29T06:39:32Z",
+  "time_s": 1787985572.196359
+}

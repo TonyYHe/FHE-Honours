@@ -34,7 +34,9 @@ _LAYOUT_POLICY_PRESERVING_MODULES = {
     "Chebyshev",
     "ELU",
     "GELU",
+    "Identity",
     "Mish",
+    "Mult",
     "Quad",
     "ReLU",
     "SELU",
@@ -3368,7 +3370,17 @@ def _layout_policy_with_native_physical_output_counts(
     compile_plan: dict[str, Any],
     groups: tuple[RegionFirstRuntimeGroup, ...],
 ) -> dict[str, Any]:
+    """Publish executable native CT counts and storage signatures.
+
+    Provider planning discovers the exact stripe signature after the abstract
+    layout DP has finished.  Copy that physical metadata into the executable
+    plan and carry it only through operations that leave slot positions
+    unchanged.  Bootstrap masks and the next provider boundary can then use
+    the physical batch instead of the smaller logical compact batch.
+    """
     counts: dict[str, int] = {}
+    signatures: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
+    provider_nodes = {str(getattr(group, "module_prefix", "")) for group in groups}
     for group in groups:
         executor = getattr(group, "executor", None)
         if executor is None or not bool(getattr(executor, "native_halo_output_capable", False)):
@@ -3377,7 +3389,12 @@ def _layout_policy_with_native_physical_output_counts(
         if isinstance(executor, HaloSupportedTConvRuntimeExecutor):
             output_row = _layout_policy_native_output_row(compile_plan, node=str(node))
             if output_row is not None and output_row.get("native_halo_target_storage_signature"):
-                counts[str(node)] = int(len(output_row.get("native_halo_target_storage_signature") or ()))
+                target_signature = tuple(
+                    tuple(int(value) for value in raw)
+                    for raw in (output_row.get("native_halo_target_storage_signature") or ())
+                )
+                signatures[str(node)] = target_signature
+                counts[str(node)] = int(len(target_signature))
             continue
         native_rows = _layout_policy_incoming_native_rows(compile_plan, node=str(node))
         compact_input_rows = _layout_policy_compact_input_rows_for_node(compile_plan, node=str(node))
@@ -3417,15 +3434,98 @@ def _layout_policy_with_native_physical_output_counts(
             and str(dict(output_row).get("physical_layout", "")) == "native_source_stripe"
             and str(output_storage) == "native_source_stripe"
         ):
-            counts[str(node)] = int(
-                sum(int(value) for value in getattr(plan, "target_channel_group_counts", ()) or ())
+            target_signature = tuple(
+                tuple(int(value) for value in raw)
+                for raw in (getattr(plan, "target_storage_signature", ()) or ())
             )
+            if not target_signature and output_row is not None:
+                target_signature = tuple(
+                    tuple(int(value) for value in raw)
+                    for raw in (output_row.get("native_halo_target_storage_signature") or ())
+                )
+            if target_signature:
+                signatures[str(node)] = target_signature
+                counts[str(node)] = int(len(target_signature))
+            else:
+                counts[str(node)] = int(
+                    sum(int(value) for value in getattr(plan, "target_channel_group_counts", ()) or ())
+                )
         else:
             counts[str(node)] = int(getattr(plan, "output_ct_count", 0) or 0)
     if not counts:
         return dict(compile_plan)
+
+    node_layouts = [dict(row) for row in compile_plan.get("node_layouts", [])]
+    edge_layouts = [dict(row) for row in compile_plan.get("edge_layouts", [])]
+    nodes_by_id = {str(row.get("node", "")): row for row in node_layouts}
+    incoming_by_target: dict[str, list[dict[str, Any]]] = {}
+    for row in edge_layouts:
+        incoming_by_target.setdefault(str(row.get("target", "")), []).append(row)
+
+    def publish_node_metadata(node: str) -> None:
+        row = nodes_by_id.get(str(node))
+        if row is None:
+            return
+        count = int(counts.get(str(node), 0) or 0)
+        signature = tuple(signatures.get(str(node), ()))
+        if int(count) > 0:
+            row["native_physical_output_ct_count"] = int(count)
+            row["native_output_ct_count"] = int(count)
+            row["native_output_ct_count_estimate"] = int(count)
+        if signature:
+            row["native_halo_output_storage_layout"] = "native_source_stripe"
+            row["native_halo_target_storage_signature"] = [
+                [int(value) for value in item] for item in signature
+            ]
+
+    for node in tuple(counts):
+        publish_node_metadata(str(node))
+
+    transparent_op_kinds = {str(name).lower() for name in _LAYOUT_POLICY_PRESERVING_MODULES}
+    changed = True
+    while changed:
+        changed = False
+        for target, incoming_rows in incoming_by_target.items():
+            if str(target) in provider_nodes or str(target) in signatures:
+                continue
+            target_row = nodes_by_id.get(str(target))
+            if target_row is None or str(target_row.get("physical_layout", "")) != "native_source_stripe":
+                continue
+            if not incoming_rows or any(
+                bool(row.get("relayout", False))
+                or str(row.get("source_physical_layout", "")) != "native_source_stripe"
+                or str(row.get("target_physical_layout", "")) != "native_source_stripe"
+                or str(row.get("op_kind", "")) not in transparent_op_kinds
+                for row in incoming_rows
+            ):
+                continue
+            incoming_signatures = [signatures.get(str(row.get("source", "")), ()) for row in incoming_rows]
+            if not incoming_signatures or any(not signature for signature in incoming_signatures):
+                continue
+            first_signature = tuple(incoming_signatures[0])
+            if any(tuple(signature) != first_signature for signature in incoming_signatures[1:]):
+                continue
+            signatures[str(target)] = first_signature
+            counts[str(target)] = int(len(first_signature))
+            publish_node_metadata(str(target))
+            changed = True
+
+    for row in edge_layouts:
+        source = str(row.get("source", ""))
+        signature = tuple(signatures.get(source, ()))
+        if not signature or str(row.get("source_physical_layout", "")) != "native_source_stripe":
+            continue
+        serialized = [[int(value) for value in item] for item in signature]
+        row["native_halo_source_storage_signature"] = serialized
+        row["native_input_ct_count"] = int(len(signature))
+        row["native_input_ct_count_estimate"] = int(len(signature))
+        row["native_ct_count"] = int(len(signature))
+        row["native_ct_count_estimate"] = int(len(signature))
+
     updated = dict(compile_plan)
     updated["_native_physical_output_ct_counts"] = dict(counts)
+    updated["node_layouts"] = node_layouts
+    updated["edge_layouts"] = edge_layouts
     return updated
 
 

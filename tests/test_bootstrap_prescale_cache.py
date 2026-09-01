@@ -199,6 +199,40 @@ def test_bootstrap_placer_keeps_sparse_prescale_in_bootstrap() -> None:
     assert not hasattr(module, "_bootstrap_prescale_fusion")
 
 
+def test_bootstrap_placer_sizes_prescale_for_vgg_native_stripes() -> None:
+    class _Params:
+        def get_slots(self):
+            return 32768
+
+    encoder = _DummyEncoder()
+    scheme = SimpleNamespace(encoder=encoder, params=_Params())
+    signature = [
+        *[[0, 145, channel, 1] for channel in range(16)],
+        *[[144, 224, channel, 1] for channel in range(16)],
+    ]
+    module = SimpleNamespace(
+        level=3,
+        depth=1,
+        output_min=torch.tensor(-4.0),
+        output_max=torch.tensor(4.0),
+        output_shape=torch.Size([1, 16, 224, 224]),
+        fhe_output_shape=torch.Size([32, 32768]),
+        output_gap=1,
+        scheme=scheme,
+        layout_policy_output_materialization="native_halo_stripe",
+        layout_policy_native_output_target_signature=signature,
+    )
+    placer = BootstrapPlacer(net=SimpleNamespace(scheme=scheme, margin=1.0), network_dag=None)
+
+    bootstrap = placer._create_bootstrapper(module)
+
+    assert tuple(int(value) for value in bootstrap.fhe_input_shape) == (32, 32768)
+    assert tuple(int(value) for value in bootstrap._bootstrap_prescale_active_mask.shape) == (32, 32768)
+    assert int(bootstrap._prescale_vec.numel()) == 32 * 32768
+    assert int(torch.count_nonzero(bootstrap._prescale_vec).item()) == 16 * (145 + 80) * 224
+    assert encoder.calls == [(2, 303, 32 * 32768)]
+
+
 def test_chebyshev_compile_fuses_bootstrap_output_affine() -> None:
     class _PolyEvaluator:
         def __init__(self) -> None:

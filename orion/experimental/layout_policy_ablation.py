@@ -38,6 +38,7 @@ TEMPLATE_ESTIMATOR_MAX_SLOT_MAPPINGS = int(os.environ.get("HALOED_TEMPLATE_ESTIM
 PHYSICAL_COMPACT = "packed_compact"
 PHYSICAL_LOGICAL_HALO = "logical_halo_compact"
 PHYSICAL_NATIVE_SOURCE_STRIPE = "native_source_stripe"
+_LAYOUT_PRESERVING_OPERATION_NAMES = {"Identity", "Mult"}
 _FALSE_ENV_VALUES = {"", "0", "false", "no", "off"}
 CONCAT_NATIVE_TARGET_RELAYOUT_EXPERIMENTAL = (
     os.environ.get("ORION_CONCAT_NATIVE_TARGET_RELAYOUT", "1").strip().lower()
@@ -692,7 +693,10 @@ def _consumer_requirement(module: Any | None) -> tuple[int, int, int, str, int]:
 
 
 def _layout_preserving_module_for_demand(module: Any | None) -> bool:
-    return isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+    return bool(
+        isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+        or type(module).__name__ in _LAYOUT_PRESERVING_OPERATION_NAMES
+    )
 
 
 def _pair_tuple(value: Any, default: tuple[int, int]) -> tuple[int, int]:
@@ -8011,7 +8015,10 @@ def _native_operator_output_layout(module: Any | None) -> bool:
 
 
 def _layout_preserving_output(module: Any | None) -> bool:
-    return isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+    return bool(
+        isinstance(module, (Activation, Chebyshev, Quad, ReLU))
+        or type(module).__name__ in _LAYOUT_PRESERVING_OPERATION_NAMES
+    )
 
 
 def _direct_output_layout_without_relayout(module: Any | None) -> bool:

@@ -57,6 +57,7 @@ from orion.experimental.layout_policy_ablation import (
     _source_transitive_input_layout_candidates,
     _with_concat_transitive_future_layouts,
 )
+from orion.models.vgg import VGG
 from orion.experimental.cir.native_halo_conv2d import (
     NativeHaloConv2DSpec,
     NativeHaloStripeNoRIConvExecutor,
@@ -1390,6 +1391,60 @@ def test_dp_no_share_fold_layout_preserving_activation_does_not_claim_unmaterial
     tconv_row = edges["bottleneckb_act->up4"]
     assert tconv_row["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
     assert tconv_row["native_halo_source_storage_signature"] == producer_signature
+
+
+def test_vgg_relu_primitives_preserve_native_stripe_metadata_until_next_provider() -> None:
+    torch.manual_seed(0)
+    model = VGG("VGG16", dataset="imagenet", base_dim=16)
+    model.eval()
+    traced = OrionTracer().trace_model(model)
+    StatsTracker(traced).propagate(torch.randn((1, 3, 224, 224), dtype=torch.float32))
+    dag = NetworkDAG(traced)
+    dag.build_dag()
+    for module in model.modules():
+        if hasattr(module, "init_orion_params") and callable(module.init_orion_params):
+            module.init_orion_params()
+        if hasattr(module, "update_params") and callable(module.update_params):
+            module.update_params()
+    orion_core.Fuser(dag).fuse_modules()
+    dag.remove_fused_batchnorms()
+
+    registry = U22CompileRegistry.for_dag(
+        dag,
+        allowed_nodes=None,
+        enable_conv_kernels=True,
+        layout_policy="dp",
+    )
+    registry.attach_to_dag(dag)
+    compile_plan = next(
+        dict(group.executor.compile_plan)
+        for group in registry.groups
+        if isinstance(getattr(group.executor, "compile_plan", None), dict)
+        and group.executor.compile_plan.get("edge_layouts")
+    )
+    nodes = {str(row["node"]): row for row in compile_plan["node_layouts"]}
+    edges = {str(row["edge"]): row for row in compile_plan["edge_layouts"]}
+
+    producer_signature = nodes["features_0"]["native_halo_target_storage_signature"]
+    assert len(producer_signature) == 32
+    for node in (
+        "features_2_mult1",
+        "features_2_identity",
+        "features_2_sign_acts_0",
+        "features_2_sign_acts_1",
+        "features_2_sign_acts_2",
+        "features_2_mult2",
+    ):
+        assert nodes[node]["physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+        assert nodes[node]["native_halo_target_storage_signature"] == producer_signature
+        module = dag.nodes[node]["module"]
+        assert tuple(int(value) for value in module.fhe_output_shape) == (32, 32768)
+        assert module.layout_policy_native_output_target_signature == producer_signature
+
+    next_conv = edges["features_2_mult2->features_3"]
+    assert next_conv["source_physical_layout"] == PHYSICAL_NATIVE_SOURCE_STRIPE
+    assert next_conv["native_halo_source_storage_signature"] == producer_signature
+    assert bool(next_conv["relayout"]) is True
 
 
 def test_native_output_module_apply_uses_physical_beta_for_boundary_pruned_offset() -> None:
