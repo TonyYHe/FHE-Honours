@@ -1,15 +1,15 @@
 {
-  "attempt_index": 0,
-  "attempt_kind": "warmup",
+  "attempt_index": 1,
+  "attempt_kind": "measured",
   "event": "end",
   "layer": "classifier",
-  "layer_cache_evict_s": 0.0006148777902126312,
+  "layer_cache_evict_s": 0.0005847737193107605,
   "mode": "provider",
   "network": "vgg16_imgnet",
   "path": "dense",
   "phase": "evict",
   "pid": 1373791,
   "result_path": "/home/tony/FHE-Honours/.tmp/results/honours/04_step1_model_matrix/vgg16_imgnet_provider.json",
-  "time": "2026-09-01T22:43:25Z",
-  "time_s": 1788302605.3470464
+  "time": "2026-09-02T03:22:22Z",
+  "time_s": 1788319342.3176045
 }
