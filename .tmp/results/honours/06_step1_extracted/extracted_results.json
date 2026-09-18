@@ -1,0 +1,2531 @@
+{
+  "accepted_real_fhe_count": 3,
+  "read_errors": [],
+  "readable_result_count": 4,
+  "records": [
+    {
+      "acceptance_errors": [],
+      "accepted_as_step1": true,
+      "attempts": [
+        {
+          "attempt_index": 0,
+          "error": null,
+          "error_type": null,
+          "kind": "warmup",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 1546.6562167592347,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.48800145102089,
+                "seconds": 997.407683506
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.00012152709668721741,
+                "seconds": 0.0018796063959598541
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.9076184380288332e-07,
+                "seconds": 2.950429916381836e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.20229048188026588,
+                "seconds": 3.1287383139133453
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.112900162103993,
+                "seconds": 63.61242604628205
+              },
+              "online_encode": {
+                "percent_of_he_forward": 19.939729392978233,
+                "seconds": 308.39906426146626
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 11.256956794158087,
+                "seconds": 174.10642207474712
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 1546.6562167592347,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.5466562167592347e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 19.939729392978233,
+            "online_encode_s": 308.39906426146626,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1551,
+              "diag_terms": 17651,
+              "final_moddown": 704,
+              "giant_rotation_count": 2058,
+              "inner_reduce_count": 17686,
+              "outer_reduce_count": 2604,
+              "q_mul": 4102,
+              "qp_mul": 31200,
+              "transform_count": 352
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.48800145102089,
+                "seconds": 997.407683506
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0023398992277410004,
+                "seconds": 0.03619019687175751
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 37.85691064868762,
+                "seconds": 585.5162620209157
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 6.736383447079813,
+                "seconds": 104.18869336899995
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 29.797339794079274,
+                "seconds": 460.8624083540004
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.020339235663414,
+            "encrypt": 0.14711955934762955,
+            "he_forward": 1546.6562167592347
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 1,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 1544.931661233306,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.70484708967588,
+                "seconds": 999.645669041
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.00012110815482801081,
+                "seconds": 0.0018710382282733917
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.5408192869947797e-07,
+                "seconds": 2.380460500717163e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.20388140120010215,
+                "seconds": 3.1498283185064793
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.0809432985236365,
+                "seconds": 63.047785095870495
+              },
+              "online_encode": {
+                "percent_of_he_forward": 19.952554460417254,
+                "seconds": 308.25333108380437
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 11.057652487946369,
+                "seconds": 170.8331742754358
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 1544.931661233306,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.5449316612333061e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 19.952554460417254,
+            "online_encode_s": 308.25333108380437,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1551,
+              "diag_terms": 17651,
+              "final_moddown": 704,
+              "giant_rotation_count": 2058,
+              "inner_reduce_count": 17686,
+              "outer_reduce_count": 2604,
+              "q_mul": 4102,
+              "qp_mul": 31200,
+              "transform_count": 352
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.70484708967588,
+                "seconds": 999.645669041
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.002835334150062535,
+                "seconds": 0.043803974986076355
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 37.50053867801832,
+                "seconds": 579.3576951697469
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 6.9562208936936765,
+                "seconds": 107.46885901200004
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 29.678693726619024,
+                "seconds": 458.5155360230002
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.024936236441135406,
+            "encrypt": 0.11564945429563522,
+            "he_forward": 1544.931661233306
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 2,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 1526.1920807510614,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.59531773457044,
+                "seconds": 985.848623801
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.00011473792556335047,
+                "seconds": 0.0017511211335659027
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.7867426602896325e-07,
+                "seconds": 2.726912498474121e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.19912333196038776,
+                "seconds": 3.039004523307085
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.039265403588426,
+                "seconds": 61.64694871008396
+              },
+              "online_encode": {
+                "percent_of_he_forward": 20.076091682836537,
+                "seconds": 306.39972138777375
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 11.090086930444377,
+                "seconds": 169.25602848085055
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 1526.1920807510614,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.5261920807510615e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 20.076091682836537,
+            "online_encode_s": 306.39972138777375,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1551,
+              "diag_terms": 17651,
+              "final_moddown": 704,
+              "giant_rotation_count": 2058,
+              "inner_reduce_count": 17686,
+              "outer_reduce_count": 2604,
+              "q_mul": 4102,
+              "qp_mul": 31200,
+              "transform_count": 352
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.59531773457044,
+                "seconds": 985.848623801
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0025258883198071153,
+                "seconds": 0.03854990750551224
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 37.704143284443184,
+                "seconds": 575.437648922205
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 6.883849716563704,
+                "seconds": 105.06076922499965
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 29.616553103300152,
+                "seconds": 452.00548805399967
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.021402783691883087,
+            "encrypt": 0.11140622198581696,
+            "he_forward": 1526.1920807510614
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 3,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 1519.2556312531233,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.63165508243571,
+                "seconds": 981.920059412
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0001297259340132212,
+                "seconds": 0.001970868557691574
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.7458593787255578e-07,
+                "seconds": 2.652406692504883e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.20138831858088718,
+                "seconds": 3.0596033707261086
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.1661382647118055,
+                "seconds": 63.29429019242525
+              },
+              "online_encode": {
+                "percent_of_he_forward": 19.848838663912602,
+                "seconds": 301.5545991398394
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 11.151849769839043,
+                "seconds": 169.42510561716813
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 1519.2556312531233,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.5192556312531234e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 19.848838663912602,
+            "online_encode_s": 301.5545991398394,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1551,
+              "diag_terms": 17651,
+              "final_moddown": 704,
+              "giant_rotation_count": 2058,
+              "inner_reduce_count": 17686,
+              "outer_reduce_count": 2604,
+              "q_mul": 4102,
+              "qp_mul": 31200,
+              "transform_count": 352
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 64.63165508243571,
+                "seconds": 981.920059412
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0026980709454849598,
+                "seconds": 0.040990594774484634
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 37.7772123909063,
+                "seconds": 573.9324265792966
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 6.960624266751887,
+                "seconds": 105.74967614299946
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 29.615155247631744,
+                "seconds": 449.9299138040001
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.020321708172559738,
+            "encrypt": 0.10902681946754456,
+            "he_forward": 1519.2556312531233
+          },
+          "traceback_last_line": null
+        }
+      ],
+      "backend": "lattigo",
+      "clear_backend": false,
+      "compile_s": 198.32782565057278,
+      "correctness": {
+        "actual_shape": [
+          1,
+          10
+        ],
+        "checksum_delta": -0.00020498782396316528,
+        "compare_actual_shape": [
+          1,
+          10
+        ],
+        "compare_count": 10,
+        "mae": 0.00010260045382892713,
+        "max_abs": 0.00020191818475723267,
+        "numel_match": true,
+        "reference_shape": [
+          1,
+          10
+        ],
+        "reshaped_for_diagnostic": false,
+        "rmse": 0.00011983457807218656,
+        "shape_match": true
+      },
+      "dataset": "cifar10",
+      "environment": {
+        "ORION_LATTIGO_CLEAR_BACKEND": "0",
+        "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+        "ORION_LATTIGO_STREAMING_LT": "0",
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1",
+        "ORION_SINGLE_SLOT_LAYER_CACHE": "1"
+      },
+      "error": null,
+      "error_type": null,
+      "label": "ResNet20 CIFAR10",
+      "measured_attempt_statistics": {
+        "he_forward_mean_s": 1530.1264577458303,
+        "he_forward_sample_std_s": 13.282474191148797,
+        "online_encode_mean_s": 305.4025505371392,
+        "online_encode_pct_mean": 19.959161602388797,
+        "online_encode_pct_sample_std": 0.11377049000634895,
+        "online_encode_sample_std_s": 3.4589036837256106
+      },
+      "mode": "dense",
+      "model": "ResNet20",
+      "network": "resnet20_cifar10",
+      "profile": {
+        "denominator": "mean he_forward_s",
+        "he_forward_s": 1530.1264577458303,
+        "major_wall_categories": {
+          "bootstrap": {
+            "percent_of_he_forward": 64.64420717717607,
+            "seconds": 989.138117418
+          },
+          "layer_cache_evict": {
+            "percent_of_he_forward": 0.00012184238958851527,
+            "seconds": 0.001864342639843623
+          },
+          "layer_cache_key_prepare": {
+            "percent_of_he_forward": 1.6904440920366393e-07,
+            "seconds": 2.586593230565389e-06
+          },
+          "layer_cache_other": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "linear_wrapper_postprocess": {
+            "percent_of_he_forward": 0.20147433274163046,
+            "seconds": 3.0828120708465576
+          },
+          "mvm_kernel": {
+            "percent_of_he_forward": 4.0952829540490745,
+            "seconds": 62.6630079994599
+          },
+          "online_encode": {
+            "percent_of_he_forward": 19.959301336900985,
+            "seconds": 305.4025505371392
+          },
+          "other_he_forward": {
+            "percent_of_he_forward": 11.099612187698238,
+            "seconds": 169.8381027911515
+          },
+          "provider_executor_overhead": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "runtime_load_trim": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          }
+        },
+        "major_wall_categories_accounting": {
+          "category_sum_pct_of_he_forward": 100.00000000000001,
+          "category_sum_s": 1530.1264577458303,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1.5301264577458304e-06,
+          "valid": true,
+          "validation_errors": []
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "entry_sources": {
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+          },
+          "residual_category": "other_he_forward",
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+        },
+        "measured_attempt_count": 3,
+        "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
+        "online_encode_pct_of_he_forward": 19.959301336900985,
+        "online_encode_s": 305.4025505371392,
+        "operation_counts_mean_per_forward": {
+          "baby_rotation_count": 1551.0,
+          "diag_terms": 17651.0,
+          "final_moddown": 704.0,
+          "giant_rotation_count": 2058.0,
+          "inner_reduce_count": 17686.0,
+          "outer_reduce_count": 2604.0,
+          "q_mul": 4102.0,
+          "qp_mul": 31200.0,
+          "transform_count": 352.0
+        },
+        "operator_microprofile": {
+          "bootstrap": {
+            "percent_of_he_forward": 64.64420717717607,
+            "seconds": 989.138117418
+          },
+          "elementwise_add_module_wall": {
+            "percent_of_he_forward": 0.002687021425400863,
+            "seconds": 0.04111482575535774
+          },
+          "elementwise_multiply_module_wall": {
+            "percent_of_he_forward": 37.65980173120236,
+            "seconds": 576.2425902237495
+          },
+          "explicit_accumulate": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "lt_fused_multiply_accumulate": {
+            "percent_of_he_forward": 6.933616559790437,
+            "seconds": 106.09310145999972
+          },
+          "lt_rotation": {
+            "percent_of_he_forward": 29.63700442304629,
+            "seconds": 453.48364596033326
+          }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+        },
+        "profile_count": 3,
+        "requested_measured_attempt_count": 3,
+        "runtime_fairness_mode": "single_slot_layer_cache",
+        "schema_version": 2,
+        "valid": true,
+        "validation_errors": []
+      },
+      "provider_mode": "",
+      "result_kind": "accepted_real_fhe",
+      "source": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/04_step1_model_matrix/resnet20_cifar10_dense.json",
+      "status": "ok",
+      "traceback_last_line": null
+    },
+    {
+      "acceptance_errors": [],
+      "accepted_as_step1": true,
+      "attempts": [
+        {
+          "attempt_index": 0,
+          "error": null,
+          "error_type": null,
+          "kind": "warmup",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 5513.092898432165,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 1.9789975817209142,
+                "seconds": 109.10397513800001
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.000305591367281658,
+                "seconds": 0.016847535967826843
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.6946981015319887e-07,
+                "seconds": 9.34302806854248e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 7.417408784301325,
+                "seconds": 408.928636935
+              },
+              "online_encode": {
+                "percent_of_he_forward": 90.31824131531366,
+                "seconds": 4979.3285479433835
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 0.24736741433888434,
+                "seconds": 13.637595352952303
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.03767161978536064,
+                "seconds": 2.076871395111084
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 7.52370276782208e-06,
+                "seconds": 0.00041478872299194336
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 5513.092898432165,
+              "closure_error_s": 0.0,
+              "tolerance_s": 5.513092898432166e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 90.31824131531366,
+            "online_encode_s": 4979.3285479433835,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1703,
+              "diag_terms": 74064,
+              "final_moddown": 346,
+              "giant_rotation_count": 1533,
+              "inner_reduce_count": 42012,
+              "outer_reduce_count": 1328,
+              "q_mul": 2744,
+              "qp_mul": 145384,
+              "transform_count": 173
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 1.9789975817209142,
+                "seconds": 109.10397513800001
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.006759984770929072,
+                "seconds": 0.3726842403411865
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 4.998707178367588,
+                "seconds": 275.58337046400237
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 3.0166330300963375,
+                "seconds": 166.30978135400022
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.08691471442580223,
+            "encrypt": 0.08197888359427452,
+            "he_forward": 5513.092898432165
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 1,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 5603.869819298387,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 1.9786513628163207,
+                "seconds": 110.88104655000001
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0003210100184657629,
+                "seconds": 0.017988983541727066
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.6074163448016524e-07,
+                "seconds": 9.007751941680908e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 7.346587655966364,
+                "seconds": 411.6932084009999
+              },
+              "online_encode": {
+                "percent_of_he_forward": 90.46486199020202,
+                "seconds": 5069.533098138869
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 0.1772065032304294,
+                "seconds": 9.930421752364055
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.0323629851835715,
+                "seconds": 1.8135795593261719
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 8.331841197657994e-06,
+                "seconds": 0.00046690553426742554
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 5603.869819298387,
+              "closure_error_s": 0.0,
+              "tolerance_s": 5.6038698192983866e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 90.46486199020202,
+            "online_encode_s": 5069.533098138869,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1703,
+              "diag_terms": 74064,
+              "final_moddown": 346,
+              "giant_rotation_count": 1533,
+              "inner_reduce_count": 42012,
+              "outer_reduce_count": 1328,
+              "q_mul": 2744,
+              "qp_mul": 145384,
+              "transform_count": 173
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 1.9786513628163207,
+                "seconds": 110.88104655000001
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.006695897134885175,
+                "seconds": 0.3752293586730957
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 4.956735502749013,
+                "seconds": 277.7690048610001
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 2.9940094013284275,
+                "seconds": 167.78038922800008
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.08326106518507004,
+            "encrypt": 0.11002080887556076,
+            "he_forward": 5603.869819298387
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 2,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 5585.993522789329,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 1.9821891615031844,
+                "seconds": 110.724958171
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.00031008149316329875,
+                "seconds": 0.017321132123470306
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.6799171398143188e-07,
+                "seconds": 9.384006261825562e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 7.658457209835438,
+                "seconds": 427.80092368699997
+              },
+              "online_encode": {
+                "percent_of_he_forward": 90.1488301327496,
+                "seconds": 5035.707812085748
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 0.17858697530026962,
+                "seconds": 9.97585687281844
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.031619227278753236,
+                "seconds": 1.7662479877471924
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 7.043847885046772e-06,
+                "seconds": 0.0003934688866138458
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 5585.993522789329,
+              "closure_error_s": 0.0,
+              "tolerance_s": 5.585993522789329e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 90.1488301327496,
+            "online_encode_s": 5035.707812085748,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1703,
+              "diag_terms": 74064,
+              "final_moddown": 346,
+              "giant_rotation_count": 1533,
+              "inner_reduce_count": 42012,
+              "outer_reduce_count": 1328,
+              "q_mul": 2744,
+              "qp_mul": 145384,
+              "transform_count": 173
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 1.9821891615031844,
+                "seconds": 110.724958171
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.006791860047315253,
+                "seconds": 0.3793928623199463
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 5.253069233303976,
+                "seconds": 293.4361071199992
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 3.0148424899695585,
+                "seconds": 168.40890621200006
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.08027154207229614,
+            "encrypt": 0.11894528567790985,
+            "he_forward": 5585.993522789329
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 3,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 5536.865815155208,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 2.023393989038897,
+                "seconds": 112.032610085
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0003086278320782823,
+                "seconds": 0.017088308930397034
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.5595868132109784e-07,
+                "seconds": 8.635222911834717e-06
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 6.964969399717875,
+                "seconds": 385.64100972899996
+              },
+              "online_encode": {
+                "percent_of_he_forward": 90.79821905601011,
+                "seconds": 5027.375551681966
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 0.18171109005742056,
+                "seconds": 10.061099227735212
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.03139054092638802,
+                "seconds": 1.7380521297454834
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 7.140458555325915e-06,
+                "seconds": 0.000395357608795166
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 5536.865815155208,
+              "closure_error_s": 0.0,
+              "tolerance_s": 5.536865815155208e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 90.79821905601011,
+            "online_encode_s": 5027.375551681966,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 1703,
+              "diag_terms": 74064,
+              "final_moddown": 346,
+              "giant_rotation_count": 1533,
+              "inner_reduce_count": 42012,
+              "outer_reduce_count": 1328,
+              "q_mul": 2744,
+              "qp_mul": 145384,
+              "transform_count": 173
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 2.023393989038897,
+                "seconds": 112.032610085
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.00645059961714913,
+                "seconds": 0.3571610450744629
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 4.565003698810328,
+                "seconds": 252.75812925999986
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 3.0259488814305597,
+                "seconds": 167.54272920000008
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.08060701191425323,
+            "encrypt": 0.08738402277231216,
+            "he_forward": 5536.865815155208
+          },
+          "traceback_last_line": null
+        }
+      ],
+      "backend": "lattigo",
+      "clear_backend": false,
+      "compile_s": 282.0609001144767,
+      "correctness": {
+        "actual_shape": [
+          1,
+          1,
+          64,
+          64
+        ],
+        "checksum_delta": 4.932031515636481e-06,
+        "compare_actual_shape": [
+          1,
+          1,
+          64,
+          64
+        ],
+        "compare_count": 4096,
+        "mae": 2.276418875624131e-08,
+        "max_abs": 1.1920928955078125e-07,
+        "numel_match": true,
+        "reference_shape": [
+          1,
+          1,
+          64,
+          64
+        ],
+        "reshaped_for_diagnostic": false,
+        "rmse": 2.920418573637562e-08,
+        "shape_match": true
+      },
+      "dataset": "montgomery_lung_64",
+      "environment": {
+        "ORION_LATTIGO_CLEAR_BACKEND": "0",
+        "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+        "ORION_LATTIGO_STREAMING_LT": "0",
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1",
+        "ORION_SINGLE_SLOT_LAYER_CACHE": "1"
+      },
+      "error": null,
+      "error_type": null,
+      "label": "U22 64 base32",
+      "measured_attempt_statistics": {
+        "he_forward_mean_s": 5575.576385747641,
+        "he_forward_sample_std_s": 34.69541325469045,
+        "online_encode_mean_s": 5044.205487302194,
+        "online_encode_pct_mean": 90.47063705965391,
+        "online_encode_pct_sample_std": 0.3247329779738177,
+        "online_encode_sample_std_s": 22.326498692800957
+      },
+      "mode": "provider",
+      "model": "UNet22",
+      "network": "u22_64_base32",
+      "profile": {
+        "denominator": "mean he_forward_s",
+        "he_forward_s": 5575.576385747641,
+        "major_wall_categories": {
+          "bootstrap": {
+            "percent_of_he_forward": 1.994643493474213,
+            "seconds": 111.212871602
+          },
+          "layer_cache_evict": {
+            "percent_of_he_forward": 0.00031326163114744465,
+            "seconds": 0.017466141531864803
+          },
+          "layer_cache_key_prepare": {
+            "percent_of_he_forward": 1.6157959432037613e-07,
+            "seconds": 9.00899370511373e-06
+          },
+          "layer_cache_other": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "linear_wrapper_postprocess": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "mvm_kernel": {
+            "percent_of_he_forward": 7.324415492711543,
+            "seconds": 408.37838060566656
+          },
+          "online_encode": {
+            "percent_of_he_forward": 90.46966875382168,
+            "seconds": 5044.205487302194
+          },
+          "other_he_forward": {
+            "percent_of_he_forward": 0.1791586243263907,
+            "seconds": 9.98912595097257
+          },
+          "provider_executor_overhead": {
+            "percent_of_he_forward": 0.03179270511782112,
+            "seconds": 1.772626558939616
+          },
+          "runtime_load_trim": {
+            "percent_of_he_forward": 7.507337614375651e-06,
+            "seconds": 0.0004185773432254791
+          }
+        },
+        "major_wall_categories_accounting": {
+          "category_sum_pct_of_he_forward": 100.00000000000001,
+          "category_sum_s": 5575.576385747642,
+          "closure_error_s": -9.094947017729282e-13,
+          "tolerance_s": 5.575576385747642e-06,
+          "valid": true,
+          "validation_errors": []
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "entry_sources": {
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+          },
+          "residual_category": "other_he_forward",
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+        },
+        "measured_attempt_count": 3,
+        "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
+        "online_encode_pct_of_he_forward": 90.46966875382168,
+        "online_encode_s": 5044.205487302194,
+        "operation_counts_mean_per_forward": {
+          "baby_rotation_count": 1703.0,
+          "diag_terms": 74064.0,
+          "final_moddown": 346.0,
+          "giant_rotation_count": 1533.0,
+          "inner_reduce_count": 42012.0,
+          "outer_reduce_count": 1328.0,
+          "q_mul": 2744.0,
+          "qp_mul": 145384.0,
+          "transform_count": 173.0
+        },
+        "operator_microprofile": {
+          "bootstrap": {
+            "percent_of_he_forward": 1.994643493474213,
+            "seconds": 111.212871602
+          },
+          "elementwise_add_module_wall": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "elementwise_multiply_module_wall": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "explicit_accumulate": {
+            "percent_of_he_forward": 0.0066467463878679845,
+            "seconds": 0.37059442202250165
+          },
+          "lt_fused_multiply_accumulate": {
+            "percent_of_he_forward": 4.926027279423072,
+            "seconds": 274.65441374699975
+          },
+          "lt_rotation": {
+            "percent_of_he_forward": 3.0115393147373153,
+            "seconds": 167.91067488000007
+          }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+        },
+        "profile_count": 3,
+        "requested_measured_attempt_count": 3,
+        "runtime_fairness_mode": "single_slot_layer_cache",
+        "schema_version": 2,
+        "valid": true,
+        "validation_errors": []
+      },
+      "provider_mode": "u22_64_base32",
+      "result_kind": "accepted_real_fhe",
+      "source": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/04_step1_model_matrix/u22_64_base32_provider.json",
+      "status": "ok",
+      "traceback_last_line": null
+    },
+    {
+      "acceptance_errors": [],
+      "accepted_as_step1": true,
+      "attempts": [
+        {
+          "attempt_index": 0,
+          "error": null,
+          "error_type": null,
+          "kind": "warmup",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 16897.04378860444,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 44.34176677511479,
+                "seconds": 7492.447748632
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0003138685744499477,
+                "seconds": 0.05303451046347618
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.254033041681633e-07,
+                "seconds": 2.1189451217651367e-05
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.0001598143853154021,
+                "seconds": 0.027003906667232513
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.506385079257613,
+                "seconds": 761.4458601252956
+              },
+              "online_encode": {
+                "percent_of_he_forward": 47.85258389450686,
+                "seconds": 8085.672054633498
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 3.2393406548622816,
+                "seconds": 547.3528089141455
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.05944295533339925,
+                "seconds": 10.044102191925049
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 6.832561988651779e-06,
+                "seconds": 0.0011545009911060333
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 16897.04378860444,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.689704378860444e-05,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 47.85258389450686,
+            "online_encode_s": 8085.672054633498,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 11766,
+              "diag_terms": 196659,
+              "final_moddown": 7186,
+              "giant_rotation_count": 18438,
+              "inner_reduce_count": 169366,
+              "outer_reduce_count": 24404,
+              "q_mul": 28224,
+              "qp_mul": 365094,
+              "transform_count": 3593
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 44.34176677511479,
+                "seconds": 7492.447748632
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 20.01340581608761,
+                "seconds": 3381.673944335431
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.04342385927873887,
+                "seconds": 7.3373485170304775
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 5.826952865968398,
+                "seconds": 984.5827773040214
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 20.843604240412994,
+                "seconds": 3521.952935625995
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.017169740051031113,
+            "encrypt": 1.8161880150437355,
+            "he_forward": 16897.04378860444
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 1,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 16733.60105246678,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 43.991247059196695,
+                "seconds": 7361.319780891
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0003063966926144422,
+                "seconds": 0.05127120018005371
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.2805295004684091e-07,
+                "seconds": 2.142786979675293e-05
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.00018079324500861382,
+                "seconds": 0.030253220349550247
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.524370408559355,
+                "seconds": 757.0900943041837
+              },
+              "online_encode": {
+                "percent_of_he_forward": 48.329228290799634,
+                "seconds": 8087.22025391832
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 3.096095898368265,
+                "seconds": 518.0883358347328
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.05856439798911259,
+                "seconds": 9.799932718276978
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 6.627096362281588e-06,
+                "seconds": 0.0011089518666267395
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 16733.60105246678,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.673360105246678e-05,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 48.329228290799634,
+            "online_encode_s": 8087.22025391832,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 11766,
+              "diag_terms": 196659,
+              "final_moddown": 7186,
+              "giant_rotation_count": 18438,
+              "inner_reduce_count": 169366,
+              "outer_reduce_count": 24404,
+              "q_mul": 28224,
+              "qp_mul": 365094,
+              "transform_count": 3593
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 43.991247059196695,
+                "seconds": 7361.319780891
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 19.904506921839303,
+                "seconds": 3330.740779761225
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.04244780100608688,
+                "seconds": 7.103045675903559
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 5.672393755897993,
+                "seconds": 949.1957412370065
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 20.63731058982614,
+                "seconds": 3453.3652220599847
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.021046098321676254,
+            "encrypt": 2.236842818558216,
+            "he_forward": 16733.60105246678
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 2,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 16424.112382557243,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 44.36346863059834,
+                "seconds": 7286.30594469
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0003169641471188514,
+                "seconds": 0.05205854773521423
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.2583882826944402e-07,
+                "seconds": 2.06679105758667e-05
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.00016706789713212173,
+                "seconds": 0.0274394191801548
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.515741348112272,
+                "seconds": 741.670433919565
+              },
+              "online_encode": {
+                "percent_of_he_forward": 47.88110046456355,
+                "seconds": 7864.045750305057
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 3.1818300391778536,
+                "seconds": 522.5873414565358
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.05736885013663396,
+                "seconds": 9.422324419021606
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 6.509528269922953e-06,
+                "seconds": 0.00106913223862648
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 16424.112382557243,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.6424112382557244e-05,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 47.88110046456355,
+            "online_encode_s": 7864.045750305057,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 11766,
+              "diag_terms": 196659,
+              "final_moddown": 7186,
+              "giant_rotation_count": 18438,
+              "inner_reduce_count": 169366,
+              "outer_reduce_count": 24404,
+              "q_mul": 28224,
+              "qp_mul": 365094,
+              "transform_count": 3593
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 44.36346863059834,
+                "seconds": 7286.30594469
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 20.08420189833562,
+                "seconds": 3298.6518909223378
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.04117281216993585,
+                "seconds": 6.76226894184947
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 5.472153598349027,
+                "seconds": 898.7526567389942
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 20.75804531873989,
+                "seconds": 3409.3246915720024
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.017547596246004105,
+            "encrypt": 1.839958481490612,
+            "he_forward": 16424.112382557243
+          },
+          "traceback_last_line": null
+        },
+        {
+          "attempt_index": 3,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 16366.62217714265,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 44.05615552040463,
+                "seconds": 7210.504519799
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.00032349055947221856,
+                "seconds": 0.052944477647542953
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 1.1804118943250596e-07,
+                "seconds": 1.9319355487823486e-05
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.00018398940896405188,
+                "seconds": 0.030112851411104202
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 4.700039188848615,
+                "seconds": 769.2376562164928
+              },
+              "online_encode": {
+                "percent_of_he_forward": 48.029367600116544,
+                "seconds": 7860.785129182041
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 3.1618820476121168,
+                "seconds": 517.4932884195769
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.05204165070858217,
+                "seconds": 8.517460346221924
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 6.394299880932543e-06,
+                "seconds": 0.0010465309023857117
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 16366.62217714265,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1.636662217714265e-05,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 48.029367600116544,
+            "online_encode_s": 7860.785129182041,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 11766,
+              "diag_terms": 196659,
+              "final_moddown": 7186,
+              "giant_rotation_count": 18438,
+              "inner_reduce_count": 169366,
+              "outer_reduce_count": 24404,
+              "q_mul": 28224,
+              "qp_mul": 365094,
+              "transform_count": 3593
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 44.05615552040463,
+                "seconds": 7210.504519799
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 19.84927008360459,
+                "seconds": 3248.6550395041704
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.03713847007001951,
+                "seconds": 6.0783130787312984
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 5.63987631280515,
+                "seconds": 923.0572473749828
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 20.631275792855785,
+                "seconds": 3376.642959340998
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": true,
+            "validation_errors": []
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.020074788480997086,
+            "encrypt": 1.6855985596776009,
+            "he_forward": 16366.62217714265
+          },
+          "traceback_last_line": null
+        }
+      ],
+      "backend": "lattigo",
+      "clear_backend": false,
+      "compile_s": 610.941519163549,
+      "correctness": {
+        "actual_shape": [
+          1,
+          1000
+        ],
+        "checksum_delta": 0.0006768605671823025,
+        "compare_actual_shape": [
+          1,
+          1000
+        ],
+        "compare_count": 1000,
+        "mae": 0.00014179630670696497,
+        "max_abs": 0.00062568299472332,
+        "numel_match": true,
+        "reference_shape": [
+          1,
+          1000
+        ],
+        "reshaped_for_diagnostic": false,
+        "rmse": 0.00018024197197519243,
+        "shape_match": true
+      },
+      "dataset": "imagenet",
+      "environment": {
+        "ORION_LATTIGO_CLEAR_BACKEND": "0",
+        "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+        "ORION_LATTIGO_STREAMING_LT": "0",
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1",
+        "ORION_SINGLE_SLOT_LAYER_CACHE": "1"
+      },
+      "error": null,
+      "error_type": null,
+      "label": "VGG16/base16 ImageNet 224",
+      "measured_attempt_statistics": {
+        "he_forward_mean_s": 16508.111870722223,
+        "he_forward_sample_std_s": 197.38366001907292,
+        "online_encode_mean_s": 7937.350377801806,
+        "online_encode_pct_mean": 48.07989878515991,
+        "online_encode_pct_sample_std": 0.22829736673510745,
+        "online_encode_sample_std_s": 129.80135876758553
+      },
+      "mode": "provider",
+      "model": "VGG16-base16",
+      "network": "vgg16_imgnet",
+      "profile": {
+        "denominator": "mean he_forward_s",
+        "he_forward_s": 16508.111870722223,
+        "major_wall_categories": {
+          "bootstrap": {
+            "percent_of_he_forward": 44.13614029384395,
+            "seconds": 7286.043415126667
+          },
+          "layer_cache_evict": {
+            "percent_of_he_forward": 0.0003155503726220992,
+            "seconds": 0.052091408520936966
+          },
+          "layer_cache_key_prepare": {
+            "percent_of_he_forward": 1.2401001467519983e-07,
+            "seconds": 2.0471711953481037e-05
+          },
+          "layer_cache_other": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "linear_wrapper_postprocess": {
+            "percent_of_he_forward": 0.00017729766559298986,
+            "seconds": 0.02926849698026975
+          },
+          "mvm_kernel": {
+            "percent_of_he_forward": 4.579563070166783,
+            "seconds": 755.9993948134138
+          },
+          "online_encode": {
+            "percent_of_he_forward": 48.08151556011081,
+            "seconds": 7937.350377801806
+          },
+          "other_he_forward": {
+            "percent_of_he_forward": 3.1462692966002135,
+            "seconds": 519.3896552369484
+          },
+          "provider_executor_overhead": {
+            "percent_of_he_forward": 0.05601229605734615,
+            "seconds": 9.246572494506836
+          },
+          "runtime_load_trim": {
+            "percent_of_he_forward": 6.511172674564338e-06,
+            "seconds": 0.0010748716692129772
+          }
+        },
+        "major_wall_categories_accounting": {
+          "category_sum_pct_of_he_forward": 100.0,
+          "category_sum_s": 16508.111870722223,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1.6508111870722225e-05,
+          "valid": true,
+          "validation_errors": []
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "entry_sources": {
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+          },
+          "residual_category": "other_he_forward",
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+        },
+        "measured_attempt_count": 3,
+        "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
+        "online_encode_pct_of_he_forward": 48.08151556011081,
+        "online_encode_s": 7937.350377801806,
+        "operation_counts_mean_per_forward": {
+          "baby_rotation_count": 11766.0,
+          "diag_terms": 196659.0,
+          "final_moddown": 7186.0,
+          "giant_rotation_count": 18438.0,
+          "inner_reduce_count": 169366.0,
+          "outer_reduce_count": 24404.0,
+          "q_mul": 28224.0,
+          "qp_mul": 365094.0,
+          "transform_count": 3593.0
+        },
+        "operator_microprofile": {
+          "bootstrap": {
+            "percent_of_he_forward": 44.13614029384395,
+            "seconds": 7286.043415126667
+          },
+          "elementwise_add_module_wall": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "elementwise_multiply_module_wall": {
+            "percent_of_he_forward": 19.94584599285566,
+            "seconds": 3292.6825700625777
+          },
+          "explicit_accumulate": {
+            "percent_of_he_forward": 0.040270358905299,
+            "seconds": 6.647875898828109
+          },
+          "lt_fused_multiply_accumulate": {
+            "percent_of_he_forward": 5.59524042291287,
+            "seconds": 923.6685484503278
+          },
+          "lt_rotation": {
+            "percent_of_he_forward": 20.675356360474794,
+            "seconds": 3413.110957657662
+          }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+        },
+        "profile_count": 3,
+        "requested_measured_attempt_count": 3,
+        "runtime_fairness_mode": "single_slot_layer_cache",
+        "schema_version": 2,
+        "valid": true,
+        "validation_errors": []
+      },
+      "provider_mode": "vgg_imgnet_layout_dp",
+      "result_kind": "accepted_real_fhe",
+      "source": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/04_step1_model_matrix/vgg16_imgnet_provider.json",
+      "status": "ok",
+      "traceback_last_line": null
+    },
+    {
+      "acceptance_errors": [
+        "ORION_LATTIGO_CLEAR_BACKEND is enabled",
+        "canonical Step 1 profile is marked invalid"
+      ],
+      "accepted_as_step1": false,
+      "attempts": [
+        {
+          "attempt_index": 0,
+          "error": null,
+          "error_type": null,
+          "kind": "measured",
+          "profile": {
+            "denominator": "he_forward_s",
+            "he_forward_s": 225.58419233403401,
+            "major_wall_categories": {
+              "bootstrap": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "layer_cache_evict": {
+                "percent_of_he_forward": 0.0034355610490463826,
+                "seconds": 0.007750082644633949
+              },
+              "layer_cache_key_prepare": {
+                "percent_of_he_forward": 4.749985074774209e-06,
+                "seconds": 1.0715215466916561e-05
+              },
+              "layer_cache_other": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "linear_wrapper_postprocess": {
+                "percent_of_he_forward": 0.00019351716216455594,
+                "seconds": 0.00043654412729665637
+              },
+              "mvm_kernel": {
+                "percent_of_he_forward": 5.787152381505714,
+                "seconds": 13.054900958959479
+              },
+              "online_encode": {
+                "percent_of_he_forward": 78.52955005935704,
+                "seconds": 177.1502512449515
+              },
+              "other_he_forward": {
+                "percent_of_he_forward": 15.659035283574376,
+                "seconds": 35.32430827175267
+              },
+              "provider_executor_overhead": {
+                "percent_of_he_forward": 0.020417183958182056,
+                "seconds": 0.046057939529418945
+              },
+              "runtime_load_trim": {
+                "percent_of_he_forward": 0.00021126340840311555,
+                "seconds": 0.00047657685354352
+              }
+            },
+            "major_wall_categories_accounting": {
+              "category_sum_pct_of_he_forward": 100.0,
+              "category_sum_s": 225.58419233403401,
+              "closure_error_s": 0.0,
+              "tolerance_s": 1e-06,
+              "valid": true,
+              "validation_errors": []
+            },
+            "major_wall_categories_metadata": {
+              "additive": true,
+              "entry_sources": {
+                "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+                "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+                "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+                "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+                "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+                "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+                "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+                "other_he_forward": "he_forward_s minus all other major wall categories",
+                "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+                "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+              },
+              "residual_category": "other_he_forward",
+              "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+            },
+            "measured_attempt_count": null,
+            "measurement_scope": "one real-FHE HE forward pass",
+            "online_encode_pct_of_he_forward": 78.52955005935704,
+            "online_encode_s": 177.1502512449515,
+            "operation_counts_mean_per_forward": {
+              "baby_rotation_count": 0,
+              "diag_terms": 0,
+              "final_moddown": 0,
+              "giant_rotation_count": 0,
+              "inner_reduce_count": 0,
+              "outer_reduce_count": 0,
+              "q_mul": 0,
+              "qp_mul": 0,
+              "transform_count": 0
+            },
+            "operator_microprofile": {
+              "bootstrap": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_add_module_wall": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "elementwise_multiply_module_wall": {
+                "percent_of_he_forward": 0.10556575817032804,
+                "seconds": 0.23813966294983402
+              },
+              "explicit_accumulate": {
+                "percent_of_he_forward": 0.017964059241779993,
+                "seconds": 0.04052407795097679
+              },
+              "lt_fused_multiply_accumulate": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              },
+              "lt_rotation": {
+                "percent_of_he_forward": 0.0,
+                "seconds": 0.0
+              }
+            },
+            "operator_microprofile_metadata": {
+              "additive": false,
+              "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+              "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+              "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+            },
+            "profile_count": null,
+            "requested_measured_attempt_count": null,
+            "runtime_fairness_mode": "single_slot_layer_cache",
+            "schema_version": 2,
+            "valid": false,
+            "validation_errors": [
+              "ORION_LATTIGO_CLEAR_BACKEND must be disabled"
+            ]
+          },
+          "status": "ok",
+          "timing_s": {
+            "decrypt_decode": 0.003685167001094669,
+            "encrypt": 0.28974858298897743,
+            "he_forward": 225.58419233403401
+          },
+          "traceback_last_line": null
+        }
+      ],
+      "backend": "lattigo",
+      "clear_backend": true,
+      "compile_s": 63.135262834024616,
+      "correctness": {
+        "actual_shape": [
+          1,
+          1000
+        ],
+        "checksum_delta": 0.2050704061985016,
+        "compare_actual_shape": [
+          1,
+          1000
+        ],
+        "compare_count": 1000,
+        "mae": 0.005178216844797134,
+        "max_abs": 0.02234802022576332,
+        "numel_match": true,
+        "reference_shape": [
+          1,
+          1000
+        ],
+        "reshaped_for_diagnostic": false,
+        "rmse": 0.006486488506197929,
+        "shape_match": true
+      },
+      "dataset": "imagenet",
+      "environment": {
+        "ORION_LATTIGO_CLEAR_BACKEND": "1",
+        "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+        "ORION_LATTIGO_STREAMING_LT": "0",
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1",
+        "ORION_SINGLE_SLOT_LAYER_CACHE": "1"
+      },
+      "error": null,
+      "error_type": null,
+      "label": "VGG16/base16 ImageNet 224",
+      "measured_attempt_statistics": {
+        "he_forward_mean_s": 225.58419233403401,
+        "he_forward_sample_std_s": 0.0,
+        "online_encode_mean_s": 177.1502512449515,
+        "online_encode_pct_mean": 78.52955005935704,
+        "online_encode_pct_sample_std": 0.0,
+        "online_encode_sample_std_s": 0.0
+      },
+      "mode": "provider",
+      "model": "VGG16-base16",
+      "network": "vgg16_imgnet",
+      "profile": {
+        "denominator": "mean he_forward_s",
+        "he_forward_s": 225.58419233403401,
+        "major_wall_categories": {
+          "bootstrap": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "layer_cache_evict": {
+            "percent_of_he_forward": 0.0034355610490463826,
+            "seconds": 0.007750082644633949
+          },
+          "layer_cache_key_prepare": {
+            "percent_of_he_forward": 4.749985074774209e-06,
+            "seconds": 1.0715215466916561e-05
+          },
+          "layer_cache_other": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "linear_wrapper_postprocess": {
+            "percent_of_he_forward": 0.00019351716216455594,
+            "seconds": 0.00043654412729665637
+          },
+          "mvm_kernel": {
+            "percent_of_he_forward": 5.787152381505714,
+            "seconds": 13.054900958959479
+          },
+          "online_encode": {
+            "percent_of_he_forward": 78.52955005935704,
+            "seconds": 177.1502512449515
+          },
+          "other_he_forward": {
+            "percent_of_he_forward": 15.659035283574376,
+            "seconds": 35.32430827175267
+          },
+          "provider_executor_overhead": {
+            "percent_of_he_forward": 0.020417183958182056,
+            "seconds": 0.046057939529418945
+          },
+          "runtime_load_trim": {
+            "percent_of_he_forward": 0.00021126340840311555,
+            "seconds": 0.00047657685354352
+          }
+        },
+        "major_wall_categories_accounting": {
+          "category_sum_pct_of_he_forward": 100.0,
+          "category_sum_s": 225.58419233403401,
+          "closure_error_s": 0.0,
+          "tolerance_s": 1e-06,
+          "valid": true,
+          "validation_errors": []
+        },
+        "major_wall_categories_metadata": {
+          "additive": true,
+          "entry_sources": {
+            "bootstrap": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+            "layer_cache_evict": "operator_breakdown_after_forward.totals.lt_layer_cache_evict_s",
+            "layer_cache_key_prepare": "operator_breakdown_after_forward.totals.lt_layer_cache_key_prepare_s",
+            "layer_cache_other": "layer-cache turnover minus encode/key-prepare/evict",
+            "linear_wrapper_postprocess": "operator_breakdown_after_forward.totals.wall_linear_wrapper_postprocess_s",
+            "mvm_kernel": "operator_breakdown_after_forward.totals.mvm_kernel_s",
+            "online_encode": "operator_breakdown_after_forward.totals.lt_layer_cache_encode_s",
+            "other_he_forward": "he_forward_s minus all other major wall categories",
+            "provider_executor_overhead": "operator_breakdown_after_forward.totals.wall_executor_overhead_s",
+            "runtime_load_trim": "operator_breakdown_after_forward.totals.wall_runtime_load_trim_s"
+          },
+          "residual_category": "other_he_forward",
+          "timing_semantics": "non-overlapping wall intervals inside he_forward_s"
+        },
+        "measured_attempt_count": 1,
+        "measurement_scope": "arithmetic mean across measured real-FHE HE forward passes",
+        "online_encode_pct_of_he_forward": 78.52955005935704,
+        "online_encode_s": 177.1502512449515,
+        "operation_counts_mean_per_forward": {
+          "baby_rotation_count": 0.0,
+          "diag_terms": 0.0,
+          "final_moddown": 0.0,
+          "giant_rotation_count": 0.0,
+          "inner_reduce_count": 0.0,
+          "outer_reduce_count": 0.0,
+          "q_mul": 0.0,
+          "qp_mul": 0.0,
+          "transform_count": 0.0
+        },
+        "operator_microprofile": {
+          "bootstrap": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "elementwise_add_module_wall": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "elementwise_multiply_module_wall": {
+            "percent_of_he_forward": 0.10556575817032804,
+            "seconds": 0.23813966294983402
+          },
+          "explicit_accumulate": {
+            "percent_of_he_forward": 0.017964059241779993,
+            "seconds": 0.04052407795097679
+          },
+          "lt_fused_multiply_accumulate": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          },
+          "lt_rotation": {
+            "percent_of_he_forward": 0.0,
+            "seconds": 0.0
+          }
+        },
+        "operator_microprofile_metadata": {
+          "additive": false,
+          "bootstrap_source": "lattigo_bootstrap_profile_after_he_forward.totals.total_s",
+          "percent_semantics": "diagnostic timer seconds divided by he_forward_s; not a partition",
+          "reason": "module timers can be nested and Lattigo microtimers can accumulate parallel work; fused multiply-accumulate cannot be separated into primitive multiply and add"
+        },
+        "profile_count": 1,
+        "requested_measured_attempt_count": 1,
+        "runtime_fairness_mode": "single_slot_layer_cache",
+        "schema_version": 2,
+        "valid": false,
+        "validation_errors": [
+          "ORION_LATTIGO_CLEAR_BACKEND must be disabled",
+          "one or more measured attempts failed Step 1 validation"
+        ]
+      },
+      "provider_mode": "vgg_imgnet_layout_dp",
+      "result_kind": "clear_structural",
+      "source": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/05_vgg16_profile_fix/vgg16_clear_structural.json",
+      "status": "ok",
+      "traceback_last_line": null
+    }
+  ],
+  "schema_version": 1
+}

@@ -2,7 +2,7 @@
 
 ## Status
 
-The profiling workflow is implemented, unit-tested, and has completed a real-FHE ResNet20 server run. The checked-in result is under `.tmp/results/honours/03_step1_online_encode/`. The VGG16 provider-layout failure found in the first model-matrix run is fixed and passes a complete clear-Lattigo structural forward; its real-FHE profile must be rerun on the server.
+The profiling workflow is implemented, unit-tested, and has completed real-FHE server runs for ResNet20, U-Net22, and the repaired VGG16/base16 provider path. The model-matrix results are under `.tmp/results/honours/04_step1_model_matrix/`. The clear-Lattigo VGG16 structural audit remains under `.tmp/results/honours/05_vgg16_profile_fix/`, but its timing is not accepted as real-FHE evidence.
 
 Step 1 is valid only when all of the following are true:
 
@@ -85,7 +85,7 @@ python tools/run_step1_online_encode_profile.py \
   --out .tmp/results/honours/03_step1_online_encode/u22_64_base32_provider.json
 ```
 
-Rerun the repaired VGG16/base16 provider path for the model matrix:
+Run or repeat the repaired VGG16/base16 provider path for the model matrix:
 
 ```bash
 python tools/run_step1_online_encode_profile.py \
@@ -141,6 +141,52 @@ Each `forward_attempts[*].step1_online_encode_profile` contains the correspondin
 6. its requested, successful measured-attempt, and profile counts all agree;
 7. online Encode time is positive;
 8. model correctness fields such as `mae_vs_clear.shape_match` remain successful.
+
+## Extracting the saved model matrix
+
+Use the schema-aware extractor to turn the large runner JSON files into concise JSON, CSV, Markdown, and PNG artifacts:
+
+```bash
+python tools/extract_step1_results.py
+```
+
+By default it reads:
+
+```text
+.tmp/results/honours/04_step1_model_matrix
+.tmp/results/honours/05_vgg16_profile_fix
+```
+
+and writes to:
+
+```text
+.tmp/results/honours/06_step1_extracted
+```
+
+Explicit paths are also supported. For convenience, the extractor resolves paths that omit the intermediate `honours` directory when the corresponding honours path exists:
+
+```bash
+python tools/extract_step1_results.py \
+  .tmp/results/04_step1_model_matrix \
+  .tmp/results/05_vgg16_profile_fix \
+  --out-dir .tmp/results/honours/06_step1_extracted
+```
+
+The outputs are:
+
+- `report.md`: concise accepted/excluded interpretation;
+- `extracted_results.json`: structured, compact extraction with validation decisions and per-attempt data;
+- `runs.csv`: one wide row per primary result;
+- `attempts.csv`: warmup and measured-forward rows, including per-attempt Encode and major-category values;
+- `major_wall_categories.csv`: additive category seconds and percentages in long form;
+- `operator_microprofile.csv`: non-additive diagnostic operator values in long form;
+- `operation_counts.csv`: mean Lattigo operation counts per measured forward;
+- `online_encode_comparison.png`: HE-forward versus Encode seconds and Encode percentage, with measured-run sample-standard-deviation error bars;
+- `major_wall_categories_pct.png`: accepted real-FHE additive wall-time stacks;
+- `operator_microprofile_pct.png`: accepted real-FHE non-additive operator diagnostics;
+- `operation_counts_log.png`: accepted real-FHE operation counts on a log scale.
+
+The extractor ignores `*.forwardN.progress_state.json` checkpoints. It applies the full Step 1 acceptance gate and only plots accepted real-FHE profiles. The clear-Lattigo VGG16 result is retained in the tables as `clear_structural`, but never mixed into timing comparisons. If Matplotlib is unavailable, table/report generation still succeeds with a warning; use `--no-plots` to request that behavior explicitly.
 
 ## Corrected ResNet20 result
 

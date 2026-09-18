@@ -206,3 +206,5 @@ go.work.sum
 
 # env file
 .env
+AGENTS.md
+agents.md
