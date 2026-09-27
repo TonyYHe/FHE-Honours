@@ -579,7 +579,8 @@ class UnifiedTransformGroup:
                     "module_name": transform_name,
                     "operator_type": type(transform).__name__,
                     "transform_id": (
-                        f"provider:{transform_name}:{int(transform_index)}"
+                        f"provider:{self._storage_key}:{int(transform_index)}:"
+                        f"{transform_name}"
                     ),
                     # Provider payloads are already flattened across their
                     # physical block mapping.  Use a documented logical block

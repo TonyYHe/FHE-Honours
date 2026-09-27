@@ -311,3 +311,39 @@ def test_provider_runtime_hook_records_complete_metadata(monkeypatch, tmp_path) 
         assert summary["occurrence"]["full_encoded_bytes"] == 8 * 8 * 4
     finally:
         reset_global_periodicity_collector()
+
+
+def test_provider_group_identity_prevents_false_payload_changes(monkeypatch, tmp_path) -> None:
+    from orion.nn.unified_transform import UnifiedTransformGroup
+
+    monkeypatch.setenv(PROFILE_ENV, "1")
+    monkeypatch.setenv(PROFILE_JSONL_ENV, str(tmp_path / "provider-groups.jsonl"))
+    monkeypatch.setenv("ORION_WPC_MODEL", "u22_64_base32")
+    monkeypatch.setenv("ORION_WPC_MODE", "provider")
+    reset_global_periodicity_collector()
+    try:
+        params = SimpleNamespace(get_logp=lambda: [60], get_ring_degree=lambda: 8)
+
+        def group_with_payload(values):
+            transform = SimpleNamespace(
+                name="reused_transform_name",
+                scheme=SimpleNamespace(params=params),
+                N1=2,
+            )
+            group = UnifiedTransformGroup([transform])
+            payload = (
+                np.asarray([5], dtype=np.int32),
+                np.asarray(values, dtype=np.float32),
+                2,
+            )
+            assert group._record_wpc_provider_payloads([payload], has_complex=False) == 1
+
+        group_with_payload([1.0, 2.0] * 2)
+        group_with_payload([3.0, 4.0] * 2)
+        summary = flush_periodicity_profile()
+        assert summary is not None
+        assert summary["occurrence"]["observed_count"] == 2
+        assert summary["unique_diagonal"]["observed_count"] == 2
+        assert summary["logical_diagonal_payload_change_count"] == 0
+    finally:
+        reset_global_periodicity_collector()

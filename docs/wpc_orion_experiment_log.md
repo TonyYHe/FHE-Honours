@@ -52,6 +52,52 @@ The full JSON and environment manifest have not yet been copied into this local
 working tree. The values above are transcribed from the validation output and
 the final profile summary supplied by the user.
 
+### 2026-09-27 — ResNet20 Orion slot-periodicity census
+
+- Executor: user, on `tony@corg-comb`
+- Network/mode: `resnet20_cifar10`, `dense`
+- Backend: clear Lattigo; one structural forward
+- Scope: slot-message periodicity only; no compression or performance timing
+- Result: valid
+
+| Census metric | Occurrence | Unique diagonal |
+|---|---:|---:|
+| Observed nonzero diagonals | 8,381 | 8,381 |
+| Exact proper-period candidates | 0 | 0 |
+| Count coverage | 0% | 0% |
+| Full encoded bytes | 38,254,673,920 | 38,254,673,920 |
+| Periodic full encoded bytes | 0 | 0 |
+| Byte coverage | 0% | 0% |
+| Selective-layout storage ratio | 1.0x | 1.0x |
+
+All 8,381 records had complete identity metadata, occurrence and unique JSONL
+counts matched their summaries, and no logical diagonal changed payload during
+the run. There were no all-zero or constant-nonzero records. The 35.63 GiB
+value is a sum of logical encoded Q/P plaintext sizes across diagonals at their
+respective levels, not a resident- or peak-memory measurement.
+
+For the current Orion ResNet20 layout, selective WPC has no exact slot-periodic
+diagonal to compress. This result concerns WPC compatibility of the existing
+Orion layout; it does not evaluate a full CIPS/Rotation-Padding WPC layout.
+
+### 2026-09-27 — U-Net census attempt 1 (invalid metadata identity)
+
+The first `u22_64_base32` provider census completed its clear forward and slot
+scan, but validation rejected the report. It recorded 73,077 occurrences and
+14 periodic slot messages, while reporting 10,095 logical IDs with multiple
+payload hashes. Occurrence and unique-record counts were both 73,077, which
+isolated the problem to logical identity collisions rather than duplicate
+payload observations.
+
+Cause: provider transform names and transform-local indexes are reused across
+multiple unified groups, but the profiler's `transform_id` omitted the group
+storage key. Records from distinct groups therefore shared a logical identity.
+The fix includes `runtime_storage_key` in the provider transform identity. A
+regression test now constructs two groups with the same transform name and
+diagonal index but different payloads and requires zero reported payload
+changes. The invalid attempt's 14/73,077 periodic count must not be used as a
+final result; U-Net must be rerun after the fix.
+
 ## Periodicity-census implementation
 
 The next stage is an untimed clear-Lattigo audit. It must not be mixed with the
