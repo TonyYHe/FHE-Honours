@@ -1381,6 +1381,83 @@ class NewEvaluator:
             self._add_profile("wait_s", time.perf_counter() - wait_started)
         return list(ordered)
 
+    def _record_wpc_dense_payloads(self, linear_layer, payloads) -> int:
+        """Audit dense runtime payloads without changing backend generation."""
+
+        if str(os.environ.get("ORION_WPC_PERIODICITY_PROFILE", "")).strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return 0
+        from orion.experimental.wpc_periodicity import (
+            encoded_plaintext_bytes as wpc_encoded_plaintext_bytes,
+            periodicity_collection_enabled as wpc_periodicity_collection_enabled,
+            record_flattened_diagonals as record_wpc_flattened_diagonals,
+        )
+
+        if not wpc_periodicity_collection_enabled():
+            return 0
+        level_q = int(
+            getattr(
+                linear_layer,
+                "_dense_layer_cache_level",
+                getattr(linear_layer, "level", 0),
+            )
+        )
+        try:
+            level_p = int(len(self.params.get_logp()) - 1)
+        except Exception:
+            level_p = -1
+        try:
+            ring_degree = int(self.params.get_ring_degree())
+        except Exception:
+            slots = int(getattr(self.params, "get_slots", lambda: 0)() or 0)
+            ring_degree = 2 * int(slots)
+        full_bytes = wpc_encoded_plaintext_bytes(
+            ring_degree=int(ring_degree),
+            level_q=int(level_q),
+            level_p=int(level_p),
+        )
+        layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
+        bsgs_ratio = float(
+            getattr(
+                linear_layer,
+                "_dense_layer_cache_bsgs_ratio",
+                getattr(linear_layer, "bsgs_ratio", 0.0),
+            )
+        )
+        recorded = 0
+        for row, col, diag_indices, diag_data in payloads:
+            recorded += record_wpc_flattened_diagonals(
+                diag_indices,
+                diag_data,
+                metadata={
+                    "model": os.environ.get("ORION_WPC_MODEL", "unknown"),
+                    "mode": os.environ.get("ORION_WPC_MODE", "dense"),
+                    "checkpoint_hash": os.environ.get(
+                        "ORION_WPC_CHECKPOINT_HASH",
+                        "none:deterministic-seed",
+                    ),
+                    "module_name": layer_name,
+                    "operator_type": type(linear_layer).__name__,
+                    "transform_id": f"dense:{layer_name}:{int(row)}:{int(col)}",
+                    "block_row": int(row),
+                    "block_col": int(col),
+                    "level_q": int(level_q),
+                    "level_p": int(level_p),
+                    "source_dtype": str(getattr(diag_data, "dtype", "float32")),
+                    "bsgs_n1": None,
+                    "bsgs_rotation": None,
+                    "bsgs_ratio": float(bsgs_ratio),
+                    "path": "dense",
+                },
+                has_complex=False,
+                full_encoded_bytes=int(full_bytes),
+            )
+        return int(recorded)
+
     def _materialize_dense_layer_cache_blocks(
         self,
         linear_layer,
@@ -1421,6 +1498,7 @@ class NewEvaluator:
         started = time.perf_counter()
         try:
             payloads = tuple(self._dense_layer_cache_build_payloads_for_blocks(linear_layer, requested))
+            self._record_wpc_dense_payloads(linear_layer, payloads)
             batch_results = self._generate_transforms_from_payloads_batch(
                 payloads,
                 level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
@@ -1480,6 +1558,7 @@ class NewEvaluator:
         self._record_diag_builder_metadata(linear_layer, getattr(linear_layer, "_last_diag_builder_metadata", None))
         if not payloads:
             raise RuntimeError(f"dense layer cache for {getattr(linear_layer, 'name', '<unnamed>')} has no payloads")
+        self._record_wpc_dense_payloads(linear_layer, payloads)
         started = time.perf_counter()
         try:
             batch_results = self._generate_transforms_from_payloads_batch(

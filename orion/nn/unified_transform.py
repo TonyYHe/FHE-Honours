@@ -511,6 +511,96 @@ class UnifiedTransformGroup:
             except Exception:
                 pass
 
+    def _record_wpc_provider_payloads(
+        self,
+        payloads,
+        *,
+        has_complex: bool,
+        transforms=None,
+    ) -> int:
+        """Audit provider payloads immediately before backend generation."""
+
+        if str(os.environ.get("ORION_WPC_PERIODICITY_PROFILE", "")).strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return 0
+        from orion.experimental.wpc_periodicity import (
+            encoded_plaintext_bytes as wpc_encoded_plaintext_bytes,
+            periodicity_collection_enabled as wpc_periodicity_collection_enabled,
+            record_flattened_diagonals as record_wpc_flattened_diagonals,
+        )
+
+        if not wpc_periodicity_collection_enabled():
+            return 0
+        selected_transforms = list(self.transforms if transforms is None else transforms)
+        selected_payloads = list(payloads)
+        if len(selected_transforms) != len(selected_payloads):
+            raise ValueError(
+                "WPC provider audit requires one transform per flattened payload: "
+                f"transforms={len(selected_transforms)} payloads={len(selected_payloads)}"
+            )
+
+        recorded = 0
+        for transform_index, (transform, payload) in enumerate(
+            zip(selected_transforms, selected_payloads)
+        ):
+            diag_indices, diag_data, level_q = payload
+            params = transform.scheme.params
+            try:
+                level_p = int(len(params.get_logp()) - 1)
+            except Exception:
+                level_p = -1
+            try:
+                ring_degree = int(params.get_ring_degree())
+            except Exception:
+                slots = int(getattr(params, "get_slots", lambda: 0)() or 0)
+                ring_degree = 2 * int(slots)
+            full_bytes = wpc_encoded_plaintext_bytes(
+                ring_degree=int(ring_degree),
+                level_q=int(level_q),
+                level_p=int(level_p),
+            )
+            transform_name = str(
+                getattr(transform, "name", f"transform_{int(transform_index)}")
+            )
+            recorded += record_wpc_flattened_diagonals(
+                diag_indices,
+                diag_data,
+                metadata={
+                    "model": os.environ.get("ORION_WPC_MODEL", "unknown"),
+                    "mode": os.environ.get("ORION_WPC_MODE", "provider"),
+                    "checkpoint_hash": os.environ.get(
+                        "ORION_WPC_CHECKPOINT_HASH",
+                        "none:deterministic-seed",
+                    ),
+                    "module_name": transform_name,
+                    "operator_type": type(transform).__name__,
+                    "transform_id": (
+                        f"provider:{transform_name}:{int(transform_index)}"
+                    ),
+                    # Provider payloads are already flattened across their
+                    # physical block mapping.  Use a documented logical block
+                    # rather than inventing unavailable physical coordinates.
+                    "block_row": 0,
+                    "block_col": 0,
+                    "level_q": int(level_q),
+                    "level_p": int(level_p),
+                    "source_dtype": str(getattr(diag_data, "dtype", "unknown")),
+                    "bsgs_n1": getattr(transform, "N1", None),
+                    "bsgs_rotation": None,
+                    "path": "provider",
+                    "provider_block_semantics": "flattened_logical_transform",
+                    "has_complex": bool(has_complex),
+                    "runtime_storage_key": str(self._storage_key),
+                },
+                has_complex=bool(has_complex),
+                full_encoded_bytes=int(full_bytes),
+            )
+        return int(recorded)
+
     def _materialize_single_slot_for_eval(self, backend) -> dict[str, float]:
         if not self._single_slot_layer_cache or self.unified_ids is not None:
             return {
@@ -557,6 +647,10 @@ class UnifiedTransformGroup:
         self._set_compile_profile("mode", "single_slot_materialize")
         self._set_compile_profile("has_complex", bool(self._single_slot_has_complex))
         self._set_compile_profile("worker_count", int(flatten_workers))
+        self._record_wpc_provider_payloads(
+            payloads,
+            has_complex=bool(self._single_slot_has_complex),
+        )
         try:
             self.unified_ids = self._generate_unified_backend_batch(
                 backend,
@@ -2797,6 +2891,15 @@ class UnifiedTransformGroup:
         finally:
             for group in selected:
                 group._release_single_slot_diagonal_caches()
+
+        cursor = 0
+        for group in selected:
+            count = int(len(group.transforms))
+            group._record_wpc_provider_payloads(
+                payloads[int(cursor): int(cursor + count)],
+                has_complex=bool(has_complex),
+            )
+            cursor += int(count)
 
         ids = cls._generate_unified_backend_grouped_batch(
             backend,

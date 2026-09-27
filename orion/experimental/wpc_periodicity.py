@@ -14,11 +14,13 @@ materialising or scanning the payload.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import math
 import os
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -730,6 +732,94 @@ def record_payload(
     )
 
 
+def encoded_plaintext_bytes(
+    *,
+    ring_degree: int,
+    level_q: int,
+    level_p: int,
+) -> int:
+    """Return the Q/P polynomial payload size for one encoded diagonal.
+
+    Lattigo stores one ``uint64`` coefficient per ring position in each active
+    Q and P limb.  Levels are zero based, so level ``L`` contains ``L+1``
+    limbs.  ``level_p=-1`` denotes an empty P basis.
+    """
+
+    n = int(ring_degree)
+    q = int(level_q)
+    p = int(level_p)
+    if not _is_power_of_two(n):
+        raise ValueError("ring_degree must be a positive power of two")
+    if q < 0 or p < -1:
+        raise ValueError("level_q must be nonnegative and level_p must be at least -1")
+    return int(n * 8 * ((q + 1) + (p + 1)))
+
+
+def record_flattened_diagonals(
+    diag_indices: Iterable[Any],
+    diag_data: Any,
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+    has_complex: bool = False,
+    full_encoded_bytes: Optional[int] = None,
+) -> int:
+    """Split one backend batch payload and record each logical diagonal.
+
+    Orion flattens all diagonals for a linear transform before crossing the
+    Python/Go boundary.  Real payloads contain ``n`` values per diagonal;
+    complex payloads contain ``2*n`` interleaved real/imaginary components.
+    The function validates that split before scanning any values.  It is a
+    strict no-op, including no payload conversion, when profiling is disabled.
+    """
+
+    collector = _global_collector()
+    if collector is None:
+        return 0
+
+    indices = tuple(int(value) for value in diag_indices)
+    if not indices:
+        if int(getattr(diag_data, "size", 0) or 0) != 0:
+            raise ValueError("flattened diagonal data is nonempty but has no indices")
+        return 0
+
+    try:
+        raw_count = int(diag_data.size)
+    except (AttributeError, TypeError, ValueError):
+        raw_count = len(diag_data)
+    if raw_count % len(indices):
+        raise ValueError(
+            "flattened diagonal data length is not divisible by the diagonal count: "
+            f"data={raw_count} diagonals={len(indices)}"
+        )
+    raw_per_diagonal = raw_count // len(indices)
+    if bool(has_complex) and raw_per_diagonal % 2:
+        raise ValueError("interleaved complex diagonal payload length must be even")
+    slot_count = raw_per_diagonal // 2 if bool(has_complex) else raw_per_diagonal
+    if not _is_power_of_two(slot_count):
+        raise ValueError(
+            "decoded slots per diagonal must be a positive power of two; "
+            f"received {slot_count}"
+        )
+
+    base_metadata = dict(metadata or {})
+    payload_format = (
+        PAYLOAD_FORMAT_INTERLEAVED_COMPLEX if bool(has_complex) else PAYLOAD_FORMAT_REAL
+    )
+    for position, diagonal_index in enumerate(indices):
+        start = int(position * raw_per_diagonal)
+        stop = int(start + raw_per_diagonal)
+        row_metadata = dict(base_metadata)
+        row_metadata["diagonal_index"] = int(diagonal_index)
+        row_metadata["diagonal_position"] = int(position)
+        collector.record_payload(
+            diag_data[start:stop],
+            metadata=row_metadata,
+            payload_format=payload_format,
+            full_encoded_bytes=full_encoded_bytes,
+        )
+    return int(len(indices))
+
+
 def flush_periodicity_profile(
     jsonl_path: Optional[Union[str, Path]] = None,
     *,
@@ -757,6 +847,22 @@ def reset_global_periodicity_collector() -> None:
         _GLOBAL_COLLECTOR = None
 
 
+def _flush_global_collector_at_exit() -> None:
+    """Best-effort audit flush for runner processes configured by environment."""
+
+    if not _env_truthy(PROFILE_ENV):
+        return
+    if not os.environ.get(PROFILE_JSONL_ENV):
+        return
+    try:
+        flush_periodicity_profile()
+    except Exception as exc:  # pragma: no cover - exercised only during shutdown
+        print(f"Failed to flush WPC periodicity profile: {exc}", file=sys.stderr)
+
+
+atexit.register(_flush_global_collector_at_exit)
+
+
 __all__ = [
     "EXPECTED_METADATA_FIELDS",
     "PAYLOAD_FORMAT_AUTO",
@@ -774,8 +880,10 @@ __all__ = [
     "analyze_slot_periodicity",
     "canonicalize_slot_payload",
     "canonicalize_slot_value",
+    "encoded_plaintext_bytes",
     "flush_periodicity_profile",
     "periodicity_collection_enabled",
+    "record_flattened_diagonals",
     "record_payload",
     "reset_global_periodicity_collector",
     "slot_payload_sha256",

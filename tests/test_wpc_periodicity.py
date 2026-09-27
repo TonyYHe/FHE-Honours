@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from orion.experimental.wpc_periodicity import (
@@ -14,7 +16,9 @@ from orion.experimental.wpc_periodicity import (
     aggregate_periodicity,
     analyze_slot_periodicity,
     canonicalize_slot_value,
+    encoded_plaintext_bytes,
     flush_periodicity_profile,
+    record_flattened_diagonals,
     record_payload,
     reset_global_periodicity_collector,
     slot_payload_sha256,
@@ -170,5 +174,140 @@ def test_env_gated_global_collector_records_interleaved_payload(monkeypatch, tmp
         assert summary is not None
         assert jsonl_path.exists()
         assert summary_path.exists()
+    finally:
+        reset_global_periodicity_collector()
+
+
+def test_encoded_plaintext_bytes_counts_active_q_and_p_limbs() -> None:
+    assert encoded_plaintext_bytes(ring_degree=16, level_q=2, level_p=1) == 16 * 8 * 5
+    assert encoded_plaintext_bytes(ring_degree=16, level_q=0, level_p=-1) == 16 * 8
+
+
+def test_flattened_real_payload_records_each_diagonal(monkeypatch, tmp_path) -> None:
+    jsonl_path = tmp_path / "flat-real.jsonl"
+    monkeypatch.setenv(PROFILE_ENV, "1")
+    monkeypatch.setenv(PROFILE_JSONL_ENV, str(jsonl_path))
+    reset_global_periodicity_collector()
+    try:
+        count = record_flattened_diagonals(
+            [3, 9],
+            [1.0, 2.0] * 4 + list(range(8)),
+            metadata={"module_name": "conv"},
+            full_encoded_bytes=800,
+        )
+        assert count == 2
+        summary = flush_periodicity_profile()
+        assert summary is not None
+        assert summary["occurrence"]["observed_count"] == 2
+        assert summary["occurrence"]["periodic_count"] == 1
+        records = [
+            json.loads(line)
+            for line in jsonl_path.read_text().splitlines()
+            if json.loads(line)["record_type"] == "slot_periodicity_occurrence"
+        ]
+        assert [record["diagonal_index"] for record in records] == [3, 9]
+    finally:
+        reset_global_periodicity_collector()
+
+
+def test_flattened_interleaved_payload_uses_decoded_slot_count(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(PROFILE_ENV, "1")
+    monkeypatch.setenv(PROFILE_JSONL_ENV, str(tmp_path / "flat-complex.jsonl"))
+    reset_global_periodicity_collector()
+    try:
+        # Two complex diagonals, each with four decoded slots.
+        diagonal = [1.0, 2.0, 3.0, 4.0] * 2
+        assert record_flattened_diagonals(
+            [1, 2],
+            diagonal + diagonal,
+            has_complex=True,
+        ) == 2
+        summary = flush_periodicity_profile()
+        assert summary is not None
+        assert summary["occurrence"]["observed_count"] == 2
+        assert summary["occurrence"]["periodic_count"] == 2
+    finally:
+        reset_global_periodicity_collector()
+
+
+def test_flattened_payload_is_noop_without_profiling(monkeypatch) -> None:
+    class MustNotTouch:
+        @property
+        def size(self):
+            raise AssertionError("disabled flattened recorder touched payload data")
+
+    monkeypatch.delenv(PROFILE_ENV, raising=False)
+    reset_global_periodicity_collector()
+    try:
+        assert record_flattened_diagonals([1], MustNotTouch()) == 0
+    finally:
+        reset_global_periodicity_collector()
+
+
+def test_dense_runtime_hook_records_complete_metadata(monkeypatch, tmp_path) -> None:
+    from orion.backend.python.lt_evaluator import NewEvaluator
+
+    monkeypatch.setenv(PROFILE_ENV, "1")
+    monkeypatch.setenv(PROFILE_JSONL_ENV, str(tmp_path / "dense-hook.jsonl"))
+    monkeypatch.setenv("ORION_WPC_MODEL", "resnet20_cifar10")
+    monkeypatch.setenv("ORION_WPC_MODE", "dense")
+    reset_global_periodicity_collector()
+    try:
+        fake_evaluator = SimpleNamespace(
+            params=SimpleNamespace(
+                get_logp=lambda: [60],
+                get_ring_degree=lambda: 8,
+            )
+        )
+        layer = SimpleNamespace(name="conv1", level=2, bsgs_ratio=2.0)
+        payloads = [
+            (
+                0,
+                1,
+                np.asarray([3, 7], dtype=np.int32),
+                np.asarray([1.0, 2.0] * 2 + list(range(4)), dtype=np.float32),
+            )
+        ]
+        recorded = NewEvaluator._record_wpc_dense_payloads(fake_evaluator, layer, payloads)
+        assert recorded == 2
+        summary = flush_periodicity_profile()
+        assert summary is not None
+        assert summary["occurrence"]["observed_count"] == 2
+        assert summary["metadata_complete_occurrence_count"] == 2
+        assert summary["occurrence"]["full_encoded_bytes"] == 2 * 8 * 8 * 4
+    finally:
+        reset_global_periodicity_collector()
+
+
+def test_provider_runtime_hook_records_complete_metadata(monkeypatch, tmp_path) -> None:
+    from orion.nn.unified_transform import UnifiedTransformGroup
+
+    monkeypatch.setenv(PROFILE_ENV, "1")
+    monkeypatch.setenv(PROFILE_JSONL_ENV, str(tmp_path / "provider-hook.jsonl"))
+    monkeypatch.setenv("ORION_WPC_MODEL", "u22_64_base32")
+    monkeypatch.setenv("ORION_WPC_MODE", "provider")
+    reset_global_periodicity_collector()
+    try:
+        params = SimpleNamespace(get_logp=lambda: [60], get_ring_degree=lambda: 8)
+        transform = SimpleNamespace(
+            name="encoder_conv",
+            scheme=SimpleNamespace(params=params),
+            N1=2,
+        )
+        group = UnifiedTransformGroup([transform])
+        payloads = [
+            (
+                np.asarray([5], dtype=np.int32),
+                np.asarray([1.0, 2.0] * 2, dtype=np.float32),
+                2,
+            )
+        ]
+        recorded = group._record_wpc_provider_payloads(payloads, has_complex=False)
+        assert recorded == 1
+        summary = flush_periodicity_profile()
+        assert summary is not None
+        assert summary["occurrence"]["observed_count"] == 1
+        assert summary["metadata_complete_occurrence_count"] == 1
+        assert summary["occurrence"]["full_encoded_bytes"] == 8 * 8 * 4
     finally:
         reset_global_periodicity_collector()
