@@ -1,0 +1,15 @@
+{
+  "attempt_index": 1,
+  "attempt_kind": "measured",
+  "event": "end",
+  "layer": "linear",
+  "layer_cache_evict_s": 8.333101868629456e-05,
+  "mode": "dense",
+  "network": "resnet20_cifar10",
+  "path": "dense",
+  "phase": "evict",
+  "pid": 7163,
+  "result_path": "/home/tony/FHE-Honours/.tmp/results/honours/08_wpc_orion_tradeoff/resnet20_o_online.json",
+  "time": "2026-09-26T13:15:17Z",
+  "time_s": 1790428517.1371777
+}
