@@ -15,10 +15,12 @@ materialising or scanning the payload.
 from __future__ import annotations
 
 import atexit
+import ctypes
 import hashlib
 import json
 import math
 import os
+import platform
 import struct
 import sys
 import tempfile
@@ -28,13 +30,19 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Number
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Union
 
 
 PROFILE_ENV = "ORION_WPC_PERIODICITY_PROFILE"
 PROFILE_JSONL_ENV = "ORION_WPC_PERIODICITY_JSONL"
 PROFILE_SUMMARY_ENV = "ORION_WPC_PERIODICITY_SUMMARY"
-PROFILE_SCHEMA_VERSION = 1
+ENCODED_VERIFY_ENV = "ORION_WPC_ENCODED_QP_VERIFY"
+PROFILE_SCHEMA_VERSION = 2
+
+EncodedQPVerifier = Callable[
+    [Sequence[complex], "SlotPeriodicity", str, int],
+    Mapping[str, Any],
+]
 
 PAYLOAD_FORMAT_AUTO = "auto"
 PAYLOAD_FORMAT_REAL = "real"
@@ -505,6 +513,7 @@ class PeriodicityCollector:
         full_encoded_bytes: Optional[int] = None,
         baseline_encode_s: Optional[float] = None,
         compressed_bytes: Optional[int] = None,
+        encoded_qp_verifier: Optional[EncodedQPVerifier] = None,
     ) -> dict[str, Any]:
         """Analyze one materialization occurrence and retain metadata, not values."""
 
@@ -519,6 +528,16 @@ class PeriodicityCollector:
             compressed_bytes=compressed_bytes,
         )
         effective_compressed_bytes = observation.effective_hybrid_bytes
+        encoded_verification: dict[str, Any] = {}
+        if periodicity.wpc_candidate and encoded_qp_verifier is not None:
+            encoded_verification = dict(
+                encoded_qp_verifier(
+                    slots,
+                    periodicity,
+                    str(payload_format),
+                    int(dict(metadata or {}).get("level_q", -1)),
+                )
+            )
 
         safe_metadata = _json_safe(dict(metadata or {}))
         metadata_complete = all(
@@ -555,6 +574,8 @@ class PeriodicityCollector:
             ),
             "analysis_s": float(time.perf_counter() - started),
         }
+        if encoded_verification:
+            record["encoded_qp_verification"] = _json_safe(encoded_verification)
         for field in EXPECTED_METADATA_FIELDS:
             record[field] = safe_metadata.get(field)
         extras = {
@@ -601,11 +622,40 @@ class PeriodicityCollector:
         unique_aggregate = aggregate_periodicity(
             _observation_from_record(record) for record in unique
         )
+        candidate_occurrences = [
+            record for record in occurrences if bool(record.get("wpc_slot_candidate", False))
+        ]
+        verified_occurrences = [
+            record
+            for record in candidate_occurrences
+            if isinstance(record.get("encoded_qp_verification"), Mapping)
+            and bool(record["encoded_qp_verification"].get("attempted", False))
+        ]
+        passed_occurrences = [
+            record
+            for record in verified_occurrences
+            if bool(record["encoded_qp_verification"].get("passed", False))
+        ]
+        encoded_verification_complete = bool(
+            len(verified_occurrences) == len(candidate_occurrences)
+            and len(passed_occurrences) == len(candidate_occurrences)
+        )
         return {
             "schema_version": PROFILE_SCHEMA_VERSION,
             "profile": "wpc_orion_slot_periodicity",
-            "scope": "slot_message_only",
-            "encoded_representation_verification_required": True,
+            "scope": (
+                "slot_message_plus_encoded_qp_candidates"
+                if verified_occurrences
+                else "slot_message_only"
+            ),
+            "encoded_representation_verification_required": not encoded_verification_complete,
+            "encoded_qp_verification": {
+                "candidate_occurrence_count": len(candidate_occurrences),
+                "attempted_occurrence_count": len(verified_occurrences),
+                "passed_occurrence_count": len(passed_occurrences),
+                "failed_occurrence_count": len(verified_occurrences) - len(passed_occurrences),
+                "complete": encoded_verification_complete,
+            },
             "occurrence": occurrence_aggregate.to_dict(),
             "unique_diagonal": unique_aggregate.to_dict(),
             "metadata_complete_occurrence_count": sum(
@@ -689,6 +739,201 @@ def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def real_lattigo_library_path() -> Path:
+    """Resolve the real Lattigo shared library even during a clear run."""
+
+    override = str(os.environ.get("ORION_LATTIGO_LIBRARY_PATH", "")).strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    system = platform.system()
+    if system == "Linux":
+        name = "lattigo-linux.so"
+    elif system == "Darwin":
+        name = (
+            "lattigo-mac-arm64.dylib"
+            if platform.machine().lower() in {"arm64", "aarch64"}
+            else "lattigo-mac.dylib"
+        )
+    elif system == "Windows":
+        name = "lattigo-windows.dll"
+    else:
+        raise RuntimeError(f"unsupported platform for Lattigo verifier: {system}")
+    return Path(__file__).resolve().parents[1] / "backend" / "lattigo" / name
+
+
+class _LattigoEncodedQPVerifier:
+    """Minimal ctypes bridge used only by the untimed clear audit."""
+
+    _STATUS = {
+        1: "verified",
+        0: "encoded_qp_mismatch",
+        -1: "invalid_input",
+        -2: "source_not_periodic",
+        -3: "encode_failure",
+    }
+
+    def __init__(self, params: Any) -> None:
+        self._lock = threading.Lock()
+        self._closed = False
+        self._logn = int(params.get_logn())
+        self._logq = tuple(int(value) for value in params.get_logq())
+        self._logp = tuple(int(value) for value in params.get_logp())
+        self._logscale = int(params.get_logscale())
+        self._hamming_weight = int(params.get_hamming_weight())
+        self._ringtype = str(params.get_ringtype())
+        self.signature = (
+            self._logn,
+            self._logq,
+            self._logp,
+            self._logscale,
+            self._hamming_weight,
+            self._ringtype,
+        )
+
+        path = real_lattigo_library_path()
+        if not path.is_file():
+            raise RuntimeError(
+                f"real Lattigo verifier library does not exist: {path}; "
+                "run python tools/build_lattigo.py first"
+            )
+        self.library_path = path
+        self._lib = ctypes.CDLL(str(path))
+        try:
+            new_scheme = self._lib.NewScheme
+            verify = self._lib.VerifyWPCEncodedDiagonal
+            delete_scheme = self._lib.DeleteScheme
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"{path} does not expose the WPC encoded verifier; rebuild it from current source"
+            ) from exc
+
+        new_scheme.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+        ]
+        new_scheme.restype = None
+        verify.argtypes = [
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        verify.restype = ctypes.c_int
+        delete_scheme.argtypes = []
+        delete_scheme.restype = None
+        self._verify = verify
+        self._delete_scheme = delete_scheme
+
+        logq_array = (ctypes.c_int * len(self._logq))(*self._logq)
+        logp_array = (ctypes.c_int * len(self._logp))(*self._logp)
+        new_scheme(
+            self._logn,
+            logq_array,
+            len(self._logq),
+            logp_array,
+            len(self._logp),
+            self._logscale,
+            self._hamming_weight,
+            self._ringtype.encode("utf-8"),
+            b"",
+            b"none",
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._delete_scheme()
+            self._closed = True
+
+    def verify(
+        self,
+        slots: Sequence[complex],
+        periodicity: SlotPeriodicity,
+        payload_format: str,
+        level_q: int,
+    ) -> Mapping[str, Any]:
+        is_complex = str(payload_format) in {
+            PAYLOAD_FORMAT_COMPLEX,
+            PAYLOAD_FORMAT_INTERLEAVED_COMPLEX,
+        }
+        raw_values: list[float] = []
+        if is_complex:
+            for value in slots:
+                raw_values.extend((float(value.real), float(value.imag)))
+        else:
+            raw_values.extend(float(value.real) for value in slots)
+        values_array = (ctypes.c_double * len(raw_values))(*raw_values)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the WPC encoded verifier has already been closed")
+            status_code = int(
+                self._verify(
+                    values_array,
+                    len(raw_values),
+                    int(is_complex),
+                    int(level_q),
+                    int(periodicity.minimal_period),
+                )
+            )
+        return {
+            "attempted": True,
+            "passed": status_code == 1,
+            "status_code": status_code,
+            "status": self._STATUS.get(status_code, "unknown_status"),
+            "method": "lattigo_qp_evaluation_copy_map_exact_roundtrip",
+            "library_path": str(self.library_path),
+            "level_q": int(level_q),
+            "level_p": int(len(self._logp) - 1),
+            "q_limb_count": int(level_q + 1),
+            "p_limb_count": int(len(self._logp)),
+            "slot_period_t": int(periodicity.minimal_period),
+            "evaluation_period_2t": int(2 * periodicity.minimal_period),
+            "full_polynomial_reconstruction_exact": status_code == 1,
+        }
+
+
+_ENCODED_VERIFIER_LOCK = threading.Lock()
+_ENCODED_VERIFIER: Optional[_LattigoEncodedQPVerifier] = None
+
+
+def encoded_qp_verification_enabled() -> bool:
+    return _env_truthy(ENCODED_VERIFY_ENV)
+
+
+def encoded_qp_verifier_for_params(params: Any) -> Optional[EncodedQPVerifier]:
+    """Return a process-global verifier bound to the model's CKKS parameters."""
+
+    global _ENCODED_VERIFIER
+    if not encoded_qp_verification_enabled():
+        return None
+    with _ENCODED_VERIFIER_LOCK:
+        candidate_signature = (
+            int(params.get_logn()),
+            tuple(int(value) for value in params.get_logq()),
+            tuple(int(value) for value in params.get_logp()),
+            int(params.get_logscale()),
+            int(params.get_hamming_weight()),
+            str(params.get_ringtype()),
+        )
+        if _ENCODED_VERIFIER is None:
+            _ENCODED_VERIFIER = _LattigoEncodedQPVerifier(params)
+        elif _ENCODED_VERIFIER.signature != candidate_signature:
+            raise RuntimeError(
+                "one WPC audit process cannot mix different CKKS parameter sets"
+            )
+        return _ENCODED_VERIFIER.verify
+
+
 def _global_collector() -> Optional[PeriodicityCollector]:
     global _GLOBAL_COLLECTOR
     current = _GLOBAL_COLLECTOR
@@ -716,6 +961,7 @@ def record_payload(
     full_encoded_bytes: Optional[int] = None,
     baseline_encode_s: Optional[float] = None,
     compressed_bytes: Optional[int] = None,
+    encoded_qp_verifier: Optional[EncodedQPVerifier] = None,
 ) -> Optional[dict[str, Any]]:
     """Record one payload when profiling is enabled; otherwise do no work."""
 
@@ -729,6 +975,7 @@ def record_payload(
         full_encoded_bytes=full_encoded_bytes,
         baseline_encode_s=baseline_encode_s,
         compressed_bytes=compressed_bytes,
+        encoded_qp_verifier=encoded_qp_verifier,
     )
 
 
@@ -762,6 +1009,7 @@ def record_flattened_diagonals(
     metadata: Optional[Mapping[str, Any]] = None,
     has_complex: bool = False,
     full_encoded_bytes: Optional[int] = None,
+    encoded_qp_verifier: Optional[EncodedQPVerifier] = None,
 ) -> int:
     """Split one backend batch payload and record each logical diagonal.
 
@@ -816,6 +1064,7 @@ def record_flattened_diagonals(
             metadata=row_metadata,
             payload_format=payload_format,
             full_encoded_bytes=full_encoded_bytes,
+            encoded_qp_verifier=encoded_qp_verifier,
         )
     return int(len(indices))
 
@@ -842,9 +1091,13 @@ def flush_periodicity_profile(
 def reset_global_periodicity_collector() -> None:
     """Forget cached env state and records; intended for tests and run boundaries."""
 
-    global _GLOBAL_COLLECTOR
+    global _GLOBAL_COLLECTOR, _ENCODED_VERIFIER
     with _GLOBAL_LOCK:
         _GLOBAL_COLLECTOR = None
+    with _ENCODED_VERIFIER_LOCK:
+        if _ENCODED_VERIFIER is not None:
+            _ENCODED_VERIFIER.close()
+        _ENCODED_VERIFIER = None
 
 
 def _flush_global_collector_at_exit() -> None:
@@ -860,11 +1113,24 @@ def _flush_global_collector_at_exit() -> None:
         print(f"Failed to flush WPC periodicity profile: {exc}", file=sys.stderr)
 
 
+def _close_encoded_verifier_at_exit() -> None:
+    global _ENCODED_VERIFIER
+    with _ENCODED_VERIFIER_LOCK:
+        if _ENCODED_VERIFIER is not None:
+            try:
+                _ENCODED_VERIFIER.close()
+            except Exception as exc:  # pragma: no cover - shutdown only
+                print(f"Failed to close WPC encoded verifier: {exc}", file=sys.stderr)
+            _ENCODED_VERIFIER = None
+
+
 atexit.register(_flush_global_collector_at_exit)
+atexit.register(_close_encoded_verifier_at_exit)
 
 
 __all__ = [
     "EXPECTED_METADATA_FIELDS",
+    "ENCODED_VERIFY_ENV",
     "PAYLOAD_FORMAT_AUTO",
     "PAYLOAD_FORMAT_COMPLEX",
     "PAYLOAD_FORMAT_INTERLEAVED_COMPLEX",
@@ -881,10 +1147,13 @@ __all__ = [
     "canonicalize_slot_payload",
     "canonicalize_slot_value",
     "encoded_plaintext_bytes",
+    "encoded_qp_verification_enabled",
+    "encoded_qp_verifier_for_params",
     "flush_periodicity_profile",
     "periodicity_collection_enabled",
     "record_flattened_diagonals",
     "record_payload",
+    "real_lattigo_library_path",
     "reset_global_periodicity_collector",
     "slot_payload_sha256",
 ]

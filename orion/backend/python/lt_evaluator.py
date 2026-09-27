@@ -1392,6 +1392,7 @@ class NewEvaluator:
         }:
             return 0
         from orion.experimental.wpc_periodicity import (
+            encoded_qp_verifier_for_params as wpc_encoded_qp_verifier_for_params,
             encoded_plaintext_bytes as wpc_encoded_plaintext_bytes,
             periodicity_collection_enabled as wpc_periodicity_collection_enabled,
             record_flattened_diagonals as record_wpc_flattened_diagonals,
@@ -1420,6 +1421,7 @@ class NewEvaluator:
             level_q=int(level_q),
             level_p=int(level_p),
         )
+        encoded_qp_verifier = wpc_encoded_qp_verifier_for_params(self.params)
         layer_name = str(getattr(linear_layer, "name", "<unnamed>"))
         bsgs_ratio = float(
             getattr(
@@ -1455,6 +1457,7 @@ class NewEvaluator:
                 },
                 has_complex=False,
                 full_encoded_bytes=int(full_bytes),
+                encoded_qp_verifier=encoded_qp_verifier,
             )
         return int(recorded)
 

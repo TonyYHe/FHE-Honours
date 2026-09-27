@@ -9,6 +9,7 @@ must not be used as an end-to-end timing result.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shlex
@@ -20,6 +21,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = REPO_ROOT / ".tmp/results/honours/09_wpc_periodicity_census"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _slug(network: str, mode: str) -> str:
@@ -49,6 +52,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--encode-workers", type=int, default=1)
     parser.add_argument("--checkpoint-hash", default=None)
+    parser.add_argument(
+        "--verify-encoded-qp",
+        action="store_true",
+        help=(
+            "Independently encode each slot-periodic candidate with the real "
+            "Lattigo library and require exact Q/P copy-map reconstruction."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -74,6 +85,7 @@ def main() -> int:
             "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
             "ORION_SINGLE_SLOT_ENCODE_WORKERS": str(int(args.encode_workers)),
             "ORION_WPC_PERIODICITY_PROFILE": "1",
+            "ORION_WPC_ENCODED_QP_VERIFY": "1" if args.verify_encoded_qp else "0",
             "ORION_WPC_PERIODICITY_JSONL": str(jsonl_path),
             "ORION_WPC_PERIODICITY_SUMMARY": str(summary_path),
             "ORION_WPC_MODEL": str(args.network),
@@ -85,6 +97,23 @@ def main() -> int:
             ),
         }
     )
+    if bool(args.verify_encoded_qp):
+        from orion.experimental.wpc_periodicity import real_lattigo_library_path
+
+        verifier_library = real_lattigo_library_path()
+        if not verifier_library.is_file():
+            raise SystemExit(
+                f"real Lattigo verifier library is missing: {verifier_library}; "
+                "run python tools/build_lattigo.py first"
+            )
+        try:
+            verifier_cdll = ctypes.CDLL(str(verifier_library))
+            getattr(verifier_cdll, "VerifyWPCEncodedDiagonal")
+        except (OSError, AttributeError) as exc:
+            raise SystemExit(
+                f"real Lattigo library is missing the encoded-Q/P verifier: {exc}; "
+                "rebuild it from the current source"
+            ) from exc
     command = [
         sys.executable,
         str(REPO_ROOT / "tools/run_lattigo_e2e_compare.py"),
@@ -118,6 +147,7 @@ def main() -> int:
                 "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT",
                 "ORION_SINGLE_SLOT_ENCODE_WORKERS",
                 "ORION_WPC_PERIODICITY_PROFILE",
+                "ORION_WPC_ENCODED_QP_VERIFY",
                 "ORION_WPC_MODEL",
                 "ORION_WPC_MODE",
                 "ORION_WPC_CHECKPOINT_HASH",
@@ -148,8 +178,16 @@ def main() -> int:
         errors.append("the one requested clear forward did not succeed")
     if not bool(dict(result.get("mae_vs_clear", {}) or {}).get("shape_match", False)):
         errors.append("clear output shape does not match the reference")
-    if str(summary.get("scope", "")) != "slot_message_only":
-        errors.append("periodicity summary has an unexpected scope")
+    expected_scope = (
+        "slot_message_plus_encoded_qp_candidates"
+        if bool(args.verify_encoded_qp)
+        else "slot_message_only"
+    )
+    if str(summary.get("scope", "")) != expected_scope:
+        errors.append(
+            f"periodicity summary scope is {summary.get('scope')!r}, "
+            f"expected {expected_scope!r}"
+        )
     occurrence = dict(summary.get("occurrence", {}) or {})
     if int(occurrence.get("observed_count", 0) or 0) <= 0:
         errors.append("periodicity census recorded no diagonal occurrences")
@@ -157,6 +195,19 @@ def main() -> int:
         occurrence.get("observed_count", 0) or 0
     ):
         errors.append("one or more periodicity records has incomplete identity metadata")
+    encoded_verification = dict(summary.get("encoded_qp_verification", {}) or {})
+    if bool(args.verify_encoded_qp):
+        candidate_count = int(encoded_verification.get("candidate_occurrence_count", 0) or 0)
+        attempted_count = int(encoded_verification.get("attempted_occurrence_count", 0) or 0)
+        passed_count = int(encoded_verification.get("passed_occurrence_count", 0) or 0)
+        if candidate_count <= 0:
+            errors.append("encoded-Q/P verification was requested but found no candidates")
+        if attempted_count != candidate_count:
+            errors.append(
+                "encoded-Q/P verification did not attempt every slot-periodic candidate"
+            )
+        if passed_count != candidate_count or not bool(encoded_verification.get("complete", False)):
+            errors.append("one or more encoded-Q/P candidate failed exact reconstruction")
 
     if errors:
         print("WPC periodicity census validation failed:", file=sys.stderr)
@@ -169,6 +220,7 @@ def main() -> int:
         "encoded_representation_verification_required": bool(
             summary.get("encoded_representation_verification_required", True)
         ),
+        "encoded_qp_verification": encoded_verification,
         "observed_count": occurrence.get("observed_count"),
         "nonzero_count": occurrence.get("nonzero_count"),
         "periodic_count": occurrence.get("periodic_count"),

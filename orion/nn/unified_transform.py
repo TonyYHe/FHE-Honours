@@ -528,6 +528,7 @@ class UnifiedTransformGroup:
         }:
             return 0
         from orion.experimental.wpc_periodicity import (
+            encoded_qp_verifier_for_params as wpc_encoded_qp_verifier_for_params,
             encoded_plaintext_bytes as wpc_encoded_plaintext_bytes,
             periodicity_collection_enabled as wpc_periodicity_collection_enabled,
             record_flattened_diagonals as record_wpc_flattened_diagonals,
@@ -563,6 +564,7 @@ class UnifiedTransformGroup:
                 level_q=int(level_q),
                 level_p=int(level_p),
             )
+            encoded_qp_verifier = wpc_encoded_qp_verifier_for_params(params)
             transform_name = str(
                 getattr(transform, "name", f"transform_{int(transform_index)}")
             )
@@ -599,6 +601,7 @@ class UnifiedTransformGroup:
                 },
                 has_complex=bool(has_complex),
                 full_encoded_bytes=int(full_bytes),
+                encoded_qp_verifier=encoded_qp_verifier,
             )
         return int(recorded)
 

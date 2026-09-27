@@ -12,42 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// evaluationBlockRepresentatives captures the copy map induced by Lattigo's
-// bit-reversed NTT storage. A slot period T becomes 2T constant raw blocks,
-// each containing N/(2T) equal coefficients.
-func evaluationBlockRepresentatives(coeffs []uint64, evaluationPeriod int) ([]uint64, bool) {
-	if evaluationPeriod <= 0 || len(coeffs)%evaluationPeriod != 0 {
-		return nil, false
-	}
-	blockSize := len(coeffs) / evaluationPeriod
-	representatives := make([]uint64, evaluationPeriod)
-	for block := range representatives {
-		start := block * blockSize
-		representatives[block] = coeffs[start]
-		for i := start + 1; i < start+blockSize; i++ {
-			if coeffs[i] != representatives[block] {
-				return nil, false
-			}
-		}
-	}
-	return representatives, true
-}
-
-func reconstructEvaluationBlocks(representatives []uint64, ringDegree int) ([]uint64, bool) {
-	if len(representatives) == 0 || ringDegree%len(representatives) != 0 {
-		return nil, false
-	}
-	blockSize := ringDegree / len(representatives)
-	reconstructed := make([]uint64, ringDegree)
-	for block, representative := range representatives {
-		start := block * blockSize
-		for i := start; i < start+blockSize; i++ {
-			reconstructed[i] = representative
-		}
-	}
-	return reconstructed, true
-}
-
 func requireExactEvaluationPeriod(t *testing.T, poly ring.Poly, evaluationPeriod int) {
 	t.Helper()
 	require.NotEmpty(t, poly.Coeffs)
@@ -135,4 +99,24 @@ func TestWPCRejectsNonPeriodicEvaluationPolynomial(t *testing.T) {
 		_, periodic := evaluationBlockRepresentatives(coeffs, 16)
 		require.False(t, periodic)
 	}
+}
+
+func TestWPCEncodedCandidateVerifier(t *testing.T) {
+	params := wpcTestParameters(t)
+	for _, slotPeriod := range []int{1, 2, 8, 32, params.MaxSlots() / 4} {
+		values := periodicValues(params.MaxSlots(), slotPeriod, 1000*slotPeriod)
+		require.Equal(
+			t,
+			wpcVerificationPassed,
+			verifyWPCEncodedReal(params, values, params.MaxLevel(), slotPeriod),
+		)
+	}
+
+	nonPeriodic := periodicValues(params.MaxSlots(), 8, 100)
+	nonPeriodic[len(nonPeriodic)-1] += 1
+	require.Equal(
+		t,
+		wpcVerificationSourceNotPeriodic,
+		verifyWPCEncodedReal(params, nonPeriodic, params.MaxLevel(), 8),
+	)
 }

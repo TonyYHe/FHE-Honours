@@ -98,6 +98,84 @@ diagonal index but different payloads and requires zero reported payload
 changes. The invalid attempt's 14/73,077 periodic count must not be used as a
 final result; U-Net must be rerun after the fix.
 
+### 2026-09-27 — U-Net census retry 2 (valid)
+
+- Executor: user, on `tony@corg-comb`
+- Network/mode: `u22_64_base32`, `provider`
+- Backend: clear Lattigo; one structural forward
+- Scope: slot-message periodicity only; no compression or performance timing
+- Result: valid after provider group identity fix
+
+| Census metric | Occurrence | Unique diagonal |
+|---|---:|---:|
+| Observed nonzero diagonals | 73,077 | 73,077 |
+| Exact proper-period candidates | 14 | 14 |
+| Constant-nonzero candidates | 14 | 14 |
+| Count coverage | 0.019158% | 0.019158% |
+| Full encoded bytes | 366,921,383,936 | 366,921,383,936 |
+| Periodic full encoded bytes | 60,817,408 | 60,817,408 |
+| Byte coverage | 0.016575% | 0.016575% |
+| Selective-layout storage ratio | 1.000166x | 1.000166x |
+
+All identity and correctness checks passed, including zero logical payload
+changes. Encode-time coverage remains unavailable because this read-only audit
+does not time each diagonal. The 14 constant candidates require layer/operator
+classification before they can be described as learned-weight opportunities;
+the census also includes non-weight online linear transforms.
+
+Candidate inspection assigned all 14 records to `cat1_materialize_*`,
+`cat2_materialize_*`, or `cat3_materialize_*`. These names are created by the
+explicit concatenation materializers in `orion/nn/operations.py`; every record
+was diagonal 0 with period 1. They are structural layout transforms, not
+learned Conv, ConvTranspose, or Linear weights. Therefore U-Net has zero
+periodic learned-weight candidates, while the broader online-LT scope contains
+14/73,077 constant structural candidates. The broader byte coverage remains
+0.016575%; periodic learned-weight byte coverage is 0%.
+
+### 2026-09-27 — VGG16 Orion slot-periodicity census
+
+- Executor: user, on `tony@corg-comb`
+- Network/mode: `vgg16_imgnet`, `provider`
+- Backend: clear Lattigo; one structural forward
+- Scope: slot-message periodicity only; no compression or performance timing
+- Result: valid
+
+| Census metric | Occurrence | Unique diagonal |
+|---|---:|---:|
+| Observed diagonals | 128,387 | 128,387 |
+| All-zero diagonals | 169 | 169 |
+| Observed nonzero diagonals | 128,218 | 128,218 |
+| Exact proper-period nonzero candidates | 0 | 0 |
+| Count coverage | 0% | 0% |
+| Full encoded nonzero bytes | 491,591,827,456 | 491,591,827,456 |
+| Periodic full encoded bytes | 0 | 0 |
+| Byte coverage | 0% | 0% |
+| Selective-layout storage ratio | 1.0x | 1.0x |
+
+All correctness, metadata, JSONL-count, and logical-payload checks passed.
+All-zero diagonals are reported separately and excluded from the WPC candidate
+denominators rather than being counted as a compression success.
+
+## Orion-layout compatibility result
+
+| Model | Nonzero online-LT diagonals | Periodic learned-weight candidates | Periodic structural candidates | All-LT count coverage | All-LT byte coverage |
+|---|---:|---:|---:|---:|---:|
+| ResNet20/dense | 8,381 | 0 | 0 | 0% | 0% |
+| U-Net22/provider | 73,077 | 0 | 14 | 0.019158% | 0.016575% |
+| VGG16/provider | 128,218 | 0 | 0 | 0% | 0% |
+
+The compatibility hypothesis is not supported for the current Orion layouts:
+U-Net's high online-Encode share does not correspond to naturally WPC-periodic
+learned-weight diagonals. Selective compression of already-periodic Orion
+payloads would have no measurable weight-storage benefit; even including
+U-Net's 14 concatenation materializers gives only a 1.000166x analytical
+storage ratio.
+
+This does **not** test or refute full WPC. WPC obtains periodicity through its
+CIPS/Rotation-Padding data layout. A valid layout-trade-off comparison must next
+implement or reproduce that layout and compare it with Orion under matched
+models, parameters, accuracy, and operation-count accounting.
+
 ## Periodicity-census implementation
 
 The next stage is an untimed clear-Lattigo audit. It must not be mixed with the
@@ -119,6 +197,15 @@ Current implementation changes:
 - `orion/backend/lattigo/wpc_periodicity_test.go` verifies the library-specific
   bit-reversed NTT copy map in every Q and P limb, exact reconstruction, several
   periods, and rejection of a nonperiodic message.
+- `orion/backend/lattigo/wpc_verification.go` exports an audit-only verifier
+  that independently encodes one real candidate message with the model's CKKS
+  parameters, checks the expected evaluation period `2T` in every active Q/P
+  limb, reconstructs every coefficient from the stored representatives, and
+  requires exact equality with the original polynomial.
+- `--verify-encoded-qp` makes the clear census load a second, key-free real
+  Lattigo instance and invoke that verifier only for candidates. This preserves
+  clear execution for the model forward and avoids paying for a full encrypted
+  U-Net inference merely to verify 14 structural messages.
 
 Profiling is gated by `ORION_WPC_PERIODICITY_PROFILE`; disabled execution does
 not scan or convert payloads. The audit launcher fixes both streaming flags to
@@ -128,22 +215,24 @@ zero because this is a clear census, not a real-FHE streaming run.
 
 ```text
 python -m pytest -q tests/test_wpc_periodicity.py
-23 passed
+25 passed
 
 go test -run 'TestWPC' -count=1
 PASS
 ```
 
-The census launcher dry run also produced the intended clear-Lattigo command
-and output paths. No model census or WPC performance experiment was executed
-locally, following the decision to perform all experiment runs on the remote
-server.
+The encoded verifier also passed a direct Python/ctypes integration probe after
+building the shared library locally. The census launcher's encoded-verification
+dry run resolved the library and exported symbol and produced the intended
+clear-Lattigo command and output paths. No model census or WPC performance
+experiment was executed locally, following the decision to perform experiment
+runs on the remote server.
 
 ## Remaining validity boundary
 
-The first census reports slot-message periodicity and analytical byte coverage.
-Each periodic record remains only a candidate until the actual encoded Q/P
-polynomial passes the exact copy-map and reconstruction check. The current
-launcher does not apply compression, does not measure decompression, and does
-not provide Encode-time-weighted coverage. Those claims require later backend
-instrumentation and O-hybrid timing runs.
+The archived first census reports slot-message periodicity and analytical byte
+coverage. The next remote run will apply the encoded Q/P check to U-Net's 14
+structural candidates; only candidates that pass become eligible for an
+O-hybrid implementation. The launcher still does not apply compression,
+measure decompression, or provide Encode-time-weighted coverage. Those claims
+require the later O-hybrid implementation and timing runs.

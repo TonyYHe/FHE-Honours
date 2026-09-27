@@ -141,6 +141,41 @@ def test_collector_flushes_unique_and_occurrence_records(tmp_path) -> None:
     assert json.loads(summary_path.read_text())["scope"] == "slot_message_only"
 
 
+def test_collector_records_complete_encoded_qp_candidate_verification(tmp_path) -> None:
+    collector = PeriodicityCollector()
+
+    def verifier(slots, periodicity, payload_format, level_q):
+        assert tuple(slots) == (complex(7.0),) * 8
+        assert periodicity.minimal_period == 1
+        assert payload_format == "real"
+        assert level_q == 3
+        return {
+            "attempted": True,
+            "passed": True,
+            "status_code": 1,
+            "full_polynomial_reconstruction_exact": True,
+        }
+
+    record = collector.record_payload(
+        [7.0] * 8,
+        metadata={"level_q": 3},
+        payload_format="real",
+        encoded_qp_verifier=verifier,
+    )
+    summary = collector.flush(tmp_path / "verified.jsonl")
+
+    assert record["encoded_qp_verification"]["passed"] is True
+    assert summary["scope"] == "slot_message_plus_encoded_qp_candidates"
+    assert summary["encoded_representation_verification_required"] is False
+    assert summary["encoded_qp_verification"] == {
+        "candidate_occurrence_count": 1,
+        "attempted_occurrence_count": 1,
+        "passed_occurrence_count": 1,
+        "failed_occurrence_count": 0,
+        "complete": True,
+    }
+
+
 def test_global_collector_is_noop_when_disabled(monkeypatch) -> None:
     class MustNotIterate:
         def __iter__(self):
