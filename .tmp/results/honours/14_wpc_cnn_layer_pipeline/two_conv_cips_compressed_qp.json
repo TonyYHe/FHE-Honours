@@ -1,0 +1,635 @@
+{
+  "acceptance": {
+    "aggregate_storage_accounting_valid": true,
+    "all_compressed_transforms_released": true,
+    "bias_plaintext_add_counts_match": true,
+    "ciphertext_accumulation_counts_match": true,
+    "cips_output_to_input_signature_chains": true,
+    "compressed_output_exactly_matches_full_control": true,
+    "eight_group_transforms_exact_qp": true,
+    "full_and_compressed_two_layer_outputs_correct": true,
+    "level_chain_2_to_1_to_0_valid": true,
+    "materialization_isolated_between_transforms": true,
+    "operation_counters_match": true,
+    "orion_conv2d_forward_dispatch_exercised": true,
+    "peak_materialization_is_one_transform": true,
+    "valid": true,
+    "zero_online_python_encode_calls": true
+  },
+  "ckks": {
+    "logn": 10,
+    "logp": [
+      60
+    ],
+    "logq": [
+      55,
+      45,
+      45
+    ],
+    "slots": 512
+  },
+  "compile_s": 0.49428929085843265,
+  "compressed_orion_forward_pipeline": {
+    "correct": true,
+    "evaluate_s": 0.014186458894982934,
+    "layers": [
+      {
+        "bias_plaintext_add_count": 2,
+        "ciphertext_accumulation_add_count": 2,
+        "evaluation_sequence": [
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out0_in0",
+            "layer": "wpc_block_conv1"
+          },
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out0_in1",
+            "layer": "wpc_block_conv1"
+          },
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out1_in0",
+            "layer": "wpc_block_conv1"
+          },
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out1_in1",
+            "layer": "wpc_block_conv1"
+          }
+        ],
+        "input_level": 2,
+        "output_level": 1,
+        "path": "compressed",
+        "transform_evaluation_count": 4
+      },
+      {
+        "bias_plaintext_add_count": 2,
+        "ciphertext_accumulation_add_count": 2,
+        "evaluation_sequence": [
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out0_in0",
+            "layer": "wpc_block_conv2"
+          },
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out0_in1",
+            "layer": "wpc_block_conv2"
+          },
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out1_in0",
+            "layer": "wpc_block_conv2"
+          },
+          {
+            "current_materialized_bytes_after": 0,
+            "current_materialized_bytes_before": 0,
+            "current_materialized_transforms_after": 0,
+            "group_key": "out1_in1",
+            "layer": "wpc_block_conv2"
+          }
+        ],
+        "input_level": 1,
+        "output_level": 0,
+        "path": "compressed",
+        "transform_evaluation_count": 4
+      }
+    ],
+    "max_abs_delta_vs_full_control": 0.0,
+    "max_abs_error": 3.113758184625226e-08,
+    "mean_abs_error": 7.3375910062515345e-09,
+    "online_python_encode_call_count": 0,
+    "operation_counters": {
+      "conjugation": 0,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 142,
+      "rotation_total": 142
+    },
+    "operation_counters_match_full_control": true
+  },
+  "full_control_pipeline": {
+    "correct": true,
+    "evaluate_s": 0.01514933304861188,
+    "layers": [
+      {
+        "bias_plaintext_add_count": 2,
+        "ciphertext_accumulation_add_count": 2,
+        "evaluation_sequence": [],
+        "input_level": 2,
+        "output_level": 1,
+        "path": "full_control",
+        "transform_evaluation_count": 4
+      },
+      {
+        "bias_plaintext_add_count": 2,
+        "ciphertext_accumulation_add_count": 2,
+        "evaluation_sequence": [],
+        "input_level": 1,
+        "output_level": 0,
+        "path": "full_control",
+        "transform_evaluation_count": 4
+      }
+    ],
+    "max_abs_error": 3.113758184625226e-08,
+    "mean_abs_error": 7.3375910062515345e-09,
+    "operation_counters": {
+      "conjugation": 0,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 142,
+      "rotation_total": 142
+    }
+  },
+  "global_stats_after_compressed_pipeline": {
+    "aggregate_compressed_payload_bytes": 284928,
+    "aggregate_full_payload_bytes": 18235392,
+    "aggregate_full_to_sequential_peak_ratio": 5.983870967741935,
+    "aggregate_metadata_bytes": 35808,
+    "aggregate_payload_compression_ratio": 64.0,
+    "aggregate_storage_compression_ratio_including_metadata": 56.85483388207123,
+    "aggregate_stored_payload_plus_metadata_bytes": 320736,
+    "backend_schema_version": 1,
+    "current_materialized_full_payload_bytes": 0,
+    "current_materialized_transform_count": 0,
+    "max_single_transform_full_payload_bytes": 3047424,
+    "peak_materialized_full_payload_bytes": 3047424,
+    "peak_materialized_transform_count": 1,
+    "registered_transform_count": 8,
+    "total_weight_plaintext_offline_encode_calls": 8,
+    "total_weight_plaintext_online_encode_calls": 0
+  },
+  "global_stats_before_compressed_pipeline": {
+    "aggregate_compressed_payload_bytes": 284928,
+    "aggregate_full_payload_bytes": 18235392,
+    "aggregate_full_to_sequential_peak_ratio": null,
+    "aggregate_metadata_bytes": 35808,
+    "aggregate_payload_compression_ratio": 64.0,
+    "aggregate_storage_compression_ratio_including_metadata": 56.85483388207123,
+    "aggregate_stored_payload_plus_metadata_bytes": 320736,
+    "backend_schema_version": 1,
+    "current_materialized_full_payload_bytes": 0,
+    "current_materialized_transform_count": 0,
+    "max_single_transform_full_payload_bytes": 3047424,
+    "peak_materialized_full_payload_bytes": 0,
+    "peak_materialized_transform_count": 0,
+    "registered_transform_count": 8,
+    "total_weight_plaintext_offline_encode_calls": 8,
+    "total_weight_plaintext_online_encode_calls": 0
+  },
+  "layer_plans": {
+    "wpc_block_conv1": {
+      "case": {
+        "channel_capacity": 8,
+        "height": 8,
+        "input_channels": 12,
+        "input_group_count": 2,
+        "input_group_ranges": [
+          [
+            0,
+            8
+          ],
+          [
+            8,
+            12
+          ]
+        ],
+        "kernel_height": 3,
+        "kernel_width": 3,
+        "output_channels": 12,
+        "output_group_count": 2,
+        "output_group_ranges": [
+          [
+            0,
+            8
+          ],
+          [
+            8,
+            12
+          ]
+        ],
+        "pad_height_before": 1,
+        "pad_width_before": 1,
+        "slots": 512,
+        "transform_count": 4,
+        "width": 8
+      },
+      "level": 2,
+      "output_level": 1,
+      "transform_rows": {
+        "out0_in0": {
+          "diagonal_count": 93,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            0,
+            8
+          ],
+          "input_group": 0,
+          "manual_decompressed_diagonal_count": 93,
+          "output_channel_range": [
+            0,
+            8
+          ],
+          "output_group": 0,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 47616,
+            "decompression_count": 1,
+            "diagonal_count": 93,
+            "evaluation_count": 0,
+            "full_payload_bytes": 3047424,
+            "last_decompress_nanoseconds": 340750,
+            "last_decompress_s": 0.00034075,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 5232,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 57.66394187102634,
+            "stored_payload_plus_metadata_bytes": 52848,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        },
+        "out0_in1": {
+          "diagonal_count": 81,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            8,
+            12
+          ],
+          "input_group": 1,
+          "manual_decompressed_diagonal_count": 81,
+          "output_channel_range": [
+            0,
+            8
+          ],
+          "output_group": 0,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 41472,
+            "decompression_count": 1,
+            "diagonal_count": 81,
+            "evaluation_count": 0,
+            "full_payload_bytes": 2654208,
+            "last_decompress_nanoseconds": 210667,
+            "last_decompress_s": 0.000210667,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 4560,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 57.660062565172055,
+            "stored_payload_plus_metadata_bytes": 46032,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        },
+        "out1_in0": {
+          "diagonal_count": 81,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            0,
+            8
+          ],
+          "input_group": 0,
+          "manual_decompressed_diagonal_count": 81,
+          "output_channel_range": [
+            8,
+            12
+          ],
+          "output_group": 1,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 41472,
+            "decompression_count": 1,
+            "diagonal_count": 81,
+            "evaluation_count": 0,
+            "full_payload_bytes": 2654208,
+            "last_decompress_nanoseconds": 318000,
+            "last_decompress_s": 0.000318,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 4560,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 57.660062565172055,
+            "stored_payload_plus_metadata_bytes": 46032,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        },
+        "out1_in1": {
+          "diagonal_count": 63,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            8,
+            12
+          ],
+          "input_group": 1,
+          "manual_decompressed_diagonal_count": 63,
+          "output_channel_range": [
+            8,
+            12
+          ],
+          "output_group": 1,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 32256,
+            "decompression_count": 1,
+            "diagonal_count": 63,
+            "evaluation_count": 0,
+            "full_payload_bytes": 2064384,
+            "last_decompress_nanoseconds": 120125,
+            "last_decompress_s": 0.000120125,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 3552,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 57.6514745308311,
+            "stored_payload_plus_metadata_bytes": 35808,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        }
+      }
+    },
+    "wpc_block_conv2": {
+      "case": {
+        "channel_capacity": 8,
+        "height": 8,
+        "input_channels": 12,
+        "input_group_count": 2,
+        "input_group_ranges": [
+          [
+            0,
+            8
+          ],
+          [
+            8,
+            12
+          ]
+        ],
+        "kernel_height": 3,
+        "kernel_width": 3,
+        "output_channels": 12,
+        "output_group_count": 2,
+        "output_group_ranges": [
+          [
+            0,
+            8
+          ],
+          [
+            8,
+            12
+          ]
+        ],
+        "pad_height_before": 1,
+        "pad_width_before": 1,
+        "slots": 512,
+        "transform_count": 4,
+        "width": 8
+      },
+      "level": 1,
+      "output_level": 0,
+      "transform_rows": {
+        "out0_in0": {
+          "diagonal_count": 93,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            0,
+            8
+          ],
+          "input_group": 0,
+          "manual_decompressed_diagonal_count": 93,
+          "output_channel_range": [
+            0,
+            8
+          ],
+          "output_group": 0,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 35712,
+            "decompression_count": 1,
+            "diagonal_count": 93,
+            "evaluation_count": 0,
+            "full_payload_bytes": 2285568,
+            "last_decompress_nanoseconds": 216375,
+            "last_decompress_s": 0.000216375,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 5232,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 55.821805392731534,
+            "stored_payload_plus_metadata_bytes": 40944,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        },
+        "out0_in1": {
+          "diagonal_count": 81,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            8,
+            12
+          ],
+          "input_group": 1,
+          "manual_decompressed_diagonal_count": 81,
+          "output_channel_range": [
+            0,
+            8
+          ],
+          "output_group": 0,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 31104,
+            "decompression_count": 1,
+            "diagonal_count": 81,
+            "evaluation_count": 0,
+            "full_payload_bytes": 1990656,
+            "last_decompress_nanoseconds": 106500,
+            "last_decompress_s": 0.0001065,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 4560,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 55.81695827725437,
+            "stored_payload_plus_metadata_bytes": 35664,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        },
+        "out1_in0": {
+          "diagonal_count": 81,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            0,
+            8
+          ],
+          "input_group": 0,
+          "manual_decompressed_diagonal_count": 81,
+          "output_channel_range": [
+            8,
+            12
+          ],
+          "output_group": 1,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 31104,
+            "decompression_count": 1,
+            "diagonal_count": 81,
+            "evaluation_count": 0,
+            "full_payload_bytes": 1990656,
+            "last_decompress_nanoseconds": 175750,
+            "last_decompress_s": 0.00017575,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 4560,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 55.81695827725437,
+            "stored_payload_plus_metadata_bytes": 35664,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        },
+        "out1_in1": {
+          "diagonal_count": 63,
+          "exact_qp_match": true,
+          "input_channel_range": [
+            8,
+            12
+          ],
+          "input_group": 1,
+          "manual_decompressed_diagonal_count": 63,
+          "output_channel_range": [
+            8,
+            12
+          ],
+          "output_group": 1,
+          "slot_period": 8,
+          "stats_after_compile": {
+            "backend_schema_version": 1,
+            "compressed_payload_bytes": 24192,
+            "decompression_count": 1,
+            "diagonal_count": 63,
+            "evaluation_count": 0,
+            "full_payload_bytes": 1548288,
+            "last_decompress_nanoseconds": 170041,
+            "last_decompress_s": 0.000170041,
+            "last_evaluate_nanoseconds": 0,
+            "last_evaluate_s": 0.0,
+            "materialized_full_payload_bytes": 0,
+            "max_slot_period": 8,
+            "metadata_bytes": 3552,
+            "min_slot_period": 8,
+            "payload_compression_ratio": 64.0,
+            "storage_compression_ratio_including_metadata": 55.806228373702425,
+            "stored_payload_plus_metadata_bytes": 27744,
+            "weight_plaintext_offline_encode_calls": 1,
+            "weight_plaintext_online_encode_calls": 0
+          }
+        }
+      }
+    }
+  },
+  "profile": "wpc_cips_orion_conv2d_two_layer_pipeline",
+  "schema_version": 1,
+  "scope": {
+    "channels_per_layer": 12,
+    "compressed_transform_count": 8,
+    "convolution": "3x3_stride1_same_shape_rotation_padding",
+    "group_matrix_per_layer": [
+      2,
+      2
+    ],
+    "layer_count": 2,
+    "levels": [
+      2,
+      1
+    ],
+    "limitations": [
+      "no activation or bootstrap between convolutions",
+      "no stride, downsample reshaping, dilation, or grouped convolution",
+      "uncompressed bias plaintexts remain resident",
+      "validation-only full transforms coexist during this runner",
+      "logical plaintext accounting rather than process RSS",
+      "no trained-model accuracy or performance claim"
+    ],
+    "orion_module": "orion.nn.Conv2d",
+    "output_level": 0,
+    "spatial_shape": [
+      8,
+      8
+    ]
+  },
+  "seed": 20260928,
+  "status": "ok",
+  "storage": {
+    "by_layer": {
+      "wpc_block_conv1": {
+        "compressed_weight_qp_payload_bytes": 162816,
+        "full_weight_plus_bias_payload_bytes": 10452992,
+        "full_weight_qp_payload_bytes": 10420224,
+        "layer_plaintext_storage_compression_ratio": 48.96290189612531,
+        "stored_weight_plus_metadata_plus_bias_bytes": 213488,
+        "transform_count": 4,
+        "uncompressed_bias_q_payload_bytes": 32768,
+        "weight_metadata_bytes": 17904,
+        "weight_payload_compression_ratio": 64.0
+      },
+      "wpc_block_conv2": {
+        "compressed_weight_qp_payload_bytes": 122112,
+        "full_weight_plus_bias_payload_bytes": 7831552,
+        "full_weight_qp_payload_bytes": 7815168,
+        "layer_plaintext_storage_compression_ratio": 50.07386189258312,
+        "stored_weight_plus_metadata_plus_bias_bytes": 156400,
+        "transform_count": 4,
+        "uncompressed_bias_q_payload_bytes": 16384,
+        "weight_metadata_bytes": 17904,
+        "weight_payload_compression_ratio": 64.0
+      }
+    },
+    "compression_ratio_including_uncompressed_bias": 49.43264988320789,
+    "full_weight_plus_bias_payload_bytes": 18284544,
+    "stored_weight_plus_metadata_plus_bias_bytes": 369888
+  },
+  "timing_policy": "diagnostic_single_run_not_for_performance_claims"
+}

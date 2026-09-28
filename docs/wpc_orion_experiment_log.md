@@ -435,3 +435,52 @@ single diagnostic timings have no warmup or repetitions and are not a
 performance result. Model-layer integration, WPC downsampling reshaping,
 trained Rotation-Padding accuracy, repeated latency, and process-RSS
 measurements remain outstanding.
+
+### 2026-09-28 — Orion Conv2d two-layer CIPS integration
+
+- Executor: local deterministic correctness run; server confirmation pending
+- Modules: two actual `orion.nn.Conv2d(12,12,3)` layers with bias
+- Spatial shape: `8 x 8`; Rotation Padding; stride one
+- CKKS: `LogN=10`, levels `2 -> 1 -> 0`
+- Group matrix: 2 output x 2 input groups per layer
+- Compressed transforms: eight total
+- Result: valid
+- Machine-readable result:
+  `.tmp/results/honours/14_wpc_cnn_layer_pipeline/`
+  `two_conv_cips_compressed_qp.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full transforms | 8/8 pass |
+| Aggregate full weight Q/P payload | 18,235,392 B |
+| Aggregate compressed weight payload | 284,928 B |
+| Weight metadata | 35,808 B |
+| Uncompressed bias Q payload | 49,152 B |
+| Full weights plus bias | 18,284,544 B |
+| Stored weights, metadata, and bias | 369,888 B |
+| Weight payload compression | 64.0x |
+| Layer plaintext compression including bias | 49.433x |
+| Peak materialized full payload | 3,047,424 B |
+| Peak materialized transforms | 1 |
+| Aggregate full weight / peak | 5.984x |
+| Offline / online weight Encode calls | 8 / 0 |
+| Online Python Encode calls | 0 |
+| Full / compressed rotations | 142 / 142 |
+| Ciphertext accumulation additions | 4 per path |
+| Bias plaintext additions | 4 per path |
+| Compressed output delta vs. full | 0 |
+| Maximum two-layer error vs. clear | `3.11e-8` |
+| Materialized payload after execution | 0 B |
+
+The new opt-in planner extracts real Orion layer parameters, compiles the CIPS
+group matrix, and returns output ciphertexts carrying an explicit packing
+signature. The second layer accepts the first layer's output without repacking
+and verifies its input level. The compressed validation calls the installed
+`Conv2d.forward` methods, while a full-Q/P control runs through the same plan
+and bias/rescale lifecycle.
+
+This establishes same-shape convolution-layer integration, not a complete
+model. PyTorch clear Conv2d still has zero-padding semantics; model training or
+fine-tuning must explicitly adopt Rotation Padding. Activation/bootstrap,
+stride-two reshaping, residual/concatenation paths, RSS, repeated timing, and
+trained accuracy remain outside this stage.

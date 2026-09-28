@@ -56,6 +56,10 @@ class LinearTransform(Module):
         backend = getattr(self, "_transform_backend", None)
         if 'sys' in globals() and sys.modules and backend is not None:
             try:
+                wpc_plan = getattr(self, "_wpc_cips_plan", None)
+                cleanup_wpc = getattr(wpc_plan, "cleanup", None)
+                if callable(cleanup_wpc):
+                    cleanup_wpc()
                 for tid in self.transform_ids.values():
                     backend.DeleteLinearTransform(tid)
                 for tid in getattr(self, "_dense_layer_cache_active_transform_ids", {}).values():
@@ -1832,6 +1836,74 @@ class Conv2d(LinearTransform):
         on_Wo = max(Wi, Wo*output_gap)
 
         return torch.Size((N, on_Co, on_Ho, on_Wo))
+
+    def install_wpc_cips_plan(
+        self,
+        input_shape,
+        *,
+        include_full_control: bool = False,
+        verify_exact_qp: bool = True,
+    ):
+        """Compile the opt-in WPC CIPS path for this Conv2d layer.
+
+        The ordinary Orion planner remains the default. This explicit method
+        is used for Rotation-Padding experiments whose inputs and outputs are
+        grouped CIPS ciphertexts.
+        """
+
+        if self.scheme is None:
+            raise RuntimeError("set the Orion scheme before installing a WPC plan")
+        ordinary_resources = bool(self.transform_ids) or bool(
+            getattr(self, "_dense_layer_cache_active_transform_ids", {})
+        )
+        ordinary_resources = ordinary_resources or any(
+            bool(dict(transform_ids))
+            for transform_ids in (
+                getattr(self, "_concat_transform_ids_by_input", []) or []
+            )
+        )
+        ordinary_resources = ordinary_resources or any(
+            bool(dict(groups))
+            for groups in (
+                getattr(self, "_concat_unified_groups_by_input", []) or []
+            )
+        )
+        ordinary_resources = ordinary_resources or any(
+            bool(getattr(proxy, "_dense_layer_cache_active_transform_ids", {}))
+            for proxy in (
+                getattr(self, "_concat_transform_sources_by_input", []) or []
+            )
+        )
+        if ordinary_resources:
+            raise RuntimeError(
+                "install the WPC CIPS plan before compiling the ordinary Orion plan"
+            )
+        existing = getattr(self, "_wpc_cips_plan", None)
+        from orion.experimental.wpc_cips_layer import WPCCIPSConv2dPlan
+
+        plan = WPCCIPSConv2dPlan(
+            self,
+            input_shape=torch.Size(input_shape),
+            slots=int(self.scheme.params.get_slots()),
+        )
+        plan.compile(
+            self.scheme,
+            include_full_control=bool(include_full_control),
+            verify_exact_qp=bool(verify_exact_qp),
+        )
+        cleanup = getattr(existing, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = plan
+        self._transform_backend = self.scheme.backend
+        return plan
+
+    def remove_wpc_cips_plan(self) -> None:
+        plan = getattr(self, "_wpc_cips_plan", None)
+        cleanup = getattr(plan, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = None
     
     def generate_diagonals(self, last):
         if bool(getattr(self, "region_first_probe_dense_bypass", False)):
@@ -1915,6 +1987,9 @@ class Conv2d(LinearTransform):
 
     def forward(self, x):
         # Forward pass that handles both cleartext and FHE inference.
+        wpc_plan = getattr(self, "_wpc_cips_plan", None)
+        if self.he_mode and wpc_plan is not None:
+            return wpc_plan.evaluate(x, compressed=True)
         runtime = self._region_runtime_if_ready(require_skip_dense_pack=False)
         release_concat_owned_parts = None
         if self.he_mode and self._is_concat_cipher_tensor(x):

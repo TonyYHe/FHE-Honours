@@ -164,7 +164,8 @@ transform.
 
 This stage establishes a real multi-ciphertext compressed-transform lifecycle,
 but it does not yet establish model-level WPC performance or accuracy. The
-remaining work is to integrate the mechanism with actual CNN layer planning,
-implement downsampling reshaping where required, measure process RSS and
-repeated latency on the server, and evaluate trained models under Rotation
-Padding.
+mechanism has subsequently been integrated with chained actual Orion Conv2d
+layers, including bias and CKKS level consumption; see
+`docs/wpc_cnn_layer_pipeline.md`. Remaining work includes activation/bootstrap
+integration, downsampling reshaping, process-RSS and repeated-latency
+measurement, and trained-model evaluation under Rotation Padding.

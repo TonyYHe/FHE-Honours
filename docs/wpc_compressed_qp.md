@@ -11,6 +11,8 @@ evaluates the linear transform, and immediately releases the materialization.
 The mechanism has subsequently been extended to a matrix of input/output
 ciphertext channel groups with backend-wide peak-materialization accounting.
 See `docs/wpc_multigroup_compressed_qp.md`.
+It is also integrated with chained opt-in Orion Conv2d layers, including bias
+and CKKS level consumption; see `docs/wpc_cnn_layer_pipeline.md`.
 
 It remains a mechanism-level correctness experiment. Timings are single-run
 diagnostics, not model-level performance results.
