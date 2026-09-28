@@ -132,6 +132,37 @@ periodic learned-weight candidates, while the broader online-LT scope contains
 14/73,077 constant structural candidates. The broader byte coverage remains
 0.016575%; periodic learned-weight byte coverage is 0%.
 
+### 2026-09-28 — U-Net encoded Q/P candidate verification
+
+- Executor: user, on `tony@corg-comb`
+- Network/mode: `u22_64_base32`, `provider`
+- Model execution: one clear-Lattigo structural forward
+- Candidate verification: independent key-free real-Lattigo Encode using the
+  same CKKS parameter set, followed by an exact `2T` copy-map and full Q/P
+  polynomial reconstruction check
+- Result directory:
+  `.tmp/results/honours/10_wpc_encoded_qp_verification`
+- Result: valid
+
+| Verification metric | Result |
+|---|---:|
+| Observed nonzero diagonals | 73,077 |
+| Slot-periodic candidates | 14 |
+| Encoded Q/P attempts | 14 |
+| Exact Q/P passes | 14 |
+| Exact Q/P failures | 0 |
+| Verification complete | yes |
+| Further encoded-representation verification required | no |
+| Count coverage | 0.019158% |
+| Byte coverage | 0.016575% |
+| Selective-layout storage ratio | 1.000166x |
+
+The encoded-form result confirms that the 14 structural period-1 candidates
+are genuinely WPC-reconstructible under Lattigo rather than false positives of
+the slot-level classifier. It does not change their classification: none is a
+learned-weight diagonal, and the selective storage opportunity in the existing
+Orion layout remains negligible.
+
 ### 2026-09-27 — VGG16 Orion slot-periodicity census
 
 - Executor: user, on `tony@corg-comb`
@@ -230,9 +261,10 @@ runs on the remote server.
 
 ## Remaining validity boundary
 
-The archived first census reports slot-message periodicity and analytical byte
-coverage. The next remote run will apply the encoded Q/P check to U-Net's 14
-structural candidates; only candidates that pass become eligible for an
-O-hybrid implementation. The launcher still does not apply compression,
-measure decompression, or provide Encode-time-weighted coverage. Those claims
-require the later O-hybrid implementation and timing runs.
+The U-Net candidates now pass the encoded Q/P eligibility gate. The launcher
+still does not apply compression, measure decompression, or provide
+Encode-time-weighted coverage. Those claims require an O-hybrid implementation
+and timing run. Because the only eligible messages are 14 structural
+materializers (0.016575% byte coverage), selective WPC on Orion cannot establish
+the proposed layout crossover; the decisive next experiment is a matched
+CIPS/Rotation-Padding reproduction versus Orion.
