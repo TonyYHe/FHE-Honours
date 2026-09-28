@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import numpy as np
+
+from orion.experimental.wpc_cips_baseline import (
+    CIPSConvCase,
+    LAYOUT_CHANNEL_FIRST,
+    LAYOUT_CIPS,
+    build_cyclic_diagonals,
+    pack_tensor,
+    rotation_padded_reference,
+    run_clear_layout_comparison,
+    zero_padded_reference,
+)
+
+
+def _paper_toy() -> tuple[CIPSConvCase, np.ndarray, np.ndarray]:
+    case = CIPSConvCase(
+        slots=8,
+        input_channels=2,
+        output_channels=2,
+        height=2,
+        width=2,
+        kernel_height=2,
+        pad_height_before=0,
+    )
+    tensor = np.arange(1, 9, dtype=np.float64).reshape(2, 2, 2)
+    weights = np.arange(1, 9, dtype=np.float64).reshape(2, 2, 2, 1)
+    return case, tensor, weights
+
+
+def test_cips_packing_matches_channel_innermost_paper_order() -> None:
+    case, tensor, _weights = _paper_toy()
+
+    packed = pack_tensor(tensor, case, LAYOUT_CIPS)
+
+    assert packed.tolist() == [
+        tensor[0, 0, 0],
+        tensor[1, 0, 0],
+        tensor[0, 0, 1],
+        tensor[1, 0, 1],
+        tensor[0, 1, 0],
+        tensor[1, 1, 0],
+        tensor[0, 1, 1],
+        tensor[1, 1, 1],
+    ]
+
+
+def test_matched_layouts_equal_rotation_padding_reference() -> None:
+    case, tensor, weights = _paper_toy()
+
+    result = run_clear_layout_comparison(
+        tensor,
+        weights,
+        case,
+        full_encoded_bytes_per_diagonal=1024,
+    )
+
+    assert result["valid"] is True
+    assert result["layout_output_max_abs_delta"] == 0.0
+    assert result["layouts"][LAYOUT_CIPS]["correct"] is True
+    assert result["layouts"][LAYOUT_CHANNEL_FIRST]["correct"] is True
+
+
+def test_cips_messages_are_periodic_but_channel_first_control_is_not() -> None:
+    case, tensor, weights = _paper_toy()
+    result = run_clear_layout_comparison(
+        tensor,
+        weights,
+        case,
+        full_encoded_bytes_per_diagonal=1024,
+    )
+
+    cips = result["layouts"][LAYOUT_CIPS]
+    channel_first = result["layouts"][LAYOUT_CHANNEL_FIRST]
+    assert cips["diagonal_count"] == 6
+    assert cips["periodicity"]["periodic_count"] == 6
+    assert set(cips["minimal_slot_period_by_rotation"].values()) == {2}
+    assert cips["periodicity"]["partial_storage_compression_ratio"] == 4.0
+    assert cips["message_period_reconstruction_exact"] is True
+
+    assert channel_first["diagonal_count"] == 4
+    assert channel_first["periodicity"]["periodic_count"] == 0
+    assert channel_first["periodicity"]["partial_storage_compression_ratio"] == 1.0
+
+
+def test_rotation_padding_is_not_silently_treated_as_zero_padding() -> None:
+    case, tensor, weights = _paper_toy()
+
+    rotation_padded = rotation_padded_reference(tensor, weights, case)
+    zero_padded = zero_padded_reference(tensor, weights, case)
+
+    assert not np.array_equal(rotation_padded, zero_padded)
+    assert float(np.max(np.abs(rotation_padded - zero_padded))) > 0.0
+
+
+def test_larger_random_case_preserves_cips_periodicity_and_correctness() -> None:
+    case = CIPSConvCase(
+        slots=512,
+        input_channels=4,
+        output_channels=4,
+        height=8,
+        width=8,
+        kernel_height=3,
+        pad_height_before=1,
+    )
+    rng = np.random.default_rng(17)
+    tensor = rng.normal(size=(4, 8, 8))
+    weights = rng.normal(size=(4, 4, 3, 1))
+
+    result = run_clear_layout_comparison(
+        tensor,
+        weights,
+        case,
+        full_encoded_bytes_per_diagonal=4096,
+    )
+    cips = result["layouts"][LAYOUT_CIPS]
+
+    assert result["valid"] is True
+    assert cips["periodicity"]["periodic_count"] == cips["diagonal_count"]
+    assert cips["periodicity"]["byte_coverage_pct"] == 100.0
+    assert cips["message_period_reconstruction_exact"] is True
+
+
+def test_build_rejects_weight_shape_mismatch() -> None:
+    case, _tensor, weights = _paper_toy()
+    bad = weights[:, :, :, 0]
+
+    try:
+        build_cyclic_diagonals(bad, case, LAYOUT_CIPS)
+    except ValueError as exc:
+        assert "weight tensor shape" in str(exc)
+    else:
+        raise AssertionError("shape mismatch was not rejected")

@@ -52,6 +52,43 @@ The full JSON and environment manifest have not yet been copied into this local
 working tree. The values above are transcribed from the validation output and
 the final profile summary supplied by the user.
 
+### 2026-09-28 — WPC CIPS functional baseline (local correctness gate)
+
+- Executor: local development machine
+- Scope: WPC Algorithms 1–2 and Figures 8–10 vertical-convolution subset
+- Backend: clear NumPy reference plus real Lattigo CKKS
+- Workload: one ciphertext, 512 slots, `8 x 8`, 4 input/output channels,
+  `3 x 1` kernel, stride one, circular same-channel height Rotation Padding
+- Seed: `20260928`
+- Result: `.tmp/results/honours/11_wpc_cips_baseline/cips_baseline.json`
+- Result: valid
+
+| Gate | Result |
+|---|---:|
+| Python/regression tests | 31 passed |
+| Clear channel-first reference | pass |
+| Clear CIPS reference | pass |
+| CIPS periodic diagonals | 21/21 |
+| CIPS minimal slot period | 8 of 512 slots |
+| CIPS analytical partial-storage ratio | 64.0x |
+| Exact Lattigo encoded Q/P reconstruction | 21/21 pass |
+| Real-FHE channel-first maximum absolute error | `8.95e-8` |
+| Real-FHE CIPS maximum absolute error | `8.95e-8` |
+| Rotation Padding differs from zero padding | yes |
+
+The matched channel-first control had 23 nonzero diagonals and no proper
+periodic diagonal; CIPS had 21 nonzero diagonals and all were periodic. This is
+the expected mechanism-level contrast: WPC creates periodicity through its
+layout and padding construction, whereas selectively inspecting the unchanged
+Orion layout finds essentially none.
+
+The result is not a model reproduction or performance measurement. Its width
+kernel is one, and it omits multi-ciphertext channel groups, downsampling
+reshaping, fine-tuning, and the compressed online Encode/decompression path.
+The single-run timings in the JSON are diagnostic only. See
+`docs/wpc_cips_baseline.md` for the construction, acceptance gates, server
+command, and remaining work.
+
 ### 2026-09-27 — ResNet20 Orion slot-periodicity census
 
 - Executor: user, on `tony@corg-comb`
