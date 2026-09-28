@@ -52,9 +52,10 @@ The full JSON and environment manifest have not yet been copied into this local
 working tree. The values above are transcribed from the validation output and
 the final profile summary supplied by the user.
 
-### 2026-09-28 — WPC CIPS functional baseline (local correctness gate)
+### 2026-09-28 — Initial WPC CIPS `3 x 1` functional baseline
 
-- Executor: local development machine
+- Executors: local development machine and user on `tony@corg-comb`
+- Remote commit: `606834a`
 - Scope: WPC Algorithms 1–2 and Figures 8–10 vertical-convolution subset
 - Backend: clear NumPy reference plus real Lattigo CKKS
 - Workload: one ciphertext, 512 slots, `8 x 8`, 4 input/output channels,
@@ -88,6 +89,49 @@ reshaping, fine-tuning, and the compressed online Encode/decompression path.
 The single-run timings in the JSON are diagnostic only. See
 `docs/wpc_cips_baseline.md` for the construction, acceptance gates, server
 command, and remaining work.
+
+The remote reproduction rebuilt the Linux Lattigo shared library, passed the
+same 31 Python tests and Go `TestWPC` suite, passed every acceptance gate, and
+exited with status zero. Its exact Q/P records resolved
+`orion/backend/lattigo/lattigo-linux.so`, confirming that the server used the
+rebuilt Linux backend rather than the local macOS library.
+
+### 2026-09-28 — General `3 x 3` CIPS correctness extension
+
+- Executor: local development machine
+- Backend: clear NumPy reference plus real Lattigo CKKS
+- Workload: one ciphertext, 512 slots, `8 x 8`, 4 input/output channels,
+  `3 x 3` kernel, stride one
+- Rotation Padding: Algorithm 2 flattened spatial cyclic rotation, including
+  width offsets crossing packed row boundaries
+- Seed: `20260928`
+- Result: `.tmp/results/honours/11_wpc_cips_baseline/cips_baseline.json`
+- Result: valid
+
+| Gate | Result |
+|---|---:|
+| Python/regression tests | 32 passed |
+| Explicit flattened width-boundary test | pass |
+| Clear channel-first reference | pass, maximum error `6.66e-16` |
+| Clear CIPS reference | pass, maximum error `8.88e-16` |
+| CIPS periodic diagonals | 63/63 |
+| CIPS minimal slot period | 8 of 512 slots |
+| CIPS analytical partial-storage ratio | 64.0x |
+| Exact Lattigo encoded Q/P reconstruction | 63/63 pass |
+| Real-FHE channel-first maximum absolute error | `2.04e-7` |
+| Real-FHE CIPS maximum absolute error | `2.04e-7` |
+| Real-FHE correctness tolerance | `1e-6`, both pass |
+| Rotation Padding differs from zero padding | yes |
+
+The matched channel-first control had 71 nonzero diagonals and no proper
+periodic diagonal. CIPS had 63 nonzero diagonals, all with slot period 8. The
+flattened width-boundary test distinguishes Algorithm 2 semantics from both
+zero padding and independent height/width modulo wrapping.
+
+This extension removes the earlier width-one limitation but remains a
+single-ciphertext mechanism test. Multi-ciphertext channel groups,
+downsampling reshaping, model fine-tuning, compressed online decompression,
+and model-level performance measurements remain out of scope.
 
 ### 2026-09-27 — ResNet20 Orion slot-periodicity census
 

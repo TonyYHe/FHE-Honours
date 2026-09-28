@@ -1,15 +1,15 @@
 """Functional CIPS/Rotation-Padding baseline for the WPC experiment.
 
-This module implements the vertically padded convolution illustrated by
-Algorithms 1-2 and Figures 8-10 of the WPC paper.  It is intentionally a
-correctness baseline, not an optimized homomorphic kernel:
+This module implements the CIPS convolution and Rotation Padding construction
+described by Algorithms 1-2 and Figures 8-10 of the WPC paper.  It is
+intentionally a correctness baseline, not an optimized homomorphic kernel:
 
 * ``cips`` packs channels in the innermost slot dimension;
 * ``channel_first`` is the matched channel-first diagonal-layout control;
-* height padding uses adjacent same-channel values, i.e. circular extension;
-* the width kernel is fixed to one so a single flattened rotation has exactly
-  the paper's illustrated semantics without an unimplemented row-boundary
-  transform.
+* two-dimensional Rotation Padding follows Algorithm 2's flattened spatial
+  rotation, including width offsets that cross row boundaries;
+* the direct reference uses that same nonstandard boundary semantics rather
+  than silently substituting ordinary zero or toroidal padding.
 
 Both layouts are lowered to cyclic diagonals and evaluated with the same clear
 rotate/multiply/accumulate primitive.  The resulting output is compared with a
@@ -49,7 +49,9 @@ class CIPSConvCase:
     height: int
     width: int
     kernel_height: int
+    kernel_width: int
     pad_height_before: int
+    pad_width_before: int
 
     def __post_init__(self) -> None:
         values = {
@@ -59,6 +61,7 @@ class CIPSConvCase:
             "height": self.height,
             "width": self.width,
             "kernel_height": self.kernel_height,
+            "kernel_width": self.kernel_width,
         }
         if any(int(value) <= 0 for value in values.values()):
             raise ValueError(f"case dimensions must be positive: {values}")
@@ -74,6 +77,8 @@ class CIPSConvCase:
             raise ValueError("output channels exceed the single-ciphertext CIPS capacity")
         if not 0 <= int(self.pad_height_before) < int(self.kernel_height):
             raise ValueError("pad_height_before must lie in [0, kernel_height)")
+        if not 0 <= int(self.pad_width_before) < int(self.kernel_width):
+            raise ValueError("pad_width_before must lie in [0, kernel_width)")
 
     @property
     def channel_capacity(self) -> int:
@@ -83,12 +88,57 @@ class CIPSConvCase:
     def pad_height_after(self) -> int:
         return int(self.kernel_height) - 1 - int(self.pad_height_before)
 
+    @property
+    def pad_width_after(self) -> int:
+        return int(self.kernel_width) - 1 - int(self.pad_width_before)
+
     def to_dict(self) -> dict[str, int]:
         result = {key: int(value) for key, value in asdict(self).items()}
         result["channel_capacity"] = int(self.channel_capacity)
         result["pad_height_after"] = int(self.pad_height_after)
-        result["kernel_width"] = 1
+        result["pad_width_after"] = int(self.pad_width_after)
         return result
+
+
+def rotation_padded_source_coordinates(
+    case: CIPSConvCase,
+    output_height: int,
+    output_width: int,
+    kernel_height: int,
+    kernel_width: int,
+) -> tuple[int, int]:
+    """Return the source coordinates selected by WPC Rotation Padding.
+
+    Algorithm 2 rotates CIPS by
+
+    ``(kh*W + kw - PHB*W - PWB) * C + channel_delta``.
+
+    Consequently, the spatial part wraps as one flattened ``H*W`` ring.  In
+    particular, a positive width offset from the last column advances to the
+    first column of the next row.  That is deliberately different from
+    independently applying modulo to height and width.
+    """
+
+    h = int(output_height)
+    w = int(output_width)
+    kh = int(kernel_height)
+    kw = int(kernel_width)
+    if not 0 <= h < int(case.height) or not 0 <= w < int(case.width):
+        raise IndexError("output spatial coordinate lies outside the packed tensor")
+    if not 0 <= kh < int(case.kernel_height):
+        raise IndexError("kernel height index lies outside the kernel")
+    if not 0 <= kw < int(case.kernel_width):
+        raise IndexError("kernel width index lies outside the kernel")
+
+    spatial_length = int(case.height) * int(case.width)
+    output_position = h * int(case.width) + w
+    rotation_offset = (
+        (kh - int(case.pad_height_before)) * int(case.width)
+        + kw
+        - int(case.pad_width_before)
+    )
+    source_position = int((output_position + rotation_offset) % spatial_length)
+    return divmod(source_position, int(case.width))
 
 
 def slot_index(case: CIPSConvCase, layout: str, channel: int, height: int, width: int) -> int:
@@ -150,10 +200,11 @@ def rotation_padded_reference(
     weights: np.ndarray,
     case: CIPSConvCase,
 ) -> np.ndarray:
-    """Direct convolution with WPC adjacent-neuron height padding.
+    """Direct convolution with WPC two-dimensional Rotation Padding.
 
-    The padded rows are copied cyclically from the same channel.  This is not
-    zero padding and is therefore kept separate from ordinary ``conv2d``.
+    Height and width kernel offsets advance through the flattened spatial CIPS
+    sequence and wrap cyclically.  This mirrors Algorithm 2's rotation index
+    and is kept separate from ordinary zero-padded ``conv2d``.
     """
 
     source = np.asarray(tensor, dtype=np.float64)
@@ -163,7 +214,7 @@ def rotation_padded_reference(
         int(case.output_channels),
         int(case.input_channels),
         int(case.kernel_height),
-        1,
+        int(case.kernel_width),
     )
     if tuple(source.shape) != expected_input:
         raise ValueError(f"input tensor shape is {tuple(source.shape)}, expected {expected_input}")
@@ -180,13 +231,25 @@ def rotation_padded_reference(
                 total = 0.0
                 for input_channel in range(int(case.input_channels)):
                     for kernel_height in range(int(case.kernel_height)):
-                        source_height = (
-                            height + kernel_height - int(case.pad_height_before)
-                        ) % int(case.height)
-                        total += (
-                            source[input_channel, source_height, width]
-                            * kernel[output_channel, input_channel, kernel_height, 0]
-                        )
+                        for kernel_width in range(int(case.kernel_width)):
+                            source_height, source_width = (
+                                rotation_padded_source_coordinates(
+                                    case,
+                                    height,
+                                    width,
+                                    kernel_height,
+                                    kernel_width,
+                                )
+                            )
+                            total += (
+                                source[input_channel, source_height, source_width]
+                                * kernel[
+                                    output_channel,
+                                    input_channel,
+                                    kernel_height,
+                                    kernel_width,
+                                ]
+                            )
                 output[output_channel, height, width] = total
     return output
 
@@ -211,11 +274,23 @@ def zero_padded_reference(
                 for input_channel in range(int(case.input_channels)):
                     for kernel_height in range(int(case.kernel_height)):
                         source_height = height + kernel_height - int(case.pad_height_before)
-                        if 0 <= source_height < int(case.height):
-                            total += (
-                                source[input_channel, source_height, width]
-                                * kernel[output_channel, input_channel, kernel_height, 0]
+                        for kernel_width in range(int(case.kernel_width)):
+                            source_width = (
+                                width + kernel_width - int(case.pad_width_before)
                             )
+                            if (
+                                0 <= source_height < int(case.height)
+                                and 0 <= source_width < int(case.width)
+                            ):
+                                total += (
+                                    source[input_channel, source_height, source_width]
+                                    * kernel[
+                                        output_channel,
+                                        input_channel,
+                                        kernel_height,
+                                        kernel_width,
+                                    ]
+                                )
                 output[output_channel, height, width] = total
     return output
 
@@ -232,7 +307,7 @@ def build_cyclic_diagonals(
         int(case.output_channels),
         int(case.input_channels),
         int(case.kernel_height),
-        1,
+        int(case.kernel_width),
     )
     if tuple(kernel.shape) != expected:
         raise ValueError(f"weight tensor shape is {tuple(kernel.shape)}, expected {expected}")
@@ -241,34 +316,50 @@ def build_cyclic_diagonals(
     for output_channel in range(int(case.output_channels)):
         for input_channel in range(int(case.input_channels)):
             for kernel_height in range(int(case.kernel_height)):
-                weight = float(kernel[output_channel, input_channel, kernel_height, 0])
-                if weight == 0.0:
-                    continue
-                for height in range(int(case.height)):
-                    source_height = (
-                        height + kernel_height - int(case.pad_height_before)
-                    ) % int(case.height)
-                    for width in range(int(case.width)):
-                        output_slot = slot_index(
-                            case,
-                            layout,
+                for kernel_width in range(int(case.kernel_width)):
+                    weight = float(
+                        kernel[
                             output_channel,
-                            height,
-                            width,
-                        )
-                        input_slot = slot_index(
-                            case,
-                            layout,
                             input_channel,
-                            source_height,
-                            width,
-                        )
-                        rotation = int((input_slot - output_slot) % int(case.slots))
-                        diagonal = diagonals.setdefault(
-                            rotation,
-                            np.zeros((int(case.slots),), dtype=np.float64),
-                        )
-                        diagonal[output_slot] += weight
+                            kernel_height,
+                            kernel_width,
+                        ]
+                    )
+                    if weight == 0.0:
+                        continue
+                    for height in range(int(case.height)):
+                        for width in range(int(case.width)):
+                            source_height, source_width = (
+                                rotation_padded_source_coordinates(
+                                    case,
+                                    height,
+                                    width,
+                                    kernel_height,
+                                    kernel_width,
+                                )
+                            )
+                            output_slot = slot_index(
+                                case,
+                                layout,
+                                output_channel,
+                                height,
+                                width,
+                            )
+                            input_slot = slot_index(
+                                case,
+                                layout,
+                                input_channel,
+                                source_height,
+                                source_width,
+                            )
+                            rotation = int(
+                                (input_slot - output_slot) % int(case.slots)
+                            )
+                            diagonal = diagonals.setdefault(
+                                rotation,
+                                np.zeros((int(case.slots),), dtype=np.float64),
+                            )
+                            diagonal[output_slot] += weight
     return {
         int(rotation): diagonal
         for rotation, diagonal in sorted(diagonals.items())
@@ -372,10 +463,50 @@ def run_clear_layout_comparison(
 
     layout_delta = np.abs(outputs[LAYOUT_CIPS] - outputs[LAYOUT_CHANNEL_FIRST])
     boundary_delta = np.abs(reference - zero_reference)
+    differs_from_independent_axis_wrap = False
+    for height in range(int(case.height)):
+        for width in range(int(case.width)):
+            for kernel_height in range(int(case.kernel_height)):
+                for kernel_width in range(int(case.kernel_width)):
+                    flattened = rotation_padded_source_coordinates(
+                        case,
+                        height,
+                        width,
+                        kernel_height,
+                        kernel_width,
+                    )
+                    independent = (
+                        (
+                            height
+                            + kernel_height
+                            - int(case.pad_height_before)
+                        )
+                        % int(case.height),
+                        (
+                            width
+                            + kernel_width
+                            - int(case.pad_width_before)
+                        )
+                        % int(case.width),
+                    )
+                    if flattened != independent:
+                        differs_from_independent_axis_wrap = True
+                        break
+                if differs_from_independent_axis_wrap:
+                    break
+            if differs_from_independent_axis_wrap:
+                break
+        if differs_from_independent_axis_wrap:
+            break
     return {
         "case": case.to_dict(),
-        "rotation_padding_semantics": "circular_adjacent_same_channel_height",
+        "rotation_padding_semantics": (
+            "wpc_flattened_spatial_cyclic_adjacent_same_channel"
+        ),
         "zero_padding_is_not_the_reference": True,
+        "flattened_rotation_differs_from_independent_axis_wrap": bool(
+            differs_from_independent_axis_wrap
+        ),
         "rotation_padding_vs_zero_padding_max_abs_delta": float(np.max(boundary_delta)),
         "layout_output_max_abs_delta": float(np.max(layout_delta)),
         "layouts": layouts,
@@ -400,6 +531,7 @@ __all__ = [
     "pack_tensor",
     "reconstruct_message_period",
     "rotation_padded_reference",
+    "rotation_padded_source_coordinates",
     "run_clear_layout_comparison",
     "slot_index",
     "summarize_layout",

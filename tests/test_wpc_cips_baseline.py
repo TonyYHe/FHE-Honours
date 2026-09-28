@@ -9,6 +9,7 @@ from orion.experimental.wpc_cips_baseline import (
     build_cyclic_diagonals,
     pack_tensor,
     rotation_padded_reference,
+    rotation_padded_source_coordinates,
     run_clear_layout_comparison,
     zero_padded_reference,
 )
@@ -22,7 +23,9 @@ def _paper_toy() -> tuple[CIPSConvCase, np.ndarray, np.ndarray]:
         height=2,
         width=2,
         kernel_height=2,
+        kernel_width=1,
         pad_height_before=0,
+        pad_width_before=0,
     )
     tensor = np.arange(1, 9, dtype=np.float64).reshape(2, 2, 2)
     weights = np.arange(1, 9, dtype=np.float64).reshape(2, 2, 2, 1)
@@ -94,6 +97,37 @@ def test_rotation_padding_is_not_silently_treated_as_zero_padding() -> None:
     assert float(np.max(np.abs(rotation_padded - zero_padded))) > 0.0
 
 
+def test_width_padding_follows_algorithm2_flattened_rotation() -> None:
+    case = CIPSConvCase(
+        slots=16,
+        input_channels=1,
+        output_channels=1,
+        height=2,
+        width=2,
+        kernel_height=1,
+        kernel_width=3,
+        pad_height_before=0,
+        pad_width_before=1,
+    )
+    tensor = np.asarray([[[1.0, 2.0], [3.0, 4.0]]])
+    weights = np.zeros((1, 1, 1, 3), dtype=np.float64)
+    weights[0, 0, 0, 2] = 1.0
+
+    assert rotation_padded_source_coordinates(case, 0, 1, 0, 2) == (1, 0)
+    assert rotation_padded_source_coordinates(case, 1, 1, 0, 2) == (0, 0)
+    output = rotation_padded_reference(tensor, weights, case)
+    assert output.tolist() == [[[2.0, 3.0], [4.0, 1.0]]]
+
+    comparison = run_clear_layout_comparison(
+        tensor,
+        weights,
+        case,
+        full_encoded_bytes_per_diagonal=1024,
+    )
+    assert comparison["valid"] is True
+    assert comparison["flattened_rotation_differs_from_independent_axis_wrap"] is True
+
+
 def test_larger_random_case_preserves_cips_periodicity_and_correctness() -> None:
     case = CIPSConvCase(
         slots=512,
@@ -102,11 +136,13 @@ def test_larger_random_case_preserves_cips_periodicity_and_correctness() -> None
         height=8,
         width=8,
         kernel_height=3,
+        kernel_width=3,
         pad_height_before=1,
+        pad_width_before=1,
     )
     rng = np.random.default_rng(17)
     tensor = rng.normal(size=(4, 8, 8))
-    weights = rng.normal(size=(4, 4, 3, 1))
+    weights = rng.normal(size=(4, 4, 3, 3))
 
     result = run_clear_layout_comparison(
         tensor,
@@ -119,6 +155,8 @@ def test_larger_random_case_preserves_cips_periodicity_and_correctness() -> None
     assert result["valid"] is True
     assert cips["periodicity"]["periodic_count"] == cips["diagonal_count"]
     assert cips["periodicity"]["byte_coverage_pct"] == 100.0
+    assert set(cips["minimal_slot_period_by_rotation"].values()) == {8}
+    assert cips["periodicity"]["partial_storage_compression_ratio"] == 64.0
     assert cips["message_period_reconstruction_exact"] is True
 
 

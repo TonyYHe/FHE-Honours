@@ -51,7 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Compare a channel-first diagonal layout with WPC CIPS and "
-            "Rotation Padding on one matched vertical-convolution workload."
+            "Rotation Padding on one matched two-dimensional convolution."
         )
     )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
@@ -62,7 +62,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-channels", type=int, default=4)
     parser.add_argument("--output-channels", type=int, default=4)
     parser.add_argument("--kernel-height", type=int, default=3)
+    parser.add_argument("--kernel-width", type=int, default=3)
     parser.add_argument("--pad-height-before", type=int, default=None)
+    parser.add_argument("--pad-width-before", type=int, default=None)
     parser.add_argument(
         "--skip-encoded-qp",
         action="store_true",
@@ -293,10 +295,15 @@ def _real_fhe_evaluate(
 
 def main() -> int:
     args = _parser().parse_args()
-    pad_before = (
+    pad_height_before = (
         int(args.kernel_height) // 2
         if args.pad_height_before is None
         else int(args.pad_height_before)
+    )
+    pad_width_before = (
+        int(args.kernel_width) // 2
+        if args.pad_width_before is None
+        else int(args.pad_width_before)
     )
     slots = 1 << (int(args.logn) - 1)
     case = CIPSConvCase(
@@ -306,7 +313,9 @@ def main() -> int:
         height=int(args.height),
         width=int(args.width),
         kernel_height=int(args.kernel_height),
-        pad_height_before=int(pad_before),
+        kernel_width=int(args.kernel_width),
+        pad_height_before=int(pad_height_before),
+        pad_width_before=int(pad_width_before),
     )
     params = _params(int(args.logn))
     level_q = int(params.get_max_level())
@@ -330,7 +339,7 @@ def main() -> int:
             int(case.output_channels),
             int(case.input_channels),
             int(case.kernel_height),
-            1,
+            int(case.kernel_width),
         ),
     ).astype(np.float64)
 
@@ -374,6 +383,9 @@ def main() -> int:
         enabled=not bool(args.skip_fhe_eval),
     )
 
+    two_dimensional_wrap_required = bool(
+        int(case.kernel_width) > 1 and int(case.width) > 1
+    )
     accepted = bool(
         comparison["valid"]
         and cips_all_nonzero_periodic
@@ -382,9 +394,15 @@ def main() -> int:
         and real_fhe["complete"]
         and real_fhe["all_layouts_correct"]
         and float(comparison["rotation_padding_vs_zero_padding_max_abs_delta"]) > 0.0
+        and (
+            not two_dimensional_wrap_required
+            or bool(
+                comparison["flattened_rotation_differs_from_independent_axis_wrap"]
+            )
+        )
     )
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": "wpc_cips_rotation_padding_functional_baseline",
         "status": "ok" if accepted else "invalid",
         "timing_policy": "correctness_and_accounting_only_not_for_performance_claims",
@@ -399,14 +417,15 @@ def main() -> int:
             "full_encoded_bytes_per_diagonal": int(full_bytes),
         },
         "scope": {
-            "convolution": "single_ciphertext_vertical_kernel",
-            "kernel_width": 1,
+            "convolution": "single_ciphertext_two_dimensional_kernel",
+            "kernel_shape": [int(case.kernel_height), int(case.kernel_width)],
             "stride": [1, 1],
-            "rotation_padding": "adjacent_same_channel_circular_height",
+            "rotation_padding": (
+                "algorithm2_flattened_spatial_cyclic_adjacent_same_channel"
+            ),
             "matches_wpc_paper": "Algorithms 1-2 and Figures 8-10 functional subset",
             "limitations": [
                 "not an optimized homomorphic kernel",
-                "no width-kernel row-boundary transform",
                 "no multi-ciphertext channel groups",
                 "no downsample reshaping layer",
                 "no performance claim",
@@ -430,6 +449,12 @@ def main() -> int:
             ),
             "rotation_padding_boundary_change_observed": bool(
                 float(comparison["rotation_padding_vs_zero_padding_max_abs_delta"]) > 0.0
+            ),
+            "two_dimensional_flattened_wrap_exercised": bool(
+                comparison["flattened_rotation_differs_from_independent_axis_wrap"]
+            ),
+            "two_dimensional_flattened_wrap_required": (
+                two_dimensional_wrap_required
             ),
             "valid": accepted,
         },
