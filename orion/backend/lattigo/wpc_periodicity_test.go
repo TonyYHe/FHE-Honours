@@ -185,3 +185,43 @@ func TestWPCCompressionRejectsWrongEvaluationPeriod(t *testing.T) {
 	_, _, _, ok := compressWPCQPEvaluationPoly(transform.Vec[0], 4)
 	require.False(t, ok)
 }
+
+func TestWPCGlobalAccountingTracksSequentialSingleTransformPeak(t *testing.T) {
+	clearWPCCompressedTransforms()
+	defer clearWPCCompressedTransforms()
+
+	first := &wpcCompressedTransformState{
+		FullPayloadBytes:       100,
+		CompressedPayloadBytes: 10,
+		MetadataBytes:          5,
+		OfflineEncodeCalls:     1,
+	}
+	second := &wpcCompressedTransformState{
+		FullPayloadBytes:       240,
+		CompressedPayloadBytes: 24,
+		MetadataBytes:          7,
+		OfflineEncodeCalls:     1,
+	}
+	registerWPCCompressedTransform(1001, first)
+	registerWPCCompressedTransform(1002, second)
+
+	beginWPCMaterialization(first)
+	endWPCMaterialization(first)
+	ResetWPCCompressedGlobalMaterializationPeak()
+	beginWPCMaterialization(second)
+	endWPCMaterialization(second)
+
+	wpcCompressedGlobalMu.Lock()
+	snapshot := wpcCompressedGlobal
+	wpcCompressedGlobalMu.Unlock()
+	require.Equal(t, uint64(2), snapshot.RegisteredTransformCount)
+	require.Equal(t, uint64(340), snapshot.AggregateFullPayloadBytes)
+	require.Equal(t, uint64(34), snapshot.AggregateCompressedBytes)
+	require.Equal(t, uint64(12), snapshot.AggregateMetadataBytes)
+	require.Equal(t, uint64(0), snapshot.CurrentMaterializedBytes)
+	require.Equal(t, uint64(240), snapshot.PeakMaterializedBytes)
+	require.Equal(t, uint64(0), snapshot.CurrentMaterializedTransforms)
+	require.Equal(t, uint64(1), snapshot.PeakMaterializedTransforms)
+	require.Equal(t, uint64(2), snapshot.OfflineEncodeCalls)
+	require.Equal(t, uint64(0), snapshot.OnlineEncodeCalls)
+}

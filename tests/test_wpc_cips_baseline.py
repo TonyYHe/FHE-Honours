@@ -4,12 +4,14 @@ import numpy as np
 
 from orion.experimental.wpc_cips_baseline import (
     CIPSConvCase,
+    CIPSMultiGroupConvCase,
     LAYOUT_CHANNEL_FIRST,
     LAYOUT_CIPS,
     build_cyclic_diagonals,
     pack_tensor,
     rotation_padded_reference,
     rotation_padded_source_coordinates,
+    run_clear_cips_group_comparison,
     run_clear_layout_comparison,
     zero_padded_reference,
 )
@@ -170,3 +172,45 @@ def test_build_rejects_weight_shape_mismatch() -> None:
         assert "weight tensor shape" in str(exc)
     else:
         raise AssertionError("shape mismatch was not rejected")
+
+
+def test_multigroup_cips_matches_global_reference_and_preserves_periodicity() -> None:
+    case = CIPSMultiGroupConvCase(
+        slots=32,
+        input_channels=12,
+        output_channels=10,
+        height=2,
+        width=2,
+        kernel_height=3,
+        kernel_width=3,
+        pad_height_before=1,
+        pad_width_before=1,
+    )
+    rng = np.random.default_rng(20260928)
+    tensor = rng.normal(size=(12, 2, 2))
+    weights = rng.normal(size=(10, 12, 3, 3))
+
+    result = run_clear_cips_group_comparison(
+        tensor,
+        weights,
+        case,
+        full_encoded_bytes_per_diagonal=4096,
+    )
+
+    assert case.channel_capacity == 8
+    assert case.input_group_ranges == ((0, 8), (8, 12))
+    assert case.output_group_ranges == ((0, 8), (8, 10))
+    assert result["transform_count"] == 4
+    assert result["ciphertext_accumulation_add_count"] == 2
+    assert result["correct"] is True
+    assert result["max_abs_error_vs_reference"] < 1e-10
+    assert result["all_transforms_proper_periodic"] is True
+    assert result["all_message_period_roundtrips_exact"] is True
+    assert set(result["transforms"]) == {
+        "out0_in0",
+        "out0_in1",
+        "out1_in0",
+        "out1_in1",
+    }
+    for row in result["transforms"].values():
+        assert set(row["minimal_slot_period_by_rotation"].values()) == {8}

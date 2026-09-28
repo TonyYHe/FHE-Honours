@@ -100,6 +100,116 @@ class CIPSConvCase:
         return result
 
 
+@dataclass(frozen=True)
+class CIPSMultiGroupConvCase:
+    """A convolution whose channels span multiple CIPS ciphertexts.
+
+    Every ciphertext still has ``slots/(height*width)`` channel positions.
+    Input and output channels are partitioned into contiguous groups of at
+    most that capacity.  One linear transform is compiled for every
+    ``(output_group, input_group)`` pair.
+    """
+
+    slots: int
+    input_channels: int
+    output_channels: int
+    height: int
+    width: int
+    kernel_height: int
+    kernel_width: int
+    pad_height_before: int
+    pad_width_before: int
+
+    def __post_init__(self) -> None:
+        values = {
+            "slots": self.slots,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "height": self.height,
+            "width": self.width,
+            "kernel_height": self.kernel_height,
+            "kernel_width": self.kernel_width,
+        }
+        if any(int(value) <= 0 for value in values.values()):
+            raise ValueError(f"case dimensions must be positive: {values}")
+        if not _is_power_of_two(int(self.slots)):
+            raise ValueError("slots must be a power of two")
+        if not _is_power_of_two(int(self.height)) or not _is_power_of_two(int(self.width)):
+            raise ValueError("CIPS baseline height and width must be powers of two")
+        if int(self.slots) % (int(self.height) * int(self.width)):
+            raise ValueError("slots must be divisible by height*width")
+        if not 0 <= int(self.pad_height_before) < int(self.kernel_height):
+            raise ValueError("pad_height_before must lie in [0, kernel_height)")
+        if not 0 <= int(self.pad_width_before) < int(self.kernel_width):
+            raise ValueError("pad_width_before must lie in [0, kernel_width)")
+
+    @property
+    def channel_capacity(self) -> int:
+        return int(self.slots) // (int(self.height) * int(self.width))
+
+    @property
+    def input_group_ranges(self) -> tuple[tuple[int, int], ...]:
+        return _channel_group_ranges(int(self.input_channels), int(self.channel_capacity))
+
+    @property
+    def output_group_ranges(self) -> tuple[tuple[int, int], ...]:
+        return _channel_group_ranges(int(self.output_channels), int(self.channel_capacity))
+
+    @property
+    def input_group_count(self) -> int:
+        return len(self.input_group_ranges)
+
+    @property
+    def output_group_count(self) -> int:
+        return len(self.output_group_ranges)
+
+    @property
+    def transform_count(self) -> int:
+        return int(self.input_group_count * self.output_group_count)
+
+    def local_case(self, output_group: int, input_group: int) -> CIPSConvCase:
+        input_start, input_end = self.input_group_ranges[int(input_group)]
+        output_start, output_end = self.output_group_ranges[int(output_group)]
+        return CIPSConvCase(
+            slots=int(self.slots),
+            input_channels=int(input_end - input_start),
+            output_channels=int(output_end - output_start),
+            height=int(self.height),
+            width=int(self.width),
+            kernel_height=int(self.kernel_height),
+            kernel_width=int(self.kernel_width),
+            pad_height_before=int(self.pad_height_before),
+            pad_width_before=int(self.pad_width_before),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            key: int(value) for key, value in asdict(self).items()
+        }
+        result.update(
+            {
+                "channel_capacity": int(self.channel_capacity),
+                "input_group_count": int(self.input_group_count),
+                "output_group_count": int(self.output_group_count),
+                "transform_count": int(self.transform_count),
+                "input_group_ranges": [list(value) for value in self.input_group_ranges],
+                "output_group_ranges": [list(value) for value in self.output_group_ranges],
+            }
+        )
+        return result
+
+
+def _channel_group_ranges(total_channels: int, capacity: int) -> tuple[tuple[int, int], ...]:
+    total = int(total_channels)
+    group_capacity = int(capacity)
+    if total <= 0 or group_capacity <= 0:
+        raise ValueError("channel count and group capacity must be positive")
+    return tuple(
+        (start, min(total, start + group_capacity))
+        for start in range(0, total, group_capacity)
+    )
+
+
 def rotation_padded_source_coordinates(
     case: CIPSConvCase,
     output_height: int,
@@ -522,16 +632,220 @@ def run_clear_layout_comparison(
     }
 
 
+def rotation_padded_reference_multi_group(
+    tensor: np.ndarray,
+    weights: np.ndarray,
+    case: CIPSMultiGroupConvCase,
+) -> np.ndarray:
+    """Direct Rotation-Padded convolution before channel grouping.
+
+    This is intentionally independent of the grouped diagonal evaluator: it
+    sums over the original global channel indices and is therefore the clear
+    correctness oracle for group slicing and ciphertext accumulation.
+    """
+
+    source = np.asarray(tensor, dtype=np.float64)
+    kernel = np.asarray(weights, dtype=np.float64)
+    expected_input = (int(case.input_channels), int(case.height), int(case.width))
+    expected_weight = (
+        int(case.output_channels),
+        int(case.input_channels),
+        int(case.kernel_height),
+        int(case.kernel_width),
+    )
+    if tuple(source.shape) != expected_input:
+        raise ValueError(f"input tensor shape is {tuple(source.shape)}, expected {expected_input}")
+    if tuple(kernel.shape) != expected_weight:
+        raise ValueError(f"weight tensor shape is {tuple(kernel.shape)}, expected {expected_weight}")
+
+    coordinate_case = case.local_case(0, 0)
+    output = np.zeros(
+        (int(case.output_channels), int(case.height), int(case.width)),
+        dtype=np.float64,
+    )
+    for output_channel in range(int(case.output_channels)):
+        for height in range(int(case.height)):
+            for width in range(int(case.width)):
+                total = 0.0
+                for input_channel in range(int(case.input_channels)):
+                    for kernel_height in range(int(case.kernel_height)):
+                        for kernel_width in range(int(case.kernel_width)):
+                            source_height, source_width = rotation_padded_source_coordinates(
+                                coordinate_case,
+                                height,
+                                width,
+                                kernel_height,
+                                kernel_width,
+                            )
+                            total += (
+                                source[input_channel, source_height, source_width]
+                                * kernel[
+                                    output_channel,
+                                    input_channel,
+                                    kernel_height,
+                                    kernel_width,
+                                ]
+                            )
+                output[output_channel, height, width] = total
+    return output
+
+
+def build_cips_group_transforms(
+    weights: np.ndarray,
+    case: CIPSMultiGroupConvCase,
+) -> dict[str, dict[str, Any]]:
+    """Build one CIPS diagonal transform for every channel-group pair."""
+
+    kernel = np.asarray(weights, dtype=np.float64)
+    expected = (
+        int(case.output_channels),
+        int(case.input_channels),
+        int(case.kernel_height),
+        int(case.kernel_width),
+    )
+    if tuple(kernel.shape) != expected:
+        raise ValueError(f"weight tensor shape is {tuple(kernel.shape)}, expected {expected}")
+
+    transforms: dict[str, dict[str, Any]] = {}
+    for output_group, (output_start, output_end) in enumerate(
+        case.output_group_ranges
+    ):
+        for input_group, (input_start, input_end) in enumerate(
+            case.input_group_ranges
+        ):
+            local_case = case.local_case(output_group, input_group)
+            key = f"out{output_group}_in{input_group}"
+            local_weights = kernel[
+                output_start:output_end,
+                input_start:input_end,
+                :,
+                :,
+            ]
+            transforms[key] = {
+                "key": key,
+                "output_group": int(output_group),
+                "input_group": int(input_group),
+                "output_channel_range": [int(output_start), int(output_end)],
+                "input_channel_range": [int(input_start), int(input_end)],
+                "case": local_case,
+                "diagonals": build_cyclic_diagonals(
+                    local_weights,
+                    local_case,
+                    LAYOUT_CIPS,
+                ),
+            }
+    return transforms
+
+
+def run_clear_cips_group_comparison(
+    tensor: np.ndarray,
+    weights: np.ndarray,
+    case: CIPSMultiGroupConvCase,
+    *,
+    full_encoded_bytes_per_diagonal: int,
+    atol: float = 1e-10,
+) -> dict[str, Any]:
+    """Evaluate and accumulate all CIPS group-pair transforms in clear."""
+
+    source = np.asarray(tensor, dtype=np.float64)
+    expected_input = (int(case.input_channels), int(case.height), int(case.width))
+    if tuple(source.shape) != expected_input:
+        raise ValueError(f"input tensor shape is {tuple(source.shape)}, expected {expected_input}")
+
+    reference = rotation_padded_reference_multi_group(source, weights, case)
+    transforms = build_cips_group_transforms(weights, case)
+    output_groups: list[np.ndarray] = []
+    summaries: dict[str, dict[str, Any]] = {}
+    all_periodic = True
+    all_message_roundtrips = True
+    for output_group, (output_start, output_end) in enumerate(
+        case.output_group_ranges
+    ):
+        accumulated = np.zeros(
+            (output_end - output_start, int(case.height), int(case.width)),
+            dtype=np.float64,
+        )
+        for input_group, (input_start, input_end) in enumerate(
+            case.input_group_ranges
+        ):
+            key = f"out{output_group}_in{input_group}"
+            row = transforms[key]
+            local_case = row["case"]
+            diagonals = row["diagonals"]
+            packed = pack_tensor(
+                source[input_start:input_end],
+                local_case,
+                LAYOUT_CIPS,
+            )
+            partial = unpack_output(
+                evaluate_cyclic_diagonals(packed, diagonals),
+                local_case,
+                LAYOUT_CIPS,
+            )
+            accumulated += partial
+            summary = summarize_layout(
+                diagonals,
+                full_encoded_bytes_per_diagonal=int(full_encoded_bytes_per_diagonal),
+            )
+            periods = {
+                int(value)
+                for value in summary["minimal_slot_period_by_rotation"].values()
+            }
+            proper_periodic = bool(
+                int(summary["periodicity"]["periodic_count"])
+                == int(summary["periodicity"]["nonzero_count"])
+                == int(summary["diagonal_count"])
+                and periods
+                and all(0 < period < int(case.slots) for period in periods)
+            )
+            all_periodic = bool(all_periodic and proper_periodic)
+            all_message_roundtrips = bool(
+                all_message_roundtrips
+                and summary["message_period_reconstruction_exact"]
+            )
+            summaries[key] = {
+                **summary,
+                "proper_periodic": proper_periodic,
+                "output_group": int(output_group),
+                "input_group": int(input_group),
+                "output_channel_range": [int(output_start), int(output_end)],
+                "input_channel_range": [int(input_start), int(input_end)],
+                "local_case": local_case.to_dict(),
+                "diagonals": diagonals,
+            }
+        output_groups.append(accumulated)
+
+    output = np.concatenate(output_groups, axis=0)
+    error = np.abs(output - reference)
+    return {
+        "case": case.to_dict(),
+        "transform_count": int(len(summaries)),
+        "ciphertext_accumulation_add_count": int(
+            case.output_group_count * max(0, case.input_group_count - 1)
+        ),
+        "all_transforms_proper_periodic": bool(all_periodic),
+        "all_message_period_roundtrips_exact": bool(all_message_roundtrips),
+        "max_abs_error_vs_reference": float(np.max(error)),
+        "mean_abs_error_vs_reference": float(np.mean(error)),
+        "correct": bool(np.allclose(output, reference, rtol=0.0, atol=float(atol))),
+        "transforms": summaries,
+    }
+
+
 __all__ = [
     "CIPSConvCase",
+    "CIPSMultiGroupConvCase",
     "LAYOUT_CHANNEL_FIRST",
     "LAYOUT_CIPS",
+    "build_cips_group_transforms",
     "build_cyclic_diagonals",
     "evaluate_cyclic_diagonals",
     "pack_tensor",
     "reconstruct_message_period",
     "rotation_padded_reference",
+    "rotation_padded_reference_multi_group",
     "rotation_padded_source_coordinates",
+    "run_clear_cips_group_comparison",
     "run_clear_layout_comparison",
     "slot_index",
     "summarize_layout",

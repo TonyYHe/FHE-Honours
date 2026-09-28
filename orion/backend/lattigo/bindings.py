@@ -836,6 +836,16 @@ class LattigoLibrary:
             "GetWPCCompressedLinearTransformStats",
             None,
         )
+        reset_wpc_global_peak = getattr(
+            self.lib,
+            "ResetWPCCompressedGlobalMaterializationPeak",
+            None,
+        )
+        get_wpc_global_stats = getattr(
+            self.lib,
+            "GetWPCCompressedGlobalStats",
+            None,
+        )
         if all(
             value is not None
             for value in (
@@ -881,6 +891,17 @@ class LattigoLibrary:
             self.GetWPCCompressedLinearTransformStats = LattigoFunction(
                 get_wpc_stats,
                 argtypes=[ctypes.c_int],
+                restype=ArrayResultUInt64,
+            )
+        if reset_wpc_global_peak is not None and get_wpc_global_stats is not None:
+            self.ResetWPCCompressedGlobalMaterializationPeak = LattigoFunction(
+                reset_wpc_global_peak,
+                argtypes=[],
+                restype=None,
+            )
+            self.GetWPCCompressedGlobalStats = LattigoFunction(
+                get_wpc_global_stats,
+                argtypes=[],
                 restype=ArrayResultUInt64,
             )
 

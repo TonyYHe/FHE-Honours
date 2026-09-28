@@ -62,10 +62,74 @@ type wpcCompressedTransformState struct {
 	OnlineEncodeCalls         uint64
 }
 
+type wpcCompressedGlobalState struct {
+	RegisteredTransformCount      uint64
+	AggregateFullPayloadBytes     uint64
+	AggregateCompressedBytes      uint64
+	AggregateMetadataBytes        uint64
+	CurrentMaterializedBytes      uint64
+	PeakMaterializedBytes         uint64
+	CurrentMaterializedTransforms uint64
+	PeakMaterializedTransforms    uint64
+	OfflineEncodeCalls            uint64
+	OnlineEncodeCalls             uint64
+}
+
 var (
 	wpcCompressedMu         sync.Mutex
 	wpcCompressedTransforms = make(map[int]*wpcCompressedTransformState)
+	wpcCompressedGlobalMu   sync.Mutex
+	wpcCompressedGlobal     wpcCompressedGlobalState
 )
+
+func registerWPCCompressedGlobal(state *wpcCompressedTransformState) {
+	wpcCompressedGlobalMu.Lock()
+	wpcCompressedGlobal.RegisteredTransformCount++
+	wpcCompressedGlobal.AggregateFullPayloadBytes += state.FullPayloadBytes
+	wpcCompressedGlobal.AggregateCompressedBytes += state.CompressedPayloadBytes
+	wpcCompressedGlobal.AggregateMetadataBytes += state.MetadataBytes
+	wpcCompressedGlobal.OfflineEncodeCalls += state.OfflineEncodeCalls
+	wpcCompressedGlobal.OnlineEncodeCalls += state.OnlineEncodeCalls
+	wpcCompressedGlobalMu.Unlock()
+}
+
+func unregisterWPCCompressedGlobal(state *wpcCompressedTransformState) {
+	wpcCompressedGlobalMu.Lock()
+	if wpcCompressedGlobal.RegisteredTransformCount > 0 {
+		wpcCompressedGlobal.RegisteredTransformCount--
+	}
+	wpcCompressedGlobal.AggregateFullPayloadBytes -= state.FullPayloadBytes
+	wpcCompressedGlobal.AggregateCompressedBytes -= state.CompressedPayloadBytes
+	wpcCompressedGlobal.AggregateMetadataBytes -= state.MetadataBytes
+	wpcCompressedGlobal.OfflineEncodeCalls -= state.OfflineEncodeCalls
+	wpcCompressedGlobal.OnlineEncodeCalls -= state.OnlineEncodeCalls
+	wpcCompressedGlobalMu.Unlock()
+}
+
+func beginWPCMaterialization(state *wpcCompressedTransformState) {
+	wpcCompressedGlobalMu.Lock()
+	wpcCompressedGlobal.CurrentMaterializedBytes += state.FullPayloadBytes
+	wpcCompressedGlobal.CurrentMaterializedTransforms++
+	if wpcCompressedGlobal.CurrentMaterializedBytes > wpcCompressedGlobal.PeakMaterializedBytes {
+		wpcCompressedGlobal.PeakMaterializedBytes = wpcCompressedGlobal.CurrentMaterializedBytes
+	}
+	if wpcCompressedGlobal.CurrentMaterializedTransforms > wpcCompressedGlobal.PeakMaterializedTransforms {
+		wpcCompressedGlobal.PeakMaterializedTransforms = wpcCompressedGlobal.CurrentMaterializedTransforms
+	}
+	wpcCompressedGlobalMu.Unlock()
+}
+
+func endWPCMaterialization(state *wpcCompressedTransformState) {
+	wpcCompressedGlobalMu.Lock()
+	if wpcCompressedGlobal.CurrentMaterializedBytes < state.FullPayloadBytes ||
+		wpcCompressedGlobal.CurrentMaterializedTransforms == 0 {
+		wpcCompressedGlobalMu.Unlock()
+		panic("WPC compressed materialization accounting underflow")
+	}
+	wpcCompressedGlobal.CurrentMaterializedBytes -= state.FullPayloadBytes
+	wpcCompressedGlobal.CurrentMaterializedTransforms--
+	wpcCompressedGlobalMu.Unlock()
+}
 
 func compressWPCEvaluationLimbs(
 	coeffs [][]uint64,
@@ -180,6 +244,7 @@ func registerWPCCompressedTransform(
 	wpcCompressedMu.Lock()
 	wpcCompressedTransforms[transformID] = state
 	wpcCompressedMu.Unlock()
+	registerWPCCompressedGlobal(state)
 }
 
 func lookupWPCCompressedTransform(transformID int) (*wpcCompressedTransformState, bool) {
@@ -191,20 +256,37 @@ func lookupWPCCompressedTransform(transformID int) (*wpcCompressedTransformState
 
 func deleteWPCCompressedTransform(transformID int) {
 	wpcCompressedMu.Lock()
-	delete(wpcCompressedTransforms, transformID)
+	state, ok := wpcCompressedTransforms[transformID]
+	if ok {
+		delete(wpcCompressedTransforms, transformID)
+	}
 	wpcCompressedMu.Unlock()
+	if ok {
+		state.mu.Lock()
+		if state.Materialized {
+			removeWPCMaterializationLocked(transformID, state)
+		}
+		unregisterWPCCompressedGlobal(state)
+		state.mu.Unlock()
+	}
 }
 
 func clearWPCCompressedTransforms() {
 	wpcCompressedMu.Lock()
 	wpcCompressedTransforms = make(map[int]*wpcCompressedTransformState)
 	wpcCompressedMu.Unlock()
+	wpcCompressedGlobalMu.Lock()
+	wpcCompressedGlobal = wpcCompressedGlobalState{}
+	wpcCompressedGlobalMu.Unlock()
 }
 
 func materializeWPCTransformLocked(
 	transformID int,
 	state *wpcCompressedTransformState,
 ) (int, bool) {
+	if state.Materialized {
+		return 0, false
+	}
 	transform := RetrieveLinearTransform(transformID)
 	count := 0
 	for key, diagonal := range state.Diagonals {
@@ -219,6 +301,7 @@ func materializeWPCTransformLocked(
 		count++
 	}
 	state.Materialized = true
+	beginWPCMaterialization(state)
 	return count, true
 }
 
@@ -226,11 +309,15 @@ func removeWPCMaterializationLocked(
 	transformID int,
 	state *wpcCompressedTransformState,
 ) {
+	wasMaterialized := state.Materialized
 	transform := RetrieveLinearTransform(transformID)
 	for key := range state.Diagonals {
 		transform.Vec[key] = ringqp.Poly{}
 	}
 	state.Materialized = false
+	if wasMaterialized {
+		endWPCMaterialization(state)
+	}
 }
 
 // GenerateWPCCompressedLinearTransform performs the offline Encode once,
@@ -446,6 +533,59 @@ func GetWPCCompressedLinearTransformStats(
 		wpcCompressedSchemaVersion,
 	}
 	state.mu.Unlock()
+	result, length := SliceToCArray(values, convertUint64ToCULonglong)
+	return result, C.ulonglong(length)
+}
+
+// ResetWPCCompressedGlobalMaterializationPeak starts a new lifecycle
+// measurement window without changing any registered compressed transforms.
+// The new peak begins at the currently materialized amount, which should be
+// zero between synchronous group evaluations.
+//
+//export ResetWPCCompressedGlobalMaterializationPeak
+func ResetWPCCompressedGlobalMaterializationPeak() {
+	wpcCompressedGlobalMu.Lock()
+	wpcCompressedGlobal.PeakMaterializedBytes = wpcCompressedGlobal.CurrentMaterializedBytes
+	wpcCompressedGlobal.PeakMaterializedTransforms = wpcCompressedGlobal.CurrentMaterializedTransforms
+	wpcCompressedGlobalMu.Unlock()
+}
+
+// GetWPCCompressedGlobalStats returns aggregate resident-storage and
+// materialization-lifecycle accounting across every registered compressed
+// transform. Values are, in order: registered transforms, aggregate full,
+// compressed, metadata, and stored bytes, current and peak materialized full
+// bytes, current and peak materialized transform counts, maximum live
+// single-transform full bytes, offline and online weight Encode calls, and the
+// backend schema version.
+//
+//export GetWPCCompressedGlobalStats
+func GetWPCCompressedGlobalStats() (*C.ulonglong, C.ulonglong) {
+	wpcCompressedMu.Lock()
+	maxSingleTransformFullBytes := uint64(0)
+	for _, state := range wpcCompressedTransforms {
+		if state.FullPayloadBytes > maxSingleTransformFullBytes {
+			maxSingleTransformFullBytes = state.FullPayloadBytes
+		}
+	}
+	wpcCompressedMu.Unlock()
+
+	wpcCompressedGlobalMu.Lock()
+	values := []uint64{
+		wpcCompressedGlobal.RegisteredTransformCount,
+		wpcCompressedGlobal.AggregateFullPayloadBytes,
+		wpcCompressedGlobal.AggregateCompressedBytes,
+		wpcCompressedGlobal.AggregateMetadataBytes,
+		wpcCompressedGlobal.AggregateCompressedBytes + wpcCompressedGlobal.AggregateMetadataBytes,
+		wpcCompressedGlobal.CurrentMaterializedBytes,
+		wpcCompressedGlobal.PeakMaterializedBytes,
+		wpcCompressedGlobal.CurrentMaterializedTransforms,
+		wpcCompressedGlobal.PeakMaterializedTransforms,
+		maxSingleTransformFullBytes,
+		wpcCompressedGlobal.OfflineEncodeCalls,
+		wpcCompressedGlobal.OnlineEncodeCalls,
+		wpcCompressedSchemaVersion,
+	}
+	wpcCompressedGlobalMu.Unlock()
 	result, length := SliceToCArray(values, convertUint64ToCULonglong)
 	return result, C.ulonglong(length)
 }

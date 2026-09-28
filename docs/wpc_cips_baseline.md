@@ -117,6 +117,11 @@ reconstructed output is identical to full CIPS, uses the same 17 rotations,
 performs zero online weight-plaintext Encode calls, and releases the full
 materialization after evaluation. See `docs/wpc_compressed_qp.md`.
 
+The follow-on multi-group baseline applies this mechanism to a 2 x 2 matrix of
+input/output ciphertext groups, performs encrypted partial-result
+accumulation, and proves with backend-wide accounting that only one transform
+is materialized at a time. See `docs/wpc_multigroup_compressed_qp.md`.
+
 The storage values are analytical Q/P payload accounting. They are not peak
 resident memory measurements. The recorded timings are single diagnostic
 executions without warmup and must not be used for performance comparisons.
@@ -147,9 +152,9 @@ log and the exact Git commit used for the run.
 
 ## Scope and next implementation work
 
-This baseline deliberately does not yet implement:
+This single-transform baseline deliberately does not itself implement the
+following (multi-group execution is covered by the follow-on baseline):
 
-- multiple ciphertext channel groups;
 - WPC's downsampling reshaping layer;
 - training or fine-tuning for Rotation Padding;
 - matched model-level runtime and memory measurements.

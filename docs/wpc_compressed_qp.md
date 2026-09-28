@@ -8,6 +8,10 @@ reconstructibility-only check with an executable path that stores compressed
 Q/P data, reconstructs full plaintext polynomials online without Encode,
 evaluates the linear transform, and immediately releases the materialization.
 
+The mechanism has subsequently been extended to a matrix of input/output
+ciphertext channel groups with backend-wide peak-materialization accounting.
+See `docs/wpc_multigroup_compressed_qp.md`.
+
 It remains a mechanism-level correctness experiment. Timings are single-run
 diagnostics, not model-level performance results.
 
@@ -108,6 +112,8 @@ or repetition.
   reconstruction, byte accounting, and invalid-period rejection.
 - `tools/run_wpc_cips_baseline.py` performs the three-way full-control,
   full-CIPS, and compressed-CIPS comparison.
+- `tools/run_wpc_cips_multigroup.py` applies the same storage lifecycle to
+  multiple input/output ciphertext groups and accumulates partial outputs.
 
 Compressed state is removed with its transform and cleared on scheme deletion,
 so it does not outlive the Lattigo objects it references.
@@ -143,10 +149,9 @@ A valid run exits with status zero and reports schema version 3,
 
 ## Limitations
 
-- The experiment contains one single-ciphertext transform, not a complete
-  ResNet, VGG, or U-Net execution.
-- It does not yet manage compressed transforms across multiple ciphertext
-  channel groups.
+- This specific experiment contains one single-ciphertext transform; the
+  separate multi-group baseline covers a transform matrix but is still not a
+  complete ResNet, VGG, or U-Net execution.
 - It does not implement WPC downsampling reshaping or trained-model accuracy.
 - At-rest payload accounting is exact, while metadata accounting is logical;
   neither is a process RSS or Go-heap measurement.

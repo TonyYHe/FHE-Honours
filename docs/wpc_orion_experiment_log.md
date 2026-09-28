@@ -387,3 +387,51 @@ and timing run. Because the only eligible messages are 14 structural
 materializers (0.016575% byte coverage), selective WPC on Orion cannot establish
 the proposed layout crossover; the decisive next experiment is a matched
 CIPS/Rotation-Padding reproduction versus Orion.
+
+### 2026-09-28 — Multi-group compressed CIPS functional baseline
+
+- Executor: local deterministic correctness run; server confirmation pending
+- Layout: CIPS with flattened two-dimensional Rotation Padding
+- Convolution: 12 input channels, 12 output channels, `3 x 3`, `8 x 8`
+  spatial grid
+- CKKS: `LogN=10`, 512 slots, channel capacity 8
+- Group matrix: 2 output groups x 2 input groups, four transforms
+- Result: valid
+- Machine-readable result:
+  `.tmp/results/honours/13_wpc_multigroup/cips_multigroup_compressed_qp.json`
+
+| Metric | Result |
+|---|---:|
+| Clear grouped-vs-global maximum error | `4.44e-15` |
+| Encoded Q/P diagonal checks | 318/318 pass |
+| Exact compressed-vs-full transforms | 4/4 pass |
+| Aggregate full Q/P payload | 10,420,224 B |
+| Aggregate compressed payload | 162,816 B |
+| Logical metadata | 17,904 B |
+| Stored payload plus metadata | 180,720 B |
+| Payload-only compression ratio | 64.0x |
+| Compression ratio including metadata | 57.659x |
+| Peak materialized full payload | 3,047,424 B |
+| Peak materialized transforms | 1 |
+| Aggregate-full / sequential-peak ratio | 3.419x |
+| Offline / online weight Encode calls | 4 / 0 |
+| Full / compressed LT rotations | 71 / 71 |
+| Ciphertext accumulation additions | 2 per path |
+| Compressed output delta vs. full | 0 |
+| Maximum FHE error vs. clear | `1.81e-7` |
+| Materialized payload after execution | 0 B |
+
+The runner compiles one transform for each input/output group pair. The
+compressed path synchronously reconstructs one transform, evaluates it,
+releases its full Q/P representation, and only then proceeds to the next
+transform. Backend-wide counters observed zero materialized bytes before and
+after every call, one transform at peak, and peak bytes equal to the largest
+single transform rather than aggregate full storage. This proves the intended
+multi-group storage lifecycle and encrypted accumulation mechanics.
+
+The full-Q/P transforms coexist in this runner only as an exact correctness
+control. Payload counts are exact logical Q/P storage, not process RSS. The
+single diagnostic timings have no warmup or repetitions and are not a
+performance result. Model-layer integration, WPC downsampling reshaping,
+trained Rotation-Padding accuracy, repeated latency, and process-RSS
+measurements remain outstanding.
