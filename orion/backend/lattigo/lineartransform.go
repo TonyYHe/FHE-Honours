@@ -1488,6 +1488,7 @@ func LinearTransformUsesStreaming(id C.int) C.int {
 func DeleteLinearTransform(id C.int) {
 	deleteStreamingLTState(int(id))
 	deletePredecodedPlaintextDiagonals(int(id))
+	deleteWPCCompressedTransform(int(id))
 	ltHeap.Delete(int(id))
 }
 

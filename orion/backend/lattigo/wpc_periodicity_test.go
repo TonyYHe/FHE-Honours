@@ -120,3 +120,68 @@ func TestWPCEncodedCandidateVerifier(t *testing.T) {
 		verifyWPCEncodedReal(params, nonPeriodic, params.MaxLevel(), 8),
 	)
 }
+
+func TestWPCCompressedQPPayloadRoundTrip(t *testing.T) {
+	params := wpcTestParameters(t)
+	slotPeriod := 8
+	transform := wpcTestTransformation(params)
+	require.NoError(t, lintrans.Encode(
+		ckks.NewEncoder(params),
+		lintrans.Diagonals[float64]{
+			0: periodicValues(params.MaxSlots(), slotPeriod, 912),
+		},
+		transform,
+	))
+
+	original := transform.Vec[0]
+	compressed, fullBytes, compressedBytes, ok := compressWPCQPEvaluationPoly(
+		original,
+		slotPeriod,
+	)
+	require.True(t, ok)
+	require.Equal(t, uint64((params.MaxLevel()+1+params.MaxLevelP()+1)*params.N()*8), fullBytes)
+	require.Equal(t, uint64((params.MaxLevel()+1+params.MaxLevelP()+1)*2*slotPeriod*8), compressedBytes)
+	require.Equal(t, uint64(params.MaxSlots()/slotPeriod), fullBytes/compressedBytes)
+
+	reconstructed, ok := reconstructWPCDiagonal(
+		wpcCompressedDiagonal{
+			Key:              0,
+			SlotPeriod:       slotPeriod,
+			EvaluationPeriod: 2 * slotPeriod,
+			LevelQ:           original.LevelQ(),
+			LevelP:           original.LevelP(),
+			Representatives:  compressed,
+		},
+		params.N(),
+	)
+	require.True(t, ok)
+	require.True(t, original.Equal(&reconstructed))
+
+	_, ok = reconstructWPCDiagonal(
+		wpcCompressedDiagonal{
+			Key:              0,
+			SlotPeriod:       slotPeriod,
+			EvaluationPeriod: 2*slotPeriod + 1,
+			LevelQ:           original.LevelQ(),
+			LevelP:           original.LevelP(),
+			Representatives:  compressed,
+		},
+		params.N(),
+	)
+	require.False(t, ok)
+}
+
+func TestWPCCompressionRejectsWrongEvaluationPeriod(t *testing.T) {
+	params := wpcTestParameters(t)
+	transform := wpcTestTransformation(params)
+	require.NoError(t, lintrans.Encode(
+		ckks.NewEncoder(params),
+		lintrans.Diagonals[float64]{
+			0: periodicValues(params.MaxSlots(), 8, 321),
+		},
+		transform,
+	))
+
+	_, _, _, ok := compressWPCQPEvaluationPoly(transform.Vec[0], 4)
+	require.False(t, ok)
+}

@@ -810,6 +810,80 @@ class LattigoLibrary:
             restype=ctypes.c_int
         )
 
+        generate_wpc_compressed = getattr(
+            self.lib,
+            "GenerateWPCCompressedLinearTransform",
+            None,
+        )
+        decompress_wpc = getattr(self.lib, "DecompressWPCLinearTransform", None)
+        verify_wpc_exact = getattr(
+            self.lib,
+            "VerifyWPCDecompressedLinearTransformExact",
+            None,
+        )
+        remove_wpc_decompressed = getattr(
+            self.lib,
+            "RemoveWPCDecompressedLinearTransform",
+            None,
+        )
+        evaluate_wpc_compressed = getattr(
+            self.lib,
+            "EvaluateWPCCompressedLinearTransform",
+            None,
+        )
+        get_wpc_stats = getattr(
+            self.lib,
+            "GetWPCCompressedLinearTransformStats",
+            None,
+        )
+        if all(
+            value is not None
+            for value in (
+                generate_wpc_compressed,
+                decompress_wpc,
+                verify_wpc_exact,
+                remove_wpc_decompressed,
+                evaluate_wpc_compressed,
+                get_wpc_stats,
+            )
+        ):
+            self.GenerateWPCCompressedLinearTransform = LattigoFunction(
+                generate_wpc_compressed,
+                argtypes=[
+                    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_float,
+                    ctypes.c_int,
+                ],
+                restype=ctypes.c_int,
+            )
+            self.DecompressWPCLinearTransform = LattigoFunction(
+                decompress_wpc,
+                argtypes=[ctypes.c_int],
+                restype=ctypes.c_int,
+            )
+            self.VerifyWPCDecompressedLinearTransformExact = LattigoFunction(
+                verify_wpc_exact,
+                argtypes=[ctypes.c_int, ctypes.c_int],
+                restype=ctypes.c_int,
+            )
+            self.RemoveWPCDecompressedLinearTransform = LattigoFunction(
+                remove_wpc_decompressed,
+                argtypes=[ctypes.c_int],
+                restype=None,
+            )
+            self.EvaluateWPCCompressedLinearTransform = LattigoFunction(
+                evaluate_wpc_compressed,
+                argtypes=[ctypes.c_int, ctypes.c_int],
+                restype=ctypes.c_int,
+            )
+            self.GetWPCCompressedLinearTransformStats = LattigoFunction(
+                get_wpc_stats,
+                argtypes=[ctypes.c_int],
+                restype=ArrayResultUInt64,
+            )
+
         generate_batch = getattr(self.lib, "GenerateLinearTransformsBatch", None)
         if generate_batch is not None:
             self.GenerateLinearTransformsBatch = LattigoFunction(

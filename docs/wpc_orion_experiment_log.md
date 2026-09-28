@@ -133,6 +133,44 @@ single-ciphertext mechanism test. Multi-ciphertext channel groups,
 downsampling reshaping, model fine-tuning, compressed online decompression,
 and model-level performance measurements remain out of scope.
 
+### 2026-09-28 — Real compressed Q/P storage and online decompression
+
+- Executor: local development machine
+- Backend: real Lattigo CKKS
+- Workload: the validated single-ciphertext `3 x 3` CIPS transform
+- Result: `.tmp/results/honours/12_wpc_compressed_qp/cips_3x3_compressed_qp.json`
+- Result schema: 3
+- Result: valid
+
+| Gate or metric | Result |
+|---|---:|
+| Compressed diagonals | 63 |
+| Full Q/P payload | 2,064,384 B |
+| Compressed Q/P payload | 32,256 B |
+| Logical period/level metadata | 3,552 B |
+| Stored payload plus metadata | 35,808 B |
+| Payload-only compression ratio | 64.0x |
+| Compression ratio including metadata | 57.651x |
+| Exact decompressed-vs-full Q/P equality | pass |
+| Offline weight-plaintext Encode calls | 1 |
+| Online weight-plaintext Encode calls | 0 |
+| Compressed-vs-full decrypted output delta | 0 |
+| Full/compressed CIPS rotation counts | 17 / 17 |
+| Maximum error vs. clear reference | `2.04e-7` |
+| Full bytes materialized after online call | 0 B |
+
+The online path copies stored representatives into full Q/P polynomials,
+evaluates the ordinary Lattigo transform, and releases those polynomials before
+returning. The default local diagnostic recorded approximately `0.24 ms` for
+decompression and `1.64 ms` for evaluation. Those single-run numbers are not a
+performance claim.
+
+This result advances beyond the earlier candidate verifier: the compressed
+representation is now the state retained by a real transform and is consumed
+by an executable encrypted evaluation path. It still covers only one
+single-ciphertext transform and temporarily materializes that transform during
+evaluation; multi-group model integration and peak-memory measurement remain.
+
 ### 2026-09-27 — ResNet20 Orion slot-periodicity census
 
 - Executor: user, on `tony@corg-comb`

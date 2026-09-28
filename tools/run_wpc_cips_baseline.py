@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run the matched WPC CIPS/Rotation-Padding correctness baseline.
+"""Run the matched WPC CIPS and compressed-Q/P correctness baseline.
 
 This is an audit microbenchmark, not a performance result. It uses the same
 input, weights, ring size, and clear rotate/multiply/accumulate evaluator for a
 channel-first control and a channel-innermost CIPS layout. Every CIPS weight
-message is additionally encoded by real Lattigo and must pass exact Q/P
-copy-map reconstruction.
+message must pass exact Q/P copy-map reconstruction, then a real compressed
+transform must decompress without Encode and match the full transform.
 """
 
 from __future__ import annotations
@@ -44,7 +44,28 @@ from orion.experimental.wpc_periodicity import (
 )
 
 
-DEFAULT_OUT = REPO_ROOT / ".tmp/results/honours/11_wpc_cips_baseline/cips_baseline.json"
+DEFAULT_OUT = (
+    REPO_ROOT
+    / ".tmp/results/honours/12_wpc_compressed_qp/cips_3x3_compressed_qp.json"
+)
+
+WPC_COMPRESSED_STATS_FIELDS = (
+    "diagonal_count",
+    "full_payload_bytes",
+    "compressed_payload_bytes",
+    "metadata_bytes",
+    "stored_payload_plus_metadata_bytes",
+    "min_slot_period",
+    "max_slot_period",
+    "last_decompress_nanoseconds",
+    "last_evaluate_nanoseconds",
+    "weight_plaintext_offline_encode_calls",
+    "weight_plaintext_online_encode_calls",
+    "decompression_count",
+    "evaluation_count",
+    "materialized_full_payload_bytes",
+    "backend_schema_version",
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -97,6 +118,34 @@ def _params(logn: int) -> NewParameters:
             },
         }
     )
+
+
+def _decode_wpc_compressed_stats(values: list[int]) -> dict[str, Any]:
+    if len(values) != len(WPC_COMPRESSED_STATS_FIELDS):
+        raise RuntimeError(
+            "unexpected WPC compressed-transform statistics length: "
+            f"{len(values)} != {len(WPC_COMPRESSED_STATS_FIELDS)}"
+        )
+    result = {
+        name: int(value)
+        for name, value in zip(WPC_COMPRESSED_STATS_FIELDS, values)
+    }
+    full_bytes = int(result["full_payload_bytes"])
+    compressed_bytes = int(result["compressed_payload_bytes"])
+    stored_bytes = int(result["stored_payload_plus_metadata_bytes"])
+    result["payload_compression_ratio"] = (
+        float(full_bytes / compressed_bytes) if compressed_bytes else None
+    )
+    result["storage_compression_ratio_including_metadata"] = (
+        float(full_bytes / stored_bytes) if stored_bytes else None
+    )
+    result["last_decompress_s"] = float(
+        int(result["last_decompress_nanoseconds"]) / 1_000_000_000
+    )
+    result["last_evaluate_s"] = float(
+        int(result["last_evaluate_nanoseconds"]) / 1_000_000_000
+    )
+    return result
 
 
 def _encoded_qp_verify(
@@ -163,6 +212,7 @@ def _real_fhe_evaluate(
     reference: np.ndarray,
     case: CIPSConvCase,
     diagonals_by_layout: dict[str, dict[int, np.ndarray]],
+    cips_slot_period: int,
     logn: int,
     bsgs_ratio: float,
     enabled: bool,
@@ -173,6 +223,7 @@ def _real_fhe_evaluate(
             "enabled": False,
             "complete": False,
             "all_layouts_correct": False,
+            "compressed_path_valid": False,
             "layouts": {},
         }
 
@@ -199,7 +250,25 @@ def _real_fhe_evaluate(
     scheme = orion.init_scheme(config)
     init_s = float(time.perf_counter() - init_started)
     rows: dict[str, Any] = {}
+    compressed_path: dict[str, Any] = {}
     try:
+        required_methods = (
+            "GenerateWPCCompressedLinearTransform",
+            "DecompressWPCLinearTransform",
+            "VerifyWPCDecompressedLinearTransformExact",
+            "RemoveWPCDecompressedLinearTransform",
+            "EvaluateWPCCompressedLinearTransform",
+            "GetWPCCompressedLinearTransformStats",
+        )
+        missing = [
+            name for name in required_methods if not hasattr(scheme.backend, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "Lattigo library is missing WPC compressed-Q/P APIs: "
+                + ", ".join(missing)
+            )
+
         transform_ids: dict[str, int] = {}
         compile_s: dict[str, float] = {}
         key_prepare_s: dict[str, float] = {}
@@ -226,6 +295,64 @@ def _real_fhe_evaluate(
             key_prepare_s[layout] = float(time.perf_counter() - started)
             transform_ids[layout] = transform_id
 
+        cips_diagonals = diagonals_by_layout[LAYOUT_CIPS]
+        cips_indices = [int(value) for value in sorted(cips_diagonals)]
+        cips_flattened = np.concatenate(
+            [
+                np.asarray(cips_diagonals[index], dtype=np.float32)
+                for index in cips_indices
+            ]
+        ).tolist()
+        started = time.perf_counter()
+        compressed_transform_id = int(
+            scheme.backend.GenerateWPCCompressedLinearTransform(
+                cips_indices,
+                cips_flattened,
+                level_q,
+                float(bsgs_ratio),
+                int(cips_slot_period),
+            )
+        )
+        compressed_generate_s = float(time.perf_counter() - started)
+        started = time.perf_counter()
+        scheme.lt_evaluator.generate_rotation_keys(compressed_transform_id)
+        compressed_key_prepare_s = float(time.perf_counter() - started)
+
+        stats_after_compression = _decode_wpc_compressed_stats(
+            scheme.backend.GetWPCCompressedLinearTransformStats(
+                compressed_transform_id
+            )
+        )
+        started = time.perf_counter()
+        manually_decompressed_count = int(
+            scheme.backend.DecompressWPCLinearTransform(compressed_transform_id)
+        )
+        manual_decompress_call_s = float(time.perf_counter() - started)
+        exact_qp_match = bool(
+            int(
+                scheme.backend.VerifyWPCDecompressedLinearTransformExact(
+                    int(transform_ids[LAYOUT_CIPS]),
+                    compressed_transform_id,
+                )
+            )
+            == 1
+        )
+        stats_while_materialized = _decode_wpc_compressed_stats(
+            scheme.backend.GetWPCCompressedLinearTransformStats(
+                compressed_transform_id
+            )
+        )
+        scheme.backend.RemoveWPCDecompressedLinearTransform(
+            compressed_transform_id
+        )
+        stats_after_manual_release = _decode_wpc_compressed_stats(
+            scheme.backend.GetWPCCompressedLinearTransformStats(
+                compressed_transform_id
+            )
+        )
+
+        ciphertext_ids: dict[str, int] = {}
+        output_tensors: dict[str, np.ndarray] = {}
         for layout in (LAYOUT_CHANNEL_FIRST, LAYOUT_CIPS):
             packed = pack_tensor(tensor, case, layout)
             started = time.perf_counter()
@@ -237,6 +364,7 @@ def _real_fhe_evaluate(
             started = time.perf_counter()
             ciphertext = scheme.encrypt(plaintext)
             encrypt_s = float(time.perf_counter() - started)
+            ciphertext_ids[layout] = int(ciphertext.ids[0])
             scheme.backend.ResetOperationCounters()
             started = time.perf_counter()
             output_id = int(
@@ -254,6 +382,7 @@ def _real_fhe_evaluate(
             )
             decrypt_decode_s = float(time.perf_counter() - started)
             output = unpack_output(decoded, case, layout)
+            output_tensors[layout] = output
             error = np.abs(output - reference)
             rows[layout] = {
                 "correct": bool(
@@ -274,15 +403,126 @@ def _real_fhe_evaluate(
                     "conjugation": counters[3] if len(counters) > 3 else None,
                 },
             }
+
+        scheme.backend.ResetOperationCounters()
+        started = time.perf_counter()
+        compressed_output_id = int(
+            scheme.backend.EvaluateWPCCompressedLinearTransform(
+                compressed_transform_id,
+                int(ciphertext_ids[LAYOUT_CIPS]),
+            )
+        )
+        compressed_call_s = float(time.perf_counter() - started)
+        compressed_counters = [
+            int(value) for value in scheme.backend.GetOperationCounters()
+        ]
+        started = time.perf_counter()
+        compressed_decoded = np.asarray(
+            scheme.backend.Decode(
+                scheme.backend.Decrypt(compressed_output_id)
+            )[: int(case.slots)],
+            dtype=np.float64,
+        )
+        compressed_decrypt_decode_s = float(time.perf_counter() - started)
+        compressed_output = unpack_output(
+            compressed_decoded,
+            case,
+            LAYOUT_CIPS,
+        )
+        compressed_error = np.abs(compressed_output - reference)
+        compressed_full_delta = np.abs(
+            compressed_output - output_tensors[LAYOUT_CIPS]
+        )
+        compressed_operation_counters = {
+            "rotation_total": (
+                compressed_counters[0] if len(compressed_counters) > 0 else None
+            ),
+            "linear_transform_rotation": (
+                compressed_counters[1] if len(compressed_counters) > 1 else None
+            ),
+            "direct_rotation": (
+                compressed_counters[2] if len(compressed_counters) > 2 else None
+            ),
+            "conjugation": (
+                compressed_counters[3] if len(compressed_counters) > 3 else None
+            ),
+        }
+        stats_after_evaluation = _decode_wpc_compressed_stats(
+            scheme.backend.GetWPCCompressedLinearTransformStats(
+                compressed_transform_id
+            )
+        )
+        operation_counters_match = bool(
+            compressed_operation_counters
+            == rows[LAYOUT_CIPS]["operation_counters"]
+        )
+        rows["cips_compressed_qp"] = {
+            "correct": bool(
+                np.allclose(
+                    compressed_output,
+                    reference,
+                    rtol=0.0,
+                    atol=float(atol),
+                )
+            ),
+            "max_abs_error": float(np.max(compressed_error)),
+            "mean_abs_error": float(np.mean(compressed_error)),
+            "max_abs_delta_vs_full_cips": float(np.max(compressed_full_delta)),
+            "decompress_and_evaluate_call_s": compressed_call_s,
+            "decrypt_decode_s": compressed_decrypt_decode_s,
+            "operation_counters": compressed_operation_counters,
+            "operation_counters_match_full_cips": operation_counters_match,
+        }
+        compressed_path_valid = bool(
+            exact_qp_match
+            and manually_decompressed_count
+            == int(stats_after_compression["diagonal_count"])
+            and int(stats_while_materialized["materialized_full_payload_bytes"])
+            == int(stats_after_compression["full_payload_bytes"])
+            and int(stats_after_manual_release["materialized_full_payload_bytes"])
+            == 0
+            and rows["cips_compressed_qp"]["correct"]
+            and float(rows["cips_compressed_qp"]["max_abs_delta_vs_full_cips"])
+            <= float(atol)
+            and operation_counters_match
+            and int(stats_after_evaluation["weight_plaintext_offline_encode_calls"])
+            == 1
+            and int(stats_after_evaluation["weight_plaintext_online_encode_calls"])
+            == 0
+            and int(stats_after_evaluation["materialized_full_payload_bytes"])
+            == 0
+            and int(stats_after_evaluation["compressed_payload_bytes"])
+            < int(stats_after_evaluation["full_payload_bytes"])
+        )
+        compressed_path = {
+            "valid": compressed_path_valid,
+            "slot_period": int(cips_slot_period),
+            "offline_generate_encode_compress_s": compressed_generate_s,
+            "rotation_key_prepare_s": compressed_key_prepare_s,
+            "manual_decompression_call_s": manual_decompress_call_s,
+            "manual_decompressed_diagonal_count": manually_decompressed_count,
+            "exact_qp_match_vs_full_transform": exact_qp_match,
+            "stats_after_compression": stats_after_compression,
+            "stats_while_manually_materialized": stats_while_materialized,
+            "stats_after_manual_release": stats_after_manual_release,
+            "stats_after_online_evaluation": stats_after_evaluation,
+            "online_path": rows["cips_compressed_qp"],
+            "online_encode_definition": (
+                "weight-plaintext Encode calls inside decompression/evaluation; "
+                "input ciphertext encoding is separate"
+            ),
+        }
     finally:
         scheme.delete_scheme()
 
+    all_paths_correct = bool(
+        len(rows) == 3 and all(bool(row["correct"]) for row in rows.values())
+    )
     return {
         "enabled": True,
-        "complete": bool(len(rows) == 2),
-        "all_layouts_correct": bool(
-            len(rows) == 2 and all(bool(row["correct"]) for row in rows.values())
-        ),
+        "complete": bool(all_paths_correct and compressed_path.get("valid", False)),
+        "all_layouts_correct": all_paths_correct,
+        "compressed_path_valid": bool(compressed_path.get("valid", False)),
         "scheme_init_and_base_keys_s": init_s,
         "bsgs_ratio": float(bsgs_ratio),
         "correctness_atol": float(atol),
@@ -290,6 +530,7 @@ def _real_fhe_evaluate(
             "single diagnostic execution without warmup; not a performance comparison"
         ),
         "layouts": rows,
+        "compressed_qp_storage_and_online_decompression": compressed_path,
     }
 
 
@@ -357,10 +598,20 @@ def main() -> int:
     }
     cips_diagonals = diagonals_by_layout[LAYOUT_CIPS]
     cips_periodicity = comparison["layouts"][LAYOUT_CIPS]["periodicity"]
+    cips_slot_periods = {
+        int(value)
+        for value in comparison["layouts"][LAYOUT_CIPS][
+            "minimal_slot_period_by_rotation"
+        ].values()
+    }
+    cips_common_slot_period = (
+        next(iter(cips_slot_periods)) if len(cips_slot_periods) == 1 else 0
+    )
     cips_all_nonzero_periodic = bool(
         int(cips_periodicity["periodic_count"])
         == int(cips_periodicity["nonzero_count"])
         == int(comparison["layouts"][LAYOUT_CIPS]["diagonal_count"])
+        and cips_common_slot_period > 0
     )
 
     encoded_verification: dict[str, Any]
@@ -378,6 +629,7 @@ def main() -> int:
         reference=rotation_padded_reference(tensor, weights, case),
         case=case,
         diagonals_by_layout=diagonals_by_layout,
+        cips_slot_period=int(cips_common_slot_period),
         logn=int(args.logn),
         bsgs_ratio=float(args.bsgs_ratio),
         enabled=not bool(args.skip_fhe_eval),
@@ -393,6 +645,7 @@ def main() -> int:
         and encoded_verification["complete"]
         and real_fhe["complete"]
         and real_fhe["all_layouts_correct"]
+        and real_fhe["compressed_path_valid"]
         and float(comparison["rotation_padding_vs_zero_padding_max_abs_delta"]) > 0.0
         and (
             not two_dimensional_wrap_required
@@ -402,8 +655,8 @@ def main() -> int:
         )
     )
     payload = {
-        "schema_version": 2,
-        "profile": "wpc_cips_rotation_padding_functional_baseline",
+        "schema_version": 3,
+        "profile": "wpc_cips_compressed_qp_functional_baseline",
         "status": "ok" if accepted else "invalid",
         "timing_policy": "correctness_and_accounting_only_not_for_performance_claims",
         "seed": int(args.seed),
@@ -422,6 +675,10 @@ def main() -> int:
             "stride": [1, 1],
             "rotation_padding": (
                 "algorithm2_flattened_spatial_cyclic_adjacent_same_channel"
+            ),
+            "wpc_compressed_qp_storage": (
+                "one evaluation period per active Q/P limb with online copy-map "
+                "materialization and no weight-plaintext Encode"
             ),
             "matches_wpc_paper": "Algorithms 1-2 and Figures 8-10 functional subset",
             "limitations": [
@@ -446,6 +703,9 @@ def main() -> int:
             "cips_encoded_qp_roundtrip_complete": bool(encoded_verification["complete"]),
             "both_layouts_match_reference_under_real_fhe": bool(
                 real_fhe["all_layouts_correct"]
+            ),
+            "compressed_qp_storage_and_online_decompression_valid": bool(
+                real_fhe["compressed_path_valid"]
             ),
             "rotation_padding_boundary_change_observed": bool(
                 float(comparison["rotation_padding_vs_zero_padding_max_abs_delta"]) > 0.0

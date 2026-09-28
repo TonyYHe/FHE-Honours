@@ -66,7 +66,9 @@ round trips:
 
 Finally, both layouts are compiled as real Lattigo linear transforms,
 encrypted, evaluated, decrypted, and compared with the direct Rotation-Padded
-convolution.
+convolution. The CIPS transform is also encoded offline into real compressed
+Q/P storage, reconstructed online by coefficient copies without Encode,
+evaluated, and released.
 
 ## Acceptance gates
 
@@ -78,6 +80,10 @@ An output is valid only if all of the following hold:
 - slot-message reconstruction is exact;
 - exact encoded Q/P reconstruction passes for every CIPS candidate;
 - both layouts match the reference after real CKKS evaluation within `1e-6`;
+- the compressed Q/P transform exactly matches the full Q/P transform;
+- compressed and full CIPS outputs and operation counts match;
+- online weight-plaintext Encode calls and post-evaluation materialized bytes
+  are both zero;
 - a width offset exercises the flattened row-boundary wrap and differs from
   independent per-axis wrapping;
 - Rotation Padding is observably different from zero padding for the test case.
@@ -104,6 +110,13 @@ four output channels, and a `3 x 3` kernel. The deterministic seed is
 | Real-FHE maximum absolute error | `2.04e-7` | `2.04e-7` |
 | Real-FHE correctness at `1e-6` | pass | pass |
 
+The CIPS compressed execution stores 32,256 B of Q/P representatives plus
+3,552 B of logical metadata instead of 2,064,384 B of full Q/P payloads. This
+is a 64.0x payload ratio and a 57.651x ratio including metadata. Its
+reconstructed output is identical to full CIPS, uses the same 17 rotations,
+performs zero online weight-plaintext Encode calls, and releases the full
+materialization after evaluation. See `docs/wpc_compressed_qp.md`.
+
 The storage values are analytical Q/P payload accounting. They are not peak
 resident memory measurements. The recorded timings are single diagnostic
 executions without warmup and must not be used for performance comparisons.
@@ -116,10 +129,10 @@ From the repository root, after pulling the implementing commit:
 source .venv/bin/activate
 python tools/build_lattigo.py
 python -m pytest -q tests/test_wpc_cips_baseline.py tests/test_wpc_periodicity.py
-mkdir -p .tmp/results/honours/11_wpc_cips_baseline
+mkdir -p .tmp/results/honours/12_wpc_compressed_qp
 python tools/run_wpc_cips_baseline.py \
-  --out .tmp/results/honours/11_wpc_cips_baseline/cips_baseline.json \
-  2>&1 | tee .tmp/results/honours/11_wpc_cips_baseline/cips_baseline.log
+  --out .tmp/results/honours/12_wpc_compressed_qp/cips_3x3_compressed_qp.json \
+  2>&1 | tee .tmp/results/honours/12_wpc_compressed_qp/cips_3x3_compressed_qp.log
 ```
 
 A successful run exits with status zero and reports:
@@ -139,7 +152,6 @@ This baseline deliberately does not yet implement:
 - multiple ciphertext channel groups;
 - WPC's downsampling reshaping layer;
 - training or fine-tuning for Rotation Padding;
-- the compressed online Encode/decompression path;
 - matched model-level runtime and memory measurements.
 
 Therefore, it proves that the implemented CIPS/Rotation-Padding subset creates
