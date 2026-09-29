@@ -484,3 +484,39 @@ model. PyTorch clear Conv2d still has zero-padding semantics; model training or
 fine-tuning must explicitly adopt Rotation Padding. Activation/bootstrap,
 stride-two reshaping, residual/concatenation paths, RSS, repeated timing, and
 trained accuracy remain outside this stage.
+
+### 2026-09-29 — Isolated full vs compressed resource benchmark
+
+- Executor: local deterministic validation; Linux server confirmation pending
+- Workers: separate fresh `full` and `compressed` processes
+- Modules: two actual `orion.nn.Conv2d(12,12,3)` layers with bias
+- Warmups / measured forwards: 2 / 10 per worker
+- Memory sampling: external macOS `ps` RSS plus Go `runtime.MemStats`
+- Result: valid; all acceptance gates pass
+- Machine-readable result:
+  `.tmp/results/honours/15_wpc_isolated_resource_benchmark/comparison.json`
+- Generated report:
+  `.tmp/results/honours/15_wpc_isolated_resource_benchmark/comparison.md`
+
+| Metric | Full Q/P | WPC compressed |
+|---|---:|---:|
+| Logical resident plaintext storage | 18,284,544 B | 369,888 B |
+| Go heap-in-use after compile GC | 25,804,800 B | 7,979,008 B |
+| Pre-online RSS | 397,885,440 B | 386,646,016 B |
+| Measured-phase peak RSS | 414,318,592 B | 387,252,224 B |
+| Median two-layer forward | 12.221 ms | 15.064 ms |
+| p95 two-layer forward | 13.107 ms | 16.743 ms |
+| Maximum error versus clear | `3.11e-8` | `3.11e-8` |
+| Rotations per forward | 142 | 142 |
+| Online Encode calls | 0 | 0 |
+
+The local logical-storage ratio is 49.433x. The compressed median forward is
+1.233x the full-Q/P median; its median Q/P decompression time is 1.794 ms, or
+12.038% of compressed forward wall time. The independently encrypted outputs
+match exactly in this run.
+
+These timings and RSS values are machine-specific local evidence rather than
+the server result. RSS includes Python, Torch, keys, ciphertexts, and runtime
+allocator pages, while the logical payload count isolates transform storage.
+The Linux server run must replace these local performance observations before
+they are used in a thesis table.

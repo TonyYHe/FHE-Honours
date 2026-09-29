@@ -159,8 +159,10 @@ A valid run exits with status zero and reports every acceptance field as true.
 ## Remaining boundary
 
 This implementation proves layer planning, same-shape ciphertext handoff, bias
-addition, and level chaining. It is not yet a complete WPC network runtime.
-The next required features are activation/bootstrap integration, stride-two
-downsampling reshaping, residual/concatenation layout handling, trained-model
-Rotation-Padding accuracy, process-RSS measurement, and repeated server
-latency experiments.
+addition, and level chaining. The subsequent isolated full-vs-compressed
+resource benchmark adds process-RSS and repeated-latency measurement without
+co-resident control transforms; see `docs/wpc_isolated_resource_benchmark.md`.
+It is not yet a complete WPC network runtime. The next required features are
+activation/bootstrap integration, stride-two downsampling reshaping,
+residual/concatenation layout handling, and trained-model Rotation-Padding
+accuracy.

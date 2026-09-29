@@ -81,6 +81,39 @@ def test_conv2d_forward_dispatches_only_when_wpc_plan_is_installed() -> None:
     layer._wpc_cips_plan = None
 
 
+def test_conv2d_forward_dispatches_full_storage_without_compression() -> None:
+    layer = Conv2d(1, 1, 1, bias=False)
+
+    class _FakePlan:
+        storage_mode = "full"
+
+        def __init__(self) -> None:
+            self.compressed = None
+
+        def evaluate(self, value, *, compressed=True):
+            del value
+            self.compressed = compressed
+            return "full-output"
+
+    fake = _FakePlan()
+    layer._wpc_cips_plan = fake
+    layer.he()
+    assert layer(object()) == "full-output"
+    assert fake.compressed is False
+    layer._wpc_cips_plan = None
+
+
+def test_wpc_plan_validates_storage_mode_before_backend_use() -> None:
+    layer = Conv2d(1, 1, 1, bias=False)
+    layer.init_orion_params()
+    plan = WPCCIPSConv2dPlan(layer, input_shape=(1, 1, 8, 8), slots=512)
+
+    with pytest.raises(ValueError, match="storage_mode"):
+        plan.compile(object(), storage_mode="unknown")
+    with pytest.raises(ValueError, match="requires compressed storage"):
+        plan.compile(object(), storage_mode="full", verify_exact_qp=True)
+
+
 def test_wpc_plan_rejects_coexistence_with_ordinary_transform_resources() -> None:
     layer = Conv2d(1, 1, 1, bias=False)
     layer.transform_ids[(0, 0)] = 123

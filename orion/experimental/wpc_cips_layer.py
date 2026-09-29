@@ -64,6 +64,10 @@ WPC_GLOBAL_STATS_FIELDS = (
     "backend_schema_version",
 )
 
+WPC_STORAGE_COMPRESSED = "compressed"
+WPC_STORAGE_FULL = "full"
+WPC_STORAGE_MODES = (WPC_STORAGE_COMPRESSED, WPC_STORAGE_FULL)
+
 
 def _tuple2(value: Any) -> tuple[int, int]:
     if isinstance(value, int):
@@ -177,6 +181,7 @@ class WPCCIPSConv2dPlan:
         self.bias_plaintext: Any | None = None
         self.bias_plaintext_payload_bytes = 0
         self.include_full_control = False
+        self.storage_mode = WPC_STORAGE_COMPRESSED
         self.compiled = False
         self.cleaned = False
         self.last_evaluation: dict[str, Any] = {}
@@ -298,6 +303,7 @@ class WPCCIPSConv2dPlan:
         self,
         scheme: Any,
         *,
+        storage_mode: str = WPC_STORAGE_COMPRESSED,
         include_full_control: bool = False,
         verify_exact_qp: bool = True,
     ) -> dict[str, Any]:
@@ -305,21 +311,36 @@ class WPCCIPSConv2dPlan:
             raise RuntimeError("WPC CIPS Conv2d plan is already compiled")
         if self.cleaned:
             raise RuntimeError("a cleaned WPC CIPS Conv2d plan cannot be reused")
-        required = [
-            "GenerateWPCCompressedLinearTransform",
-            "EvaluateWPCCompressedLinearTransform",
-            "GetWPCCompressedLinearTransformStats",
-            "GetWPCCompressedGlobalStats",
-            "ResetWPCCompressedGlobalMaterializationPeak",
-        ]
-        if bool(verify_exact_qp):
+        storage_mode = str(storage_mode).strip().lower()
+        if storage_mode not in WPC_STORAGE_MODES:
+            raise ValueError(
+                f"storage_mode must be one of {WPC_STORAGE_MODES}, got {storage_mode!r}"
+            )
+        if storage_mode == WPC_STORAGE_FULL and bool(include_full_control):
+            raise ValueError("a full-storage plan is already the full control")
+        if storage_mode == WPC_STORAGE_FULL and bool(verify_exact_qp):
+            raise ValueError(
+                "exact compressed-Q/P verification requires compressed storage"
+            )
+        required: list[str] = []
+        if storage_mode == WPC_STORAGE_COMPRESSED:
             required.extend(
                 [
-                    "DecompressWPCLinearTransform",
-                    "VerifyWPCDecompressedLinearTransformExact",
-                    "RemoveWPCDecompressedLinearTransform",
+                    "GenerateWPCCompressedLinearTransform",
+                    "EvaluateWPCCompressedLinearTransform",
+                    "GetWPCCompressedLinearTransformStats",
+                    "GetWPCCompressedGlobalStats",
+                    "ResetWPCCompressedGlobalMaterializationPeak",
                 ]
             )
+            if bool(verify_exact_qp):
+                required.extend(
+                    [
+                        "DecompressWPCLinearTransform",
+                        "VerifyWPCDecompressedLinearTransformExact",
+                        "RemoveWPCDecompressedLinearTransform",
+                    ]
+                )
         missing = [name for name in required if not hasattr(scheme.backend, name)]
         if missing:
             raise RuntimeError("Lattigo backend is missing WPC APIs: " + ", ".join(missing))
@@ -337,6 +358,7 @@ class WPCCIPSConv2dPlan:
             raise ValueError("WPC Conv2d needs at least one remaining rescale level")
         self.output_level = int(self.level - 1)
         self.include_full_control = bool(include_full_control)
+        self.storage_mode = storage_mode
         weight, bias = self._weight_bias()
         group_rows = build_cips_group_transforms(weight, self.case)
         full_bytes_per_diagonal = (
@@ -363,7 +385,11 @@ class WPCCIPSConv2dPlan:
                 indices, flattened = self._flatten_diagonals(diagonals)
 
                 full_id: int | None = None
-                if bool(verify_exact_qp) or bool(include_full_control):
+                if (
+                    storage_mode == WPC_STORAGE_FULL
+                    or bool(verify_exact_qp)
+                    or bool(include_full_control)
+                ):
                     full_id = int(
                         scheme.backend.GenerateLinearTransform(
                             indices,
@@ -375,22 +401,24 @@ class WPCCIPSConv2dPlan:
                     )
                     scheme.lt_evaluator.generate_rotation_keys(full_id)
 
-                compressed_id = int(
-                    scheme.backend.GenerateWPCCompressedLinearTransform(
-                        indices,
-                        flattened,
-                        int(self.level),
-                        float(getattr(layer, "bsgs_ratio", 2.0)),
-                        period,
+                compressed_id: int | None = None
+                if storage_mode == WPC_STORAGE_COMPRESSED:
+                    compressed_id = int(
+                        scheme.backend.GenerateWPCCompressedLinearTransform(
+                            indices,
+                            flattened,
+                            int(self.level),
+                            float(getattr(layer, "bsgs_ratio", 2.0)),
+                            period,
+                        )
                     )
-                )
-                scheme.lt_evaluator.generate_rotation_keys(compressed_id)
-                self.compressed_transform_ids[key] = compressed_id
+                    scheme.lt_evaluator.generate_rotation_keys(compressed_id)
+                    self.compressed_transform_ids[key] = compressed_id
 
                 exact_qp_match: bool | None = None
                 manually_decompressed_count = 0
                 if bool(verify_exact_qp):
-                    if full_id is None:
+                    if full_id is None or compressed_id is None:
                         raise RuntimeError("exact Q/P verification requires a full transform")
                     manually_decompressed_count = int(
                         scheme.backend.DecompressWPCLinearTransform(compressed_id)
@@ -408,17 +436,37 @@ class WPCCIPSConv2dPlan:
                     if not exact_qp_match:
                         raise RuntimeError(f"group transform {key} failed exact Q/P verification")
 
-                if bool(include_full_control):
+                if storage_mode == WPC_STORAGE_FULL or bool(include_full_control):
                     if full_id is None:
                         raise RuntimeError("full control transform was not generated")
                     self.full_control_transform_ids[key] = int(full_id)
                 elif full_id is not None:
                     scheme.backend.DeleteLinearTransform(int(full_id))
 
-                stats = _decode_stats(
-                    scheme.backend.GetWPCCompressedLinearTransformStats(compressed_id),
-                    WPC_COMPRESSED_STATS_FIELDS,
+                full_payload_bytes = int(
+                    int(summary["diagonal_count"]) * full_bytes_per_diagonal
                 )
+                if compressed_id is not None:
+                    stats = _decode_stats(
+                        scheme.backend.GetWPCCompressedLinearTransformStats(
+                            compressed_id
+                        ),
+                        WPC_COMPRESSED_STATS_FIELDS,
+                    )
+                    resident_payload_bytes = int(stats["compressed_payload_bytes"])
+                    metadata_bytes = int(stats["metadata_bytes"])
+                else:
+                    stats = {
+                        "backend_schema_version": 1,
+                        "diagonal_count": int(summary["diagonal_count"]),
+                        "full_payload_bytes": full_payload_bytes,
+                        "resident_payload_bytes": full_payload_bytes,
+                        "metadata_bytes": 0,
+                        "stored_payload_plus_metadata_bytes": full_payload_bytes,
+                        "storage_mode": WPC_STORAGE_FULL,
+                    }
+                    resident_payload_bytes = full_payload_bytes
+                    metadata_bytes = 0
                 self.transform_rows[key] = {
                     "output_group": int(group_rows[key]["output_group"]),
                     "input_group": int(group_rows[key]["input_group"]),
@@ -426,6 +474,10 @@ class WPCCIPSConv2dPlan:
                     "input_channel_range": group_rows[key]["input_channel_range"],
                     "diagonal_count": int(summary["diagonal_count"]),
                     "slot_period": period,
+                    "storage_mode": storage_mode,
+                    "full_payload_bytes": full_payload_bytes,
+                    "resident_payload_bytes": resident_payload_bytes,
+                    "metadata_bytes": metadata_bytes,
                     "exact_qp_match": exact_qp_match,
                     "manual_decompressed_diagonal_count": int(
                         manually_decompressed_count
@@ -454,20 +506,26 @@ class WPCCIPSConv2dPlan:
             raise
 
     def storage_summary(self) -> dict[str, Any]:
-        rows = [row["stats_after_compile"] for row in self.transform_rows.values()]
+        rows = list(self.transform_rows.values())
         full_weights = int(sum(int(row["full_payload_bytes"]) for row in rows))
-        compressed_weights = int(
-            sum(int(row["compressed_payload_bytes"]) for row in rows)
+        resident_weights = int(
+            sum(int(row["resident_payload_bytes"]) for row in rows)
         )
         metadata = int(sum(int(row["metadata_bytes"]) for row in rows))
         full_including_bias = int(full_weights + self.bias_plaintext_payload_bytes)
         stored_including_bias = int(
-            compressed_weights + metadata + self.bias_plaintext_payload_bytes
+            resident_weights + metadata + self.bias_plaintext_payload_bytes
         )
         return {
+            "storage_mode": self.storage_mode,
             "transform_count": int(len(rows)),
             "full_weight_qp_payload_bytes": full_weights,
-            "compressed_weight_qp_payload_bytes": compressed_weights,
+            "resident_weight_qp_payload_bytes": resident_weights,
+            "compressed_weight_qp_payload_bytes": (
+                resident_weights
+                if self.storage_mode == WPC_STORAGE_COMPRESSED
+                else 0
+            ),
             "weight_metadata_bytes": metadata,
             "uncompressed_bias_q_payload_bytes": int(
                 self.bias_plaintext_payload_bytes
@@ -475,7 +533,7 @@ class WPCCIPSConv2dPlan:
             "full_weight_plus_bias_payload_bytes": full_including_bias,
             "stored_weight_plus_metadata_plus_bias_bytes": stored_including_bias,
             "weight_payload_compression_ratio": (
-                float(full_weights / compressed_weights) if compressed_weights else None
+                float(full_weights / resident_weights) if resident_weights else None
             ),
             "layer_plaintext_storage_compression_ratio": (
                 float(full_including_bias / stored_including_bias)
@@ -538,12 +596,14 @@ class WPCCIPSConv2dPlan:
         self,
         value: CipherTensor,
         *,
-        compressed: bool = True,
+        compressed: bool | None = None,
         record_sequence: bool = True,
     ) -> CipherTensor:
         if not self.compiled or self.scheme is None:
             raise RuntimeError("WPC CIPS plan must be compiled before evaluation")
         self._check_input_ciphertext(value)
+        if compressed is None:
+            compressed = self.storage_mode == WPC_STORAGE_COMPRESSED
         transform_ids = (
             self.compressed_transform_ids
             if bool(compressed)
@@ -625,7 +685,15 @@ class WPCCIPSConv2dPlan:
         )
         output._wpc_cips_packing_signature = self.output_packing_signature
         self.last_evaluation = {
-            "path": "compressed" if compressed else "full_control",
+            "path": (
+                "compressed"
+                if compressed
+                else (
+                    "full"
+                    if self.storage_mode == WPC_STORAGE_FULL
+                    else "full_control"
+                )
+            ),
             "transform_evaluation_count": int(self.case.transform_count),
             "ciphertext_accumulation_add_count": int(accumulation_add_count),
             "bias_plaintext_add_count": (
@@ -703,4 +771,7 @@ __all__ = [
     "WPCCIPSConv2dPlan",
     "WPC_COMPRESSED_STATS_FIELDS",
     "WPC_GLOBAL_STATS_FIELDS",
+    "WPC_STORAGE_COMPRESSED",
+    "WPC_STORAGE_FULL",
+    "WPC_STORAGE_MODES",
 ]

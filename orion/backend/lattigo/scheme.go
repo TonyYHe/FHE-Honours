@@ -4,6 +4,7 @@ import (
 	"C"
 
 	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 
 	"github.com/realqhc/lattigo/v6/circuits/ckks/bootstrapping"
@@ -175,4 +176,16 @@ func GetRuntimeMemoryStats() (*C.ulonglong, C.ulonglong) {
 	}
 	arrPtr, length := SliceToCArray(values, convertUint64ToCULonglong)
 	return arrPtr, C.ulonglong(length)
+}
+
+// CollectRuntimeMemory provides an explicit measurement boundary for isolated
+// memory benchmarks. It is not called by inference code. When releaseOS is
+// non-zero, unused Go heap pages are also returned to the operating system.
+//
+//export CollectRuntimeMemory
+func CollectRuntimeMemory(releaseOS C.int) {
+	runtime.GC()
+	if releaseOS != 0 {
+		debug.FreeOSMemory()
+	}
 }

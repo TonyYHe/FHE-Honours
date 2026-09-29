@@ -254,6 +254,14 @@ class LattigoLibrary:
                 restype=ArrayResultUInt64,
             )
 
+        collect_runtime_memory = getattr(self.lib, "CollectRuntimeMemory", None)
+        if collect_runtime_memory is not None:
+            self.CollectRuntimeMemory = LattigoFunction(
+                collect_runtime_memory,
+                argtypes=[ctypes.c_int],
+                restype=None,
+            )
+
         reset_operation_counters = getattr(self.lib, "ResetOperationCounters", None)
         if reset_operation_counters is not None:
             self.ResetOperationCounters = LattigoFunction(

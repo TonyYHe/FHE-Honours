@@ -1841,6 +1841,7 @@ class Conv2d(LinearTransform):
         self,
         input_shape,
         *,
+        storage_mode: str = "compressed",
         include_full_control: bool = False,
         verify_exact_qp: bool = True,
     ):
@@ -1888,6 +1889,7 @@ class Conv2d(LinearTransform):
         )
         plan.compile(
             self.scheme,
+            storage_mode=str(storage_mode),
             include_full_control=bool(include_full_control),
             verify_exact_qp=bool(verify_exact_qp),
         )
@@ -1989,7 +1991,12 @@ class Conv2d(LinearTransform):
         # Forward pass that handles both cleartext and FHE inference.
         wpc_plan = getattr(self, "_wpc_cips_plan", None)
         if self.he_mode and wpc_plan is not None:
-            return wpc_plan.evaluate(x, compressed=True)
+            return wpc_plan.evaluate(
+                x,
+                compressed=(
+                    getattr(wpc_plan, "storage_mode", "compressed") == "compressed"
+                ),
+            )
         runtime = self._region_runtime_if_ready(require_skip_dense_pack=False)
         release_concat_owned_parts = None
         if self.he_mode and self._is_concat_cipher_tensor(x):

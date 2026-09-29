@@ -13,6 +13,9 @@ ciphertext channel groups with backend-wide peak-materialization accounting.
 See `docs/wpc_multigroup_compressed_qp.md`.
 It is also integrated with chained opt-in Orion Conv2d layers, including bias
 and CKKS level consumption; see `docs/wpc_cnn_layer_pipeline.md`.
+Full and compressed representations can now be benchmarked in isolated fresh
+processes with repeated timing, Go-heap snapshots, and externally sampled RSS;
+see `docs/wpc_isolated_resource_benchmark.md`.
 
 It remains a mechanism-level correctness experiment. Timings are single-run
 diagnostics, not model-level performance results.

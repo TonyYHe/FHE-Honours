@@ -859,6 +859,8 @@ ArrayResultUInt64 GetRuntimeMemoryStats() {
   return MakeUInt64ArrayResult(std::vector<unsigned long long>(12, 0));
 }
 
+void CollectRuntimeMemory(int /*release_os*/) {}
+
 void ResetOperationCounters() {
   std::lock_guard<std::mutex> lock(g_mu);
   g_scheme.rotations_total = 0;

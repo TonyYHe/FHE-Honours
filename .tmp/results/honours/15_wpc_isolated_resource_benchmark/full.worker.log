@@ -1,0 +1,73 @@
+{
+  "acceptance": {
+    "compressed_materialization_released": true,
+    "compressed_registry_matches_mode": true,
+    "correct_vs_clear": true,
+    "expected_transform_count": true,
+    "measured_forward_count_matches_request": true,
+    "storage_mode_matches_request": true,
+    "valid": true,
+    "zero_online_python_encode_calls": true
+  },
+  "compile_s": 0.5090529578737915,
+  "correctness": {
+    "correct": true,
+    "max_abs_error": 3.113758184625226e-08,
+    "mean_abs_error": 7.337287841350944e-09,
+    "output_shape": [
+      12,
+      8,
+      8
+    ]
+  },
+  "forward_wall_summary_s": {
+    "count": 10,
+    "max": 0.013660792028531432,
+    "mean": 0.012247733329422772,
+    "median": 0.012221291428431869,
+    "min": 0.011664625024423003,
+    "p95": 0.013106766878627241,
+    "stdev": 0.0005626199773718567
+  },
+  "mode": "full",
+  "status": "ok",
+  "storage": {
+    "by_layer": {
+      "wpc_block_conv1": {
+        "compressed_weight_qp_payload_bytes": 0,
+        "full_weight_plus_bias_payload_bytes": 10452992,
+        "full_weight_qp_payload_bytes": 10420224,
+        "layer_plaintext_storage_compression_ratio": 1.0,
+        "resident_weight_qp_payload_bytes": 10420224,
+        "storage_mode": "full",
+        "stored_weight_plus_metadata_plus_bias_bytes": 10452992,
+        "transform_count": 4,
+        "uncompressed_bias_q_payload_bytes": 32768,
+        "weight_metadata_bytes": 0,
+        "weight_payload_compression_ratio": 1.0
+      },
+      "wpc_block_conv2": {
+        "compressed_weight_qp_payload_bytes": 0,
+        "full_weight_plus_bias_payload_bytes": 7831552,
+        "full_weight_qp_payload_bytes": 7815168,
+        "layer_plaintext_storage_compression_ratio": 1.0,
+        "resident_weight_qp_payload_bytes": 7815168,
+        "storage_mode": "full",
+        "stored_weight_plus_metadata_plus_bias_bytes": 7831552,
+        "transform_count": 4,
+        "uncompressed_bias_q_payload_bytes": 16384,
+        "weight_metadata_bytes": 0,
+        "weight_payload_compression_ratio": 1.0
+      }
+    },
+    "full_to_stored_ratio": 1.0,
+    "full_weight_plus_bias_payload_bytes": 18284544,
+    "full_weight_qp_payload_bytes": 18235392,
+    "resident_weight_qp_payload_bytes": 18235392,
+    "storage_mode": "full",
+    "stored_weight_plus_metadata_plus_bias_bytes": 18284544,
+    "transform_count": 8,
+    "uncompressed_bias_q_payload_bytes": 49152,
+    "weight_metadata_bytes": 0
+  }
+}
