@@ -2125,6 +2125,61 @@ class ConvTranspose2d(LinearTransform):
 
         return torch.Size((N, on_Co, on_Ho, on_Wo))
 
+    def install_wpc_cips_plan(
+        self,
+        input_shape,
+        *,
+        storage_mode: str = "compressed",
+        include_full_control: bool = False,
+        verify_exact_qp: bool = True,
+    ):
+        """Compile the opt-in WPC CIPS decoder path for this layer.
+
+        The supported U-Net geometry is a 2x2, stride-two transposed
+        convolution with no padding or output padding. The normal Orion dense
+        path remains unchanged unless this method is called explicitly.
+        """
+
+        if self.scheme is None:
+            raise RuntimeError("set the Orion scheme before installing a WPC plan")
+        ordinary_resources = bool(self.transform_ids) or bool(
+            getattr(self, "_dense_layer_cache_active_transform_ids", {})
+        )
+        if ordinary_resources:
+            raise RuntimeError(
+                "install the WPC CIPS plan before compiling the ordinary Orion plan"
+            )
+
+        from orion.experimental.wpc_cips_upsample import (
+            WPCCIPSConvTranspose2dPlan,
+        )
+
+        existing = getattr(self, "_wpc_cips_plan", None)
+        plan = WPCCIPSConvTranspose2dPlan(
+            self,
+            input_shape=torch.Size(input_shape),
+            slots=int(self.scheme.params.get_slots()),
+        )
+        plan.compile(
+            self.scheme,
+            storage_mode=str(storage_mode),
+            include_full_control=bool(include_full_control),
+            verify_exact_qp=bool(verify_exact_qp),
+        )
+        cleanup = getattr(existing, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = plan
+        self._transform_backend = self.scheme.backend
+        return plan
+
+    def remove_wpc_cips_plan(self) -> None:
+        plan = getattr(self, "_wpc_cips_plan", None)
+        cleanup = getattr(plan, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = None
+
     def generate_diagonals(self, last):
         runtime = getattr(self, "region_runtime", None)
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
@@ -2179,6 +2234,14 @@ class ConvTranspose2d(LinearTransform):
         self._transform_backend = self.scheme.backend
 
     def forward(self, x):
+        wpc_plan = getattr(self, "_wpc_cips_plan", None)
+        if self.he_mode and wpc_plan is not None:
+            return wpc_plan.evaluate(
+                x,
+                compressed=(
+                    getattr(wpc_plan, "storage_mode", "compressed") == "compressed"
+                ),
+            )
         runtime = getattr(self, "region_runtime", None)
         runtime_supported = bool(runtime is not None and getattr(runtime, "supports_scheme", lambda _scheme: True)(self.scheme))
         if self.he_mode and runtime is not None and bool(getattr(runtime, "executable", False)) and bool(runtime_supported):

@@ -167,5 +167,6 @@ then stride-two downsampling with one-level encrypted CIPS reshaping; see
 `docs/wpc_cips_activation_bootstrap.md` and
 `docs/wpc_cips_downsample_reshape.md`. Residual and concatenation joins are
 implemented next in `docs/wpc_cips_branch_joins.md`. This is not yet a
-complete WPC network runtime: upsampling, higher-degree trained-model
-activations, and trained-model Rotation-Padding accuracy remain outstanding.
+complete WPC network runtime. Transposed-convolution upsampling is implemented
+in `docs/wpc_cips_upsample.md`; higher-degree trained-model activations and
+trained-model Rotation-Padding accuracy remain outstanding.

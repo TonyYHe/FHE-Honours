@@ -200,6 +200,7 @@ field under `acceptance` to `true`.
 
 This stage proves functional residual and materialized-concat handling for
 same-spatial-shape CIPS branches. It is not a complete trained WPC network.
-Lazy concat-to-convolution fusion, upsampling/transposed-convolution layout
-handling, higher-degree trained activations, trained-model Rotation-Padding
-accuracy, and server-scale repeated timing/RSS remain future work.
+Lazy concat-to-convolution fusion, higher-degree trained activations,
+trained-model Rotation-Padding accuracy, and server-scale repeated timing/RSS
+remain future work. The transposed-convolution upsampling boundary is
+implemented separately in `docs/wpc_cips_upsample.md`.

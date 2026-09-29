@@ -649,3 +649,42 @@ Concat plaintexts are ordinary offline-encoded Q/P permutations and are
 reported separately from compressed convolution weights. These are functional
 local results; lazy concat fusion, upsampling, server timing/RSS, and
 trained-model accuracy remain outstanding.
+
+### 2026-09-29 — CIPS transposed-convolution upsampling
+
+- Executor: seeded local functional validation; Linux server confirmation pending
+- Pipeline: compressed `ConvTranspose2d(2x2,stride=2) -> Conv2d(3x3)`
+- Spatial shapes: `4 x 4 -> 8 x 8`
+- Channel groups: one low-resolution group -> two high-resolution groups
+- CKKS levels: `2 -> 1 -> 0`
+- Compressed weight transforms: four total
+- Result: valid; all acceptance gates pass
+- Machine-readable result:
+  `.tmp/results/honours/19_wpc_upsample/conv_transpose2d_pipeline.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full weight transforms | 4/4 pass |
+| Upsampling weight period / compression | 128 / 4.0x |
+| Consumer weight period / compression | 8 / 64.0x |
+| Aggregate weight payload compression | 5.734x |
+| Full weights plus bias | 13,295,616 B |
+| Stored weights, metadata, and bias | 2,377,568 B |
+| Storage ratio including bias | 5.592x |
+| Full / compressed rotations | 84 / 84 |
+| Online Python / weight Encode calls | 0 / 0 |
+| Maximum upsampling error | `1.07e-8` |
+| Maximum final error versus clear | `9.48e-9` |
+| Compressed final delta versus full | `0` |
+| Peak materialized weight transforms | 1 |
+
+The new plan directly maps low-resolution CIPS slots to high-resolution CIPS
+slots and expands ciphertext channel groups as spatial area grows. The output
+packing signature is consumed directly by the following convolution, with no
+decrypt, clear repack, Encode, or re-encryption. An independent NumPy oracle
+and PyTorch `conv_transpose2d` agree with the cyclic-diagonal implementation.
+
+This completes the isolated functional operator boundaries required for a
+small WPC encoder/decoder. The next stage composes them into one graph with a
+skip connection; trained-model matching and repeated server timing/RSS remain
+outstanding.
