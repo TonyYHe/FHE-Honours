@@ -147,6 +147,7 @@ field under `acceptance` to `true`.
 
 This proves one multi-ciphertext activation/bootstrap boundary with a
 quadratic activation. The next stage implements stride-two CIPS reshaping in
-`docs/wpc_cips_downsample_reshape.md`. Residual or concatenation paths, a
-higher-degree trained-model activation, and trained-model accuracy evaluation
-remain outstanding. This stage does not make a performance claim.
+`docs/wpc_cips_downsample_reshape.md`; residual and concatenation joins follow
+in `docs/wpc_cips_branch_joins.md`. A higher-degree trained-model activation
+and trained-model accuracy evaluation remain outstanding. This stage does not
+make a performance claim.

@@ -165,6 +165,7 @@ co-resident control transforms; see `docs/wpc_isolated_resource_benchmark.md`.
 The following stages add a real quadratic activation and Lattigo bootstrap,
 then stride-two downsampling with one-level encrypted CIPS reshaping; see
 `docs/wpc_cips_activation_bootstrap.md` and
-`docs/wpc_cips_downsample_reshape.md`. This is not yet a complete WPC network
-runtime. Residual/concatenation layout handling, higher-degree trained-model
+`docs/wpc_cips_downsample_reshape.md`. Residual and concatenation joins are
+implemented next in `docs/wpc_cips_branch_joins.md`. This is not yet a
+complete WPC network runtime: upsampling, higher-degree trained-model
 activations, and trained-model Rotation-Padding accuracy remain outstanding.

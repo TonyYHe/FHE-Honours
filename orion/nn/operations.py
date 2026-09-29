@@ -33,10 +33,36 @@ class Add(Module):
             runtime.compile(self.scheme)
 
     def forward(self, x, y):
+        wpc_plan = getattr(self, "_wpc_cips_plan", None)
+        if self.he_mode and wpc_plan is not None:
+            return wpc_plan.evaluate(x, y)
         runtime = getattr(self, "layout_policy_add_runtime", None)
         if self.he_mode and runtime is not None:
             return runtime(x, y)
         return x + y
+
+    def install_wpc_cips_plan(self, left_plan, right_plan):
+        """Install an explicit CIPS-preserving residual-add contract."""
+
+        if self.scheme is None:
+            raise RuntimeError("set the Orion scheme before installing a WPC plan")
+        from orion.experimental.wpc_cips_branches import WPCCIPSResidualAddPlan
+
+        existing = getattr(self, "_wpc_cips_plan", None)
+        plan = WPCCIPSResidualAddPlan.between_plans(left_plan, right_plan)
+        plan.compile(self.scheme)
+        cleanup = getattr(existing, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = plan
+        return plan
+
+    def remove_wpc_cips_plan(self) -> None:
+        plan = getattr(self, "_wpc_cips_plan", None)
+        cleanup = getattr(plan, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = None
 
 
 class ConcatCipherTensor:
@@ -658,6 +684,11 @@ class Concat(Module):
         return out
 
     def cleanup(self, backend=None):
+        wpc_plan = getattr(self, "_wpc_cips_plan", None)
+        cleanup_wpc = getattr(wpc_plan, "cleanup", None)
+        if callable(cleanup_wpc):
+            cleanup_wpc()
+        self._wpc_cips_plan = None
         backend = backend if backend is not None else self._compiled_backend
         delete = getattr(backend, "DeleteLinearTransform", None)
         if callable(delete):
@@ -686,6 +717,9 @@ class Concat(Module):
         if not xs:
             raise ValueError("Concat requires at least one input")
         if self.he_mode:
+            wpc_plan = getattr(self, "_wpc_cips_plan", None)
+            if wpc_plan is not None:
+                return wpc_plan.evaluate(*xs)
             runtime = getattr(self, "layout_policy_concat_runtime", None)
             owned_parts = ()
             if runtime is not None:
@@ -700,6 +734,44 @@ class Concat(Module):
                             release()
             return ConcatCipherTensor(self, xs, owned_parts=owned_parts)
         return torch.cat(tuple(xs), dim=int(self.dim))
+
+    def install_wpc_cips_plan(self, producers, *, consumer_plan=None):
+        """Compile an explicit encrypted CIPS channel-concat materializer."""
+
+        if self.scheme is None:
+            raise RuntimeError("set the Orion scheme before installing a WPC plan")
+        if int(self.dim) != 1:
+            raise ValueError("WPC CIPS concatenation supports channel dim=1 only")
+        if self.transform_ids_by_input or self.transform_sources_by_input:
+            raise RuntimeError(
+                "install the WPC CIPS plan before compiling ordinary concat resources"
+            )
+        from orion.experimental.wpc_cips_branches import WPCCIPSConcatPlan
+
+        existing = getattr(self, "_wpc_cips_plan", None)
+        plan = WPCCIPSConcatPlan.from_producers(
+            tuple(producers),
+            bsgs_ratio=float(self.bsgs_ratio),
+        )
+        try:
+            plan.compile(self.scheme)
+            if consumer_plan is not None:
+                plan.validate_consumer(consumer_plan)
+        except Exception:
+            plan.cleanup()
+            raise
+        cleanup = getattr(existing, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = plan
+        return plan
+
+    def remove_wpc_cips_plan(self) -> None:
+        plan = getattr(self, "_wpc_cips_plan", None)
+        cleanup = getattr(plan, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        self._wpc_cips_plan = None
 
 
 class Identity(Module):

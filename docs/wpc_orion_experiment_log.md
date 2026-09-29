@@ -607,3 +607,45 @@ earlier same-shape `8 x 8` layers because their exact slot period grows to 128.
 After reshaping to `4 x 4`, the next layer's period is 32 and its weight payload
 compresses by 16x. These are functional local results; server timing and RSS,
 trained-model accuracy, and residual/concatenation joins remain outstanding.
+
+### 2026-09-29 — CIPS residual and concatenation branch joins
+
+- Executor: seeded local functional validation; Linux server confirmation pending
+- Pipeline: three compressed branches, residual add, channel concat, compressed consumer
+- Spatial shape: `8 x 8`; CIPS channel capacity eight
+- Channels: residual `12 + 12 -> 12`; concat `12 + 4 -> 16`; consumer `16 -> 8`
+- Levels: branch convolutions `3 -> 2`, residual `2 -> 2`, concat `2 -> 1`, consumer `1 -> 0`
+- Compressed weight transforms: 12 total
+- Ordinary concat transforms: three, each with one diagonal
+- Result: valid; all acceptance gates pass
+- Machine-readable result:
+  `.tmp/results/honours/18_wpc_branch_joins/residual_concat_pipeline.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full weight transforms | 12/12 pass |
+| Weight payload compression | 64.0x |
+| Full / compressed weight Q/P | 36,519,936 / 570,624 B |
+| Layer storage ratio including bias | 48.475x |
+| Ordinary concat Q/P payload | 98,304 B |
+| Full weight+bias / stored weight+concat | 42.898x |
+| Residual additions / levels consumed | 2 / 0 |
+| Concat input / output ciphertext groups | 3 / 2 |
+| Full / compressed rotations | 214 / 214 |
+| Online Python / weight Encode calls | 0 / 0 |
+| Maximum residual and concat error | `3.99e-8` |
+| Maximum final error versus clear | `2.53e-8` |
+| Compressed final delta versus full | `0` |
+| Peak materialized weight transforms | 1 |
+
+The residual plan rejects different shapes, signatures, levels, schemes, or
+group counts and performs a direct ciphertext addition per channel group. The
+concat plan generates encrypted permutation transforms for every source/output
+group intersection, so branch offsets that cross a ciphertext boundary are
+handled without clear repacking. In this case three source ciphertexts become
+two output ciphertexts, and concat consumes one level.
+
+Concat plaintexts are ordinary offline-encoded Q/P permutations and are
+reported separately from compressed convolution weights. These are functional
+local results; lazy concat fusion, upsampling, server timing/RSS, and
+trained-model accuracy remain outstanding.

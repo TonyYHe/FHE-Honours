@@ -193,7 +193,8 @@ as `true`.
 ## Remaining boundary
 
 This stage proves the stride-two encrypted layout transition in a functional
-two-layer pipeline. It is not a complete trained WPC network. Residual and
-concatenation layout joins, higher-degree trained activations, trained-model
-Rotation-Padding accuracy, and server-scale repeated timing/RSS measurements
-remain future work.
+two-layer pipeline. The next stage implements residual and channel-concat
+joins in `docs/wpc_cips_branch_joins.md`. A complete trained WPC network still
+requires upsampling/transposed-convolution layout handling, higher-degree
+trained activations, trained-model Rotation-Padding accuracy, and server-scale
+repeated timing/RSS measurements.
