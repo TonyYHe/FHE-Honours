@@ -688,3 +688,41 @@ This completes the isolated functional operator boundaries required for a
 small WPC encoder/decoder. The next stage composes them into one graph with a
 skip connection; trained-model matching and repeated server timing/RSS remain
 outstanding.
+
+### 2026-09-29 — Integrated CIPS miniature U-Net
+
+- Executor: seeded local functional validation; Linux server confirmation pending
+- Graph: encoder, skip, stride-two downsample, compact reshape, bottleneck,
+  identity bootstrap refresh, transposed-convolution upsample, concat, decoder
+- Spatial shapes: `8 x 8 -> 4 x 4 -> 8 x 8`
+- CKKS levels: `5 -> 4 -> 3 -> 2 -> 1 -> bootstrap(5) -> 4 -> 3 -> 2`
+- Compressed learned transforms: 14 total
+- Result: valid; all acceptance gates pass
+- Machine-readable result:
+  `.tmp/results/honours/20_wpc_mini_unet/mini_unet_pipeline.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full learned transforms | 14/14 pass |
+| Weight-payload compression | 7.771x |
+| Weight storage including metadata | 7.702x |
+| Overall storage including layout transforms | 7.116x |
+| Full / stored weight+bias payload | 68,059,136 / 9,071,920 B |
+| Ordinary reshape plus concat Q/P | 573,440 B |
+| Full / compressed rotations | 318 / 318 |
+| Bootstrap calls per path | 1 |
+| Online Python / weight Encode calls | 0 / 0 |
+| Maximum intermediate error | `8.37e-9` |
+| Final error versus clear | `3.25e-9` |
+| Compressed final delta versus full | `0` |
+| Peak materialized weight transforms | 1 |
+
+The identity refresh resolves the level mismatch between the retained
+level-four skip and the deep decoder branch. It covers all 512 physical CIPS
+slots; using the 256-slot logical-value power of two was rejected because
+interleaved values in the upper physical slots were lost. The corrected graph
+chains every packing signature and level without clear repacking.
+
+This is a deterministic functional graph rather than a trained U-Net22. The
+next stage is trained-model parameter and activation/bootstrap integration,
+then repeated server O-online versus CIPS-WPC timing and RSS measurement.

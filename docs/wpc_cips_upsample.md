@@ -154,8 +154,8 @@ A valid run exits with status zero and reports every field in `acceptance` as
 
 ## Remaining boundary
 
-This stage completes the functional operator boundaries needed by a small
-WPC U-Net decoder: downsampling, upsampling, residual joins, concatenation,
-activation, and bootstrap are all covered. The next stage integrates these
-plans into one small encoder/decoder graph with a skip connection, followed by
-trained-model parameter matching and server-scale repeated timing/RSS.
+This stage completes the isolated operator boundaries needed by a small WPC
+U-Net decoder: downsampling, upsampling, residual joins, concatenation,
+activation, and bootstrap are all covered. Their integrated encoder/decoder
+validation is implemented in `docs/wpc_cips_mini_unet.md`; trained-model
+parameter matching and server-scale repeated timing/RSS remain outstanding.
