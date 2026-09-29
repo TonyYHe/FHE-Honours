@@ -726,3 +726,45 @@ chains every packing signature and level without clear repacking.
 This is a deterministic functional graph rather than a trained U-Net22. The
 next stage is trained-model parameter and activation/bootstrap integration,
 then repeated server O-online versus CIPS-WPC timing and RSS measurement.
+
+### 2026-09-29 — Checkpoint-trained decoder-stage integration
+
+- Executor: seeded local Lattigo functional validation; Linux server
+  confirmation pending
+- Checkpoint: COVID-19 U-Net22-plus-output base32 Cheb7 fine-tuned model
+- Checkpoint SHA-256:
+  `761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59`
+- Graph: `up1 + skip1 -> cat1 -> dec1a -> trained dec1a_act -> bootstrap -> dec1b`
+- Spatial shapes: `64 x 4 x 4` low branch and `32 x 8 x 8` skip branch
+- CKKS levels: `8 -> 7 -> 6 -> 5 -> 1 -> bootstrap(8) -> 7`
+- Compressed learned transforms: 56
+- Result: valid; every acceptance gate passes
+- Machine-readable result:
+  `.tmp/results/honours/21_wpc_trained_decoder/trained_decoder_stage.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full learned transforms | 56/56 pass |
+| Independent Torch-WPC clear-oracle delta | max `1.42e-14` |
+| Maximum encrypted error vs WPC clear | `6.14e-7` |
+| Compressed final delta vs full | `0` |
+| Aggregate learned payload compression | 13.584x |
+| Learned storage ratio including bias/metadata | 13.164x |
+| Overall ratio including concat Q/P | 12.926x |
+| Offline / online weight Encode calls | 56 / 0 |
+| Online Python Encode calls | 0 |
+| Full / compressed rotations | 1,200 / 1,200 |
+| Bootstrap calls per path | 4 |
+| Peak materialized weight transforms | 1 |
+
+The exact checkpoint coefficients, independent learned pre/post scales, and
+all four trained layer tensors are used without refitting or slicing. The
+degree-7 activation consumes four levels and a real four-ciphertext bootstrap
+refreshes the result before `dec1b`.
+
+The run also exposes the expected incompatibility between WPC flattened
+Rotation Padding and the checkpoint's native zero padding. The seeded maximum
+deltas are `0.077914` after `dec1a`, `0.035058` after its activation, and
+`0.067241` after `dec1b`. These are layout-semantic differences rather than
+FHE error. End-to-end accuracy therefore requires Rotation-Padding-aware
+training or fine-tuning before a native-checkpoint accuracy claim is valid.
