@@ -1880,9 +1880,15 @@ class Conv2d(LinearTransform):
                 "install the WPC CIPS plan before compiling the ordinary Orion plan"
             )
         existing = getattr(self, "_wpc_cips_plan", None)
-        from orion.experimental.wpc_cips_layer import WPCCIPSConv2dPlan
+        stride = tuple(int(value) for value in self.stride)
+        if stride == (2, 2):
+            from orion.experimental.wpc_cips_downsample import (
+                WPCCIPSStride2Conv2dPlan as PlanType,
+            )
+        else:
+            from orion.experimental.wpc_cips_layer import WPCCIPSConv2dPlan as PlanType
 
-        plan = WPCCIPSConv2dPlan(
+        plan = PlanType(
             self,
             input_shape=torch.Size(input_shape),
             slots=int(self.scheme.params.get_slots()),

@@ -256,6 +256,19 @@ class WPCCIPSConv2dPlan:
             for input_group in range(int(self.case.input_group_count))
         ]
 
+    def _build_group_transforms(
+        self, weight: np.ndarray
+    ) -> dict[str, dict[str, Any]]:
+        """Build the transforms used by this layout.
+
+        The stride-two experimental planner overrides this hook because its
+        output remains on the sparse down-sampled grid until the explicit
+        reshape layer runs. Keeping the compilation/storage lifecycle here
+        ensures both layouts use the same full-vs-compressed Q/P checks.
+        """
+
+        return build_cips_group_transforms(weight, self.case)
+
     @staticmethod
     def _flatten_diagonals(
         diagonals: dict[int, np.ndarray],
@@ -360,7 +373,7 @@ class WPCCIPSConv2dPlan:
         self.include_full_control = bool(include_full_control)
         self.storage_mode = storage_mode
         weight, bias = self._weight_bias()
-        group_rows = build_cips_group_transforms(weight, self.case)
+        group_rows = self._build_group_transforms(weight)
         full_bytes_per_diagonal = (
             int(self.level + 1 + len(scheme.params.get_logp()))
             * int(scheme.params.get_ring_degree())

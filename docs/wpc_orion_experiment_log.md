@@ -564,3 +564,46 @@ activation is not a trained-model activation, and the single-run wall times
 are not a performance comparison. Stride-two reshaping,
 residual/concatenation paths, higher-degree activations, and trained-model
 accuracy remain outstanding.
+
+### 2026-09-29 — Stride-two CIPS and encrypted reshaping
+
+- Executor: seeded local functional validation; Linux server confirmation pending
+- Pipeline: compressed stride-two `Conv2d -> reshape -> Conv2d`
+- Input/output spatial shapes: `8 x 8 -> 4 x 4`
+- Channel groups: two sparse input-grid groups -> one compact CIPS group
+- CKKS levels: `3 -> 2 -> reshape(2 -> 1) -> 0`
+- Compressed weight transforms: five total
+- Ordinary reshape transforms: two, containing eight diagonals
+- Result: valid; all acceptance gates pass
+- Machine-readable result:
+  `.tmp/results/honours/17_wpc_downsample_reshape/`
+  `stride2_reshape_pipeline.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full weight transforms | 5/5 pass |
+| Stride-two weight period / compression | 128 / 4.0x |
+| Post-downsample weight period / compression | 32 / 16.0x |
+| Aggregate full / compressed weight Q/P | 18,112,512 / 3,574,272 B |
+| Aggregate weight payload compression | 5.067x |
+| Layer storage ratio including bias | 4.963x |
+| Ordinary reshape Q/P payload | 262,144 B |
+| Full / compressed rotations | 110 / 110 |
+| Online Python / weight Encode calls | 0 / 0 |
+| Maximum sparse and reshaped error | `3.09e-8` |
+| Maximum final error versus clear | `1.91e-8` |
+| Compressed final delta versus full | `0` |
+| Peak materialized weight transforms | 1 |
+
+The stride-two convolution keeps its logical outputs at every second input-grid
+position. A distinct encrypted permutation transform compacts these positions
+into lower-resolution CIPS, merges the two channel groups into one ciphertext,
+and consumes one CKKS level. Packing signatures and level checks prevent this
+sparse intermediate from being passed directly to an incompatible layer. No
+decrypt, decode, clear repack, Encode, or re-encrypt occurs at the boundary.
+
+The stride-two weights compress by 4x rather than the 64x observed for the
+earlier same-shape `8 x 8` layers because their exact slot period grows to 128.
+After reshaping to `4 x 4`, the next layer's period is 32 and its weight payload
+compresses by 16x. These are functional local results; server timing and RSS,
+trained-model accuracy, and residual/concatenation joins remain outstanding.
