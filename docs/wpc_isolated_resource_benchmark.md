@@ -134,6 +134,8 @@ A successful run exits with status zero, writes `comparison.json` and
 
 This stage makes defensible memory and repeated-latency claims for the
 two-layer mechanism microbenchmark only. It does not establish trained-model
-accuracy or whole-network performance. Activation/bootstrap integration,
-stride-two CIPS reshaping, residual/concatenation handling, and model-scale
+accuracy or whole-network performance. A subsequent functional stage now
+integrates one quadratic activation/bootstrap boundary; see
+`docs/wpc_cips_activation_bootstrap.md`. Stride-two CIPS reshaping,
+residual/concatenation handling, higher-degree activations, and model-scale
 evaluation remain separate stages.

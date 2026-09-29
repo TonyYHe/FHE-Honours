@@ -520,3 +520,47 @@ the server result. RSS includes Python, Torch, keys, ciphertexts, and runtime
 allocator pages, while the logical payload count isolates transform storage.
 The Linux server run must replace these local performance observations before
 they are used in a thesis table.
+
+### 2026-09-29 — CIPS activation/bootstrap integration
+
+- Executor: seeded local functional validation; Linux server confirmation pending
+- Pipeline: compressed CIPS `Conv2d -> Quad -> Bootstrap -> Conv2d`
+- Spatial shape: `8 x 8`; 12 channels; two ciphertext groups
+- CKKS: `LogN=10`, levels `3 -> 2 -> 1 -> bootstrap(0 -> 3) -> 2`
+- Compressed transforms: eight total
+- Result: valid; all acceptance gates pass
+- Machine-readable result:
+  `.tmp/results/honours/16_wpc_activation_bootstrap/`
+  `two_conv_quad_bootstrap.json`
+
+| Metric | Result |
+|---|---:|
+| Exact compressed-vs-full transforms | 8/8 pass |
+| Backend bootstrap calls per path | 2 |
+| First-convolution maximum error | `1.11e-8` |
+| Activation/bootstrap maximum error | `2.54e-9` |
+| Final maximum error versus clear | `1.06e-9` |
+| Compressed output delta vs. full | `0` |
+| Full weight Q/P payload | 26,050,560 B |
+| Compressed weight payload | 407,040 B |
+| Weight payload compression | 64.0x |
+| Stored weights, metadata, and bias | 541,152 B |
+| Full/stored ratio including bias | 48.321x |
+| Peak materialized transforms | 1 |
+| Offline / online weight Encode calls | 8 / 0 |
+| Online Python Encode calls | 0 |
+| Materialized payload after execution | 0 B |
+
+The activation/bootstrap bridge preserves the explicit CIPS packing signature
+and validates levels before and after each operation. Its bootstrap prescale
+mask follows the CIPS slot equation: for a partial channel group, active
+channels occupy the first positions of every spatial block. A naive contiguous
+prefix mask was rejected during development because it produced a `5.60e-2`
+intermediate error; the corrected interleaved mask reduces that error to
+`2.54e-9`.
+
+This is a functional correctness and storage-accounting result. The quadratic
+activation is not a trained-model activation, and the single-run wall times
+are not a performance comparison. Stride-two reshaping,
+residual/concatenation paths, higher-degree activations, and trained-model
+accuracy remain outstanding.
