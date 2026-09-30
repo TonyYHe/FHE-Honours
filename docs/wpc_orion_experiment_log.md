@@ -768,3 +768,25 @@ deltas are `0.077914` after `dec1a`, `0.035058` after its activation, and
 `0.067241` after `dec1b`. These are layout-semantic differences rather than
 FHE error. End-to-end accuracy therefore requires Rotation-Padding-aware
 training or fine-tuning before a native-checkpoint accuracy claim is valid.
+
+### 2026-09-30 — Rotation-Padding-aware fine-tuning implementation
+
+- Executor: local mathematical/unit validation and synthetic training smoke
+  run; dataset-scale CUDA run pending
+- Source: COVID-19 U-Net22-plus-output base32 Cheb7 checkpoint
+- Converted operators: all 18 same-padded `3x3` convolutions
+- Preserved operators: four `2x2` transposed convolutions and the `1x1` output
+  head
+- Activation policy: retain all 18 fixed checkpoint degree-7 Chebyshev
+  activations with `blend_alpha=1`
+- Training: segmentation loss plus optional native-model logit distillation
+- Recovery: atomic best/last checkpoints, per-epoch result updates, and resume
+  support
+
+The differentiable Torch implementation exactly matches the independent NumPy
+WPC Rotation-Padding oracle, preserves every checkpoint key/value at
+conversion, and passes input/weight/bias gradient checks. A one-sample local
+smoke run completed training, resumed into a second epoch, reloaded the best
+checkpoint in evaluation-only mode, and passed every mechanical acceptance
+gate. These synthetic values are deliberately not recorded as accuracy
+evidence. Dataset-scale Dice/IoU must be collected on the server.
