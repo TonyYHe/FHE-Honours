@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+import tools.finetune_wpc_rotation_padding as finetune_runner
 from orion.experimental.wpc_cips_baseline import (
     CIPSConvCase,
     rotation_padded_reference,
@@ -23,9 +24,11 @@ from orion.experimental.wpc_rotation_padding_training import (
 )
 from orion.models.unet import UNet22PlusOutput
 from tools.finetune_wpc_rotation_padding import (
+    _NonFiniteEpochError,
     _build_result,
     _evaluate,
     _parser,
+    _run_epoch_with_backoff,
     _should_select_candidate,
 )
 
@@ -190,6 +193,10 @@ def test_result_accepts_finite_recovery_from_nonfinite_baseline(
         epochs=1,
         batch_size=1,
         lr=1.0e-6,
+        resume_lr=None,
+        max_epoch_retries=4,
+        lr_backoff_factor=0.25,
+        min_lr=1.0e-10,
         weight_decay=1.0e-4,
         grad_clip_norm=1.0,
         distill_weight=0.001,
@@ -222,14 +229,14 @@ def test_result_accepts_finite_recovery_from_nonfinite_baseline(
         best_metrics=_validation_metrics(fully_finite=True, dice=0.90),
         best_epoch=1,
         completed_epoch=1,
-        history=[],
+        history=[{"epoch": 1, "train": {"sample_count": 2048}}],
         best_path=best_path,
         last_path=last_path,
         checkpoint_reload_compatible=True,
         started=0.0,
     )
 
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert result["status"] == "ok"
     assert result["acceptance"]["valid"] is True
     assert result["metrics"]["numerical_stability_recovered_by_finetuning"] is True
@@ -242,6 +249,10 @@ def test_stable_server_protocol_defaults() -> None:
     args = _parser().parse_args([])
     assert args.batch_size == 1
     assert args.lr == 1.0e-6
+    assert args.resume_lr is None
+    assert args.max_epoch_retries == 4
+    assert args.lr_backoff_factor == 0.25
+    assert args.min_lr == 1.0e-10
     assert args.distill_weight == 0.001
     assert args.train_limit == 2048
     assert args.val_limit == 512
@@ -260,3 +271,70 @@ def test_finite_resume_candidate_replaces_legacy_nonfinite_best() -> None:
 
     better_finite_best = _validation_metrics(fully_finite=True, dice=0.91)
     assert _should_select_candidate(candidate, better_finite_best) is False
+
+
+def test_epoch_retry_restores_safe_checkpoint_and_backs_off_lr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = nn.Linear(1, 1, bias=False)
+    native = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0)
+    safe_weight = model.weight.detach().clone()
+    safe_path = tmp_path / "rotation_padding_last.pt"
+    torch.save(
+        {
+            "epoch": 1,
+            "state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        safe_path,
+    )
+    calls = 0
+
+    def fake_train_epoch(*args: object, **kwargs: object) -> dict[str, float]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with torch.no_grad():
+                model.weight.fill_(99.0)
+            raise _NonFiniteEpochError("synthetic non-finite batch")
+        assert torch.equal(model.weight.detach(), safe_weight)
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(0.25)
+        return {"loss": 0.2, "segmentation_loss": 0.2, "distillation_loss": 0.0}
+
+    monkeypatch.setattr(finetune_runner, "_train_epoch", fake_train_epoch)
+    monkeypatch.setattr(
+        finetune_runner,
+        "_evaluate",
+        lambda *args, **kwargs: _validation_metrics(fully_finite=True, dice=0.9),
+    )
+    dataset = TensorDataset(torch.zeros((1, 1)), torch.zeros((1, 1)))
+    validation_loader = DataLoader(dataset, batch_size=1)
+
+    train_metrics, validation_metrics, accounting = _run_epoch_with_backoff(
+        model=model,
+        native_teacher=native,
+        train_set=dataset,
+        validation_loader=validation_loader,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        epoch=2,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        grad_clip_norm=1.0,
+        distill_weight=0.001,
+        safe_checkpoint_path=safe_path,
+        max_epoch_retries=2,
+        lr_backoff_factor=0.25,
+        min_lr=1.0e-10,
+    )
+
+    assert calls == 2
+    assert train_metrics["loss"] == 0.2
+    assert validation_metrics["fully_finite"] is True
+    assert accounting["attempt_count"] == 2
+    assert accounting["effective_lr"] == pytest.approx(0.25)
+    assert accounting["shuffle_seed"] == 1
+    assert len(accounting["failed_attempts"]) == 1

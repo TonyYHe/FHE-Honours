@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
@@ -83,6 +83,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--resume-lr",
+        type=float,
+        default=None,
+        help="Override the optimizer learning rate loaded from a resume checkpoint.",
+    )
+    parser.add_argument("--max-epoch-retries", type=int, default=4)
+    parser.add_argument("--lr-backoff-factor", type=float, default=0.25)
+    parser.add_argument("--min-lr", type=float, default=1.0e-10)
     parser.add_argument("--weight-decay", type=float, default=1.0e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--distill-weight", type=float, default=0.001)
@@ -173,6 +182,25 @@ def _should_select_candidate(
             or float(candidate["dice"]) + 1.0e-12 >= float(current_best["dice"])
         )
     )
+
+
+class _NonFiniteEpochError(RuntimeError):
+    """A recoverable numerical failure within a training epoch."""
+
+
+def _optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+    learning_rates = {float(group["lr"]) for group in optimizer.param_groups}
+    if len(learning_rates) != 1:
+        raise RuntimeError(
+            "WPC fine-tuning requires one effective learning rate; got "
+            f"{sorted(learning_rates)}"
+        )
+    return learning_rates.pop()
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(learning_rate)
 
 
 @torch.no_grad()
@@ -340,7 +368,7 @@ def _train_epoch(
         loss = segmentation + float(distill_weight) * distillation
         if not bool(torch.isfinite(loss)):
             finite_logits = bool(torch.isfinite(logits).all())
-            raise RuntimeError(
+            raise _NonFiniteEpochError(
                 "non-finite training loss at "
                 f"batch_index={batch_index}: logits_finite={finite_logits}, "
                 f"segmentation_loss={float(segmentation.detach().item())}, "
@@ -355,7 +383,7 @@ def _train_epoch(
                     error_if_nonfinite=True,
                 )
             except RuntimeError as error:
-                raise RuntimeError(
+                raise _NonFiniteEpochError(
                     f"non-finite gradient norm at batch_index={batch_index}"
                 ) from error
         optimizer.step()
@@ -367,6 +395,120 @@ def _train_epoch(
     return {
         name: value / max(1, items) for name, value in totals.items()
     } | {"sample_count": int(items)}
+
+
+def _run_epoch_with_backoff(
+    *,
+    model: nn.Module,
+    native_teacher: nn.Module,
+    train_set: Dataset,
+    validation_loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    grad_clip_norm: float,
+    distill_weight: float,
+    safe_checkpoint_path: Path,
+    max_epoch_retries: int,
+    lr_backoff_factor: float,
+    min_lr: float,
+) -> tuple[dict[str, float], dict[str, Any], dict[str, Any]]:
+    """Run one epoch, rolling back and lowering LR after numerical failure."""
+
+    epoch_started = time.time()
+    failures: list[dict[str, Any]] = []
+    shuffle_seed = int(seed) + int(epoch) - 1
+    attempt = 0
+    while True:
+        attempt += 1
+        attempt_started = time.time()
+        effective_lr = _optimizer_lr(optimizer)
+        train_loader = make_loader(
+            train_set,
+            batch_size=int(batch_size),
+            shuffle=True,
+            num_workers=int(num_workers),
+            seed=shuffle_seed,
+        )
+        try:
+            train_metrics = _train_epoch(
+                model,
+                native_teacher,
+                train_loader,
+                device=device,
+                optimizer=optimizer,
+                grad_clip_norm=float(grad_clip_norm),
+                distill_weight=float(distill_weight),
+            )
+            validation_metrics = _evaluate(
+                model,
+                validation_loader,
+                device=device,
+                native_reference=native_teacher,
+            )
+            if not _finite_metrics(validation_metrics):
+                raise _NonFiniteEpochError(
+                    "non-finite validation logits after epoch: "
+                    f"nonfinite_sample_count="
+                    f"{validation_metrics.get('nonfinite_sample_count')}"
+                )
+            accounting = {
+                "attempt_count": int(attempt),
+                "effective_lr": float(effective_lr),
+                "epoch_s": float(time.time() - epoch_started),
+                "failed_attempts": failures,
+                "shuffle_seed": int(shuffle_seed),
+            }
+            return train_metrics, validation_metrics, accounting
+        except _NonFiniteEpochError as error:
+            failure = {
+                "attempt": int(attempt),
+                "attempt_s": float(time.time() - attempt_started),
+                "error": str(error),
+                "lr": float(effective_lr),
+            }
+            failures.append(failure)
+            print(
+                json.dumps(
+                    {
+                        "epoch": int(epoch),
+                        "event": "nonfinite_epoch_attempt_rolled_back",
+                        **failure,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            if len(failures) > int(max_epoch_retries):
+                raise RuntimeError(
+                    f"epoch {epoch} remained non-finite after {attempt} attempts; "
+                    f"last safe checkpoint remains {safe_checkpoint_path}"
+                ) from error
+
+            next_lr = max(float(min_lr), effective_lr * float(lr_backoff_factor))
+            if not next_lr < effective_lr:
+                raise RuntimeError(
+                    f"cannot reduce learning rate below {effective_lr}; "
+                    f"last safe checkpoint remains {safe_checkpoint_path}"
+                ) from error
+            safe = torch.load(
+                safe_checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            expected_safe_epoch = int(epoch) - 1
+            if int(safe.get("epoch", -1)) != expected_safe_epoch:
+                raise RuntimeError(
+                    "safe checkpoint epoch mismatch: "
+                    f"expected {expected_safe_epoch}, got {safe.get('epoch')}"
+                ) from error
+            model.load_state_dict(safe["state_dict"], strict=True)
+            model.to(device)
+            optimizer.load_state_dict(safe["optimizer_state_dict"])
+            _set_optimizer_lr(optimizer, next_lr)
 
 
 def _checkpoint_payload(
@@ -382,7 +524,7 @@ def _checkpoint_payload(
     conversions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": int(epoch),
@@ -450,6 +592,14 @@ def _build_result(
             or float(best_metrics["dice"]) + 1.0e-12 >= float(pre_metrics["dice"])
         )
     )
+    history_epoch_numbers = [int(row.get("epoch", -1)) for row in history]
+    training_history_complete = bool(
+        history_epoch_numbers == list(range(1, int(completed_epoch) + 1))
+        and all(
+            int(row.get("train", {}).get("sample_count", -1)) == int(train_count)
+            for row in history
+        )
+    )
     acceptance = {
         "source_checkpoint_sha256_recorded": len(source_sha256) == 64,
         "all_18_spatial_convolutions_use_wpc_rotation_padding": len(conversions)
@@ -469,6 +619,7 @@ def _build_result(
         "best_checkpoint_is_finite_and_not_worse_when_comparable": (
             best_not_worse_when_comparable
         ),
+        "completed_epochs_cover_every_training_sample": training_history_complete,
         "requested_epochs_completed": bool(
             args.eval_only or int(completed_epoch) >= int(args.epochs)
         ),
@@ -480,7 +631,7 @@ def _build_result(
     }
     acceptance["valid"] = bool(all(acceptance.values()))
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
         "status": "ok" if acceptance["valid"] else "invalid",
         "timing_policy": "clear training and accuracy validation; no FHE latency claim",
@@ -499,6 +650,12 @@ def _build_result(
             "epochs": int(args.epochs),
             "batch_size": int(args.batch_size),
             "lr": float(args.lr),
+            "resume_lr": float(args.resume_lr)
+            if args.resume_lr is not None
+            else None,
+            "max_epoch_retries": int(args.max_epoch_retries),
+            "lr_backoff_factor": float(args.lr_backoff_factor),
+            "min_lr": float(args.min_lr),
             "weight_decay": float(args.weight_decay),
             "grad_clip_norm": float(args.grad_clip_norm),
             "distill_weight": float(args.distill_weight),
@@ -561,6 +718,9 @@ def _build_result(
             "completed_epoch": int(completed_epoch),
             "best_epoch": int(best_epoch),
             "history": list(history),
+            "nonfinite_retry_count": int(
+                sum(len(row.get("failed_attempts", [])) for row in history)
+            ),
         },
         "outputs": {
             "best_checkpoint": str(best_path),
@@ -587,6 +747,16 @@ def main() -> int:
         raise SystemExit("batch-size must be positive")
     if float(args.distill_weight) < 0.0:
         raise SystemExit("distill-weight must be nonnegative")
+    if float(args.lr) <= 0.0:
+        raise SystemExit("lr must be positive")
+    if args.resume_lr is not None and float(args.resume_lr) <= 0.0:
+        raise SystemExit("resume-lr must be positive")
+    if int(args.max_epoch_retries) < 0:
+        raise SystemExit("max-epoch-retries must be nonnegative")
+    if not 0.0 < float(args.lr_backoff_factor) < 1.0:
+        raise SystemExit("lr-backoff-factor must be between zero and one")
+    if float(args.min_lr) <= 0.0:
+        raise SystemExit("min-lr must be positive")
     _set_seed(int(args.seed))
     started = time.time()
     source_checkpoint = args.checkpoint.expanduser().resolve()
@@ -634,13 +804,6 @@ def main() -> int:
         image_size=int(args.image_size),
         limit=int(args.val_limit),
         seed=int(args.seed) + 1,
-    )
-    train_loader = make_loader(
-        train_set,
-        batch_size=int(args.batch_size),
-        shuffle=True,
-        num_workers=int(args.num_workers),
-        seed=int(args.seed),
     )
     validation_loader = make_loader(
         validation_set,
@@ -735,6 +898,8 @@ def main() -> int:
             rotation_model.load_state_dict(resumed["state_dict"], strict=True)
             rotation_model.to(device)
             optimizer.load_state_dict(resumed["optimizer_state_dict"])
+            if args.resume_lr is not None:
+                _set_optimizer_lr(optimizer, float(args.resume_lr))
             completed_epoch = int(resumed.get("epoch", 0))
             start_epoch = completed_epoch + 1
             best_epoch = int(resumed.get("best_epoch", 0))
@@ -788,29 +953,31 @@ def main() -> int:
             _atomic_torch_save(initial, last_path)
 
         for epoch in range(start_epoch, int(args.epochs) + 1):
-            epoch_started = time.time()
-            train_metrics = _train_epoch(
-                rotation_model,
-                native_model,
-                train_loader,
-                device=device,
-                optimizer=optimizer,
-                grad_clip_norm=float(args.grad_clip_norm),
-                distill_weight=float(args.distill_weight),
+            train_metrics, validation_metrics, epoch_accounting = (
+                _run_epoch_with_backoff(
+                    model=rotation_model,
+                    native_teacher=native_model,
+                    train_set=train_set,
+                    validation_loader=validation_loader,
+                    device=device,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    batch_size=int(args.batch_size),
+                    num_workers=int(args.num_workers),
+                    seed=int(args.seed),
+                    grad_clip_norm=float(args.grad_clip_norm),
+                    distill_weight=float(args.distill_weight),
+                    safe_checkpoint_path=last_path,
+                    max_epoch_retries=int(args.max_epoch_retries),
+                    lr_backoff_factor=float(args.lr_backoff_factor),
+                    min_lr=float(args.min_lr),
+                )
             )
-            validation_metrics = _evaluate(
-                rotation_model,
-                validation_loader,
-                device=device,
-                native_reference=native_model,
-            )
-            if not _finite_metrics(validation_metrics):
-                raise RuntimeError("non-finite validation metrics")
             row = {
                 "epoch": int(epoch),
                 "train": train_metrics,
                 "validation": validation_metrics,
-                "epoch_s": float(time.time() - epoch_started),
+                **epoch_accounting,
             }
             history.append(row)
             completed_epoch = int(epoch)
@@ -842,7 +1009,7 @@ def main() -> int:
             )
             _atomic_torch_save(last_payload, last_path)
             partial_result = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
                 "status": "running",
                 "completed_epoch": int(completed_epoch),

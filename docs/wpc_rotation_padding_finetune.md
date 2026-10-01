@@ -76,6 +76,14 @@ checkpoint and promotes it when it is the first fully finite checkpoint or it
 improves Dice. This also recovers a completed epoch if an older runner failed
 while writing its final report.
 
+Training shuffles are derived from `seed + epoch - 1`, so a resumed epoch uses
+the same sample order as an uninterrupted run. If an epoch produces a
+non-finite loss, gradient, or validation output, the runner reloads the last
+completed checkpoint, reduces the learning rate, and retries the entire epoch
+without skipping samples. Each failed attempt, effective learning rate, retry
+count, and shuffle seed is retained in the result. `--resume-lr` can lower the
+optimizer rate when continuing an older checkpoint.
+
 The un-fine-tuned Rotation-Padding model can drive the fixed Chebyshev
 polynomials beyond their fitted domains on some images. Validation therefore
 accounts for every sample explicitly. It records the indices and counts of
@@ -98,6 +106,7 @@ The final result is valid only when:
 - a nonzero Rotation-Padding semantic change is observed;
 - the selected best model is not worse than the un-fine-tuned model when the
   two validation results are comparable;
+- every completed epoch processed every selected training sample;
 - all requested epochs complete, unless `--eval-only` is used;
 - the best checkpoint strictly reloads through the original Orion schema; and
 - both best and last checkpoints exist.
@@ -158,6 +167,9 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 nohup .venv/bin/python \
   --epochs 5 \
   --batch-size 1 \
   --lr 1e-6 \
+  --resume-lr 2.5e-7 \
+  --max-epoch-retries 4 \
+  --lr-backoff-factor 0.25 \
   --distill-weight 0.001 \
   --train-limit 2048 \
   --val-limit 512 \
@@ -195,8 +207,16 @@ separate reporting defect: a non-finite epoch-zero baseline value could not be
 serialized with strict JSON. Schema v2 reports that instability explicitly
 and can resume from the already-written finite epoch-one `last` checkpoint.
 
-The one-epoch values establish numerical stability for the revised
-hyperparameters; they are not yet the final five-epoch accuracy result.
+The recovered schema-v2 report was valid, with epoch one selected as best.
+Continuing at `1e-6` then became non-finite at batch 1,588 of epoch two. The
+last checkpoint was not overwritten, so epoch one remained recoverable. This
+shows that `1e-6` is stable for one epoch but not for the requested five-epoch
+schedule. Schema v3 adds deterministic epoch shuffling and whole-epoch
+rollback with recorded learning-rate backoff. The resumed server command
+starts epoch two at `2.5e-7` and backs off further only if required.
+
+The one-epoch values are valid intermediate accuracy evidence; the final
+five-epoch result remains pending.
 
 ## Following stage
 

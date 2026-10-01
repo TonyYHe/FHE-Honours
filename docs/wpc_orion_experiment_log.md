@@ -821,4 +821,15 @@ Schema v2 now performs sample-level finite accounting, reports non-finite
 baseline indices and counts instead of emitting `NaN`, rejects non-finite
 models from best-checkpoint selection, and promotes a fully finite `last`
 checkpoint on resume. The stable epoch-one checkpoint is therefore reusable;
-the five-epoch resumed run remains pending.
+the recovered epoch-one report completed with `status=ok` and selected epoch
+one as best.
+
+The subsequent epoch-two continuation at `1e-6` again became non-finite at
+batch 1,588. Because checkpoints are committed only after complete finite
+epochs, `rotation_padding_last.pt` remained the valid epoch-one state. Schema
+v3 now assigns each epoch a deterministic shuffle seed and treats a
+non-finite training or validation attempt as recoverable: it rolls back the
+whole epoch, reduces the learning rate by a recorded factor, and retries
+without omitting any sample. The next continuation begins at `2.5e-7`, with
+additional `0.25x` backoff available if required. The five-epoch result remains
+pending.
