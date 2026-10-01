@@ -790,3 +790,35 @@ smoke run completed training, resumed into a second epoch, reloaded the best
 checkpoint in evaluation-only mode, and passed every mechanical acceptance
 gate. These synthetic values are deliberately not recorded as accuracy
 evidence. Dataset-scale Dice/IoU must be collected on the server.
+
+### 2026-10-01 — Rotation-Padding fine-tuning stability pilot
+
+- Executor: Linux CUDA server, Tesla P100, PyTorch `2.13.0+cu126`
+- Dataset: official Zenodo `covid19radio_512.npz`, MD5 verified
+- Split: deterministic 2,048 training / 512 validation samples, seed zero
+- Stable protocol: batch one, learning rate `1e-6`, distillation weight
+  `0.001`, gradient clipping at `1.0`
+- Epoch one wall time: `221.20 s`
+
+| Epoch-one metric | Result |
+|---|---:|
+| Training loss | 0.738985 |
+| Training segmentation loss | 0.259764 |
+| Training distillation loss | 479.221125 |
+| Validation loss | 0.248910 |
+| Validation Dice | 0.909560 |
+| Validation IoU | 0.842765 |
+| Probability MAE vs native | 0.031545 |
+| Prediction flip rate vs native | 0.026200 |
+
+The earlier `lr=1e-5`, distillation-weight `0.05` attempt became non-finite at
+batch 1,588. The stability pilot completed its epoch and wrote a finite
+`rotation_padding_last.pt`, then exposed a distinct schema-v1 reporting bug:
+the final strict-JSON write rejected a `NaN` originating in the un-fine-tuned
+Rotation-Padding baseline.
+
+Schema v2 now performs sample-level finite accounting, reports non-finite
+baseline indices and counts instead of emitting `NaN`, rejects non-finite
+models from best-checkpoint selection, and promotes a fully finite `last`
+checkpoint on resume. The stable epoch-one checkpoint is therefore reusable;
+the five-epoch resumed run remains pending.

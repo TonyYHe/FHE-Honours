@@ -81,15 +81,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--result", type=Path, default=DEFAULT_RESULT)
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1.0e-5)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1.0e-6)
     parser.add_argument("--weight-decay", type=float, default=1.0e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--distill-weight", type=float, default=0.05)
-    parser.add_argument("--train-limit", type=int, default=0)
-    parser.add_argument("--val-limit", type=int, default=0)
+    parser.add_argument("--distill-weight", type=float, default=0.001)
+    parser.add_argument("--train-limit", type=int, default=2048)
+    parser.add_argument("--val-limit", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=20260930)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -140,8 +140,39 @@ def _atomic_json_save(payload: dict[str, Any], path: Path) -> None:
     temporary.replace(path)
 
 
-def _finite_metrics(metrics: dict[str, float]) -> bool:
-    return all(math.isfinite(float(value)) for value in metrics.values())
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _finite_metrics(metrics: dict[str, Any]) -> bool:
+    required = ("loss", "dice", "iou")
+    return bool(
+        metrics.get("fully_finite") is True
+        and all(_finite_number(metrics.get(name)) for name in required)
+    )
+
+
+def _optional_delta(left: Any, right: Any) -> float | None:
+    if not _finite_number(left) or not _finite_number(right):
+        return None
+    return float(left) - float(right)
+
+
+def _should_select_candidate(
+    candidate: dict[str, Any],
+    current_best: dict[str, Any],
+) -> bool:
+    return bool(
+        _finite_metrics(candidate)
+        and (
+            not _finite_metrics(current_best)
+            or float(candidate["dice"]) + 1.0e-12 >= float(current_best["dice"])
+        )
+    )
 
 
 @torch.no_grad()
@@ -151,7 +182,7 @@ def _evaluate(
     *,
     device: torch.device,
     native_reference: nn.Module | None = None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     model.eval()
     if native_reference is not None:
         native_reference.eval()
@@ -165,57 +196,114 @@ def _evaluate(
     }
     maximum_logit_delta = 0.0
     items = 0
+    finite_items = 0
+    comparison_items = 0
+    nonfinite_sample_indices: list[int] = []
+    native_reference_nonfinite_sample_indices: list[int] = []
     for images, masks in tqdm(loader, desc="validate", leave=False):
         images = images.to(device=device, dtype=torch.float32, non_blocking=True)
         masks = masks.to(device=device, dtype=torch.float32, non_blocking=True)
         logits = model(images)
-        loss = segmentation_loss(logits, masks)
-        metrics = batch_metrics(logits, masks)
         batch = int(images.shape[0])
-        totals["loss"] += float(loss.item()) * batch
-        totals["dice"] += float(metrics["dice"]) * batch
-        totals["iou"] += float(metrics["iou"]) * batch
+        finite_mask = torch.isfinite(logits).reshape(batch, -1).all(dim=1)
+        nonfinite_sample_indices.extend(
+            items + int(offset)
+            for offset in torch.nonzero(~finite_mask, as_tuple=False).flatten().tolist()
+        )
+        finite_count = int(finite_mask.sum().item())
+        if finite_count:
+            # Compute validation reductions in float64.  A finite float32 logit can
+            # still overflow a float32 reduction, which should not be mistaken for
+            # a non-finite model output.
+            finite_logits = logits[finite_mask].to(torch.float64)
+            finite_masks = masks[finite_mask].to(torch.float64)
+            loss = segmentation_loss(finite_logits, finite_masks)
+            metrics = batch_metrics(finite_logits, finite_masks)
+            if not bool(torch.isfinite(loss)):
+                raise RuntimeError("finite logits produced a non-finite validation loss")
+            totals["loss"] += float(loss.item()) * finite_count
+            totals["dice"] += float(metrics["dice"]) * finite_count
+            totals["iou"] += float(metrics["iou"]) * finite_count
+            finite_items += finite_count
         if native_reference is not None:
             native_logits = native_reference(images)
-            delta = (logits - native_logits).abs()
-            totals["logits_mae_vs_native"] += float(delta.mean().item()) * batch
-            maximum_logit_delta = max(
-                maximum_logit_delta,
-                float(delta.max().item()),
+            native_finite_mask = (
+                torch.isfinite(native_logits).reshape(batch, -1).all(dim=1)
             )
-            probabilities = torch.sigmoid(logits)
-            native_probabilities = torch.sigmoid(native_logits)
-            totals["prob_mae_vs_native"] += float(
-                (probabilities - native_probabilities).abs().mean().item()
-            ) * batch
-            totals["prediction_flip_rate_vs_native"] += float(
-                (
-                    (probabilities >= 0.5)
-                    != (native_probabilities >= 0.5)
+            native_reference_nonfinite_sample_indices.extend(
+                items + int(offset)
+                for offset in torch.nonzero(
+                    ~native_finite_mask, as_tuple=False
+                ).flatten().tolist()
+            )
+            comparison_mask = finite_mask & native_finite_mask
+            comparison_count = int(comparison_mask.sum().item())
+            if comparison_count:
+                compared_logits = logits[comparison_mask].to(torch.float64)
+                compared_native = native_logits[comparison_mask].to(torch.float64)
+                delta = (compared_logits - compared_native).abs()
+                totals["logits_mae_vs_native"] += (
+                    float(delta.mean().item()) * comparison_count
                 )
-                .to(torch.float32)
-                .mean()
-                .item()
-            ) * batch
+                maximum_logit_delta = max(
+                    maximum_logit_delta,
+                    float(delta.max().item()),
+                )
+                probabilities = torch.sigmoid(compared_logits)
+                native_probabilities = torch.sigmoid(compared_native)
+                totals["prob_mae_vs_native"] += float(
+                    (probabilities - native_probabilities).abs().mean().item()
+                ) * comparison_count
+                totals["prediction_flip_rate_vs_native"] += float(
+                    (
+                        (probabilities >= 0.5)
+                        != (native_probabilities >= 0.5)
+                    )
+                    .to(torch.float32)
+                    .mean()
+                    .item()
+                ) * comparison_count
+                comparison_items += comparison_count
         items += batch
+    fully_finite = bool(items > 0 and finite_items == items)
     result = {
-        "loss": totals["loss"] / max(1, items),
-        "dice": totals["dice"] / max(1, items),
-        "iou": totals["iou"] / max(1, items),
+        "loss": totals["loss"] / finite_items if finite_items else None,
+        "dice": totals["dice"] / finite_items if finite_items else None,
+        "iou": totals["iou"] / finite_items if finite_items else None,
         "sample_count": int(items),
+        "finite_sample_count": int(finite_items),
+        "nonfinite_sample_count": int(items - finite_items),
+        "nonfinite_sample_indices": nonfinite_sample_indices,
+        "fully_finite": fully_finite,
+        "metric_scope": "all_samples" if fully_finite else "finite_samples_only",
     }
     if native_reference is not None:
         result.update(
             {
                 "logits_mae_vs_native": totals["logits_mae_vs_native"]
-                / max(1, items),
-                "max_abs_logit_delta_vs_native": float(maximum_logit_delta),
+                / comparison_items
+                if comparison_items
+                else None,
+                "max_abs_logit_delta_vs_native": float(maximum_logit_delta)
+                if comparison_items
+                else None,
                 "prob_mae_vs_native": totals["prob_mae_vs_native"]
-                / max(1, items),
+                / comparison_items
+                if comparison_items
+                else None,
                 "prediction_flip_rate_vs_native": totals[
                     "prediction_flip_rate_vs_native"
                 ]
-                / max(1, items),
+                / comparison_items
+                if comparison_items
+                else None,
+                "comparison_sample_count": int(comparison_items),
+                "native_reference_nonfinite_sample_count": int(
+                    len(native_reference_nonfinite_sample_indices)
+                ),
+                "native_reference_nonfinite_sample_indices": (
+                    native_reference_nonfinite_sample_indices
+                ),
             }
         )
     return result
@@ -235,7 +323,9 @@ def _train_epoch(
     native_teacher.eval()
     totals = {"loss": 0.0, "segmentation_loss": 0.0, "distillation_loss": 0.0}
     items = 0
-    for images, masks in tqdm(loader, desc="train", leave=False):
+    for batch_index, (images, masks) in enumerate(
+        tqdm(loader, desc="train", leave=False)
+    ):
         images = images.to(device=device, dtype=torch.float32, non_blocking=True)
         masks = masks.to(device=device, dtype=torch.float32, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -249,12 +339,25 @@ def _train_epoch(
             distillation = torch.zeros((), device=device, dtype=logits.dtype)
         loss = segmentation + float(distill_weight) * distillation
         if not bool(torch.isfinite(loss)):
-            raise RuntimeError("non-finite training loss")
+            finite_logits = bool(torch.isfinite(logits).all())
+            raise RuntimeError(
+                "non-finite training loss at "
+                f"batch_index={batch_index}: logits_finite={finite_logits}, "
+                f"segmentation_loss={float(segmentation.detach().item())}, "
+                f"distillation_loss={float(distillation.detach().item())}"
+            )
         loss.backward()
         if float(grad_clip_norm) > 0.0:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float(grad_clip_norm)
-            )
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=float(grad_clip_norm),
+                    error_if_nonfinite=True,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"non-finite gradient norm at batch_index={batch_index}"
+                ) from error
         optimizer.step()
         batch = int(images.shape[0])
         totals["loss"] += float(loss.detach().item()) * batch
@@ -272,14 +375,14 @@ def _checkpoint_payload(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     best_epoch: int,
-    best_metrics: dict[str, float],
+    best_metrics: dict[str, Any],
     history: list[dict[str, Any]],
     source_checkpoint: Path,
     source_sha256: str,
     conversions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": int(epoch),
@@ -314,9 +417,9 @@ def _build_result(
     conversions: list[dict[str, Any]],
     conversion_preserved_state: bool,
     activations_fully_polynomial: bool,
-    native_metrics: dict[str, float],
-    pre_metrics: dict[str, float],
-    best_metrics: dict[str, float],
+    native_metrics: dict[str, Any],
+    pre_metrics: dict[str, Any],
+    best_metrics: dict[str, Any],
     best_epoch: int,
     completed_epoch: int,
     history: list[dict[str, Any]],
@@ -325,6 +428,28 @@ def _build_result(
     checkpoint_reload_compatible: bool,
     started: float,
 ) -> dict[str, Any]:
+    native_finite = _finite_metrics(native_metrics)
+    pre_finite = _finite_metrics(pre_metrics)
+    best_finite = _finite_metrics(best_metrics)
+    pre_evaluation_complete = bool(
+        int(pre_metrics.get("sample_count", -1)) == int(val_count)
+        and int(pre_metrics.get("finite_sample_count", 0))
+        + int(pre_metrics.get("nonfinite_sample_count", 0))
+        == int(val_count)
+    )
+    instability_recovered = bool(not pre_finite and best_finite)
+    pre_delta = pre_metrics.get("max_abs_logit_delta_vs_native")
+    semantic_change_observed = bool(
+        int(pre_metrics.get("nonfinite_sample_count", 0)) > 0
+        or (_finite_number(pre_delta) and float(pre_delta) > 0.0)
+    )
+    best_not_worse_when_comparable = bool(
+        best_finite
+        and (
+            not pre_finite
+            or float(best_metrics["dice"]) + 1.0e-12 >= float(pre_metrics["dice"])
+        )
+    )
     acceptance = {
         "source_checkpoint_sha256_recorded": len(source_sha256) == 64,
         "all_18_spatial_convolutions_use_wpc_rotation_padding": len(conversions)
@@ -335,20 +460,15 @@ def _build_result(
         "checkpoint_cheb7_activations_remain_fully_polynomial": bool(
             activations_fully_polynomial
         ),
-        "native_validation_metrics_are_finite": _finite_metrics(native_metrics),
-        "unfinetuned_rotation_padding_metrics_are_finite": _finite_metrics(
-            pre_metrics
+        "native_validation_metrics_are_finite": native_finite,
+        "unfinetuned_rotation_padding_evaluation_is_fully_accounted": (
+            pre_evaluation_complete
         ),
-        "best_rotation_padding_metrics_are_finite": _finite_metrics(best_metrics),
-        "rotation_padding_semantic_change_was_observed": float(
-            pre_metrics.get("max_abs_logit_delta_vs_native", 0.0)
-        )
-        > 0.0,
-        "best_checkpoint_not_worse_than_unfinetuned_rotation_padding": float(
-            best_metrics["dice"]
-        )
-        + 1.0e-12
-        >= float(pre_metrics["dice"]),
+        "best_rotation_padding_metrics_are_finite": best_finite,
+        "rotation_padding_semantic_change_was_observed": semantic_change_observed,
+        "best_checkpoint_is_finite_and_not_worse_when_comparable": (
+            best_not_worse_when_comparable
+        ),
         "requested_epochs_completed": bool(
             args.eval_only or int(completed_epoch) >= int(args.epochs)
         ),
@@ -360,7 +480,7 @@ def _build_result(
     }
     acceptance["valid"] = bool(all(acceptance.values()))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
         "status": "ok" if acceptance["valid"] else "invalid",
         "timing_policy": "clear training and accuracy validation; no FHE latency claim",
@@ -400,17 +520,41 @@ def _build_result(
             "native_zero_padding_checkpoint": native_metrics,
             "rotation_padding_before_finetune": pre_metrics,
             "rotation_padding_best": best_metrics,
+            "numerical_stability_recovered_by_finetuning": instability_recovered,
             "native_to_unfinetuned_rotation": {
-                "dice_delta": float(pre_metrics["dice"] - native_metrics["dice"]),
-                "iou_delta": float(pre_metrics["iou"] - native_metrics["iou"]),
+                "dice_delta": _optional_delta(
+                    pre_metrics.get("dice"), native_metrics.get("dice")
+                )
+                if pre_finite
+                else None,
+                "iou_delta": _optional_delta(
+                    pre_metrics.get("iou"), native_metrics.get("iou")
+                )
+                if pre_finite
+                else None,
+                "comparable": pre_finite and native_finite,
             },
             "unfinetuned_to_best_rotation": {
-                "dice_delta": float(best_metrics["dice"] - pre_metrics["dice"]),
-                "iou_delta": float(best_metrics["iou"] - pre_metrics["iou"]),
+                "dice_delta": _optional_delta(
+                    best_metrics.get("dice"), pre_metrics.get("dice")
+                )
+                if pre_finite
+                else None,
+                "iou_delta": _optional_delta(
+                    best_metrics.get("iou"), pre_metrics.get("iou")
+                )
+                if pre_finite
+                else None,
+                "comparable": pre_finite and best_finite,
             },
             "native_to_best_rotation": {
-                "dice_delta": float(best_metrics["dice"] - native_metrics["dice"]),
-                "iou_delta": float(best_metrics["iou"] - native_metrics["iou"]),
+                "dice_delta": _optional_delta(
+                    best_metrics.get("dice"), native_metrics.get("dice")
+                ),
+                "iou_delta": _optional_delta(
+                    best_metrics.get("iou"), native_metrics.get("iou")
+                ),
+                "comparable": best_finite and native_finite,
             },
         },
         "training": {
@@ -427,6 +571,7 @@ def _build_result(
             "clear PyTorch fine-tuning and validation rather than FHE inference",
             "accuracy is measured only on the selected FHELIPE dataset split",
             "the best checkpoint may remain epoch zero if fine-tuning does not improve Dice",
+            "un-fine-tuned Rotation Padding metrics are finite-sample-only when polynomial extrapolation produces non-finite logits",
             "server timing is training throughput and is not an HE performance result",
         ],
         "wall_s": float(time.time() - started),
@@ -595,6 +740,38 @@ def main() -> int:
             best_epoch = int(resumed.get("best_epoch", 0))
             best_metrics = dict(resumed.get("best_valid", pre_metrics))
             history = list(resumed.get("history", []))
+            resumed_metrics = _evaluate(
+                rotation_model,
+                validation_loader,
+                device=device,
+                native_reference=native_model,
+            )
+            if _should_select_candidate(resumed_metrics, best_metrics):
+                best_metrics = dict(resumed_metrics)
+                best_epoch = int(completed_epoch)
+                promoted_payload = _checkpoint_payload(
+                    model=rotation_model,
+                    optimizer=optimizer,
+                    epoch=completed_epoch,
+                    best_epoch=best_epoch,
+                    best_metrics=best_metrics,
+                    history=history,
+                    source_checkpoint=source_checkpoint,
+                    source_sha256=source_sha256,
+                    conversions=conversions,
+                )
+                _atomic_torch_save(promoted_payload, best_path)
+                print(
+                    json.dumps(
+                        {
+                            "event": "resumed_last_promoted_to_best",
+                            "epoch": int(completed_epoch),
+                            "validation": resumed_metrics,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
         else:
             initial = _checkpoint_payload(
                 model=rotation_model,
@@ -637,7 +814,7 @@ def main() -> int:
             }
             history.append(row)
             completed_epoch = int(epoch)
-            if float(validation_metrics["dice"]) >= float(best_metrics["dice"]):
+            if _should_select_candidate(validation_metrics, best_metrics):
                 best_metrics = dict(validation_metrics)
                 best_epoch = int(epoch)
                 best_payload = _checkpoint_payload(
@@ -665,7 +842,7 @@ def main() -> int:
             )
             _atomic_torch_save(last_payload, last_path)
             partial_result = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
                 "status": "running",
                 "completed_epoch": int(completed_epoch),

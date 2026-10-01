@@ -68,10 +68,21 @@ For each validation point the result contains:
 - probability MAE from the native model; and
 - prediction flip rate at threshold 0.5.
 
-Epoch zero is saved as the initial best checkpoint. Fine-tuning can therefore
-never replace it with a lower-Dice model. `rotation_padding_last.pt` is written
-atomically after every epoch, and `--resume-if-present` continues from it.
-The result JSON is also updated after each completed epoch.
+`rotation_padding_last.pt` is written atomically after every epoch, and
+`--resume-if-present` continues from it. A checkpoint is eligible to become
+the best checkpoint only when every validation sample has finite logits and
+its loss, Dice, and IoU are finite. On resume, the runner re-evaluates the last
+checkpoint and promotes it when it is the first fully finite checkpoint or it
+improves Dice. This also recovers a completed epoch if an older runner failed
+while writing its final report.
+
+The un-fine-tuned Rotation-Padding model can drive the fixed Chebyshev
+polynomials beyond their fitted domains on some images. Validation therefore
+accounts for every sample explicitly. It records the indices and counts of
+non-finite samples, calculates diagnostic metrics only over the finite subset,
+labels those metrics `finite_samples_only`, and writes `null` for comparisons
+that are not scientifically valid. The result remains strict JSON and never
+encodes `NaN` or infinity.
 
 ## Acceptance gates
 
@@ -81,9 +92,12 @@ The final result is valid only when:
 - exactly 18 spatial convolutions use WPC Rotation Padding;
 - conversion preserves all checkpoint keys and values;
 - all 18 activations are pure degree-7 polynomial paths;
-- native, pre-fine-tuning, and best validation metrics are finite;
+- native and selected-best validation metrics are fully finite;
+- every pre-fine-tuning validation sample is accounted for, including any
+  explicitly reported non-finite sample;
 - a nonzero Rotation-Padding semantic change is observed;
-- the selected best model is not worse than the un-fine-tuned converted model;
+- the selected best model is not worse than the un-fine-tuned model when the
+  two validation results are comparable;
 - all requested epochs complete, unless `--eval-only` is used;
 - the best checkpoint strictly reloads through the original Orion schema; and
 - both best and last checkpoints exist.
@@ -102,7 +116,10 @@ The implementation passed:
 - a full U-Net conversion test proving 18 replacements and unchanged state;
 - a one-sample training smoke run;
 - resume from epoch one into epoch two; and
-- evaluation-only reload of the saved best checkpoint.
+- evaluation-only reload of the saved best checkpoint;
+- strict-JSON reporting when the pre-fine-tuning model emits non-finite logits;
+- acceptance of a fully finite checkpoint that recovers from a non-finite
+  epoch-zero baseline.
 
 The synthetic smoke run validates mechanics only and is not an accuracy
 result. Dataset-scale metrics must come from the server run.
@@ -118,8 +135,9 @@ result. Dataset-scale metrics must come from the server run.
 
 ## Server execution
 
-The full run is intended for a CUDA server and may take hours. First verify
-that the dataset exists:
+The bounded protocol uses the same deterministic 2,048 training and 512
+validation samples selected with seed zero. The full five-epoch run is
+intended for a CUDA server. First verify that the dataset exists:
 
 ```bash
 ls -lh data/fhelipe_medseg/covid19radio_512.npz
@@ -129,38 +147,56 @@ Then run the job under `nohup`:
 
 ```bash
 OUT=.tmp/results/honours/22_wpc_rotation_padding_finetune
-CKPT=checkpoints/wpc_rotation_padding_covid19_cheb7
+CKPT=checkpoints/wpc_rotation_padding_covid19_cheb7_lr1e6_dw1e3
 mkdir -p "$OUT" "$CKPT"
 
-nohup python tools/finetune_wpc_rotation_padding.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 nohup .venv/bin/python \
+  tools/finetune_wpc_rotation_padding.py \
   --dataset covid19 \
   --data-root data/fhelipe_medseg \
   --image-size 256 \
   --epochs 5 \
   --batch-size 1 \
-  --lr 1e-5 \
-  --distill-weight 0.05 \
+  --lr 1e-6 \
+  --distill-weight 0.001 \
+  --train-limit 2048 \
+  --val-limit 512 \
+  --seed 0 \
   --num-workers 2 \
   --device cuda \
   --resume-if-present \
   --out-dir "$CKPT" \
-  --result "$OUT/rotation_padding_finetune.json" \
-  > "$OUT/rotation_padding_finetune.log" 2>&1 &
+  --result "$OUT/stability_pilot_lr1e6_dw1e3.json" \
+  > "$OUT/stability_pilot_lr1e6_dw1e3_resume.log" 2>&1 &
 
-echo $! | tee "$OUT/rotation_padding_finetune.pid"
+echo $! | tee "$OUT/stability_pilot_lr1e6_dw1e3_resume.pid"
 ```
 
 Monitor with:
 
 ```bash
-PID=$(cat .tmp/results/honours/22_wpc_rotation_padding_finetune/rotation_padding_finetune.pid)
+PID=$(cat .tmp/results/honours/22_wpc_rotation_padding_finetune/stability_pilot_lr1e6_dw1e3_resume.pid)
 ps -p "$PID" -o pid,etime,stat,cmd
-tail -n 80 .tmp/results/honours/22_wpc_rotation_padding_finetune/rotation_padding_finetune.log
+tail -n 80 .tmp/results/honours/22_wpc_rotation_padding_finetune/stability_pilot_lr1e6_dw1e3_resume.log
 ```
 
 The job is complete when `ps` shows no process and the log ends with the
 result path. A successful result has `status: "ok"` and every acceptance gate
 set to `true`.
+
+## Server stability observation
+
+On the P100 server, the original `lr=1e-5`, `distill_weight=0.05` run became
+non-finite at training batch 1,588 of 2,048. The bounded stability protocol
+above completed epoch one in 221.20 seconds with finite validation metrics:
+Dice `0.909560`, IoU `0.842765`, loss `0.248910`, and prediction flip rate
+`0.026200` versus the native model. Its final schema-v1 report then exposed a
+separate reporting defect: a non-finite epoch-zero baseline value could not be
+serialized with strict JSON. Schema v2 reports that instability explicitly
+and can resume from the already-written finite epoch-one `last` checkpoint.
+
+The one-epoch values establish numerical stability for the revised
+hyperparameters; they are not yet the final five-epoch accuracy result.
 
 ## Following stage
 

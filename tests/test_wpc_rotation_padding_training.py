@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import argparse
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from orion.experimental.wpc_cips_baseline import (
     CIPSConvCase,
@@ -17,6 +22,12 @@ from orion.experimental.wpc_rotation_padding_training import (
     rotation_padding_module_names,
 )
 from orion.models.unet import UNet22PlusOutput
+from tools.finetune_wpc_rotation_padding import (
+    _build_result,
+    _evaluate,
+    _parser,
+    _should_select_candidate,
+)
 
 
 def test_rotation_padding_conv_matches_independent_numpy_oracle() -> None:
@@ -101,3 +112,151 @@ def test_conversion_rejects_unsupported_stride_or_groups() -> None:
         WPCRotationPaddingConv2d.from_conv2d(
             nn.Conv2d(2, 2, 3, padding=1, groups=2)
         )
+
+
+class _SelectiveNonfiniteModel(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        result = value[:, :1].clone()
+        nonfinite = value[:, 0, 0, 0] > 0.5
+        result[nonfinite] = float("nan")
+        return result
+
+
+def test_evaluate_accounts_for_nonfinite_samples_without_emitting_nan() -> None:
+    images = torch.stack(
+        [
+            torch.zeros((1, 2, 2), dtype=torch.float32),
+            torch.ones((1, 2, 2), dtype=torch.float32),
+        ]
+    )
+    masks = torch.zeros_like(images)
+    loader = DataLoader(TensorDataset(images, masks), batch_size=2, shuffle=False)
+
+    metrics = _evaluate(
+        _SelectiveNonfiniteModel(),
+        loader,
+        device=torch.device("cpu"),
+        native_reference=nn.Identity(),
+    )
+
+    assert metrics["sample_count"] == 2
+    assert metrics["finite_sample_count"] == 1
+    assert metrics["nonfinite_sample_count"] == 1
+    assert metrics["nonfinite_sample_indices"] == [1]
+    assert metrics["fully_finite"] is False
+    assert metrics["metric_scope"] == "finite_samples_only"
+    assert metrics["comparison_sample_count"] == 1
+    assert metrics["native_reference_nonfinite_sample_count"] == 0
+    json.dumps(metrics, allow_nan=False)
+
+
+def _validation_metrics(
+    *,
+    fully_finite: bool,
+    dice: float,
+    nonfinite_count: int = 0,
+) -> dict[str, object]:
+    finite_count = 2 - int(nonfinite_count)
+    return {
+        "loss": 0.25,
+        "dice": float(dice),
+        "iou": 0.8,
+        "sample_count": 2,
+        "finite_sample_count": finite_count,
+        "nonfinite_sample_count": int(nonfinite_count),
+        "nonfinite_sample_indices": [1] if nonfinite_count else [],
+        "fully_finite": bool(fully_finite),
+        "metric_scope": "all_samples" if fully_finite else "finite_samples_only",
+        "logits_mae_vs_native": 1.0,
+        "max_abs_logit_delta_vs_native": 2.0,
+        "prob_mae_vs_native": 0.01,
+        "prediction_flip_rate_vs_native": 0.02,
+        "comparison_sample_count": finite_count,
+        "native_reference_nonfinite_sample_count": 0,
+        "native_reference_nonfinite_sample_indices": [],
+    }
+
+
+def test_result_accepts_finite_recovery_from_nonfinite_baseline(
+    tmp_path: Path,
+) -> None:
+    best_path = tmp_path / "rotation_padding_best.pt"
+    last_path = tmp_path / "rotation_padding_last.pt"
+    best_path.write_bytes(b"best")
+    last_path.write_bytes(b"last")
+    args = argparse.Namespace(
+        dataset="covid19",
+        image_size=256,
+        epochs=1,
+        batch_size=1,
+        lr=1.0e-6,
+        weight_decay=1.0e-4,
+        grad_clip_norm=1.0,
+        distill_weight=0.001,
+        train_limit=2048,
+        val_limit=512,
+        num_workers=2,
+        seed=0,
+        device="cuda",
+        resume_if_present=True,
+        eval_only=False,
+        result=tmp_path / "result.json",
+    )
+
+    result = _build_result(
+        args=args,
+        source_checkpoint=tmp_path / "source.pt",
+        source_sha256="a" * 64,
+        data_path=tmp_path / "covid19radio_512.npz",
+        train_count=2048,
+        val_count=2,
+        conversions=[{"name": str(index)} for index in range(18)],
+        conversion_preserved_state=True,
+        activations_fully_polynomial=True,
+        native_metrics=_validation_metrics(fully_finite=True, dice=0.91),
+        pre_metrics=_validation_metrics(
+            fully_finite=False,
+            dice=0.80,
+            nonfinite_count=1,
+        ),
+        best_metrics=_validation_metrics(fully_finite=True, dice=0.90),
+        best_epoch=1,
+        completed_epoch=1,
+        history=[],
+        best_path=best_path,
+        last_path=last_path,
+        checkpoint_reload_compatible=True,
+        started=0.0,
+    )
+
+    assert result["schema_version"] == 2
+    assert result["status"] == "ok"
+    assert result["acceptance"]["valid"] is True
+    assert result["metrics"]["numerical_stability_recovered_by_finetuning"] is True
+    assert result["metrics"]["native_to_unfinetuned_rotation"]["comparable"] is False
+    assert result["metrics"]["native_to_unfinetuned_rotation"]["dice_delta"] is None
+    json.dumps(result, allow_nan=False)
+
+
+def test_stable_server_protocol_defaults() -> None:
+    args = _parser().parse_args([])
+    assert args.batch_size == 1
+    assert args.lr == 1.0e-6
+    assert args.distill_weight == 0.001
+    assert args.train_limit == 2048
+    assert args.val_limit == 512
+    assert args.seed == 0
+
+
+def test_finite_resume_candidate_replaces_legacy_nonfinite_best() -> None:
+    candidate = _validation_metrics(fully_finite=True, dice=0.90)
+    legacy_best = {
+        "loss": float("nan"),
+        "dice": 0.95,
+        "iou": 0.90,
+        "sample_count": 2,
+    }
+    assert _should_select_candidate(candidate, legacy_best) is True
+
+    better_finite_best = _validation_metrics(fully_finite=True, dice=0.91)
+    assert _should_select_candidate(candidate, better_finite_best) is False
