@@ -84,6 +84,16 @@ without skipping samples. Each failed attempt, effective learning rate, retry
 count, and shuffle seed is retained in the result. `--resume-lr` can lower the
 optimizer rate when continuing an older checkpoint.
 
+Before an epoch is accepted, the resulting checkpoint is evaluated without
+updates over all selected training samples as well as the validation set. A
+single non-finite training sample rejects and rolls back the whole epoch.
+Every accepted state is also saved as an immutable
+`rotation_padding_epoch_NNNN.pt` checkpoint, preventing a later apparently
+successful epoch from erasing the last independently auditable state. Resume
+is allowed only from schema-v4 checkpoints with complete audits and all prior
+epoch files; schema-v3 checkpoints are rejected. A new non-resume run also
+refuses to overwrite checkpoint files already present in its output directory.
+
 The un-fine-tuned Rotation-Padding model can drive the fixed Chebyshev
 polynomials beyond their fitted domains on some images. Validation therefore
 accounts for every sample explicitly. It records the indices and counts of
@@ -107,6 +117,8 @@ The final result is valid only when:
 - the selected best model is not worse than the un-fine-tuned model when the
   two validation results are comparable;
 - every completed epoch processed every selected training sample;
+- every accepted epoch passes a fully finite no-update training-set audit;
+- immutable checkpoints exist for epoch zero and every completed epoch;
 - all requested epochs complete, unless `--eval-only` is used;
 - the best checkpoint strictly reloads through the original Orion schema; and
 - both best and last checkpoints exist.
@@ -156,19 +168,25 @@ Then run the job under `nohup`:
 
 ```bash
 OUT=.tmp/results/honours/22_wpc_rotation_padding_finetune
-CKPT=checkpoints/wpc_rotation_padding_covid19_cheb7_lr1e6_dw1e3
-mkdir -p "$OUT" "$CKPT"
+CKPT=checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart
+mkdir -p "$OUT"
+
+if [ -e "$CKPT" ]; then
+  echo "ERROR: audited restart directory already exists: $CKPT"
+  exit 1
+fi
+
+mkdir -p "$CKPT"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 nohup .venv/bin/python \
   tools/finetune_wpc_rotation_padding.py \
   --dataset covid19 \
   --data-root data/fhelipe_medseg \
   --image-size 256 \
-  --epochs 5 \
+  --epochs 1 \
   --batch-size 1 \
   --lr 1e-6 \
-  --resume-lr 2.5e-7 \
-  --max-epoch-retries 4 \
+  --max-epoch-retries 0 \
   --lr-backoff-factor 0.25 \
   --distill-weight 0.001 \
   --train-limit 2048 \
@@ -176,20 +194,19 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 nohup .venv/bin/python \
   --seed 0 \
   --num-workers 2 \
   --device cuda \
-  --resume-if-present \
   --out-dir "$CKPT" \
-  --result "$OUT/stability_pilot_lr1e6_dw1e3.json" \
-  > "$OUT/stability_pilot_lr1e6_dw1e3_resume.log" 2>&1 &
+  --result "$OUT/audited_epoch1_restart.json" \
+  > "$OUT/audited_epoch1_restart.log" 2>&1 &
 
-echo $! | tee "$OUT/stability_pilot_lr1e6_dw1e3_resume.pid"
+echo $! | tee "$OUT/audited_epoch1_restart.pid"
 ```
 
 Monitor with:
 
 ```bash
-PID=$(cat .tmp/results/honours/22_wpc_rotation_padding_finetune/stability_pilot_lr1e6_dw1e3_resume.pid)
+PID=$(cat .tmp/results/honours/22_wpc_rotation_padding_finetune/audited_epoch1_restart.pid)
 ps -p "$PID" -o pid,etime,stat,cmd
-tail -n 80 .tmp/results/honours/22_wpc_rotation_padding_finetune/stability_pilot_lr1e6_dw1e3_resume.log
+tail -n 80 .tmp/results/honours/22_wpc_rotation_padding_finetune/audited_epoch1_restart.log
 ```
 
 The job is complete when `ps` shows no process and the log ends with the
@@ -214,6 +231,21 @@ shows that `1e-6` is stable for one epoch but not for the requested five-epoch
 schedule. Schema v3 adds deterministic epoch shuffling and whole-epoch
 rollback with recorded learning-rate backoff. The resumed server command
 starts epoch two at `2.5e-7` and backs off further only if required.
+
+Epoch two subsequently completed at `2.5e-7`, improving validation Dice to
+`0.911259`. Epoch three nevertheless failed at the identical batch 1,923 on
+all five attempts from `2.5e-7` through `9.765625e-10`. A no-update probe of
+the saved epoch-two checkpoint reproduced the failure on selected training
+sample 308 (original dataset row 2,379). The first non-finite module was
+`dec1a_act`: its finite input magnitude reached `8.661925888e9`, versus a
+Chebyshev domain scale of approximately `1.138e3`. Epoch two is therefore not
+a valid model despite its finite validation metrics.
+
+Schema v4 closes this acceptance gap by auditing every selected training
+sample after each epoch and retaining immutable per-epoch checkpoints. Since
+the earlier epoch-one file was overwritten before this defect was known, the
+next server task reconstructs epoch one in a fresh directory and audits it;
+it does not continue from the invalid epoch-two state.
 
 The one-epoch values are valid intermediate accuracy evidence; the final
 five-epoch result remains pending.

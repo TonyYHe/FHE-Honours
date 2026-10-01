@@ -165,6 +165,67 @@ def _finite_metrics(metrics: dict[str, Any]) -> bool:
     )
 
 
+def _training_audits_complete(
+    history: list[dict[str, Any]],
+    *,
+    completed_epoch: int,
+    train_count: int,
+) -> bool:
+    """Return whether every completed epoch has a full finite training audit."""
+
+    return bool(
+        [int(row.get("epoch", -1)) for row in history]
+        == list(range(1, int(completed_epoch) + 1))
+        and all(
+            _finite_metrics(dict(row.get("post_epoch_training_audit", {})))
+            and int(
+                row.get("post_epoch_training_audit", {}).get("sample_count", -1)
+            )
+            == int(train_count)
+            for row in history
+        )
+    )
+
+
+def _validate_resume_checkpoint(
+    checkpoint: dict[str, Any],
+    *,
+    checkpoint_path: Path,
+    train_count: int,
+) -> None:
+    """Reject legacy or incomplete states that are unsafe to resume."""
+
+    schema_version = int(checkpoint.get("schema_version", 0))
+    completed_epoch = int(checkpoint.get("epoch", -1))
+    history = list(checkpoint.get("history", []))
+    if schema_version < 4:
+        raise RuntimeError(
+            "resume checkpoint predates mandatory full training-set audits "
+            f"(schema_version={schema_version}); restart in a fresh output directory"
+        )
+    if completed_epoch < 0 or not _training_audits_complete(
+        history,
+        completed_epoch=completed_epoch,
+        train_count=int(train_count),
+    ):
+        raise RuntimeError(
+            "resume checkpoint does not contain a complete finite training-set "
+            "audit for every completed epoch; restart from an audited checkpoint"
+        )
+    missing_epoch_checkpoints = [
+        checkpoint_path.parent / f"rotation_padding_epoch_{epoch:04d}.pt"
+        for epoch in range(0, completed_epoch + 1)
+        if not (
+            checkpoint_path.parent / f"rotation_padding_epoch_{epoch:04d}.pt"
+        ).is_file()
+    ]
+    if missing_epoch_checkpoints:
+        raise RuntimeError(
+            "resume checkpoint is missing immutable epoch evidence: "
+            + ", ".join(str(path) for path in missing_epoch_checkpoints)
+        )
+
+
 def _optional_delta(left: Any, right: Any) -> float | None:
     if not _finite_number(left) or not _finite_number(right):
         return None
@@ -415,7 +476,7 @@ def _run_epoch_with_backoff(
     max_epoch_retries: int,
     lr_backoff_factor: float,
     min_lr: float,
-) -> tuple[dict[str, float], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, float], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Run one epoch, rolling back and lowering LR after numerical failure."""
 
     epoch_started = time.time()
@@ -443,6 +504,35 @@ def _run_epoch_with_backoff(
                 grad_clip_norm=float(grad_clip_norm),
                 distill_weight=float(distill_weight),
             )
+            training_audit_loader = make_loader(
+                train_set,
+                batch_size=int(batch_size),
+                shuffle=False,
+                num_workers=int(num_workers),
+                seed=shuffle_seed,
+            )
+            post_epoch_training_audit = _evaluate(
+                model,
+                training_audit_loader,
+                device=device,
+            )
+            training_audit_complete = bool(
+                _finite_metrics(post_epoch_training_audit)
+                and int(post_epoch_training_audit.get("sample_count", -1))
+                == len(train_set)
+            )
+            if not training_audit_complete:
+                raise _NonFiniteEpochError(
+                    "post-epoch training-set audit was incomplete or found "
+                    "non-finite logits: "
+                    f"expected_sample_count={len(train_set)}, "
+                    f"sample_count="
+                    f"{post_epoch_training_audit.get('sample_count')}, "
+                    f"nonfinite_sample_count="
+                    f"{post_epoch_training_audit.get('nonfinite_sample_count')}, "
+                    f"nonfinite_sample_indices="
+                    f"{post_epoch_training_audit.get('nonfinite_sample_indices')}"
+                )
             validation_metrics = _evaluate(
                 model,
                 validation_loader,
@@ -462,7 +552,12 @@ def _run_epoch_with_backoff(
                 "failed_attempts": failures,
                 "shuffle_seed": int(shuffle_seed),
             }
-            return train_metrics, validation_metrics, accounting
+            return (
+                train_metrics,
+                post_epoch_training_audit,
+                validation_metrics,
+                accounting,
+            )
         except _NonFiniteEpochError as error:
             failure = {
                 "attempt": int(attempt),
@@ -524,7 +619,7 @@ def _checkpoint_payload(
     conversions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": int(epoch),
@@ -600,6 +695,15 @@ def _build_result(
             for row in history
         )
     )
+    post_epoch_training_audits_valid = _training_audits_complete(
+        history,
+        completed_epoch=int(completed_epoch),
+        train_count=int(train_count),
+    )
+    epoch_checkpoint_paths = [
+        last_path.parent / f"rotation_padding_epoch_{epoch:04d}.pt"
+        for epoch in range(0, int(completed_epoch) + 1)
+    ]
     acceptance = {
         "source_checkpoint_sha256_recorded": len(source_sha256) == 64,
         "all_18_spatial_convolutions_use_wpc_rotation_padding": len(conversions)
@@ -620,6 +724,12 @@ def _build_result(
             best_not_worse_when_comparable
         ),
         "completed_epochs_cover_every_training_sample": training_history_complete,
+        "post_epoch_training_set_audits_are_fully_finite": (
+            post_epoch_training_audits_valid
+        ),
+        "immutable_epoch_checkpoints_exist": all(
+            path.is_file() for path in epoch_checkpoint_paths
+        ),
         "requested_epochs_completed": bool(
             args.eval_only or int(completed_epoch) >= int(args.epochs)
         ),
@@ -631,7 +741,7 @@ def _build_result(
     }
     acceptance["valid"] = bool(all(acceptance.values()))
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
         "status": "ok" if acceptance["valid"] else "invalid",
         "timing_policy": "clear training and accuracy validation; no FHE latency claim",
@@ -725,6 +835,7 @@ def _build_result(
         "outputs": {
             "best_checkpoint": str(best_path),
             "last_checkpoint": str(last_path),
+            "epoch_checkpoints": [str(path) for path in epoch_checkpoint_paths],
             "result": str(Path(args.result).expanduser().resolve()),
         },
         "limitations": [
@@ -732,6 +843,7 @@ def _build_result(
             "accuracy is measured only on the selected FHELIPE dataset split",
             "the best checkpoint may remain epoch zero if fine-tuning does not improve Dice",
             "un-fine-tuned Rotation Padding metrics are finite-sample-only when polynomial extrapolation produces non-finite logits",
+            "every accepted epoch is audited over the complete selected training set without parameter updates",
             "server timing is training throughput and is not an HE performance result",
         ],
         "wall_s": float(time.time() - started),
@@ -858,6 +970,7 @@ def main() -> int:
     out_dir = args.out_dir.expanduser().resolve()
     best_path = out_dir / "rotation_padding_best.pt"
     last_path = out_dir / "rotation_padding_last.pt"
+    epoch_zero_path = out_dir / "rotation_padding_epoch_0000.pt"
     result_path = args.result.expanduser().resolve()
 
     native_metrics = _evaluate(native_model, validation_loader, device=device)
@@ -893,6 +1006,11 @@ def main() -> int:
     else:
         if bool(args.resume_if_present) and last_path.is_file():
             resumed = torch.load(last_path, map_location="cpu", weights_only=False)
+            _validate_resume_checkpoint(
+                resumed,
+                checkpoint_path=last_path,
+                train_count=len(train_set),
+            )
             if str(resumed.get("source_checkpoint_sha256")) != source_sha256:
                 raise RuntimeError("resume checkpoint belongs to a different source checkpoint")
             rotation_model.load_state_dict(resumed["state_dict"], strict=True)
@@ -938,6 +1056,21 @@ def main() -> int:
                     flush=True,
                 )
         else:
+            existing_checkpoint_paths = [
+                path
+                for path in (
+                    best_path,
+                    last_path,
+                    *sorted(out_dir.glob("rotation_padding_epoch_*.pt")),
+                )
+                if path.is_file()
+            ]
+            if existing_checkpoint_paths:
+                raise RuntimeError(
+                    "refusing to overwrite existing fine-tuning checkpoints without "
+                    "--resume-if-present: "
+                    + ", ".join(str(path) for path in existing_checkpoint_paths)
+                )
             initial = _checkpoint_payload(
                 model=rotation_model,
                 optimizer=optimizer,
@@ -951,9 +1084,15 @@ def main() -> int:
             )
             _atomic_torch_save(initial, best_path)
             _atomic_torch_save(initial, last_path)
+            _atomic_torch_save(initial, epoch_zero_path)
 
         for epoch in range(start_epoch, int(args.epochs) + 1):
-            train_metrics, validation_metrics, epoch_accounting = (
+            (
+                train_metrics,
+                post_epoch_training_audit,
+                validation_metrics,
+                epoch_accounting,
+            ) = (
                 _run_epoch_with_backoff(
                     model=rotation_model,
                     native_teacher=native_model,
@@ -976,6 +1115,7 @@ def main() -> int:
             row = {
                 "epoch": int(epoch),
                 "train": train_metrics,
+                "post_epoch_training_audit": post_epoch_training_audit,
                 "validation": validation_metrics,
                 **epoch_accounting,
             }
@@ -1008,8 +1148,10 @@ def main() -> int:
                 conversions=conversions,
             )
             _atomic_torch_save(last_payload, last_path)
+            epoch_path = out_dir / f"rotation_padding_epoch_{epoch:04d}.pt"
+            _atomic_torch_save(last_payload, epoch_path)
             partial_result = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
                 "status": "running",
                 "completed_epoch": int(completed_epoch),

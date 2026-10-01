@@ -833,3 +833,20 @@ whole epoch, reduces the learning rate by a recorded factor, and retries
 without omitting any sample. The next continuation begins at `2.5e-7`, with
 additional `0.25x` backoff available if required. The five-epoch result remains
 pending.
+
+The v3 run accepted epoch two at `2.5e-7` because all 512 validation samples
+were finite and Dice improved to `0.911259`. Epoch three then failed at batch
+1,923 under every retry learning rate down to `9.765625e-10`. A direct
+no-update probe proved the saved epoch-two state itself was invalid on selected
+training sample 308 (source row 2,379): `dec1a_act` received a finite
+`8.661925888e9` input, roughly 7.6 million times its fitted Chebyshev domain
+scale, and overflowed.
+
+This invalidates epoch two despite its validation score and shows that
+validation-only finite checks are insufficient for polynomial networks.
+Schema v4 therefore requires a complete no-update training-set finite audit
+before accepting an epoch and saves immutable epoch-numbered checkpoints. The
+runner rejects legacy or incompletely audited resume checkpoints and refuses
+to overwrite prior evidence in a non-resume run. The next run reconstructs and
+audits epoch one in a fresh output directory rather than continuing from epoch
+two.

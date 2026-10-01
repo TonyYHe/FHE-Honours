@@ -30,6 +30,8 @@ from tools.finetune_wpc_rotation_padding import (
     _parser,
     _run_epoch_with_backoff,
     _should_select_candidate,
+    _training_audits_complete,
+    _validate_resume_checkpoint,
 )
 
 
@@ -187,6 +189,16 @@ def test_result_accepts_finite_recovery_from_nonfinite_baseline(
     last_path = tmp_path / "rotation_padding_last.pt"
     best_path.write_bytes(b"best")
     last_path.write_bytes(b"last")
+    (tmp_path / "rotation_padding_epoch_0000.pt").write_bytes(b"epoch zero")
+    (tmp_path / "rotation_padding_epoch_0001.pt").write_bytes(b"epoch one")
+    training_audit = _validation_metrics(fully_finite=True, dice=0.90)
+    training_audit.update(
+        {
+            "sample_count": 2048,
+            "finite_sample_count": 2048,
+            "comparison_sample_count": 2048,
+        }
+    )
     args = argparse.Namespace(
         dataset="covid19",
         image_size=256,
@@ -229,14 +241,20 @@ def test_result_accepts_finite_recovery_from_nonfinite_baseline(
         best_metrics=_validation_metrics(fully_finite=True, dice=0.90),
         best_epoch=1,
         completed_epoch=1,
-        history=[{"epoch": 1, "train": {"sample_count": 2048}}],
+        history=[
+            {
+                "epoch": 1,
+                "train": {"sample_count": 2048},
+                "post_epoch_training_audit": training_audit,
+            }
+        ],
         best_path=best_path,
         last_path=last_path,
         checkpoint_reload_compatible=True,
         started=0.0,
     )
 
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     assert result["status"] == "ok"
     assert result["acceptance"]["valid"] is True
     assert result["metrics"]["numerical_stability_recovered_by_finetuning"] is True
@@ -304,15 +322,28 @@ def test_epoch_retry_restores_safe_checkpoint_and_backs_off_lr(
         return {"loss": 0.2, "segmentation_loss": 0.2, "distillation_loss": 0.0}
 
     monkeypatch.setattr(finetune_runner, "_train_epoch", fake_train_epoch)
-    monkeypatch.setattr(
-        finetune_runner,
-        "_evaluate",
-        lambda *args, **kwargs: _validation_metrics(fully_finite=True, dice=0.9),
-    )
+    def fake_evaluate(*args: object, **kwargs: object) -> dict[str, object]:
+        metrics = _validation_metrics(fully_finite=True, dice=0.9)
+        if kwargs.get("native_reference") is None:
+            metrics.update(
+                {
+                    "sample_count": 1,
+                    "finite_sample_count": 1,
+                    "nonfinite_sample_count": 0,
+                }
+            )
+        return metrics
+
+    monkeypatch.setattr(finetune_runner, "_evaluate", fake_evaluate)
     dataset = TensorDataset(torch.zeros((1, 1)), torch.zeros((1, 1)))
     validation_loader = DataLoader(dataset, batch_size=1)
 
-    train_metrics, validation_metrics, accounting = _run_epoch_with_backoff(
+    (
+        train_metrics,
+        training_audit,
+        validation_metrics,
+        accounting,
+    ) = _run_epoch_with_backoff(
         model=model,
         native_teacher=native,
         train_set=dataset,
@@ -333,8 +364,141 @@ def test_epoch_retry_restores_safe_checkpoint_and_backs_off_lr(
 
     assert calls == 2
     assert train_metrics["loss"] == 0.2
+    assert training_audit["fully_finite"] is True
     assert validation_metrics["fully_finite"] is True
     assert accounting["attempt_count"] == 2
     assert accounting["effective_lr"] == pytest.approx(0.25)
     assert accounting["shuffle_seed"] == 1
     assert len(accounting["failed_attempts"]) == 1
+
+
+def test_post_epoch_training_audit_failure_rolls_back_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = nn.Linear(1, 1, bias=False)
+    native = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0)
+    safe_path = tmp_path / "rotation_padding_last.pt"
+    torch.save(
+        {
+            "epoch": 0,
+            "state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        safe_path,
+    )
+    monkeypatch.setattr(
+        finetune_runner,
+        "_train_epoch",
+        lambda *args, **kwargs: {
+            "loss": 0.2,
+            "segmentation_loss": 0.2,
+            "distillation_loss": 0.0,
+            "sample_count": 1,
+        },
+    )
+    evaluation_count = 0
+
+    def fake_evaluate(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal evaluation_count
+        evaluation_count += 1
+        if evaluation_count == 1:
+            metrics = _validation_metrics(
+                fully_finite=False,
+                dice=0.0,
+                nonfinite_count=1,
+            )
+            metrics.update({"sample_count": 1, "finite_sample_count": 0})
+            return metrics
+        metrics = _validation_metrics(fully_finite=True, dice=0.9)
+        if kwargs.get("native_reference") is None:
+            metrics.update(
+                {
+                    "sample_count": 1,
+                    "finite_sample_count": 1,
+                    "nonfinite_sample_count": 0,
+                }
+            )
+        return metrics
+
+    monkeypatch.setattr(finetune_runner, "_evaluate", fake_evaluate)
+    dataset = TensorDataset(torch.zeros((1, 1)), torch.zeros((1, 1)))
+    validation_loader = DataLoader(dataset, batch_size=1)
+
+    _, training_audit, validation_metrics, accounting = _run_epoch_with_backoff(
+        model=model,
+        native_teacher=native,
+        train_set=dataset,
+        validation_loader=validation_loader,
+        device=torch.device("cpu"),
+        optimizer=optimizer,
+        epoch=1,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        grad_clip_norm=1.0,
+        distill_weight=0.001,
+        safe_checkpoint_path=safe_path,
+        max_epoch_retries=1,
+        lr_backoff_factor=0.25,
+        min_lr=1.0e-10,
+    )
+
+    assert training_audit["fully_finite"] is True
+    assert validation_metrics["fully_finite"] is True
+    assert accounting["attempt_count"] == 2
+    assert accounting["effective_lr"] == pytest.approx(0.25)
+    assert "training-set audit" in accounting["failed_attempts"][0]["error"]
+
+
+def test_legacy_resume_checkpoint_is_rejected(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "rotation_padding_last.pt"
+    with pytest.raises(RuntimeError, match="predates mandatory"):
+        _validate_resume_checkpoint(
+            {"schema_version": 3, "epoch": 2, "history": []},
+            checkpoint_path=checkpoint_path,
+            train_count=2048,
+        )
+
+
+def test_audited_resume_checkpoint_requires_immutable_evidence(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "rotation_padding_last.pt"
+    training_audit = _validation_metrics(fully_finite=True, dice=0.9)
+    training_audit.update(
+        {
+            "sample_count": 2048,
+            "finite_sample_count": 2048,
+        }
+    )
+    checkpoint = {
+        "schema_version": 4,
+        "epoch": 1,
+        "history": [
+            {
+                "epoch": 1,
+                "post_epoch_training_audit": training_audit,
+            }
+        ],
+    }
+    assert _training_audits_complete(
+        checkpoint["history"],
+        completed_epoch=1,
+        train_count=2048,
+    )
+    with pytest.raises(RuntimeError, match="missing immutable epoch evidence"):
+        _validate_resume_checkpoint(
+            checkpoint,
+            checkpoint_path=checkpoint_path,
+            train_count=2048,
+        )
+
+    (tmp_path / "rotation_padding_epoch_0000.pt").write_bytes(b"epoch zero")
+    (tmp_path / "rotation_padding_epoch_0001.pt").write_bytes(b"epoch one")
+    _validate_resume_checkpoint(
+        checkpoint,
+        checkpoint_path=checkpoint_path,
+        train_count=2048,
+    )
