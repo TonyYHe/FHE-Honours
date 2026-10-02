@@ -276,8 +276,15 @@ def summarize_periodicity(
 
     import hashlib
 
-    if _integer(summary.get("schema_version"), name=f"{network} census schema") < 2:
-        raise EvidenceValidationError(f"{network} census schema is older than 2")
+    schema_version = _integer(
+        summary.get("schema_version"),
+        name=f"{network} census schema",
+        minimum=1,
+    )
+    if require_encoded_verification and schema_version < 2:
+        raise EvidenceValidationError(
+            f"{network} encoded-Q/P verification requires census schema 2 or newer"
+        )
     if str(summary.get("profile")) != "wpc_orion_slot_periodicity":
         raise EvidenceValidationError(f"{network} has an unexpected census profile")
     occurrence = _dict(summary.get("occurrence"))
@@ -358,6 +365,15 @@ def summarize_periodicity(
             if not isinstance(record, dict):
                 raise EvidenceValidationError(
                     f"{jsonl_path}:{line_number}: record is not an object"
+                )
+            record_schema = _integer(
+                record.get("schema_version"),
+                name=f"{jsonl_path}:{line_number} schema",
+                minimum=1,
+            )
+            if record_schema != schema_version:
+                raise EvidenceValidationError(
+                    f"{jsonl_path}:{line_number}: record/summary schema mismatch"
                 )
             kind = str(record.get("record_type", ""))
             if kind not in record_counts:

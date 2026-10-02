@@ -25,7 +25,8 @@ any required condition is false. It independently checks:
 - additive major-wall timing closure and agreement of the canonical online
   Encode value with its wall category;
 - complete census identity metadata, zero logical-payload changes, and exact
-  JSONL occurrence/unique counts;
+  JSONL occurrence/unique counts (schema 1 is accepted for the pre-verifier
+  ResNet/VGG censuses; encoded-Q/P evidence requires schema 2 or newer);
 - conservative classification of every periodic occurrence as a learned
   weight or a known structural concatenation materializer;
 - exact encoded-Q/P verification for all 14 U-Net candidates;

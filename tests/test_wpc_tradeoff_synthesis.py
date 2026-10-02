@@ -283,6 +283,45 @@ def test_candidate_classification_is_conservative() -> None:
     ) == "unclassified"
 
 
+def test_schema_one_census_is_accepted_when_no_encoded_verification_is_needed(
+    tmp_path: Path,
+) -> None:
+    summary, path = _periodicity_files(
+        tmp_path,
+        network="resnet20_cifar10",
+        mode="dense",
+        periodic=False,
+    )
+    summary["schema_version"] = 1
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for record in records:
+        record["schema_version"] = 1
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    row, _ = summarize_periodicity(
+        summary,
+        path,
+        network="resnet20_cifar10",
+        display_name="ResNet20",
+        expected_mode="dense",
+        require_encoded_verification=False,
+    )
+
+    assert row["periodic_count"] == 0
+    with pytest.raises(EvidenceValidationError, match="requires census schema 2"):
+        summarize_periodicity(
+            summary,
+            path,
+            network="resnet20_cifar10",
+            display_name="ResNet20",
+            expected_mode="dense",
+            require_encoded_verification=True,
+        )
+
+
 def test_synthesis_joins_scoped_evidence(tmp_path: Path) -> None:
     checkpoint = tmp_path / "rotation_padding_best.pt"
     checkpoint.write_bytes(b"checkpoint")
