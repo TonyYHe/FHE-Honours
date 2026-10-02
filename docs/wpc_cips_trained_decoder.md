@@ -178,7 +178,7 @@ field under `acceptance` to `true`.
 ## Remaining work
 
 This gate proves exact trained-parameter and learned-activation integration for
-one decoder stage. It does not prove end-to-end trained-model accuracy. The
-next stages are Rotation-Padding-aware fine-tuning/accuracy validation and
-then repeated isolated server timing/RSS comparisons between the Orion and
-WPC paths.
+one decoder stage. Rotation-Padding-aware fine-tuning and full held-out
+validation are documented in `docs/wpc_rotation_padding_finetune.md`. The
+matched fresh-process full-Q/P versus compressed-Q/P resource experiment is
+implemented in `docs/wpc_cips_trained_isolated_benchmark.md`.

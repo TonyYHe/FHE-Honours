@@ -850,3 +850,21 @@ runner rejects legacy or incompletely audited resume checkpoints and refuses
 to overwrite prior evidence in a non-resume run. The next run reconstructs and
 audits epoch one in a fresh output directory rather than continuing from epoch
 two.
+
+### 2026-10-02 — Isolated fine-tuned decoder benchmark implementation
+
+- Executor: local real-Lattigo smoke run; Linux RSS/timing run pending
+- Workers: fresh full-Q/P and compressed-Q/P processes
+- Graph: fine-tuned `up1 + cat1 + dec1a + Cheb7 + bootstrap + dec1b`
+- Learned transforms: 56
+- Timing: complete encrypted graph, warmups excluded, repeated forwards
+- Memory: logical plaintexts, Go heap, and externally sampled RSS reported
+  separately
+
+The local one-forward smoke run validated both encrypted workers, matched the
+same clear result within `6.13e-7`, matched operation counts, observed zero
+online Encode calls, and reduced logical resident plaintext storage by
+`12.94x`. The combined local result is intentionally invalid only because
+external process RSS is unavailable inside the restricted macOS environment.
+The Linux server uses `/proc/<pid>/status` and must close that final acceptance
+gate with two warmups and ten measured forwards per worker.
