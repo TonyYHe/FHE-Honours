@@ -868,3 +868,51 @@ online Encode calls, and reduced logical resident plaintext storage by
 external process RSS is unavailable inside the restricted macOS environment.
 The Linux server uses `/proc/<pid>/status` and must close that final acceptance
 gate with two warmups and ten measured forwards per worker.
+
+### 2026-10-02 — Isolated fine-tuned decoder server benchmark
+
+- Executor: Linux server
+- Protocol: separate fresh full-Q/P and compressed-Q/P workers, two warmups
+  and ten measured forwards each
+- Result:
+  `.tmp/results/honours/25_wpc_finetuned_decoder_isolated_benchmark/server_run1/comparison.json`
+- Result: valid; every acceptance gate passed
+
+| Metric | Full Q/P | WPC compressed Q/P |
+|---|---:|---:|
+| Median encrypted decoder forward | 2.385596 s | 2.444890 s |
+| Mean encrypted decoder forward | 2.382545 s | 2.459265 s |
+| Logical resident plaintexts | 422,445,056 B | 32,635,904 B |
+| Pre-online RSS | 1,358,647,296 B | 958,169,088 B |
+| Measured online peak RSS | 1,934,684,160 B | 1,145,720,832 B |
+| Go heap after compile/GC | 533,954,560 B | 144,302,080 B |
+
+The compressed/full median latency ratio was `1.024855`, a `2.486%` overhead.
+Median online decompression was `149.836 ms`, or `6.181%` of the compressed
+forward. Logical plaintext storage fell by `12.944x`; pre-online RSS fell by
+`400,478,208 B` (`29.48%`) and measured peak RSS by `788,963,328 B`
+(`40.78%`). Both workers performed 1,200 linear-transform rotations and four
+conjugations per forward. Their maximum output delta was `1.12e-8`.
+
+This result establishes a trained encrypted decoder-stage memory/latency
+trade-off. It does not establish complete encrypted U-Net performance.
+
+### 2026-10-02 — Trade-off synthesis implementation
+
+- Tool: `tools/synthesize_wpc_orion_tradeoff.py`
+- Tests: `tests/test_wpc_tradeoff_synthesis.py`
+- Documentation: `docs/wpc_orion_tradeoff_synthesis.md`
+- Server evidence synthesis: pending
+
+The synthesis runner validates the three-model Step-1 matrix, streams and
+cross-checks all census JSONL records, classifies periodic candidates,
+validates the full 2,115-sample Rotation-Padding accuracy result, joins the
+trained-decoder FHE correctness and isolated resource benchmark, and requires
+matching checkpoint hashes. It writes machine-readable JSON/CSV, a concise
+Markdown report, four plots, and a SHA-256 artifact manifest.
+
+The report keeps the central conclusion scoped: selective WPC compression of
+already-periodic diagonals in the unchanged Orion layouts is unsupported, while
+the CIPS/Rotation-Padding layout shows a favorable memory/latency trade-off at
+the trained decoder-stage scope. Complete encrypted-network comparison remains
+unmeasured.
