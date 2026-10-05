@@ -50,10 +50,9 @@ from tools.run_wpc_cips_trained_decoder import (
     _aggregate_storage,
     _config,
     _encrypt_packed,
-    _load_checkpoint,
+    _load_checkpoint_identified,
     _make_conv,
     _make_up,
-    _sha256,
     _torch_reference,
 )
 
@@ -135,8 +134,7 @@ def main() -> int:
         raise SystemExit("trained decoder benchmark requires logn=10 and 8x8 output")
 
     _write_phase(args.phase_file, "startup")
-    state, model_metadata = _load_checkpoint(checkpoint_path)
-    checkpoint_sha256 = _sha256(checkpoint_path)
+    state, model_metadata, checkpoint_sha256 = _load_checkpoint_identified(checkpoint_path)
     activation_spec = CheckpointChebyshevSpec.from_state_dict(
         state, "dec1a_act"
     )
@@ -434,6 +432,7 @@ def main() -> int:
             "checkpoint": {
                 "path": str(checkpoint_path),
                 "sha256": checkpoint_sha256,
+                "identity_policy": "sha256_of_exact_bytes_deserialized",
                 "model_metadata": model_metadata,
             },
             "experiment": {

@@ -916,3 +916,18 @@ already-periodic diagonals in the unchanged Orion layouts is unsupported, while
 the CIPS/Rotation-Padding layout shows a favorable memory/latency trade-off at
 the trained decoder-stage scope. Complete encrypted-network comparison remains
 unmeasured.
+
+## 2026-10-05 — Validation and checkpoint provenance repair
+
+- Implemented independent reconstruction of Step-1 percentages/statistics,
+  census counts/byte coverage and isolated decoder benchmark summaries from
+  raw observations; required named gates and finite, complete measurements.
+- Bound accuracy schema 5 to the exact checkpoint bytes loaded, verified source
+  identity in eval-only mode, checked reload tensor values, and recorded
+  checkpoint-file hashes. Synthesis schema 2 joins four checkpoint hashes.
+- Added decoder correctness schema 2 with its measured tolerance and fixed the
+  common concat payload's missing numerator contribution in its storage ratio.
+- Added corruption/provenance regression tests and a fail-fast, non-overwriting
+  server recovery script. Historical evidence/archives and checkpoints were
+  preserved; no retraining or remote experiment was performed locally.
+- Recovery instructions and scope limits: `docs/wpc_validation_provenance.md`.

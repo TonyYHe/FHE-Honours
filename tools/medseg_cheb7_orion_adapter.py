@@ -182,8 +182,11 @@ def build_orion_cheb7_model_from_checkpoint(
     *,
     replacements_path: Path | None = None,
     device: torch.device | str = "cpu",
+    checkpoint_payload: dict[str, Any] | None = None,
 ) -> tuple[UNet22PlusOutput, dict[str, Any]]:
-    checkpoint = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
+    checkpoint = checkpoint_payload if checkpoint_payload is not None else torch.load(
+        Path(checkpoint_path), map_location="cpu", weights_only=False
+    )
     state = checkpoint.get("state_dict", checkpoint)
     model_cfg = dict(checkpoint.get("model", {}) or {})
     replacements = load_degree_replacements(replacements_path)

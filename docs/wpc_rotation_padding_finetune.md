@@ -104,6 +104,11 @@ encodes `NaN` or infinity.
 
 ## Acceptance gates
 
+Final accuracy results now use schema 5 and bind the evaluated checkpoint by
+SHA-256, source identity and epoch. Checkpoints retain audited schema 4. See
+[Validation and checkpoint provenance](wpc_validation_provenance.md) for
+evaluation-only recovery; existing trained weights need not be retrained.
+
 The final result is valid only when:
 
 - the source checkpoint hash is recorded;

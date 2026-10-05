@@ -6,6 +6,7 @@ import pytest
 
 from orion.experimental.wpc_cips_trained_benchmark import (
     TRAINED_DECODER_TRANSFORM_COUNT,
+    WORKER_GATES,
     compare_trained_decoder_workers,
 )
 
@@ -21,6 +22,7 @@ def _worker(mode: str, pid: int) -> dict:
         "experiment": {
             "graph": "trained-decoder",
             "forward_runs": 3,
+            "atol": 2e-3,
         },
         "measurements": {
             "forward_wall_s": (
@@ -30,6 +32,7 @@ def _worker(mode: str, pid: int) -> dict:
                 [0.0, 0.0, 0.0] if not compressed else [0.2, 0.2, 0.2]
             ),
             "activation_s": [0.1, 0.1, 0.1],
+            "transform_evaluate_s": [0.0, 0.0, 0.0],
             "bootstrap_s": [0.5, 0.5, 0.5],
             "bootstrap_call_count": 3,
             "operation_counters_per_forward": {
@@ -38,12 +41,17 @@ def _worker(mode: str, pid: int) -> dict:
                 "direct_rotation": 0,
                 "conjugation": 0,
             },
+            "operation_counters_total": {
+                "rotation_total": 3600, "linear_transform_rotation": 3600,
+                "direct_rotation": 0, "conjugation": 0,
+            },
             "online_python_encode_call_count": 0,
         },
         "correctness": {
             "correct": True,
             "max_abs_error": 1.0e-6,
             "output_values": [1.0, 2.0, 3.0],
+            "output_shape": [1, 3],
         },
         "storage": {
             "learned_transform_count": TRAINED_DECODER_TRANSFORM_COUNT,
@@ -72,6 +80,7 @@ def _worker(mode: str, pid: int) -> dict:
                 "peak_materialized_transform_count": 1 if compressed else 0,
             }
         },
+        "acceptance": dict.fromkeys(WORKER_GATES, True),
     }
 
 
@@ -128,6 +137,39 @@ def test_trained_decoder_comparison_rejects_mismatched_checkpoint() -> None:
         is False
     )
     assert result["acceptance"]["valid"] is False
+
+
+@pytest.mark.parametrize("field,values", [
+    ("forward_wall_s", []), ("decompression_s", [0.2]),
+    ("activation_s", [float("nan")] * 3),
+    ("bootstrap_s", [-1.0] * 3), ("forward_wall_s", [0.0] * 3),
+    ("decompression_s", [2.0] * 3),
+    ("forward_wall_s", [True] * 3),
+])
+def test_worker_rejects_missing_invalid_or_nonclosing_samples(field, values) -> None:
+    worker = _worker("compressed", 101)
+    worker["measurements"][field] = values
+    with pytest.raises(ValueError):
+        compare_trained_decoder_workers(_worker("full", 100), worker, rss_samples=_rss(), atol=2e-3)
+
+
+@pytest.mark.parametrize("kind", ["nan_output", "empty_output", "shape", "error", "gate", "totals"])
+def test_worker_rejects_inconsistent_correctness_and_missing_gates(kind) -> None:
+    worker = _worker("compressed", 101)
+    if kind == "nan_output":
+        worker["correctness"]["output_values"][0] = float("nan")
+    elif kind == "empty_output":
+        worker["correctness"]["output_values"] = []
+    elif kind == "shape":
+        worker["correctness"]["output_shape"] = [2, 3]
+    elif kind == "error":
+        worker["correctness"]["max_abs_error"] = 1.0
+    elif kind == "gate":
+        del worker["acceptance"]["correct_vs_clear"]
+    else:
+        worker["measurements"]["operation_counters_total"]["rotation_total"] += 1
+    with pytest.raises(ValueError):
+        compare_trained_decoder_workers(_worker("full", 100), worker, rss_samples=_rss(), atol=2e-3)
 
 
 def test_trained_decoder_comparison_rejects_missing_measured_rss() -> None:

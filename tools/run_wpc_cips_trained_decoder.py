@@ -125,8 +125,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+def _load_checkpoint_identified(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any], str]:
+    from orion.experimental.wpc_evidence_validation import load_checkpoint_bytes
+    payload, digest = load_checkpoint_bytes(path)
     state = payload.get("state_dict", payload)
     model = dict(payload.get("model", {}) or {})
     expected_shapes = {
@@ -152,6 +153,11 @@ def _load_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any
         raise ValueError("checkpoint must use the unet22-plus-output architecture")
     if int(model.get("base_dim", -1)) != 32:
         raise ValueError("checkpoint must use base_dim=32")
+    return state, model, digest
+
+
+def _load_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    state, model, _digest = _load_checkpoint_identified(path)
     return state, model
 
 
@@ -309,7 +315,7 @@ def _aggregate_storage(plans: list[Any], concat_plan: WPCCIPSConcatPlan) -> dict
         "learned_weight_storage_ratio": float(full / stored),
         "concat_full_qp_payload_bytes": int(concat["full_qp_payload_bytes"]),
         "overall_full_to_stored_including_concat_ratio": float(
-            full / (stored + concat["full_qp_payload_bytes"])
+            (full + concat["full_qp_payload_bytes"]) / (stored + concat["full_qp_payload_bytes"])
         ),
         "concat": concat,
     }
@@ -420,7 +426,7 @@ def main() -> int:
     if float(args.bound_headroom) < 1.0:
         raise SystemExit("bound-headroom must be at least one")
 
-    state, model_metadata = _load_checkpoint(checkpoint_path)
+    state, model_metadata, checkpoint_sha256 = _load_checkpoint_identified(checkpoint_path)
     activation_spec = CheckpointChebyshevSpec.from_state_dict(
         state, "dec1a_act"
     )
@@ -751,14 +757,16 @@ def main() -> int:
         acceptance["valid"] = bool(all(acceptance.values()))
 
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "wpc_cips_checkpoint_trained_unet_decoder_stage",
             "status": "ok" if acceptance["valid"] else "invalid",
             "timing_policy": "single diagnostic execution; no performance claim",
+            "correctness_atol": float(args.atol),
             "seed": int(args.seed),
             "checkpoint": {
                 "path": str(checkpoint_path),
-                "sha256": _sha256(checkpoint_path),
+                "sha256": checkpoint_sha256,
+                "identity_policy": "sha256_of_exact_bytes_deserialized",
                 "model_metadata": model_metadata,
                 "parameter_names": [
                     "up1.weight",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -251,12 +252,20 @@ def test_result_accepts_finite_recovery_from_nonfinite_baseline(
         best_path=best_path,
         last_path=last_path,
         checkpoint_reload_compatible=True,
+        evaluated_checkpoint={
+            "path": str(best_path), "sha256": hashlib.sha256(best_path.read_bytes()).hexdigest(),
+            "source_checkpoint_sha256": "a" * 64, "epoch": 1,
+            "padding_semantics": "wpc_flattened_spatial_rotation_padding",
+            "identity_policy": "sha256_of_exact_bytes_deserialized",
+        },
         started=0.0,
     )
 
-    assert result["schema_version"] == 4
+    assert result["schema_version"] == 5
     assert result["status"] == "ok"
     assert result["acceptance"]["valid"] is True
+    assert len(result["checkpoint_manifest"]) == 4
+    assert result["checkpoint_manifest"][0]["sha256"] == result["evaluated_checkpoint"]["sha256"]
     assert result["metrics"]["numerical_stability_recovered_by_finetuning"] is True
     assert result["metrics"]["native_to_unfinetuned_rotation"]["comparable"] is False
     assert result["metrics"]["native_to_unfinetuned_rotation"]["dice_delta"] is None

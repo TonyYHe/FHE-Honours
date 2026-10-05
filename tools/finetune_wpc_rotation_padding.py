@@ -41,6 +41,7 @@ from orion.experimental.wpc_rotation_padding_training import (
     convert_model_to_wpc_rotation_padding,
     rotation_padding_module_names,
 )
+from orion.experimental.wpc_evidence_validation import load_checkpoint_bytes, sha256
 from tools.medseg_cheb7_orion_adapter import (
     CheckpointScaledChebyshevSiLU,
     build_orion_cheb7_model_from_checkpoint,
@@ -162,6 +163,16 @@ def _finite_metrics(metrics: dict[str, Any]) -> bool:
     return bool(
         metrics.get("fully_finite") is True
         and all(_finite_number(metrics.get(name)) for name in required)
+        and 0.0 <= float(metrics["dice"]) <= 1.0
+        and 0.0 <= float(metrics["iou"]) <= 1.0
+        and float(metrics["loss"]) >= 0.0
+        and isinstance(metrics.get("sample_count"), int)
+        and not isinstance(metrics.get("sample_count"), bool)
+        and metrics["sample_count"] > 0
+        and metrics.get("finite_sample_count") == metrics["sample_count"]
+        and metrics.get("nonfinite_sample_count") == 0
+        and metrics.get("nonfinite_sample_indices") == []
+        and metrics.get("metric_scope") == "all_samples"
     )
 
 
@@ -224,6 +235,33 @@ def _validate_resume_checkpoint(
             "resume checkpoint is missing immutable epoch evidence: "
             + ", ".join(str(path) for path in missing_epoch_checkpoints)
         )
+
+
+def _validate_evaluated_checkpoint(
+    saved: dict[str, Any], *, path: Path, source_sha256: str, train_count: int,
+) -> None:
+    """Evaluation must not bypass the provenance/audit checks used by resume."""
+    _validate_resume_checkpoint(saved, checkpoint_path=path, train_count=train_count)
+    if saved.get("source_checkpoint_sha256") != source_sha256:
+        raise RuntimeError("evaluated checkpoint belongs to a different source checkpoint")
+    if saved.get("model", {}).get("padding_semantics") != "wpc_flattened_spatial_rotation_padding":
+        raise RuntimeError("evaluated checkpoint is not a WPC Rotation-Padding checkpoint")
+    state = saved.get("state_dict", {})
+    if not state or any(not torch.isfinite(value).all() for value in state.values()):
+        raise RuntimeError("evaluated checkpoint contains missing/non-finite weights")
+    # Adapted fine-tuning checkpoints store fixed coeffs and scale buffers,
+    # not the source model's log-scale/blend_alpha training parameters.
+    coefficients = {key.removesuffix(".coeffs"): value for key, value in state.items() if key.endswith(".coeffs")}
+    if len(coefficients) != 18 or any(value.numel() != 8 for value in coefficients.values()):
+        raise RuntimeError("evaluated checkpoint must have 18 degree-seven activations")
+    for name in coefficients:
+        for suffix in ("postscale_tensor", "prescale_tensor"):
+            scale = state.get(f"{name}.{suffix}")
+            if scale is None or scale.numel() != 1 or float(scale) <= 0:
+                raise RuntimeError("evaluated checkpoint activation scales are invalid")
+    blends = [value for key, value in state.items() if key.endswith(".blend_alpha")]
+    if any(not torch.allclose(value, torch.ones_like(value), atol=1e-7, rtol=0) for value in blends):
+        raise RuntimeError("evaluated checkpoint is not fully polynomial")
 
 
 def _optional_delta(left: Any, right: Any) -> float | None:
@@ -663,8 +701,10 @@ def _build_result(
     best_path: Path,
     last_path: Path,
     checkpoint_reload_compatible: bool,
+    evaluated_checkpoint: dict[str, Any],
     started: float,
 ) -> dict[str, Any]:
+    sha256(source_sha256, name="source checkpoint")
     native_finite = _finite_metrics(native_metrics)
     pre_finite = _finite_metrics(pre_metrics)
     best_finite = _finite_metrics(best_metrics)
@@ -704,6 +744,10 @@ def _build_result(
         last_path.parent / f"rotation_padding_epoch_{epoch:04d}.pt"
         for epoch in range(0, int(completed_epoch) + 1)
     ]
+    checkpoint_manifest = [
+        {"path": str(path), "sha256": _sha256(path), "bytes": path.stat().st_size}
+        for path in [best_path, last_path, *epoch_checkpoint_paths] if path.is_file()
+    ]
     acceptance = {
         "source_checkpoint_sha256_recorded": len(source_sha256) == 64,
         "all_18_spatial_convolutions_use_wpc_rotation_padding": len(conversions)
@@ -738,10 +782,19 @@ def _build_result(
         ),
         "best_and_last_checkpoints_exist": best_path.is_file()
         and last_path.is_file(),
+        "evaluated_checkpoint_content_identity_recorded": bool(
+            sha256(evaluated_checkpoint.get("sha256"), name="evaluated checkpoint")
+            and evaluated_checkpoint.get("source_checkpoint_sha256") == source_sha256
+            and evaluated_checkpoint.get("epoch") == best_epoch
+            and evaluated_checkpoint.get("path") == str(best_path)
+            and evaluated_checkpoint.get("padding_semantics") == "wpc_flattened_spatial_rotation_padding"
+            and evaluated_checkpoint.get("identity_policy") == "sha256_of_exact_bytes_deserialized"
+            and best_path.is_file() and _sha256(best_path) == evaluated_checkpoint.get("sha256")
+        ),
     }
     acceptance["valid"] = bool(all(acceptance.values()))
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "profile": "wpc_rotation_padding_checkpoint_finetune_accuracy",
         "status": "ok" if acceptance["valid"] else "invalid",
         "timing_policy": "clear training and accuracy validation; no FHE latency claim",
@@ -749,6 +802,8 @@ def _build_result(
             "path": str(source_checkpoint),
             "sha256": str(source_sha256),
         },
+        "evaluated_checkpoint": dict(evaluated_checkpoint),
+        "checkpoint_manifest": checkpoint_manifest,
         "dataset": {
             "name": str(args.dataset),
             "path": str(data_path),
@@ -874,8 +929,7 @@ def main() -> int:
     source_checkpoint = args.checkpoint.expanduser().resolve()
     if not source_checkpoint.is_file():
         raise SystemExit(f"missing checkpoint: {source_checkpoint}")
-    source_sha256 = _sha256(source_checkpoint)
-    source_payload = torch.load(source_checkpoint, map_location="cpu", weights_only=False)
+    source_payload, source_sha256 = load_checkpoint_bytes(source_checkpoint)
     source_state = source_payload.get("state_dict", source_payload)
     blend_rows = {
         name: float(value.detach().cpu().item())
@@ -894,7 +948,6 @@ def main() -> int:
             "source checkpoint must contain 18 pure-polynomial activations "
             "with blend_alpha=1"
         )
-    del source_payload
     spec = SPECS[str(args.dataset)]
     data_path = (args.data_root.expanduser().resolve() / spec.filename)
     if not data_path.is_file():
@@ -928,7 +981,9 @@ def main() -> int:
     native_model, adapter_metadata = build_orion_cheb7_model_from_checkpoint(
         source_checkpoint,
         device=device,
+        checkpoint_payload=source_payload,
     )
+    del source_payload
     native_model.eval()
     rotation_model = copy.deepcopy(native_model).to(device)
     for parameter in native_model.parameters():
@@ -989,7 +1044,8 @@ def main() -> int:
     if bool(args.eval_only):
         if not best_path.is_file():
             raise SystemExit(f"eval-only checkpoint does not exist: {best_path}")
-        saved = torch.load(best_path, map_location="cpu", weights_only=False)
+        saved, best_sha256 = load_checkpoint_bytes(best_path)
+        _validate_evaluated_checkpoint(saved, path=best_path, source_sha256=source_sha256, train_count=len(train_set))
         rotation_model.load_state_dict(saved["state_dict"], strict=True)
         rotation_model.to(device)
         best_epoch = int(saved.get("best_epoch", saved.get("epoch", 0)))
@@ -1002,7 +1058,8 @@ def main() -> int:
             native_reference=native_model,
         )
         if not last_path.is_file():
-            _atomic_torch_save(saved, last_path)
+            raise RuntimeError("eval-only requires the existing last checkpoint; no checkpoints are written")
+        best_saved = saved
     else:
         if bool(args.resume_if_present) and last_path.is_file():
             resumed = torch.load(last_path, map_location="cpu", weights_only=False)
@@ -1167,7 +1224,8 @@ def main() -> int:
             _atomic_json_save(partial_result, result_path)
             print(json.dumps({"event": "epoch_complete", **row}, sort_keys=True), flush=True)
 
-        best_saved = torch.load(best_path, map_location="cpu", weights_only=False)
+        best_saved, best_sha256 = load_checkpoint_bytes(best_path)
+        _validate_evaluated_checkpoint(best_saved, path=best_path, source_sha256=source_sha256, train_count=len(train_set))
         rotation_model.load_state_dict(best_saved["state_dict"], strict=True)
         rotation_model.to(device)
         best_epoch = int(best_saved.get("best_epoch", best_saved.get("epoch", 0)))
@@ -1181,11 +1239,17 @@ def main() -> int:
     reload_model, _reload_metadata = build_orion_cheb7_model_from_checkpoint(
         best_path,
         device="cpu",
+        checkpoint_payload=best_saved,
     )
     checkpoint_reload_compatible = bool(
         set(reload_model.state_dict()) == set(rotation_model.state_dict())
+        and all(torch.equal(value.detach().cpu(), rotation_model.state_dict()[key].detach().cpu())
+                for key, value in reload_model.state_dict().items())
     )
     del reload_model
+    # Refuse to emit a result if the supplied files changed during evaluation.
+    if _sha256(best_path) != best_sha256 or _sha256(source_checkpoint) != source_sha256:
+        raise RuntimeError("checkpoint file changed during evaluation; result not written")
 
     result = _build_result(
         args=args,
@@ -1206,6 +1270,15 @@ def main() -> int:
         best_path=best_path,
         last_path=last_path,
         checkpoint_reload_compatible=checkpoint_reload_compatible,
+        evaluated_checkpoint={
+            "path": str(best_path),
+            "sha256": best_sha256,
+            "source_checkpoint_sha256": str(best_saved["source_checkpoint_sha256"]),
+            "epoch": int(best_saved["epoch"]),
+            "checkpoint_schema_version": int(best_saved["schema_version"]),
+            "padding_semantics": str(best_saved["model"]["padding_semantics"]),
+            "identity_policy": "sha256_of_exact_bytes_deserialized",
+        },
         started=started,
     )
     result["adapter_metadata"] = adapter_metadata

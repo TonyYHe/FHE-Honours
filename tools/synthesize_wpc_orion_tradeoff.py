@@ -135,13 +135,16 @@ def _resolve(path: Path, *, name: str) -> Path:
     return candidate
 
 
-def _load_json(path: Path, *, name: str) -> dict[str, Any]:
+def _load_json(path: Path, *, name: str, digests: dict[Path, str] | None = None) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        content = path.read_bytes()
+        payload = json.loads(content)
     except (OSError, json.JSONDecodeError) as exc:
         raise EvidenceValidationError(f"cannot read {name} {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise EvidenceValidationError(f"{name} is not a JSON object: {path}")
+    if digests is not None:
+        digests[path] = hashlib.sha256(content).hexdigest()
     return payload
 
 
@@ -534,7 +537,7 @@ def _render_report(summary: Mapping[str, Any], *, plots: Sequence[str]) -> str:
                 f"{final['loss']:.6f} |"
             ),
             "",
-            "Before fine-tuning, one sample was non-finite, so its aggregate metrics are "
+            f"Before fine-tuning, {before['nonfinite_sample_count']} samples were non-finite; affected aggregate metrics are "
             "finite-sample diagnostics rather than a directly comparable full-set result. "
             f"Fine-tuning restored finite outputs for all {accuracy['validation_count']:,} "
             "samples. The final Dice gap "
@@ -600,11 +603,30 @@ def main() -> int:
             "decoder_benchmark": _resolve(args.decoder_benchmark, name="decoder benchmark"),
             "checkpoint": _resolve(args.checkpoint, name="fine-tuned checkpoint"),
         }
+        streamed_hashes: dict[Path, str] = {}
         payloads = {
-            key: _load_json(path, name=key)
+            key: _load_json(path, name=key, digests=streamed_hashes)
             for key, path in paths.items()
             if key not in {"resnet_jsonl", "unet_jsonl", "vgg_jsonl", "checkpoint"}
         }
+        # comparison.json omits bulky output_values. Rehydrate from the raw
+        # workers, checking embedded metadata/measurements before comparison.
+        benchmark = payloads["decoder_benchmark"]
+        for mode in ("full", "compressed"):
+            worker = benchmark.get("workers", {}).get(mode, {})
+            if "output_values" in worker.get("correctness", {}):
+                continue
+            artifact = benchmark.get("artifacts", {}).get(mode, {}).get("result")
+            if not isinstance(artifact, str) or not artifact:
+                raise EvidenceValidationError(f"benchmark missing {mode} raw-worker artifact path")
+            worker_path = _resolve(Path(artifact), name=f"{mode} raw worker")
+            raw_worker = _load_json(worker_path, name=f"{mode} raw worker", digests=streamed_hashes)
+            stripped = json.loads(json.dumps(raw_worker))
+            stripped.get("correctness", {}).pop("output_values", None)
+            if stripped != worker:
+                raise EvidenceValidationError(f"{mode} embedded worker disagrees with raw artifact")
+            benchmark["workers"][mode] = raw_worker
+            paths[f"{mode}_raw_worker"] = worker_path
         census_specs = (
             (
                 "resnet20_cifar10",
@@ -632,10 +654,9 @@ def main() -> int:
             ),
         )
         periodicity_rows: list[dict[str, Any]] = []
-        streamed_hashes: dict[Path, str] = {}
         for network, display, mode, summary_path, jsonl_path, require_encoded in census_specs:
             row, jsonl_sha = summarize_periodicity(
-                _load_json(summary_path, name=f"{network} census summary"),
+                _load_json(summary_path, name=f"{network} census summary", digests=streamed_hashes),
                 jsonl_path,
                 network=network,
                 display_name=display,

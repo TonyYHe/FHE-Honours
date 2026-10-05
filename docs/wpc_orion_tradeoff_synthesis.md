@@ -18,6 +18,10 @@ the decoder-stage benchmark as complete encrypted U-Net performance.
 
 ## Validation policy
 
+For the schema-2 validation/provenance repair and the required evaluation-only
+recovery of historical accuracy results, see
+[Validation and checkpoint provenance](wpc_validation_provenance.md).
+
 `tools/synthesize_wpc_orion_tradeoff.py` fails without writing a report when
 any required condition is false. It independently checks:
 
@@ -32,9 +36,9 @@ any required condition is false. It independently checks:
 - exact encoded-Q/P verification for all 14 U-Net candidates;
 - all acceptance gates in the full validation, decoder correctness, and
   isolated benchmark results;
-- complete held-out sample accounting and finite native/fine-tuned metrics;
-- matching checkpoint hashes across the checkpoint file, decoder correctness
-  result, and isolated benchmark; and
+- complete validation-split sample accounting and finite native/fine-tuned metrics;
+- matching checkpoint hashes across the checkpoint file, schema-5 accuracy,
+  schema-2 decoder correctness, and isolated benchmark; and
 - matching operation counters between isolated full and compressed workers.
 
 The large census JSONL files are streamed. Their SHA-256 hashes are calculated
@@ -63,6 +67,12 @@ rotation_padding_accuracy.png
 hash of every input artifact. The report uses only validated inputs.
 
 ## Server execution
+
+Historical schema-4 accuracy and schema-1 decoder-correctness files must first
+be regenerated using `tools/revalidate_wpc_evidence.sh`. The commands below
+apply only when the selected inputs already satisfy the new contracts; the
+recovery script passes the fresh input paths explicitly and preserves this
+directory's historical outputs.
 
 Run from the repository root after synchronizing the synthesis implementation:
 
