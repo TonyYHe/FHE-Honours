@@ -1,0 +1,96 @@
+{
+  "ckks_config": {
+    "ckks_params": {
+      "LogN": 11,
+      "LogQ": [
+        55,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45
+      ],
+      "LogP": [
+        60
+      ],
+      "LogScale": 45,
+      "H": 192,
+      "RingType": "Standard"
+    },
+    "boot_params": {
+      "LogP": [
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61
+      ]
+    },
+    "orion": {
+      "margin": 1,
+      "backend": "lattigo",
+      "embedding_method": "square",
+      "io_mode": "none",
+      "debug": false
+    }
+  },
+  "configuration_source": {
+    "kind": "json_file",
+    "path": "/private/tmp/wpc-decoder-level9-test.json",
+    "sha256": "918dd064fff214a61f993a6d4dd86b29f0c9e4ce26de45db08467d8b97af7267"
+  },
+  "geometry": {
+    "logn": 11,
+    "slots": 1024,
+    "low_shape": [
+      1,
+      64,
+      4,
+      4
+    ],
+    "high_shape": [
+      1,
+      32,
+      8,
+      8
+    ],
+    "concat_shape": [
+      1,
+      64,
+      8,
+      8
+    ],
+    "low_channel_capacity": 64,
+    "high_channel_capacity": 16,
+    "learned_transform_count_by_layer": {
+      "checkpoint_up1": 2,
+      "checkpoint_dec1a": 8,
+      "checkpoint_dec1b": 4
+    },
+    "learned_transform_count": 14,
+    "concat_transform_count": 4,
+    "bootstrap_ciphertext_group_count": 2,
+    "levels": {
+      "up1": 9,
+      "skip1": 8,
+      "concat": 8,
+      "dec1a": 7,
+      "bridge_input": 6,
+      "dec1b": 9,
+      "output": 8
+    }
+  },
+  "security_assessed": false,
+  "verify_exact_qp": true,
+  "resource_guards": {
+    "max_worker_rss_mib": 4096.0,
+    "worker_timeout_s": 300.0
+  }
+}

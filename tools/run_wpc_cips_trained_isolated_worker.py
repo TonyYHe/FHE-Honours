@@ -35,8 +35,9 @@ from orion.experimental.wpc_cips_layer import (
     WPC_STORAGE_ONLINE,
     WPC_STORAGE_MODES,
 )
-from orion.experimental.wpc_cips_trained_benchmark import (
-    TRAINED_DECODER_TRANSFORM_COUNT,
+from orion.experimental.wpc_decoder_geometry import (
+    UNASSESSED_SECURITY_SCOPE, decoder_geometry, resolve_decoder_config,
+    validate_parameter_manifest,
 )
 from orion.experimental.wpc_cips_upsample import WPCCIPSConvTranspose2dPlan
 from orion.nn import Concat, Conv2d, ConvTranspose2d
@@ -51,7 +52,6 @@ from tools.run_wpc_cips_isolated_worker import (
 from tools.run_wpc_cips_trained_decoder import (
     DEFAULT_CHECKPOINT,
     _aggregate_storage,
-    _config,
     _encrypt_packed,
     _load_checkpoint_identified,
     _make_conv,
@@ -67,7 +67,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--phase-file", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260929)
-    parser.add_argument("--logn", type=int, default=10)
+    parser.add_argument("--logn", type=int, default=None)
+    parser.add_argument("--ckks-config", type=Path, help="explicit Orion CKKS JSON; otherwise use functional defaults")
+    parser.add_argument("--verify-exact-qp", action="store_true", help="untimed exact Q/P control for the compressed worker")
     parser.add_argument("--height", type=int, default=8)
     parser.add_argument("--width", type=int, default=8)
     parser.add_argument("--bsgs-ratio", type=float, default=2.0)
@@ -126,6 +128,13 @@ def _logical_storage(
 
 def main() -> int:
     args = _parser().parse_args()
+    config, config_source = resolve_decoder_config(args)
+    geometry = decoder_geometry(args.logn, args.height, args.width, len(config["ckks_params"]["LogQ"]) - 1)
+    levels = geometry["levels"]
+    expected_transform_count = geometry["learned_transform_count"]
+    for name in ("feature_std", "bsgs_ratio", "atol", "bound_headroom"):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            raise SystemExit(f"{name} must be finite and positive")
     if int(args.warmup_runs) < 0 or int(args.forward_runs) <= 0:
         raise SystemExit("warmup-runs must be nonnegative and forward-runs positive")
     if float(args.bound_headroom) < 1.0:
@@ -133,8 +142,6 @@ def main() -> int:
     checkpoint_path = args.checkpoint.expanduser().resolve()
     if not checkpoint_path.is_file():
         raise SystemExit(f"checkpoint does not exist: {checkpoint_path}")
-    if int(args.logn) != 10 or (int(args.height), int(args.width)) != (8, 8):
-        raise SystemExit("trained decoder benchmark requires logn=10 and 8x8 output")
     environment = {
         "ORION_LATTIGO_CLEAR_BACKEND": "0", "ORION_LATTIGO_STREAMING_LT": "0",
         "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0", "ORION_WPC_PERIODICITY_PROFILE": "0",
@@ -177,13 +184,13 @@ def main() -> int:
     try:
         _write_phase(args.phase_file, "scheme_init")
         scheme_started = time.perf_counter()
-        scheme = orion.init_scheme(_config(int(args.logn)))
+        scheme = orion.init_scheme(config)
         shared_library_path = Path(scheme.backend.lib._name).resolve()
         shared_library_sha256 = hashlib.sha256(shared_library_path.read_bytes()).hexdigest()
         required_apis = ("ResetWPCBenchmarkEncodeCounters", "GetWPCBenchmarkEncodeCounters",
-                         "GetWPCOnlineGlobalStats", "ResetWPCOnlineMaterializationPeak")
+                         "GetWPCOnlineGlobalStats", "ResetWPCOnlineMaterializationPeak", "GetWPCParameterManifest")
         if any(not hasattr(scheme.backend, name) for name in required_apis):
-            raise RuntimeError("Stage-28 shared-library APIs missing; rebuild with tools/build_lattigo.py")
+            raise RuntimeError("decoder benchmark shared-library APIs missing; rebuild with tools/build_lattigo.py")
         scheme.backend.ResetWPCBenchmarkEncodeCounters()
         scheme_init_s = float(time.perf_counter() - scheme_started)
         Conv2d.set_scheme(scheme)
@@ -195,7 +202,7 @@ def main() -> int:
 
         up_layer = _make_up(
             state,
-            level=8,
+            level=levels["up1"],
             bsgs_ratio=float(args.bsgs_ratio),
         )
         dec1a_layer = _make_conv(
@@ -203,7 +210,7 @@ def main() -> int:
             "dec1a",
             input_channels=64,
             output_channels=32,
-            level=6,
+            level=levels["dec1a"],
             bsgs_ratio=float(args.bsgs_ratio),
         )
         dec1b_layer = _make_conv(
@@ -211,7 +218,7 @@ def main() -> int:
             "dec1b",
             input_channels=32,
             output_channels=32,
-            level=8,
+            level=levels["dec1b"],
             bsgs_ratio=float(args.bsgs_ratio),
         )
         concat_module = Concat(dim=1, bsgs_ratio=float(args.bsgs_ratio))
@@ -223,7 +230,7 @@ def main() -> int:
             low_shape,
             storage_mode=str(args.mode),
             include_full_control=False,
-            verify_exact_qp=False,
+            verify_exact_qp=args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED,
         )
         if not isinstance(up_plan, WPCCIPSConvTranspose2dPlan):
             raise RuntimeError("up1 did not install a transposed-convolution plan")
@@ -231,19 +238,19 @@ def main() -> int:
             concat_shape,
             storage_mode=str(args.mode),
             include_full_control=False,
-            verify_exact_qp=False,
+            verify_exact_qp=args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED,
         )
         dec1b_plan = dec1b_layer.install_wpc_cips_plan(
             high_shape,
             storage_mode=str(args.mode),
             include_full_control=False,
-            verify_exact_qp=False,
+            verify_exact_qp=args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED,
         )
         plans = [up_plan, dec1a_plan, dec1b_plan]
         skip_contract = SimpleNamespace(
             output_shape=high_shape,
             output_packing_signature=up_plan.output_packing_signature,
-            output_level=7,
+            output_level=levels["skip1"],
         )
         concat_plan = concat_module.install_wpc_cips_plan(
             (up_plan, skip_contract),
@@ -279,6 +286,10 @@ def main() -> int:
             bootstrap_bound=bound,
         )
         bridge_compile = bridge.compile(scheme)
+        parameter_manifest = json.loads(bytes(scheme.backend.GetWPCParameterManifest()).decode("utf-8"))
+        validate_parameter_manifest(parameter_manifest, config, slots)
+        print(json.dumps({"event": "decoder_compiled", "geometry": geometry,
+                          "security_scope": UNASSESSED_SECURITY_SCOPE}), flush=True)
         for layer in (up_layer, dec1a_layer, dec1b_layer):
             layer.he()
         concat_module.he()
@@ -297,7 +308,7 @@ def main() -> int:
             scheme,
             skip[0],
             up_plan.output_packing_signature,
-            level=7,
+            level=levels["skip1"],
         )
         _collect_runtime_memory(scheme.backend)
         memory["after_input_gc"] = _memory_snapshot(scheme.backend)
@@ -437,7 +448,7 @@ def main() -> int:
             plan.layer_name: plan.compressed_stats() for plan in plans
         }
         expected_registry_count = (
-            TRAINED_DECODER_TRANSFORM_COUNT
+            expected_transform_count
             if args.mode == WPC_STORAGE_COMPRESSED
             else 0
         )
@@ -453,15 +464,19 @@ def main() -> int:
             "independent_torch_oracle_matches_clear": oracle_max_abs_delta
             <= 1e-10,
             "expected_transform_count": storage["learned_transform_count"]
-            == TRAINED_DECODER_TRANSFORM_COUNT,
+            == expected_transform_count,
             "checkpoint_activation_is_degree_seven": bridge_compile[
                 "activation_degree"
             ]
             == 7,
-            "bootstrap_uses_four_ciphertext_groups": bridge_compile[
+            "bootstrap_group_count_matches_geometry": bridge_compile[
                 "ciphertext_group_count"
             ]
-            == 4,
+            == geometry["bootstrap_ciphertext_group_count"],
+            "runtime_parameters_match_request": True,
+            "exact_qp_verified_if_requested": bool(
+                not args.verify_exact_qp or args.mode != WPC_STORAGE_COMPRESSED
+                or all(row["exact_qp_match"] is True for plan in plans for row in plan.transform_rows.values())),
             "real_bootstrap_ran_for_every_measured_forward": bootstrap_call_count
             == int(args.forward_runs),
             "zero_online_python_encode_calls": online_encode_call_count == 0,
@@ -483,14 +498,14 @@ def main() -> int:
             "all_measured_outputs_correct": all(value <= float(args.atol) for value in measured_output_errors),
             "timed_lifecycle_tracing_disabled": all(plan.record_sequence is False for plan in plans),
             "actual_transform_encode_invocations_match_mode": all(
-                value == (TRAINED_DECODER_TRANSFORM_COUNT if args.mode == WPC_STORAGE_ONLINE else 0)
+                value == (expected_transform_count if args.mode == WPC_STORAGE_ONLINE else 0)
                 for value in transform_encode_invocations),
             "online_recipe_materialization_released": online_global_stats["current_materialized_bytes"] == 0
                 and online_global_stats["current_materialized_transforms"] == 0,
         }
         worker_acceptance["valid"] = bool(all(worker_acceptance.values()))
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "profile": "wpc_cips_trained_decoder_isolated_worker",
             "status": "ok" if worker_acceptance["valid"] else "invalid",
             "mode": str(args.mode),
@@ -520,14 +535,17 @@ def main() -> int:
                 "warmup_runs": int(args.warmup_runs),
                 "forward_runs": int(args.forward_runs),
                 "atol": float(args.atol),
-                "ckks_config": _config(int(args.logn)),
-                "security_scope": "small_insecure_functional_test_not_secure_deployment",
+                "ckks_config": config,
+                "configuration_source": config_source,
+                "geometry": geometry,
+                "verify_exact_qp": bool(args.verify_exact_qp),
+                "security_scope": UNASSESSED_SECURITY_SCOPE,
                 "timed_lifecycle_tracing": False,
                 "runtime_environment": environment,
             },
             "timing_policy": (
                 "fresh process with warmups excluded; measured wall time includes "
-                "up1, concat, dec1a, trained Cheb7, four-ciphertext bootstrap, "
+                "up1, concat, dec1a, trained Cheb7, geometry-derived ciphertext-group bootstrap, "
                 "and dec1b; compilation, encryption, decryption, and cleanup excluded"
             ),
             "scheme_init_s": float(scheme_init_s),
@@ -538,6 +556,17 @@ def main() -> int:
                 "symmetric_bound": float(bound),
             },
             "clear_oracle_max_abs_delta": float(oracle_max_abs_delta),
+            "runtime_parameter_manifest": parameter_manifest,
+            "bootstrap_compile": bridge_compile,
+            "qp_verification": {
+                "requested": bool(args.verify_exact_qp),
+                "applicable": args.mode == WPC_STORAGE_COMPRESSED,
+                "rows": [dict(layer=plan.layer_name, transform=key, exact_qp_match=row["exact_qp_match"],
+                              diagonal_count=row["diagonal_count"], reconstructed_diagonal_count=row["manual_decompressed_diagonal_count"])
+                         for plan in plans for key, row in plan.transform_rows.items()]
+                        if args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED else [],
+                "retained_full_control_count": sum(len(plan.full_control_transform_ids) for plan in plans),
+            },
             "storage": storage,
             "measurements": {
                 "forward_wall_s": forward_wall_s,
@@ -591,7 +620,7 @@ def main() -> int:
                 "weight_plaintext_offline_encode_calls": (
                     int(global_stats["total_weight_plaintext_offline_encode_calls"])
                     if args.mode == WPC_STORAGE_COMPRESSED
-                    else (0 if args.mode == WPC_STORAGE_ONLINE else TRAINED_DECODER_TRANSFORM_COUNT)
+                    else (0 if args.mode == WPC_STORAGE_ONLINE else expected_transform_count)
                 ),
                 "weight_plaintext_online_encode_calls": (
                     int(global_stats["total_weight_plaintext_online_encode_calls"])

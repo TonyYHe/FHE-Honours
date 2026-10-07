@@ -1,0 +1,796 @@
+{
+  "acceptance": {
+    "all_blocks_independently_validated": true,
+    "balanced_order_or_explicit_smoke": true,
+    "checkpoint_and_features_consistent": true,
+    "valid": true
+  },
+  "blocks": [
+    {
+      "block_index": 1,
+      "checkpoint_sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 11,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "configuration_source": {
+          "kind": "built_in_functional_config",
+          "path": null,
+          "sha256": null
+        },
+        "feature_std": 0.02,
+        "forward_runs": 1,
+        "geometry": {
+          "bootstrap_ciphertext_group_count": 2,
+          "concat_shape": [
+            1,
+            64,
+            8,
+            8
+          ],
+          "concat_transform_count": 4,
+          "high_channel_capacity": 16,
+          "high_shape": [
+            1,
+            32,
+            8,
+            8
+          ],
+          "learned_transform_count": 14,
+          "learned_transform_count_by_layer": {
+            "checkpoint_dec1a": 8,
+            "checkpoint_dec1b": 4,
+            "checkpoint_up1": 2
+          },
+          "levels": {
+            "bridge_input": 5,
+            "concat": 7,
+            "dec1a": 6,
+            "dec1b": 8,
+            "output": 7,
+            "skip1": 7,
+            "up1": 8
+          },
+          "logn": 11,
+          "low_channel_capacity": 64,
+          "low_shape": [
+            1,
+            64,
+            4,
+            4
+          ],
+          "slots": 1024
+        },
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 11,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "unassessed_experimental_parameters_not_secure_deployment",
+        "slots": 1024,
+        "timed_lifecycle_tracing": false,
+        "verify_exact_qp": true,
+        "warmup_runs": 0
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "online_encode",
+        "full",
+        "compressed"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.0053802920010639355,
+          "bootstrap_median_s": 0.24118145799729973,
+          "decompression_median_pct": 7.963522232912319,
+          "decompression_median_s": 0.055267206,
+          "forward_median_s": 0.694004542005132,
+          "logical_resident_bytes": 32638208,
+          "max_abs_delta_vs_isolated_full": 1.4901161193847656e-08,
+          "max_abs_error_vs_clear": 6.137289926787248e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1129578496,
+          "sampled_online_peak_rss_bytes": 1131331584
+        },
+        "full": {
+          "activation_median_s": 0.005365874996641651,
+          "bootstrap_median_s": 0.23896170800435357,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 0.6312541669904022,
+          "logical_resident_bytes": 427884544,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.137166394595828e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1341145088,
+          "sampled_online_peak_rss_bytes": 1341947904
+        },
+        "online_encode": {
+          "activation_median_s": 0.005181540997000411,
+          "bootstrap_median_s": 0.23368558399670292,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 0.9519984999933513,
+          "logical_resident_bytes": 2156352,
+          "max_abs_delta_vs_isolated_full": 1.30385160446167e-08,
+          "max_abs_error_vs_clear": 6.152992760976445e-07,
+          "online_encode_median_pct": 30.893023991324984,
+          "online_encode_median_s": 0.294101125,
+          "online_materialization_median_pct": 34.009813671162426,
+          "online_prepare_median_s": 0.029671791,
+          "pre_online_rss_bytes": 1116717056,
+          "sampled_online_peak_rss_bytes": 1116815360
+        }
+      },
+      "runtime_parameter_manifest": {
+        "bootstrappers": [
+          {
+            "encapsulation": {
+              "p": [
+                2305843009213616129
+              ],
+              "q": [
+                36028797018972161
+              ],
+              "secret_hamming_weight": 32
+            },
+            "ephemeral_secret_weight": 32,
+            "parameters": {
+              "error_distribution": {
+                "parameters": {
+                  "Bound": 19.2,
+                  "Sigma": 3.2
+                },
+                "type": "DiscreteGaussian"
+              },
+              "log_default_scale": 45,
+              "logn": 11,
+              "logqp": 1724.000000020492,
+              "p": [
+                2305843009213616129,
+                2305843009213800449,
+                2305843009213812737,
+                2305843009213554689,
+                2305843009213861889,
+                2305843009213870081,
+                2305843009213501441,
+                2305843009213489153
+              ],
+              "q": [
+                36028797018972161,
+                35184372060161,
+                35184372121601,
+                35184371986433,
+                35184372203521,
+                35184371961857,
+                35184371884033,
+                35184372355073,
+                35184372375553,
+                549755809793,
+                549755731969,
+                549755904001,
+                1152921504606830593,
+                1152921504606904321,
+                1152921504606748673,
+                1152921504606965761,
+                1152921504606994433,
+                1152921504607019009,
+                1152921504606683137,
+                1152921504607031297,
+                72057594037948417,
+                72057594038149121,
+                72057594037641217,
+                72057594037616641
+              ],
+              "ring_type": "Standard",
+              "secret_distribution": {
+                "parameters": {
+                  "H": 192,
+                  "P": 0
+                },
+                "type": "Ternary"
+              }
+            },
+            "slots": 1024
+          }
+        ],
+        "residual": {
+          "error_distribution": {
+            "parameters": {
+              "Bound": 19.2,
+              "Sigma": 3.2
+            },
+            "type": "DiscreteGaussian"
+          },
+          "log_default_scale": 45,
+          "logn": 11,
+          "logqp": 475.0000000097418,
+          "p": [
+            1152921504606830593
+          ],
+          "q": [
+            36028797018972161,
+            35184372060161,
+            35184372121601,
+            35184371986433,
+            35184372203521,
+            35184371961857,
+            35184371884033,
+            35184372355073,
+            35184372375553
+          ],
+          "ring_type": "Standard",
+          "secret_distribution": {
+            "parameters": {
+              "H": 192,
+              "P": 0
+            },
+            "type": "Ternary"
+          }
+        },
+        "schema_version": 1,
+        "security_assessed": false
+      },
+      "shared_library_sha256": "4122d71b5d2b6edbeaeb87b4d55156ffbe796e1671fcc94945acf72a47342bda",
+      "valid": true
+    }
+  ],
+  "checkpoint": {
+    "path": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+    "sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59"
+  },
+  "profile": "wpc_cips_three_way_online_encode_process_blocks",
+  "provenance": {
+    "implementation_sha256": {
+      "configs/wpc_decoder_scale_functional.json": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195",
+      "lattigo/circuits/ckks/bootstrapping/keys.go": "635be5abeb7f9ee804f2efc14172e52e8b04fa7d32261a2f1407ca69e2505eb3",
+      "lattigo/circuits/ckks/bootstrapping/parameters.go": "feb38277e5360232e4109e49e184321d83f14ab0506f9653b899451c76946b1a",
+      "lattigo/circuits/ckks/bootstrapping/parameters_literal.go": "107afa2dc1d721f508bb61590eead648c72d15c816b2caae0cbc3830ad9ab054",
+      "orion/backend/lattigo/bindings.py": "757cd89dcc7524382ddce1b254417d71db6a72530dd43b85779fe107bfdd09ff",
+      "orion/backend/lattigo/bootstrapper.go": "d35d31bafed48b16d25147d424e530984a2b80b9c6158fc74081b3104ec5e2e7",
+      "orion/backend/lattigo/lineartransform.go": "cd3c907b2f6f51d7cc9b7553405bd087cb43c39bf9351293a3188b78145a5ec7",
+      "orion/backend/lattigo/scheme.go": "fc783eec73582add3d6a99b2b0f9d3a70ea1fde56c09adb15bfd36f6e2fc944e",
+      "orion/backend/lattigo/wpc_compression.go": "32266e97eed6e715256c101a505e5af3c66f69bfe41b7c9cd0c43bc976581394",
+      "orion/backend/lattigo/wpc_online_encode.go": "3532c492b45f26c403ef1d7d0bd3e3bca21ba50e3f1166e170edd29c17e101bd",
+      "orion/backend/lattigo/wpc_parameter_manifest.go": "ab16fc6cd3d366d4bf7f06538d5016461556db81206d4dee48528c5b5e9b0e64",
+      "orion/experimental/wpc_cips_baseline.py": "3bdfa52db72cac4efc4f952865e599be65c96278838d4cb5534cc1f7e7219789",
+      "orion/experimental/wpc_cips_branches.py": "ffaad534fa502bba86468f7be4c5318fc818bf51cf44727c9fd87d7e9dd462e5",
+      "orion/experimental/wpc_cips_checkpoint.py": "0888addfd119fa2d4d9b6b2ea5da981f79b0b5344e398e6e208cf3c8a33fd1d8",
+      "orion/experimental/wpc_cips_layer.py": "977500fb6b24bf2d418df8af7a7c353dffc6cdd39ca4ce7a8c8a31a6decb143f",
+      "orion/experimental/wpc_cips_trained_benchmark.py": "76ee5f2c2759eabe7deee0dd7e5dc1e847447c3fa38ac64bd883198f4247368b",
+      "orion/experimental/wpc_cips_upsample.py": "9df5976c247ed7b9bc7e73653ae753ce2248df48e85b9af55b5664ac889ce0a2",
+      "orion/experimental/wpc_decoder_geometry.py": "08817666008e6dce2e48d4dbae38e86d33373c42cc60361890a521c554153909",
+      "orion/experimental/wpc_evidence_validation.py": "c54d0f766280872cf26745823ecbe343c6e075b7b980f81d2703ece68fdc86df",
+      "orion/experimental/wpc_online_encode_benchmark.py": "97efcacf9acb0a43530f12ccabd545d7d70c27cfdf36a4418144db8e056e391b",
+      "tools/run_wpc_cips_trained_decoder.py": "fc55ddb2a14d90ed89f4fa58e45dc683d34dade65e9f33ba60c84a6446fff87e",
+      "tools/run_wpc_cips_trained_isolated_benchmark.py": "b149fd461e292f134ebf9d7bd79a0f6e5b9315894e5d888be555ddfdfb23c3fb",
+      "tools/run_wpc_cips_trained_isolated_worker.py": "578b5dc2dbec2b7079b9cca6807aae679ff1033da213d3f90f83181547b4e085",
+      "tools/run_wpc_decoder_feasibility.py": "3fc7defe025ae5fc9afbac0a0ad8f713555879f05e190c396f70f9505b5bce27",
+      "tools/run_wpc_decoder_feasibility_server.sh": "d85aa0c9732dc95f29adcfdb2125226ca4102406ec6755c4189e0e5ae20e67e1",
+      "tools/run_wpc_online_encode_benchmark.py": "866c7254cbe6fb36f14b3b339c1a6d6d4998cb541eef16ae7b0bb2cd379537b0"
+    },
+    "repository_commit": "ca3454d31dc2a61a34596e67fccef5c2f63fe2c5",
+    "repository_status": " M AGENTS.md\n M orion/backend/lattigo/bindings.py\n M orion/experimental/wpc_cips_trained_benchmark.py\n M orion/experimental/wpc_online_encode_benchmark.py\n M tools/run_wpc_cips_trained_isolated_benchmark.py\n M tools/run_wpc_cips_trained_isolated_worker.py\n M tools/run_wpc_online_encode_benchmark.py\n?? .tmp/results/honours/29_wpc_decoder_scale_feasibility/\n?? .tmp/results/honours/stage28_review.Q4lbrF/\n?? configs/wpc_decoder_scale_functional.json\n?? docs/wpc_decoder_scale_feasibility.md\n?? orion/backend/lattigo/wpc_parameter_manifest.go\n?? orion/backend/lattigo/wpc_parameter_manifest_test.go\n?? orion/experimental/wpc_decoder_geometry.py\n?? tests/test_wpc_decoder_geometry.py\n?? tools/run_wpc_decoder_feasibility.py\n?? tools/run_wpc_decoder_feasibility_server.sh\n",
+    "worker_artifacts": [
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_geometry_smoke_rss_20261007/block_001/online_encode.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_geometry_smoke_rss_20261007/block_001/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "11",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002",
+          "--verify-exact-qp"
+        ],
+        "path": "block_001/online_encode.worker.json",
+        "rss_path": "block_001/online_encode.rss.json",
+        "rss_sha256": "aee690e41d1d50afa6b1e71e904c8c7f315286e72e806db2850330264e318aea",
+        "sha256": "dd6c859dfbf9bbae1820a31fe0ca70f6c2d77f9e058f9e68cb94f254431abb14",
+        "size_bytes": 76886
+      },
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_geometry_smoke_rss_20261007/block_001/full.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_geometry_smoke_rss_20261007/block_001/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "11",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002",
+          "--verify-exact-qp"
+        ],
+        "path": "block_001/full.worker.json",
+        "rss_path": "block_001/full.rss.json",
+        "rss_sha256": "9f993c3ab5837ea1c60a35c3cebab8627cc0a04136375e91ad2745ecfda72e63",
+        "sha256": "79fb1b0896d92249fd63a3b8b6d5b6c1589b4ea59810bdbdf6d85abd0670ba48",
+        "size_bytes": 76663
+      },
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_geometry_smoke_rss_20261007/block_001/compressed.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_geometry_smoke_rss_20261007/block_001/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "11",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002",
+          "--verify-exact-qp"
+        ],
+        "path": "block_001/compressed.worker.json",
+        "rss_path": "block_001/compressed.rss.json",
+        "rss_sha256": "9d882bfb193cb60732e1f663478a5dc1331d41d0f06a3ccb06c14e0d5f04a93a",
+        "sha256": "35440fc4de889e738f5480064449f2c4fd4391f4ac000b0516f5d6b10d41702c",
+        "size_bytes": 95489
+      }
+    ]
+  },
+  "schema_version": 2,
+  "smoke": true,
+  "status": "ok",
+  "summary": {
+    "bootstrap_resamples": 0,
+    "bootstrap_seed": 0,
+    "by_mode": {
+      "compressed": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0053802920010639355,
+          "median": 0.0053802920010639355,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.24118145799729973,
+          "median": 0.24118145799729973,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 7.963522232912319,
+          "median": 7.963522232912319,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.055267206,
+          "median": 0.055267206,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.694004542005132,
+          "median": 0.694004542005132,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 32638208.0,
+          "median": 32638208.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.4901161193847656e-08,
+          "median": 1.4901161193847656e-08,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.137289926787248e-07,
+          "median": 6.137289926787248e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1129578496.0,
+          "median": 1129578496.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1131331584.0,
+          "median": 1131331584.0,
+          "stdev": null
+        }
+      },
+      "full": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.005365874996641651,
+          "median": 0.005365874996641651,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.23896170800435357,
+          "median": 0.23896170800435357,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.6312541669904022,
+          "median": 0.6312541669904022,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 427884544.0,
+          "median": 427884544.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.137166394595828e-07,
+          "median": 6.137166394595828e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1341145088.0,
+          "median": 1341145088.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1341947904.0,
+          "median": 1341947904.0,
+          "stdev": null
+        }
+      },
+      "online_encode": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.005181540997000411,
+          "median": 0.005181540997000411,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.23368558399670292,
+          "median": 0.23368558399670292,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.9519984999933513,
+          "median": 0.9519984999933513,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 2156352.0,
+          "median": 2156352.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.30385160446167e-08,
+          "median": 1.30385160446167e-08,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.152992760976445e-07,
+          "median": 6.152992760976445e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 30.893023991324984,
+          "median": 30.893023991324984,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.294101125,
+          "median": 0.294101125,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 34.009813671162426,
+          "median": 34.009813671162426,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.029671791,
+          "median": 0.029671791,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1116717056.0,
+          "median": 1116717056.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1116815360.0,
+          "median": 1116815360.0,
+          "stdev": null
+        }
+      }
+    },
+    "independent_block_count": 1,
+    "order_balanced": false,
+    "paired_ratios": {
+      "compressed_over_full_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 1.0994058784814071,
+        "median": 1.0994058784814071,
+        "stdev": null
+      },
+      "compressed_over_online_encode_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.7289975162880812,
+        "median": 0.7289975162880812,
+        "stdev": null
+      },
+      "full_over_online_encode_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.663083152961702,
+        "median": 0.663083152961702,
+        "stdev": null
+      }
+    },
+    "performance_claims_enabled": false,
+    "scope": "same-CIPS trained decoder with synthetic features; security is not assessed; not Orion-versus-WPC layout or whole-network comparison",
+    "uncertainty_method": "correctness-only smoke block; no uncertainty estimation or performance claim"
+  }
+}

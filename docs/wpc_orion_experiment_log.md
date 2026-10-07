@@ -972,3 +972,31 @@ unmeasured.
   server recovery script. Historical evidence/archives and checkpoints were
   preserved; no retraining or remote experiment was performed locally.
 - Recovery instructions and scope limits: `docs/wpc_validation_provenance.md`.
+
+## 2026-10-07 — Stage 29 configurable decoder feasibility implementation
+
+- Removed the worker's LogN=10/8×8-only rejection and fixed 56-transform/four-
+  bootstrap-group assertions. Independent geometry derives each layer's group
+  matrix, concat count, bootstrap group count and residual-level schedule.
+- Added explicit, fail-closed CKKS JSON input and config-byte provenance;
+  actual residual/bootstrap Q/P chains, distributions and sparse encapsulation
+  parameters are exported from Go as public metadata. No security estimate is
+  claimed. Unsupported keys are rejected rather than ignored.
+- Added untimed exact Q/P reconstruction controls, released before online
+  execution, and corrected offline counter expectations for these validation
+  Encodes. Historical schemas retain their old validation contracts.
+- Added sampled-RSS/time watchdogs and a non-overwriting three-mode feasibility
+  runner/server wrapper. Missing RSS access fails closed; partial failure
+  artifacts are preserved. Watchdogs are not OS-enforced memory limits.
+- Local correctness used the available original source checkpoint, not the
+  server-only fine-tuned checkpoint. LogN=11, 8×8 successfully exercised 14
+  learned transforms and two bootstrap groups in all three modes, with exact
+  compressed Q/P and matched operations. A JSON configuration with ten Q primes
+  also passed the full feasibility entry point at maximum residual level 9.
+- A sandboxed attempt passed FHE gates but failed comparison because process RSS
+  was unavailable; preserved as failed evidence. A fresh resource-sampled smoke
+  passed. No server scale benchmark or Orion-layout control was executed here.
+- Documentation and command: `docs/wpc_decoder_scale_feasibility.md`.
+- Final verification: 250 targeted Python tests and `go test ./... -count=3`
+  passed; the final level-9 smoke's raw/config/source hashes and recomputed
+  summaries passed an independent artifact audit. No remote job was launched.

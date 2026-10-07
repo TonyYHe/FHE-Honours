@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from orion.experimental.wpc_online_encode_benchmark import (
     MODES, balanced_orders, compare_block, process_block_summary,
 )
 from tools.run_wpc_cips_trained_isolated_benchmark import _parser as worker_parser, _sample_worker
+from orion.experimental.wpc_decoder_geometry import archive_config_input, decoder_geometry, resolve_decoder_config
 
 IMPLEMENTATION_FILES = (
     "tools/run_wpc_online_encode_benchmark.py", "tools/run_wpc_cips_trained_isolated_worker.py",
@@ -27,6 +29,14 @@ IMPLEMENTATION_FILES = (
     "orion/experimental/wpc_cips_upsample.py", "orion/backend/lattigo/bindings.py",
     "orion/backend/lattigo/wpc_online_encode.go", "orion/backend/lattigo/wpc_compression.go",
     "orion/backend/lattigo/lineartransform.go", "orion/backend/lattigo/scheme.go",
+    "orion/experimental/wpc_decoder_geometry.py", "orion/experimental/wpc_cips_trained_benchmark.py",
+    "orion/backend/lattigo/wpc_parameter_manifest.go", "orion/backend/lattigo/bootstrapper.go",
+    "lattigo/circuits/ckks/bootstrapping/parameters_literal.go", "lattigo/circuits/ckks/bootstrapping/parameters.go",
+    "lattigo/circuits/ckks/bootstrapping/keys.go",
+    "tools/run_wpc_decoder_feasibility.py", "tools/run_wpc_decoder_feasibility_server.sh",
+    "configs/wpc_decoder_scale_functional.json", "orion/experimental/wpc_cips_checkpoint.py",
+    "orion/experimental/wpc_cips_branches.py", "orion/experimental/wpc_cips_baseline.py",
+    "orion/experimental/wpc_evidence_validation.py",
 )
 
 
@@ -48,10 +58,13 @@ def parser() -> argparse.ArgumentParser:
 
 def render_report(payload: dict) -> str:
     summary = payload["summary"]
+    experiment = payload["blocks"][0].get("experiment", {})
+    security_note = (f"**Security not assessed:** LogN={experiment.get('logn', 10)}, "
+                     f"output shape {experiment.get('high_shape', [1, 32, 8, 8])}; neither a secure-deployment nor a complete-network benchmark.")
     lines = ["# Three-way CIPS online-Encode benchmark", "",
              f"Status: {payload['status']}. Independent process blocks: {len(payload['blocks'])}.", "",
              "Same checkpoint, exact feature values, CIPS layout, CKKS configuration, and homomorphic operations in all modes.", "",
-             "**Functional-test parameters only:** LogN=10; not a secure-deployment or complete-network benchmark.", "",
+             security_note, "",
              "| Mode | Forward (s) | Encode share | Preparation + Encode share | Decompression share | Logical resident (MiB) | Sampled online peak RSS (MiB) |",
              "|---|---:|---:|---:|---:|---:|---:|"]
     for mode in MODES:
@@ -79,8 +92,16 @@ def render_report(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    args = parser().parse_args()
+def run(args: argparse.Namespace) -> int:
+    config, source = resolve_decoder_config(args)
+    geometry = decoder_geometry(args.logn, args.height, args.width, len(config["ckks_params"]["LogQ"]) - 1)
+    for name in ("rss_sample_ms", "atol", "feature_std", "bsgs_ratio", "bound_headroom"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            raise SystemExit(f"{name} must be finite and positive")
+    if any(not math.isfinite(value) or value < 0 for value in (args.max_worker_rss_mib, args.worker_timeout_s)):
+        raise SystemExit("worker guards must be finite and nonnegative")
+    if args.bound_headroom < 1:
+        raise SystemExit("bound-headroom must be at least one")
     if args.warmup_runs < 0 or args.forward_runs <= 0 or args.rss_sample_ms <= 0 or args.atol <= 0:
         raise SystemExit("invalid forward/warmup count, RSS interval, or tolerance")
     orders = balanced_orders(args.trial_blocks, seed=args.order_seed, smoke=args.smoke)
@@ -93,6 +114,10 @@ def main() -> int:
     if root.exists() and any(root.iterdir()):
         raise SystemExit(f"refusing to overwrite existing run directory: {root}; choose a fresh --out-dir")
     root.mkdir(parents=True, exist_ok=True)
+    configuration_artifact = archive_config_input(config, source, root / "configuration_input.json")
+    (root / "requested_run.json").write_text(json.dumps({"ckks_config": config, "configuration_source": source,
+        "geometry": geometry, "security_assessed": False, "verify_exact_qp": args.verify_exact_qp,
+        "resource_guards": {"max_worker_rss_mib": args.max_worker_rss_mib, "worker_timeout_s": args.worker_timeout_s}}, indent=2) + "\n")
     implementation = implementation_hashes()
     manifest = []
     blocks = []
@@ -103,6 +128,8 @@ def main() -> int:
         for mode in order:
             print(json.dumps({"event": "worker_start", "block": index + 1, "mode": mode, "order": order}), flush=True)
             worker, rss, command = _sample_worker(mode=mode, checkpoint=checkpoint, out_dir=directory, args=args)
+            if worker["experiment"]["ckks_config"] != config or worker["experiment"]["geometry"] != geometry or worker["experiment"]["configuration_source"] != source:
+                raise RuntimeError("worker configuration changed after the controller's request was frozen")
             workers[mode], sampling[mode] = worker, rss
             file = directory / f"{mode}.worker.json"
             worker_bytes = file.read_bytes()
@@ -126,11 +153,11 @@ def main() -> int:
         commit, status = None, "unavailable"
     if implementation_hashes() != implementation:
         raise RuntimeError("implementation files changed during the run; preserve partial artifacts and rerun from a frozen checkout")
-    payload = {"schema_version": 1, "profile": "wpc_cips_three_way_online_encode_process_blocks", "status": "ok",
+    payload = {"schema_version": 2, "profile": "wpc_cips_three_way_online_encode_process_blocks", "status": "ok",
                "smoke": args.smoke, "blocks": blocks, "summary": summary,
                "checkpoint": {"path": str(checkpoint), "sha256": blocks[0]["checkpoint_sha256"]},
                "provenance": {"repository_commit": commit, "repository_status": status, "implementation_sha256": implementation,
-                              "worker_artifacts": manifest},
+                              "worker_artifacts": manifest, "configuration_artifact": configuration_artifact},
                "acceptance": {"all_blocks_independently_validated": True, "checkpoint_and_features_consistent": True,
                               "balanced_order_or_explicit_smoke": summary["order_balanced"] or args.smoke, "valid": True}}
     (root / "comparison.json").write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
@@ -146,6 +173,10 @@ def main() -> int:
     print(json.dumps({"status": "ok", "result": str(root / "comparison.json"),
                       "report": str(root / "comparison.md"), "smoke": args.smoke}, indent=2))
     return 0
+
+
+def main() -> int:
+    return run(parser().parse_args())
 
 
 if __name__ == "__main__":

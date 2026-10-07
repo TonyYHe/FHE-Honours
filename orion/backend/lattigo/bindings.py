@@ -254,6 +254,12 @@ class LattigoLibrary:
                 restype=ArrayResultUInt64,
             )
 
+        parameter_manifest = getattr(self.lib, "GetWPCParameterManifest", None)
+        if parameter_manifest is not None:
+            self.GetWPCParameterManifest = LattigoFunction(
+                parameter_manifest, argtypes=[], restype=ArrayResultUInt64,
+            )
+
         collect_runtime_memory = getattr(self.lib, "CollectRuntimeMemory", None)
         if collect_runtime_memory is not None:
             self.CollectRuntimeMemory = LattigoFunction(

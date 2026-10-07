@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import math
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import time
 from typing import Any
@@ -27,6 +29,7 @@ from tools.run_wpc_cips_isolated_benchmark import (
     _read_process_memory,
 )
 from tools.run_wpc_cips_trained_decoder import DEFAULT_CHECKPOINT
+from orion.experimental.wpc_decoder_geometry import decoder_geometry, resolve_decoder_config
 
 
 DEFAULT_OUT_DIR = (
@@ -41,7 +44,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--seed", type=int, default=20260929)
-    parser.add_argument("--logn", type=int, default=10)
+    parser.add_argument("--logn", type=int, default=None)
+    parser.add_argument("--ckks-config", type=Path)
+    parser.add_argument("--verify-exact-qp", action="store_true")
     parser.add_argument("--height", type=int, default=8)
     parser.add_argument("--width", type=int, default=8)
     parser.add_argument("--bsgs-ratio", type=float, default=2.0)
@@ -51,7 +56,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--forward-runs", type=int, default=10)
     parser.add_argument("--rss-sample-ms", type=float, default=5.0)
     parser.add_argument("--atol", type=float, default=2e-3)
+    parser.add_argument("--max-worker-rss-mib", type=float, default=0, help="sampled RSS guard; 0 disables (not an OS allocation limit)")
+    parser.add_argument("--worker-timeout-s", type=float, default=0, help="wall-clock guard per worker; 0 disables")
     return parser
+
+
+def _stop_worker(process: subprocess.Popen) -> None:
+    """Stop only the new session created for this worker, including descendants."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
 
 
 def _sample_worker(
@@ -98,11 +121,23 @@ def _sample_worker(
         "--atol",
         str(float(args.atol)),
     ]
+    if getattr(args, "ckks_config", None) is not None:
+        command += ["--ckks-config", str(args.ckks_config.expanduser().resolve())]
+    if getattr(args, "verify_exact_qp", False):
+        command += ["--verify-exact-qp"]
+    rss_limit = float(getattr(args, "max_worker_rss_mib", 0))
+    timeout = float(getattr(args, "worker_timeout_s", 0))
+    if any(not math.isfinite(value) or value < 0 for value in (rss_limit, timeout)):
+        raise ValueError("worker resource guards must be finite and nonnegative")
+    if rss_limit and _read_process_memory(os.getpid())[0] is None:
+        raise RuntimeError("RSS watchdog unavailable on this host; refusing to launch an unguarded worker")
     peak_rss: dict[str, int] = {}
     peak_hwm: dict[str, int] = {}
     sample_count: dict[str, int] = {}
     total_samples = 0
     sampling_source = "unavailable"
+    started = time.monotonic()
+    termination_reason = None
     with log_path.open("w", encoding="utf-8") as log_handle:
         process = subprocess.Popen(
             command,
@@ -110,44 +145,56 @@ def _sample_worker(
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             env=dict(os.environ),
+            start_new_session=True,
         )
-        while process.poll() is None:
-            phase = _read_phase(phase_path)
-            sample, source = _read_process_memory(process.pid)
-            if sample is not None:
-                sampling_source = source
-                total_samples += 1
-                sample_count[phase] = int(sample_count.get(phase, 0) + 1)
-                peak_rss[phase] = max(
-                    int(peak_rss.get(phase, 0)),
-                    int(sample["rss_bytes"]),
-                )
-                if "hwm_bytes" in sample:
-                    peak_hwm[phase] = max(
-                        int(peak_hwm.get(phase, 0)),
-                        int(sample["hwm_bytes"]),
+        try:
+            while process.poll() is None:
+                phase = _read_phase(phase_path)
+                sample, source = _read_process_memory(process.pid)
+                if sample is not None:
+                    sampling_source = source
+                    total_samples += 1
+                    sample_count[phase] = int(sample_count.get(phase, 0) + 1)
+                    peak_rss[phase] = max(
+                        int(peak_rss.get(phase, 0)), int(sample["rss_bytes"]),
                     )
-            time.sleep(float(args.rss_sample_ms) / 1000.0)
+                    if "hwm_bytes" in sample:
+                        peak_hwm[phase] = max(int(peak_hwm.get(phase, 0)), int(sample["hwm_bytes"]))
+                    if rss_limit and sample["rss_bytes"] > rss_limit * 2**20:
+                        termination_reason = f"sampled RSS exceeded {rss_limit:g} MiB in phase {phase}"
+                elif rss_limit and process.poll() is None:
+                    termination_reason = "RSS watchdog lost access to the live worker; refusing an unguarded run"
+                if timeout and time.monotonic() - started > timeout:
+                    termination_reason = f"worker exceeded {timeout:g} seconds in phase {phase}"
+                if termination_reason:
+                    _stop_worker(process)
+                    break
+                time.sleep(float(args.rss_sample_ms) / 1000.0)
+        finally:
+            _stop_worker(process)
         return_code = int(process.wait())
 
-    if return_code != 0:
+    sampling = {
+        "source": sampling_source, "interval_ms": float(args.rss_sample_ms),
+        "total_sample_count": int(total_samples), "sample_count_by_phase": sample_count,
+        "peak_rss_by_phase": peak_rss, "peak_hwm_by_phase": peak_hwm,
+        "return_code": return_code, "termination_reason": termination_reason,
+        "elapsed_s": time.monotonic() - started,
+        "guards": {"max_worker_rss_mib": rss_limit, "worker_timeout_s": timeout,
+                   "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"},
+    }
+    # Preserve failure evidence even when no worker JSON was produced.
+    (out_dir / f"{mode}.rss.json").write_text(json.dumps(sampling, indent=2, allow_nan=False) + "\n")
+    if return_code != 0 or termination_reason:
         tail = log_path.read_text(
             encoding="utf-8", errors="replace"
         ).splitlines()[-100:]
         raise RuntimeError(
-            f"{mode} worker exited with {return_code}\n" + "\n".join(tail)
+            f"{mode} worker exited with {return_code}; {termination_reason or 'see worker log'}\n" + "\n".join(tail)
         )
     if not result_path.is_file():
         raise RuntimeError(f"{mode} worker did not produce {result_path}")
     payload = json.loads(result_path.read_text(encoding="utf-8"))
-    sampling = {
-        "source": sampling_source,
-        "interval_ms": float(args.rss_sample_ms),
-        "total_sample_count": int(total_samples),
-        "sample_count_by_phase": sample_count,
-        "peak_rss_by_phase": peak_rss,
-        "peak_hwm_by_phase": peak_hwm,
-    }
     return payload, sampling, command
 
 
@@ -217,6 +264,8 @@ All acceptance gates passed: **{comparison['acceptance']['valid']}**.
 
 def main() -> int:
     args = _parser().parse_args()
+    config, _source = resolve_decoder_config(args)
+    decoder_geometry(args.logn, args.height, args.width, len(config["ckks_params"]["LogQ"]) - 1)
     if float(args.rss_sample_ms) <= 0.0:
         raise SystemExit("rss-sample-ms must be positive")
     if int(args.warmup_runs) < 0 or int(args.forward_runs) <= 0:

@@ -12,7 +12,7 @@ import random
 import statistics
 from typing import Any
 
-from orion.experimental.wpc_cips_trained_benchmark import validate_worker
+from orion.experimental.wpc_cips_trained_benchmark import expected_transform_count, validate_worker
 from orion.experimental.wpc_evidence_validation import (
     EvidenceValidationError, close, finite, gates, integer, sha256,
 )
@@ -51,11 +51,11 @@ def _samples(values: Any, count: int, name: str) -> list[float]:
 def validate_three_way_worker(worker: dict[str, Any], *, mode: str, atol: float) -> None:
     validate_worker(worker, mode=mode, atol=atol)
     gates(worker, name=f"{mode} Stage-28 worker", required=EXTRA_GATES)
-    if worker.get("schema_version") != 2:
-        raise EvidenceValidationError("three-way benchmark requires worker schema 2")
+    if worker.get("schema_version") not in (2, 3):
+        raise EvidenceValidationError("three-way benchmark requires worker schema 2 or 3")
     if worker["experiment"].get("timed_lifecycle_tracing") is not False:
         raise EvidenceValidationError("lifecycle tracing must be outside measured forwards")
-    if worker["experiment"].get("security_scope") != "small_insecure_functional_test_not_secure_deployment":
+    if worker["schema_version"] == 2 and worker["experiment"].get("security_scope") != "small_insecure_functional_test_not_secure_deployment":
         raise EvidenceValidationError("functional security scope must be explicit")
     sha256(worker.get("feature_sha256"), name="exact feature identity")
     sha256(worker["shared_library"]["sha256"], name="loaded backend binary identity")
@@ -64,6 +64,7 @@ def validate_three_way_worker(worker: dict[str, Any], *, mode: str, atol: float)
         raise EvidenceValidationError("untimed correctness preflight exceeds tolerance")
     m = worker["measurements"]
     count = worker["experiment"]["forward_runs"]
+    transforms = expected_transform_count(worker)
     encode = _samples(m.get("online_encode_s"), count, "online Encode")
     prepare = _samples(m.get("online_prepare_s"), count, "recipe preparation")
     shares = _samples(m.get("online_encode_pct_of_forward"), count, "Encode shares")
@@ -73,7 +74,7 @@ def validate_three_way_worker(worker: dict[str, Any], *, mode: str, atol: float)
     trace_counts = _samples(m.get("timed_lifecycle_record_count"), count, "timed lifecycle records")
     if any(trace_counts):
         raise EvidenceValidationError("lifecycle audit records were produced during timed forwards")
-    expected_calls = 56 if mode == "online_encode" else 0
+    expected_calls = transforms if mode == "online_encode" else 0
     for i, wall in enumerate(m["forward_wall_s"]):
         if calls[i] != expected_calls or errors[i] > atol:
             raise EvidenceValidationError("measured Encode calls or output errors do not match contract")
@@ -102,11 +103,12 @@ def validate_three_way_worker(worker: dict[str, Any], *, mode: str, atol: float)
     if backend["weight_plaintext_online_encode_calls"] != count * expected_calls:
         raise EvidenceValidationError("weight Encode summary disagrees with actual calls")
     concat_count = integer(worker["storage"]["concat"]["transform_count"], name="common concat transforms")
-    compile_expected = {"ordinary": concat_count + (56 if mode == "full" else 0),
-                        "compressed": 56 if mode == "compressed" else 0, "online_recipe": 0}
+    verification_calls = transforms if mode == "compressed" and worker["experiment"].get("verify_exact_qp", False) else 0
+    compile_expected = {"ordinary": concat_count + (transforms if mode == "full" else verification_calls),
+                        "compressed": transforms if mode == "compressed" else 0, "online_recipe": 0}
     if backend["compile_transform_encode_invocations"] != compile_expected:
         raise EvidenceValidationError("offline Encode counts disagree with selected storage mode")
-    if backend["weight_plaintext_offline_encode_calls"] != (0 if mode == "online_encode" else 56):
+    if backend["weight_plaintext_offline_encode_calls"] != (0 if mode == "online_encode" else transforms):
         raise EvidenceValidationError("offline learned-transform Encode count is inconsistent")
     online = backend["online_recipe_global_stats"]
     comp = backend["compressed_global_stats"]
@@ -116,9 +118,9 @@ def validate_three_way_worker(worker: dict[str, Any], *, mode: str, atol: float)
     for key in ("current_materialized_full_payload_bytes", "current_materialized_transform_count"):
         if integer(comp[key], name=key) != 0:
             raise EvidenceValidationError("compressed path left materialization resident")
-    if integer(online["registered_transform_count"], name="recipe registry") != (56 if mode == "online_encode" else 0):
+    if integer(online["registered_transform_count"], name="recipe registry") != (transforms if mode == "online_encode" else 0):
         raise EvidenceValidationError("recipe registry disagrees with storage mode")
-    if integer(comp["registered_transform_count"], name="compressed registry") != (56 if mode == "compressed" else 0):
+    if integer(comp["registered_transform_count"], name="compressed registry") != (transforms if mode == "compressed" else 0):
         raise EvidenceValidationError("compressed registry disagrees with storage mode")
     if mode in ("online_encode", "compressed"):
         integer(backend["expected_max_single_transform_bytes"], name="maximum full transform bytes", minimum=1)
@@ -150,7 +152,7 @@ def validate_three_way_worker(worker: dict[str, Any], *, mode: str, atol: float)
         raise EvidenceValidationError("missing untimed lifecycle trace")
     if mode == "compressed":
         records = [row for sequence in trace for row in sequence]
-        if len(records) != 56 or any(row[key] != 0 for row in records for key in (
+        if len(records) != transforms or any(row[key] != 0 for row in records for key in (
             "current_materialized_bytes_before", "current_materialized_bytes_after",
             "current_materialized_transforms_after")):
             raise EvidenceValidationError("untimed lifecycle audit does not verify sequential release")
@@ -175,6 +177,8 @@ def compare_block(workers: dict[str, dict[str, Any]], rss: dict[str, dict[str, A
             raise EvidenceValidationError("checkpoint, exact features, or configuration differ between treatments")
         if worker["measurements"]["operation_counters_per_forward"] != reference["measurements"]["operation_counters_per_forward"]:
             raise EvidenceValidationError("homomorphic operation counts differ between treatments")
+        if worker.get("runtime_parameter_manifest") != reference.get("runtime_parameter_manifest"):
+            raise EvidenceValidationError("actual residual/bootstrap parameters differ between treatments")
         if worker["correctness"]["output_shape"] != reference["correctness"]["output_shape"]:
             raise EvidenceValidationError("isolated output shapes differ")
         delta = max(abs(a-b) for a,b in zip(worker["correctness"]["output_values"], reference["correctness"]["output_values"]))
@@ -201,9 +205,12 @@ def compare_block(workers: dict[str, dict[str, Any]], rss: dict[str, dict[str, A
             "max_abs_error_vs_clear": max(m["measured_output_max_abs_errors"]),
             "max_abs_delta_vs_isolated_full": delta,
         }
-    return {"order": order, "rows": rows, "checkpoint_sha256": reference["checkpoint"]["sha256"],
+    result = {"order": order, "rows": rows, "checkpoint_sha256": reference["checkpoint"]["sha256"],
             "feature_sha256": reference["feature_sha256"], "shared_library_sha256": reference["shared_library"]["sha256"],
             "experiment": reference["experiment"], "valid": True}
+    if "runtime_parameter_manifest" in reference:
+        result["runtime_parameter_manifest"] = reference["runtime_parameter_manifest"]
+    return result
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -223,6 +230,8 @@ def process_block_summary(blocks: list[dict[str, Any]], *, smoke: bool = False, 
     identity = (blocks[0]["checkpoint_sha256"], blocks[0]["feature_sha256"], blocks[0]["shared_library_sha256"], blocks[0]["experiment"])
     if any((b["checkpoint_sha256"], b["feature_sha256"], b["shared_library_sha256"], b["experiment"]) != identity for b in blocks):
         raise EvidenceValidationError("checkpoint/features/configuration changed between process blocks")
+    if any(b.get("runtime_parameter_manifest") != blocks[0].get("runtime_parameter_manifest") for b in blocks):
+        raise EvidenceValidationError("actual runtime parameters changed between process blocks")
     count = len(blocks)
     resamples = integer(resamples, name="bootstrap resamples", minimum=100)
     rng = random.Random(seed)
@@ -250,4 +259,6 @@ def process_block_summary(blocks: list[dict[str, Any]], *, smoke: bool = False, 
             "bootstrap_resamples": resamples if not smoke else 0, "bootstrap_seed": seed,
             "independent_block_count": count, "order_balanced": not smoke,
             "performance_claims_enabled": not smoke,
-            "scope": "same-CIPS trained decoder with synthetic features and insecure functional CKKS parameters; not Orion-versus-WPC layout or whole-network comparison"}
+            "scope": ("same-CIPS trained decoder with synthetic features; security is not assessed; not Orion-versus-WPC layout or whole-network comparison"
+                      if "geometry" in blocks[0]["experiment"] else
+                      "same-CIPS trained decoder with synthetic features and insecure functional CKKS parameters; not Orion-versus-WPC layout or whole-network comparison")}

@@ -1,0 +1,44 @@
+{
+  "source": "macos_ps_rss",
+  "interval_ms": 5.0,
+  "total_sample_count": 860,
+  "sample_count_by_phase": {
+    "process_start": 94,
+    "startup": 2,
+    "scheme_init": 7,
+    "compile": 523,
+    "post_compile_raw": 1,
+    "post_compile_gc": 1,
+    "input_prepare": 1,
+    "correctness_preflight": 101,
+    "pre_measured_gc": 1,
+    "measured": 99,
+    "post_measured": 1,
+    "correctness": 1,
+    "complete": 28
+  },
+  "peak_rss_by_phase": {
+    "process_start": 380043264,
+    "startup": 411402240,
+    "scheme_init": 472563712,
+    "compile": 824967168,
+    "post_compile_raw": 615710720,
+    "post_compile_gc": 616333312,
+    "input_prepare": 616693760,
+    "correctness_preflight": 1072660480,
+    "pre_measured_gc": 1072758784,
+    "measured": 1073250304,
+    "post_measured": 1073266688,
+    "correctness": 1073643520,
+    "complete": 1168408576
+  },
+  "peak_hwm_by_phase": {},
+  "return_code": 0,
+  "termination_reason": null,
+  "elapsed_s": 11.387490082997829,
+  "guards": {
+    "max_worker_rss_mib": 4096.0,
+    "worker_timeout_s": 300.0,
+    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"
+  }
+}

@@ -1,0 +1,2013 @@
+{
+  "acceptance": {
+    "all_blocks_independently_validated": true,
+    "balanced_order_or_explicit_smoke": true,
+    "checkpoint_and_features_consistent": true,
+    "valid": true
+  },
+  "blocks": [
+    {
+      "block_index": 1,
+      "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 10,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 2
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "compressed",
+        "online_encode",
+        "full"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.01761745347175747,
+          "bootstrap_median_s": 0.7282318114885129,
+          "decompression_median_pct": 6.604811679361633,
+          "decompression_median_s": 0.1593640905,
+          "forward_median_s": 2.4205348864779808,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.079289208427152e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 959369216,
+          "sampled_online_peak_rss_bytes": 1148674048
+        },
+        "full": {
+          "activation_median_s": 0.017890197515953332,
+          "bootstrap_median_s": 0.726437324017752,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 2.2542671395349316,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.067874308637866e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1362796544,
+          "sampled_online_peak_rss_bytes": 1927303168
+        },
+        "online_encode": {
+          "activation_median_s": 0.017665505991317332,
+          "bootstrap_median_s": 0.7284203214803711,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 3.288250634504948,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 9.313225746154785e-09,
+          "max_abs_error_vs_clear": 6.067977894597121e-07,
+          "online_encode_median_pct": 26.45906538664481,
+          "online_encode_median_s": 0.8673882024999999,
+          "online_materialization_median_pct": 31.270961521563848,
+          "online_prepare_median_s": 0.162864634,
+          "pre_online_rss_bytes": 924262400,
+          "sampled_online_peak_rss_bytes": 1076817920
+        }
+      },
+      "shared_library_sha256": "fff2d0bb7dd2c9468ae0c8b4069605e065801ab8c6a2d95f867c9b879d319211",
+      "valid": true
+    },
+    {
+      "block_index": 2,
+      "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 10,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 2
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "full",
+        "online_encode",
+        "compressed"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.017626349988859147,
+          "bootstrap_median_s": 0.7299248609924689,
+          "decompression_median_pct": 6.47145222079057,
+          "decompression_median_s": 0.15665086350000001,
+          "forward_median_s": 2.4310762544628233,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.075176404978649e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 958767104,
+          "sampled_online_peak_rss_bytes": 1146384384
+        },
+        "full": {
+          "activation_median_s": 0.01770750602008775,
+          "bootstrap_median_s": 0.7330734089482576,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 2.3022377919987775,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.071969171489444e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1364639744,
+          "sampled_online_peak_rss_bytes": 1929494528
+        },
+        "online_encode": {
+          "activation_median_s": 0.017636133008636534,
+          "bootstrap_median_s": 0.7362765949801542,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 3.2767637580400333,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 8.614733815193176e-09,
+          "max_abs_error_vs_clear": 6.069961053581374e-07,
+          "online_encode_median_pct": 26.618462522437905,
+          "online_encode_median_s": 0.8689611755,
+          "online_materialization_median_pct": 31.37499855016965,
+          "online_prepare_median_s": 0.153665561,
+          "pre_online_rss_bytes": 923881472,
+          "sampled_online_peak_rss_bytes": 1075896320
+        }
+      },
+      "shared_library_sha256": "fff2d0bb7dd2c9468ae0c8b4069605e065801ab8c6a2d95f867c9b879d319211",
+      "valid": true
+    },
+    {
+      "block_index": 3,
+      "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 10,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 2
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "online_encode",
+        "compressed",
+        "full"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.01768833602545783,
+          "bootstrap_median_s": 0.7314017525059171,
+          "decompression_median_pct": 6.314361130028315,
+          "decompression_median_s": 0.15363588649999999,
+          "forward_median_s": 2.432307204522658,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 1.0244548320770264e-08,
+          "max_abs_error_vs_clear": 6.073330166278534e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 959795200,
+          "sampled_online_peak_rss_bytes": 1145880576
+        },
+        "full": {
+          "activation_median_s": 0.017835684004239738,
+          "bootstrap_median_s": 0.7297889399924316,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 2.261541173502337,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.086152784029117e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1363456000,
+          "sampled_online_peak_rss_bytes": 1928032256
+        },
+        "online_encode": {
+          "activation_median_s": 0.01782177499262616,
+          "bootstrap_median_s": 0.7342406564857811,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 3.3114278175053187,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.070097804643237e-07,
+          "online_encode_median_pct": 26.457135232827266,
+          "online_encode_median_s": 0.876021267,
+          "online_materialization_median_pct": 31.42538961742231,
+          "online_prepare_median_s": 0.16058655700000002,
+          "pre_online_rss_bytes": 923553792,
+          "sampled_online_peak_rss_bytes": 1076236288
+        }
+      },
+      "shared_library_sha256": "fff2d0bb7dd2c9468ae0c8b4069605e065801ab8c6a2d95f867c9b879d319211",
+      "valid": true
+    },
+    {
+      "block_index": 4,
+      "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 10,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 2
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "online_encode",
+        "full",
+        "compressed"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.017738383961841464,
+          "bootstrap_median_s": 0.7323457135353237,
+          "decompression_median_pct": 6.365751437992335,
+          "decompression_median_s": 0.15359754850000001,
+          "forward_median_s": 2.4303783834911883,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.084910946363431e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 958545920,
+          "sampled_online_peak_rss_bytes": 1145958400
+        },
+        "full": {
+          "activation_median_s": 0.0177699769847095,
+          "bootstrap_median_s": 0.7425897939829156,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 2.2989639524603263,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.077386261252316e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1363247104,
+          "sampled_online_peak_rss_bytes": 1927307264
+        },
+        "online_encode": {
+          "activation_median_s": 0.017707339022308588,
+          "bootstrap_median_s": 0.7323092584847473,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 3.277271674014628,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.079289208427152e-07,
+          "online_encode_median_pct": 26.304912596951937,
+          "online_encode_median_s": 0.85846613,
+          "online_materialization_median_pct": 30.864727857739332,
+          "online_prepare_median_s": 0.1497750355,
+          "pre_online_rss_bytes": 924479488,
+          "sampled_online_peak_rss_bytes": 1071185920
+        }
+      },
+      "shared_library_sha256": "fff2d0bb7dd2c9468ae0c8b4069605e065801ab8c6a2d95f867c9b879d319211",
+      "valid": true
+    },
+    {
+      "block_index": 5,
+      "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 10,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 2
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "compressed",
+        "full",
+        "online_encode"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.017670456552878022,
+          "bootstrap_median_s": 0.7326824430492707,
+          "decompression_median_pct": 6.257905432476187,
+          "decompression_median_s": 0.15150076699999998,
+          "forward_median_s": 2.422189412987791,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.079551711432596e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 959578112,
+          "sampled_online_peak_rss_bytes": 1147154432
+        },
+        "full": {
+          "activation_median_s": 0.017850415024440736,
+          "bootstrap_median_s": 0.7264444814645685,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 2.2679428395349532,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.06286971966373e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1363361792,
+          "sampled_online_peak_rss_bytes": 1927528448
+        },
+        "online_encode": {
+          "activation_median_s": 0.017695713497232646,
+          "bootstrap_median_s": 0.7316956155118532,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 3.27447816147469,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 9.778887033462524e-09,
+          "max_abs_error_vs_clear": 6.077290890683235e-07,
+          "online_encode_median_pct": 26.51316825688336,
+          "online_encode_median_s": 0.8704481239999999,
+          "online_materialization_median_pct": 31.206933502481718,
+          "online_prepare_median_s": 0.153943685,
+          "pre_online_rss_bytes": 923222016,
+          "sampled_online_peak_rss_bytes": 1069477888
+        }
+      },
+      "shared_library_sha256": "fff2d0bb7dd2c9468ae0c8b4069605e065801ab8c6a2d95f867c9b879d319211",
+      "valid": true
+    },
+    {
+      "block_index": 6,
+      "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 10,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 2
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "full",
+        "compressed",
+        "online_encode"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.017629404494073242,
+          "bootstrap_median_s": 0.7310361270210706,
+          "decompression_median_pct": 6.420132865410473,
+          "decompression_median_s": 0.155059037,
+          "forward_median_s": 2.423789914988447,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 1.0244548320770264e-08,
+          "max_abs_error_vs_clear": 6.070238485686441e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 958656512,
+          "sampled_online_peak_rss_bytes": 1144569856
+        },
+        "full": {
+          "activation_median_s": 0.018300963449291885,
+          "bootstrap_median_s": 0.7484692994621582,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 2.3005314330221154,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.08020014000038e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1363251200,
+          "sampled_online_peak_rss_bytes": 1927106560
+        },
+        "online_encode": {
+          "activation_median_s": 0.017761916446033865,
+          "bootstrap_median_s": 0.7287220404832624,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 3.291248876019381,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 9.313225746154785e-09,
+          "max_abs_error_vs_clear": 6.084788330730506e-07,
+          "online_encode_median_pct": 26.586487378827172,
+          "online_encode_median_s": 0.8792172540000001,
+          "online_materialization_median_pct": 31.404578658266857,
+          "online_prepare_median_s": 0.1543145275,
+          "pre_online_rss_bytes": 924622848,
+          "sampled_online_peak_rss_bytes": 1075843072
+        }
+      },
+      "shared_library_sha256": "fff2d0bb7dd2c9468ae0c8b4069605e065801ab8c6a2d95f867c9b879d319211",
+      "valid": true
+    }
+  ],
+  "checkpoint": {
+    "path": "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+    "sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39"
+  },
+  "profile": "wpc_cips_three_way_online_encode_process_blocks",
+  "provenance": {
+    "implementation_sha256": {
+      "orion/backend/lattigo/bindings.py": "105018d96e85021baf316c7a466f88fa35210f523d2b98bdded81df1a5250783",
+      "orion/backend/lattigo/lineartransform.go": "cd3c907b2f6f51d7cc9b7553405bd087cb43c39bf9351293a3188b78145a5ec7",
+      "orion/backend/lattigo/scheme.go": "fc783eec73582add3d6a99b2b0f9d3a70ea1fde56c09adb15bfd36f6e2fc944e",
+      "orion/backend/lattigo/wpc_compression.go": "32266e97eed6e715256c101a505e5af3c66f69bfe41b7c9cd0c43bc976581394",
+      "orion/backend/lattigo/wpc_online_encode.go": "3532c492b45f26c403ef1d7d0bd3e3bca21ba50e3f1166e170edd29c17e101bd",
+      "orion/experimental/wpc_cips_layer.py": "977500fb6b24bf2d418df8af7a7c353dffc6cdd39ca4ce7a8c8a31a6decb143f",
+      "orion/experimental/wpc_cips_upsample.py": "9df5976c247ed7b9bc7e73653ae753ce2248df48e85b9af55b5664ac889ce0a2",
+      "orion/experimental/wpc_online_encode_benchmark.py": "b504d806583f6d6f5f5cb33f713b65d9e9162320ca65bfc2ad934b73768a1acd",
+      "tools/run_wpc_cips_trained_decoder.py": "fc55ddb2a14d90ed89f4fa58e45dc683d34dade65e9f33ba60c84a6446fff87e",
+      "tools/run_wpc_cips_trained_isolated_benchmark.py": "0c0e06894245cc378f5e9818e7fae2766acf3befe9cc00af81a78fdab6e13088",
+      "tools/run_wpc_cips_trained_isolated_worker.py": "fb29672748e290662aaf5f194b17b5af4da12875ec836978e7c67bec6920a1ec",
+      "tools/run_wpc_online_encode_benchmark.py": "48fd57f3d78382a95384d12ad9eb9f4e97ab5ad46c35f4df91077d28543525aa"
+    },
+    "repository_commit": "ca3454d31dc2a61a34596e67fccef5c2f63fe2c5",
+    "repository_status": "?? .tmp/results/honours/09_wpc_periodicity_census/\n?? .tmp/results/honours/10_wpc_encoded_qp_verification/\n?? .tmp/results/honours/11_wpc_cips_baseline/cips_baseline_3x1_server_606834a.json\n?? .tmp/results/honours/11_wpc_cips_baseline/cips_baseline_3x1_server_606834a.json.sha256\n?? .tmp/results/honours/11_wpc_cips_baseline/cips_baseline_3x3_server_08002f3.json\n?? .tmp/results/honours/12_wpc_compressed_qp/cips_3x3_compressed_qp_server_bc1560d.json\n?? .tmp/results/honours/13_wpc_multigroup/cips_multigroup_server_6b5cda4.json\n?? .tmp/results/honours/14_wpc_cnn_layer_pipeline/two_conv_cips_server_9aba825.json\n?? .tmp/results/honours/15_wpc_isolated_resource_benchmark/server_fb08156/\n?? .tmp/results/honours/16_wpc_activation_bootstrap/two_conv_quad_bootstrap_server_c25243b.json\n?? .tmp/results/honours/17_wpc_downsample_reshape/stride2_reshape_server_7d086f3.json\n?? .tmp/results/honours/18_wpc_branch_joins/residual_concat_server_232169b.json\n?? .tmp/results/honours/19_wpc_upsample/conv_transpose2d_server_6ddb0e5.json\n?? .tmp/results/honours/20_wpc_mini_unet/mini_unet_server_1aeb629.json\n?? .tmp/results/honours/21_wpc_trained_decoder/trained_decoder_server_09517c9.json\n?? .tmp/results/honours/22_wpc_rotation_padding_finetune/\n?? .tmp/results/honours/23_wpc_rotation_padding_full_validation/\n?? .tmp/results/honours/24_wpc_finetuned_decoder_fhe/\n?? .tmp/results/honours/25_wpc_finetuned_decoder_isolated_benchmark/\n?? .tmp/results/honours/27_wpc_validation_provenance/\n?? .tmp/results/honours/28_wpc_online_encode_benchmark/server_run1.pid\n?? .tmp/results/honours/28_wpc_online_encode_benchmark/server_run2.pid\n?? .tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/\n?? .tmp/results/honours/pre_pull_36387a9.YykqAL/\n?? .tmp/results/honours/wpc_activation_bootstrap_c25243b_2026-09-29.tar.gz\n?? .tmp/results/honours/wpc_activation_bootstrap_c25243b_2026-09-29.tar.gz.sha256\n?? .tmp/results/honours/wpc_branch_joins_server_232169b_2026-09-29.tar.gz\n?? .tmp/results/honours/wpc_branch_joins_server_232169b_2026-09-29.tar.gz.sha256\n?? .tmp/results/honours/wpc_cips_3x3_08002f3_2026-09-28.tar.gz\n?? .tmp/results/honours/wpc_cips_3x3_08002f3_2026-09-28.tar.gz.sha256\n?? .tmp/results/honours/wpc_cips_baseline_2026-09-28.tar.gz\n?? .tmp/results/honours/wpc_cips_baseline_2026-09-28.tar.gz.sha256\n?? .tmp/results/honours/wpc_cnn_layer_pipeline_2026-09-29_9aba825.tar.gz\n?? .tmp/results/honours/wpc_cnn_layer_pipeline_2026-09-29_9aba825.tar.gz.sha256\n?? .tmp/results/honours/wpc_compressed_qp_bc1560d_2026-09-28.tar.gz\n?? .tmp/results/honours/wpc_compressed_qp_bc1560d_2026-09-28.tar.gz.sha256\n?? .tmp/results/honours/wpc_downsample_reshape_server_7d086f3_2026-09-29.tar.gz\n?? .tmp/results/honours/wpc_downsample_reshape_server_7d086f3_2026-09-29.tar.gz.sha256\n?? .tmp/results/honours/wpc_encoded_qp_2026-09-28.tar.gz\n?? .tmp/results/honours/wpc_encoded_qp_2026-09-28.tar.gz.sha256\n?? .tmp/results/honours/wpc_finetuned_decoder_isolated_2026-10-02.tar.gz\n?? .tmp/results/honours/wpc_finetuned_decoder_isolated_2026-10-02.tar.gz.sha256\n?? .tmp/results/honours/wpc_finetuned_validation_fhe_2026-10-02.tar.gz\n?? .tmp/results/honours/wpc_finetuned_validation_fhe_2026-10-02.tar.gz.sha256\n?? .tmp/results/honours/wpc_isolated_resource_server_fb08156_2026-09-29.tar.gz\n?? .tmp/results/honours/wpc_isolated_resource_server_fb08156_2026-09-29.tar.gz.sha256\n?? .tmp/results/honours/wpc_mini_unet_server_1aeb629.tar.gz\n?? .tmp/results/honours/wpc_mini_unet_server_1aeb629.tar.gz.sha256\n?? .tmp/results/honours/wpc_multigroup_6b5cda4_2026-09-28.tar.gz\n?? .tmp/results/honours/wpc_multigroup_6b5cda4_2026-09-28.tar.gz.sha256\n?? .tmp/results/honours/wpc_orion_census_2026-09-27.tar.gz\n?? .tmp/results/honours/wpc_orion_census_2026-09-27.tar.gz.sha256\n?? .tmp/results/honours/wpc_rotation_padding_finetune_2026-10-02.tar.gz\n?? .tmp/results/honours/wpc_rotation_padding_finetune_2026-10-02.tar.gz.pid\n?? .tmp/results/honours/wpc_rotation_padding_finetune_2026-10-02.tar.gz.sha256\n?? .tmp/results/honours/wpc_trained_decoder_server_09517c9.tar.gz\n?? .tmp/results/honours/wpc_trained_decoder_server_09517c9.tar.gz.sha256\n?? .tmp/results/honours/wpc_upsample_server_6ddb0e5.tar.gz\n?? .tmp/results/honours/wpc_upsample_server_6ddb0e5.tar.gz.sha256\n?? checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/\n?? checkpoints/wpc_rotation_padding_covid19_cheb7_lr1e6_dw1e3/\n?? checkpoints/wpc_rotation_padding_covid19_cheb7_train2048_val512_seed0/\n",
+    "worker_artifacts": [
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_001/compressed.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_001/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_001/compressed.worker.json",
+        "rss_path": "block_001/compressed.rss.json",
+        "rss_sha256": "b3fc775ecfb81bcc01fbfb569882672cce7b2d8ebe9cd9e7aa52971d8b68c8a9",
+        "sha256": "af6dd49de067cd2c430afb9a67b2da7310d58ef507cfc23fb4275ec84ae236b4",
+        "size_bytes": 137225
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_001/online_encode.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_001/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_001/online_encode.worker.json",
+        "rss_path": "block_001/online_encode.rss.json",
+        "rss_sha256": "70b5231f2bb845afceed87ac6315ac648b3aa1a9f2c7bd6ec782c0c5b129004c",
+        "sha256": "602cb3c4129587bd73281c9661aeb905f1a7739a508680abcd9e122732919332",
+        "size_bytes": 74479
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_001/full.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_001/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_001/full.worker.json",
+        "rss_path": "block_001/full.rss.json",
+        "rss_sha256": "6ca3bf61fd0e660727d6ab23403c58e82c6ca6bdc14621338f0bb4e075a8a3a8",
+        "sha256": "f8fff29f012d1c3f3c67baf1059cc8898f707252b9c53b9fed85747b1c938628",
+        "size_bytes": 73776
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_002/full.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_002/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_002/full.worker.json",
+        "rss_path": "block_002/full.rss.json",
+        "rss_sha256": "d90a9e7234b76c23fe007a2dbd6b14a8c899d00f425c3280c2760f1e5f9f0216",
+        "sha256": "5937f23aff7b5daf1b86ab688b43b4a06955f04778c8730aacb31a6485715556",
+        "size_bytes": 73742
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_002/online_encode.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_002/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_002/online_encode.worker.json",
+        "rss_path": "block_002/online_encode.rss.json",
+        "rss_sha256": "e499cbdcebe82ba9f74b3aa4f64868a00ab43ce3d51c485c4f10a9f48aab49aa",
+        "sha256": "05b6fbf8ad069a0b2bb23cf137863f697332e1ee8bf7a9567db3e204ee4dbeaa",
+        "size_bytes": 74450
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_002/compressed.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_002/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_002/compressed.worker.json",
+        "rss_path": "block_002/compressed.rss.json",
+        "rss_sha256": "8d2ff2673601901994a7bf38137513ab9b018609c458d62f5b2ffff5cff5eaff",
+        "sha256": "b986f39d66737b29cbd500c3694705527c94a5168e8456072d8e7770738c04ed",
+        "size_bytes": 137210
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_003/online_encode.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_003/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_003/online_encode.worker.json",
+        "rss_path": "block_003/online_encode.rss.json",
+        "rss_sha256": "6adbf07e4f98c937297415c94aa9a4978fb5f2c1686e85443fad0267b672d1b5",
+        "sha256": "945b0ca028bba2d36d18c8321a64c06caae23e46e0a6e18d13f3c368fbfc9cb1",
+        "size_bytes": 74452
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_003/compressed.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_003/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_003/compressed.worker.json",
+        "rss_path": "block_003/compressed.rss.json",
+        "rss_sha256": "0ce6bfd2f3069881eaf939a3622fb402989e8d61943a59671d06854689eaaeda",
+        "sha256": "b472d88d3d3e9af5653eb2ae8d5c671f90b41058d7aae257d31ea2c3c6c3e976",
+        "size_bytes": 137228
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_003/full.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_003/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_003/full.worker.json",
+        "rss_path": "block_003/full.rss.json",
+        "rss_sha256": "a7f6d1b0f5720a4dd7fec4bde2cc3a9439ba4cec1174695442d512dc1f1faf0a",
+        "sha256": "5ae46fbc406639c2d3bc349a21c375daec0c078b4bd32fd735619cf9f18a4a4e",
+        "size_bytes": 73760
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_004/online_encode.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_004/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_004/online_encode.worker.json",
+        "rss_path": "block_004/online_encode.rss.json",
+        "rss_sha256": "e07e1d294590b2e6c9ab55fcb5e7f8d561444d69ce66a88c3c984ffd07f9922e",
+        "sha256": "4586571fe4749142a6789544f595c778afa46fe45c4c75653daed3dd28f1f49d",
+        "size_bytes": 74446
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_004/full.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_004/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_004/full.worker.json",
+        "rss_path": "block_004/full.rss.json",
+        "rss_sha256": "83ff65cbe02be29d232741237cc850b3ceda27351cc9bd9a7e8d465ee261e626",
+        "sha256": "8b349b36b5555e7374c9d705743f6dee2b3d64c2ba9d65cebce8bb4db22c7f84",
+        "size_bytes": 73773
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_004/compressed.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_004/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_004/compressed.worker.json",
+        "rss_path": "block_004/compressed.rss.json",
+        "rss_sha256": "3473dae4e9780eb21b8833cd01a936e0c8d35cfa8136b845abc92b17566c542f",
+        "sha256": "5c46d1f3811a8839cfa09be31f9cb8b80830728b4c32e80ae82ff8b479480e90",
+        "size_bytes": 137216
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_005/compressed.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_005/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_005/compressed.worker.json",
+        "rss_path": "block_005/compressed.rss.json",
+        "rss_sha256": "b9dcfe0b177dcc72709a0240782e707a8f68fd63317e9cf60a226aefd602d12f",
+        "sha256": "b0535dc9bb604cff50093779b3b79d9aaa1deabeb25a72d889a0f2f25f42e3ab",
+        "size_bytes": 137174
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_005/full.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_005/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_005/full.worker.json",
+        "rss_path": "block_005/full.rss.json",
+        "rss_sha256": "1a200a983634a2c4b23de72a96434b7117295964f5e17a38e7484e4ec65df528",
+        "sha256": "b6dd46bf3b74a6d128443bb7cbc247638df4ff2b1ab726eabba90420579200b1",
+        "size_bytes": 73769
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_005/online_encode.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_005/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_005/online_encode.worker.json",
+        "rss_path": "block_005/online_encode.rss.json",
+        "rss_sha256": "6e324a2d6d71dd89a234ff6dbba104742da25f435ef7a051a00fcac5212a1f06",
+        "sha256": "f803ddfe1b9e9d262a813298aa6b65d0d0f0d6e84dd861b53221d7c9b14fea8a",
+        "size_bytes": 74485
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_006/full.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_006/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_006/full.worker.json",
+        "rss_path": "block_006/full.rss.json",
+        "rss_sha256": "07e80c0d40a47d18995c390c447eef80e5949e4dadeb39513a7517a968a8ccd0",
+        "sha256": "612034dae36d2efbb506ebf37c959bb3c07534857c1276bb23114122abdee0db",
+        "size_bytes": 73749
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_006/compressed.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_006/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_006/compressed.worker.json",
+        "rss_path": "block_006/compressed.rss.json",
+        "rss_sha256": "5c07b0c956c26aef010b0618db7f42086781e0ec8e5309da6e588805e2425a3d",
+        "sha256": "322ac20d026175734a1c60453914f45db55b648e5ccef2fe02eb925aea3d6275",
+        "size_bytes": 137210
+      },
+      {
+        "command": [
+          "/home/tony/FHE-Honours/.venv/bin/python",
+          "/home/tony/FHE-Honours/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+          "--out",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_006/online_encode.worker.json",
+          "--phase-file",
+          "/home/tony/FHE-Honours/.tmp/results/honours/28_wpc_online_encode_benchmark/server_run2/block_006/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "2",
+          "--forward-runs",
+          "10",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_006/online_encode.worker.json",
+        "rss_path": "block_006/online_encode.rss.json",
+        "rss_sha256": "bc1214ed06d0581bdcf0dd5e0e94b4060361d379a2c060e856c092d3497e1e4c",
+        "sha256": "807349b07841a08b7f85f07e530f6633167be93b9502ea03becc2f0c5aeb0d4e",
+        "size_bytes": 74456
+      }
+    ]
+  },
+  "schema_version": 1,
+  "smoke": false,
+  "status": "ok",
+  "summary": {
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 0,
+    "by_mode": {
+      "compressed": {
+        "activation_median_s": {
+          "ci95_mean": [
+            0.01763074998355781,
+            0.017699058846725773
+          ],
+          "count": 6,
+          "mean": 0.017661730749144528,
+          "median": 0.017649930523475632,
+          "stdev": 4.672677530791115e-05
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": [
+            0.729667022669067,
+            0.7320775494542128
+          ],
+          "count": 6,
+          "mean": 0.7309371180987606,
+          "median": 0.7312189397634938,
+          "stdev": 0.0016492020185822015
+        },
+        "decompression_median_pct": {
+          "ci95_mean": [
+            6.321229075367391,
+            6.498798921854226
+          ],
+          "count": 6,
+          "mean": 6.4057357943432525,
+          "median": 6.392942151701404,
+          "stdev": 0.12325504150125782
+        },
+        "decompression_median_s": {
+          "ci95_mean": [
+            0.15306443325,
+            0.15702466366666668
+          ],
+          "count": 6,
+          "mean": 0.15496803216666666,
+          "median": 0.15434746175,
+          "stdev": 0.0027510106266609375
+        },
+        "forward_median_s": {
+          "ci95_mean": [
+            2.423039444237171,
+            2.4302454025559803
+          ],
+          "count": 6,
+          "mean": 2.426712676155148,
+          "median": 2.4270841492398176,
+          "stdev": 0.005117509186892535
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": [
+            32635904.0,
+            32635904.0
+          ],
+          "count": 6,
+          "mean": 32635904.0,
+          "median": 32635904.0,
+          "stdev": 0.0
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": [
+            1.0554989178975424e-08,
+            1.1175870895385742e-08
+          ],
+          "count": 6,
+          "mean": 1.0865430037180582e-08,
+          "median": 1.1175870895385742e-08,
+          "stdev": 4.809329095243684e-10
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": [
+            6.073299143767585e-07,
+            6.081106903703856e-07
+          ],
+          "count": 6,
+          "mean": 6.077082820527801e-07,
+          "median": 6.077232806702901e-07,
+          "stdev": 5.230771980155103e-10
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "online_encode_median_s": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": [
+            958754816.0,
+            959509845.3333334
+          ],
+          "count": 6,
+          "mean": 959118677.3333334,
+          "median": 959068160.0,
+          "stdev": 528542.2068061043
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": [
+            1145472341.3333333,
+            1147502592.0
+          ],
+          "count": 6,
+          "mean": 1146436949.3333333,
+          "median": 1146171392.0,
+          "stdev": 1381792.546042519
+        }
+      },
+      "full": {
+        "activation_median_s": {
+          "ci95_mean": [
+            0.017771595012163743,
+            0.018066458142129704
+          ],
+          "count": 6,
+          "mean": 0.017892457166453823,
+          "median": 0.017843049514340237,
+          "stdev": 0.00021027674348516885
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": [
+            0.7281055195586911,
+            0.7413775007977771
+          ],
+          "count": 6,
+          "mean": 0.7344672079780139,
+          "median": 0.7314311744703446,
+          "stdev": 0.00910721706716665
+        },
+        "decompression_median_pct": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "decompression_median_s": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "forward_median_s": {
+          "ci95_mean": [
+            2.264596611862847,
+            2.2954306867419896
+          ],
+          "count": 6,
+          "mean": 2.280914055008907,
+          "median": 2.2834533959976397,
+          "stdev": 0.021995277449259675
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": [
+            422445056.0,
+            422445056.0
+          ],
+          "count": 6,
+          "mean": 422445056.0,
+          "median": 422445056.0,
+          "stdev": 0.0
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": [
+            6.068322293870399e-07,
+            6.080653176996319e-07
+          ],
+          "count": 6,
+          "mean": 6.074408730845476e-07,
+          "median": 6.07467771637088e-07,
+          "stdev": 8.510320734199345e-10
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "online_encode_median_s": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": [
+            1363076437.3333333,
+            1363978922.6666667
+          ],
+          "count": 6,
+          "mean": 1363458730.6666667,
+          "median": 1363306496.0,
+          "stdev": 621376.3851820141
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": [
+            1927275861.3333333,
+            1928521728.0
+          ],
+          "count": 6,
+          "mean": 1927795370.6666667,
+          "median": 1927417856.0,
+          "stdev": 891007.2650861308
+        }
+      },
+      "online_encode": {
+        "activation_median_s": {
+          "ci95_mean": [
+            0.017667860840447247,
+            0.017765800885778543
+          ],
+          "count": 6,
+          "mean": 0.017714730493025854,
+          "median": 0.017701526259770617,
+          "stdev": 6.7382394058239e-05
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": [
+            0.7297149329873113,
+            0.7342037194854735
+          ],
+          "count": 6,
+          "mean": 0.7319440812376948,
+          "median": 0.7320024369983003,
+          "stdev": 0.003067195862280803
+        },
+        "decompression_median_pct": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "decompression_median_s": {
+          "ci95_mean": [
+            0.0,
+            0.0
+          ],
+          "count": 6,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": 0.0
+        },
+        "forward_median_s": {
+          "ci95_mean": [
+            3.2779163719290714,
+            3.2980093992567467
+          ],
+          "count": 6,
+          "mean": 3.2865734869264998,
+          "median": 3.282761154259788,
+          "stdev": 0.013938875404777682
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": [
+            2199296.0,
+            2199296.0
+          ],
+          "count": 6,
+          "mean": 2199296.0,
+          "median": 2199296.0,
+          "stdev": 0.0
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": [
+            9.158005317052206e-09,
+            1.0632599393526713e-08
+          ],
+          "count": 6,
+          "mean": 9.89530235528946e-09,
+          "median": 9.546056389808655e-09,
+          "stdev": 1.059315462231387e-09
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": [
+            6.070236697293512e-07,
+            6.079820497649838e-07
+          ],
+          "count": 6,
+          "mean": 6.074900863777105e-07,
+          "median": 6.073694347663236e-07,
+          "stdev": 6.60500422731897e-10
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": [
+            26.407037738808004,
+            26.567376862114358
+          ],
+          "count": 6,
+          "mean": 26.489871895762075,
+          "median": 26.486116821764085,
+          "stdev": 0.11193166986935896
+        },
+        "online_encode_median_s": {
+          "ci95_mean": [
+            0.86487599725,
+            0.8752288816666667
+          ],
+          "count": 6,
+          "mean": 0.8700836921666667,
+          "median": 0.86970464975,
+          "stdev": 0.007242969227220564
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": [
+            31.090114212435424,
+            31.384316103851972
+          ],
+          "count": 6,
+          "mean": 31.25793161794062,
+          "median": 31.32298003586675,
+          "stdev": 0.2100628410041116
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": [
+            0.15252323425,
+            0.15957311191666668
+          ],
+          "count": 6,
+          "mean": 0.15585833333333332,
+          "median": 0.15412910624999998,
+          "stdev": 0.004884840341300855
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": [
+            923597482.6666666,
+            924391424.0
+          ],
+          "count": 6,
+          "mean": 924003669.3333334,
+          "median": 924071936.0,
+          "stdev": 548640.3046640547
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": [
+            1071893162.6666666,
+            1076299093.3333333
+          ],
+          "count": 6,
+          "mean": 1074242901.3333333,
+          "median": 1075869696.0,
+          "stdev": 3096744.6754765343
+        }
+      }
+    },
+    "independent_block_count": 6,
+    "order_balanced": true,
+    "paired_ratios": {
+      "compressed_over_full_forward_ratio": {
+        "ci95_mean": [
+          1.0571785629428394,
+          1.0711762486703593
+        ],
+        "count": 6,
+        "mean": 1.0639967098126002,
+        "median": 1.0625870627031249,
+        "stdev": 0.009630266392867933
+      },
+      "compressed_over_online_encode_forward_ratio": {
+        "ci95_mean": [
+          0.7361693674769452,
+          0.7405815316412503
+        ],
+        "count": 6,
+        "mean": 0.7383812568846411,
+        "median": 0.7380761992133174,
+        "stdev": 0.003110283031904159
+      },
+      "full_over_online_encode_forward_ratio": {
+        "ci95_mean": [
+          0.687666639645367,
+          0.6999601001429939
+        ],
+        "count": 6,
+        "mean": 0.6940301729639338,
+        "median": 0.6957981670609792,
+        "stdev": 0.008368453665592924
+      }
+    },
+    "performance_claims_enabled": true,
+    "scope": "same-CIPS trained decoder with synthetic features and insecure functional CKKS parameters; not Orion-versus-WPC layout or whole-network comparison",
+    "uncertainty_method": "percentile bootstrap of matched process blocks; mean of block statistics; not pooled-forward confidence intervals"
+  }
+}

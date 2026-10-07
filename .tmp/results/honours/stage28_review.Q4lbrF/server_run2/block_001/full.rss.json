@@ -1,0 +1,47 @@
+{
+  "source": "linux_proc_pid_status",
+  "interval_ms": 5.0,
+  "total_sample_count": 10252,
+  "sample_count_by_phase": {
+    "process_start": 630,
+    "startup": 65,
+    "scheme_init": 31,
+    "compile": 3801,
+    "post_compile_raw": 7,
+    "input_prepare": 8,
+    "correctness_preflight": 465,
+    "warmup": 882,
+    "measured": 4202,
+    "sample_validation": 19,
+    "correctness": 3,
+    "complete": 139
+  },
+  "peak_rss_by_phase": {
+    "process_start": 721342464,
+    "startup": 905560064,
+    "scheme_init": 817266688,
+    "compile": 1428398080,
+    "post_compile_raw": 1430343680,
+    "input_prepare": 1356021760,
+    "correctness_preflight": 1514717184,
+    "warmup": 1810591744,
+    "measured": 1927303168,
+    "sample_validation": 1927307264,
+    "correctness": 1927307264,
+    "complete": 1976373248
+  },
+  "peak_hwm_by_phase": {
+    "process_start": 721342464,
+    "startup": 907456512,
+    "scheme_init": 907456512,
+    "compile": 1428398080,
+    "post_compile_raw": 1430343680,
+    "input_prepare": 1422581760,
+    "correctness_preflight": 1514717184,
+    "warmup": 1810591744,
+    "measured": 1927303168,
+    "sample_validation": 1927307264,
+    "correctness": 1927307264,
+    "complete": 1976373248
+  }
+}

@@ -1,5 +1,10 @@
 # Stage 28: matched three-way online-Encode benchmark
 
+Stage 29 extends the worker to configurable CKKS/geometry and schema 3; see
+[`wpc_decoder_scale_feasibility.md`](wpc_decoder_scale_feasibility.md). The
+fixed sizes/counts below describe the original Stage-28 protocol and archived
+evidence, not the only configurations supported by the current code.
+
 ## Research question
 
 Does compressed Q/P storage replace online weight Encode with less expensive
@@ -146,7 +151,10 @@ The final smoke artifacts are in
 This smoke used the available original source checkpoint, **not** the
 server-only audited fine-tuned checkpoint, with zero warmups and one measured
 forward per process. Its timings are diagnostics only; it generated no
-confidence intervals. The six-block server experiment has not been run.
+confidence intervals. At implementation time the six-block server experiment
+had not been run. The subsequent `server_run2` completed all 18 workers and was
+transferred/independently checked locally; its archived protocol remains
+LogN=10 with 8×8 outputs. Stage 29 does not replace or rewrite those results.
 
 ## Server execution
 

@@ -12,6 +12,7 @@ from orion.experimental.wpc_cips_benchmark import (
 from orion.experimental.wpc_evidence_validation import (
     EvidenceValidationError, finite, gates, integer, sha256,
 )
+from orion.experimental.wpc_decoder_geometry import expected_worker_geometry, validate_parameter_manifest
 
 
 TRAINED_DECODER_TRANSFORM_COUNT = 56
@@ -24,12 +25,46 @@ WORKER_GATES = {
     "measured_forward_count_matches_request", "compressed_registry_matches_mode",
     "compressed_materialization_released",
 }
+CONFIGURABLE_WORKER_GATES = (WORKER_GATES - {"bootstrap_uses_four_ciphertext_groups"}) | {
+    "bootstrap_group_count_matches_geometry", "runtime_parameters_match_request", "exact_qp_verified_if_requested",
+}
+
+
+def expected_transform_count(worker: dict[str, Any]) -> int:
+    geometry = expected_worker_geometry(worker)
+    return TRAINED_DECODER_TRANSFORM_COUNT if geometry is None else geometry["learned_transform_count"]
 
 
 def validate_worker(worker: dict[str, Any], *, mode: str, atol: float) -> None:
     """Check raw observations, not just the worker's success booleans."""
     try:
-        gates(worker, name=f"{mode} worker", required=WORKER_GATES)
+        configurable = worker.get("schema_version", 1) >= 3
+        gates(worker, name=f"{mode} worker", required=CONFIGURABLE_WORKER_GATES if configurable else WORKER_GATES)
+        expected = expected_transform_count(worker)
+        if configurable:
+            geometry = expected_worker_geometry(worker)
+            validate_parameter_manifest(worker["runtime_parameter_manifest"], worker["experiment"]["ckks_config"], geometry["slots"])
+            if worker["bootstrap_compile"]["ciphertext_group_count"] != geometry["bootstrap_ciphertext_group_count"]:
+                raise EvidenceValidationError("bootstrap group count differs from geometry")
+            layers = worker["storage"]["by_layer"]
+            if {key: row["transform_count"] for key, row in layers.items()} != geometry["learned_transform_count_by_layer"]:
+                raise EvidenceValidationError("per-layer transform counts differ from geometry")
+            if worker["storage"]["concat"]["transform_count"] != geometry["concat_transform_count"]:
+                raise EvidenceValidationError("concat transform count differs from geometry")
+            verification = worker["qp_verification"]
+            if verification["requested"] != worker["experiment"]["verify_exact_qp"] or verification["applicable"] != (mode == "compressed"):
+                raise EvidenceValidationError("Q/P verification policy differs from request")
+            if verification["requested"] and mode == "compressed":
+                rows = verification["rows"]
+                if len(rows) != expected or len({(r["layer"], r["transform"]) for r in rows}) != expected:
+                    raise EvidenceValidationError("incomplete/duplicate exact Q/P verification records")
+                if {name: sum(row["layer"] == name for row in rows) for name in geometry["learned_transform_count_by_layer"]} != geometry["learned_transform_count_by_layer"]:
+                    raise EvidenceValidationError("exact Q/P records do not cover each expected layer")
+                for row in rows:
+                    if row["exact_qp_match"] is not True or integer(row["diagonal_count"], name="verified diagonals", minimum=1) != integer(row["reconstructed_diagonal_count"], name="reconstructed diagonals", minimum=1):
+                        raise EvidenceValidationError("reconstructed Q/P verification failed")
+                if verification["retained_full_control_count"] != 0:
+                    raise EvidenceValidationError("compressed verification controls were retained")
         if worker.get("status") != "ok" or worker.get("mode") != mode:
             raise EvidenceValidationError(f"{mode} worker status/mode mismatch")
         sha256(worker["checkpoint"]["sha256"], name=f"{mode} checkpoint")
@@ -81,7 +116,7 @@ def validate_worker(worker: dict[str, Any], *, mode: str, atol: float) -> None:
                       worker["memory"]["pre_measured_gc"]["current_rss_bytes"],
                       worker["memory"]["post_compile_gc"]["go"]["heap_inuse_bytes"]):
             integer(value, name=f"{mode} memory bytes", minimum=1)
-        if integer(worker["storage"]["learned_transform_count"], name="learned transforms") != TRAINED_DECODER_TRANSFORM_COUNT:
+        if integer(worker["storage"]["learned_transform_count"], name="learned transforms") != expected:
             raise EvidenceValidationError(f"{mode} worker has incorrect learned transform count")
         for key in ("bootstrap_call_count", "online_python_encode_call_count"):
             integer(measurements[key], name=f"{mode}/{key}")
@@ -184,6 +219,9 @@ def compare_trained_decoder_workers(
         full["measurements"]["operation_counters_per_forward"]
         == compressed["measurements"]["operation_counters_per_forward"]
     )
+    legacy = full.get("schema_version", 1) < 3 and compressed.get("schema_version", 1) < 3
+    registry_gate = "compressed_worker_contains_56_compressed_transforms" if legacy else "compressed_worker_contains_expected_compressed_transforms"
+    offline_gate = "both_workers_encoded_56_weight_transforms_offline" if legacy else "both_workers_encoded_expected_weight_transforms_offline"
     acceptance = {
         "workers_completed_successfully": bool(
             full.get("status") == "ok" and compressed.get("status") == "ok"
@@ -196,10 +234,10 @@ def compare_trained_decoder_workers(
             full_stats["registered_transform_count"]
         )
         == 0,
-        "compressed_worker_contains_56_compressed_transforms": int(
+        registry_gate: int(
             compressed_stats["registered_transform_count"]
         )
-        == TRAINED_DECODER_TRANSFORM_COUNT,
+        == expected_transform_count(compressed),
         "both_paths_match_the_same_clear_reference": bool(
             full["correctness"]["correct"]
             and compressed["correctness"]["correct"]
@@ -222,11 +260,11 @@ def compare_trained_decoder_workers(
             == 0
             and compressed_stats["total_weight_plaintext_online_encode_calls"] == 0
         ),
-        "both_workers_encoded_56_weight_transforms_offline": bool(
+        offline_gate: bool(
             full["backend"]["weight_plaintext_offline_encode_calls"]
-            == TRAINED_DECODER_TRANSFORM_COUNT
+            == expected_transform_count(full)
             and compressed["backend"]["weight_plaintext_offline_encode_calls"]
-            == TRAINED_DECODER_TRANSFORM_COUNT
+            == expected_transform_count(compressed)
         ),
         "compressed_materialization_released": bool(
             compressed_stats["current_materialized_full_payload_bytes"] == 0

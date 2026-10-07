@@ -1,0 +1,293 @@
+{
+  "order": [
+    "online_encode",
+    "full",
+    "compressed"
+  ],
+  "rows": {
+    "online_encode": {
+      "forward_median_s": 1.2528478750027716,
+      "online_encode_median_s": 0.364371752,
+      "online_prepare_median_s": 0.045167126,
+      "online_encode_median_pct": 29.083479269116683,
+      "online_materialization_median_pct": 32.68863572116399,
+      "decompression_median_s": 0.0,
+      "decompression_median_pct": 0.0,
+      "activation_median_s": 0.007638750001206063,
+      "bootstrap_median_s": 0.2725852500007022,
+      "logical_resident_bytes": 2320192,
+      "pre_online_rss_bytes": 1072758784,
+      "sampled_online_peak_rss_bytes": 1073250304,
+      "max_abs_error_vs_clear": 6.153077832388165e-07,
+      "max_abs_delta_vs_isolated_full": 1.4901161193847656e-08
+    },
+    "full": {
+      "forward_median_s": 0.771539124994888,
+      "online_encode_median_s": 0.0,
+      "online_prepare_median_s": 0.0,
+      "online_encode_median_pct": 0.0,
+      "online_materialization_median_pct": 0.0,
+      "decompression_median_s": 0.0,
+      "decompression_median_pct": 0.0,
+      "activation_median_s": 0.007271374997799285,
+      "bootstrap_median_s": 0.2715081670030486,
+      "logical_resident_bytes": 475660288,
+      "pre_online_rss_bytes": 1456979968,
+      "sampled_online_peak_rss_bytes": 1457324032,
+      "max_abs_error_vs_clear": 6.155916378279558e-07,
+      "max_abs_delta_vs_isolated_full": 0.0
+    },
+    "compressed": {
+      "forward_median_s": 0.7908445829962147,
+      "online_encode_median_s": 0.0,
+      "online_prepare_median_s": 0.0,
+      "online_encode_median_pct": 0.0,
+      "online_materialization_median_pct": 0.0,
+      "decompression_median_s": 0.056825125,
+      "decompression_median_pct": 7.185371970901137,
+      "activation_median_s": 0.007085457997163758,
+      "bootstrap_median_s": 0.26184858300257474,
+      "logical_resident_bytes": 35995904,
+      "pre_online_rss_bytes": 1276837888,
+      "sampled_online_peak_rss_bytes": 1276870656,
+      "max_abs_error_vs_clear": 6.134366309484135e-07,
+      "max_abs_delta_vs_isolated_full": 1.4901161193847656e-08
+    }
+  },
+  "checkpoint_sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59",
+  "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+  "shared_library_sha256": "4122d71b5d2b6edbeaeb87b4d55156ffbe796e1671fcc94945acf72a47342bda",
+  "experiment": {
+    "atol": 0.002,
+    "bound_headroom": 1.25,
+    "bsgs_ratio": 2.0,
+    "ckks_config": {
+      "boot_params": {
+        "LogP": [
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61
+        ]
+      },
+      "ckks_params": {
+        "H": 192,
+        "LogN": 11,
+        "LogP": [
+          60
+        ],
+        "LogQ": [
+          55,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45
+        ],
+        "LogScale": 45,
+        "RingType": "Standard"
+      },
+      "orion": {
+        "backend": "lattigo",
+        "debug": false,
+        "embedding_method": "square",
+        "io_mode": "none",
+        "margin": 1
+      }
+    },
+    "configuration_source": {
+      "kind": "json_file",
+      "path": "/private/tmp/wpc-decoder-level9-test.json",
+      "sha256": "918dd064fff214a61f993a6d4dd86b29f0c9e4ce26de45db08467d8b97af7267"
+    },
+    "feature_std": 0.02,
+    "forward_runs": 1,
+    "geometry": {
+      "bootstrap_ciphertext_group_count": 2,
+      "concat_shape": [
+        1,
+        64,
+        8,
+        8
+      ],
+      "concat_transform_count": 4,
+      "high_channel_capacity": 16,
+      "high_shape": [
+        1,
+        32,
+        8,
+        8
+      ],
+      "learned_transform_count": 14,
+      "learned_transform_count_by_layer": {
+        "checkpoint_dec1a": 8,
+        "checkpoint_dec1b": 4,
+        "checkpoint_up1": 2
+      },
+      "levels": {
+        "bridge_input": 6,
+        "concat": 8,
+        "dec1a": 7,
+        "dec1b": 9,
+        "output": 8,
+        "skip1": 8,
+        "up1": 9
+      },
+      "logn": 11,
+      "low_channel_capacity": 64,
+      "low_shape": [
+        1,
+        64,
+        4,
+        4
+      ],
+      "slots": 1024
+    },
+    "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+    "high_shape": [
+      1,
+      32,
+      8,
+      8
+    ],
+    "logn": 11,
+    "low_shape": [
+      1,
+      64,
+      4,
+      4
+    ],
+    "runtime_environment": {
+      "ORION_LATTIGO_CLEAR_BACKEND": "0",
+      "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+      "ORION_LATTIGO_STREAMING_LT": "0",
+      "ORION_WPC_PERIODICITY_PROFILE": "0"
+    },
+    "security_scope": "unassessed_experimental_parameters_not_secure_deployment",
+    "slots": 1024,
+    "timed_lifecycle_tracing": false,
+    "verify_exact_qp": true,
+    "warmup_runs": 0
+  },
+  "valid": true,
+  "runtime_parameter_manifest": {
+    "bootstrappers": [
+      {
+        "encapsulation": {
+          "p": [
+            2305843009213616129
+          ],
+          "q": [
+            36028797018972161
+          ],
+          "secret_hamming_weight": 32
+        },
+        "ephemeral_secret_weight": 32,
+        "parameters": {
+          "error_distribution": {
+            "parameters": {
+              "Bound": 19.2,
+              "Sigma": 3.2
+            },
+            "type": "DiscreteGaussian"
+          },
+          "log_default_scale": 45,
+          "logn": 11,
+          "logqp": 1769.000000034432,
+          "p": [
+            2305843009213616129,
+            2305843009213800449,
+            2305843009213812737,
+            2305843009213554689,
+            2305843009213861889,
+            2305843009213870081,
+            2305843009213501441,
+            2305843009213489153
+          ],
+          "q": [
+            36028797018972161,
+            35184372060161,
+            35184372121601,
+            35184371986433,
+            35184372203521,
+            35184371961857,
+            35184371884033,
+            35184372355073,
+            35184372375553,
+            35184372428801,
+            549755809793,
+            549755731969,
+            549755904001,
+            1152921504606830593,
+            1152921504606904321,
+            1152921504606748673,
+            1152921504606965761,
+            1152921504606994433,
+            1152921504607019009,
+            1152921504606683137,
+            1152921504607031297,
+            72057594037948417,
+            72057594038149121,
+            72057594037641217,
+            72057594037616641
+          ],
+          "ring_type": "Standard",
+          "secret_distribution": {
+            "parameters": {
+              "H": 192,
+              "P": 0
+            },
+            "type": "Ternary"
+          }
+        },
+        "slots": 1024
+      }
+    ],
+    "residual": {
+      "error_distribution": {
+        "parameters": {
+          "Bound": 19.2,
+          "Sigma": 3.2
+        },
+        "type": "DiscreteGaussian"
+      },
+      "log_default_scale": 45,
+      "logn": 11,
+      "logqp": 520.0000000236819,
+      "p": [
+        1152921504606830593
+      ],
+      "q": [
+        36028797018972161,
+        35184372060161,
+        35184372121601,
+        35184371986433,
+        35184372203521,
+        35184371961857,
+        35184371884033,
+        35184372355073,
+        35184372375553,
+        35184372428801
+      ],
+      "ring_type": "Standard",
+      "secret_distribution": {
+        "parameters": {
+          "H": 192,
+          "P": 0
+        },
+        "type": "Ternary"
+      }
+    },
+    "schema_version": 1,
+    "security_assessed": false
+  },
+  "block_index": 1
+}
