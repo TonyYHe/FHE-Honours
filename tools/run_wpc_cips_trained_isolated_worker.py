@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run one isolated full or compressed trained-decoder FHE worker."""
+"""Run one isolated full, compressed, or online-Encode decoder FHE worker."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -31,6 +32,8 @@ from orion.experimental.wpc_cips_checkpoint import (
 from orion.experimental.wpc_cips_layer import (
     WPC_STORAGE_COMPRESSED,
     WPC_STORAGE_FULL,
+    WPC_STORAGE_ONLINE,
+    WPC_STORAGE_MODES,
 )
 from orion.experimental.wpc_cips_trained_benchmark import (
     TRAINED_DECODER_TRANSFORM_COUNT,
@@ -59,7 +62,7 @@ from tools.run_wpc_cips_trained_decoder import (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("full", "compressed"), required=True)
+    parser.add_argument("--mode", choices=WPC_STORAGE_MODES, required=True)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--phase-file", type=Path, required=True)
@@ -132,6 +135,11 @@ def main() -> int:
         raise SystemExit(f"checkpoint does not exist: {checkpoint_path}")
     if int(args.logn) != 10 or (int(args.height), int(args.width)) != (8, 8):
         raise SystemExit("trained decoder benchmark requires logn=10 and 8x8 output")
+    environment = {
+        "ORION_LATTIGO_CLEAR_BACKEND": "0", "ORION_LATTIGO_STREAMING_LT": "0",
+        "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0", "ORION_WPC_PERIODICITY_PROFILE": "0",
+    }
+    os.environ.update(environment)
 
     _write_phase(args.phase_file, "startup")
     state, model_metadata, checkpoint_sha256 = _load_checkpoint_identified(checkpoint_path)
@@ -170,6 +178,13 @@ def main() -> int:
         _write_phase(args.phase_file, "scheme_init")
         scheme_started = time.perf_counter()
         scheme = orion.init_scheme(_config(int(args.logn)))
+        shared_library_path = Path(scheme.backend.lib._name).resolve()
+        shared_library_sha256 = hashlib.sha256(shared_library_path.read_bytes()).hexdigest()
+        required_apis = ("ResetWPCBenchmarkEncodeCounters", "GetWPCBenchmarkEncodeCounters",
+                         "GetWPCOnlineGlobalStats", "ResetWPCOnlineMaterializationPeak")
+        if any(not hasattr(scheme.backend, name) for name in required_apis):
+            raise RuntimeError("Stage-28 shared-library APIs missing; rebuild with tools/build_lattigo.py")
+        scheme.backend.ResetWPCBenchmarkEncodeCounters()
         scheme_init_s = float(time.perf_counter() - scheme_started)
         Conv2d.set_scheme(scheme)
         ConvTranspose2d.set_scheme(scheme)
@@ -268,6 +283,7 @@ def main() -> int:
             layer.he()
         concat_module.he()
         compile_s = float(time.perf_counter() - compile_started)
+        compile_encode_invocations = list(scheme.backend.GetWPCBenchmarkEncodeCounters())
 
         _write_phase(args.phase_file, "post_compile_raw")
         memory["post_compile_raw"] = _memory_snapshot(scheme.backend)
@@ -296,6 +312,20 @@ def main() -> int:
 
         scheme.encoder.encode = counted_online_encode
         try:
+            # Traced correctness/lifecycle run is OUTSIDE performance samples.
+            _write_phase(args.phase_file, "correctness_preflight")
+            preflight = _run_decoder(up_layer, concat_module, dec1a_layer, bridge,
+                                     dec1b_layer, low_ciphertext, skip_ciphertext)
+            try:
+                preflight_decoded = dec1b_plan.decrypt_unpack(preflight)
+                preflight_error = float(np.max(np.abs(preflight_decoded - clear_dec1b)))
+                if not np.isfinite(preflight_decoded).all() or preflight_error > float(args.atol):
+                    raise RuntimeError("untimed decoder correctness preflight failed")
+                lifecycle_trace = [plan.last_evaluation["evaluation_sequence"] for plan in plans]
+            finally:
+                preflight.release()
+            for plan in plans:
+                plan.record_sequence = False
             _write_phase(args.phase_file, "warmup")
             for _ in range(int(args.warmup_runs)):
                 warmup_output = _run_decoder(
@@ -314,16 +344,25 @@ def main() -> int:
             memory["pre_measured_gc"] = _memory_snapshot(scheme.backend)
 
             scheme.backend.ResetOperationCounters()
+            scheme.backend.ResetWPCBenchmarkEncodeCounters()
+            scheme.backend.ResetWPCOnlineMaterializationPeak()
             if args.mode == WPC_STORAGE_COMPRESSED:
                 scheme.backend.ResetWPCCompressedGlobalMaterializationPeak()
             forward_wall_s: list[float] = []
             decompression_s: list[float] = []
+            online_encode_s: list[float] = []
+            online_prepare_s: list[float] = []
+            transform_encode_invocations: list[int] = []
+            measured_output_errors: list[float] = []
+            timed_lifecycle_records: list[int] = []
             transform_evaluate_s: list[float] = []
             activation_s: list[float] = []
             bootstrap_s: list[float] = []
             bootstrap_call_count = 0
             _write_phase(args.phase_file, "measured")
             for _ in range(int(args.forward_runs)):
+                _write_phase(args.phase_file, "measured")
+                before_encode = list(scheme.backend.GetWPCBenchmarkEncodeCounters())
                 started = time.perf_counter()
                 output = _run_decoder(
                     up_layer,
@@ -335,12 +374,21 @@ def main() -> int:
                     skip_ciphertext,
                 )
                 forward_wall_s.append(float(time.perf_counter() - started))
+                timed_lifecycle_records.append(sum(len(plan.last_evaluation["evaluation_sequence"]) for plan in plans))
+                _write_phase(args.phase_file, "sample_validation")
+                after_encode = list(scheme.backend.GetWPCBenchmarkEncodeCounters())
+                transform_encode_invocations.append(int(sum(after_encode) - sum(before_encode)))
                 if final_output is not None:
                     final_output.release()
                 final_output = output
                 activation_s.append(float(bridge.last_evaluation["activation_s"]))
                 bootstrap_s.append(float(bridge.last_evaluation["bootstrap_s"]))
                 bootstrap_call_count += 1
+                sample_decoded = dec1b_plan.decrypt_unpack(output)
+                sample_error = float(np.max(np.abs(sample_decoded - clear_dec1b)))
+                if not np.isfinite(sample_decoded).all() or sample_error > float(args.atol):
+                    raise RuntimeError("measured decoder output failed clear-reference validation")
+                measured_output_errors.append(sample_error)
                 if args.mode == WPC_STORAGE_COMPRESSED:
                     runtime_rows = [
                         row
@@ -355,9 +403,19 @@ def main() -> int:
                     transform_evaluate_s.append(
                         float(sum(row["last_evaluate_s"] for row in runtime_rows))
                     )
+                    online_encode_s.append(0.0)
+                    online_prepare_s.append(0.0)
+                elif args.mode == WPC_STORAGE_ONLINE:
+                    rows = [row for plan in plans for row in plan.online_stats().values()]
+                    online_encode_s.append(sum(row["last_encode_nanoseconds"] for row in rows) / 1e9)
+                    online_prepare_s.append(sum(row["last_prepare_nanoseconds"] for row in rows) / 1e9)
+                    transform_evaluate_s.append(sum(row["last_evaluate_nanoseconds"] for row in rows) / 1e9)
+                    decompression_s.append(0.0)
                 else:
                     decompression_s.append(0.0)
                     transform_evaluate_s.append(0.0)
+                    online_encode_s.append(0.0)
+                    online_prepare_s.append(0.0)
             counters_total = _operation_counters(scheme.backend)
             _write_phase(args.phase_file, "post_measured")
             memory["after_measured"] = _memory_snapshot(scheme.backend)
@@ -370,6 +428,11 @@ def main() -> int:
         error = np.abs(decoded - clear_dec1b)
         storage = _logical_storage(plans, concat_plan)
         global_stats = _global_stats(scheme.backend)
+        online_global_values = list(scheme.backend.GetWPCOnlineGlobalStats())
+        online_global_stats = dict(zip(("registered_transform_count", "current_materialized_bytes",
+            "peak_materialized_bytes", "current_materialized_transforms", "peak_materialized_transforms"),
+            map(int, online_global_values)))
+        measured_encode_invocations = list(map(int, scheme.backend.GetWPCBenchmarkEncodeCounters()))
         compressed_rows = {
             plan.layer_name: plan.compressed_stats() for plan in plans
         }
@@ -416,14 +479,24 @@ def main() -> int:
                     and global_stats["current_materialized_transform_count"] == 0
                 )
             ),
+            "untimed_preflight_correct": preflight_error <= float(args.atol),
+            "all_measured_outputs_correct": all(value <= float(args.atol) for value in measured_output_errors),
+            "timed_lifecycle_tracing_disabled": all(plan.record_sequence is False for plan in plans),
+            "actual_transform_encode_invocations_match_mode": all(
+                value == (TRAINED_DECODER_TRANSFORM_COUNT if args.mode == WPC_STORAGE_ONLINE else 0)
+                for value in transform_encode_invocations),
+            "online_recipe_materialization_released": online_global_stats["current_materialized_bytes"] == 0
+                and online_global_stats["current_materialized_transforms"] == 0,
         }
         worker_acceptance["valid"] = bool(all(worker_acceptance.values()))
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "wpc_cips_trained_decoder_isolated_worker",
             "status": "ok" if worker_acceptance["valid"] else "invalid",
             "mode": str(args.mode),
             "seed": int(args.seed),
+            "feature_sha256": hashlib.sha256(low.tobytes(order="C") + skip.tobytes(order="C")).hexdigest(),
+            "shared_library": {"path": str(shared_library_path), "sha256": shared_library_sha256},
             "process": {
                 "pid": int(os.getpid()),
                 "python": sys.version.split()[0],
@@ -447,6 +520,10 @@ def main() -> int:
                 "warmup_runs": int(args.warmup_runs),
                 "forward_runs": int(args.forward_runs),
                 "atol": float(args.atol),
+                "ckks_config": _config(int(args.logn)),
+                "security_scope": "small_insecure_functional_test_not_secure_deployment",
+                "timed_lifecycle_tracing": False,
+                "runtime_environment": environment,
             },
             "timing_policy": (
                 "fresh process with warmups excluded; measured wall time includes "
@@ -464,6 +541,13 @@ def main() -> int:
             "storage": storage,
             "measurements": {
                 "forward_wall_s": forward_wall_s,
+                "online_encode_s": online_encode_s,
+                "online_prepare_s": online_prepare_s,
+                "online_encode_pct_of_forward": [100 * encode / wall for encode, wall in zip(online_encode_s, forward_wall_s)],
+                "online_materialization_pct_of_forward": [100 * (encode + prepare) / wall for encode, prepare, wall in zip(online_encode_s, online_prepare_s, forward_wall_s)],
+                "transform_encode_invocations": transform_encode_invocations,
+                "measured_output_max_abs_errors": measured_output_errors,
+                "timed_lifecycle_record_count": timed_lifecycle_records,
                 "forward_wall_summary_s": summarize_samples(forward_wall_s),
                 "decompression_s": decompression_s,
                 "decompression_summary_s": summarize_samples(decompression_s),
@@ -488,6 +572,8 @@ def main() -> int:
             "correctness": {
                 "correct": worker_acceptance["correct_vs_clear"],
                 "max_abs_error": float(np.max(error)),
+                "preflight_max_abs_error": preflight_error,
+                "untimed_lifecycle_trace": lifecycle_trace,
                 "mean_abs_error": float(np.mean(error)),
                 "output_shape": list(decoded.shape),
                 "output_values": decoded.reshape(-1).tolist(),
@@ -496,15 +582,21 @@ def main() -> int:
             "backend": {
                 "compressed_global_stats": global_stats,
                 "compressed_transform_stats": compressed_rows,
+                "online_recipe_global_stats": online_global_stats,
+                "expected_max_single_transform_bytes": max(
+                    row["full_payload_bytes"] for plan in plans for row in plan.transform_rows.values()),
+                "compile_transform_encode_invocations": dict(zip(("ordinary", "compressed", "online_recipe"), map(int, compile_encode_invocations))),
+                "measured_transform_encode_invocations": dict(zip(("ordinary", "compressed", "online_recipe"), measured_encode_invocations)),
+                "encode_counter_scope": "actual successful lintrans.Encode invocations; one invocation per transform, not per diagonal; excludes input/bias/bootstrapping encoder internals",
                 "weight_plaintext_offline_encode_calls": (
                     int(global_stats["total_weight_plaintext_offline_encode_calls"])
                     if args.mode == WPC_STORAGE_COMPRESSED
-                    else TRAINED_DECODER_TRANSFORM_COUNT
+                    else (0 if args.mode == WPC_STORAGE_ONLINE else TRAINED_DECODER_TRANSFORM_COUNT)
                 ),
                 "weight_plaintext_online_encode_calls": (
                     int(global_stats["total_weight_plaintext_online_encode_calls"])
                     if args.mode == WPC_STORAGE_COMPRESSED
-                    else 0
+                    else (sum(transform_encode_invocations) if args.mode == WPC_STORAGE_ONLINE else 0)
                 ),
             },
             "acceptance": worker_acceptance,

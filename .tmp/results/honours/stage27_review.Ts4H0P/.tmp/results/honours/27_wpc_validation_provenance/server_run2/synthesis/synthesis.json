@@ -1,0 +1,292 @@
+{
+  "acceptance": {
+    "checkpoint_identity_consistent": true,
+    "full_validation_valid": true,
+    "isolated_decoder_benchmark_valid": true,
+    "periodic_candidates_fully_classified": true,
+    "periodicity_censuses_and_jsonl_valid": true,
+    "step1_three_model_matrix_valid": true,
+    "trained_decoder_fhe_correctness_valid": true,
+    "valid": true
+  },
+  "claim_scope": {
+    "accuracy": "complete clear U-Net validation on 2,115 validation-split samples (not an untouched test set)",
+    "not_measured": "complete encrypted WPC U-Net or ResNet latency and memory",
+    "periodicity": "unchanged Orion layouts; structural clear-Lattigo audit",
+    "step1": "whole-model Orion real-FHE forward profiles",
+    "wpc_resource_benchmark": "fine-tuned encrypted U-Net decoder stage with synthetic internal features"
+  },
+  "cross_artifact_checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+  "derived": {
+    "complete_encrypted_network_tradeoff": "not_established",
+    "models_by_descending_online_encode_share": [
+      "u22_64_base32",
+      "vgg16_imgnet",
+      "resnet20_cifar10"
+    ],
+    "periodic_learned_weight_candidate_count_across_models": 0,
+    "periodic_structural_candidate_count_across_models": 14,
+    "selective_existing_orion_layout_hypothesis": "not_supported",
+    "wpc_layout_trained_decoder_mechanism": "supported"
+  },
+  "input_artifacts": {
+    "checkpoint": {
+      "bytes": 93199571,
+      "path": "checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+      "sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39"
+    },
+    "compressed_raw_worker": {
+      "bytes": 119586,
+      "path": ".tmp/results/honours/25_wpc_finetuned_decoder_isolated_benchmark/server_run1/compressed.worker.json",
+      "sha256": "21c2c2badf3b5f7ac670571e98bbee6166a5c482ee278eeacbbe3d26c664394c"
+    },
+    "decoder_benchmark": {
+      "bytes": 93727,
+      "path": ".tmp/results/honours/25_wpc_finetuned_decoder_isolated_benchmark/server_run1/comparison.json",
+      "sha256": "819a4e36bfd3ef719c371388db17e54a16abd3c3b937b7de9b5d28b9e893752a"
+    },
+    "decoder_correctness": {
+      "bytes": 50834,
+      "path": ".tmp/results/honours/27_wpc_validation_provenance/server_run2/decoder_correctness.json",
+      "sha256": "0e8ba72350fae4542e505e7e7b2eaea783ee3667564b658ff37f451da8b8df7e"
+    },
+    "full_raw_worker": {
+      "bytes": 69973,
+      "path": ".tmp/results/honours/25_wpc_finetuned_decoder_isolated_benchmark/server_run1/full.worker.json",
+      "sha256": "c35d718113414d577b4f7b09a63b062a2f1782b5de74d02f2729c83af49aca74"
+    },
+    "full_validation": {
+      "bytes": 26516,
+      "path": ".tmp/results/honours/27_wpc_validation_provenance/server_run2/full_validation_2115.json",
+      "sha256": "94e3480acb16f8916254d2db05d49c3dad9699364a7ccc9812772987a0968424"
+    },
+    "resnet_jsonl": {
+      "bytes": 19541822,
+      "path": ".tmp/results/honours/09_wpc_periodicity_census/resnet20_cifar10_dense.periodicity.jsonl",
+      "sha256": "1592957a17e3063245339c2f46a539290b1db27b99b4b52109a704ecf6962617"
+    },
+    "resnet_summary": {
+      "bytes": 1892,
+      "path": ".tmp/results/honours/09_wpc_periodicity_census/resnet20_cifar10_dense.periodicity.summary.json",
+      "sha256": "8c85f168fb7153e28f0214f31f6dd04e79efd4bdf1ba4f0f003a300b3c52cda2"
+    },
+    "step1": {
+      "bytes": 108445,
+      "path": ".tmp/results/honours/06_step1_extracted/extracted_results.json",
+      "sha256": "7c71947369baf0cb199d979d4ef677fd18f3e0f399f89d121b417e1e120ad24c"
+    },
+    "unet_jsonl": {
+      "bytes": 207928584,
+      "path": ".tmp/results/honours/10_wpc_encoded_qp_verification/u22_64_base32_provider.periodicity.jsonl",
+      "sha256": "ef3a6ca5a191b86e0f79233288e2a5316126e0e8fde7fa043c0ccb4643b25c08"
+    },
+    "unet_summary": {
+      "bytes": 2329,
+      "path": ".tmp/results/honours/10_wpc_encoded_qp_verification/u22_64_base32_provider.periodicity.summary.json",
+      "sha256": "d211775f0cbd4672e77e9ad177d8bab4c80813d9a36ac5d4b3854c3ab0757d06"
+    },
+    "vgg_jsonl": {
+      "bytes": 363743542,
+      "path": ".tmp/results/honours/09_wpc_periodicity_census/vgg16_run1/vgg16_imgnet_provider.periodicity.jsonl",
+      "sha256": "875ce4438cf878bb5b310d35392d31b69ffacbb4f8eed4b7e426031081d3f4c1"
+    },
+    "vgg_summary": {
+      "bytes": 1936,
+      "path": ".tmp/results/honours/09_wpc_periodicity_census/vgg16_run1/vgg16_imgnet_provider.periodicity.summary.json",
+      "sha256": "6eda6271f1d52707761b0fbb2db528f2b9d30f09108923bc84b9d54858ead3b0"
+    }
+  },
+  "model_profiles": [
+    {
+      "bootstrap_pct": 64.64420717717607,
+      "he_forward_s": 1530.1264577458303,
+      "he_forward_sample_std_s": 13.282474191148797,
+      "mae_vs_clear": 0.00010260045382892713,
+      "mode": "dense",
+      "model": "ResNet20",
+      "mvm_kernel_pct": 4.0952829540490745,
+      "network": "resnet20_cifar10",
+      "online_encode_pct": 19.959301336900985,
+      "online_encode_pct_sample_std": 0.11377049000634895,
+      "online_encode_s": 305.4025505371392,
+      "online_encode_sample_std_s": 3.4589036837256106,
+      "other_he_forward_pct": 11.099612187698238,
+      "profile_count": 3
+    },
+    {
+      "bootstrap_pct": 1.994643493474213,
+      "he_forward_s": 5575.576385747641,
+      "he_forward_sample_std_s": 34.69541325469045,
+      "mae_vs_clear": 2.276418875624131e-08,
+      "mode": "provider",
+      "model": "U-Net22",
+      "mvm_kernel_pct": 7.324415492711543,
+      "network": "u22_64_base32",
+      "online_encode_pct": 90.46966875382168,
+      "online_encode_pct_sample_std": 0.3247329779738177,
+      "online_encode_s": 5044.205487302194,
+      "online_encode_sample_std_s": 22.326498692800957,
+      "other_he_forward_pct": 0.1791586243263907,
+      "profile_count": 3
+    },
+    {
+      "bootstrap_pct": 44.13614029384395,
+      "he_forward_s": 16508.111870722223,
+      "he_forward_sample_std_s": 197.38366001907292,
+      "mae_vs_clear": 0.00014179630670696497,
+      "mode": "provider",
+      "model": "VGG16",
+      "mvm_kernel_pct": 4.579563070166783,
+      "network": "vgg16_imgnet",
+      "online_encode_pct": 48.08151556011081,
+      "online_encode_pct_sample_std": 0.22829736673510745,
+      "online_encode_s": 7937.350377801806,
+      "online_encode_sample_std_s": 129.80135876758553,
+      "other_he_forward_pct": 3.1462692966002135,
+      "profile_count": 3
+    }
+  ],
+  "orion_layout_periodicity": [
+    {
+      "all_zero_count": 0,
+      "byte_coverage_pct": 0.0,
+      "count_coverage_pct": 0.0,
+      "encoded_qp_verified_candidate_count": 0,
+      "full_encoded_bytes": 38254673920,
+      "hybrid_storage_bytes": 38254673920,
+      "mode": "dense",
+      "model": "ResNet20",
+      "network": "resnet20_cifar10",
+      "nonzero_count": 8381,
+      "observed_count": 8381,
+      "partial_storage_compression_ratio": 1.0,
+      "periodic_count": 0,
+      "periodic_learned_weight_count": 0,
+      "periodic_structural_count": 0
+    },
+    {
+      "all_zero_count": 0,
+      "byte_coverage_pct": 0.016575051404092607,
+      "count_coverage_pct": 0.01915787457065835,
+      "encoded_qp_verified_candidate_count": 14,
+      "full_encoded_bytes": 366921383936,
+      "hybrid_storage_bytes": 366860568384,
+      "mode": "provider",
+      "model": "U-Net22",
+      "network": "u22_64_base32",
+      "nonzero_count": 73077,
+      "observed_count": 73077,
+      "partial_storage_compression_ratio": 1.0001657729318467,
+      "periodic_count": 14,
+      "periodic_learned_weight_count": 0,
+      "periodic_structural_count": 14
+    },
+    {
+      "all_zero_count": 169,
+      "byte_coverage_pct": 0.0,
+      "count_coverage_pct": 0.0,
+      "encoded_qp_verified_candidate_count": 0,
+      "full_encoded_bytes": 491591827456,
+      "hybrid_storage_bytes": 491591827456,
+      "mode": "provider",
+      "model": "VGG16",
+      "network": "vgg16_imgnet",
+      "nonzero_count": 128218,
+      "observed_count": 128387,
+      "partial_storage_compression_ratio": 1.0,
+      "periodic_count": 0,
+      "periodic_learned_weight_count": 0,
+      "periodic_structural_count": 0
+    }
+  ],
+  "outputs": {
+    "artifact_manifest_csv": "artifact_manifest.csv",
+    "model_profiles_csv": "model_profiles.csv",
+    "periodicity_census_csv": "periodicity_census.csv",
+    "plots": [
+      "online_encode_share.png",
+      "orion_periodicity_coverage.png",
+      "trained_decoder_tradeoff.png",
+      "rotation_padding_accuracy.png"
+    ],
+    "report": "report.md",
+    "rotation_padding_accuracy_csv": "rotation_padding_accuracy.csv",
+    "trained_decoder_benchmark_csv": "trained_decoder_benchmark.csv"
+  },
+  "profile": "wpc_orion_tradeoff_evidence_synthesis",
+  "rotation_padding_accuracy": {
+    "best_checkpoint_path": "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+    "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+    "dataset": "covid19",
+    "native_dice_retained_pct": 96.42987467170268,
+    "native_to_finetuned_dice_delta": -0.033634201246904416,
+    "native_to_finetuned_iou_delta": -0.0530704931541387,
+    "native_zero_padding": {
+      "dice": 0.9421014153288947,
+      "finite_sample_count": 2115,
+      "fully_finite": true,
+      "iou": 0.895599356475451,
+      "loss": 0.1470133425815019,
+      "nonfinite_sample_count": 0,
+      "sample_count": 2115
+    },
+    "numerical_stability_recovered": true,
+    "rotation_padding_before_finetune": {
+      "dice": 0.8318225482754281,
+      "finite_sample_count": 2114,
+      "fully_finite": false,
+      "iou": 0.7233448426333735,
+      "loss": 6868.503357841171,
+      "nonfinite_sample_count": 1,
+      "sample_count": 2115
+    },
+    "rotation_padding_finetuned": {
+      "dice": 0.9084672140819903,
+      "finite_sample_count": 2115,
+      "fully_finite": true,
+      "iou": 0.8425288633213123,
+      "loss": 0.2416906052608101,
+      "nonfinite_sample_count": 0,
+      "sample_count": 2115
+    },
+    "source_checkpoint_sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59",
+    "validation_count": 2115
+  },
+  "schema_version": 2,
+  "status": "ok",
+  "trained_decoder_fhe_correctness": {
+    "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+    "compressed_full_final_max_abs_delta": 0.0,
+    "compressed_transform_count": 56,
+    "max_compressed_qp_error_vs_clear": 6.100122622648349e-07,
+    "max_full_qp_error_vs_clear": 6.100122622648349e-07,
+    "online_weight_encode_calls": 0,
+    "overall_storage_ratio_including_concat": 12.9441812305858
+  },
+  "trained_decoder_isolated_benchmark": {
+    "activation_plus_bootstrap_median_pct_of_forward": 31.24415166448933,
+    "bootstrap_median_s": 0.7454331530316267,
+    "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+    "compressed_forward_median_s": 2.4448896610119846,
+    "compressed_go_heap_inuse_after_compile_gc_bytes": 144302080,
+    "compressed_online_peak_rss_bytes": 1145720832,
+    "compressed_over_full_median_ratio": 1.0248549992943072,
+    "compressed_pre_online_rss_bytes": 958169088,
+    "decompression_median_pct_of_forward": 6.180884348911883,
+    "decompression_median_s": 0.1498357375,
+    "forward_runs": 10,
+    "full_forward_median_s": 2.385595682018902,
+    "full_go_heap_inuse_after_compile_gc_bytes": 533954560,
+    "full_online_peak_rss_bytes": 1934684160,
+    "full_pre_online_rss_bytes": 1358647296,
+    "latency_overhead_pct": 2.4854999294307234,
+    "logical_compressed_resident_bytes": 32635904,
+    "logical_full_resident_bytes": 422445056,
+    "logical_storage_compression_ratio": 12.9441812305858,
+    "logical_storage_reduction_pct": 92.27452102078809,
+    "max_abs_delta_between_isolated_outputs": 1.1175870895385742e-08,
+    "online_peak_rss_reduction_pct": 40.77995490488742,
+    "operation_counters_match": true,
+    "pre_online_rss_reduction_pct": 29.47624517261027
+  }
+}

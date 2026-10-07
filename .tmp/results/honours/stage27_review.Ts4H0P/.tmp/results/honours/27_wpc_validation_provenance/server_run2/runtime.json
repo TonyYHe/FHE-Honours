@@ -1,0 +1,1 @@
+{"torch": "2.13.0+cu126", "cuda": "12.6", "gpu": "Tesla P100-PCIE-16GB"}

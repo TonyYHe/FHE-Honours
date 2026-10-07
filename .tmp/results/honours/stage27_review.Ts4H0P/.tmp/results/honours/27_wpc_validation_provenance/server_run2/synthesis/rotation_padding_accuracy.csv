@@ -1,0 +1,4 @@
+configuration,sample_count,finite_sample_count,nonfinite_sample_count,fully_finite,dice,iou,loss
+Native zero padding,2115,2115,0,True,0.9421014153288947,0.895599356475451,0.1470133425815019
+Rotation Padding before fine-tuning,2115,2114,1,False,0.8318225482754281,0.7233448426333735,6868.503357841171
+Rotation Padding after fine-tuning,2115,2115,0,True,0.9084672140819903,0.8425288633213123,0.2416906052608101

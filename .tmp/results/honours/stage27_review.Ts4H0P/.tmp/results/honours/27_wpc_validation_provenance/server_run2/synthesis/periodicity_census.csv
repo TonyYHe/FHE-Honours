@@ -1,0 +1,4 @@
+network,model,mode,observed_count,nonzero_count,all_zero_count,periodic_count,periodic_learned_weight_count,periodic_structural_count,count_coverage_pct,byte_coverage_pct,full_encoded_bytes,hybrid_storage_bytes,partial_storage_compression_ratio,encoded_qp_verified_candidate_count
+resnet20_cifar10,ResNet20,dense,8381,8381,0,0,0,0,0.0,0.0,38254673920,38254673920,1.0,0
+u22_64_base32,U-Net22,provider,73077,73077,0,14,0,14,0.01915787457065835,0.016575051404092607,366921383936,366860568384,1.0001657729318467,14
+vgg16_imgnet,VGG16,provider,128387,128218,169,0,0,0,0.0,0.0,491591827456,491591827456,1.0,0

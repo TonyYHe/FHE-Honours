@@ -488,6 +488,7 @@ class WPCCIPSConvTranspose2dPlan(WPCCIPSConv2dPlan):
         self.output_level: int | None = None
         self.compressed_transform_ids: dict[str, int] = {}
         self.full_control_transform_ids: dict[str, int] = {}
+        self.online_transform_ids: dict[str, int] = {}
         self.transform_rows: dict[str, dict[str, Any]] = {}
         self.bias_plaintext: Any | None = None
         self.bias_plaintext_payload_bytes = 0
@@ -496,6 +497,7 @@ class WPCCIPSConvTranspose2dPlan(WPCCIPSConv2dPlan):
         self.compiled = False
         self.cleaned = False
         self.last_evaluation: dict[str, Any] = {}
+        self.record_sequence = True
 
     @property
     def input_packing_signature(self) -> tuple[Any, ...]:

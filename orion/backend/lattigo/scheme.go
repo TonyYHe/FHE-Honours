@@ -149,6 +149,7 @@ func DeleteScheme() {
 	DeleteMinimaxSignMap()
 	clearPredecodedLinearTransformArtifacts()
 	clearWPCCompressedTransforms()
+	clearWPCOnlineRecipes()
 
 	ltHeap.Reset()
 	polyHeap.Reset()

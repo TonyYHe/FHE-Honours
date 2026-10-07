@@ -1,0 +1,34 @@
+{
+  "source": "macos_ps_rss",
+  "interval_ms": 5.0,
+  "total_sample_count": 746,
+  "sample_count_by_phase": {
+    "process_start": 88,
+    "startup": 2,
+    "scheme_init": 3,
+    "compile": 472,
+    "post_compile_raw": 1,
+    "input_prepare": 1,
+    "correctness_preflight": 81,
+    "pre_measured_gc": 1,
+    "measured": 77,
+    "post_measured": 1,
+    "correctness": 1,
+    "complete": 18
+  },
+  "peak_rss_by_phase": {
+    "process_start": 347865088,
+    "startup": 414515200,
+    "scheme_init": 445890560,
+    "compile": 604127232,
+    "post_compile_raw": 604258304,
+    "input_prepare": 604389376,
+    "correctness_preflight": 721534976,
+    "pre_measured_gc": 721534976,
+    "measured": 721616896,
+    "post_measured": 721633280,
+    "correctness": 721715200,
+    "complete": 719699968
+  },
+  "peak_hwm_by_phase": {}
+}

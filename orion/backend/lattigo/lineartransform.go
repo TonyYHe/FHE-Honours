@@ -1489,6 +1489,7 @@ func DeleteLinearTransform(id C.int) {
 	deleteStreamingLTState(int(id))
 	deletePredecodedPlaintextDiagonals(int(id))
 	deleteWPCCompressedTransform(int(id))
+	deleteWPCOnlineRecipe(int(id))
 	ltHeap.Delete(int(id))
 }
 
@@ -1553,6 +1554,7 @@ func GenerateLinearTransform(
 		if err := lintrans.Encode(scheme.Encoder, diagonals, lt); err != nil {
 			panic(err)
 		}
+		recordWPCBenchmarkEncode(0)
 	}
 
 	// Return reference to linear transform object we just created

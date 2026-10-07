@@ -1,5 +1,46 @@
 # WPC–Orion experiment log
 
+## 2026-10-07 — Three-way online-Encode implementation (Stage 28)
+
+Added a recipe-backed online weight-Encode policy alongside full and compressed
+Q/P storage for the same trained decoder. Registration retains empty transform
+shells and float32 slot periods; evaluation expands, encodes, evaluates, and
+releases one transform at a time. Rotation keys stay offline. New Go counters
+observe successful transform Encode invocations, with separate preparation and
+Encode timers. Bias and structural concat plaintexts remain common/offline.
+
+Timed forwards now disable lifecycle tracing; a separate untimed preflight
+retains the detailed release audit. The new runner uses six balanced-order
+fresh-process blocks by default and computes confidence intervals across
+matched process blocks. Raw worker/phase/RSS files, source and shared-library
+identity, checkpoint/feature hashes, process-block CSV, and a concise report
+remain separate from historical Stage-25/27 artifacts.
+
+Local validation includes exact recipe-expanded versus ordinary encoded Q/P,
+real-FHE Conv2d and ConvTranspose2d equality/repeated release, malformed-evidence
+rejection, balanced orders, and a real three-worker decoder correctness smoke.
+The local smoke uses the available original COVID-19 checkpoint, not the
+server-only fine-tuned checkpoint; it is explicitly **not performance evidence**.
+The first smoke exposed a statistics-decoder key assumption, which was fixed.
+The next was rejected because sandbox restrictions prevented RSS sampling; an
+approved rerun passed. Failed/partial artifacts were retained, not overwritten.
+
+Final verification: 214 targeted Python tests passed and
+`go test ./... -count=3` passed. Real-FHE tests covered ordinary, stride-two,
+and transposed convolutions across all three modes and consecutive calls.
+The final decoder smoke artifact is
+`.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/comparison.json`.
+It passed independent raw-evidence and artifact/source-hash checks, observed
+56 online learned-transform Encode invocations versus zero in both preencoded
+modes, and produced no timed lifecycle traces. Smoke reports explicitly omit
+balanced-performance claims and confidence intervals.
+
+The server six-block experiment with the audited fine-tuned checkpoint has
+**not been executed** by this implementation task. It remains a same-CIPS,
+small-insecure-parameter decoder experiment, not a complete encrypted network
+or Orion-versus-WPC layout comparison. See
+[Stage-28 methodology and server command](wpc_online_encode_benchmark.md).
+
 This log separates user-executed remote measurements from local implementation
 and unit-test work. A slot-periodicity census identifies WPC *candidates*; it
 does not demonstrate encoded Q/P eligibility or a WPC runtime speedup.

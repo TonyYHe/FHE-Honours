@@ -1,0 +1,134 @@
+{
+  "order": [
+    "online_encode",
+    "full",
+    "compressed"
+  ],
+  "rows": {
+    "online_encode": {
+      "forward_median_s": 0.9289719999942463,
+      "online_encode_median_s": 0.260852834,
+      "online_prepare_median_s": 0.023129507,
+      "online_encode_median_pct": 28.07973049797148,
+      "online_materialization_median_pct": 30.569526422944808,
+      "decompression_median_s": 0.0,
+      "decompression_median_pct": 0.0,
+      "activation_median_s": 0.00519041701045353,
+      "bootstrap_median_s": 0.22319395899830852,
+      "logical_resident_bytes": 2199296,
+      "pre_online_rss_bytes": 721534976,
+      "sampled_online_peak_rss_bytes": 721616896,
+      "max_abs_error_vs_clear": 6.127774140954334e-07,
+      "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08
+    },
+    "full": {
+      "forward_median_s": 0.6498212500009686,
+      "online_encode_median_s": 0.0,
+      "online_prepare_median_s": 0.0,
+      "online_encode_median_pct": 0.0,
+      "online_materialization_median_pct": 0.0,
+      "decompression_median_s": 0.0,
+      "decompression_median_pct": 0.0,
+      "activation_median_s": 0.005678292000084184,
+      "bootstrap_median_s": 0.23117054199974518,
+      "logical_resident_bytes": 422445056,
+      "pre_online_rss_bytes": 1161592832,
+      "sampled_online_peak_rss_bytes": 1162395648,
+      "max_abs_error_vs_clear": 6.111909001405014e-07,
+      "max_abs_delta_vs_isolated_full": 0.0
+    },
+    "compressed": {
+      "forward_median_s": 0.6879049160052091,
+      "online_encode_median_s": 0.0,
+      "online_prepare_median_s": 0.0,
+      "online_encode_median_pct": 0.0,
+      "online_materialization_median_pct": 0.0,
+      "decompression_median_s": 0.0450365,
+      "decompression_median_pct": 6.546907712411081,
+      "activation_median_s": 0.00515412499953527,
+      "bootstrap_median_s": 0.22399008300271817,
+      "logical_resident_bytes": 32635904,
+      "pre_online_rss_bytes": 775274496,
+      "sampled_online_peak_rss_bytes": 777830400,
+      "max_abs_error_vs_clear": 6.121042667069088e-07,
+      "max_abs_delta_vs_isolated_full": 9.313225746154785e-09
+    }
+  },
+  "checkpoint_sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59",
+  "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+  "shared_library_sha256": "31b7030a2f832bd41c9d101716ba98551b117557d11cd93265fb3dea49efa303",
+  "experiment": {
+    "atol": 0.002,
+    "bound_headroom": 1.25,
+    "bsgs_ratio": 2.0,
+    "ckks_config": {
+      "boot_params": {
+        "LogP": [
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61
+        ]
+      },
+      "ckks_params": {
+        "H": 192,
+        "LogN": 10,
+        "LogP": [
+          60
+        ],
+        "LogQ": [
+          55,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45
+        ],
+        "LogScale": 45,
+        "RingType": "Standard"
+      },
+      "orion": {
+        "backend": "lattigo",
+        "debug": false,
+        "embedding_method": "square",
+        "io_mode": "none",
+        "margin": 1
+      }
+    },
+    "feature_std": 0.02,
+    "forward_runs": 1,
+    "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+    "high_shape": [
+      1,
+      32,
+      8,
+      8
+    ],
+    "logn": 10,
+    "low_shape": [
+      1,
+      64,
+      4,
+      4
+    ],
+    "runtime_environment": {
+      "ORION_LATTIGO_CLEAR_BACKEND": "0",
+      "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+      "ORION_LATTIGO_STREAMING_LT": "0",
+      "ORION_WPC_PERIODICITY_PROFILE": "0"
+    },
+    "security_scope": "small_insecure_functional_test_not_secure_deployment",
+    "slots": 512,
+    "timed_lifecycle_tracing": false,
+    "warmup_runs": 0
+  },
+  "valid": true,
+  "block_index": 1
+}

@@ -1,0 +1,3 @@
+representation,median_forward_s,logical_resident_bytes,pre_online_rss_bytes,online_peak_rss_bytes,go_heap_inuse_after_compile_gc_bytes
+Full Q/P,2.385595682018902,422445056,1358647296,1934684160,533954560
+WPC compressed Q/P,2.4448896610119846,32635904,958169088,1145720832,144302080

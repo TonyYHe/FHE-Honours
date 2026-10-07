@@ -913,6 +913,22 @@ class LattigoLibrary:
                 restype=ArrayResultUInt64,
             )
 
+        # Optional Stage-28 APIs: older shared libraries remain usable for the
+        # historical paths, but recipe-mode compilation fails closed.
+        for name, argtypes, restype in (
+            ("GenerateWPCOnlineLinearTransform", [ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int], ctypes.c_int),
+            ("EvaluateWPCOnlineLinearTransform", [ctypes.c_int, ctypes.c_int], ctypes.c_int),
+            ("GetWPCOnlineLinearTransformStats", [ctypes.c_int], ArrayResultUInt64),
+            ("GetWPCOnlineGlobalStats", [], ArrayResultUInt64),
+            ("ResetWPCOnlineMaterializationPeak", [], None),
+            ("GetWPCBenchmarkEncodeCounters", [], ArrayResultUInt64),
+            ("ResetWPCBenchmarkEncodeCounters", [], None),
+        ):
+            function = getattr(self.lib, name, None)
+            if function is not None:
+                setattr(self, name, LattigoFunction(function, argtypes=argtypes, restype=restype))
+
         generate_batch = getattr(self.lib, "GenerateLinearTransformsBatch", None)
         if generate_batch is not None:
             self.GenerateLinearTransformsBatch = LattigoFunction(

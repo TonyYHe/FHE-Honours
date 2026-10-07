@@ -66,7 +66,13 @@ WPC_GLOBAL_STATS_FIELDS = (
 
 WPC_STORAGE_COMPRESSED = "compressed"
 WPC_STORAGE_FULL = "full"
-WPC_STORAGE_MODES = (WPC_STORAGE_COMPRESSED, WPC_STORAGE_FULL)
+WPC_STORAGE_ONLINE = "online_encode"
+WPC_STORAGE_MODES = (WPC_STORAGE_COMPRESSED, WPC_STORAGE_FULL, WPC_STORAGE_ONLINE)
+WPC_ONLINE_STATS_FIELDS = (
+    "diagonal_count", "full_payload_bytes", "recipe_payload_bytes", "metadata_bytes",
+    "last_prepare_nanoseconds", "last_encode_nanoseconds", "last_evaluate_nanoseconds",
+    "transform_encode_invocations",
+)
 
 
 def _tuple2(value: Any) -> tuple[int, int]:
@@ -86,7 +92,7 @@ def _decode_stats(values: list[int], fields: tuple[str, ...]) -> dict[str, Any]:
     result: dict[str, Any] = {
         name: int(value) for name, value in zip(fields, values)
     }
-    if "full_payload_bytes" in result:
+    if "full_payload_bytes" in result and "compressed_payload_bytes" in result:
         full_bytes = int(result["full_payload_bytes"])
         compressed_bytes = int(result["compressed_payload_bytes"])
         stored_bytes = int(result["stored_payload_plus_metadata_bytes"])
@@ -177,6 +183,7 @@ class WPCCIPSConv2dPlan:
         self.output_level: int | None = None
         self.compressed_transform_ids: dict[str, int] = {}
         self.full_control_transform_ids: dict[str, int] = {}
+        self.online_transform_ids: dict[str, int] = {}
         self.transform_rows: dict[str, dict[str, Any]] = {}
         self.bias_plaintext: Any | None = None
         self.bias_plaintext_payload_bytes = 0
@@ -185,6 +192,7 @@ class WPCCIPSConv2dPlan:
         self.compiled = False
         self.cleaned = False
         self.last_evaluation: dict[str, Any] = {}
+        self.record_sequence = True
 
     def __del__(self) -> None:
         try:
@@ -329,13 +337,19 @@ class WPCCIPSConv2dPlan:
             raise ValueError(
                 f"storage_mode must be one of {WPC_STORAGE_MODES}, got {storage_mode!r}"
             )
-        if storage_mode == WPC_STORAGE_FULL and bool(include_full_control):
+        if storage_mode != WPC_STORAGE_COMPRESSED and bool(include_full_control):
             raise ValueError("a full-storage plan is already the full control")
-        if storage_mode == WPC_STORAGE_FULL and bool(verify_exact_qp):
+        if storage_mode != WPC_STORAGE_COMPRESSED and bool(verify_exact_qp):
             raise ValueError(
                 "exact compressed-Q/P verification requires compressed storage"
             )
         required: list[str] = []
+        if storage_mode == WPC_STORAGE_ONLINE:
+            required.extend([
+                "GenerateWPCOnlineLinearTransform", "EvaluateWPCOnlineLinearTransform",
+                "GetWPCOnlineLinearTransformStats", "GetWPCOnlineGlobalStats",
+                "ResetWPCOnlineMaterializationPeak",
+            ])
         if storage_mode == WPC_STORAGE_COMPRESSED:
             required.extend(
                 [
@@ -428,6 +442,15 @@ class WPCCIPSConv2dPlan:
                     scheme.lt_evaluator.generate_rotation_keys(compressed_id)
                     self.compressed_transform_ids[key] = compressed_id
 
+                online_id: int | None = None
+                if storage_mode == WPC_STORAGE_ONLINE:
+                    online_id = int(scheme.backend.GenerateWPCOnlineLinearTransform(
+                        indices, flattened, int(self.level),
+                        float(getattr(layer, "bsgs_ratio", 2.0)), period,
+                    ))
+                    self.online_transform_ids[key] = online_id
+                    scheme.lt_evaluator.generate_rotation_keys(online_id)
+
                 exact_qp_match: bool | None = None
                 manually_decompressed_count = 0
                 if bool(verify_exact_qp):
@@ -468,6 +491,13 @@ class WPCCIPSConv2dPlan:
                     )
                     resident_payload_bytes = int(stats["compressed_payload_bytes"])
                     metadata_bytes = int(stats["metadata_bytes"])
+                elif online_id is not None:
+                    stats = _decode_stats(
+                        scheme.backend.GetWPCOnlineLinearTransformStats(online_id),
+                        WPC_ONLINE_STATS_FIELDS,
+                    )
+                    resident_payload_bytes = 0
+                    metadata_bytes = int(stats["metadata_bytes"])
                 else:
                     stats = {
                         "backend_schema_version": 1,
@@ -490,6 +520,7 @@ class WPCCIPSConv2dPlan:
                     "storage_mode": storage_mode,
                     "full_payload_bytes": full_payload_bytes,
                     "resident_payload_bytes": resident_payload_bytes,
+                    "recipe_payload_bytes": int(stats.get("recipe_payload_bytes", 0)),
                     "metadata_bytes": metadata_bytes,
                     "exact_qp_match": exact_qp_match,
                     "manual_decompressed_diagonal_count": int(
@@ -525,9 +556,10 @@ class WPCCIPSConv2dPlan:
             sum(int(row["resident_payload_bytes"]) for row in rows)
         )
         metadata = int(sum(int(row["metadata_bytes"]) for row in rows))
+        recipes = int(sum(int(row.get("recipe_payload_bytes", 0)) for row in rows))
         full_including_bias = int(full_weights + self.bias_plaintext_payload_bytes)
         stored_including_bias = int(
-            resident_weights + metadata + self.bias_plaintext_payload_bytes
+            resident_weights + recipes + metadata + self.bias_plaintext_payload_bytes
         )
         return {
             "storage_mode": self.storage_mode,
@@ -540,6 +572,7 @@ class WPCCIPSConv2dPlan:
                 else 0
             ),
             "weight_metadata_bytes": metadata,
+            "unencoded_recipe_payload_bytes": recipes,
             "uncompressed_bias_q_payload_bytes": int(
                 self.bias_plaintext_payload_bytes
             ),
@@ -610,17 +643,18 @@ class WPCCIPSConv2dPlan:
         value: CipherTensor,
         *,
         compressed: bool | None = None,
-        record_sequence: bool = True,
+        record_sequence: bool | None = None,
     ) -> CipherTensor:
         if not self.compiled or self.scheme is None:
             raise RuntimeError("WPC CIPS plan must be compiled before evaluation")
         self._check_input_ciphertext(value)
+        if record_sequence is None:
+            record_sequence = self.record_sequence
         if compressed is None:
             compressed = self.storage_mode == WPC_STORAGE_COMPRESSED
         transform_ids = (
-            self.compressed_transform_ids
-            if bool(compressed)
-            else self.full_control_transform_ids
+            self.online_transform_ids if self.storage_mode == WPC_STORAGE_ONLINE
+            else (self.compressed_transform_ids if bool(compressed) else self.full_control_transform_ids)
         )
         if len(transform_ids) != int(self.case.transform_count):
             path = "compressed" if compressed else "full-control"
@@ -640,7 +674,11 @@ class WPCCIPSConv2dPlan:
                         backend.GetWPCCompressedGlobalStats(),
                         WPC_GLOBAL_STATS_FIELDS,
                     )
-                if bool(compressed):
+                if self.storage_mode == WPC_STORAGE_ONLINE:
+                    partial_id = int(backend.EvaluateWPCOnlineLinearTransform(
+                        int(transform_ids[key]), int(value.ids[input_group]),
+                    ))
+                elif bool(compressed):
                     partial_id = int(
                         backend.EvaluateWPCCompressedLinearTransform(
                             int(transform_ids[key]),
@@ -699,7 +737,7 @@ class WPCCIPSConv2dPlan:
         output._wpc_cips_packing_signature = self.output_packing_signature
         self.last_evaluation = {
             "path": (
-                "compressed"
+                "online_encode" if self.storage_mode == WPC_STORAGE_ONLINE else "compressed"
                 if compressed
                 else (
                     "full"
@@ -755,6 +793,14 @@ class WPCCIPSConv2dPlan:
             WPC_GLOBAL_STATS_FIELDS,
         )
 
+    def online_stats(self) -> dict[str, dict[str, Any]]:
+        if not self.compiled or self.scheme is None:
+            return {}
+        return {key: _decode_stats(
+            self.scheme.backend.GetWPCOnlineLinearTransformStats(transform_id),
+            WPC_ONLINE_STATS_FIELDS,
+        ) for key, transform_id in self.online_transform_ids.items()}
+
     def reset_global_materialization_peak(self) -> None:
         if not self.compiled or self.scheme is None:
             raise RuntimeError("WPC CIPS plan is not compiled")
@@ -770,8 +816,11 @@ class WPCCIPSConv2dPlan:
                 backend.DeleteLinearTransform(int(transform_id))
             for transform_id in list(self.full_control_transform_ids.values()):
                 backend.DeleteLinearTransform(int(transform_id))
+            for transform_id in list(self.online_transform_ids.values()):
+                backend.DeleteLinearTransform(int(transform_id))
         self.compressed_transform_ids = {}
         self.full_control_transform_ids = {}
+        self.online_transform_ids = {}
         if self.bias_plaintext is not None:
             self.bias_plaintext.release()
             self.bias_plaintext = None
@@ -786,5 +835,6 @@ __all__ = [
     "WPC_GLOBAL_STATS_FIELDS",
     "WPC_STORAGE_COMPRESSED",
     "WPC_STORAGE_FULL",
+    "WPC_STORAGE_ONLINE",
     "WPC_STORAGE_MODES",
 ]

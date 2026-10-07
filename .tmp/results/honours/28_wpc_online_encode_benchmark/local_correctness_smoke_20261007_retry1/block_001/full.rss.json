@@ -1,0 +1,8 @@
+{
+  "source": "unavailable",
+  "interval_ms": 5.0,
+  "total_sample_count": 0,
+  "sample_count_by_phase": {},
+  "peak_rss_by_phase": {},
+  "peak_hwm_by_phase": {}
+}

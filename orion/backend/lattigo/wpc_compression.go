@@ -363,6 +363,7 @@ func GenerateWPCCompressedLinearTransform(
 	if err := lintrans.Encode(scheme.Encoder, diagonals, transform); err != nil {
 		panic(err)
 	}
+	recordWPCBenchmarkEncode(1)
 
 	state := &wpcCompressedTransformState{
 		RingDegree:         scheme.Params.N(),

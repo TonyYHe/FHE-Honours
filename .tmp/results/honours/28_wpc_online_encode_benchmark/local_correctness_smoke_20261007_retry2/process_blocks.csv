@@ -1,0 +1,4 @@
+block,mode,position,forward_median_s,online_encode_median_s,online_prepare_median_s,online_encode_median_pct,online_materialization_median_pct,decompression_median_s,decompression_median_pct,logical_resident_bytes,pre_online_rss_bytes,sampled_online_peak_rss_bytes,max_abs_error_vs_clear,max_abs_delta_vs_isolated_full
+1,online_encode,1,0.930718916002661,0.260461787,0.028110373,27.985010567815227,31.00529655498857,0.0,0.0,2199296,703463424,704610304,6.110329409600435e-07,9.313225746154785e-09
+1,full,2,0.6576826660020743,0.0,0.0,0.0,0.0,0.0,0.0,422445056,1153138688,1154220032,6.122477132324e-07,0.0
+1,compressed,3,0.7186478750081733,0.0,0.0,0.0,0.0,0.043786661,6.092922907411644,32635904,765231104,768802816,6.131015204864643e-07,1.1175870895385742e-08

@@ -1,0 +1,623 @@
+{
+  "acceptance": {
+    "all_blocks_independently_validated": true,
+    "balanced_order_or_explicit_smoke": true,
+    "checkpoint_and_features_consistent": true,
+    "valid": true
+  },
+  "blocks": [
+    {
+      "block_index": 1,
+      "checkpoint_sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 10,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "feature_std": 0.02,
+        "forward_runs": 1,
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 10,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "small_insecure_functional_test_not_secure_deployment",
+        "slots": 512,
+        "timed_lifecycle_tracing": false,
+        "warmup_runs": 0
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "online_encode",
+        "full",
+        "compressed"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.00515412499953527,
+          "bootstrap_median_s": 0.22399008300271817,
+          "decompression_median_pct": 6.546907712411081,
+          "decompression_median_s": 0.0450365,
+          "forward_median_s": 0.6879049160052091,
+          "logical_resident_bytes": 32635904,
+          "max_abs_delta_vs_isolated_full": 9.313225746154785e-09,
+          "max_abs_error_vs_clear": 6.121042667069088e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 775274496,
+          "sampled_online_peak_rss_bytes": 777830400
+        },
+        "full": {
+          "activation_median_s": 0.005678292000084184,
+          "bootstrap_median_s": 0.23117054199974518,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 0.6498212500009686,
+          "logical_resident_bytes": 422445056,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.111909001405014e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1161592832,
+          "sampled_online_peak_rss_bytes": 1162395648
+        },
+        "online_encode": {
+          "activation_median_s": 0.00519041701045353,
+          "bootstrap_median_s": 0.22319395899830852,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 0.9289719999942463,
+          "logical_resident_bytes": 2199296,
+          "max_abs_delta_vs_isolated_full": 1.1175870895385742e-08,
+          "max_abs_error_vs_clear": 6.127774140954334e-07,
+          "online_encode_median_pct": 28.07973049797148,
+          "online_encode_median_s": 0.260852834,
+          "online_materialization_median_pct": 30.569526422944808,
+          "online_prepare_median_s": 0.023129507,
+          "pre_online_rss_bytes": 721534976,
+          "sampled_online_peak_rss_bytes": 721616896
+        }
+      },
+      "shared_library_sha256": "31b7030a2f832bd41c9d101716ba98551b117557d11cd93265fb3dea49efa303",
+      "valid": true
+    }
+  ],
+  "checkpoint": {
+    "path": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+    "sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59"
+  },
+  "profile": "wpc_cips_three_way_online_encode_process_blocks",
+  "provenance": {
+    "implementation_sha256": {
+      "orion/backend/lattigo/bindings.py": "105018d96e85021baf316c7a466f88fa35210f523d2b98bdded81df1a5250783",
+      "orion/backend/lattigo/lineartransform.go": "cd3c907b2f6f51d7cc9b7553405bd087cb43c39bf9351293a3188b78145a5ec7",
+      "orion/backend/lattigo/scheme.go": "fc783eec73582add3d6a99b2b0f9d3a70ea1fde56c09adb15bfd36f6e2fc944e",
+      "orion/backend/lattigo/wpc_compression.go": "32266e97eed6e715256c101a505e5af3c66f69bfe41b7c9cd0c43bc976581394",
+      "orion/backend/lattigo/wpc_online_encode.go": "3532c492b45f26c403ef1d7d0bd3e3bca21ba50e3f1166e170edd29c17e101bd",
+      "orion/experimental/wpc_cips_layer.py": "977500fb6b24bf2d418df8af7a7c353dffc6cdd39ca4ce7a8c8a31a6decb143f",
+      "orion/experimental/wpc_cips_upsample.py": "9df5976c247ed7b9bc7e73653ae753ce2248df48e85b9af55b5664ac889ce0a2",
+      "orion/experimental/wpc_online_encode_benchmark.py": "b504d806583f6d6f5f5cb33f713b65d9e9162320ca65bfc2ad934b73768a1acd",
+      "tools/run_wpc_cips_trained_decoder.py": "fc55ddb2a14d90ed89f4fa58e45dc683d34dade65e9f33ba60c84a6446fff87e",
+      "tools/run_wpc_cips_trained_isolated_benchmark.py": "0c0e06894245cc378f5e9818e7fae2766acf3befe9cc00af81a78fdab6e13088",
+      "tools/run_wpc_cips_trained_isolated_worker.py": "fb29672748e290662aaf5f194b17b5af4da12875ec836978e7c67bec6920a1ec",
+      "tools/run_wpc_online_encode_benchmark.py": "48fd57f3d78382a95384d12ad9eb9f4e97ab5ad46c35f4df91077d28543525aa"
+    },
+    "repository_commit": "36387a93fd0cd828894fa2b1958687845582f5a7",
+    "repository_status": " M AGENTS.md\n M docs/wpc_cips_trained_isolated_benchmark.md\n M docs/wpc_orion_experiment_log.md\n M orion/backend/lattigo/bindings.py\n M orion/backend/lattigo/lineartransform.go\n M orion/backend/lattigo/scheme.go\n M orion/backend/lattigo/wpc_compression.go\n M orion/experimental/wpc_cips_downsample.py\n M orion/experimental/wpc_cips_layer.py\n M orion/experimental/wpc_cips_upsample.py\n M tools/run_wpc_cips_trained_isolated_worker.py\n?? .tmp/mpl_stage28/\n?? .tmp/results/honours/28_wpc_online_encode_benchmark/\n?? .tmp/results/honours/stage27_review.Ts4H0P/\n?? .tmp/results/honours/wpc_validation_server_run2_2026-10-06.tar.gz\n?? .tmp/results/honours/wpc_validation_server_run2_2026-10-06.tar.gz.sha256\n?? docs/wpc_online_encode_benchmark.md\n?? orion/backend/lattigo/wpc_online_encode.go\n?? orion/backend/lattigo/wpc_online_encode_test.go\n?? orion/experimental/wpc_online_encode_benchmark.py\n?? tests/test_wpc_online_encode_benchmark.py\n?? tests/test_wpc_online_encode_integration.py\n?? tools/run_wpc_online_encode_benchmark.py\n?? tools/run_wpc_online_encode_server.sh\n",
+    "worker_artifacts": [
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/block_001/online_encode.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/block_001/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_001/online_encode.worker.json",
+        "rss_path": "block_001/online_encode.rss.json",
+        "rss_sha256": "4e254d216ed571cc92704c9eae6498cf0e6dbfb9731616ea472281db7a94c1e3",
+        "sha256": "91bcfc259ecd6d819f06534f841d8f2751585661b90666a1abda45080e141aa9",
+        "size_bytes": 72207
+      },
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/block_001/full.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/block_001/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_001/full.worker.json",
+        "rss_path": "block_001/full.rss.json",
+        "rss_sha256": "c279c91935c1d40dbc3726cfc79b269402ff338a13f0e1fa1e77fad37b6d0513",
+        "sha256": "b2906bcde710d2e98c91705577feabba840c0dc2ab4861e1397bfd761de41bcf",
+        "size_bytes": 71983
+      },
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/block_001/compressed.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/28_wpc_online_encode_benchmark/local_correctness_final_20261007_v2/block_001/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "10",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002"
+        ],
+        "path": "block_001/compressed.worker.json",
+        "rss_path": "block_001/compressed.rss.json",
+        "rss_sha256": "34723caa96bb84d43105f50e27ac044ab879bb725a61e7b8905b6130f4809506",
+        "sha256": "f90a42cd92e0187f769f6e880bc9241cd27a5f7e73641dcbaba6d9f03d88964a",
+        "size_bytes": 135046
+      }
+    ]
+  },
+  "schema_version": 1,
+  "smoke": true,
+  "status": "ok",
+  "summary": {
+    "bootstrap_resamples": 0,
+    "bootstrap_seed": 0,
+    "by_mode": {
+      "compressed": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.00515412499953527,
+          "median": 0.00515412499953527,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.22399008300271817,
+          "median": 0.22399008300271817,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.546907712411081,
+          "median": 6.546907712411081,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0450365,
+          "median": 0.0450365,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.6879049160052091,
+          "median": 0.6879049160052091,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 32635904.0,
+          "median": 32635904.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 9.313225746154785e-09,
+          "median": 9.313225746154785e-09,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.121042667069088e-07,
+          "median": 6.121042667069088e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 775274496.0,
+          "median": 775274496.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 777830400.0,
+          "median": 777830400.0,
+          "stdev": null
+        }
+      },
+      "full": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.005678292000084184,
+          "median": 0.005678292000084184,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.23117054199974518,
+          "median": 0.23117054199974518,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.6498212500009686,
+          "median": 0.6498212500009686,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 422445056.0,
+          "median": 422445056.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.111909001405014e-07,
+          "median": 6.111909001405014e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1161592832.0,
+          "median": 1161592832.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1162395648.0,
+          "median": 1162395648.0,
+          "stdev": null
+        }
+      },
+      "online_encode": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.00519041701045353,
+          "median": 0.00519041701045353,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.22319395899830852,
+          "median": 0.22319395899830852,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.9289719999942463,
+          "median": 0.9289719999942463,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 2199296.0,
+          "median": 2199296.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.1175870895385742e-08,
+          "median": 1.1175870895385742e-08,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.127774140954334e-07,
+          "median": 6.127774140954334e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 28.07973049797148,
+          "median": 28.07973049797148,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.260852834,
+          "median": 0.260852834,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 30.569526422944808,
+          "median": 30.569526422944808,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.023129507,
+          "median": 0.023129507,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 721534976.0,
+          "median": 721534976.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 721616896.0,
+          "median": 721616896.0,
+          "stdev": null
+        }
+      }
+    },
+    "independent_block_count": 1,
+    "order_balanced": false,
+    "paired_ratios": {
+      "compressed_over_full_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 1.0586063721433914,
+        "median": 1.0586063721433914,
+        "stdev": null
+      },
+      "compressed_over_online_encode_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.7405012379377094,
+        "median": 0.7405012379377094,
+        "stdev": null
+      },
+      "full_over_online_encode_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.6995057439890474,
+        "median": 0.6995057439890474,
+        "stdev": null
+      }
+    },
+    "performance_claims_enabled": false,
+    "scope": "same-CIPS trained decoder with synthetic features and insecure functional CKKS parameters; not Orion-versus-WPC layout or whole-network comparison",
+    "uncertainty_method": "correctness-only smoke block; no uncertainty estimation or performance claim"
+  }
+}

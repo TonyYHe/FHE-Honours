@@ -1,5 +1,10 @@
 # Isolated fine-tuned WPC decoder benchmark
 
+For the subsequent three-way online-Encode comparison, balanced fresh-process
+trials, and timed-tracing repair, see
+[Stage 28](wpc_online_encode_benchmark.md). Historical Stage-25 evidence is
+preserved; it compares two **offline-preencoded** CIPS storage policies.
+
 ## Purpose
 
 This stage measures the resource trade-off of the exact fine-tuned decoder
