@@ -52,11 +52,17 @@ are unchanged:
   the worker log and `.rss.json`, even when no worker result was produced. These
   are watchdogs, **not an OS-enforced allocation ceiling or a memory reservation**.
   Missing or lost RSS access fails closed rather than silently disabling the guard.
-  A missing final RSS sample triggers at most a **100 ms bounded exit check**:
-  an exited worker retains its real exit code; a worker still alive without
-  readable RSS is stopped and rejected. `.rss.json` records unavailable samples,
-  whether exit was confirmed after one, and the exit-check timeout. Missing
-  samples are never inserted as zero-byte observations or counted as valid samples.
+  If the leader's RSS becomes unreadable on Linux, the sampler probes
+  `/proc/<pid>/task/<tid>/stat` and `status`. A surviving thread's RSS measures
+  the shared address space; observations are combined by **maximum, not sum**.
+  Only when all examined threads have `PF_EXITING` or a terminal state, with no
+  unreadable or newly discovered threads, may it allow **up to 5 seconds to
+  reap the process**, capped by the remaining worker deadline. Otherwise the
+  original 100 ms exit check applies and persistent monitoring loss is rejected.
+  The actual exit code and independent worker validation are still required.
+  `.rss.json` records sample counts by source, unavailable samples, the last
+  thread-state probe, and both wait limits. Missing samples are not zero-byte
+  observations and do not count as valid samples.
 - `tools/run_wpc_decoder_feasibility.py` runs three fresh processes, zero warmups,
   and one measured diagnostic forward per mode. It independently validates
   outputs, operation counts, lifecycle release, exact compressed Q/P, and
@@ -149,8 +155,8 @@ full nor compressed treatment ran, so **server_run1 is incomplete evidence**,
 not an accepted three-way feasibility result. These values come from the
 supplied diagnostic; its raw server artifacts have not been inspected locally.
 
-The sampler now checks for an exit for up to 100 ms before treating RSS loss as
-a live-worker monitoring failure. Regression tests cover successful and failed
+The first repair checked for an exit for up to 100 ms before treating RSS loss
+as a live-worker monitoring failure. Regression tests covered successful and failed
 exits observed through both `poll()` and `wait()`, actual monitoring loss while
 the worker remains alive, and the existing RSS/time budget failures. The memory
 budget, time budget, FHE tolerance and other acceptance gates are unchanged.
@@ -161,11 +167,49 @@ three small real-FHE storage-policy integration cases. Python compilation,
 server-wrapper shell syntax, and diff whitespace checks also passed. No remote
 job or larger local profiling run was launched for this repair.
 
-After committing/pushing this repair, pull it on the server and rerun the same
-gate under the fresh name `server_run2`. Keep `server_run1` and all its sibling
-launch/preflight/exit-status files intact. The wrapper rebuilds and tests before
-starting all three workers; it refuses existing evidence. This remains a
-diagnostic correctness/resource gate, not a repeated performance experiment.
+That repair was run as `server_run2`; its result below supersedes the earlier
+retry instructions. Keep both failed runs and their sibling files intact.
+
+### Server-run2: Linux thread-aware shutdown handling (2026-10-07)
+
+The supplied diagnostic records commit
+`d107156e93f06313770ba039f7b6c24c543826d2`. The online worker again had status
+`ok`, no failed gates, and exit code **0**, but the parent rejected it after its
+single unavailable RSS observation. There were 22,126 valid RSS observations,
+elapsed time `121.57028893800452 s`, and sampled peak `2186.61328125 MiB`.
+The recorded 100 ms guard confirms the first repair was present; that wait was
+insufficient. No full or compressed worker result was produced. These are
+user-supplied diagnostic values, not an independent raw-artifact audit.
+
+Shutdown ordering is the likely explanation, but the old record does not
+include thread states and cannot prove exactly which kernel cleanup stage was
+observed. Linux sets `PF_EXITING` before releasing the address space and does
+not reap a group leader while subthreads remain. RSS is emitted only while a
+task has an address space. See the primary
+[exit/reaping implementation](https://github.com/torvalds/linux/blob/master/kernel/exit.c),
+[proc status/stat implementation](https://github.com/torvalds/linux/blob/master/fs/proc/array.c),
+and [PF_EXITING definition](https://github.com/torvalds/linux/blob/master/include/linux/sched.h).
+
+The second repair uses the thread-aware logic described above, not a blanket
+increase in tolerance for unobservable live computation. A dead leader does
+not waive the guard on live helper threads. Malformed/unreadable exit evidence
+does not authorize the longer wait; a stuck shutdown or overall deadline
+violation still fails. Valid thread RSS is checked against the same budget.
+An exit code of 0 alone, a completed phase marker, or an `ok` worker JSON is
+not sufficient to bypass these checks. The error logger now repeats the concise
+failure headline **after** verbose worker context, making `tail -n 30` useful.
+
+Local verification: **147 tests passed, 1 Linux-only test skipped** on macOS.
+Tests reproduce the previous successful-exit false rejection before the repair,
+check delayed zero/nonzero/signalled exits, shared-RSS recovery without double
+counting, live/unreadable/new-thread rejection, RSS/reap/deadline limits,
+historical comparison/synthesis compatibility, and three small real-FHE
+integration cases. The Linux-only test reads actual current-process procfs and
+will run in the server wrapper's preflight. No server profiling is run locally.
+
+After committing/pushing this repair, pull it on the server and rerun all three
+treatments under fresh `server_run3`. Keep `server_run1` and `server_run2`
+unchanged. This remains a diagnostic gate, not an accepted performance result.
 
 ## Outputs and follow-on work
 

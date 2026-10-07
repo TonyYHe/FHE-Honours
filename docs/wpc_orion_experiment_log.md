@@ -1021,3 +1021,32 @@ unmeasured.
 - Repair verification: 127 tests passed, including the exit-race/watchdog cases,
   comparison/synthesis compatibility and three small real-FHE integration cases.
   Python compilation, wrapper shell syntax and diff whitespace checks passed.
+
+### 2026-10-07 — Stage 29 Linux thread-aware shutdown repair
+
+- The supplied `server_run2` diagnostic records commit
+  `d107156e93f06313770ba039f7b6c24c543826d2`, online worker status `ok`, all
+  worker gates passed, exit code 0, 22,126 valid RSS observations, one missing
+  observation, peak `2186.61328125 MiB`, elapsed `121.57028893800452 s`, and the
+  first repair's 100 ms wait. The controller still failed; the full and
+  compressed workers were not run. The first repair was insufficient. Old
+  evidence has no thread-state snapshot, so exact kernel shutdown state is not
+  proven. Raw server artifacts have not been independently inspected locally.
+- Added Linux task-stat exit evidence and task-status shared-RSS recovery for a
+  disappearing leader address space. A dead leader alone does not authorize
+  relaxed monitoring. The maximum observed shared RSS is used, not a sum of
+  thread RSS values. All active observed tasks must have entered kernel exit,
+  with complete evidence and no new/unexamined threads, before a bounded
+  five-second reap wait is permitted; the overall deadline remains binding.
+- Retained fail-closed handling of live/unobservable computation, actual exit
+  codes, memory/time limits, exact Q/P and FHE correctness gates. A completed
+  phase or successful result JSON does not override a watchdog failure.
+  New RSS metadata records probe evidence and per-source sample counts.
+- Reproduced the successful-exit false rejection before repair; final targeted
+  suite passed 147 tests, with one actual Linux-procfs test skipped on macOS.
+  Deterministic procfs fixtures cover exit flags/states, live helper threads,
+  malformed/permission-denied evidence and new threads. The server preflight
+  includes the actual Linux test. No server or larger local profiling was run.
+- Failure logging now ends with a concise headline after verbose context.
+  Both old failed runs remain unchanged; retry all three treatments under fresh
+  `server_run3` after syncing. See `docs/wpc_decoder_scale_feasibility.md`.

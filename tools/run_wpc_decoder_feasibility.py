@@ -88,10 +88,18 @@ def main() -> int:
     return 0 if acceptance["valid"] else 1
 
 
+def _report_failure(error: Exception) -> None:
+    message = str(error)
+    print(f"DECODER FEASIBILITY FAILED: {message}", file=sys.stderr)
+    # Worker context can be a long JSON tail; keep the cause visible to tail -n.
+    headline = message.splitlines()[0] if message else type(error).__name__
+    print(f"FAILURE SUMMARY: {headline}", file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
     try:
         result = main()
     except (ValueError, RuntimeError, KeyError) as error:
-        print(f"DECODER FEASIBILITY FAILED: {error}", file=sys.stderr)
+        _report_failure(error)
         result = 1
     raise SystemExit(result)

@@ -38,6 +38,87 @@ DEFAULT_OUT_DIR = (
 )
 WORKER = REPO_ROOT / "tools/run_wpc_cips_trained_isolated_worker.py"
 WORKER_EXIT_CONFIRMATION_S = 0.1
+WORKER_EXITING_REAP_S = 5.0
+LINUX_PF_EXITING = 0x00000004
+
+
+def _probe_linux_worker_shutdown(
+    pid: int, *, proc_root: Path | None = None,
+) -> tuple[dict[str, int] | None, dict[str, Any] | None]:
+    """Recover shared RSS or prove all observed threads have entered kernel exit.
+
+    A dead leader alone does not prove a multithreaded worker has exited. Linux
+    can clear task->mm before the task becomes reapable (kernel/exit.c), while
+    PF_EXITING is exposed in field 9 of each thread's stat (fs/proc/array.c).
+    Explicit proc_root supports deterministic fixtures without a Linux host.
+    """
+    if proc_root is None:
+        if sys.platform != "linux":
+            return None, None
+        proc_root = Path("/proc")
+    task_root = proc_root / str(int(pid)) / "task"
+    probe: dict[str, Any] = {"source": "linux_proc_pid_task_stat", "threads": [],
+                             "errors": [], "all_threads_exiting": False}
+    try:
+        initial = {int(path.name) for path in task_root.iterdir() if path.name.isdecimal()}
+    except OSError as error:
+        probe["errors"].append(type(error).__name__)
+        return None, probe
+    disappeared: set[int] = set()
+    samples = []
+    for tid in sorted(initial):
+        directory = task_root / str(tid)
+        try:
+            text = (directory / "stat").read_text(encoding="utf-8")
+            # comm can contain spaces and parentheses; never split the whole line.
+            fields = text.rsplit(")", 1)[1].split()
+            if int(text.split(" ", 1)[0]) != tid or fields[0] not in set("RSDTtZXxKWPI"):
+                raise ValueError("invalid thread identity/state")
+            state, flags = fields[0], int(fields[6])
+            if not 0 <= flags <= 0xFFFFFFFF:
+                raise ValueError("invalid thread flags")
+        except FileNotFoundError:
+            disappeared.add(tid)
+            continue
+        except (OSError, ValueError, IndexError) as error:
+            probe["errors"].append(f"tid={tid} stat: {type(error).__name__}")
+            continue
+        probe["threads"].append({"tid": tid, "state": state, "flags": flags,
+            "exiting": bool(flags & LINUX_PF_EXITING) or state in ("Z", "X", "x")})
+        try:
+            values = {}
+            for line in (directory / "status").read_text(encoding="utf-8").splitlines():
+                if line.startswith(("VmRSS:", "VmHWM:")):
+                    name, value, unit = line.split()
+                    if unit != "kB" or int(value) < 0:
+                        raise ValueError("invalid memory observation")
+                    values["rss_bytes" if name == "VmRSS:" else "hwm_bytes"] = int(value) * 1024
+            if "rss_bytes" in values:
+                samples.append(values)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            probe["errors"].append(f"tid={tid} status: {type(error).__name__}")
+    try:
+        remaining = {int(path.name) for path in task_root.iterdir() if path.name.isdecimal()}
+    except FileNotFoundError:
+        remaining = set()
+    except OSError as error:
+        probe["errors"].append(type(error).__name__)
+        remaining = initial
+    probe["new_thread_ids"] = sorted(remaining - initial)
+    probe["unreadable_remaining_thread_ids"] = sorted(disappeared & remaining)
+    probe["all_threads_exiting"] = bool(probe["threads"]) and not (
+        probe["errors"] or probe["new_thread_ids"] or probe["unreadable_remaining_thread_ids"]
+    ) and all(row["exiting"] for row in probe["threads"])
+    if not samples:
+        return None, probe
+    # Thread RSS is for the shared address space: take a maximum, never a sum.
+    sample = {"rss_bytes": max(row["rss_bytes"] for row in samples)}
+    hwm = [row["hwm_bytes"] for row in samples if "hwm_bytes" in row]
+    if hwm:
+        sample["hwm_bytes"] = max(hwm)
+    return sample, probe
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -137,6 +218,9 @@ def _sample_worker(
     sample_count: dict[str, int] = {}
     total_samples = 0
     unavailable_samples = 0
+    shutdown_probe_count = 0
+    last_shutdown_probe = None
+    sample_count_by_source: dict[str, int] = {}
     exit_confirmed_after_unavailable_sample = False
     sampling_source = "unavailable"
     started = time.monotonic()
@@ -154,9 +238,18 @@ def _sample_worker(
             while process.poll() is None:
                 phase = _read_phase(phase_path)
                 sample, source = _read_process_memory(process.pid)
+                shutdown_probe = None
+                if sample is None and rss_limit:
+                    sample, shutdown_probe = _probe_linux_worker_shutdown(process.pid)
+                    if shutdown_probe is not None:
+                        shutdown_probe_count += 1
+                        last_shutdown_probe = dict(shutdown_probe, phase=phase)
+                    if sample is not None:
+                        source = "linux_proc_pid_task_status"
                 if sample is not None:
                     sampling_source = source
                     total_samples += 1
+                    sample_count_by_source[source] = sample_count_by_source.get(source, 0) + 1
                     sample_count[phase] = int(sample_count.get(phase, 0) + 1)
                     peak_rss[phase] = max(
                         int(peak_rss.get(phase, 0)), int(sample["rss_bytes"]),
@@ -168,16 +261,23 @@ def _sample_worker(
                 else:
                     unavailable_samples += 1
                     if rss_limit:
-                        # Linux can remove VmRSS during exit before waitpid/poll
-                        # exposes the exit code. Confirm exit with a bounded
-                        # wait; a still-live, unobservable worker must fail closed.
                         if process.poll() is not None:
                             exit_confirmed_after_unavailable_sample = True
                             break
+                        exiting = bool(shutdown_probe and shutdown_probe["all_threads_exiting"])
+                        exit_wait = WORKER_EXITING_REAP_S if exiting else WORKER_EXIT_CONFIRMATION_S
+                        if timeout:
+                            remaining = started + timeout - time.monotonic()
+                            exit_wait = min(exit_wait, max(0.0, remaining))
                         try:
-                            process.wait(timeout=WORKER_EXIT_CONFIRMATION_S)
+                            process.wait(timeout=exit_wait)
                         except subprocess.TimeoutExpired:
-                            termination_reason = "RSS watchdog lost access to the live worker; refusing an unguarded run"
+                            if timeout and time.monotonic() - started >= timeout:
+                                termination_reason = f"worker exceeded {timeout:g} seconds in phase {phase}"
+                            elif exiting:
+                                termination_reason = "worker did not finish kernel-confirmed shutdown within the reap timeout"
+                            else:
+                                termination_reason = "RSS watchdog lost access to the live worker; refusing an unguarded run"
                         else:
                             exit_confirmed_after_unavailable_sample = True
                             break
@@ -196,11 +296,14 @@ def _sample_worker(
         "total_sample_count": int(total_samples), "sample_count_by_phase": sample_count,
         "unavailable_sample_count": int(unavailable_samples),
         "exit_confirmed_after_unavailable_sample": exit_confirmed_after_unavailable_sample,
+        "sample_count_by_source": sample_count_by_source,
+        "shutdown_probe_count": shutdown_probe_count, "last_shutdown_probe": last_shutdown_probe,
         "peak_rss_by_phase": peak_rss, "peak_hwm_by_phase": peak_hwm,
         "return_code": return_code, "termination_reason": termination_reason,
         "elapsed_s": time.monotonic() - started,
         "guards": {"max_worker_rss_mib": rss_limit, "worker_timeout_s": timeout,
                    "exit_confirmation_timeout_s": WORKER_EXIT_CONFIRMATION_S,
+                   "kernel_exiting_reap_timeout_s": WORKER_EXITING_REAP_S,
                    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"},
     }
     # Preserve failure evidence even when no worker JSON was produced.

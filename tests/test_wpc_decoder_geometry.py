@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -267,6 +269,7 @@ def test_watchdog_distinguishes_process_exit_from_lost_rss(
     monkeypatch.setattr(module.subprocess, "Popen", start)
     monkeypatch.setattr(module, "_read_process_memory", read_memory)
     monkeypatch.setattr(module, "_read_phase", lambda path: "measured")
+    monkeypatch.setattr(module, "_probe_linux_worker_shutdown", lambda pid: (None, None), raising=False)
     monkeypatch.setattr(module, "_stop_worker", stop)
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
     if exit_code == 0:
@@ -316,7 +319,12 @@ def test_watchdog_still_stops_live_worker_when_rss_access_is_lost(monkeypatch, t
             return self.returncode
 
     process = Process()
-    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **kw: process)
+    def start(*a, **kw):
+        (tmp_path / "full.worker.json").write_text(json.dumps({"status": "ok"}))
+        (tmp_path / "full.phase.json").write_text(json.dumps({"phase": "complete"}))
+        return process
+    monkeypatch.setattr(module.subprocess, "Popen", start)
+    monkeypatch.setattr(module, "_probe_linux_worker_shutdown", lambda pid: (None, None), raising=False)
     monkeypatch.setattr(module, "_read_process_memory", lambda pid:
         ({"rss_bytes": 512 * 1024}, "test") if pid != process.pid else (None, "unavailable"))
     monkeypatch.setattr(module, "_stop_worker", lambda p: setattr(p, "returncode", -15))
@@ -330,3 +338,244 @@ def test_watchdog_still_stops_live_worker_when_rss_access_is_lost(monkeypatch, t
     assert sampling["peak_rss_by_phase"] == {}
     assert sampling["unavailable_sample_count"] == 1
     assert sampling["exit_confirmed_after_unavailable_sample"] is False
+
+
+@pytest.mark.parametrize("exit_code", [0, 2, -9])
+def test_watchdog_waits_for_kernel_confirmed_exit_beyond_100ms(monkeypatch, tmp_path, exit_code):
+    from tools import run_wpc_cips_trained_isolated_benchmark as module
+    args = module._parser().parse_args([])
+    args.logn, args.max_worker_rss_mib = 10, 1
+    payload = {"status": "ok" if exit_code == 0 else "invalid"}
+    probe = {"all_threads_exiting": True, "threads": [
+        {"tid": 100, "state": "R", "flags": 4, "exiting": True}], "errors": []}
+
+    class Process:
+        pid = 100
+        returncode = None
+        bounded_waits = []
+        stops = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                self.bounded_waits.append(timeout)
+                if timeout <= 0.1:
+                    raise module.subprocess.TimeoutExpired("worker", timeout)
+                self.returncode = exit_code
+            return self.returncode
+
+    process = Process()
+    reads = 0
+
+    def start(*a, **kw):
+        (tmp_path / "full.worker.json").write_text(json.dumps(payload))
+        return process
+
+    def read_memory(pid):
+        nonlocal reads
+        if pid != process.pid:
+            return {"rss_bytes": 512 * 1024}, "test"
+        reads += 1
+        return ({"rss_bytes": 512 * 1024}, "test") if reads == 1 else (None, "unavailable")
+
+    def stop(p):
+        if p.poll() is None:
+            p.stops += 1
+            p.returncode = exit_code
+
+    monkeypatch.setattr(module.subprocess, "Popen", start)
+    monkeypatch.setattr(module, "_read_process_memory", read_memory)
+    monkeypatch.setattr(module, "_probe_linux_worker_shutdown", lambda pid: (None, probe), raising=False)
+    monkeypatch.setattr(module, "_stop_worker", stop)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    if exit_code == 0:
+        result, sampling, _ = module._sample_worker(
+            mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args,
+        )
+        assert result == payload
+    else:
+        with pytest.raises(RuntimeError, match=f"worker exited with {exit_code}; see worker log"):
+            module._sample_worker(mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args)
+    sampling = json.loads((tmp_path / "full.rss.json").read_text())
+    assert sampling["return_code"] == exit_code
+    assert sampling["termination_reason"] is None
+    assert sampling["exit_confirmed_after_unavailable_sample"] is True
+    assert process.bounded_waits == [5.0]
+    assert process.stops == 0
+    assert sampling["shutdown_probe_count"] == 1
+    assert sampling["last_shutdown_probe"]["all_threads_exiting"] is True
+    assert sampling["sample_count_by_source"] == {"test": 1}
+
+
+def linux_task(proc_root, tid, *, state="R", flags=0, rss=None, hwm=None):
+    directory = proc_root / "100" / "task" / str(tid)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "stat").write_text(
+        f"{tid} (go ) thread name) {state} 1 2 3 4 5 {flags} 0 0\n")
+    status = f"State:\t{state}\n"
+    if rss is not None:
+        status += f"VmRSS:\t{rss} kB\n"
+    if hwm is not None:
+        status += f"VmHWM:\t{hwm} kB\n"
+    (directory / "status").write_text(status)
+    return directory
+
+
+@pytest.mark.parametrize("state,flags", [("R", 4), ("S", 4), ("Z", 0), ("X", 0)])
+def test_linux_shutdown_probe_confirms_all_threads_not_just_leader(tmp_path, state, flags):
+    from tools.run_wpc_cips_trained_isolated_benchmark import _probe_linux_worker_shutdown
+    linux_task(tmp_path, 100, state="Z", flags=4)
+    linux_task(tmp_path, 101, state=state, flags=flags)
+    sample, probe = _probe_linux_worker_shutdown(100, proc_root=tmp_path)
+    assert sample is None
+    assert probe["all_threads_exiting"] is True
+    assert probe["errors"] == []
+    assert len(probe["threads"]) == 2
+
+
+def test_linux_shutdown_probe_recovers_shared_rss_without_summing_threads(tmp_path):
+    from tools.run_wpc_cips_trained_isolated_benchmark import _probe_linux_worker_shutdown
+    linux_task(tmp_path, 100, state="Z", flags=4)
+    linux_task(tmp_path, 101, rss=512, hwm=768)
+    linux_task(tmp_path, 102, rss=500, hwm=700)
+    sample, probe = _probe_linux_worker_shutdown(100, proc_root=tmp_path)
+    assert sample == {"rss_bytes": 512 * 1024, "hwm_bytes": 768 * 1024}
+    assert probe["all_threads_exiting"] is False
+
+
+@pytest.mark.parametrize("problem", ["live_thread", "bad_flags", "bad_state", "truncated", "missing", "permission"])
+def test_linux_shutdown_probe_does_not_promote_unknown_or_live_threads(monkeypatch, tmp_path, problem):
+    from tools.run_wpc_cips_trained_isolated_benchmark import _probe_linux_worker_shutdown
+    linux_task(tmp_path, 100, state="Z", flags=4)
+    thread = linux_task(tmp_path, 101, flags=4)
+    if problem == "live_thread":
+        linux_task(tmp_path, 101, flags=0)
+    elif problem == "bad_flags":
+        linux_task(tmp_path, 101, flags="not-an-integer")
+    elif problem == "bad_state":
+        linux_task(tmp_path, 101, state="?", flags=4)
+    elif problem == "truncated":
+        (thread / "stat").write_text("101 (bad) R\n")
+    else:
+        original = Path.read_text
+        def unreadable(path, *args, **kwargs):
+            if path == thread / "stat":
+                raise FileNotFoundError() if problem == "missing" else PermissionError()
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "read_text", unreadable)
+    sample, probe = _probe_linux_worker_shutdown(100, proc_root=tmp_path)
+    assert sample is None
+    assert probe["all_threads_exiting"] is False
+
+
+def test_linux_shutdown_probe_rejects_new_unexamined_thread(monkeypatch, tmp_path):
+    from tools.run_wpc_cips_trained_isolated_benchmark import _probe_linux_worker_shutdown
+    leader = linux_task(tmp_path, 100, state="Z", flags=4)
+    task_root = leader.parent
+    original = Path.iterdir
+    scans = 0
+    def changing_inventory(path):
+        nonlocal scans
+        if path == task_root:
+            scans += 1
+            if scans == 2:
+                linux_task(tmp_path, 101, flags=0)
+        return original(path)
+    monkeypatch.setattr(Path, "iterdir", changing_inventory)
+    sample, probe = _probe_linux_worker_shutdown(100, proc_root=tmp_path)
+    assert sample is None
+    assert probe["new_thread_ids"] == [101]
+    assert probe["all_threads_exiting"] is False
+
+
+@pytest.mark.parametrize("guard", ["rss", "reap", "deadline"])
+def test_shutdown_handling_preserves_resource_guards(monkeypatch, tmp_path, guard):
+    from tools import run_wpc_cips_trained_isolated_benchmark as module
+    args = module._parser().parse_args([])
+    args.logn, args.max_worker_rss_mib = 10, 1
+    args.worker_timeout_s = 0.2 if guard == "deadline" else 0
+    probe = {"all_threads_exiting": guard != "rss", "threads": [], "errors": []}
+
+    class Process:
+        pid = 100
+        returncode = None
+        bounded_waits = []
+        def poll(self): return self.returncode
+        def wait(self, timeout=None):
+            if timeout is not None:
+                self.bounded_waits.append(timeout)
+                raise module.subprocess.TimeoutExpired("worker", timeout)
+            return self.returncode
+    process = Process()
+    fallback = {"rss_bytes": 2 * 2**20} if guard == "rss" else None
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(module, "_stop_worker", lambda p: setattr(p, "returncode", -15))
+    monkeypatch.setattr(module, "_read_process_memory", lambda pid:
+        ({"rss_bytes": 512 * 1024}, "test") if pid != process.pid else (None, "unavailable"))
+    monkeypatch.setattr(module, "_probe_linux_worker_shutdown", lambda pid: (fallback, probe))
+    ticks = iter([0, 0.05, 0.25, 0.3, 0.4, 0.5])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
+    reason = {"rss": "sampled RSS exceeded", "reap": "kernel-confirmed shutdown", "deadline": "worker exceeded"}[guard]
+    with pytest.raises(RuntimeError, match=reason):
+        module._sample_worker(mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args)
+    sampling = json.loads((tmp_path / "full.rss.json").read_text())
+    assert sampling["return_code"] == -15
+    if guard == "rss":
+        assert sampling["total_sample_count"] == 1
+        assert sampling["sample_count_by_source"] == {"linux_proc_pid_task_status": 1}
+    elif guard == "reap":
+        assert process.bounded_waits == [5.0]
+    else:
+        assert process.bounded_waits == [pytest.approx(0.15)]
+
+
+def test_live_thread_rss_fallback_is_a_valid_observation_not_shutdown(monkeypatch, tmp_path):
+    from tools import run_wpc_cips_trained_isolated_benchmark as module
+    args = module._parser().parse_args([])
+    args.logn, args.max_worker_rss_mib = 10, 1
+    probe = {"all_threads_exiting": False, "threads": [], "errors": []}
+    class Process:
+        pid = 100
+        polls = 0
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+        def wait(self, timeout=None):
+            assert timeout is None
+            return 0
+    process = Process()
+    def start(*a, **kw):
+        (tmp_path / "full.worker.json").write_text(json.dumps({"status": "ok"}))
+        return process
+    monkeypatch.setattr(module.subprocess, "Popen", start)
+    monkeypatch.setattr(module, "_read_process_memory", lambda pid:
+        ({"rss_bytes": 512 * 1024}, "test") if pid != process.pid else (None, "unavailable"))
+    monkeypatch.setattr(module, "_probe_linux_worker_shutdown", lambda pid: ({"rss_bytes": 512 * 1024}, probe))
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    _, sampling, _ = module._sample_worker(mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args)
+    assert sampling["termination_reason"] is None
+    assert sampling["total_sample_count"] == 1
+    assert sampling["source"] == "linux_proc_pid_task_status"
+    assert sampling["unavailable_sample_count"] == 0
+    assert sampling["last_shutdown_probe"]["all_threads_exiting"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires actual Linux procfs")
+def test_linux_shutdown_probe_reads_actual_worker_threads():
+    from tools.run_wpc_cips_trained_isolated_benchmark import _probe_linux_worker_shutdown
+    sample, probe = _probe_linux_worker_shutdown(os.getpid())
+    assert sample["rss_bytes"] > 0
+    assert probe["all_threads_exiting"] is False
+    assert any(row["tid"] == os.getpid() for row in probe["threads"])
+
+
+def test_feasibility_failure_headline_is_last_even_with_large_worker_tail(capsys):
+    from tools.run_wpc_decoder_feasibility import _report_failure
+    headline = "online_encode worker exited with 0; monitoring failure"
+    context = "\n".join(f"storage field {i}" for i in range(120))
+    _report_failure(RuntimeError(headline + "\n" + context))
+    text = capsys.readouterr().err
+    assert "storage field 0" in text
+    assert text.splitlines()[-1] == "FAILURE SUMMARY: " + headline
