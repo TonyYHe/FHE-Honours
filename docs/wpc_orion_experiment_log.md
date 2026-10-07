@@ -1000,3 +1000,24 @@ unmeasured.
 - Final verification: 250 targeted Python tests and `go test ./... -count=3`
   passed; the final level-9 smoke's raw/config/source hashes and recomputed
   summaries passed an independent artifact audit. No remote job was launched.
+
+### 2026-10-07 — Stage 29 RSS-watchdog shutdown-race repair
+
+- The supplied `server_run1` diagnostic showed an `online_encode` worker exit
+  code 0, status `ok`, all worker gates passed, maximum FHE error
+  `6.151518958802393e-7`, and sampled peak RSS `2184.7890625 MiB` (budget 8192).
+  The controller failed because the last RSS read became unavailable before
+  process exit was visible. Full/compressed workers never ran; the gate remains
+  incomplete. Raw server files have not been independently reviewed locally.
+- Reproduced the exit race in deterministic regression tests before changing
+  the sampler. Added a bounded 100 ms exit confirmation after missing RSS;
+  genuine live-worker monitoring loss still stops the process and fails closed.
+  Nonzero exits, RSS limits, time limits and correctness gates remain enforced.
+- Recorded unavailable sample counts and exit confirmation in `.rss.json`;
+  missing observations do not contribute to sample counts or memory peaks.
+  Existing server evidence and checkpoints are not rewritten or reused as an
+  accepted result. Retry all three treatments under fresh `server_run2` after
+  syncing the repair. No server job is launched from the local workspace.
+- Repair verification: 127 tests passed, including the exit-race/watchdog cases,
+  comparison/synthesis compatibility and three small real-FHE integration cases.
+  Python compilation, wrapper shell syntax and diff whitespace checks passed.

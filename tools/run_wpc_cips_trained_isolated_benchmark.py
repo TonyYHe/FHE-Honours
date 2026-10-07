@@ -37,6 +37,7 @@ DEFAULT_OUT_DIR = (
     / ".tmp/results/honours/25_wpc_finetuned_decoder_isolated_benchmark"
 )
 WORKER = REPO_ROOT / "tools/run_wpc_cips_trained_isolated_worker.py"
+WORKER_EXIT_CONFIRMATION_S = 0.1
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -135,6 +136,8 @@ def _sample_worker(
     peak_hwm: dict[str, int] = {}
     sample_count: dict[str, int] = {}
     total_samples = 0
+    unavailable_samples = 0
+    exit_confirmed_after_unavailable_sample = False
     sampling_source = "unavailable"
     started = time.monotonic()
     termination_reason = None
@@ -162,8 +165,22 @@ def _sample_worker(
                         peak_hwm[phase] = max(int(peak_hwm.get(phase, 0)), int(sample["hwm_bytes"]))
                     if rss_limit and sample["rss_bytes"] > rss_limit * 2**20:
                         termination_reason = f"sampled RSS exceeded {rss_limit:g} MiB in phase {phase}"
-                elif rss_limit and process.poll() is None:
-                    termination_reason = "RSS watchdog lost access to the live worker; refusing an unguarded run"
+                else:
+                    unavailable_samples += 1
+                    if rss_limit:
+                        # Linux can remove VmRSS during exit before waitpid/poll
+                        # exposes the exit code. Confirm exit with a bounded
+                        # wait; a still-live, unobservable worker must fail closed.
+                        if process.poll() is not None:
+                            exit_confirmed_after_unavailable_sample = True
+                            break
+                        try:
+                            process.wait(timeout=WORKER_EXIT_CONFIRMATION_S)
+                        except subprocess.TimeoutExpired:
+                            termination_reason = "RSS watchdog lost access to the live worker; refusing an unguarded run"
+                        else:
+                            exit_confirmed_after_unavailable_sample = True
+                            break
                 if timeout and time.monotonic() - started > timeout:
                     termination_reason = f"worker exceeded {timeout:g} seconds in phase {phase}"
                 if termination_reason:
@@ -177,10 +194,13 @@ def _sample_worker(
     sampling = {
         "source": sampling_source, "interval_ms": float(args.rss_sample_ms),
         "total_sample_count": int(total_samples), "sample_count_by_phase": sample_count,
+        "unavailable_sample_count": int(unavailable_samples),
+        "exit_confirmed_after_unavailable_sample": exit_confirmed_after_unavailable_sample,
         "peak_rss_by_phase": peak_rss, "peak_hwm_by_phase": peak_hwm,
         "return_code": return_code, "termination_reason": termination_reason,
         "elapsed_s": time.monotonic() - started,
         "guards": {"max_worker_rss_mib": rss_limit, "worker_timeout_s": timeout,
+                   "exit_confirmation_timeout_s": WORKER_EXIT_CONFIRMATION_S,
                    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"},
     }
     # Preserve failure evidence even when no worker JSON was produced.

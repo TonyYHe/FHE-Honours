@@ -214,3 +214,119 @@ def test_watchdog_refuses_to_launch_when_rss_measurement_is_unavailable(monkeypa
     monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not start an unguarded worker"))
     with pytest.raises(RuntimeError, match="refusing to launch"):
         module._sample_worker(mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args)
+
+
+@pytest.mark.parametrize("exit_code", [0, 2])
+@pytest.mark.parametrize("exit_visible", ["poll", "wait"])
+def test_watchdog_distinguishes_process_exit_from_lost_rss(
+    monkeypatch, tmp_path, exit_code, exit_visible,
+):
+    from tools import run_wpc_cips_trained_isolated_benchmark as module
+    args = module._parser().parse_args([])
+    args.logn, args.max_worker_rss_mib = 10, 1
+    payload = {"status": "ok" if exit_code == 0 else "invalid"}
+
+    class Process:
+        pid = 100
+        returncode = None
+        bounded_waits = []
+        stops = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                self.bounded_waits.append(timeout)
+                self.returncode = exit_code
+            return self.returncode
+
+    process = Process()
+    reads = 0
+
+    def start(*unused_args, **unused_kwargs):
+        (tmp_path / "full.worker.json").write_text(json.dumps(payload))
+        return process
+
+    def read_memory(pid):
+        nonlocal reads
+        if pid != process.pid:
+            return {"rss_bytes": 512 * 1024}, "test"
+        reads += 1
+        if reads == 1:
+            return {"rss_bytes": 512 * 1024, "hwm_bytes": 768 * 1024}, "test"
+        if exit_visible == "poll":
+            process.returncode = exit_code
+        return None, "unavailable"
+
+    def stop(p):
+        if p.poll() is None:
+            p.stops += 1
+            p.returncode = -15
+
+    monkeypatch.setattr(module.subprocess, "Popen", start)
+    monkeypatch.setattr(module, "_read_process_memory", read_memory)
+    monkeypatch.setattr(module, "_read_phase", lambda path: "measured")
+    monkeypatch.setattr(module, "_stop_worker", stop)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    if exit_code == 0:
+        result, sampling, _ = module._sample_worker(
+            mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args,
+        )
+        assert result == payload
+    else:
+        with pytest.raises(RuntimeError, match="worker exited with 2; see worker log"):
+            module._sample_worker(
+                mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args,
+            )
+    sampling = json.loads((tmp_path / "full.rss.json").read_text())
+    assert sampling["return_code"] == exit_code
+    assert sampling["termination_reason"] is None
+    assert sampling["total_sample_count"] == 1
+    assert sampling["sample_count_by_phase"] == {"measured": 1}
+    assert sampling["peak_rss_by_phase"] == {"measured": 512 * 1024}
+    assert sampling["peak_hwm_by_phase"] == {"measured": 768 * 1024}
+    assert sampling["unavailable_sample_count"] == 1
+    assert sampling["exit_confirmed_after_unavailable_sample"] is True
+    assert sampling["guards"]["exit_confirmation_timeout_s"] == 0.1
+    assert process.stops == 0
+    if exit_visible == "wait":
+        assert process.bounded_waits == [0.1]
+    else:
+        assert process.bounded_waits == []
+
+
+def test_watchdog_still_stops_live_worker_when_rss_access_is_lost(monkeypatch, tmp_path):
+    from tools import run_wpc_cips_trained_isolated_benchmark as module
+    args = module._parser().parse_args([])
+    args.logn, args.max_worker_rss_mib = 10, 1
+
+    class Process:
+        pid = 100
+        returncode = None
+        bounded_waits = []
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                self.bounded_waits.append(timeout)
+                raise module.subprocess.TimeoutExpired("worker", timeout)
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(module, "_read_process_memory", lambda pid:
+        ({"rss_bytes": 512 * 1024}, "test") if pid != process.pid else (None, "unavailable"))
+    monkeypatch.setattr(module, "_stop_worker", lambda p: setattr(p, "returncode", -15))
+    with pytest.raises(RuntimeError, match="RSS watchdog lost access to the live worker"):
+        module._sample_worker(mode="full", checkpoint=Path("unused"), out_dir=tmp_path, args=args)
+    sampling = json.loads((tmp_path / "full.rss.json").read_text())
+    assert process.bounded_waits == [0.1]
+    assert sampling["return_code"] == -15
+    assert sampling["termination_reason"] is not None
+    assert sampling["total_sample_count"] == 0
+    assert sampling["peak_rss_by_phase"] == {}
+    assert sampling["unavailable_sample_count"] == 1
+    assert sampling["exit_confirmed_after_unavailable_sample"] is False

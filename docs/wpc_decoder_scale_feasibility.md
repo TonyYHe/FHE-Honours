@@ -52,6 +52,11 @@ are unchanged:
   the worker log and `.rss.json`, even when no worker result was produced. These
   are watchdogs, **not an OS-enforced allocation ceiling or a memory reservation**.
   Missing or lost RSS access fails closed rather than silently disabling the guard.
+  A missing final RSS sample triggers at most a **100 ms bounded exit check**:
+  an exited worker retains its real exit code; a worker still alive without
+  readable RSS is stopped and rejected. `.rss.json` records unavailable samples,
+  whether exit was confirmed after one, and the exit-check timeout. Missing
+  samples are never inserted as zero-byte observations or counted as valid samples.
 - `tools/run_wpc_decoder_feasibility.py` runs three fresh processes, zero warmups,
   and one measured diagnostic forward per mode. It independently validates
   outputs, operation counts, lifecycle release, exact compressed Q/P, and
@@ -131,6 +136,36 @@ Success requires exit status 0, `DECODER FEASIBILITY COMPLETE`, and valid
 a failed result and preserves partial logs/samples; do not use partial runs for
 performance claims. Do not automatically launch six timing blocks after this
 gate: inspect the actual parameters, correctness and available memory first.
+
+### Server-run1 shutdown race and retry (2026-10-07)
+
+The user-provided server diagnostic reported that the first `online_encode`
+worker exited **0**, had status `ok`, passed every worker acceptance gate, and
+had maximum FHE error `6.151518958802393e-7` and clear-oracle delta
+`4.285634347400702e-15`. Its sampled all-phase RSS peak was `2184.7890625 MiB`,
+below the 8192 MiB budget. The controller nevertheless rejected it because RSS
+became unavailable just before the process exit code was visible. Neither the
+full nor compressed treatment ran, so **server_run1 is incomplete evidence**,
+not an accepted three-way feasibility result. These values come from the
+supplied diagnostic; its raw server artifacts have not been inspected locally.
+
+The sampler now checks for an exit for up to 100 ms before treating RSS loss as
+a live-worker monitoring failure. Regression tests cover successful and failed
+exits observed through both `poll()` and `wait()`, actual monitoring loss while
+the worker remains alive, and the existing RSS/time budget failures. The memory
+budget, time budget, FHE tolerance and other acceptance gates are unchanged.
+No old JSON is edited or promoted to valid.
+Local repair verification passed **127 tests**: geometry/config/watchdog,
+online-Encode and trained-decoder comparison, synthesis compatibility, and
+three small real-FHE storage-policy integration cases. Python compilation,
+server-wrapper shell syntax, and diff whitespace checks also passed. No remote
+job or larger local profiling run was launched for this repair.
+
+After committing/pushing this repair, pull it on the server and rerun the same
+gate under the fresh name `server_run2`. Keep `server_run1` and all its sibling
+launch/preflight/exit-status files intact. The wrapper rebuilds and tests before
+starting all three workers; it refuses existing evidence. This remains a
+diagnostic correctness/resource gate, not a repeated performance experiment.
 
 ## Outputs and follow-on work
 
