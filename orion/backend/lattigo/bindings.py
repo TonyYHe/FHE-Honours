@@ -935,6 +935,21 @@ class LattigoLibrary:
             if function is not None:
                 setattr(self, name, LattigoFunction(function, argtypes=argtypes, restype=restype))
 
+        # Optional selective-Orion storage: never silently fall back to a
+        # stale library when an experiment explicitly requests this path.
+        for name, argtypes, restype in (
+            ("GenerateWPCSelectiveLinearTransform", [ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int], ctypes.c_int),
+            ("MaterializeWPCSelectiveLinearTransform", [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int], ctypes.c_int),
+            ("ReleaseWPCSelectiveLinearTransform", [ctypes.c_int], None),
+            ("VerifyWPCSelectiveLinearTransformExact", [ctypes.c_int, ctypes.c_int], ctypes.c_int),
+            ("GetWPCSelectiveLinearTransformStats", [ctypes.c_int], ArrayResultUInt64),
+        ):
+            function = getattr(self.lib, name, None)
+            if function is not None:
+                setattr(self, name, LattigoFunction(function, argtypes=argtypes, restype=restype))
+
         generate_batch = getattr(self.lib, "GenerateLinearTransformsBatch", None)
         if generate_batch is not None:
             self.GenerateLinearTransformsBatch = LattigoFunction(

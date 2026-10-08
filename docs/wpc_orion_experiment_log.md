@@ -1089,3 +1089,67 @@ unmeasured.
 - Failure logging now ends with a concise headline after verbose context.
   Both old failed runs remain unchanged; retry all three treatments under fresh
   `server_run3` after syncing. See `docs/wpc_decoder_scale_feasibility.md`.
+
+### 2026-10-08 — Stage 31 repeated matched-layout implementation
+
+- Preserved Stage-30 raw evidence and diagnostic-only scope. Its native online
+  preparation traversed all channel pairs per block; this was an implementation
+  confound, not evidence of an inherent layout disadvantage.
+- Added explicit channel-pair pruning only in the aligned experimental native
+  control. The default general direct packers are unchanged; selected diagonals
+  must remain bit-identical. The online plan still retains kernels/indices,
+  never a full unencoded diagonal bank.
+- Added all five native-Orion/CIPS treatments in ten balanced Williams blocks:
+  50 fresh workers, two warmups and ten measured forwards per worker. Paired
+  confidence intervals resample whole process blocks. Component mean seconds
+  and mean within-forward shares close independently to forward wall time.
+- Retained every measured output and operation-count delta for independent
+  review, plus exact configuration, raw worker/RSS/phase/log hashes and frozen
+  source/checkpoint/backend identity. Failures retain partial evidence; the
+  wrapper records exit status and supports disconnection via `nohup`.
+- Added pruning, order-balance, accounting, corruption and offline-review
+  regression tests, including a small LogN=9 synthetic-checkpoint five-worker
+  functional smoke test. No server job or trained-checkpoint benchmark was
+  launched locally. Execution instructions and all code changes are listed in
+  `docs/wpc_matched_layout_benchmark.md`; server results remain pending.
+- Final local validation: 319 WPC tests passed, one Linux-procfs test skipped
+  on macOS; guarded synthetic five-worker smoke and Go tests passed. The
+  transferred Stage-30 raw review remains valid. Broader packing/backend tests
+  passed 78 cases and exposed one existing concat-fusion assertion failure,
+  independently reproduced using the pre-change packing module from `HEAD`.
+  No unrelated concat-fusion implementation was changed.
+
+### 2026-10-08 — Stage 32 selective unchanged-Orion storage implementation
+
+- Added a separate opt-in `online`/`hybrid` storage path in the ordinary dense
+  layer cache. Original indices, full-transform BSGS pre-rotations, Q/P levels,
+  scales and rotation requirements are preserved. This is not a CIPS layout
+  change and does not change Stage 31's five-treatment protocol.
+- Hybrid stores only exactly verified periodic encoded Q/P representatives;
+  nonperiodic and all-zero diagonals are regenerated and embedded online.
+  There is no resident fallback-vector bank. Runtime payload digests reject
+  stale weights/indices, and temporary arrays are released at the selected
+  cache granularity. Failed selective releases propagate instead of being
+  silently reported as successful eviction. Registry deletion is integrated
+  with transform/scheme lifecycles; the default cache path is unchanged.
+- Added actual per-diagonal Embed counters and disjoint backend preparation,
+  Embed and copy-decompression timers, plus Encode-time eligibility coverage
+  measured in the online baseline. These are not the historical Step-1
+  category boundaries. The historical profiler rejects an active selective
+  policy; clear census runs explicitly disable it.
+- Added mixed/all-periodic controls and an ordinary zero-padded Conv2d block,
+  exact Q/P/output/operation/release gates, a non-overwriting server wrapper,
+  raw-artifact review and frozen source/backend hashes. An optional dense-model
+  diagnostic exports snapshots outside timed forwards and independently checks
+  every registered transform, all requested outputs and counter arithmetic.
+  Provider/executor whole-model integration and the existing U-Net structural
+  candidates remain unvalidated in this new path; they are not claimed as
+  measured selective whole-model results.
+- Local verification: 357 WPC/Step-1 Python tests passed, two macOS sandbox/
+  Linux-specific tests skipped; all Go tests passed. A tiny LogN=9 ordinary
+  Orion compiler/forward-hook test and the standalone LogN=10 three-case gate
+  plus its read-only JSON review passed. Python compilation, shell syntax and
+  diff whitespace checks passed. These functional parameters are not security
+  assessed, and no full research model or remote job was run locally.
+- Scope, all changed files and the correctness-first server command are in
+  `docs/wpc_selective_orion.md`. Stage 31 server results remain pending.

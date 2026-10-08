@@ -80,6 +80,7 @@ def main() -> int:
     env.update(
         {
             "ORION_LATTIGO_CLEAR_BACKEND": "1",
+            "ORION_WPC_SELECTIVE_POLICY": "off",
             "ORION_SINGLE_SLOT_LAYER_CACHE": "1",
             "ORION_LATTIGO_STREAMING_LT": "0",
             "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",

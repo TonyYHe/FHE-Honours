@@ -1353,6 +1353,25 @@ def _conv2d_spatial_cache(conv_layer, *, padding_semantics="zero") -> dict[tuple
     return cache
 
 
+def _selected_channel_pairs(channel_pairs, co, ci):
+    """Explicit opt-in pruning; ordinary/hybrid packers keep their old path.
+
+    The caller must select pairs conservatively for its packing geometry. The
+    accumulator's allowed-block mask still checks individual matrix entries.
+    """
+    if channel_pairs is None:
+        return None
+    selected = {}
+    for oc, inputs in channel_pairs.items():
+        if not isinstance(oc, int) or not 0 <= oc < co:
+            raise ValueError("selected output channel is out of range")
+        inputs = tuple(inputs)
+        if len(set(inputs)) != len(inputs) or any(not isinstance(ic, int) or not 0 <= ic < ci for ic in inputs):
+            raise ValueError("selected input channels are duplicate or out of range")
+        selected[oc] = inputs
+    return selected
+
+
 def direct_diagonalize_conv2d(
     conv_layer,
     weight,
@@ -1363,6 +1382,7 @@ def direct_diagonalize_conv2d(
     allow_hybrid: bool = True,
     allowed_blocks: set[tuple[int, int]] | None = None,
     padding_semantics: str = "zero",
+    channel_pairs: dict[int, tuple[int, ...]] | None = None,
 ):
     start_time = time.time()
     matrix_shape = (
@@ -1390,6 +1410,7 @@ def direct_diagonalize_conv2d(
     output_block_size = int(on_co * on_ho * on_wo)
 
     weight_np = weight.detach().cpu().to(dtype=torch.float32).numpy()
+    selected = _selected_channel_pairs(channel_pairs, co, ci)
     spatial_cache = _conv2d_spatial_cache(conv_layer, padding_semantics=padding_semantics)
 
     def fill_accumulator(
@@ -1398,7 +1419,7 @@ def direct_diagonalize_conv2d(
         oc_end: int,
     ) -> _DirectDiagonalAccumulator:
         for oc in range(int(oc_start), int(oc_end)):
-            for ic in range(int(ci)):
+            for ic in (range(int(ci)) if selected is None else selected.get(oc, ())):
                 for kh in range(int(weight_np.shape[2])):
                     for kw in range(int(weight_np.shape[3])):
                         coeff = float(weight_np[int(oc), int(ic), int(kh), int(kw)])
@@ -1499,6 +1520,7 @@ def direct_diagonalize_conv_transpose2d(
     *,
     allow_hybrid: bool = True,
     allowed_blocks: set[tuple[int, int]] | None = None,
+    channel_pairs: dict[int, tuple[int, ...]] | None = None,
 ):
     start_time = time.time()
     matrix_shape = (
@@ -1530,6 +1552,13 @@ def direct_diagonalize_conv_transpose2d(
     in_channels_per_group = int(conv_layer.in_channels // groups)
     out_channels_per_group = int(conv_layer.out_channels // groups)
     spatial_cache = _tconv2d_spatial_cache(conv_layer)
+    selected = _selected_channel_pairs(channel_pairs, co, ci)
+    outputs_by_input = None
+    if selected is not None:
+        outputs_by_input = {}
+        for oc, inputs in selected.items():
+            for ic in inputs:
+                outputs_by_input.setdefault(ic, []).append(oc)
 
     def fill_accumulator(
         target: _DirectDiagonalAccumulator,
@@ -1539,8 +1568,12 @@ def direct_diagonalize_conv_transpose2d(
         for ic in range(int(ic_start), int(ic_end)):
             group = int(ic) // int(in_channels_per_group)
             oc_offset = int(group) * int(out_channels_per_group)
-            for oc_rel in range(int(out_channels_per_group)):
-                oc = int(oc_offset + oc_rel)
+            outputs = (range(oc_offset, oc_offset + out_channels_per_group)
+                       if outputs_by_input is None else outputs_by_input.get(ic, ()))
+            for oc in outputs:
+                oc_rel = int(oc) - oc_offset
+                if not 0 <= oc_rel < out_channels_per_group:
+                    continue
                 if int(oc) >= int(co):
                     continue
                 for kh in range(int(weight_np.shape[2])):

@@ -83,6 +83,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-runs", type=int, default=2)
     parser.add_argument("--forward-runs", type=int, default=10)
     parser.add_argument("--atol", type=float, default=2e-3)
+    parser.add_argument("--retain-sample-outputs", action="store_true",
+                        help="retain every measured output for independent Stage-31 review (outside timed forwards)")
     return parser
 
 
@@ -384,6 +386,8 @@ def main() -> int:
             online_prepare_s: list[float] = []
             transform_encode_invocations: list[int] = []
             measured_output_errors: list[float] = []
+            measured_output_values = []
+            measured_operation_counters = []
             timed_lifecycle_records: list[int] = []
             transform_evaluate_s: list[float] = []
             activation_s: list[float] = []
@@ -393,6 +397,7 @@ def main() -> int:
             for _ in range(int(args.forward_runs)):
                 _write_phase(args.phase_file, "measured")
                 before_encode = list(scheme.backend.GetWPCBenchmarkEncodeCounters())
+                before_operations = _operation_counters(scheme.backend) if args.retain_sample_outputs else None
                 started = time.perf_counter()
                 output = run_decoder()
                 forward_wall_s.append(float(time.perf_counter() - started))
@@ -411,6 +416,11 @@ def main() -> int:
                 if not np.isfinite(sample_decoded).all() or sample_error > float(args.atol):
                     raise RuntimeError("measured decoder output failed clear-reference validation")
                 measured_output_errors.append(sample_error)
+                if args.retain_sample_outputs:
+                    measured_output_values.append(sample_decoded.reshape(-1).tolist())
+                    after_operations = _operation_counters(scheme.backend)
+                    measured_operation_counters.append({key: after_operations[key] - value
+                                                        for key, value in before_operations.items()})
                 if args.mode == WPC_STORAGE_COMPRESSED:
                     runtime_rows = [
                         row
@@ -652,6 +662,12 @@ def main() -> int:
             },
             "acceptance": worker_acceptance,
         }
+        if args.retain_sample_outputs:
+            from orion.experimental.wpc_orion_layout_control import NATIVE_PREPARATION_POLICY
+            payload["experiment"]["retain_sample_outputs"] = True
+            payload["experiment"]["native_preparation_policy"] = NATIVE_PREPARATION_POLICY if native else None
+            payload["correctness"]["measured_output_values"] = measured_output_values
+            payload["measurements"]["measured_operation_counters"] = measured_operation_counters
     finally:
         if final_output is not None:
             final_output.release()
@@ -697,7 +713,7 @@ def main() -> int:
                 "correctness": {
                     key: value
                     for key, value in payload["correctness"].items()
-                    if key not in ("output_values", "independent_clear_output_values")
+                    if key not in ("output_values", "independent_clear_output_values", "measured_output_values")
                 },
                 "acceptance": payload["acceptance"],
             },

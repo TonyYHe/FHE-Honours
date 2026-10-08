@@ -60,6 +60,8 @@ class LinearTransform(Module):
                 cleanup_wpc = getattr(wpc_plan, "cleanup", None)
                 if callable(cleanup_wpc):
                     cleanup_wpc()
+                for plan in getattr(self, "_wpc_selective_plans", {}).values():
+                    plan.close()
                 for tid in self.transform_ids.values():
                     backend.DeleteLinearTransform(tid)
                 for tid in getattr(self, "_dense_layer_cache_active_transform_ids", {}).values():
@@ -73,6 +75,8 @@ class LinearTransform(Module):
                         if callable(cleanup):
                             cleanup(backend)
                 for proxy in getattr(self, "_concat_transform_sources_by_input", []) or []:
+                    for plan in getattr(proxy, "_wpc_selective_plans", {}).values():
+                        plan.close()
                     for tid in getattr(proxy, "_dense_layer_cache_active_transform_ids", {}).values():
                         backend.DeleteLinearTransform(tid)
             except Exception:

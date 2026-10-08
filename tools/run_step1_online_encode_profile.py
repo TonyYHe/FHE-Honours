@@ -15,6 +15,8 @@ E2E_RUNNER = REPO_ROOT / "tools" / "run_lattigo_e2e_compare.py"
 
 
 def _profile_environment(base: dict[str, str], *, encode_workers: int) -> dict[str, str]:
+    if base.get("ORION_WPC_SELECTIVE_POLICY", "off").strip().lower() not in ("", "off", "0"):
+        raise ValueError("Selective materialization is not a historical Step-1 Encode profile; use the selective runner")
     env = dict(base)
     env.update(
         {

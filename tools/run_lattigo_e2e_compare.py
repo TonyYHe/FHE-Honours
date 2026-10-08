@@ -5742,6 +5742,9 @@ def _run_forward_attempt(
     # can produce impossible percentages above 100%.
     attempt["bootstrap_runtime_profiles_reset"] = _reset_bootstrap_runtime_profiles(net)
 
+    from orion.experimental.wpc_selective_orion import selective_policy, snapshot_model, runtime_delta
+    selective_before = snapshot_model(net) if selective_policy() is not None else None
+
     profile_snapshot = None
     remove_profile = None
     activation_breakdown_snapshot = None
@@ -5809,6 +5812,8 @@ def _run_forward_attempt(
             _set_lattigo_bootstrap_profile_enabled(True) if bool(profile_modules) else False
         )
         try:
+            if selective_before is not None:
+                scheme.backend.ResetOperationCounters()
             out_ct = _attempt_timed(
                 payload,
                 out_path,
@@ -5818,6 +5823,14 @@ def _run_forward_attempt(
                 lambda: net(x0_ct),
                 record_primary_timing=bool(record_primary),
             )
+            if selective_before is not None:
+                selective_after = snapshot_model(net)
+                attempt["selective_orion_profile"] = runtime_delta(
+                    selective_before, selective_after,
+                    forward_s=float(attempt["timing_s"]["he_forward"]))
+                attempt["selective_orion_snapshot"] = selective_after
+                from tools.run_wpc_cips_isolated_worker import _operation_counters
+                attempt["selective_orion_operations"] = _operation_counters(scheme.backend)
         finally:
             if bool(lt_profile_enabled):
                 _set_lattigo_lt_profile_enabled(False)
@@ -6169,6 +6182,10 @@ def _run_one(
         get_compile_load_profile = getattr(getattr(scheme, "lt_evaluator", None), "get_compile_load_profile", None)
         if callable(get_compile_load_profile):
             payload["compile_load_profile_after_compile"] = get_compile_load_profile()
+        from orion.experimental.wpc_selective_orion import selective_policy, snapshot_model
+        if selective_policy() is not None:
+            payload["selective_orion_policy"] = selective_policy()
+            payload["selective_orion_after_compile"] = snapshot_model(net)
         if bool(layer_mae):
             adjusted_outputs, reference_transforms, reference_transform_diagnostics = _layer_mae_adjust_clear_outputs_after_compile(
                 net,
@@ -6624,6 +6641,10 @@ def main() -> int:
         help="Override the network's default CKKS/bootstrapping parameters.",
     )
     args = parser.parse_args()
+
+    from orion.experimental.wpc_selective_orion import selective_policy
+    if selective_policy() is not None and bool(args.operator_breakdown):
+        parser.error("selective preparation includes decompression; historical Step-1 operator accounting must not label it Encode")
 
     activation = None if args.activation in (None, "none") else str(args.activation)
 

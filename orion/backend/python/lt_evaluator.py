@@ -908,6 +908,10 @@ class NewEvaluator:
             "layer_cache_evict_s": 0.0,
             "layer_cache_turnover_s": 0.0,
         }
+        # Opt-in only. Store verified periods offline, not full fallback
+        # diagonals; the original builders and BSGS schedule remain unchanged.
+        from orion.experimental.wpc_selective_orion import prepare_layer
+        prepare_layer(self, linear_layer, level=level, bsgs_ratio=bsgs_ratio)
         linear_layer.diagonals = {}
         gc.collect()
         return {}
@@ -1502,7 +1506,8 @@ class NewEvaluator:
         try:
             payloads = tuple(self._dense_layer_cache_build_payloads_for_blocks(linear_layer, requested))
             self._record_wpc_dense_payloads(linear_layer, payloads)
-            batch_results = self._generate_transforms_from_payloads_batch(
+            batch_results = self._generate_dense_cache_payloads(
+                linear_layer,
                 payloads,
                 level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
                 bsgs_ratio=float(getattr(linear_layer, "_dense_layer_cache_bsgs_ratio", linear_layer.bsgs_ratio)),
@@ -1564,7 +1569,8 @@ class NewEvaluator:
         self._record_wpc_dense_payloads(linear_layer, payloads)
         started = time.perf_counter()
         try:
-            batch_results = self._generate_transforms_from_payloads_batch(
+            batch_results = self._generate_dense_cache_payloads(
+                linear_layer,
                 payloads,
                 level=int(getattr(linear_layer, "_dense_layer_cache_level", linear_layer.level)),
                 bsgs_ratio=float(getattr(linear_layer, "_dense_layer_cache_bsgs_ratio", linear_layer.bsgs_ratio)),
@@ -1625,6 +1631,7 @@ class NewEvaluator:
             "layer_cache_evict_s": 0.0,
             "layer_cache_turnover_s": 0.0,
         }
+
         return {
             key: float(pending.get(key, 0.0))
             for key in (
@@ -1634,6 +1641,12 @@ class NewEvaluator:
                 "layer_cache_turnover_s",
             )
         }
+
+    def _generate_dense_cache_payloads(self, linear_layer, payloads, **kwargs):
+        if getattr(linear_layer, "_wpc_selective_plans", None):
+            from orion.experimental.wpc_selective_orion import materialize_payloads
+            return materialize_payloads(self, linear_layer, payloads)
+        return self._generate_transforms_from_payloads_batch(payloads, **kwargs)
 
     def evict_dense_layer_cache(self, linear_layer, *, clear_bias: bool = True) -> float:
         active = dict(getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {}) or {})
@@ -1650,10 +1663,17 @@ class NewEvaluator:
         started = time.perf_counter()
         remove_plaintexts = getattr(self.backend, "RemovePlaintextDiagonals", None)
         for transform_id in active.values():
+            if getattr(linear_layer, "_wpc_selective_plans", None):
+                from orion.experimental.wpc_selective_orion import release_transform
+                # A failed selective release must not be reported as an eviction.
+                release_transform(self, linear_layer, int(transform_id))
+                continue
             try:
                 if callable(remove_plaintexts):
                     remove_plaintexts(int(transform_id))
-                self.backend.DeleteLinearTransform(int(transform_id))
+                    self.backend.DeleteLinearTransform(int(transform_id))
+                else:
+                    self.backend.DeleteLinearTransform(int(transform_id))
             except Exception:
                 pass
         linear_layer.transform_ids = {}
@@ -1687,10 +1707,16 @@ class NewEvaluator:
         started = time.perf_counter()
         remove_plaintexts = getattr(self.backend, "RemovePlaintextDiagonals", None)
         for transform_id in active.values():
+            if getattr(linear_layer, "_wpc_selective_plans", None):
+                from orion.experimental.wpc_selective_orion import release_transform
+                release_transform(self, linear_layer, int(transform_id))
+                continue
             try:
                 if callable(remove_plaintexts):
                     remove_plaintexts(int(transform_id))
-                self.backend.DeleteLinearTransform(int(transform_id))
+                    self.backend.DeleteLinearTransform(int(transform_id))
+                else:
+                    self.backend.DeleteLinearTransform(int(transform_id))
             except Exception:
                 pass
         current = dict(getattr(linear_layer, "_dense_layer_cache_active_transform_ids", {}) or {})

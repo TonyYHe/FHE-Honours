@@ -150,6 +150,7 @@ func DeleteScheme() {
 	clearPredecodedLinearTransformArtifacts()
 	clearWPCCompressedTransforms()
 	clearWPCOnlineRecipes()
+	clearWPCSelective()
 
 	ltHeap.Reset()
 	polyHeap.Reset()

@@ -1490,6 +1490,7 @@ func DeleteLinearTransform(id C.int) {
 	deletePredecodedPlaintextDiagonals(int(id))
 	deleteWPCCompressedTransform(int(id))
 	deleteWPCOnlineRecipe(int(id))
+	deleteWPCSelective(int(id))
 	ltHeap.Delete(int(id))
 }
 

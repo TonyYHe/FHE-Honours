@@ -21,6 +21,25 @@ from orion.core.packing import direct_diagonalize_conv2d, direct_diagonalize_con
 from orion.experimental.wpc_cips_checkpoint import WPCCIPSTrainedActivationBootstrap
 
 SIGNATURE_ATTRIBUTE = "_orion_layout_control_signature"
+NATIVE_PREPARATION_POLICY = "channel_pruned_block_regeneration_v1"
+
+
+def block_channel_pairs(input_signature, output_signature, blocks):
+    """Whole spatial/multiplex planes belong to exactly one ciphertext.
+
+    Prune before traversing kernel coefficients, without retaining diagonal
+    payloads. Only the aligned N=1 geometry validated by native_signature is
+    supported; the general packers do not enable this optimization implicitly.
+    """
+    selected = {}
+    for row, col in sorted(blocks):
+        if not 0 <= row < len(output_signature[5]) or not 0 <= col < len(input_signature[5]):
+            raise ValueError("native block index is out of range")
+        start, end = input_signature[5][col]
+        out_start, out_end = output_signature[5][row]
+        for oc in range(out_start, out_end):
+            selected.setdefault(oc, []).extend(range(start, end))
+    return {oc: tuple(inputs) for oc, inputs in selected.items()}
 
 
 def native_signature(shape, slots: int, gap: int = 1):
@@ -141,13 +160,17 @@ class OrionLayoutConvPlan:
             raise
 
     def _build(self, blocks=None):
+        pairs = (None if blocks is None else block_channel_pairs(
+            self.input_packing_signature, self.output_packing_signature, blocks))
         if self.transpose:
             diagonals, rotations = direct_diagonalize_conv_transpose2d(
-                self.layer, self.case.slots, "square", False, allow_hybrid=False, allowed_blocks=blocks)
+                self.layer, self.case.slots, "square", False, allow_hybrid=False, allowed_blocks=blocks,
+                channel_pairs=pairs)
         else:
             diagonals, rotations = direct_diagonalize_conv2d(
                 self.layer, self.layer.on_weight, self.case.slots, "square", False,
-                allow_hybrid=False, allowed_blocks=blocks, padding_semantics="flattened_spatial_cyclic")
+                allow_hybrid=False, allowed_blocks=blocks, padding_semantics="flattened_spatial_cyclic",
+                channel_pairs=pairs)
         if rotations:
             raise RuntimeError("square native control must not require output rotations")
         return diagonals

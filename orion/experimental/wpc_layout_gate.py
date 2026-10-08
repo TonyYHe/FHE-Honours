@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import statistics
 
 import numpy as np
 
@@ -71,36 +72,38 @@ def _native(worker, mode, atol):
     if backend["compile_transform_encode_invocations"] != {"ordinary": expected if mode == "full" else 0, "compressed": 0, "online_recipe": 0}:
         raise EvidenceValidationError("native compile Encode count mismatch")
     calls = expected if mode == "online_encode" else 0
+    count = integer(worker["experiment"]["forward_runs"], name="native forward runs", minimum=1)
     for counts in (backend["compile_transform_encode_invocations"], backend["measured_transform_encode_invocations"]):
         for value in counts.values():
             integer(value, name="native Encode counter")
     for value in m["transform_encode_invocations"]:
         integer(value, name="native per-forward Encode counter")
-    if backend["measured_transform_encode_invocations"] != {"ordinary": calls, "compressed": 0, "online_recipe": 0}:
+    if backend["measured_transform_encode_invocations"] != {"ordinary": count * calls, "compressed": 0, "online_recipe": 0}:
         raise EvidenceValidationError("native actual online Encode count mismatch")
-    if backend["weight_plaintext_online_encode_calls"] != calls or backend["weight_plaintext_offline_encode_calls"] != (expected if mode == "full" else 0):
+    if backend["weight_plaintext_online_encode_calls"] != count * calls or backend["weight_plaintext_offline_encode_calls"] != (expected if mode == "full" else 0):
         raise EvidenceValidationError("native weight Encode count mismatch")
-    if m["transform_encode_invocations"] != [calls] or m["online_python_encode_call_count"] != 0 or m["bootstrap_call_count"] != 1:
+    if m["transform_encode_invocations"] != [calls] * count or m["online_python_encode_call_count"] != 0 or m["bootstrap_call_count"] != count:
         raise EvidenceValidationError("native per-forward call counts mismatch")
-    if m["timed_lifecycle_record_count"] != [0]:
+    if m["timed_lifecycle_record_count"] != [0] * count:
         raise EvidenceValidationError("native timed lifecycle tracing enabled")
     traces = [r for sequence in worker["correctness"]["untimed_lifecycle_trace"] for r in sequence]
     if len(traces) != expected or any(r["materialized_transforms_after"] != 0 for r in traces):
         raise EvidenceValidationError("native preflight release trace incomplete")
-    if m["decompression_s"] != [0.0]:
+    if m["decompression_s"] != [0.0] * count:
         raise EvidenceValidationError("native path claims WPC decompression")
-    if mode == "full" and (m["online_encode_s"] != [0.0] or m["online_prepare_s"] != [0.0]):
+    if mode == "full" and (m["online_encode_s"] != [0.0] * count or m["online_prepare_s"] != [0.0] * count):
         raise EvidenceValidationError("native full path claims online Encode")
-    if mode == "online_encode" and (m["online_encode_s"][0] <= 0 or m["online_prepare_s"][0] <= 0):
+    if mode == "online_encode" and any(value <= 0 for key in ("online_encode_s", "online_prepare_s") for value in m[key]):
         raise EvidenceValidationError("native online timers must be positive")
-    close(m["online_encode_pct_of_forward"][0], 100 * m["online_encode_s"][0] / m["forward_wall_s"][0], name="native Encode share")
-    close(m["online_materialization_pct_of_forward"][0], 100 * (m["online_encode_s"][0] + m["online_prepare_s"][0]) / m["forward_wall_s"][0], name="native preparation share")
+    for i in range(count):
+        close(m["online_encode_pct_of_forward"][i], 100 * m["online_encode_s"][i] / m["forward_wall_s"][i], name="native Encode share")
+        close(m["online_materialization_pct_of_forward"][i], 100 * (m["online_encode_s"][i] + m["online_prepare_s"][i]) / m["forward_wall_s"][i], name="native preparation share")
     for stats in (backend["compressed_global_stats"], backend["online_recipe_global_stats"]):
         if stats["registered_transform_count"] != 0:
             raise EvidenceValidationError("native path registered CIPS recipes/compression")
 
 
-def validate_layout_gate(workers, samples, *, atol, checkpoint_sha256=None, config=None):
+def validate_layout_gate(workers, samples, *, atol, checkpoint_sha256=None, config=None, repeated=False):
     """Recompute correctness/closure; never trust success flags alone."""
     try:
         if set(workers) != set(TREATMENTS) or set(samples) != set(TREATMENTS):
@@ -118,7 +121,9 @@ def validate_layout_gate(workers, samples, *, atol, checkpoint_sha256=None, conf
             else:
                 _native(worker, mode, atol)
             experiment, m, correctness = worker["experiment"], worker["measurements"], worker["correctness"]
-            if experiment["forward_runs"] != 1 or experiment["warmup_runs"] != 0 or experiment["atol"] != atol or experiment["padding_semantics"] != "flattened_spatial_cyclic":
+            count = integer(experiment["forward_runs"], name="forward count", minimum=1)
+            integer(experiment["warmup_runs"], name="warmup count")
+            if (not repeated and (count != 1 or experiment["warmup_runs"] != 0)) or experiment["atol"] != atol or experiment["padding_semantics"] != "flattened_spatial_cyclic":
                 raise EvidenceValidationError("layout gate requires matched function, zero warmups and one diagnostic forward")
             if experiment["timed_lifecycle_tracing"] is not False:
                 raise EvidenceValidationError("timed trace must be disabled")
@@ -162,19 +167,21 @@ def validate_layout_gate(workers, samples, *, atol, checkpoint_sha256=None, conf
                 raise EvidenceValidationError("FHE output exceeds clear tolerance")
             if finite(worker["clear_oracle_max_abs_delta"], name="clear oracle delta", minimum=0) > 1e-10:
                 raise EvidenceValidationError("independent clear oracle mismatch")
-            if len(m["measured_output_max_abs_errors"]) != 1 or finite(m["measured_output_max_abs_errors"][0], name="measured error", minimum=0) > atol:
+            if len(m["measured_output_max_abs_errors"]) != count or any(finite(value, name="measured error", minimum=0) > atol for value in m["measured_output_max_abs_errors"]):
                 raise EvidenceValidationError("measured output failed")
             times = {}
             for key in ("forward_wall_s", "online_encode_s", "online_prepare_s", "decompression_s", "transform_evaluate_s", "activation_s", "bootstrap_s"):
-                if not isinstance(m[key], list) or len(m[key]) != 1:
+                if not isinstance(m[key], list) or len(m[key]) != count:
                     raise EvidenceValidationError("missing diagnostic timer sample")
-                times[key] = finite(m[key][0], name=key, minimum=0)
-            if min(times[k] for k in ("forward_wall_s", "transform_evaluate_s", "activation_s", "bootstrap_s")) <= 0:
-                raise EvidenceValidationError("measured computation timer is not positive")
-            if sum(v for k, v in times.items() if k != "forward_wall_s") > times["forward_wall_s"] + 1e-6:
-                raise EvidenceValidationError("forward subtimers overlap or exceed wall time")
+                values = [finite(v, name=key, minimum=0) for v in m[key]]
+                times[key] = statistics.median(values)
+            for i in range(count):
+                if min(m[k][i] for k in ("forward_wall_s", "transform_evaluate_s", "activation_s", "bootstrap_s")) <= 0:
+                    raise EvidenceValidationError("measured computation timer is not positive")
+                if sum(m[k][i] for k in times if k != "forward_wall_s") > m["forward_wall_s"][i] + 1e-6:
+                    raise EvidenceValidationError("forward subtimers overlap or exceed wall time")
             operations = m["operation_counters_per_forward"]
-            if operations["rotation_total"] != operations["direct_rotation"] + operations["linear_transform_rotation"] or m["operation_counters_total"] != operations:
+            if operations["rotation_total"] != operations["direct_rotation"] + operations["linear_transform_rotation"] or m["operation_counters_total"] != {k: v * count for k, v in operations.items()}:
                 raise EvidenceValidationError("operation counters do not close")
             for value in operations.values():
                 integer(value, name="operation count")

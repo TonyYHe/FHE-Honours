@@ -61,7 +61,7 @@ python tools/build_lattigo.py
 
 The native backend requires a working Go toolchain. Real-FHE model runs are resource intensive and should be executed on a suitably provisioned Linux server. See [`docs/step1_online_encode_profile.md`](docs/step1_online_encode_profile.md) for exact commands, environment constraints, and acceptance criteria.
 
-WPC-specific entry points are documented in [Rotation-Padding fine-tuning](docs/wpc_rotation_padding_finetune.md), [the three-way CIPS benchmark](docs/wpc_online_encode_benchmark.md), and [the matched-layout correctness gate](docs/wpc_orion_layout_gate.md). The server wrappers preserve raw artifacts and record completion status; existing evidence is not overwritten.
+WPC-specific entry points are documented in [Rotation-Padding fine-tuning](docs/wpc_rotation_padding_finetune.md), [the three-way CIPS benchmark](docs/wpc_online_encode_benchmark.md), [the matched-layout correctness gate](docs/wpc_orion_layout_gate.md), and [the repeated matched-layout benchmark](docs/wpc_matched_layout_benchmark.md). The server wrappers preserve raw artifacts and record completion status; existing evidence is not overwritten.
 
 ## 3. Current Progress
 
@@ -106,9 +106,17 @@ Verified evidence through **8 October 2026**. Whole-model Orion profiling, clear
 - **Validation and provenance: hardened.**
   - Added explicit finite-sample accounting, evaluated-checkpoint identities, cross-artifact SHA-256 checks, archived configurations, raw worker/RSS manifests, and read-only recomputation after transfer.
   - Replaced the previously unmeasured full-Q/P evaluation timer with an actual measurement in new workers; historical artifacts remain unchanged.
-  - Independently checked the transferred Stage 30 archive and all five workers. The review also identified repeated full-channel traversal in native online preparation, which must be addressed before a fair repeated layout benchmark.
+  - Independently checked the transferred Stage 30 archive and all five workers. The review identified repeated full-channel traversal in native online preparation; Stage 31 implements the block-aware correction before collecting repeated layout timings.
 
-Remaining work includes block-aware native preparation, repeated balanced-order native-Orion/CIPS comparisons, a security assessment of benchmark parameters, original WPC VGG/U-Net model-level reproduction, and matched complete encrypted-network experiments for U-Net and ResNet.
+- **Stage 31 — repeated matched-layout benchmark: implemented; server results pending.**
+  - Corrected native online preparation to traverse only the requested block's channel pairs, with exact-diagonal regression tests and no resident diagonal bank.
+  - Added a ten-block, five-treatment balanced-order protocol, retained per-forward outputs/counters, independent raw-artifact review and paired process-block confidence intervals. No new latency finding is claimed before server validation.
+
+- **Stage 32 — selective compression in unchanged Orion transforms: implemented; server gate pending.**
+  - Added opt-in mixed periodic/nonperiodic Q/P materialization in the ordinary dense layer cache, preserving full-transform BSGS and online fallback recipes.
+  - Added exact reconstruction/output/counter/release gates and separate backend Encode, preparation and decompression measurements. No new whole-model performance result is claimed. See [the scope and server commands](docs/wpc_selective_orion.md).
+
+Remaining work includes executing the repeated balanced-order native-Orion/CIPS comparison and selective-storage gates, a security assessment of benchmark parameters, paper-aligned full-model reproduction and a separate U-Net extension, and matched complete encrypted-network experiments for U-Net and ResNet.
 
 ## 4. Results & Benchmarks
 

@@ -14,22 +14,23 @@ from orion.experimental.wpc_cips_checkpoint import CheckpointChebyshevSpec
 from orion.experimental.wpc_orion_layout_control import (
     OrionLayoutConvPlan, OrionAlignedConcatPlan, OrionLayoutTrainedActivationBootstrap,
     native_signature, pack_native, unpack_native, encrypt_native,
+    block_channel_pairs,
 )
 from orion.nn import Conv2d, ConvTranspose2d
 from tools.run_wpc_cips_trained_decoder import _config, _rotation_padding_conv2d
 from tools.run_wpc_cips_isolated_worker import _operation_counters
 
 
-def _physical_layer(transpose=False):
+def _physical_layer(transpose=False, channels=8):
     rng = np.random.default_rng(11)
     size = 2 if transpose else 3
-    layer = torch.nn.ConvTranspose2d(8, 8, size, stride=2) if transpose else torch.nn.Conv2d(8, 8, size, padding=1)
-    layer.on_weight = torch.tensor(rng.normal(0, .02, (8, 8, size, size)), dtype=torch.float32)
-    layer.on_bias = torch.tensor(rng.normal(0, .01, 8), dtype=torch.float32)
-    layer.input_shape = torch.Size((1, 8, 2 if transpose else 4, 2 if transpose else 4))
-    layer.output_shape = torch.Size((1, 8, 4, 4))
+    layer = torch.nn.ConvTranspose2d(channels, channels, size, stride=2) if transpose else torch.nn.Conv2d(channels, channels, size, padding=1)
+    layer.on_weight = torch.tensor(rng.normal(0, .02, (channels, channels, size, size)), dtype=torch.float32)
+    layer.on_bias = torch.tensor(rng.normal(0, .01, channels), dtype=torch.float32)
+    layer.input_shape = torch.Size((1, channels, 2 if transpose else 4, 2 if transpose else 4))
+    layer.output_shape = torch.Size((1, channels, 4, 4))
     layer.input_gap, layer.output_gap = (2 if transpose else 1), 1
-    layer.fhe_input_shape = torch.Size((1, 2, 4, 4)) if transpose else layer.input_shape
+    layer.fhe_input_shape = torch.Size((1, channels // 4, 4, 4)) if transpose else layer.input_shape
     layer.fhe_output_shape = layer.output_shape
     return layer
 
@@ -40,6 +41,49 @@ def _evaluate_blocks(diagonals, messages, rows, slots):
         for offset, diagonal in block.items():
             output[row] += np.asarray(diagonal) * np.roll(messages[col], -int(offset))
     return output
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("channels", [8, 12])
+def test_pruned_block_regeneration_is_exact_and_visits_only_selected_channel_pairs(transpose, workers, channels, monkeypatch):
+    import orion.core.packing as packing
+    monkeypatch.setenv("ORION_DIRECT_PACK_WORKERS", str(workers))
+    layer = _physical_layer(transpose, channels)
+    slots = (32 if not transpose else 16) if channels == 8 else (128 if not transpose else 64)
+    input_sig = native_signature(layer.input_shape, slots, layer.input_gap)
+    output_sig = native_signature(layer.output_shape, slots, layer.output_gap)
+    def build(blocks=None, pairs=None):
+        kwargs = dict(allow_hybrid=False, allowed_blocks=blocks, channel_pairs=pairs)
+        return (direct_diagonalize_conv_transpose2d(layer, slots, "square", False, **kwargs) if transpose
+                else direct_diagonalize_conv2d(layer, layer.on_weight, slots, "square", False,
+                    padding_semantics="flattened_spatial_cyclic", **kwargs))[0]
+    full = build()
+    original = packing._packed_flat_indices
+    visits = []
+    def counted(channel, *args, **kwargs):
+        visits.append(channel)
+        return original(channel, *args, **kwargs)
+    monkeypatch.setattr(packing, "_packed_flat_indices", counted)
+    total_selected_pairs = 0
+    for key, expected in full.items():
+        pairs = block_channel_pairs(input_sig, output_sig, {key})
+        visits.clear()
+        result = build({key}, pairs)
+        assert set(result) == {key}
+        assert set(result[key]) == set(expected)
+        for offset in expected:
+            np.testing.assert_array_equal(result[key][offset], expected[offset])
+        selected_pairs = sum(map(len, pairs.values()))
+        total_selected_pairs += selected_pairs
+        # Two index-vector constructions per channel pair / kernel offset.
+        assert len(visits) == 2 * selected_pairs * int(np.prod(layer.kernel_size))
+        assert selected_pairs < layer.in_channels * layer.out_channels
+    assert total_selected_pairs == layer.in_channels * layer.out_channels
+    with pytest.raises(ValueError, match="block"):
+        block_channel_pairs(input_sig, output_sig, {(len(output_sig[5]), 0)})
+    with pytest.raises(ValueError, match="channel"):
+        build({(0, 0)}, {0: (layer.in_channels,)})
 
 
 @pytest.mark.parametrize("gap", [1, 2])
