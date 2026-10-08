@@ -1,0 +1,112 @@
+{
+  "ckks_config": {
+    "boot_params": {
+      "LogP": [
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61
+      ]
+    },
+    "ckks_params": {
+      "H": 192,
+      "LogN": 12,
+      "LogP": [
+        60
+      ],
+      "LogQ": [
+        55,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45
+      ],
+      "LogScale": 45,
+      "RingType": "Standard"
+    },
+    "orion": {
+      "backend": "lattigo",
+      "debug": false,
+      "embedding_method": "square",
+      "io_mode": "none",
+      "margin": 1
+    }
+  },
+  "configuration_source": {
+    "kind": "json_file",
+    "path": "/home/tony/FHE-Honours/configs/wpc_decoder_scale_functional.json",
+    "sha256": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195"
+  },
+  "geometry": {
+    "bootstrap_ciphertext_group_count": 4,
+    "concat_shape": [
+      1,
+      64,
+      16,
+      16
+    ],
+    "concat_transform_count": 8,
+    "high_channel_capacity": 8,
+    "high_shape": [
+      1,
+      32,
+      16,
+      16
+    ],
+    "learned_transform_count": 56,
+    "learned_transform_count_by_layer": {
+      "checkpoint_dec1a": 32,
+      "checkpoint_dec1b": 16,
+      "checkpoint_up1": 8
+    },
+    "levels": {
+      "bridge_input": 5,
+      "concat": 7,
+      "dec1a": 6,
+      "dec1b": 8,
+      "output": 7,
+      "skip1": 7,
+      "up1": 8
+    },
+    "logn": 12,
+    "low_channel_capacity": 32,
+    "low_shape": [
+      1,
+      64,
+      8,
+      8
+    ],
+    "slots": 2048
+  },
+  "order": [
+    "native_orion/full",
+    "native_orion/online_encode",
+    "cips/full",
+    "cips/online_encode",
+    "cips/compressed"
+  ],
+  "padding_semantics": "flattened_spatial_cyclic",
+  "resource_guards": {
+    "max_worker_rss_mib": 8192.0,
+    "worker_timeout_s": 1800.0
+  },
+  "security_assessed": false,
+  "worker_request": {
+    "atol": 1e-05,
+    "bound_headroom": 1.25,
+    "bsgs_ratio": 2.0,
+    "feature_std": 0.02,
+    "forward_runs": 1,
+    "seed": 20260929,
+    "verify_exact_qp": true,
+    "warmup_runs": 0
+  }
+}
