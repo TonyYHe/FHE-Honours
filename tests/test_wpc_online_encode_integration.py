@@ -55,6 +55,8 @@ def test_real_fhe_three_storage_modes_and_repeated_online_release(monkeypatch, o
                     finally:
                         output.release()
                     assert plan.last_evaluation["evaluation_sequence"] == []
+                    if mode == "full":
+                        assert plan.last_evaluation["full_transform_evaluate_call_s"] > 0
                     assert list(scheme.backend.GetWPCBenchmarkEncodeCounters()) == ([0,0,expected] if mode=="online_encode" else [0,0,0])
                     online_stats = list(scheme.backend.GetWPCOnlineGlobalStats())
                     assert online_stats[1] == online_stats[3] == 0

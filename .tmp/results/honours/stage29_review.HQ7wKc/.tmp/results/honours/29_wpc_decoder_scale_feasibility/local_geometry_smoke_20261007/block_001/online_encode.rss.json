@@ -1,0 +1,16 @@
+{
+  "source": "unavailable",
+  "interval_ms": 5.0,
+  "total_sample_count": 0,
+  "sample_count_by_phase": {},
+  "peak_rss_by_phase": {},
+  "peak_hwm_by_phase": {},
+  "return_code": 0,
+  "termination_reason": null,
+  "elapsed_s": 10.095417333999649,
+  "guards": {
+    "max_worker_rss_mib": 4096.0,
+    "worker_timeout_s": 300.0,
+    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"
+  }
+}

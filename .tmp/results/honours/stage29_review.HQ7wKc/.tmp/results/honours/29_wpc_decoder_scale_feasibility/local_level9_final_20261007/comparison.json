@@ -1,0 +1,810 @@
+{
+  "acceptance": {
+    "all_blocks_independently_validated": true,
+    "balanced_order_or_explicit_smoke": true,
+    "checkpoint_and_features_consistent": true,
+    "valid": true
+  },
+  "blocks": [
+    {
+      "block_index": 1,
+      "checkpoint_sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59",
+      "experiment": {
+        "atol": 0.002,
+        "bound_headroom": 1.25,
+        "bsgs_ratio": 2.0,
+        "ckks_config": {
+          "boot_params": {
+            "LogP": [
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61,
+              61
+            ]
+          },
+          "ckks_params": {
+            "H": 192,
+            "LogN": 11,
+            "LogP": [
+              60
+            ],
+            "LogQ": [
+              55,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45,
+              45
+            ],
+            "LogScale": 45,
+            "RingType": "Standard"
+          },
+          "orion": {
+            "backend": "lattigo",
+            "debug": false,
+            "embedding_method": "square",
+            "io_mode": "none",
+            "margin": 1
+          }
+        },
+        "configuration_source": {
+          "kind": "json_file",
+          "path": "/private/tmp/wpc-decoder-level9-test.json",
+          "sha256": "918dd064fff214a61f993a6d4dd86b29f0c9e4ce26de45db08467d8b97af7267"
+        },
+        "feature_std": 0.02,
+        "forward_runs": 1,
+        "geometry": {
+          "bootstrap_ciphertext_group_count": 2,
+          "concat_shape": [
+            1,
+            64,
+            8,
+            8
+          ],
+          "concat_transform_count": 4,
+          "high_channel_capacity": 16,
+          "high_shape": [
+            1,
+            32,
+            8,
+            8
+          ],
+          "learned_transform_count": 14,
+          "learned_transform_count_by_layer": {
+            "checkpoint_dec1a": 8,
+            "checkpoint_dec1b": 4,
+            "checkpoint_up1": 2
+          },
+          "levels": {
+            "bridge_input": 6,
+            "concat": 8,
+            "dec1a": 7,
+            "dec1b": 9,
+            "output": 8,
+            "skip1": 8,
+            "up1": 9
+          },
+          "logn": 11,
+          "low_channel_capacity": 64,
+          "low_shape": [
+            1,
+            64,
+            4,
+            4
+          ],
+          "slots": 1024
+        },
+        "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+        "high_shape": [
+          1,
+          32,
+          8,
+          8
+        ],
+        "logn": 11,
+        "low_shape": [
+          1,
+          64,
+          4,
+          4
+        ],
+        "runtime_environment": {
+          "ORION_LATTIGO_CLEAR_BACKEND": "0",
+          "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+          "ORION_LATTIGO_STREAMING_LT": "0",
+          "ORION_WPC_PERIODICITY_PROFILE": "0"
+        },
+        "security_scope": "unassessed_experimental_parameters_not_secure_deployment",
+        "slots": 1024,
+        "timed_lifecycle_tracing": false,
+        "verify_exact_qp": true,
+        "warmup_runs": 0
+      },
+      "feature_sha256": "2d272bf54766e4dd6ea90cd3e24afc9c7f297fc66246c61a02821f8ca968aae1",
+      "order": [
+        "online_encode",
+        "full",
+        "compressed"
+      ],
+      "rows": {
+        "compressed": {
+          "activation_median_s": 0.007673541011172347,
+          "bootstrap_median_s": 0.2702177920000395,
+          "decompression_median_pct": 6.868025861120263,
+          "decompression_median_s": 0.060229376,
+          "forward_median_s": 0.8769532500009518,
+          "logical_resident_bytes": 35995904,
+          "max_abs_delta_vs_isolated_full": 1.3969838619232178e-08,
+          "max_abs_error_vs_clear": 6.16239105813432e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1083703296,
+          "sampled_online_peak_rss_bytes": 1083867136
+        },
+        "full": {
+          "activation_median_s": 0.008746416991925798,
+          "bootstrap_median_s": 0.4201097920013126,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 1.0446654579864116,
+          "logical_resident_bytes": 475660288,
+          "max_abs_delta_vs_isolated_full": 0.0,
+          "max_abs_error_vs_clear": 6.126722462487799e-07,
+          "online_encode_median_pct": 0.0,
+          "online_encode_median_s": 0.0,
+          "online_materialization_median_pct": 0.0,
+          "online_prepare_median_s": 0.0,
+          "pre_online_rss_bytes": 1344929792,
+          "sampled_online_peak_rss_bytes": 1344946176
+        },
+        "online_encode": {
+          "activation_median_s": 0.006915541001944803,
+          "bootstrap_median_s": 0.26902616600273177,
+          "decompression_median_pct": 0.0,
+          "decompression_median_s": 0.0,
+          "forward_median_s": 1.23144020800828,
+          "logical_resident_bytes": 2320192,
+          "max_abs_delta_vs_isolated_full": 1.3969838619232178e-08,
+          "max_abs_error_vs_clear": 6.16239105813432e-07,
+          "online_encode_median_pct": 29.461682316415036,
+          "online_encode_median_s": 0.362803002,
+          "online_materialization_median_pct": 33.0475718068533,
+          "online_prepare_median_s": 0.044158085,
+          "pre_online_rss_bytes": 1155203072,
+          "sampled_online_peak_rss_bytes": 1155416064
+        }
+      },
+      "runtime_parameter_manifest": {
+        "bootstrappers": [
+          {
+            "encapsulation": {
+              "p": [
+                2305843009213616129
+              ],
+              "q": [
+                36028797018972161
+              ],
+              "secret_hamming_weight": 32
+            },
+            "ephemeral_secret_weight": 32,
+            "parameters": {
+              "error_distribution": {
+                "parameters": {
+                  "Bound": 19.2,
+                  "Sigma": 3.2
+                },
+                "type": "DiscreteGaussian"
+              },
+              "log_default_scale": 45,
+              "logn": 11,
+              "logqp": 1769.000000034432,
+              "p": [
+                2305843009213616129,
+                2305843009213800449,
+                2305843009213812737,
+                2305843009213554689,
+                2305843009213861889,
+                2305843009213870081,
+                2305843009213501441,
+                2305843009213489153
+              ],
+              "q": [
+                36028797018972161,
+                35184372060161,
+                35184372121601,
+                35184371986433,
+                35184372203521,
+                35184371961857,
+                35184371884033,
+                35184372355073,
+                35184372375553,
+                35184372428801,
+                549755809793,
+                549755731969,
+                549755904001,
+                1152921504606830593,
+                1152921504606904321,
+                1152921504606748673,
+                1152921504606965761,
+                1152921504606994433,
+                1152921504607019009,
+                1152921504606683137,
+                1152921504607031297,
+                72057594037948417,
+                72057594038149121,
+                72057594037641217,
+                72057594037616641
+              ],
+              "ring_type": "Standard",
+              "secret_distribution": {
+                "parameters": {
+                  "H": 192,
+                  "P": 0
+                },
+                "type": "Ternary"
+              }
+            },
+            "slots": 1024
+          }
+        ],
+        "residual": {
+          "error_distribution": {
+            "parameters": {
+              "Bound": 19.2,
+              "Sigma": 3.2
+            },
+            "type": "DiscreteGaussian"
+          },
+          "log_default_scale": 45,
+          "logn": 11,
+          "logqp": 520.0000000236819,
+          "p": [
+            1152921504606830593
+          ],
+          "q": [
+            36028797018972161,
+            35184372060161,
+            35184372121601,
+            35184371986433,
+            35184372203521,
+            35184371961857,
+            35184371884033,
+            35184372355073,
+            35184372375553,
+            35184372428801
+          ],
+          "ring_type": "Standard",
+          "secret_distribution": {
+            "parameters": {
+              "H": 192,
+              "P": 0
+            },
+            "type": "Ternary"
+          }
+        },
+        "schema_version": 1,
+        "security_assessed": false
+      },
+      "shared_library_sha256": "4122d71b5d2b6edbeaeb87b4d55156ffbe796e1671fcc94945acf72a47342bda",
+      "valid": true
+    }
+  ],
+  "checkpoint": {
+    "path": "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+    "sha256": "761743bc6d700ee3d9fa3d75e6204b099bb0ec46f110ce3607902ae2fe537a59"
+  },
+  "profile": "wpc_cips_three_way_online_encode_process_blocks",
+  "provenance": {
+    "configuration_artifact": {
+      "path": "configuration_input.json",
+      "sha256": "918dd064fff214a61f993a6d4dd86b29f0c9e4ce26de45db08467d8b97af7267",
+      "size_bytes": 306
+    },
+    "implementation_sha256": {
+      "configs/wpc_decoder_scale_functional.json": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195",
+      "lattigo/circuits/ckks/bootstrapping/keys.go": "635be5abeb7f9ee804f2efc14172e52e8b04fa7d32261a2f1407ca69e2505eb3",
+      "lattigo/circuits/ckks/bootstrapping/parameters.go": "feb38277e5360232e4109e49e184321d83f14ab0506f9653b899451c76946b1a",
+      "lattigo/circuits/ckks/bootstrapping/parameters_literal.go": "107afa2dc1d721f508bb61590eead648c72d15c816b2caae0cbc3830ad9ab054",
+      "orion/backend/lattigo/bindings.py": "757cd89dcc7524382ddce1b254417d71db6a72530dd43b85779fe107bfdd09ff",
+      "orion/backend/lattigo/bootstrapper.go": "d35d31bafed48b16d25147d424e530984a2b80b9c6158fc74081b3104ec5e2e7",
+      "orion/backend/lattigo/lineartransform.go": "cd3c907b2f6f51d7cc9b7553405bd087cb43c39bf9351293a3188b78145a5ec7",
+      "orion/backend/lattigo/scheme.go": "fc783eec73582add3d6a99b2b0f9d3a70ea1fde56c09adb15bfd36f6e2fc944e",
+      "orion/backend/lattigo/wpc_compression.go": "32266e97eed6e715256c101a505e5af3c66f69bfe41b7c9cd0c43bc976581394",
+      "orion/backend/lattigo/wpc_online_encode.go": "3532c492b45f26c403ef1d7d0bd3e3bca21ba50e3f1166e170edd29c17e101bd",
+      "orion/backend/lattigo/wpc_parameter_manifest.go": "ab16fc6cd3d366d4bf7f06538d5016461556db81206d4dee48528c5b5e9b0e64",
+      "orion/experimental/wpc_cips_baseline.py": "3bdfa52db72cac4efc4f952865e599be65c96278838d4cb5534cc1f7e7219789",
+      "orion/experimental/wpc_cips_branches.py": "ffaad534fa502bba86468f7be4c5318fc818bf51cf44727c9fd87d7e9dd462e5",
+      "orion/experimental/wpc_cips_checkpoint.py": "0888addfd119fa2d4d9b6b2ea5da981f79b0b5344e398e6e208cf3c8a33fd1d8",
+      "orion/experimental/wpc_cips_layer.py": "977500fb6b24bf2d418df8af7a7c353dffc6cdd39ca4ce7a8c8a31a6decb143f",
+      "orion/experimental/wpc_cips_trained_benchmark.py": "b19a9c94b15403065de6ae8cdee58541cda763b4b67a89591346da96e085ef41",
+      "orion/experimental/wpc_cips_upsample.py": "9df5976c247ed7b9bc7e73653ae753ce2248df48e85b9af55b5664ac889ce0a2",
+      "orion/experimental/wpc_decoder_geometry.py": "6889528eac2fb21c220276f97f1e99df044a29d93853316591e0cc438e177607",
+      "orion/experimental/wpc_evidence_validation.py": "c54d0f766280872cf26745823ecbe343c6e075b7b980f81d2703ece68fdc86df",
+      "orion/experimental/wpc_online_encode_benchmark.py": "97efcacf9acb0a43530f12ccabd545d7d70c27cfdf36a4418144db8e056e391b",
+      "tools/run_wpc_cips_trained_decoder.py": "fc55ddb2a14d90ed89f4fa58e45dc683d34dade65e9f33ba60c84a6446fff87e",
+      "tools/run_wpc_cips_trained_isolated_benchmark.py": "b149fd461e292f134ebf9d7bd79a0f6e5b9315894e5d888be555ddfdfb23c3fb",
+      "tools/run_wpc_cips_trained_isolated_worker.py": "578b5dc2dbec2b7079b9cca6807aae679ff1033da213d3f90f83181547b4e085",
+      "tools/run_wpc_decoder_feasibility.py": "3fc7defe025ae5fc9afbac0a0ad8f713555879f05e190c396f70f9505b5bce27",
+      "tools/run_wpc_decoder_feasibility_server.sh": "d85aa0c9732dc95f29adcfdb2125226ca4102406ec6755c4189e0e5ae20e67e1",
+      "tools/run_wpc_online_encode_benchmark.py": "821a34d7f3e84585a1d8780a5207e942d8c841ebb2af77c71fa8afe24a4dcd5d"
+    },
+    "repository_commit": "ca3454d31dc2a61a34596e67fccef5c2f63fe2c5",
+    "repository_status": " M AGENTS.md\n M docs/wpc_online_encode_benchmark.md\n M docs/wpc_orion_experiment_log.md\n M orion/backend/lattigo/bindings.py\n M orion/experimental/wpc_cips_trained_benchmark.py\n M orion/experimental/wpc_online_encode_benchmark.py\n M tools/run_wpc_cips_trained_isolated_benchmark.py\n M tools/run_wpc_cips_trained_isolated_worker.py\n M tools/run_wpc_online_encode_benchmark.py\n?? .tmp/results/honours/29_wpc_decoder_scale_feasibility/\n?? .tmp/results/honours/stage28_review.Q4lbrF/\n?? configs/wpc_decoder_scale_functional.json\n?? docs/wpc_decoder_scale_feasibility.md\n?? orion/backend/lattigo/wpc_parameter_manifest.go\n?? orion/backend/lattigo/wpc_parameter_manifest_test.go\n?? orion/experimental/wpc_decoder_geometry.py\n?? tests/test_wpc_decoder_geometry.py\n?? tools/run_wpc_decoder_feasibility.py\n?? tools/run_wpc_decoder_feasibility_server.sh\n",
+    "worker_artifacts": [
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "online_encode",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_level9_final_20261007/block_001/online_encode.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_level9_final_20261007/block_001/online_encode.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "11",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002",
+          "--ckks-config",
+          "/private/tmp/wpc-decoder-level9-test.json",
+          "--verify-exact-qp"
+        ],
+        "path": "block_001/online_encode.worker.json",
+        "rss_path": "block_001/online_encode.rss.json",
+        "rss_sha256": "5384a3ed92602742bcaba2304dfe1203be4e54c6bad6b20dfabd1e9e35af45fb",
+        "sha256": "1aa79f3e2f5c3db65dee522c14031641f71a0a6d68fe3f954a040934abf851ee",
+        "size_bytes": 77010
+      },
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "full",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_level9_final_20261007/block_001/full.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_level9_final_20261007/block_001/full.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "11",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002",
+          "--ckks-config",
+          "/private/tmp/wpc-decoder-level9-test.json",
+          "--verify-exact-qp"
+        ],
+        "path": "block_001/full.worker.json",
+        "rss_path": "block_001/full.rss.json",
+        "rss_sha256": "9957f72b04724e0f0e54e2864dde265ce4f33e6d648aa04c5a4a15f9f2dd4223",
+        "sha256": "065d4dd4e8dce90796fc8f2875aab0691058bc13e9a70a4b7bcd8b672b9604c8",
+        "size_bytes": 76860
+      },
+      {
+        "command": [
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.venv/bin/python",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/tools/run_wpc_cips_trained_isolated_worker.py",
+          "--mode",
+          "compressed",
+          "--checkpoint",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/checkpoints/fhelipe_medseg_staged_covid19_256_scaled_silu_freeze15_cheb7_20260603/covid19_unet22_plus_output_base32_256_scaled_silu_avgpool_degree_7_rawgain_tight_g045_finetune_best.pt",
+          "--out",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_level9_final_20261007/block_001/compressed.worker.json",
+          "--phase-file",
+          "/Users/tonyhe/Documents/Honours/2026_T3/COMP4962_COMP4963/orion/.tmp/results/honours/29_wpc_decoder_scale_feasibility/local_level9_final_20261007/block_001/compressed.phase.json",
+          "--seed",
+          "20260929",
+          "--logn",
+          "11",
+          "--height",
+          "8",
+          "--width",
+          "8",
+          "--bsgs-ratio",
+          "2.0",
+          "--feature-std",
+          "0.02",
+          "--bound-headroom",
+          "1.25",
+          "--warmup-runs",
+          "0",
+          "--forward-runs",
+          "1",
+          "--atol",
+          "0.002",
+          "--ckks-config",
+          "/private/tmp/wpc-decoder-level9-test.json",
+          "--verify-exact-qp"
+        ],
+        "path": "block_001/compressed.worker.json",
+        "rss_path": "block_001/compressed.rss.json",
+        "rss_sha256": "842ffe6a3eaae5dc2500452917e0b3ecd9a4d4dc9bdd4262b231398d9d9c1cf2",
+        "sha256": "784f7b9b37e3416265013efae3cc3bc5b12855b39b6a9c63f56e6c446ae35ee0",
+        "size_bytes": 95652
+      }
+    ]
+  },
+  "schema_version": 2,
+  "smoke": true,
+  "status": "ok",
+  "summary": {
+    "bootstrap_resamples": 0,
+    "bootstrap_seed": 0,
+    "by_mode": {
+      "compressed": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.007673541011172347,
+          "median": 0.007673541011172347,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.2702177920000395,
+          "median": 0.2702177920000395,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.868025861120263,
+          "median": 6.868025861120263,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.060229376,
+          "median": 0.060229376,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.8769532500009518,
+          "median": 0.8769532500009518,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 35995904.0,
+          "median": 35995904.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.3969838619232178e-08,
+          "median": 1.3969838619232178e-08,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.16239105813432e-07,
+          "median": 6.16239105813432e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1083703296.0,
+          "median": 1083703296.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1083867136.0,
+          "median": 1083867136.0,
+          "stdev": null
+        }
+      },
+      "full": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.008746416991925798,
+          "median": 0.008746416991925798,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.4201097920013126,
+          "median": 0.4201097920013126,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.0446654579864116,
+          "median": 1.0446654579864116,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 475660288.0,
+          "median": 475660288.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.126722462487799e-07,
+          "median": 6.126722462487799e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1344929792.0,
+          "median": 1344929792.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1344946176.0,
+          "median": 1344946176.0,
+          "stdev": null
+        }
+      },
+      "online_encode": {
+        "activation_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.006915541001944803,
+          "median": 0.006915541001944803,
+          "stdev": null
+        },
+        "bootstrap_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.26902616600273177,
+          "median": 0.26902616600273177,
+          "stdev": null
+        },
+        "decompression_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "decompression_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.0,
+          "median": 0.0,
+          "stdev": null
+        },
+        "forward_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.23144020800828,
+          "median": 1.23144020800828,
+          "stdev": null
+        },
+        "logical_resident_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 2320192.0,
+          "median": 2320192.0,
+          "stdev": null
+        },
+        "max_abs_delta_vs_isolated_full": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1.3969838619232178e-08,
+          "median": 1.3969838619232178e-08,
+          "stdev": null
+        },
+        "max_abs_error_vs_clear": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 6.16239105813432e-07,
+          "median": 6.16239105813432e-07,
+          "stdev": null
+        },
+        "online_encode_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 29.461682316415036,
+          "median": 29.461682316415036,
+          "stdev": null
+        },
+        "online_encode_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.362803002,
+          "median": 0.362803002,
+          "stdev": null
+        },
+        "online_materialization_median_pct": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 33.0475718068533,
+          "median": 33.0475718068533,
+          "stdev": null
+        },
+        "online_prepare_median_s": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 0.044158085,
+          "median": 0.044158085,
+          "stdev": null
+        },
+        "pre_online_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1155203072.0,
+          "median": 1155203072.0,
+          "stdev": null
+        },
+        "sampled_online_peak_rss_bytes": {
+          "ci95_mean": null,
+          "count": 1,
+          "mean": 1155416064.0,
+          "median": 1155416064.0,
+          "stdev": null
+        }
+      }
+    },
+    "independent_block_count": 1,
+    "order_balanced": false,
+    "paired_ratios": {
+      "compressed_over_full_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.8394584537056251,
+        "median": 0.8394584537056251,
+        "stdev": null
+      },
+      "compressed_over_online_encode_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.7121362809968077,
+        "median": 0.7121362809968077,
+        "stdev": null
+      },
+      "full_over_online_encode_forward_ratio": {
+        "ci95_mean": null,
+        "count": 1,
+        "mean": 0.8483282023704942,
+        "median": 0.8483282023704942,
+        "stdev": null
+      }
+    },
+    "performance_claims_enabled": false,
+    "scope": "same-CIPS trained decoder with synthetic features; security is not assessed; not Orion-versus-WPC layout or whole-network comparison",
+    "uncertainty_method": "correctness-only smoke block; no uncertainty estimation or performance claim"
+  }
+}

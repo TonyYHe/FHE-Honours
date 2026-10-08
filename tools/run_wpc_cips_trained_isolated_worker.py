@@ -40,6 +40,10 @@ from orion.experimental.wpc_decoder_geometry import (
     validate_parameter_manifest,
 )
 from orion.experimental.wpc_cips_upsample import WPCCIPSConvTranspose2dPlan
+from orion.experimental.wpc_orion_layout_control import (
+    OrionLayoutConvPlan, OrionAlignedConcatPlan,
+    OrionLayoutTrainedActivationBootstrap, encrypt_native,
+)
 from orion.nn import Concat, Conv2d, ConvTranspose2d
 from tools.run_wpc_cips_isolated_worker import (
     _collect_runtime_memory,
@@ -63,6 +67,7 @@ from tools.run_wpc_cips_trained_decoder import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=WPC_STORAGE_MODES, required=True)
+    parser.add_argument("--layout", choices=("cips", "native_orion"), default="cips")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--phase-file", type=Path, required=True)
@@ -128,6 +133,9 @@ def _logical_storage(
 
 def main() -> int:
     args = _parser().parse_args()
+    native = args.layout == "native_orion"
+    if native and args.mode == WPC_STORAGE_COMPRESSED:
+        raise SystemExit("native control does not support WPC periodic compression")
     config, config_source = resolve_decoder_config(args)
     geometry = decoder_geometry(args.logn, args.height, args.width, len(config["ckks_params"]["LogQ"]) - 1)
     levels = geometry["levels"]
@@ -145,6 +153,9 @@ def main() -> int:
     environment = {
         "ORION_LATTIGO_CLEAR_BACKEND": "0", "ORION_LATTIGO_STREAMING_LT": "0",
         "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0", "ORION_WPC_PERIODICITY_PROFILE": "0",
+        "ORION_SINGLE_SLOT_LAYER_CACHE": "0", "ORION_CPP_DIAG_BUILDER": "0",
+        "ORION_DIRECT_PACK_WORKERS": "1",
+        "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1", "ORION_LATTIGO_COMPILE_WORKERS": "1",
     }
     os.environ.update(environment)
 
@@ -181,6 +192,8 @@ def main() -> int:
     skip_ciphertext = None
     final_output = None
     payload: dict[str, Any] | None = None
+    plans = []
+    concat_plan = None
     try:
         _write_phase(args.phase_file, "scheme_init")
         scheme_started = time.perf_counter()
@@ -189,6 +202,8 @@ def main() -> int:
         shared_library_sha256 = hashlib.sha256(shared_library_path.read_bytes()).hexdigest()
         required_apis = ("ResetWPCBenchmarkEncodeCounters", "GetWPCBenchmarkEncodeCounters",
                          "GetWPCOnlineGlobalStats", "ResetWPCOnlineMaterializationPeak", "GetWPCParameterManifest")
+        if native:
+            required_apis += ("GetLinearTransformPayloadStats", "CopyWPCLayoutCiphertext")
         if any(not hasattr(scheme.backend, name) for name in required_apis):
             raise RuntimeError("decoder benchmark shared-library APIs missing; rebuild with tools/build_lattigo.py")
         scheme.backend.ResetWPCBenchmarkEncodeCounters()
@@ -226,37 +241,43 @@ def main() -> int:
 
         _write_phase(args.phase_file, "compile")
         compile_started = time.perf_counter()
-        up_plan = up_layer.install_wpc_cips_plan(
+        up_plan = (OrionLayoutConvPlan(up_layer, low_shape, scheme, storage_mode=str(args.mode), transpose=True)
+                   if native else up_layer.install_wpc_cips_plan(
             low_shape,
             storage_mode=str(args.mode),
             include_full_control=False,
             verify_exact_qp=args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED,
-        )
-        if not isinstance(up_plan, WPCCIPSConvTranspose2dPlan):
+        ))
+        plans.append(up_plan)
+        if not native and not isinstance(up_plan, WPCCIPSConvTranspose2dPlan):
             raise RuntimeError("up1 did not install a transposed-convolution plan")
-        dec1a_plan = dec1a_layer.install_wpc_cips_plan(
+        dec1a_plan = (OrionLayoutConvPlan(dec1a_layer, concat_shape, scheme, storage_mode=str(args.mode))
+                      if native else dec1a_layer.install_wpc_cips_plan(
             concat_shape,
             storage_mode=str(args.mode),
             include_full_control=False,
             verify_exact_qp=args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED,
-        )
-        dec1b_plan = dec1b_layer.install_wpc_cips_plan(
+        ))
+        plans.append(dec1a_plan)
+        dec1b_plan = (OrionLayoutConvPlan(dec1b_layer, high_shape, scheme, storage_mode=str(args.mode))
+                      if native else dec1b_layer.install_wpc_cips_plan(
             high_shape,
             storage_mode=str(args.mode),
             include_full_control=False,
             verify_exact_qp=args.verify_exact_qp and args.mode == WPC_STORAGE_COMPRESSED,
-        )
+        ))
         plans = [up_plan, dec1a_plan, dec1b_plan]
         skip_contract = SimpleNamespace(
             output_shape=high_shape,
             output_packing_signature=up_plan.output_packing_signature,
             output_level=levels["skip1"],
         )
-        concat_plan = concat_module.install_wpc_cips_plan(
+        concat_plan = (OrionAlignedConcatPlan(scheme, up_plan, skip_contract, dec1a_plan)
+                       if native else concat_module.install_wpc_cips_plan(
             (up_plan, skip_contract),
             consumer_plan=dec1a_plan,
-        )
-        if not isinstance(concat_plan, WPCCIPSConcatPlan):
+        ))
+        if not native and not isinstance(concat_plan, WPCCIPSConcatPlan):
             raise RuntimeError("cat1 did not install a CIPS concat plan")
 
         clear_up = up_plan.clear_reference(low)
@@ -274,10 +295,11 @@ def main() -> int:
         )
         bound = max(
             1.0,
-            float(np.max(np.abs(clear_activation)))
+            float(np.max(np.abs(torch_reference["activation"])))
             * float(args.bound_headroom),
         )
-        bridge = WPCCIPSTrainedActivationBootstrap(
+        bridge_type = OrionLayoutTrainedActivationBootstrap if native else WPCCIPSTrainedActivationBootstrap
+        bridge = bridge_type(
             logical_shape=high_shape,
             packing_signature=dec1a_plan.output_packing_signature,
             input_level=int(dec1a_plan.output_level),
@@ -304,12 +326,18 @@ def main() -> int:
 
         _write_phase(args.phase_file, "input_prepare")
         low_ciphertext = up_plan.encrypt_input(low)
-        skip_ciphertext = _encrypt_packed(
+        skip_ciphertext = (encrypt_native(scheme, skip, up_plan.output_packing_signature, levels["skip1"])
+                           if native else _encrypt_packed(
             scheme,
             skip[0],
             up_plan.output_packing_signature,
             level=levels["skip1"],
-        )
+        ))
+        def run_decoder():
+            return _run_decoder(
+                up_plan if native else up_layer, concat_plan if native else concat_module,
+                dec1a_plan if native else dec1a_layer, bridge,
+                dec1b_plan if native else dec1b_layer, low_ciphertext, skip_ciphertext)
         _collect_runtime_memory(scheme.backend)
         memory["after_input_gc"] = _memory_snapshot(scheme.backend)
 
@@ -325,8 +353,7 @@ def main() -> int:
         try:
             # Traced correctness/lifecycle run is OUTSIDE performance samples.
             _write_phase(args.phase_file, "correctness_preflight")
-            preflight = _run_decoder(up_layer, concat_module, dec1a_layer, bridge,
-                                     dec1b_layer, low_ciphertext, skip_ciphertext)
+            preflight = run_decoder()
             try:
                 preflight_decoded = dec1b_plan.decrypt_unpack(preflight)
                 preflight_error = float(np.max(np.abs(preflight_decoded - clear_dec1b)))
@@ -339,15 +366,7 @@ def main() -> int:
                 plan.record_sequence = False
             _write_phase(args.phase_file, "warmup")
             for _ in range(int(args.warmup_runs)):
-                warmup_output = _run_decoder(
-                    up_layer,
-                    concat_module,
-                    dec1a_layer,
-                    bridge,
-                    dec1b_layer,
-                    low_ciphertext,
-                    skip_ciphertext,
-                )
+                warmup_output = run_decoder()
                 warmup_output.release()
             bridge.clear_runtime_profile()
             _collect_runtime_memory(scheme.backend)
@@ -375,15 +394,7 @@ def main() -> int:
                 _write_phase(args.phase_file, "measured")
                 before_encode = list(scheme.backend.GetWPCBenchmarkEncodeCounters())
                 started = time.perf_counter()
-                output = _run_decoder(
-                    up_layer,
-                    concat_module,
-                    dec1a_layer,
-                    bridge,
-                    dec1b_layer,
-                    low_ciphertext,
-                    skip_ciphertext,
-                )
+                output = run_decoder()
                 forward_wall_s.append(float(time.perf_counter() - started))
                 timed_lifecycle_records.append(sum(len(plan.last_evaluation["evaluation_sequence"]) for plan in plans))
                 _write_phase(args.phase_file, "sample_validation")
@@ -424,7 +435,7 @@ def main() -> int:
                     decompression_s.append(0.0)
                 else:
                     decompression_s.append(0.0)
-                    transform_evaluate_s.append(0.0)
+                    transform_evaluate_s.append(sum(plan.last_evaluation["full_transform_evaluate_call_s"] for plan in plans))
                     online_encode_s.append(0.0)
                     online_prepare_s.append(0.0)
             counters_total = _operation_counters(scheme.backend)
@@ -506,7 +517,8 @@ def main() -> int:
         worker_acceptance["valid"] = bool(all(worker_acceptance.values()))
         payload = {
             "schema_version": 3,
-            "profile": "wpc_cips_trained_decoder_isolated_worker",
+            "profile": ("wpc_native_orion_matched_decoder_worker" if native else "wpc_cips_trained_decoder_isolated_worker"),
+            "layout": args.layout,
             "status": "ok" if worker_acceptance["valid"] else "invalid",
             "mode": str(args.mode),
             "seed": int(args.seed),
@@ -516,6 +528,8 @@ def main() -> int:
                 "pid": int(os.getpid()),
                 "python": sys.version.split()[0],
                 "platform": platform.platform(),
+                "torch": str(torch.__version__),
+                "numpy": str(np.__version__),
             },
             "checkpoint": {
                 "path": str(checkpoint_path),
@@ -542,6 +556,8 @@ def main() -> int:
                 "security_scope": UNASSESSED_SECURITY_SCOPE,
                 "timed_lifecycle_tracing": False,
                 "runtime_environment": environment,
+                "padding_semantics": "flattened_spatial_cyclic",
+                "native_control_scope": ("square embedding; low gap 2, high gap 1; aligned concat; explicit blockwise policy; not automatic whole-model Orion" if native else None),
             },
             "timing_policy": (
                 "fresh process with warmups excluded; measured wall time includes "
@@ -551,8 +567,8 @@ def main() -> int:
             "scheme_init_s": float(scheme_init_s),
             "compile_s": float(compile_s),
             "bootstrap_range": {
-                "activation_min": float(np.min(clear_activation)),
-                "activation_max": float(np.max(clear_activation)),
+                "activation_min": float(np.min(torch_reference["activation"])),
+                "activation_max": float(np.max(torch_reference["activation"])),
                 "symmetric_bound": float(bound),
             },
             "clear_oracle_max_abs_delta": float(oracle_max_abs_delta),
@@ -569,6 +585,8 @@ def main() -> int:
             },
             "storage": storage,
             "measurements": {
+                "transform_evaluate_timer_scope": "Python-to-backend EvaluateLinearTransform call wall" if native or args.mode == WPC_STORAGE_FULL else "backend evaluation timer",
+                "online_encode_timer_scope": "GenerateLinearTransform call wall (allocation and binding included)" if native else "backend lintrans.Encode only",
                 "forward_wall_s": forward_wall_s,
                 "online_encode_s": online_encode_s,
                 "online_prepare_s": online_prepare_s,
@@ -606,6 +624,8 @@ def main() -> int:
                 "mean_abs_error": float(np.mean(error)),
                 "output_shape": list(decoded.shape),
                 "output_values": decoded.reshape(-1).tolist(),
+                "independent_clear_output_values": torch_reference["dec1b"].reshape(-1).tolist(),
+                "independent_clear_output_sha256": hashlib.sha256(np.ascontiguousarray(torch_reference["dec1b"], dtype="<f8").tobytes()).hexdigest(),
             },
             "memory": memory,
             "backend": {
@@ -617,6 +637,8 @@ def main() -> int:
                 "compile_transform_encode_invocations": dict(zip(("ordinary", "compressed", "online_recipe"), map(int, compile_encode_invocations))),
                 "measured_transform_encode_invocations": dict(zip(("ordinary", "compressed", "online_recipe"), measured_encode_invocations)),
                 "encode_counter_scope": "actual successful lintrans.Encode invocations; one invocation per transform, not per diagonal; excludes input/bias/bootstrapping encoder internals",
+                "native_materialized_transform_count_after_forward": sum(plan.current_materialized_count for plan in plans) if native else None,
+                "native_transform_rows": {plan.layer_name: plan.transform_rows for plan in plans} if native else None,
                 "weight_plaintext_offline_encode_calls": (
                     int(global_stats["total_weight_plaintext_offline_encode_calls"])
                     if args.mode == WPC_STORAGE_COMPRESSED
@@ -639,6 +661,11 @@ def main() -> int:
             skip_ciphertext.release()
         if bridge is not None:
             bridge.cleanup()
+        if native:
+            if concat_plan is not None:
+                concat_plan.cleanup()
+            for plan in plans:
+                plan.cleanup()
         if concat_module is not None:
             concat_module.remove_wpc_cips_plan()
         for layer in (up_layer, dec1a_layer, dec1b_layer):
@@ -670,7 +697,7 @@ def main() -> int:
                 "correctness": {
                     key: value
                     for key, value in payload["correctness"].items()
-                    if key != "output_values"
+                    if key not in ("output_values", "independent_clear_output_values")
                 },
                 "acceptance": payload["acceptance"],
             },

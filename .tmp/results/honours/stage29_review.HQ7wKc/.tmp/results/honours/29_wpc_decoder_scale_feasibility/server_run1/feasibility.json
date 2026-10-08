@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "error": "online_encode worker exited with 0; RSS watchdog lost access to the live worker; refusing an unguarded run\n    \"online_recipe_materialization_released\": true,\n    \"real_bootstrap_ran_for_every_measured_forward\": true,\n    \"runtime_parameters_match_request\": true,\n    \"storage_mode_matches_request\": true,\n    \"timed_lifecycle_tracing_disabled\": true,\n    \"untimed_preflight_correct\": true,\n    \"valid\": true,\n    \"zero_online_python_encode_calls\": true\n  },\n  \"checkpoint_sha256\": \"d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39\",\n  \"compile_s\": 84.82917033997364,\n  \"correctness\": {\n    \"correct\": true,\n    \"max_abs_error\": 6.151518958802393e-07,\n    \"mean_abs_error\": 2.2724939199694194e-07,\n    \"output_shape\": [\n      32,\n      16,\n      16\n    ],\n    \"preflight_max_abs_error\": 6.151518958802393e-07,\n    \"untimed_lifecycle_trace\": [\n      [],\n      [],\n      []\n    ]\n  },\n  \"forward_wall_summary_s\": {\n    \"count\": 1,\n    \"max\": 15.550729396054521,\n    \"mean\": 15.550729396054521,\n    \"median\": 15.550729396054521,\n    \"min\": 15.550729396054521,\n    \"p95\": 15.550729396054521,\n    \"stdev\": 0.0\n  },\n  \"mode\": \"online_encode\",\n  \"status\": \"ok\",\n  \"storage\": {\n    \"by_layer\": {\n      \"checkpoint_dec1a\": {\n        \"compressed_weight_qp_payload_bytes\": 0,\n        \"full_weight_plus_bias_payload_bytes\": 780926976,\n        \"full_weight_qp_payload_bytes\": 780140544,\n        \"layer_plaintext_storage_compression_ratio\": 838.9702970297029,\n        \"resident_weight_qp_payload_bytes\": 0,\n        \"storage_mode\": \"online_encode\",\n        \"stored_weight_plus_metadata_plus_bias_bytes\": 930816,\n        \"transform_count\": 32,\n        \"uncompressed_bias_q_payload_bytes\": 786432,\n        \"unencoded_recipe_payload_bytes\": 95232,\n        \"weight_metadata_bytes\": 49152,\n        \"weight_payload_compression_ratio\": null\n      },\n      \"checkpoint_dec1b\": {\n        \"compressed_weight_qp_payload_bytes\": 0,\n        \"full_weight_plus_bias_payload_bytes\": 488636416,\n        \"full_weight_qp_payload_bytes\": 487587840,\n        \"layer_plaintext_storage_compression_ratio\": 435.9835541343079,\n        \"resident_weight_qp_payload_bytes\": 0,\n        \"storage_mode\": \"online_encode\",\n        \"stored_weight_plus_metadata_plus_bias_bytes\": 1120768,\n        \"transform_count\": 16,\n        \"uncompressed_bias_q_payload_bytes\": 1048576,\n        \"unencoded_recipe_payload_bytes\": 47616,\n        \"weight_metadata_bytes\": 24576,\n        \"weight_payload_compression_ratio\": null\n      },\n      \"checkpoint_up1\": {\n        \"compressed_weight_qp_payload_bytes\": 0,\n        \"full_weight_plus_bias_payload_bytes\": 753401856,\n        \"full_weight_qp_payload_bytes\": 752353280,\n        \"layer_plaintext_storage_compression_ratio\": 219.21608938547487,\n        \"resident_weight_qp_payload_bytes\": 0,\n        \"storage_mode\": \"online_encode\",\n        \"stored_weight_plus_metadata_plus_bias_bytes\": 3436800,\n        \"transform_count\": 8,\n        \"uncompressed_bias_q_payload_bytes\": 1048576,\n        \"unencoded_recipe_payload_bytes\": 2351104,\n        \"weight_metadata_bytes\": 37120,\n        \"weight_payload_compression_ratio\": null\n      }\n    },\n    \"concat\": {\n      \"diagonal_count\": 8,\n      \"full_qp_payload_bytes\": 2359296,\n      \"storage_mode\": \"ordinary_full_qp_permutation\",\n      \"transform_count\": 8\n    },\n    \"concat_full_qp_payload_bytes\": 2359296,\n    \"full_weight_plus_bias_payload_bytes\": 2022965248,\n    \"learned_transform_count\": 56,\n    \"learned_weight_storage_ratio\": 368.59032604132653,\n    \"logical_full_reference_total_bytes\": 2025324544,\n    \"logical_resident_total_bytes\": 7847680,\n    \"overall_full_to_stored_including_concat_ratio\": 258.0793997716523,\n    \"storage_mode\": \"online_encode\",\n    \"stored_weight_plus_metadata_plus_bias_bytes\": 5488384\n  }\n}",
+  "security_assessed": false,
+  "request": {
+    "profile": "wpc_decoder_scale_feasibility_request",
+    "configuration_source": {
+      "kind": "json_file",
+      "path": "/home/tony/FHE-Honours/configs/wpc_decoder_scale_functional.json",
+      "sha256": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195"
+    },
+    "ckks_config": {
+      "ckks_params": {
+        "LogN": 12,
+        "LogQ": [
+          55,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45
+        ],
+        "LogP": [
+          60
+        ],
+        "LogScale": 45,
+        "H": 192,
+        "RingType": "Standard"
+      },
+      "boot_params": {
+        "LogP": [
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61
+        ]
+      },
+      "orion": {
+        "margin": 1,
+        "backend": "lattigo",
+        "embedding_method": "square",
+        "io_mode": "none",
+        "debug": false
+      }
+    },
+    "geometry": {
+      "logn": 12,
+      "slots": 2048,
+      "low_shape": [
+        1,
+        64,
+        8,
+        8
+      ],
+      "high_shape": [
+        1,
+        32,
+        16,
+        16
+      ],
+      "concat_shape": [
+        1,
+        64,
+        16,
+        16
+      ],
+      "low_channel_capacity": 32,
+      "high_channel_capacity": 8,
+      "learned_transform_count_by_layer": {
+        "checkpoint_up1": 8,
+        "checkpoint_dec1a": 32,
+        "checkpoint_dec1b": 16
+      },
+      "learned_transform_count": 56,
+      "concat_transform_count": 8,
+      "bootstrap_ciphertext_group_count": 4,
+      "levels": {
+        "up1": 8,
+        "skip1": 7,
+        "concat": 7,
+        "dec1a": 6,
+        "bridge_input": 5,
+        "dec1b": 8,
+        "output": 7
+      }
+    },
+    "security_assessed": false,
+    "resource_guards": {
+      "max_worker_rss_mib": 8192.0,
+      "worker_timeout_s": 1800.0
+    }
+  }
+}

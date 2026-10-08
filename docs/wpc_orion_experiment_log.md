@@ -1,5 +1,44 @@
 # WPC–Orion experiment log
 
+## 2026-10-07 — Matched-function native Orion control (Stage 30)
+
+- Independently reviewed the transferred Stage-29 `server_run3` raw evidence:
+  the three CIPS policies passed, maximum FHE errors were approximately
+  `6.15e-7`, `6.18e-7`, and `6.14e-7`; all-phase sampled RSS peaks were
+  `2198.02`, `4041.86`, and `2318.20 MiB` respectively. This was a fixed-order
+  correctness/resource gate, not performance evidence. Earlier failed runs
+  remain failures and were not substituted into the accepted result.
+- Implemented an explicit native Orion square-embedding control with gap-2
+  low features and gap-1 high features. The existing diagonal builders receive
+  an opt-in flattened cyclic boundary adapter so both layouts evaluate the
+  same checkpoint function. Normal zero padding is unchanged. Native aligned
+  concat uses owned ciphertext copies and a level drop; CIPS retains its
+  permutation transforms. Between-layout operation counts may differ.
+- Added native full/online weight policies and the trained Cheb7/bootstrap
+  bridge. The online policy regenerates and releases one ordinary block at a
+  time; it is not the automatic whole-model layer cache or a CIPS slot recipe.
+  Added actual Q/P coefficient byte observations, independent clear output
+  values/hashes, and raw-evidence validation for all five fresh-process
+  treatments. Fixed the CIPS full-Q/P learned-transform timer, previously an
+  unmeasured zero. Existing server artifacts are not rewritten.
+- Added non-overwriting Stage-30 controller/server wrapper and read-only
+  `--review-dir` recomputation. Recorded selected source, backend, checkpoint,
+  configuration and artifact provenance; retained strict sampled-RSS and
+  timeout watchdogs, failed-run evidence and per-layout operation checks.
+- Local verification uses synthetic weights and small LogN=9–10 tests,
+  including real native full/online execution, trained-activation/bootstrap
+  chaining and equivalence to the CIPS storage paths. No remote job or trained
+  LogN=12 profile was launched. The full trained server gate remains pending.
+  Commands, timer boundaries, file changes and limitations are documented in
+  `docs/wpc_orion_layout_gate.md`.
+- Final verification: 290 WPC tests passed, one Linux-only test skipped on
+  macOS, and Go tests passed three repetitions. The 62 legacy dense compile
+  tests passed with their existing manual compile policy; the auto invocation
+  had seven batching expectation failures because `/proc/meminfo` is absent
+  on macOS and the unchanged policy chooses batch size one. This is documented
+  separately; no unrelated production policy was modified. Shell syntax,
+  Python compilation and diff whitespace checks passed.
+
 ## 2026-10-07 — Three-way online-Encode implementation (Stage 28)
 
 Added a recipe-backed online weight-Encode policy alongside full and compressed

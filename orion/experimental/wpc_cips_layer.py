@@ -10,6 +10,7 @@ across same-spatial-shape convolutions.
 from __future__ import annotations
 
 import math
+import time
 import weakref
 from typing import Any
 
@@ -664,6 +665,7 @@ class WPCCIPSConv2dPlan:
         sequence: list[dict[str, Any]] = []
         output_ids: list[int] = []
         accumulation_add_count = 0
+        full_transform_evaluate_s = 0.0
         for output_group in range(int(self.case.output_group_count)):
             accumulated_id: int | None = None
             for input_group in range(int(self.case.input_group_count)):
@@ -686,12 +688,14 @@ class WPCCIPSConv2dPlan:
                         )
                     )
                 else:
+                    evaluate_started = time.perf_counter()
                     partial_id = int(
                         backend.EvaluateLinearTransform(
                             int(transform_ids[key]),
                             int(value.ids[input_group]),
                         )
                     )
+                    full_transform_evaluate_s += time.perf_counter() - evaluate_started
                 if bool(compressed) and bool(record_sequence):
                     after = _decode_stats(
                         backend.GetWPCCompressedGlobalStats(),
@@ -755,6 +759,7 @@ class WPCCIPSConv2dPlan:
             "input_level": int(self.level),
             "output_level": int(self.output_level),
             "evaluation_sequence": sequence,
+            "full_transform_evaluate_call_s": full_transform_evaluate_s,
         }
         return output
 

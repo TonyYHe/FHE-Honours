@@ -165,6 +165,8 @@ def _sample_worker(
     checkpoint: Path,
     out_dir: Path,
     args: argparse.Namespace,
+    worker_script: Path | None = None,
+    worker_args: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     result_path = out_dir / f"{mode}.worker.json"
     log_path = out_dir / f"{mode}.worker.log"
@@ -173,7 +175,7 @@ def _sample_worker(
     result_path.unlink(missing_ok=True)
     command = [
         sys.executable,
-        str(WORKER),
+        str(WORKER if worker_script is None else worker_script),
         "--mode",
         str(mode),
         "--checkpoint",
@@ -207,6 +209,7 @@ def _sample_worker(
         command += ["--ckks-config", str(args.ckks_config.expanduser().resolve())]
     if getattr(args, "verify_exact_qp", False):
         command += ["--verify-exact-qp"]
+    command += list(worker_args or ())
     rss_limit = float(getattr(args, "max_worker_rss_mib", 0))
     timeout = float(getattr(args, "worker_timeout_s", 0))
     if any(not math.isfinite(value) or value < 0 for value in (rss_limit, timeout)):
@@ -324,6 +327,7 @@ def _sample_worker(
 def _without_output_values(payload: dict[str, Any]) -> dict[str, Any]:
     clone = json.loads(json.dumps(payload))
     clone.get("correctness", {}).pop("output_values", None)
+    clone.get("correctness", {}).pop("independent_clear_output_values", None)
     return clone
 
 

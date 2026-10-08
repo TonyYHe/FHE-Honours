@@ -1,0 +1,46 @@
+{
+  "source": "macos_ps_rss",
+  "interval_ms": 5.0,
+  "total_sample_count": 831,
+  "sample_count_by_phase": {
+    "process_start": 85,
+    "startup": 3,
+    "scheme_init": 6,
+    "compile": 543,
+    "post_compile_raw": 1,
+    "input_prepare": 1,
+    "correctness_preflight": 82,
+    "warmup": 1,
+    "pre_measured_gc": 1,
+    "measured": 83,
+    "sample_validation": 1,
+    "post_measured": 1,
+    "correctness": 1,
+    "complete": 22
+  },
+  "peak_rss_by_phase": {
+    "process_start": 360611840,
+    "startup": 413138944,
+    "scheme_init": 465010688,
+    "compile": 849133568,
+    "post_compile_raw": 849395712,
+    "input_prepare": 849444864,
+    "correctness_preflight": 1116618752,
+    "warmup": 1116717056,
+    "pre_measured_gc": 1116717056,
+    "measured": 1116815360,
+    "sample_validation": 1116815360,
+    "post_measured": 1116864512,
+    "correctness": 1114849280,
+    "complete": 1114849280
+  },
+  "peak_hwm_by_phase": {},
+  "return_code": 0,
+  "termination_reason": null,
+  "elapsed_s": 9.444333124993136,
+  "guards": {
+    "max_worker_rss_mib": 4096.0,
+    "worker_timeout_s": 300.0,
+    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "source": "linux_proc_pid_status",
+  "interval_ms": 5.0,
+  "total_sample_count": 22163,
+  "sample_count_by_phase": {
+    "process_start": 628,
+    "startup": 66,
+    "scheme_init": 92,
+    "compile": 15518,
+    "post_compile_raw": 6,
+    "input_prepare": 12,
+    "correctness_preflight": 2833,
+    "warmup": 18,
+    "measured": 2833,
+    "sample_validation": 8,
+    "correctness": 9,
+    "complete": 140
+  },
+  "peak_rss_by_phase": {
+    "process_start": 721764352,
+    "startup": 905797632,
+    "scheme_init": 880115712,
+    "compile": 1606934528,
+    "post_compile_raw": 1608052736,
+    "input_prepare": 1473216512,
+    "correctness_preflight": 2286411776,
+    "warmup": 2244173824,
+    "measured": 2290569216,
+    "sample_validation": 2251915264,
+    "correctness": 2251923456,
+    "complete": 2290917376
+  },
+  "peak_hwm_by_phase": {
+    "process_start": 721764352,
+    "startup": 907079680,
+    "scheme_init": 907079680,
+    "compile": 1606934528,
+    "post_compile_raw": 1608052736,
+    "input_prepare": 1597149184,
+    "correctness_preflight": 2286411776,
+    "warmup": 2275889152,
+    "measured": 2290569216,
+    "sample_validation": 2280394752,
+    "correctness": 2280394752,
+    "complete": 2290917376
+  },
+  "return_code": 0,
+  "termination_reason": "RSS watchdog lost access to the live worker; refusing an unguarded run",
+  "elapsed_s": 121.38962373498362,
+  "guards": {
+    "max_worker_rss_mib": 8192.0,
+    "worker_timeout_s": 1800.0,
+    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling"
+  }
+}

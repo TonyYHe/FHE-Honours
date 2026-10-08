@@ -1,0 +1,95 @@
+{
+  "ckks_config": {
+    "ckks_params": {
+      "LogN": 12,
+      "LogQ": [
+        55,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45
+      ],
+      "LogP": [
+        60
+      ],
+      "LogScale": 45,
+      "H": 192,
+      "RingType": "Standard"
+    },
+    "boot_params": {
+      "LogP": [
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61
+      ]
+    },
+    "orion": {
+      "margin": 1,
+      "backend": "lattigo",
+      "embedding_method": "square",
+      "io_mode": "none",
+      "debug": false
+    }
+  },
+  "configuration_source": {
+    "kind": "json_file",
+    "path": "/home/tony/FHE-Honours/configs/wpc_decoder_scale_functional.json",
+    "sha256": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195"
+  },
+  "geometry": {
+    "logn": 12,
+    "slots": 2048,
+    "low_shape": [
+      1,
+      64,
+      8,
+      8
+    ],
+    "high_shape": [
+      1,
+      32,
+      16,
+      16
+    ],
+    "concat_shape": [
+      1,
+      64,
+      16,
+      16
+    ],
+    "low_channel_capacity": 32,
+    "high_channel_capacity": 8,
+    "learned_transform_count_by_layer": {
+      "checkpoint_up1": 8,
+      "checkpoint_dec1a": 32,
+      "checkpoint_dec1b": 16
+    },
+    "learned_transform_count": 56,
+    "concat_transform_count": 8,
+    "bootstrap_ciphertext_group_count": 4,
+    "levels": {
+      "up1": 8,
+      "skip1": 7,
+      "concat": 7,
+      "dec1a": 6,
+      "bridge_input": 5,
+      "dec1b": 8,
+      "output": 7
+    }
+  },
+  "security_assessed": false,
+  "verify_exact_qp": true,
+  "resource_guards": {
+    "max_worker_rss_mib": 8192.0,
+    "worker_timeout_s": 1800.0
+  }
+}

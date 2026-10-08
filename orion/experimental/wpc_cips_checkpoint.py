@@ -216,7 +216,7 @@ class WPCCIPSTrainedActivationBootstrap(Module):
     ) -> None:
         super().__init__()
         self.logical_shape = _normalise_shape(logical_shape)
-        self.packing_signature = _validate_signature(
+        self.packing_signature = self._normalise_signature(
             packing_signature,
             logical_shape=self.logical_shape,
         )
@@ -257,6 +257,11 @@ class WPCCIPSTrainedActivationBootstrap(Module):
         self.last_evaluation: dict[str, Any] = {}
         self.set_depth(0)
 
+    signature_attribute = "_wpc_cips_packing_signature"
+
+    def _normalise_signature(self, signature, *, logical_shape):
+        return _validate_signature(signature, logical_shape=logical_shape)
+
     @property
     def slots(self) -> int:
         return int(self.packing_signature[1])
@@ -284,8 +289,8 @@ class WPCCIPSTrainedActivationBootstrap(Module):
     def _validate_value(self, value: CipherTensor, level: int) -> None:
         if not isinstance(value, CipherTensor):
             raise TypeError("trained activation bridge expects a CipherTensor")
-        if getattr(value, "_wpc_cips_packing_signature", None) != self.packing_signature:
-            raise ValueError("ciphertext does not have the required WPC CIPS packing")
+        if getattr(value, self.signature_attribute, None) != self.packing_signature:
+            raise ValueError("ciphertext does not have the bridge's required packing")
         if len(value.ids) != self.group_count:
             raise ValueError("ciphertext group count does not match the CIPS contract")
         levels = self._levels(value)
@@ -369,7 +374,7 @@ class WPCCIPSTrainedActivationBootstrap(Module):
         activation_started = time.perf_counter()
         activated = self.activation(value)
         activation_s = float(time.perf_counter() - activation_started)
-        activated._wpc_cips_packing_signature = self.packing_signature
+        setattr(activated, self.signature_attribute, self.packing_signature)
         try:
             self._validate_value(activated, self.activation_output_level)
         except Exception:
@@ -382,7 +387,7 @@ class WPCCIPSTrainedActivationBootstrap(Module):
         finally:
             activated.release()
         bootstrap_s = float(time.perf_counter() - bootstrap_started)
-        refreshed._wpc_cips_packing_signature = self.packing_signature
+        setattr(refreshed, self.signature_attribute, self.packing_signature)
         try:
             self._validate_value(refreshed, self.output_level)
         except Exception:

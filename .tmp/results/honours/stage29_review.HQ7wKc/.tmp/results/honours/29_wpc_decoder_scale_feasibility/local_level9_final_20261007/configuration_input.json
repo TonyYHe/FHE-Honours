@@ -1,0 +1,5 @@
+{
+  "ckks_params": {"LogN": 11, "LogQ": [55,45,45,45,45,45,45,45,45,45], "LogP": [60], "LogScale": 45, "H": 192, "RingType": "Standard"},
+  "boot_params": {"LogP": [61,61,61,61,61,61,61,61]},
+  "orion": {"margin": 1, "backend": "lattigo", "embedding_method": "square", "io_mode": "none", "debug": false}
+}

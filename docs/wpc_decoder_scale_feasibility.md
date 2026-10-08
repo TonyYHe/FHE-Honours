@@ -14,6 +14,10 @@ are unchanged:
 
 `up1 + skip1 → concat → dec1a → trained Cheb7 → bootstrap → dec1b`.
 
+The next implemented correctness gate is described in
+[`wpc_orion_layout_gate.md`](wpc_orion_layout_gate.md). It adds an explicit
+native-layout matched-function control; Stage 29 itself remains CIPS-only.
+
 ## Changes
 
 - `orion/experimental/wpc_decoder_geometry.py` independently derives input/output

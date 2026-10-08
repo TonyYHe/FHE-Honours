@@ -1,0 +1,236 @@
+{
+  "acceptance": {
+    "all_workers_within_sampled_rss_budget": true,
+    "all_workers_within_time_budget": true,
+    "exact_compressed_qp_verified": true,
+    "no_performance_or_security_claim": true,
+    "three_mode_outputs_independently_validated": true,
+    "valid": true
+  },
+  "checkpoint": {
+    "path": "/home/tony/FHE-Honours/checkpoints/wpc_rotation_padding_covid19_cheb7_audited_restart/rotation_padding_best.pt",
+    "sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39"
+  },
+  "profile": "wpc_decoder_scale_correctness_resource_gate",
+  "request": {
+    "ckks_config": {
+      "boot_params": {
+        "LogP": [
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61,
+          61
+        ]
+      },
+      "ckks_params": {
+        "H": 192,
+        "LogN": 12,
+        "LogP": [
+          60
+        ],
+        "LogQ": [
+          55,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45,
+          45
+        ],
+        "LogScale": 45,
+        "RingType": "Standard"
+      },
+      "orion": {
+        "backend": "lattigo",
+        "debug": false,
+        "embedding_method": "square",
+        "io_mode": "none",
+        "margin": 1
+      }
+    },
+    "configuration_source": {
+      "kind": "json_file",
+      "path": "/home/tony/FHE-Honours/configs/wpc_decoder_scale_functional.json",
+      "sha256": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195"
+    },
+    "geometry": {
+      "bootstrap_ciphertext_group_count": 4,
+      "concat_shape": [
+        1,
+        64,
+        16,
+        16
+      ],
+      "concat_transform_count": 8,
+      "high_channel_capacity": 8,
+      "high_shape": [
+        1,
+        32,
+        16,
+        16
+      ],
+      "learned_transform_count": 56,
+      "learned_transform_count_by_layer": {
+        "checkpoint_dec1a": 32,
+        "checkpoint_dec1b": 16,
+        "checkpoint_up1": 8
+      },
+      "levels": {
+        "bridge_input": 5,
+        "concat": 7,
+        "dec1a": 6,
+        "dec1b": 8,
+        "output": 7,
+        "skip1": 7,
+        "up1": 8
+      },
+      "logn": 12,
+      "low_channel_capacity": 32,
+      "low_shape": [
+        1,
+        64,
+        8,
+        8
+      ],
+      "slots": 2048
+    },
+    "profile": "wpc_decoder_scale_feasibility_request",
+    "resource_guards": {
+      "max_worker_rss_mib": 8192.0,
+      "worker_timeout_s": 1800.0
+    },
+    "security_assessed": false
+  },
+  "resource_observations": {
+    "compressed": {
+      "elapsed_s": 125.84402087994386,
+      "sampled_all_phase_peak_rss_bytes": 2430803968
+    },
+    "full": {
+      "elapsed_s": 117.86431918898597,
+      "sampled_all_phase_peak_rss_bytes": 4238196736
+    },
+    "online_encode": {
+      "elapsed_s": 121.24970376305282,
+      "sampled_all_phase_peak_rss_bytes": 2304786432
+    }
+  },
+  "runtime_parameter_manifest": {
+    "bootstrappers": [
+      {
+        "encapsulation": {
+          "p": [
+            2305843009213800449
+          ],
+          "q": [
+            36028797018972161
+          ],
+          "secret_hamming_weight": 32
+        },
+        "ephemeral_secret_weight": 32,
+        "parameters": {
+          "error_distribution": {
+            "parameters": {
+              "Bound": 19.2,
+              "Sigma": 3.2
+            },
+            "type": "DiscreteGaussian"
+          },
+          "log_default_scale": 45,
+          "logn": 12,
+          "logqp": 1724.000000453142,
+          "p": [
+            2305843009213800449,
+            2305843009213554689,
+            2305843009213489153,
+            2305843009213931521,
+            2305843009213317121,
+            2305843009213243393,
+            2305843009213145089,
+            2305843009213120513
+          ],
+          "q": [
+            36028797018972161,
+            35184372121601,
+            35184372203521,
+            35184371884033,
+            35184372375553,
+            35184371703809,
+            35184371613697,
+            35184372637697,
+            35184372736001,
+            549755731969,
+            549755904001,
+            549755969537,
+            1152921504606830593,
+            1152921504606904321,
+            1152921504606748673,
+            1152921504606994433,
+            1152921504607019009,
+            1152921504606683137,
+            1152921504606601217,
+            1152921504607117313,
+            72057594038149121,
+            72057594037641217,
+            72057594037616641,
+            72057594038321153
+          ],
+          "ring_type": "Standard",
+          "secret_distribution": {
+            "parameters": {
+              "H": 192,
+              "P": 0
+            },
+            "type": "Ternary"
+          }
+        },
+        "slots": 2048
+      }
+    ],
+    "residual": {
+      "error_distribution": {
+        "parameters": {
+          "Bound": 19.2,
+          "Sigma": 3.2
+        },
+        "type": "DiscreteGaussian"
+      },
+      "log_default_scale": 45,
+      "logn": 12,
+      "logqp": 475.000000023178,
+      "p": [
+        1152921504606830593
+      ],
+      "q": [
+        36028797018972161,
+        35184372121601,
+        35184372203521,
+        35184371884033,
+        35184372375553,
+        35184371703809,
+        35184371613697,
+        35184372637697,
+        35184372736001
+      ],
+      "ring_type": "Standard",
+      "secret_distribution": {
+        "parameters": {
+          "H": 192,
+          "P": 0
+        },
+        "type": "Ternary"
+      }
+    },
+    "schema_version": 1,
+    "security_assessed": false
+  },
+  "schema_version": 1,
+  "scope": "same-CIPS synthetic decoder feasibility only; no security, layout-crossover or performance claim",
+  "status": "ok"
+}

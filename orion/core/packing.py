@@ -1285,13 +1285,34 @@ def _layout_physical_bottom_beta(layout: dict) -> int:
     )
 
 
-def _conv2d_spatial_cache(conv_layer) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+def _conv2d_spatial_cache(conv_layer, *, padding_semantics="zero") -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     _, _, hi, wi = [int(value) for value in conv_layer.input_shape]
     _, _, ho, wo = [int(value) for value in conv_layer.output_shape]
     stride_h, stride_w = [int(value) for value in conv_layer.stride]
     pad_h, pad_w = [int(value) for value in conv_layer.padding]
     dil_h, dil_w = [int(value) for value in conv_layer.dilation]
     k_h, k_w = [int(value) for value in conv_layer.kernel_size]
+    if padding_semantics not in {"zero", "flattened_spatial_cyclic"}:
+        raise ValueError("unsupported convolution padding semantics")
+    if padding_semantics == "flattened_spatial_cyclic":
+        # Experimental matched-function control. This is cyclic in the ONE
+        # flattened spatial axis, not independently toroidal in H and W.
+        if ((hi, wi) != (ho, wo) or (stride_h, stride_w) != (1, 1)
+                or (dil_h, dil_w) != (1, 1) or (k_h, k_w) != (3, 3)
+                or (pad_h, pad_w) != (1, 1) or int(conv_layer.groups) != 1
+                or getattr(conv_layer, "layout_policy_input_row_offset", 0)
+                or getattr(conv_layer, "layout_policy_output_row_offset", 0)
+                or getattr(conv_layer, "layout_policy_input_layout", {})
+                or getattr(conv_layer, "layout_policy_output_layout", {})):
+            raise ValueError("Rotation-Padding adapter requires plain same-shape 3x3 stride-one convolution")
+        oh, ow = np.meshgrid(np.arange(ho), np.arange(wo), indexing="ij")
+        cache = {}
+        for kh in range(k_h):
+            for kw in range(k_w):
+                flat = (oh * wi + ow + (kh - pad_h) * wi + kw - pad_w) % (hi * wi)
+                cache[(kh, kw)] = (oh.reshape(-1), ow.reshape(-1),
+                                    (flat // wi).reshape(-1), (flat % wi).reshape(-1))
+        return cache
     output_layout = dict(getattr(conv_layer, "layout_policy_output_layout", {}) or {})
     output_top_beta = _layout_top_beta(output_layout)
     output_bottom_beta = _layout_bottom_beta(output_layout)
@@ -1341,6 +1362,7 @@ def direct_diagonalize_conv2d(
     *,
     allow_hybrid: bool = True,
     allowed_blocks: set[tuple[int, int]] | None = None,
+    padding_semantics: str = "zero",
 ):
     start_time = time.time()
     matrix_shape = (
@@ -1368,7 +1390,7 @@ def direct_diagonalize_conv2d(
     output_block_size = int(on_co * on_ho * on_wo)
 
     weight_np = weight.detach().cpu().to(dtype=torch.float32).numpy()
-    spatial_cache = _conv2d_spatial_cache(conv_layer)
+    spatial_cache = _conv2d_spatial_cache(conv_layer, padding_semantics=padding_semantics)
 
     def fill_accumulator(
         target: _DirectDiagonalAccumulator,

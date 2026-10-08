@@ -1297,6 +1297,16 @@ class LattigoLibrary:
         )
 
         get_plaintext_levels = getattr(self.lib, "GetLinearTransformPlaintextLevels", None)
+        payload_stats = getattr(self.lib, "GetLinearTransformPayloadStats", None)
+        if payload_stats is not None:
+            self.GetLinearTransformPayloadStats = LattigoFunction(
+                payload_stats, argtypes=[ctypes.c_int], restype=ArrayResultUInt64,
+            )
+        copy_ciphertext = getattr(self.lib, "CopyWPCLayoutCiphertext", None)
+        if copy_ciphertext is not None:
+            self.CopyWPCLayoutCiphertext = LattigoFunction(
+                copy_ciphertext, argtypes=[ctypes.c_int, ctypes.c_int], restype=ctypes.c_int,
+            )
         if get_plaintext_levels is not None:
             self.GetLinearTransformPlaintextLevels = LattigoFunction(
                 get_plaintext_levels,

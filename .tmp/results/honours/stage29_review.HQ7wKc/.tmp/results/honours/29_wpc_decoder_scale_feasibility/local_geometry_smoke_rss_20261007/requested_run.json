@@ -1,0 +1,95 @@
+{
+  "ckks_config": {
+    "ckks_params": {
+      "LogN": 11,
+      "LogQ": [
+        55,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45
+      ],
+      "LogP": [
+        60
+      ],
+      "LogScale": 45,
+      "H": 192,
+      "RingType": "Standard"
+    },
+    "boot_params": {
+      "LogP": [
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61,
+        61
+      ]
+    },
+    "orion": {
+      "margin": 1,
+      "backend": "lattigo",
+      "embedding_method": "square",
+      "io_mode": "none",
+      "debug": false
+    }
+  },
+  "configuration_source": {
+    "kind": "built_in_functional_config",
+    "path": null,
+    "sha256": null
+  },
+  "geometry": {
+    "logn": 11,
+    "slots": 1024,
+    "low_shape": [
+      1,
+      64,
+      4,
+      4
+    ],
+    "high_shape": [
+      1,
+      32,
+      8,
+      8
+    ],
+    "concat_shape": [
+      1,
+      64,
+      8,
+      8
+    ],
+    "low_channel_capacity": 64,
+    "high_channel_capacity": 16,
+    "learned_transform_count_by_layer": {
+      "checkpoint_up1": 2,
+      "checkpoint_dec1a": 8,
+      "checkpoint_dec1b": 4
+    },
+    "learned_transform_count": 14,
+    "concat_transform_count": 4,
+    "bootstrap_ciphertext_group_count": 2,
+    "levels": {
+      "up1": 8,
+      "skip1": 7,
+      "concat": 7,
+      "dec1a": 6,
+      "bridge_input": 5,
+      "dec1b": 8,
+      "output": 7
+    }
+  },
+  "security_assessed": false,
+  "verify_exact_qp": true,
+  "resource_guards": {
+    "max_worker_rss_mib": 4096.0,
+    "worker_timeout_s": 300.0
+  }
+}
