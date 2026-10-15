@@ -1,0 +1,85 @@
+{
+  "elapsed_s": 245.4383826960111,
+  "exit_confirmed_after_unavailable_sample": true,
+  "guards": {
+    "exit_confirmation_timeout_s": 0.1,
+    "kernel_exiting_reap_timeout_s": 5.0,
+    "max_worker_rss_mib": 8192.0,
+    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling",
+    "worker_timeout_s": 1800.0
+  },
+  "interval_ms": 5.0,
+  "last_shutdown_probe": {
+    "all_threads_exiting": true,
+    "errors": [],
+    "new_thread_ids": [],
+    "phase": "complete",
+    "source": "linux_proc_pid_task_stat",
+    "threads": [
+      {
+        "exiting": true,
+        "flags": 4227084,
+        "state": "Z",
+        "tid": 237863
+      },
+      {
+        "exiting": true,
+        "flags": 4195404,
+        "state": "R",
+        "tid": 238022
+      }
+    ],
+    "unreadable_remaining_thread_ids": []
+  },
+  "peak_hwm_by_phase": {
+    "compile": 1855672320,
+    "complete": 2525687808,
+    "correctness": 2525687808,
+    "correctness_preflight": 2385182720,
+    "input_prepare": 1846935552,
+    "measured": 2534649856,
+    "post_compile_raw": 1846935552,
+    "process_start": 721813504,
+    "sample_validation": 2525687808,
+    "scheme_init": 907296768,
+    "startup": 907296768,
+    "warmup": 2445660160
+  },
+  "peak_rss_by_phase": {
+    "compile": 1855672320,
+    "complete": 2477494272,
+    "correctness": 2437234688,
+    "correctness_preflight": 2385182720,
+    "input_prepare": 1574694912,
+    "measured": 2534649856,
+    "post_compile_raw": 1796845568,
+    "process_start": 721813504,
+    "sample_validation": 2461917184,
+    "scheme_init": 880472064,
+    "startup": 907128832,
+    "warmup": 2445660160
+  },
+  "return_code": 0,
+  "sample_count_by_phase": {
+    "compile": 17887,
+    "complete": 139,
+    "correctness": 27,
+    "correctness_preflight": 2097,
+    "input_prepare": 13,
+    "measured": 19814,
+    "post_compile_raw": 9,
+    "process_start": 637,
+    "sample_validation": 75,
+    "scheme_init": 91,
+    "startup": 68,
+    "warmup": 3948
+  },
+  "sample_count_by_source": {
+    "linux_proc_pid_status": 44805
+  },
+  "shutdown_probe_count": 1,
+  "source": "linux_proc_pid_status",
+  "termination_reason": null,
+  "total_sample_count": 44805,
+  "unavailable_sample_count": 1
+}

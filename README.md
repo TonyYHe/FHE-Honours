@@ -31,7 +31,7 @@ This project studies that latency-memory trade-off in Orion. Its principal objec
 | Python 3.9–3.12 | Model definitions, graph lowering, packing, experiment orchestration, validation, and analysis |
 | PyTorch | Clear reference models and tensor-level correctness checks |
 | Go 1.24 | Native backend build and high-performance cryptographic execution |
-| Lattigo v6.1.1 | RNS-CKKS encoding, linear transforms, key switching, rotations, and bootstrapping |
+| Lattigo v6.1.1 fork (local `lattigo/`) | RNS-CKKS encoding, linear transforms, key switching, rotations, and bootstrapping; selected through the backend's Go module replacement |
 | NumPy / SciPy | Numerical processing and reference calculations |
 | Matplotlib | Reproducible benchmark figures |
 
@@ -47,6 +47,8 @@ The principal metric is
 online_encode_pct_of_he_forward = 100 × online_encode_s / he_forward_s
 ```
 
+In Step 1, `online_encode_s` is the historical `lt_layer_cache_encode_s` category: diagonal-plaintext materialization and encoding, not an isolated CKKS Encode/NTT timer. Later WPC experiments separate preparation, Encode and decompression, with boundaries stated below. Their Encode shares must not be substituted into the Step 1 table.
+
 The current experiments use `--io-mode none`; consequently, the reported shares measure local execution rather than network communication.
 
 ### Reproducibility entry points
@@ -61,11 +63,11 @@ python tools/build_lattigo.py
 
 The native backend requires a working Go toolchain. Real-FHE model runs are resource intensive and should be executed on a suitably provisioned Linux server. See [`docs/step1_online_encode_profile.md`](docs/step1_online_encode_profile.md) for exact commands, environment constraints, and acceptance criteria.
 
-WPC-specific entry points are documented in [Rotation-Padding fine-tuning](docs/wpc_rotation_padding_finetune.md), [the three-way CIPS benchmark](docs/wpc_online_encode_benchmark.md), [the matched-layout correctness gate](docs/wpc_orion_layout_gate.md), and [the repeated matched-layout benchmark](docs/wpc_matched_layout_benchmark.md). The server wrappers preserve raw artifacts and record completion status; existing evidence is not overwritten.
+WPC-specific entry points are documented in [Rotation-Padding fine-tuning](docs/wpc_rotation_padding_finetune.md), [the three-way CIPS benchmark](docs/wpc_online_encode_benchmark.md), [the matched-layout correctness gate](docs/wpc_orion_layout_gate.md), [the repeated matched-layout benchmark](docs/wpc_matched_layout_benchmark.md), and [selective compression in unchanged Orion layouts](docs/wpc_selective_orion.md). The server wrappers preserve raw artifacts and record completion status; existing evidence is not overwritten.
 
 ## 3. Current Progress
 
-Verified evidence through **8 October 2026**. Whole-model Orion profiling, clear-model accuracy, and encrypted decoder-stage experiments have distinct scopes.
+Verified server evidence through **10 October 2026**, including independently reviewed Stage 31 and Stage 32 transfers. Whole-model Orion profiling, clear-model accuracy, and encrypted decoder-stage experiments have distinct scopes. The completed-run status below supersedes older pending-run notes in the implementation guides and experiment log.
 
 - **Step 0 — clear-Lattigo validation: complete.**
   - Established clear-Lattigo as the structural correctness backend before running expensive real-FHE experiments.
@@ -106,17 +108,19 @@ Verified evidence through **8 October 2026**. Whole-model Orion profiling, clear
 - **Validation and provenance: hardened.**
   - Added explicit finite-sample accounting, evaluated-checkpoint identities, cross-artifact SHA-256 checks, archived configurations, raw worker/RSS manifests, and read-only recomputation after transfer.
   - Replaced the previously unmeasured full-Q/P evaluation timer with an actual measurement in new workers; historical artifacts remain unchanged.
-  - Independently checked the transferred Stage 30 archive and all five workers. The review identified repeated full-channel traversal in native online preparation; Stage 31 implements the block-aware correction before collecting repeated layout timings.
+  - Independently checked the transferred Stage 30 archive and all five workers. The review identified repeated full-channel traversal in native online preparation; Stage 31 corrected it before collecting repeated layout timings.
 
-- **Stage 31 — repeated matched-layout benchmark: implemented; server results pending.**
+- **Stage 31 — repeated matched-layout benchmark: completed and independently reviewed at decoder-stage scope.**
   - Corrected native online preparation to traverse only the requested block's channel pairs, with exact-diagonal regression tests and no resident diagonal bank.
-  - Added a ten-block, five-treatment balanced-order protocol, retained per-forward outputs/counters, independent raw-artifact review and paired process-block confidence intervals. No new latency finding is claimed before server validation.
+  - Completed ten balanced process blocks across five treatments: 50 fresh workers, two warmups and ten measured forwards per worker, with paired process-block confidence intervals.
+  - Independently reviewed all 50 workers and 210 hashed raw artifacts after transfer. The matched decoder results below do not establish a complete-network crossover.
 
-- **Stage 32 — selective compression in unchanged Orion transforms: implemented; server gate pending.**
+- **Stage 32 — selective compression in unchanged Orion transforms: correctness gate and ResNet20 diagnostic completed and independently reviewed.**
   - Added opt-in mixed periodic/nonperiodic Q/P materialization in the ordinary dense layer cache, preserving full-transform BSGS and online fallback recipes.
-  - Added exact reconstruction/output/counter/release gates and separate backend Encode, preparation and decompression measurements. No new whole-model performance result is claimed. See [the scope and server commands](docs/wpc_selective_orion.md).
+  - Passed the three-case exact-reconstruction/output/counter/release gate. The whole-model ResNet20 diagnostic found zero eligible diagonals across 23 registered transforms; both policies still performed 8,381 online Encodes per measured forward.
+  - Reported separate backend Encode, preparation and decompression measurements. This fixed-order diagnostic does not support a speedup claim; provider/executor integration for U-Net and VGG remains unvalidated. See [the scope and server commands](docs/wpc_selective_orion.md).
 
-Remaining work includes executing the repeated balanced-order native-Orion/CIPS comparison and selective-storage gates, a security assessment of benchmark parameters, paper-aligned full-model reproduction and a separate U-Net extension, and matched complete encrypted-network experiments for U-Net and ResNet.
+Remaining work includes validated selective-storage coverage in provider/executor paths, a security assessment of benchmark parameters, paper-aligned full-model reproduction and a separate U-Net extension, and matched complete encrypted-network experiments for U-Net and ResNet. No adaptive-layout solution or model-family crossover has yet been demonstrated.
 
 ## 4. Results & Benchmarks
 
@@ -196,7 +200,7 @@ Confidence intervals use 10,000 percentile-bootstrap resamples of matched proces
 
 Online workers performed 56 learned-transform Encode invocations per measured forward; the two preencoded policies performed zero. Preparation and Encode have different boundaries from historical Step 1 layer-cache categories and must not be substituted into whole-model profiles. This experiment isolates storage/materialization within CIPS; it does not establish the Orion-versus-WPC layout crossover. See [the Stage 28 methodology](docs/wpc_online_encode_benchmark.md).
 
-### Matched native-Orion/CIPS decoder gate — Stage 30
+### Historical matched native-Orion/CIPS decoder gate — Stage 30
 
 Both layouts evaluate the same fine-tuned checkpoint, synthetic feature values, flattened Rotation Padding, trained Cheb7 activation, and bootstrap level schedule at `LogN=12` with `16×16` outputs. **The following timings are single-run diagnostics, not a latency ranking.** Each fresh worker performs an untimed correctness preflight followed by one measured forward, with no additional warmups. Cryptographic security has not been assessed.
 
@@ -212,11 +216,52 @@ All five paths passed the recorded `1e-5` tolerance; maximum output delta versus
 
 At this geometry, CIPS compression reduced logical resident plaintext storage by **19.36×** relative to CIPS/full. The measured-phase sampled RSS was **42.63% lower** in this diagnostic run; that is neither the logical compression factor nor an OS-enforced allocation ceiling.
 
-**Performance confound identified during raw-artifact review:** native online preparation consumed **41.986 s (71.1%)**, while its Encode call consumed **6.004 s (10.2%)**. Each requested block repeats full input/output-channel traversal before filtering unwanted entries. This avoidable work belongs to the experimental blockwise control, not the unchanged whole-model Orion layer cache, and must be corrected before repeated layout benchmarking. Native Encode includes allocation/binding call wall time; CIPS reports the narrower backend Encode timer, so those shares are not interchangeable.
+**Historical performance confound:** native online preparation consumed **41.986 s (71.1%)**, while its Encode call consumed **6.004 s (10.2%)**. Each requested block repeated full input/output-channel traversal before filtering unwanted entries. This avoidable work belonged to the experimental blockwise control, not the unchanged whole-model Orion layer cache, and was corrected before Stage 31. The Stage 30 timings are retained as diagnostic evidence, not reused in the repeated benchmark or compared as if the preparation implementations were identical. Native Encode includes allocation/binding call wall time; CIPS reports the narrower backend Encode timer, so those shares are not interchangeable.
 
 The transferred archive passed checksum and byte-for-byte checks for all 28 files; the gate recomputed five workers and checked 20 raw artifact records, with no differences in the 36 selected source hashes. Checkpoint and backend-binary identities are recorded, but their contents were not bundled for local authentication. Commands, timer boundaries, and acceptance gates are documented in [the Stage 30 guide](docs/wpc_orion_layout_gate.md).
 
-The accepted evidence is retained in the user-executed Stage 27 `server_run2`, Stage 28 `server_run2`, Stage 29 `server_run3`, and Stage 30 `server_run1` artifacts under `.tmp/results/honours/`. Failed or partial attempts are not used in these tables. The results support compressed-storage mechanics and matched decoder correctness; **a complete encrypted-network WPC-versus-Orion comparison, original-paper performance reproduction, and the ResNet/U-Net layout crossover remain unestablished**.
+### Repeated matched native-Orion/CIPS decoder benchmark — Stage 31
+
+The corrected native control and CIPS evaluate the same fine-tuned checkpoint, synthetic internal features, flattened Rotation Padding, Cheb7 activation and bootstrap schedule at `LogN=12`, with `16×16` outputs. Ten balanced Williams-design blocks contain five fresh workers each; every worker performs two warmups and ten measured forwards, for **500 measured forwards**. These are functional, security-unassessed parameters, not a deployment configuration.
+
+| Layout / storage | Forward (s) | Preparation + Encode share | Decompression share | Logical resident (MiB) | Sampled measured peak RSS (MiB) | LT rotations |
+|:---|---:|---:|---:|---:|---:|---:|
+| Native Orion / full Q/P | 11.038271 | 0.000% | 0.000% | 1118.766 | 4166.263 | 1456 |
+| Native Orion / online Encode | 18.926400 | 42.544% | 0.000% | 2.903 | 1916.610 | 1456 |
+| CIPS / full Q/P | 10.396853 | 0.000% | 0.000% | 1931.500 | 5968.816 | 1288 |
+| CIPS / online Encode | 15.264793 | 33.723% | 0.000% | 7.484 | 2187.041 | 1288 |
+| CIPS / compressed Q/P | 10.808728 | 0.000% | 5.866% | 99.772 | 2380.951 | 1288 |
+
+Forward entries are means of ten within-process medians. Shares are means of within-forward ratios; RSS entries average sampled measured-phase maxima. Additive accounting uses mean component seconds and closes to mean forward time, not to the latency medians in this table. Logical resident bytes and sampled process RSS have different denominators.
+
+| Paired forward-latency ratio | Mean | 95% confidence interval for the mean |
+|:---|---:|:---:|
+| CIPS compressed / native Orion online Encode | 0.571100 | [0.568890, 0.573328] |
+| CIPS compressed / native Orion full Q/P | 0.979216 | [0.976591, 0.981629] |
+| CIPS compressed / CIPS full Q/P | 1.039632 | [1.035358, 1.043382] |
+
+Ratios are formed within each matched process block before averaging. Confidence intervals use 10,000 percentile-bootstrap resamples of whole blocks; they are descriptive, pointwise intervals for this run, not evidence of reproducibility across hosts or sessions. Warmups, the correctness preflight, output validation and lifecycle tracing are excluded from forward timing.
+
+At this decoder geometry, compressed CIPS had lower latency than the native online control, but a **3.96% latency cost** relative to resident CIPS/full. It reduced logical resident plaintexts by **94.83%** and sampled measured peak RSS by **60.11%** relative to CIPS/full. Native online recipes still had the smallest logical footprint and lower sampled RSS than compressed CIPS: compression is not the lowest-memory policy under every comparison.
+
+All 50 workers passed independent raw-artifact review; the maximum final-output delta across treatments was **`2.608e-8`**. Instrumented rotation/conjugation counts matched across storage policies within each layout; individual addition/multiplication counts were not separately measured. This establishes a **decoder-stage** layout/storage trade-off, not complete-model accuracy, secure deployment, original-paper performance reproduction or the proposed ResNet/U-Net crossover. See [the Stage 31 protocol](docs/wpc_matched_layout_benchmark.md).
+
+### Selective compression in unchanged ResNet20 — Stage 32
+
+After the three-case functional gate passed, the ResNet20/CIFAR-10 dense diagnostic ran one warmup and three measured encrypted forwards in each of two fresh processes, in fixed online-then-hybrid order. The model, configuration and original diagonal identities matched across policies.
+
+| Storage policy | HE forward (s) | Backend Encode (s) | Backend preparation (s) | Backend Encode share |
+|:---|---:|---:|---:|---:|
+| Online | 1509.109 | 268.045 | 29.364 | 17.763% |
+| Selective hybrid | 1503.240 | 265.502 | 29.338 | 17.662% |
+
+Times are means over the three measured forwards; shares are means of per-forward ratios. All **23 registered transforms** contained **zero eligible periodic diagonals**, so both policies made **8,381 online Embed calls per measured forward**, with zero decompression and no retained compressed payload. This verifies the expected negative control, not a compression speedup. The 0.39% forward-time difference has no confidence interval and must not be interpreted as a benefit from compression.
+
+Maximum output error across warmup and measured attempts was **`2.01933e-4`**, below the recorded **`1e-3`** tolerance. Raw outputs, counters, lifecycle and timing summaries passed local review. These backend Encode timers cover only registered dense-cache transforms and exclude Python recipe building, bias Encode and FFI overhead; they are not the historical Step 1 materialization category. Both policies also use the same per-diagonal backend rather than the historical batched baseline.
+
+The U-Net structural candidates have not yet been exercised through a validated provider/executor selective-storage path. No selective whole-model U-Net or VGG result is claimed. See [the Stage 32 scope](docs/wpc_selective_orion.md).
+
+The accepted evidence comprises user-executed Stage 27 `server_run2`, Stage 28 `server_run2`, Stage 29 `server_run3`, Stage 30 `server_run1`, Stage 31 `server_run1`, and Stage 32 `server_run1` / `resnet20_run1` runs under `.tmp/results/honours/`, including the independently reviewed transfers. Failed or partial attempts are not used in these tables. Source/configuration/checkpoint/backend hashes record content identities, not authentication; checkpoint and binary bytes were not bundled in the reviewed transfers. **A complete encrypted-network WPC-versus-Orion comparison, original-paper performance reproduction, and the ResNet/U-Net layout crossover remain unestablished.**
 
 ## 5. Visuals
 

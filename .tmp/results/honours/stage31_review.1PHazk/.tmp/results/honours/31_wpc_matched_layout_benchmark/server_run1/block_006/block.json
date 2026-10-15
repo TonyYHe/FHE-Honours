@@ -1,0 +1,405 @@
+{
+  "identity": {
+    "bootstrap_range": {
+      "activation_max": 0.07926166694621219,
+      "activation_min": -0.08060633140006337,
+      "symmetric_bound": 1.0
+    },
+    "checkpoint_sha256": "d48f20534506eb1605d0c7354393f5b72d9ecde9a0115067e215a7bfd7855b39",
+    "experiment": {
+      "atol": 1e-05,
+      "bound_headroom": 1.25,
+      "bsgs_ratio": 2.0,
+      "ckks_config": {
+        "boot_params": {
+          "LogP": [
+            61,
+            61,
+            61,
+            61,
+            61,
+            61,
+            61,
+            61
+          ]
+        },
+        "ckks_params": {
+          "H": 192,
+          "LogN": 12,
+          "LogP": [
+            60
+          ],
+          "LogQ": [
+            55,
+            45,
+            45,
+            45,
+            45,
+            45,
+            45,
+            45,
+            45
+          ],
+          "LogScale": 45,
+          "RingType": "Standard"
+        },
+        "orion": {
+          "backend": "lattigo",
+          "debug": false,
+          "embedding_method": "square",
+          "io_mode": "none",
+          "margin": 1
+        }
+      },
+      "configuration_source": {
+        "kind": "json_file",
+        "path": "/home/tony/FHE-Honours/configs/wpc_decoder_scale_functional.json",
+        "sha256": "79d160f6f3f299cb6163266d0b9a3ce15306f9dc29912d213f7f3185d9c83195"
+      },
+      "feature_std": 0.02,
+      "forward_runs": 10,
+      "geometry": {
+        "bootstrap_ciphertext_group_count": 4,
+        "concat_shape": [
+          1,
+          64,
+          16,
+          16
+        ],
+        "concat_transform_count": 8,
+        "high_channel_capacity": 8,
+        "high_shape": [
+          1,
+          32,
+          16,
+          16
+        ],
+        "learned_transform_count": 56,
+        "learned_transform_count_by_layer": {
+          "checkpoint_dec1a": 32,
+          "checkpoint_dec1b": 16,
+          "checkpoint_up1": 8
+        },
+        "levels": {
+          "bridge_input": 5,
+          "concat": 7,
+          "dec1a": 6,
+          "dec1b": 8,
+          "output": 7,
+          "skip1": 7,
+          "up1": 8
+        },
+        "logn": 12,
+        "low_channel_capacity": 32,
+        "low_shape": [
+          1,
+          64,
+          8,
+          8
+        ],
+        "slots": 2048
+      },
+      "graph": "up1+skip1->cat1->dec1a->Cheb7->bootstrap->dec1b",
+      "high_shape": [
+        1,
+        32,
+        16,
+        16
+      ],
+      "logn": 12,
+      "low_shape": [
+        1,
+        64,
+        8,
+        8
+      ],
+      "padding_semantics": "flattened_spatial_cyclic",
+      "security_scope": "unassessed_experimental_parameters_not_secure_deployment",
+      "slots": 2048,
+      "verify_exact_qp": true,
+      "warmup_runs": 2
+    },
+    "feature_sha256": "b2732a5973fdce4e0db6c97919380eb36f19a501545242b53cdbcffa788bdbce",
+    "runtime_environment": {
+      "ORION_CPP_DIAG_BUILDER": "0",
+      "ORION_DIRECT_PACK_WORKERS": "1",
+      "ORION_LATTIGO_CLEAR_BACKEND": "0",
+      "ORION_LATTIGO_COMPILE_WORKERS": "1",
+      "ORION_LATTIGO_LEGACY_CHUNK_STREAMING_LT": "0",
+      "ORION_LATTIGO_STREAMING_LT": "0",
+      "ORION_SINGLE_SLOT_ENCODE_WORKERS": "1",
+      "ORION_SINGLE_SLOT_LAYER_CACHE": "0",
+      "ORION_WPC_PERIODICITY_PROFILE": "0"
+    },
+    "runtime_parameter_manifest": {
+      "bootstrappers": [
+        {
+          "encapsulation": {
+            "p": [
+              2305843009213800449
+            ],
+            "q": [
+              36028797018972161
+            ],
+            "secret_hamming_weight": 32
+          },
+          "ephemeral_secret_weight": 32,
+          "parameters": {
+            "error_distribution": {
+              "parameters": {
+                "Bound": 19.2,
+                "Sigma": 3.2
+              },
+              "type": "DiscreteGaussian"
+            },
+            "log_default_scale": 45,
+            "logn": 12,
+            "logqp": 1724.000000453142,
+            "p": [
+              2305843009213800449,
+              2305843009213554689,
+              2305843009213489153,
+              2305843009213931521,
+              2305843009213317121,
+              2305843009213243393,
+              2305843009213145089,
+              2305843009213120513
+            ],
+            "q": [
+              36028797018972161,
+              35184372121601,
+              35184372203521,
+              35184371884033,
+              35184372375553,
+              35184371703809,
+              35184371613697,
+              35184372637697,
+              35184372736001,
+              549755731969,
+              549755904001,
+              549755969537,
+              1152921504606830593,
+              1152921504606904321,
+              1152921504606748673,
+              1152921504606994433,
+              1152921504607019009,
+              1152921504606683137,
+              1152921504606601217,
+              1152921504607117313,
+              72057594038149121,
+              72057594037641217,
+              72057594037616641,
+              72057594038321153
+            ],
+            "ring_type": "Standard",
+            "secret_distribution": {
+              "parameters": {
+                "H": 192,
+                "P": 0
+              },
+              "type": "Ternary"
+            }
+          },
+          "slots": 2048
+        }
+      ],
+      "residual": {
+        "error_distribution": {
+          "parameters": {
+            "Bound": 19.2,
+            "Sigma": 3.2
+          },
+          "type": "DiscreteGaussian"
+        },
+        "log_default_scale": 45,
+        "logn": 12,
+        "logqp": 475.000000023178,
+        "p": [
+          1152921504606830593
+        ],
+        "q": [
+          36028797018972161,
+          35184372121601,
+          35184372203521,
+          35184371884033,
+          35184372375553,
+          35184371703809,
+          35184371613697,
+          35184372637697,
+          35184372736001
+        ],
+        "ring_type": "Standard",
+        "secret_distribution": {
+          "parameters": {
+            "H": 192,
+            "P": 0
+          },
+          "type": "Ternary"
+        }
+      },
+      "schema_version": 1,
+      "security_assessed": false
+    },
+    "seed": 20260929,
+    "shared_library_sha256": "3fa96f02957360054100a649e947e524ef5e62bafa33d08b521a50c237291693",
+    "software": {
+      "numpy": "2.2.6",
+      "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+      "python": "3.12.3",
+      "torch": "2.13.0+cu126"
+    }
+  },
+  "maximum_final_output_delta": 2.468004822731018e-08,
+  "operations": {
+    "cips/compressed": {
+      "conjugation": 4,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 1288,
+      "rotation_total": 1288
+    },
+    "cips/full": {
+      "conjugation": 4,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 1288,
+      "rotation_total": 1288
+    },
+    "cips/online_encode": {
+      "conjugation": 4,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 1288,
+      "rotation_total": 1288
+    },
+    "native_orion/full": {
+      "conjugation": 4,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 1456,
+      "rotation_total": 1456
+    },
+    "native_orion/online_encode": {
+      "conjugation": 4,
+      "direct_rotation": 0,
+      "linear_transform_rotation": 1456,
+      "rotation_total": 1456
+    }
+  },
+  "order": [
+    "cips/compressed",
+    "native_orion/full",
+    "cips/online_encode",
+    "native_orion/online_encode",
+    "cips/full"
+  ],
+  "rows": {
+    "cips/compressed": {
+      "activation_s": 0.07315902638947591,
+      "activation_s_pct": 0.6759092917595851,
+      "bootstrap_s": 3.4095839748857544,
+      "bootstrap_s_pct": 31.499403681597467,
+      "decompression_s": 0.6493500072,
+      "decompression_s_pct": 5.9897956175196825,
+      "forward_mean_s": 10.825221638008951,
+      "forward_median_s": 10.777394772972912,
+      "logical_resident_bytes": 104619008,
+      "maximum_clear_error": 6.154561859074426e-07,
+      "online_encode_s": 0.0,
+      "online_encode_s_pct": 0.0,
+      "online_prepare_s": 0.0,
+      "online_prepare_s_pct": 0.0,
+      "other_forward_pct": 0.8218967902287719,
+      "other_forward_s": 0.08897020493372203,
+      "pre_online_rss_bytes": 1575690240,
+      "sampled_measured_peak_rss_bytes": 2490953728,
+      "transform_evaluate_s": 6.6041584246,
+      "transform_evaluate_s_pct": 61.012994618894496
+    },
+    "cips/full": {
+      "activation_s": 0.0760205723112449,
+      "activation_s_pct": 0.7355461245256801,
+      "bootstrap_s": 3.483899382187519,
+      "bootstrap_s_pct": 33.714409113715064,
+      "decompression_s": 0.0,
+      "decompression_s_pct": 0.0,
+      "forward_mean_s": 10.333503950107843,
+      "forward_median_s": 10.365673920488916,
+      "logical_resident_bytes": 2025324544,
+      "maximum_clear_error": 6.189436367355639e-07,
+      "online_encode_s": 0.0,
+      "online_encode_s_pct": 0.0,
+      "online_prepare_s": 0.0,
+      "online_prepare_s_pct": 0.0,
+      "other_forward_pct": 0.8625019527908921,
+      "other_forward_s": 0.08913291312055663,
+      "pre_online_rss_bytes": 3514449920,
+      "sampled_measured_peak_rss_bytes": 6258561024,
+      "transform_evaluate_s": 6.684451082488522,
+      "transform_evaluate_s_pct": 64.68754280896836
+    },
+    "cips/online_encode": {
+      "activation_s": 0.07463324540294707,
+      "activation_s_pct": 0.48956685521857746,
+      "bootstrap_s": 3.41262258507777,
+      "bootstrap_s_pct": 22.38296214740105,
+      "decompression_s": 0.0,
+      "decompression_s_pct": 0.0,
+      "forward_mean_s": 15.246696886001155,
+      "forward_median_s": 15.247718924016226,
+      "logical_resident_bytes": 7847680,
+      "maximum_clear_error": 6.156103694865411e-07,
+      "online_encode_s": 4.5658832153999995,
+      "online_encode_s_pct": 29.948629079747306,
+      "online_prepare_s": 0.5551521082,
+      "online_prepare_s_pct": 3.635791273586745,
+      "other_forward_pct": 0.5850116465580372,
+      "other_forward_s": 0.08920077112043767,
+      "pre_online_rss_bytes": 1475899392,
+      "sampled_measured_peak_rss_bytes": 2292621312,
+      "transform_evaluate_s": 6.5492049608,
+      "transform_evaluate_s_pct": 42.95803899748829
+    },
+    "native_orion/full": {
+      "activation_s": 0.07615954362554475,
+      "activation_s_pct": 0.6929320559722152,
+      "bootstrap_s": 3.458424789295532,
+      "bootstrap_s_pct": 31.468409566477316,
+      "decompression_s": 0.0,
+      "decompression_s_pct": 0.0,
+      "forward_mean_s": 10.988946826721076,
+      "forward_median_s": 10.98594550753478,
+      "logical_resident_bytes": 1173111424,
+      "maximum_clear_error": 6.128429851023909e-07,
+      "online_encode_s": 0.0,
+      "online_encode_s_pct": 0.0,
+      "online_prepare_s": 0.0,
+      "online_prepare_s_pct": 0.0,
+      "other_forward_pct": 0.22092499575758662,
+      "other_forward_s": 0.02428806555690244,
+      "pre_online_rss_bytes": 2532134912,
+      "sampled_measured_peak_rss_bytes": 4370620416,
+      "transform_evaluate_s": 7.430074428243097,
+      "transform_evaluate_s_pct": 67.61773338179287
+    },
+    "native_orion/online_encode": {
+      "activation_s": 0.07245601362083107,
+      "activation_s_pct": 0.38101788274087806,
+      "bootstrap_s": 3.413341084506828,
+      "bootstrap_s_pct": 17.94852972566587,
+      "decompression_s": 0.0,
+      "decompression_s_pct": 0.0,
+      "forward_mean_s": 19.018914631893857,
+      "forward_median_s": 19.015673453977797,
+      "logical_resident_bytes": 3043968,
+      "maximum_clear_error": 6.128429851023909e-07,
+      "online_encode_s": 5.3633917683,
+      "online_encode_s_pct": 28.197176548796282,
+      "online_prepare_s": 2.7421282542,
+      "online_prepare_s_pct": 14.418309913124741,
+      "other_forward_pct": 0.1379777805421635,
+      "other_forward_s": 0.026248320066198972,
+      "pre_online_rss_bytes": 1341976576,
+      "sampled_measured_peak_rss_bytes": 2010034176,
+      "transform_evaluate_s": 7.4013491912,
+      "transform_evaluate_s_pct": 38.91698814913006
+    }
+  },
+  "valid": true
+}

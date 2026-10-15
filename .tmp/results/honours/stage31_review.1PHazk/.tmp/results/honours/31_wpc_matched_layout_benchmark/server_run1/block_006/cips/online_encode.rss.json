@@ -1,0 +1,88 @@
+{
+  "elapsed_s": 289.30515657295473,
+  "exit_confirmed_after_unavailable_sample": true,
+  "guards": {
+    "exit_confirmation_timeout_s": 0.1,
+    "kernel_exiting_reap_timeout_s": 5.0,
+    "max_worker_rss_mib": 8192.0,
+    "policy": "sampled RSS watchdog, not an OS-enforced allocation ceiling",
+    "worker_timeout_s": 1800.0
+  },
+  "interval_ms": 5.0,
+  "last_shutdown_probe": {
+    "all_threads_exiting": true,
+    "errors": [],
+    "new_thread_ids": [],
+    "phase": "complete",
+    "source": "linux_proc_pid_task_stat",
+    "threads": [
+      {
+        "exiting": true,
+        "flags": 4227084,
+        "state": "Z",
+        "tid": 239820
+      },
+      {
+        "exiting": true,
+        "flags": 4195404,
+        "state": "R",
+        "tid": 239988
+      }
+    ],
+    "unreadable_remaining_thread_ids": []
+  },
+  "peak_hwm_by_phase": {
+    "compile": 1622192128,
+    "complete": 2300035072,
+    "correctness": 2284908544,
+    "correctness_preflight": 2292109312,
+    "input_prepare": 1614417920,
+    "measured": 2292621312,
+    "post_compile_raw": 1624416256,
+    "post_measured": 2284908544,
+    "process_start": 721891328,
+    "sample_validation": 2284908544,
+    "scheme_init": 906366976,
+    "startup": 907177984,
+    "warmup": 2282098688
+  },
+  "peak_rss_by_phase": {
+    "compile": 1622192128,
+    "complete": 2300035072,
+    "correctness": 2260770816,
+    "correctness_preflight": 2292109312,
+    "input_prepare": 1474170880,
+    "measured": 2292621312,
+    "post_compile_raw": 1624416256,
+    "post_measured": 2260770816,
+    "process_start": 721891328,
+    "sample_validation": 2281951232,
+    "scheme_init": 880779264,
+    "startup": 907177984,
+    "warmup": 2257006592
+  },
+  "return_code": 0,
+  "sample_count_by_phase": {
+    "compile": 15594,
+    "complete": 138,
+    "correctness": 25,
+    "correctness_preflight": 2895,
+    "input_prepare": 12,
+    "measured": 27809,
+    "post_compile_raw": 6,
+    "post_measured": 1,
+    "process_start": 631,
+    "sample_validation": 75,
+    "scheme_init": 90,
+    "startup": 65,
+    "warmup": 5560
+  },
+  "sample_count_by_source": {
+    "linux_proc_pid_status": 52901
+  },
+  "shutdown_probe_count": 1,
+  "source": "linux_proc_pid_status",
+  "termination_reason": null,
+  "total_sample_count": 52901,
+  "unavailable_sample_count": 1
+}

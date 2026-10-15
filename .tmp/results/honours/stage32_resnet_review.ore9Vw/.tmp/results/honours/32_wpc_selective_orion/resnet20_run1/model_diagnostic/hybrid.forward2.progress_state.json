@@ -1,0 +1,15 @@
+{
+  "attempt_index": 2,
+  "attempt_kind": "measured",
+  "event": "end",
+  "layer": "linear",
+  "layer_cache_evict_s": 0.000130112050101161,
+  "mode": "dense",
+  "network": "resnet20_cifar10",
+  "path": "dense",
+  "phase": "evict",
+  "pid": 275961,
+  "result_path": "/home/tony/FHE-Honours/.tmp/results/honours/32_wpc_selective_orion/resnet20_run1/model_diagnostic/hybrid.json",
+  "time": "2026-10-09T16:31:16Z",
+  "time_s": 1791563476.5066476
+}
